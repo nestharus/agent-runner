@@ -1,3 +1,9 @@
+549daaa Gate S11 residual function classification remediation
+dcfa938 Fix clippy ptr_arg in age217 launch dispatch test
+d9606aa Exclude gate patch artifacts from doomed-dir link lint (quotations, not links)
+72bb8c0 Fix borrow conflict between liveness and gate-remediation commits
+7ec42d4 Gate S11 function classification remediation
+dc2900d Fix launch heartbeat gap supervision
 a1a3ca1 FIX #32: rotate external-provider transport timeouts over the pool; right-size handshake timeout
 1e043d3 Restore opencode-turns exec bit after revert
 c3ab19c Revert "Fallback opencode turns to SQLite on invalid export"

@@ -23,7 +23,7 @@ index 87da438..858bb6e 100644
  
  - **Source**: `planning/oc-gate/code-quality/oc/reports/validation-integrity-auditor.md` VI-001.
 diff --git a/crates/oulipoly-provider/src/client.rs b/crates/oulipoly-provider/src/client.rs
-index 97bcbf9..1d757b3 100644
+index 97bcbf9..8667460 100644
 --- a/crates/oulipoly-provider/src/client.rs
 +++ b/crates/oulipoly-provider/src/client.rs
 @@ -3,7 +3,7 @@ use crate::error::{
@@ -292,19 +292,13 @@ index 97bcbf9..1d757b3 100644
          let resolved = self.resolve("launch", request_id.clone())?;
          let outcome = self.run_resolved(
              "launch",
-@@ -315,35 +260,32 @@ impl ProviderClient {
+@@ -315,35 +260,26 @@ impl ProviderClient {
              envs,
              self.options.timeouts.launch,
          )?;
 +        let diagnostics = launch_diagnostics(&outcome);
 +        self.record_process_state(&outcome, &diagnostics);
-+        if diagnostics.stdout.truncated {
-+            return Err(map_launch_stdout_limit_error(
-+                request_id,
-+                diagnostics,
-+                outcome.status,
-+            ));
-+        }
++        ensure_launch_stdout_within_limit(&diagnostics, request_id.clone(), &outcome.status)?;
 +        parse_launch_output(
 +            outcome.stdout.bytes,
 +            diagnostics,
@@ -346,7 +340,7 @@ index 97bcbf9..1d757b3 100644
      }
  
      fn resolve(
-@@ -375,41 +317,380 @@ impl ProviderClient {
+@@ -375,41 +311,395 @@ impl ProviderClient {
          I: ProviderEnv,
      {
          let request_id = request_id_from(&request);
@@ -371,15 +365,15 @@ index 97bcbf9..1d757b3 100644
 +            runner.run_with_stdout_line_gap_timeout(command, request_bytes, envs.into_env_vec())
          } else {
 -            self.options.timeouts.kill_after_grace
--        };
++            runner.run(command, request_bytes, envs.into_env_vec())
+         };
 -        let limits = ProcessLimits {
 -            timeout,
 -            kill_after_grace,
 -            stdout_limit: ByteLimit::new(self.options.output_limits.stdout_bytes),
 -            stderr_limit: ByteLimit::new(self.options.output_limits.stderr_bytes),
 -            cancellation: self.options.cancellation.clone(),
-+            runner.run(command, request_bytes, envs.into_env_vec())
-         };
+-        };
 -        let mut argv = resolved.argv_for_subcommand(subcommand);
 -        let program = argv.remove(0);
 -        let mut command = ProcessCommand::new(program);
@@ -665,6 +659,21 @@ index 97bcbf9..1d757b3 100644
 +    .with_process_context(diagnostics, status)
 +}
 +
++fn ensure_launch_stdout_within_limit(
++    diagnostics: &ProviderDiagnostics,
++    request_id: Option<String>,
++    status: &ProcessStatus,
++) -> Result<(), ProviderClientError> {
++    if diagnostics.stdout.truncated {
++        return Err(map_launch_stdout_limit_error(
++            request_id,
++            diagnostics.clone(),
++            status.clone(),
++        ));
++    }
++    Ok(())
++}
++
 +fn parse_launch_output(
 +    stdout: Vec<u8>,
 +    diagnostics: ProviderDiagnostics,
@@ -718,9 +727,9 @@ index 97bcbf9..1d757b3 100644
 +        stderr_limit: ByteLimit::new(options.output_limits.stderr_bytes),
 +        cancellation: options.cancellation.clone(),
 +        spawn_observer: launch_spawn_observer(subcommand, options),
-+    }
-+}
-+
+     }
+ }
+ 
 +fn kill_after_grace_for(subcommand: &str, options: &ProviderClientOptions) -> Duration {
 +    if subcommand == "launch" && options.cancellation.is_some() {
 +        options
@@ -729,9 +738,9 @@ index 97bcbf9..1d757b3 100644
 +            .max(Duration::from_millis(250))
 +    } else {
 +        options.timeouts.kill_after_grace
-     }
- }
- 
++    }
++}
++
 +fn process_command_from_resolved(
 +    resolved: &ResolvedProviderCommand,
 +    subcommand: &str,
@@ -756,7 +765,7 @@ index 97bcbf9..1d757b3 100644
  fn map_request_validation_error(
      error: SchemaValidationError,
      subcommand: &str,
-@@ -428,74 +709,153 @@ fn parse_one_stdout_object(
+@@ -428,74 +718,153 @@ fn parse_one_stdout_object(
      diagnostics: &ProviderDiagnostics,
      fallback_request_id: Option<String>,
  ) -> Result<Value, ProviderClientError> {
@@ -1258,7 +1267,7 @@ index 001cc07..48ba798 100644
      E: de::Error,
  {
 diff --git a/crates/oulipoly-provider/src/process.rs b/crates/oulipoly-provider/src/process.rs
-index 202a3ad..8436d86 100644
+index 202a3ad..cf1619a 100644
 --- a/crates/oulipoly-provider/src/process.rs
 +++ b/crates/oulipoly-provider/src/process.rs
 @@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
@@ -1530,7 +1539,7 @@ index 202a3ad..8436d86 100644
                          HostErrorKind::Cancelled,
                          true,
                      ));
-@@ -330,45 +373,216 @@ impl ProcessRunner {
+@@ -330,45 +373,224 @@ impl ProcessRunner {
          host_cancellation_requested: bool,
      ) -> ProviderClientError {
          terminate_tree(&mut child);
@@ -1549,8 +1558,16 @@ index 202a3ad..8436d86 100644
 +        let terminated = wait_for_terminated_process(&mut child, self.limits.kill_after_grace);
 +        let diagnostics =
 +            map_termination_diagnostics(threads, terminated, host_cancellation_requested);
-+        ProviderClientError::host_transport(kind, subcommand_for_error(&command), None, diagnostics)
++        termination_transport_error(kind, &command, diagnostics)
 +    }
++}
++
++fn termination_transport_error(
++    kind: HostErrorKind,
++    command: &ProcessCommand,
++    diagnostics: ProviderDiagnostics,
++) -> ProviderClientError {
++    ProviderClientError::host_transport(kind, subcommand_for_error(command), None, diagnostics)
 +}
 +
 +fn spawn_provider_process<I, K, V>(
@@ -1776,7 +1793,7 @@ index 202a3ad..8436d86 100644
              Err(error) if error.kind() == ErrorKind::Interrupted => {}
              Err(_) => break,
          }
-@@ -376,6 +590,15 @@ fn drain_reader(mut reader: impl Read, limit: ByteLimit) -> CapturedBytes {
+@@ -376,23 +598,38 @@ fn drain_reader(mut reader: impl Read, limit: ByteLimit) -> CapturedBytes {
      accumulator.finish()
  }
  
@@ -1792,11 +1809,228 @@ index 202a3ad..8436d86 100644
  fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {
      for (index, byte) in bytes.iter().enumerate() {
          if let Err(error) = stdin.write_all(std::slice::from_ref(byte)) {
+-            return error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock;
++            return stdin_write_closed_early(&error);
+         }
+         if index == 0 {
+             thread::sleep(Duration::from_millis(10));
+         }
+     }
++    stdin_flush_closed_early(&mut stdin)
++}
++
++fn stdin_flush_closed_early(stdin: &mut impl Write) -> bool {
+     match stdin.flush() {
+         Ok(()) => false,
+-        Err(error) => {
+-            error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
+-        }
++        Err(error) => stdin_write_closed_early(&error),
+     }
+ }
+ 
++fn stdin_write_closed_early(error: &std::io::Error) -> bool {
++    error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
++}
++
+ fn join_capture(handle: thread::JoinHandle<CapturedBytes>) -> CapturedBytes {
+     handle.join().unwrap_or_default()
+ }
 diff --git a/crates/oulipoly-provider/src/testkit.rs b/crates/oulipoly-provider/src/testkit.rs
-index a186df0..4299bec 100644
+index a186df0..6fa3ec7 100644
 --- a/crates/oulipoly-provider/src/testkit.rs
 +++ b/crates/oulipoly-provider/src/testkit.rs
-@@ -185,6 +185,8 @@ pub enum FakeProviderMode {
+@@ -3,7 +3,7 @@
+ use std::ffi::{OsStr, OsString};
+ use std::fs;
+ use std::path::{Path, PathBuf};
+-use std::process::{Child, Command, Output, Stdio};
++use std::process::{Child, Command, ExitStatus, Output, Stdio};
+ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ #[derive(Debug, Clone)]
+@@ -15,20 +15,11 @@ pub struct FakeProvider {
+ 
+ impl FakeProvider {
+     pub fn compile(source: impl AsRef<Path>) -> Self {
+-        let root = unique_temp_dir("fake-provider");
+-        fs::create_dir_all(&root).expect("fake-provider temp dir should be created");
+-        let binary = binary_path(&root);
+-        let status = Command::new("rustc")
+-            .arg("--edition=2024")
+-            .arg(source.as_ref())
+-            .arg("-o")
+-            .arg(&binary)
+-            .status()
+-            .expect("rustc should run for fake-provider fixture");
+-        assert!(status.success(), "fake-provider fixture should compile");
++        let root = create_fixture_root("fake-provider");
++        let binary = compile_fake_provider_binary(&root, source.as_ref());
+         let marker = root.join("spawned.marker");
+         let path = wrapper_path(&root, &binary, &marker);
+-        Self { root, path, marker }
++        fake_provider_fixture(root, path, marker)
+     }
+ 
+     pub fn path(&self) -> PathBuf {
+@@ -63,32 +54,10 @@ impl FakeProvider {
+         K: AsRef<OsStr>,
+         V: AsRef<OsStr>,
+     {
+-        let env_vec = envs
+-            .into_iter()
+-            .map(|(key, value)| (key.as_ref().to_os_string(), value.as_ref().to_os_string()))
+-            .collect::<Vec<_>>();
+-        let mut child = retry_spawn(|| {
+-            let mut command = Command::new(&self.path);
+-            command
+-                .arg(subcommand)
+-                .envs(mode.env())
+-                .envs(env_vec.iter().map(|(key, value)| (key, value)))
+-                .stdin(Stdio::piped())
+-                .stdout(Stdio::piped())
+-                .stderr(Stdio::piped());
+-            command
+-        })
+-        .expect("fake-provider should spawn");
+-        {
+-            use std::io::Write;
+-            let mut child_stdin = child.stdin.take().expect("stdin should be piped");
+-            child_stdin
+-                .write_all(stdin.as_bytes())
+-                .expect("stdin should be written");
+-        }
+-        child
+-            .wait_with_output()
+-            .expect("fake-provider output should be collected")
++        let env_vec = normalize_envs(envs);
++        let mut child = spawn_run_process(&self.path, mode, subcommand, &env_vec);
++        write_fake_provider_stdin(&mut child, stdin);
++        collect_fake_provider_output(child)
+     }
+ 
+     pub fn spawn<I, K, V>(&self, envs: I) -> Child
+@@ -97,25 +66,103 @@ impl FakeProvider {
+         K: AsRef<OsStr>,
+         V: AsRef<OsStr>,
+     {
+-        let env_vec = envs
+-            .into_iter()
+-            .map(|(key, value)| (key.as_ref().to_os_string(), value.as_ref().to_os_string()))
+-            .collect::<Vec<_>>();
+-        retry_spawn(|| {
+-            let mut command = Command::new(&self.path);
+-            command
+-                .arg("describe")
+-                .envs(env_vec.iter().map(|(key, value)| (key, value)))
+-                .stdin(Stdio::null())
+-                .stdout(Stdio::null())
+-                .stderr(Stdio::null());
+-            configure_test_process_group(&mut command);
+-            command
+-        })
+-        .expect("fake-provider child should spawn")
++        let env_vec = normalize_envs(envs);
++        spawn_describe_process(&self.path, &env_vec)
+     }
+ }
+ 
++fn fake_provider_fixture(root: PathBuf, path: PathBuf, marker: PathBuf) -> FakeProvider {
++    FakeProvider { root, path, marker }
++}
++
++fn compile_fake_provider_binary(root: &Path, source: &Path) -> PathBuf {
++    let binary = binary_path(root);
++    assert_fake_provider_compiled(run_rustc_fake_provider(source, &binary));
++    binary
++}
++
++fn run_rustc_fake_provider(source: &Path, binary: &Path) -> ExitStatus {
++    Command::new("rustc")
++        .arg("--edition=2024")
++        .arg(source)
++        .arg("-o")
++        .arg(binary)
++        .status()
++        .expect("rustc should run for fake-provider fixture")
++}
++
++fn assert_fake_provider_compiled(status: ExitStatus) {
++    assert!(status.success(), "fake-provider fixture should compile");
++}
++
++fn normalize_envs<I, K, V>(envs: I) -> Vec<(OsString, OsString)>
++where
++    I: IntoIterator<Item = (K, V)>,
++    K: AsRef<OsStr>,
++    V: AsRef<OsStr>,
++{
++    envs.into_iter()
++        .map(|(key, value)| (key.as_ref().to_os_string(), value.as_ref().to_os_string()))
++        .collect()
++}
++
++fn spawn_run_process(
++    path: &Path,
++    mode: FakeProviderMode,
++    subcommand: &str,
++    envs: &[(OsString, OsString)],
++) -> Child {
++    retry_spawn(|| run_process_command(path, mode, subcommand, envs))
++        .expect("fake-provider should spawn")
++}
++
++fn run_process_command(
++    path: &Path,
++    mode: FakeProviderMode,
++    subcommand: &str,
++    envs: &[(OsString, OsString)],
++) -> Command {
++    let mut command = Command::new(path);
++    command
++        .arg(subcommand)
++        .envs(mode.env())
++        .envs(envs.iter().map(|(key, value)| (key, value)))
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped());
++    command
++}
++
++fn write_fake_provider_stdin(child: &mut Child, stdin: &str) {
++    use std::io::Write;
++    let mut child_stdin = child.stdin.take().expect("stdin should be piped");
++    child_stdin
++        .write_all(stdin.as_bytes())
++        .expect("stdin should be written");
++}
++
++fn collect_fake_provider_output(child: Child) -> Output {
++    child
++        .wait_with_output()
++        .expect("fake-provider output should be collected")
++}
++
++fn spawn_describe_process(path: &Path, envs: &[(OsString, OsString)]) -> Child {
++    retry_spawn(|| describe_process_command(path, envs)).expect("fake-provider child should spawn")
++}
++
++fn describe_process_command(path: &Path, envs: &[(OsString, OsString)]) -> Command {
++    let mut command = Command::new(path);
++    command
++        .arg("describe")
++        .envs(envs.iter().map(|(key, value)| (key, value)))
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null());
++    configure_test_process_group(&mut command);
++    command
++}
++
+ fn is_executable(path: &Path) -> bool {
+     if !path.is_file() {
+         return false;
+@@ -185,6 +232,8 @@ pub enum FakeProviderMode {
      LaunchDuplicateExit,
      LaunchEventAfterExit,
      LaunchPartialHang,
@@ -1805,7 +2039,29 @@ index a186df0..4299bec 100644
  }
  
  impl FakeProviderMode {
-@@ -264,6 +266,10 @@ impl FakeProviderMode {
+@@ -202,19 +251,8 @@ impl FakeProviderMode {
+     }
+ 
+     pub fn env_with_record(self, record: &Path) -> Vec<(String, OsString)> {
+-        if let Some(parent) = record.parent() {
+-            fs::create_dir_all(parent).expect("record directory should be created");
+-        }
+-        vec![
+-            (
+-                "FAKE_PROVIDER_MODE".to_owned(),
+-                OsString::from(self.as_str()),
+-            ),
+-            (
+-                "FAKE_PROVIDER_RECORD_PATH".to_owned(),
+-                record.as_os_str().to_os_string(),
+-            ),
+-        ]
++        ensure_record_parent(record);
++        record_env(self, record)
+     }
+ 
+     fn as_str(self) -> &'static str {
+@@ -264,6 +302,10 @@ impl FakeProviderMode {
              Self::LaunchDuplicateExit => "launch-duplicate-exit",
              Self::LaunchEventAfterExit => "launch-event-after-exit",
              Self::LaunchPartialHang => "launch-partial-hang",
@@ -1816,22 +2072,534 @@ index a186df0..4299bec 100644
          }
      }
  }
+@@ -275,9 +317,8 @@ pub struct LeakProbe {
+ 
+ impl LeakProbe {
+     pub fn new() -> Self {
+-        let root = unique_temp_dir("leak-probe");
+-        fs::create_dir_all(&root).expect("leak probe directory should be created");
+-        Self { root }
++        let root = create_fixture_root("leak-probe");
++        leak_probe(root)
+     }
+ 
+     pub fn wait_for_descendants(&self) {
+@@ -300,36 +341,11 @@ impl LeakProbe {
+ 
+     pub fn assert_no_descendants(&self) {
+         let pids = self.observed_pids();
+-        assert!(
+-            !pids.is_empty(),
+-            "leak probe must observe real descendant pids before asserting cleanup"
+-        );
+-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+-        while std::time::Instant::now() < deadline {
+-            let alive = pids
+-                .iter()
+-                .copied()
+-                .filter(|pid| process_alive(*pid))
+-                .collect::<Vec<_>>();
+-            if alive.is_empty() {
+-                let _ = fs::remove_dir_all(&self.root);
+-                return;
+-            }
+-            std::thread::sleep(Duration::from_millis(20));
+-        }
+-        let alive = pids
+-            .iter()
+-            .copied()
+-            .filter(|pid| process_alive(*pid))
+-            .collect::<Vec<_>>();
+-        for pid in &alive {
+-            terminate_pid(*pid);
+-        }
+-        let _ = fs::remove_dir_all(&self.root);
+-        assert!(
+-            alive.is_empty(),
+-            "descendant pids were still alive after process-tree cleanup: {alive:?}"
+-        );
++        assert_descendants_observed(&pids);
++        let alive = wait_for_descendant_exit(&pids, &self.root);
++        terminate_descendants(&alive);
++        cleanup_probe_root(&self.root);
++        assert_descendants_cleaned(&alive);
+     }
+ 
+     fn observed_pids(&self) -> Vec<u32> {
+@@ -344,6 +360,73 @@ impl LeakProbe {
+     }
+ }
+ 
++fn ensure_record_parent(record: &Path) {
++    if let Some(parent) = record.parent() {
++        fs::create_dir_all(parent).expect("record directory should be created");
++    }
++}
++
++fn record_env(mode: FakeProviderMode, record: &Path) -> Vec<(String, OsString)> {
++    vec![
++        (
++            "FAKE_PROVIDER_MODE".to_owned(),
++            OsString::from(mode.as_str()),
++        ),
++        (
++            "FAKE_PROVIDER_RECORD_PATH".to_owned(),
++            record.as_os_str().to_os_string(),
++        ),
++    ]
++}
++
++fn leak_probe(root: PathBuf) -> LeakProbe {
++    LeakProbe { root }
++}
++
++fn assert_descendants_observed(pids: &[u32]) {
++    assert!(
++        !pids.is_empty(),
++        "leak probe must observe real descendant pids before asserting cleanup"
++    );
++}
++
++fn wait_for_descendant_exit(pids: &[u32], root: &Path) -> Vec<u32> {
++    let deadline = std::time::Instant::now() + Duration::from_secs(2);
++    while std::time::Instant::now() < deadline {
++        let alive = alive_descendants(pids);
++        if alive.is_empty() {
++            cleanup_probe_root(root);
++            return alive;
++        }
++        std::thread::sleep(Duration::from_millis(20));
++    }
++    alive_descendants(pids)
++}
++
++fn alive_descendants(pids: &[u32]) -> Vec<u32> {
++    pids.iter()
++        .copied()
++        .filter(|pid| process_alive(*pid))
++        .collect()
++}
++
++fn terminate_descendants(pids: &[u32]) {
++    for pid in pids {
++        terminate_pid(*pid);
++    }
++}
++
++fn cleanup_probe_root(root: &Path) {
++    let _ = fs::remove_dir_all(root);
++}
++
++fn assert_descendants_cleaned(alive: &[u32]) {
++    assert!(
++        alive.is_empty(),
++        "descendant pids were still alive after process-tree cleanup: {alive:?}"
++    );
++}
++
+ impl Default for LeakProbe {
+     fn default() -> Self {
+         Self::new()
+@@ -358,6 +441,12 @@ fn unique_temp_dir(label: &str) -> PathBuf {
+     std::env::temp_dir().join(format!("oulipoly-provider-{label}-{nanos}"))
+ }
+ 
++fn create_fixture_root(label: &str) -> PathBuf {
++    let root = unique_temp_dir(label);
++    fs::create_dir_all(&root).expect("fixture temp dir should be created");
++    root
++}
++
+ fn binary_path(root: &Path) -> PathBuf {
+     #[cfg(windows)]
+     {
+@@ -427,20 +516,34 @@ fn terminate_pid(_pid: u32) {}
+ 
+ #[cfg(unix)]
+ fn wrapper_path(root: &Path, binary: &Path, marker: &Path) -> PathBuf {
+-    use std::os::unix::fs::PermissionsExt;
+     let wrapper = root.join("fake-provider");
+-    let script = format!(
++    write_wrapper_script(&wrapper, &wrapper_script(binary, marker));
++    make_wrapper_executable(&wrapper);
++    wrapper
++}
++
++#[cfg(unix)]
++fn wrapper_script(binary: &Path, marker: &Path) -> String {
++    format!(
+         "#!/bin/sh\nprintf spawned > '{}'\nexec '{}' \"$@\"\n",
+         marker.display(),
+         binary.display()
+-    );
+-    fs::write(&wrapper, script).expect("fake-provider wrapper should be written");
+-    let mut permissions = fs::metadata(&wrapper)
++    )
++}
++
++#[cfg(unix)]
++fn write_wrapper_script(wrapper: &Path, script: &str) {
++    fs::write(wrapper, script).expect("fake-provider wrapper should be written");
++}
++
++#[cfg(unix)]
++fn make_wrapper_executable(wrapper: &Path) {
++    use std::os::unix::fs::PermissionsExt;
++    let mut permissions = fs::metadata(wrapper)
+         .expect("wrapper metadata should be readable")
+         .permissions();
+     permissions.set_mode(0o755);
+-    fs::set_permissions(&wrapper, permissions).expect("wrapper should be executable");
+-    wrapper
++    fs::set_permissions(wrapper, permissions).expect("wrapper should be executable");
+ }
+ 
+ #[cfg(windows)]
 diff --git a/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs b/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
-index 39705a8..12ee521 100644
+index 39705a8..c3c0c46 100644
 --- a/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
 +++ b/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
-@@ -164,6 +164,10 @@ fn main() {
-             let _ = io::stdout().flush();
-             sleep_forever()
+@@ -17,8 +17,19 @@ const CONTRACT: &str = "oulipoly.provider/v1";
+ const REQUEST_ID: &str = "request-example-001";
+ 
+ fn main() {
+-    let mode = env::var("FAKE_PROVIDER_MODE").unwrap_or_else(|_| "success".to_owned());
+-    let code = match mode.as_str() {
++    exit_fake_provider(dispatch_fake_provider_mode(&fake_provider_mode()));
++}
++
++fn fake_provider_mode() -> String {
++    env::var("FAKE_PROVIDER_MODE").unwrap_or_else(|_| "success".to_owned())
++}
++
++fn exit_fake_provider(code: i32) {
++    std::process::exit(code);
++}
++
++fn dispatch_fake_provider_mode(mode: &str) -> i32 {
++    match mode {
+         "record-argv-stdin" => record_argv_stdin(),
+         "s5-record-argv-stdin" => record_argv_stdin_with_response_kind(ResponseKind::S5Success),
+         "stdin-eof" => stdin_eof(),
+@@ -51,44 +62,26 @@ fn main() {
+         "s7c-rotation-materialize-crash-after-artifact" => {
+             s7c_rotation_materialize_crash_after_artifact()
          }
+-        "s7c-rotation-materialize-crash-during-apply" => {
+-            let _ = s7c_rotation_materialize_success(true);
+-            write_stderr("crash_during_apply\n")
+-        }
++        "s7c-rotation-materialize-crash-during-apply" => materialize_crash_during_apply(),
+         "s7c-migration-plan-success" => s7c_migration_plan_success(),
+         "s7c-migration-plan-protocol-invalid" => s7c_protocol_invalid_after_describe(),
+         "s7c-migration-apply-success" => s7c_migration_apply_success(),
+         "s7c-migration-apply-protocol-invalid" => s7c_protocol_invalid_after_describe(),
+-        "success-then-nonzero" => {
+-            success();
+-            7
+-        }
++        "success-then-nonzero" => success_then_nonzero(),
+         "schema-invalid-success" => schema_invalid_success_after_describe(),
+-        "invalid-utf8" => {
+-            let _ = read_stdin_to_string();
+-            write_bytes(&[0xff, 0xfe, 0xfd])
+-        }
++        "invalid-utf8" => invalid_utf8(),
+         "non-object-array" => read_then_write_stdout("[]\n"),
+         "non-object-string" => read_then_write_stdout("\"x\"\n"),
+         "non-object-number" => read_then_write_stdout("5\n"),
+-        "missing-ok" => read_then_write_stdout(&format!(
+-            "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"result\":{{}}}}\n"
+-        )),
++        "missing-ok" => read_then_write_stdout(&missing_ok_json()),
+         "invalid-json" => read_then_write_stdout("not json\n"),
+-        "empty-stdout" => {
+-            let _ = read_stdin_to_string();
+-            0
+-        }
++        "empty-stdout" => empty_stdout(),
+         "multiple-json" => write_stdout("{}\n{}\n"),
+         "leading-log" => write_stdout("log line\n{}"),
+-        "trailing-junk" => write_stdout(&format!("{} junk\n", success_json())),
++        "trailing-junk" => write_stdout(&trailing_junk_json()),
+         "stderr-envelope-only" => write_stderr(&success_json()),
+-        "mismatched-contract" => {
+-            write_stdout(&success_json().replace(CONTRACT, "example.contract/v0"))
+-        }
+-        "mismatched-request-id" => {
+-            write_stdout(&success_json().replace(REQUEST_ID, "request-example-other"))
+-        }
++        "mismatched-contract" => write_stdout(&mismatched_contract_json()),
++        "mismatched-request-id" => write_stdout(&mismatched_request_id_json()),
+         "large-stdout-stderr" => large_stdout_stderr(),
+         "pipe-pressure" => pipe_pressure(),
+         "sleep" => sleep_forever(),
+@@ -101,75 +94,33 @@ fn main() {
+         "early-stdin-empty" => early_stdin_empty(),
+         "launch-valid" => launch_valid(0),
+         "launch-model-nonzero" => launch_valid(9),
+-        "launch-provider-nonzero-after-final" => {
+-            launch_valid(0);
+-            6
+-        }
+-        "launch-provider-nonzero-no-final" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+-            8
+-        }
+-        "launch-cancelled-final-event" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+-            thread::sleep(Duration::from_millis(150));
+-            write_jsonl(&cancelled_exit_event(&request_id, 2));
+-            0
+-        }
++        "launch-provider-nonzero-after-final" => launch_provider_nonzero_after_final(),
++        "launch-provider-nonzero-no-final" => launch_provider_nonzero_no_final(),
++        "launch-cancelled-final-event" => launch_cancelled_final_event(),
+         "launch-malformed-line" => write_stdout("{not-json}\n"),
+-        "launch-malformed-line-nonzero" => {
+-            write_stdout("{not-json}\n");
+-            8
+-        }
+-        "launch-malformed-line-stderr" => {
+-            eprintln!("fake-provider launch diagnostic on stderr");
+-            write_stdout("{not-json}\n")
+-        }
+-        "launch-blank-line" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+-            println!("   ");
+-            write_jsonl(&exit_event(&request_id, 2, 0));
+-            0
+-        }
+-        "launch-exit-then-large-stdout" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&exit_event(&request_id, 1, 0));
+-            print!("{}", "x".repeat(1024 * 1024));
+-            let _ = io::stdout().flush();
+-            0
++        "launch-malformed-line-nonzero" => launch_malformed_line_nonzero(),
++        "launch-malformed-line-stderr" => launch_malformed_line_stderr(),
++        "launch-blank-line" => launch_blank_line(),
++        "launch-exit-then-large-stdout" => launch_exit_then_large_stdout(),
++        "launch-invalid-base64" => launch_invalid_base64(),
++        "launch-duplicate-exit" => launch_duplicate_exit(),
++        "launch-event-after-exit" => launch_event_after_exit(),
++        "launch-partial-hang" => launch_partial_hang(),
 +        "launch-heartbeats-then-exit" => launch_heartbeats_then_exit(),
 +        "launch-heartbeat-then-child-grandchild-hang" => {
 +            launch_heartbeat_then_child_grandchild_hang()
-+        }
-         other => {
-             eprintln!("unknown fake-provider mode: {other}");
-             64
-@@ -395,7 +399,10 @@ fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
+         }
+-        "launch-invalid-base64" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&stdout_event(&request_id, 1, "@@@"));
+-            write_jsonl(&exit_event(&request_id, 2, 0));
+-            0
+-        }
+-        "launch-duplicate-exit" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&exit_event(&request_id, 1, 0));
+-            write_jsonl(&exit_event(&request_id, 2, 0));
+-            0
+-        }
+-        "launch-event-after-exit" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&exit_event(&request_id, 1, 0));
+-            write_jsonl(&stdout_event(&request_id, 2, "Yg=="));
+-            0
+-        }
+-        "launch-partial-hang" => {
+-            let request_id = read_request_id();
+-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+-            let _ = io::stdout().flush();
+-            sleep_forever()
+-        }
+-        other => {
+-            eprintln!("unknown fake-provider mode: {other}");
+-            64
+-        }
+-    };
+-    std::process::exit(code);
++        other => unknown_fake_provider_mode(other),
++    }
++}
++
++fn unknown_fake_provider_mode(mode: &str) -> i32 {
++    eprintln!("{}", unknown_fake_provider_mode_message(mode));
++    64
++}
++
++fn unknown_fake_provider_mode_message(mode: &str) -> String {
++    format!("unknown fake-provider mode: {mode}")
+ }
+ 
+ fn read_stdin_to_string() -> String {
+@@ -202,6 +153,42 @@ fn write_stderr(text: &str) -> i32 {
+     0
+ }
+ 
++fn materialize_crash_during_apply() -> i32 {
++    let _ = s7c_rotation_materialize_success(true);
++    write_stderr("crash_during_apply\n")
++}
++
++fn success_then_nonzero() -> i32 {
++    success();
++    7
++}
++
++fn invalid_utf8() -> i32 {
++    let _ = read_stdin_to_string();
++    write_bytes(&[0xff, 0xfe, 0xfd])
++}
++
++fn empty_stdout() -> i32 {
++    let _ = read_stdin_to_string();
++    0
++}
++
++fn missing_ok_json() -> String {
++    format!("{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"result\":{{}}}}\n")
++}
++
++fn trailing_junk_json() -> String {
++    format!("{} junk\n", success_json())
++}
++
++fn mismatched_contract_json() -> String {
++    success_json().replace(CONTRACT, "example.contract/v0")
++}
++
++fn mismatched_request_id_json() -> String {
++    success_json().replace(REQUEST_ID, "request-example-other")
++}
++
+ fn record_argv_stdin() -> i32 {
+     record_argv_stdin_with_response_kind(ResponseKind::DescribeSuccess)
+ }
+@@ -261,25 +248,52 @@ fn write_invocation_record(path: &str, text: &str) {
+ 
+ fn record_invocation_if_requested(stdin: &str) {
+     increment_count_if_requested();
+-    if let Ok(path) = env::var("FAKE_PROVIDER_RECORD_PATH") {
+-        let record = InvocationRecord {
+-            path,
+-            argv: env::args().collect(),
+-            stdin: stdin.to_string(),
+-        };
++    if let Some(record) = invocation_record_if_requested(stdin) {
+         write_invocation_record(&record.path, &format_invocation_record(&record));
+     }
+ }
+ 
++fn invocation_record_if_requested(stdin: &str) -> Option<InvocationRecord> {
++    let path = env::var("FAKE_PROVIDER_RECORD_PATH").ok()?;
++    Some(invocation_record(path, stdin))
++}
++
++fn invocation_record(path: String, stdin: &str) -> InvocationRecord {
++    InvocationRecord {
++        path,
++        argv: env::args().collect(),
++        stdin: stdin.to_string(),
++    }
++}
++
+ fn increment_count_if_requested() {
+-    let Ok(path) = env::var("FAKE_PROVIDER_COUNT_PATH") else {
++    let Some(path) = count_path_if_requested() else {
+         return;
+     };
+-    let current = fs::read_to_string(&path)
++    write_count(&path, incremented_count(read_count(&path)));
++}
++
++fn count_path_if_requested() -> Option<String> {
++    env::var("FAKE_PROVIDER_COUNT_PATH").ok()
++}
++
++fn read_count(path: &str) -> u64 {
++    fs::read_to_string(path)
+         .ok()
+-        .and_then(|text| text.trim().parse::<u64>().ok())
+-        .unwrap_or(0);
+-    fs::write(path, (current + 1).to_string()).expect("count file should be writable");
++        .and_then(|text| parse_count(&text))
++        .unwrap_or(0)
++}
++
++fn parse_count(text: &str) -> Option<u64> {
++    text.trim().parse().ok()
++}
++
++fn incremented_count(current: u64) -> u64 {
++    current + 1
++}
++
++fn write_count(path: &str, count: u64) {
++    fs::write(path, count.to_string()).expect("count file should be writable");
+ }
+ 
+ fn write_response_for_kind(kind: ResponseKind, stdin: Option<&str>) -> i32 {
+@@ -312,11 +326,19 @@ fn provider_error_fields<'a>(category: &'a str, code: &'a str) -> ProviderErrorF
+     ProviderErrorFields {
+         category,
+         code,
+-        retryable: category == "timeout",
+-        message: format!("{category} from fake-provider"),
++        retryable: provider_error_retryable(category),
++        message: provider_error_message(category),
+     }
+ }
+ 
++fn provider_error_retryable(category: &str) -> bool {
++    category == "timeout"
++}
++
++fn provider_error_message(category: &str) -> String {
++    format!("{category} from fake-provider")
++}
++
+ fn provider_error_json(request_id: &str, fields: &ProviderErrorFields<'_>) -> String {
+     format!(
+         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":false,\"error\":{{\"category\":\"{}\",\"code\":\"{}\",\"retryable\":{},\"message\":\"{}\",\"details\":{{\"source\":\"example\"}}}}}}\n",
+@@ -367,13 +389,28 @@ fn launch_exit_event_json(request_id: &str, seq: u64, code: i32, signal: &str) -
+ 
+ fn stdin_eof() -> i32 {
+     let stdin = read_stdin_to_string();
+-    if stdin.is_empty() {
+-        eprintln!("stdin was empty before eof");
+-        65
+-    } else {
+-        eprintln!("observed stdin eof");
+-        success()
++    write_stdin_eof_result(&stdin)
++}
++
++fn write_stdin_eof_result(stdin: &str) -> i32 {
++    if stdin_empty(stdin) {
++        return write_empty_stdin_eof();
+     }
++    write_observed_stdin_eof()
++}
++
++fn stdin_empty(stdin: &str) -> bool {
++    stdin.is_empty()
++}
++
++fn write_empty_stdin_eof() -> i32 {
++    eprintln!("stdin was empty before eof");
++    65
++}
++
++fn write_observed_stdin_eof() -> i32 {
++    eprintln!("observed stdin eof");
++    success()
+ }
+ 
+ fn success() -> i32 {
+@@ -395,19 +432,22 @@ fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
      let stdin = read_stdin_to_string();
      record_invocation_if_requested(&stdin);
      let fields = provider_error_fields(category, code);
@@ -1843,7 +2611,54 @@ index 39705a8..12ee521 100644
      exit_code
  }
  
-@@ -436,7 +443,11 @@ fn success_json() -> String {
+ fn provider_error_after_describe(category: &str, code: &str, exit_code: i32) -> i32 {
+-    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
++    if s7c_describe_requested() {
+         return describe_with_capabilities(true, true);
+     }
+     provider_error(category, code, exit_code)
+ }
+ 
+ fn exit_nonzero_after_describe() -> i32 {
+-    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
++    if s7c_describe_requested() {
+         return describe_with_capabilities(true, true);
+     }
+     let stdin = read_stdin_to_string();
+@@ -415,16 +455,25 @@ fn exit_nonzero_after_describe() -> i32 {
+     7
+ }
+ 
++fn s7c_describe_requested() -> bool {
++    current_subcommand() == "describe" && s7c_runtime_fixture_requested()
++}
++
+ fn schema_invalid_success_after_describe() -> i32 {
+-    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
++    s7c_runtime_describe_or_else(|| write_recorded_stdout(schema_invalid_success_json))
++}
++
++fn s7c_runtime_describe_or_else(run: impl FnOnce() -> i32) -> i32 {
++    if s7c_describe_requested() {
+         return describe_with_capabilities(true, true);
+     }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    write_stdout(&format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{}\",\"ok\":true,\"result\":{{}}}}\n",
+-        request_id_from_stdin(&stdin)
+-    ))
++    run()
++}
++
++fn schema_invalid_success_json(request_id: &str) -> String {
++    format!(
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{}}}}\n"
++    )
+ }
+ 
+ fn success_json() -> String {
+@@ -436,141 +485,157 @@ fn success_json() -> String {
  fn describe_with_capabilities(rotation: bool, migration: bool) -> i32 {
      let stdin = read_stdin_to_string();
      record_invocation_if_requested(&stdin);
@@ -1855,11 +2670,466 @@ index 39705a8..12ee521 100644
 +    ))
  }
  
- fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {
-@@ -787,6 +798,27 @@ fn launch_valid(exit_code: i32) -> i32 {
+-fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {
+-    format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"provider_id\":\"fake-provider\",\"display_name\":\"Fake Provider\",\"contract_versions\":[\"{CONTRACT}\"],\"preferred_contract\":\"{CONTRACT}\",\"capabilities\":{{\"launch\":true,\"policy\":false,\"quota\":false,\"session\":false,\"terminal\":false,\"rotation\":{rotation},\"discovery\":false,\"settings\":false,\"setup_brain\":false,\"setup\":false,\"migration\":{migration}}},\"settings_schema_id\":\"fake-settings\",\"concurrency\":{{\"safe_for_parallel_invocation\":true,\"state_locking\":\"host\"}}}}}}\n"
+-    )
++fn describe_or_recorded_stdout(format_response: fn(&str) -> String) -> i32 {
++    describe_or_else(|| write_recorded_stdout(format_response))
+ }
+ 
+-fn s7c_rotation_assess_success() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_stdout(&format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":true,\"score\":80,\"reason\":\"target-provider accepted\",\"requirements\":[]}}}}\n"
+-    ))
++fn describe_or_materialize_stdout(format_response: impl FnOnce(&str) -> String) -> i32 {
++    describe_or_else(|| write_recorded_materialize_stdout(format_response))
+ }
+ 
+-fn s7c_rotation_assess_denied() -> i32 {
+-    if current_subcommand() == "describe" {
++fn describe_or_else(run: impl FnOnce() -> i32) -> i32 {
++    if s7c_describe_subcommand_requested() {
+         return describe_with_capabilities(true, true);
+     }
++    run()
++}
++
++fn s7c_describe_subcommand_requested() -> bool {
++    current_subcommand() == "describe"
++}
++
++fn write_recorded_stdout(format_response: fn(&str) -> String) -> i32 {
+     let stdin = read_stdin_to_string();
+     record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_stdout(&format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":false,\"score\":0,\"reason\":\"target-provider denied\",\"requirements\":[{{\"kind\":\"quota\"}}]}}}}\n"
+-    ))
++    write_stdout(&format_response(&request_id_from_stdin(&stdin)))
+ }
+ 
+-fn s7c_rotation_materialize_success(changed: bool) -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
++fn write_recorded_materialize_stdout(format_response: impl FnOnce(&str) -> String) -> i32 {
+     let stdin = read_stdin_to_string();
+     record_invocation_if_requested(&stdin);
+     let request_id = request_id_from_stdin(&stdin);
+     write_empty_materialize_artifact();
+-    write_stdout(&format!(
++    write_stdout(&format_response(&request_id))
++}
++
++fn s7c_rotation_assess_success_json(request_id: &str) -> String {
++    format!(
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":true,\"score\":80,\"reason\":\"target-provider accepted\",\"requirements\":[]}}}}\n"
++    )
++}
++
++fn s7c_rotation_assess_denied_json(request_id: &str) -> String {
++    format!(
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":false,\"score\":0,\"reason\":\"target-provider denied\",\"requirements\":[{{\"kind\":\"quota\"}}]}}}}\n"
++    )
++}
++
++fn s7c_rotation_materialize_success_json(request_id: &str, changed: bool) -> String {
++    format!(
+         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":{changed},\"target_provider_session_id\":\"{}\",\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+         s7c_target_session_id(),
+         s7c_artifact_json(),
+         s7c_host_state_plan_json()
+-    ))
++    )
+ }
+ 
+-fn s7c_rotation_materialize_no_change() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_stdout(&format!(
++fn s7c_rotation_materialize_no_change_json(request_id: &str) -> String {
++    format!(
+         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+         s7c_artifact_json(),
+         s7c_host_state_plan_json()
+-    ))
++    )
+ }
+ 
+-fn s7c_rotation_materialize_no_change_wrong_chain() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_stdout(&format!(
++fn s7c_rotation_materialize_wrong_chain_json(request_id: &str) -> String {
++    format!(
+         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+         s7c_artifact_json(),
+         s7c_host_state_plan_json_with_chain("wrong-chain")
+-    ))
++    )
+ }
+ 
+-fn s7c_rotation_materialize_hash_mismatch() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_empty_materialize_artifact();
+-    write_stdout(&format!(
++fn s7c_rotation_materialize_hash_mismatch_json(request_id: &str) -> String {
++    format!(
+         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":true,\"target_provider_session_id\":\"{}\",\"artifacts\":[{{\"kind\":\"file\",\"path\":\"{}\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}],\"host_state_plan\":{}}}}}\n",
+         s7c_target_session_id(),
+         json_escape(&s7c_artifact_path()),
+         s7c_host_state_plan_json()
+-    ))
++    )
++}
++
++fn s7c_migration_plan_success_json(request_id: &str) -> String {
++    format!(
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"actions\":[{{\"kind\":\"noop\"}}],\"warnings\":[],\"requires_backup\":false}}}}\n"
++    )
++}
++
++fn s7c_migration_apply_success_json(request_id: &str) -> String {
++    format!(
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"applied_actions\":[{{\"kind\":\"noop\"}}],\"artifacts\":[],\"warnings\":[],\"outcome\":{{\"changed\":false}}}}}}\n"
++    )
++}
++
++fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {
++    format!(
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"provider_id\":\"fake-provider\",\"display_name\":\"Fake Provider\",\"contract_versions\":[\"{CONTRACT}\"],\"preferred_contract\":\"{CONTRACT}\",\"capabilities\":{{\"launch\":true,\"policy\":false,\"quota\":false,\"session\":false,\"terminal\":false,\"rotation\":{rotation},\"discovery\":false,\"settings\":false,\"setup_brain\":false,\"setup\":false,\"migration\":{migration}}},\"settings_schema_id\":\"fake-settings\",\"concurrency\":{{\"safe_for_parallel_invocation\":true,\"state_locking\":\"host\"}}}}}}\n"
++    )
++}
++
++fn s7c_rotation_assess_success() -> i32 {
++    describe_or_recorded_stdout(s7c_rotation_assess_success_json)
++}
++
++fn s7c_rotation_assess_denied() -> i32 {
++    describe_or_recorded_stdout(s7c_rotation_assess_denied_json)
++}
++
++fn s7c_rotation_materialize_success(changed: bool) -> i32 {
++    describe_or_materialize_stdout(|request_id| {
++        s7c_rotation_materialize_success_json(request_id, changed)
++    })
++}
++
++fn s7c_rotation_materialize_no_change() -> i32 {
++    describe_or_recorded_stdout(s7c_rotation_materialize_no_change_json)
++}
++
++fn s7c_rotation_materialize_no_change_wrong_chain() -> i32 {
++    describe_or_recorded_stdout(s7c_rotation_materialize_wrong_chain_json)
++}
++
++fn s7c_rotation_materialize_hash_mismatch() -> i32 {
++    describe_or_materialize_stdout(s7c_rotation_materialize_hash_mismatch_json)
+ }
+ 
+ fn s7c_rotation_materialize_crash_after_artifact() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    s7c_rotation_materialize_hash_mismatch()
++    describe_or_else(s7c_rotation_materialize_hash_mismatch)
+ }
+ 
+ fn s7c_rotation_materialize_provider_error(code: &str) -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    provider_error("failed", code, 0)
++    describe_or_else(|| provider_error("failed", code, 0))
+ }
+ 
+ fn s7c_migration_plan_success() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_stdout(&format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"actions\":[{{\"kind\":\"noop\"}}],\"warnings\":[],\"requires_backup\":false}}}}\n"
+-    ))
++    describe_or_recorded_stdout(s7c_migration_plan_success_json)
+ }
+ 
+ fn s7c_migration_apply_success() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
+-    let stdin = read_stdin_to_string();
+-    record_invocation_if_requested(&stdin);
+-    let request_id = request_id_from_stdin(&stdin);
+-    write_stdout(&format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"applied_actions\":[{{\"kind\":\"noop\"}}],\"artifacts\":[],\"warnings\":[],\"outcome\":{{\"changed\":false}}}}}}\n"
+-    ))
++    describe_or_recorded_stdout(s7c_migration_apply_success_json)
+ }
+ 
+ fn s7c_protocol_invalid_after_describe() -> i32 {
+-    if current_subcommand() == "describe" {
+-        return describe_with_capabilities(true, true);
+-    }
++    describe_or_else(write_recorded_invalid_protocol)
++}
++
++fn write_recorded_invalid_protocol() -> i32 {
+     let stdin = read_stdin_to_string();
+     record_invocation_if_requested(&stdin);
+     write_stdout("not json\n")
+@@ -589,28 +654,53 @@ fn s7c_host_state_plan_json() -> String {
+ }
+ 
+ fn s7c_host_state_plan_json_with_chain(chain_id: &str) -> String {
+-    let source_provider = s7c_env_or("S7C_SOURCE_PROVIDER", "source-provider");
+-    let target_provider = s7c_env_or("S7C_TARGET_PROVIDER", "target-provider");
+-    let source_session = s7c_env_or("S7C_SOURCE_SESSION_ID", "session-source");
+-    let target_session = s7c_target_session_id();
++    let values = s7c_host_state_values(chain_id);
++    format_s7c_host_state_plan(&values)
++}
++
++struct S7cHostStateValues {
++    chain_id: String,
++    source_provider: String,
++    target_provider: String,
++    source_session: String,
++    target_session: String,
++}
++
++fn s7c_host_state_values(chain_id: &str) -> S7cHostStateValues {
++    S7cHostStateValues {
++        chain_id: chain_id.to_string(),
++        source_provider: s7c_env_or("S7C_SOURCE_PROVIDER", "source-provider"),
++        target_provider: s7c_env_or("S7C_TARGET_PROVIDER", "target-provider"),
++        source_session: s7c_env_or("S7C_SOURCE_SESSION_ID", "session-source"),
++        target_session: s7c_target_session_id(),
++    }
++}
++
++fn format_s7c_host_state_plan(values: &S7cHostStateValues) -> String {
+     format!(
+         "{{\"schema_version\":1,\"operation\":\"rotation.materialize\",\"chain_id\":\"{}\",\"source_provider\":\"{}\",\"target_provider\":\"{}\",\"source_session_id\":\"{}\",\"target_session_id\":\"{}\",\"transition_reason\":\"quota_threshold\",\"segments\":[{{\"provider\":\"{}\",\"session_id\":\"{}\",\"ended_at\":\"2026-05-01T00:00:00Z\"}},{{\"provider\":\"{}\",\"session_id\":\"{}\",\"started_at\":\"2026-05-01T00:00:00Z\"}}],\"artifacts\":[{}]}}",
+-        json_escape(chain_id),
+-        json_escape(&source_provider),
+-        json_escape(&target_provider),
+-        json_escape(&source_session),
+-        json_escape(&target_session),
+-        json_escape(&source_provider),
+-        json_escape(&source_session),
+-        json_escape(&target_provider),
+-        json_escape(&target_session),
++        json_escape(&values.chain_id),
++        json_escape(&values.source_provider),
++        json_escape(&values.target_provider),
++        json_escape(&values.source_session),
++        json_escape(&values.target_session),
++        json_escape(&values.source_provider),
++        json_escape(&values.source_session),
++        json_escape(&values.target_provider),
++        json_escape(&values.target_session),
+         s7c_artifact_json()
+     )
+ }
+ 
+ fn write_empty_materialize_artifact() {
+-    let artifact_path = s7c_artifact_path();
+-    let path = std::path::Path::new(&artifact_path);
++    write_empty_file(&materialize_artifact_path());
++}
++
++fn materialize_artifact_path() -> std::path::PathBuf {
++    std::path::PathBuf::from(s7c_artifact_path())
++}
++
++fn write_empty_file(path: &std::path::Path) {
+     if let Some(parent) = path.parent() {
+         let _ = fs::create_dir_all(parent);
+     }
+@@ -650,24 +740,36 @@ fn large_stdout_stderr() -> i32 {
+ }
+ 
+ fn pipe_pressure() -> i32 {
+-    let stdout_thread = thread::spawn(|| {
+-        for _ in 0..128 {
+-            print!("{}", "o".repeat(8192));
+-            let _ = io::stdout().flush();
+-        }
+-    });
+-    let stderr_thread = thread::spawn(|| {
+-        for _ in 0..128 {
+-            eprint!("{}", "e".repeat(8192));
+-            let _ = io::stderr().flush();
+-        }
+-    });
++    let stdout_thread = thread::spawn(write_stdout_pressure_blocks);
++    let stderr_thread = thread::spawn(write_stderr_pressure_blocks);
+     let _ = read_stdin_to_string();
+     let _ = stdout_thread.join();
+     let _ = stderr_thread.join();
      0
  }
  
++fn write_stdout_pressure_blocks() {
++    for _ in 0..128 {
++        print!("{}", stdout_pressure_block());
++        let _ = io::stdout().flush();
++    }
++}
++
++fn write_stderr_pressure_blocks() {
++    for _ in 0..128 {
++        eprint!("{}", stderr_pressure_block());
++        let _ = io::stderr().flush();
++    }
++}
++
++fn stdout_pressure_block() -> String {
++    "o".repeat(8192)
++}
++
++fn stderr_pressure_block() -> String {
++    "e".repeat(8192)
++}
++
+ fn sleep_forever() -> i32 {
+     loop {
+         thread::sleep(Duration::from_secs(60));
+@@ -750,13 +852,25 @@ fn ignore_sigterm() {
+ fn ignore_sigterm() {}
+ 
+ fn write_probe_pid(label: &str) {
+-    let Ok(root) = env::var("FAKE_PROVIDER_PROBE_DIR") else {
++    let Some(root) = probe_root() else {
+         return;
+     };
+-    let root = std::path::PathBuf::from(root);
+-    let _ = fs::create_dir_all(&root);
+-    let pid = std::process::id();
+-    let _ = fs::write(root.join(format!("{label}-{pid}.pid")), pid.to_string());
++    write_pid_file(&root, label, std::process::id());
++}
++
++fn probe_root() -> Option<std::path::PathBuf> {
++    env::var("FAKE_PROVIDER_PROBE_DIR")
++        .ok()
++        .map(std::path::PathBuf::from)
++}
++
++fn write_pid_file(root: &std::path::Path, label: &str, pid: u32) {
++    let _ = fs::create_dir_all(root);
++    let _ = fs::write(probe_pid_path(root, label, pid), pid.to_string());
++}
++
++fn probe_pid_path(root: &std::path::Path, label: &str, pid: u32) -> std::path::PathBuf {
++    root.join(format!("{label}-{pid}.pid"))
+ }
+ 
+ fn early_stdin_success() -> i32 {
+@@ -787,6 +901,104 @@ fn launch_valid(exit_code: i32) -> i32 {
+     0
+ }
+ 
++fn launch_provider_nonzero_after_final() -> i32 {
++    launch_valid(0);
++    6
++}
++
++fn launch_provider_nonzero_no_final() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
++    8
++}
++
++fn launch_cancelled_final_event() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
++    thread::sleep(Duration::from_millis(150));
++    write_jsonl(&cancelled_exit_event(&request_id, 2));
++    0
++}
++
++fn launch_malformed_line_nonzero() -> i32 {
++    write_stdout("{not-json}\n");
++    8
++}
++
++fn launch_malformed_line_stderr() -> i32 {
++    eprintln!("fake-provider launch diagnostic on stderr");
++    write_stdout("{not-json}\n")
++}
++
++fn launch_blank_line() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
++    println!("   ");
++    write_jsonl(&exit_event(&request_id, 2, 0));
++    0
++}
++
++fn launch_exit_then_large_stdout() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&exit_event(&request_id, 1, 0));
++    print!("{}", large_launch_stdout_block());
++    let _ = io::stdout().flush();
++    0
++}
++
++fn large_launch_stdout_block() -> String {
++    "x".repeat(1024 * 1024)
++}
++
++fn launch_invalid_base64() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&stdout_event(&request_id, 1, "@@@"));
++    write_jsonl(&exit_event(&request_id, 2, 0));
++    0
++}
++
++fn launch_duplicate_exit() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&exit_event(&request_id, 1, 0));
++    write_jsonl(&exit_event(&request_id, 2, 0));
++    0
++}
++
++fn launch_event_after_exit() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&exit_event(&request_id, 1, 0));
++    write_jsonl(&stdout_event(&request_id, 2, "Yg=="));
++    0
++}
++
++fn launch_partial_hang() -> i32 {
++    let request_id = read_request_id();
++    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
++    let _ = io::stdout().flush();
++    sleep_forever()
++}
++
 +fn launch_heartbeats_then_exit() -> i32 {
 +    let request_id = read_request_id();
 +    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
@@ -1885,7 +3155,7 @@ index 39705a8..12ee521 100644
      println!("{line}");
      let _ = io::stdout().flush();
 diff --git a/crates/oulipoly-provider/tests/launch_stream_lifecycle.rs b/crates/oulipoly-provider/tests/launch_stream_lifecycle.rs
-index 5b05cf5..b7b1b39 100644
+index 5b05cf5..9ee61ab 100644
 --- a/crates/oulipoly-provider/tests/launch_stream_lifecycle.rs
 +++ b/crates/oulipoly-provider/tests/launch_stream_lifecycle.rs
 @@ -3,7 +3,9 @@ pub mod support {
@@ -1955,7 +3225,7 @@ index 5b05cf5..b7b1b39 100644
 +    ProviderClient::new(
 +        ProviderArtifactRef::Path { path: path.into() },
 +        ProviderClientOptions::default()
-+            .with_timeout(gap)
++            .with_launch_heartbeat_gap(gap)
 +            .with_kill_after_grace(Duration::from_millis(50)),
 +    )
 +}
@@ -3372,57 +4642,15 @@ index 12ad3b7..4c70eee 100644
  fn settings_target_from_description(
      model_name: &str,
      description: DescribeResult,
-diff --git a/crates/oulipoly-runtime/src/quota/in_flight.rs b/crates/oulipoly-runtime/src/quota/in_flight.rs
-index e1fe673..49dcd9a 100644
---- a/crates/oulipoly-runtime/src/quota/in_flight.rs
-+++ b/crates/oulipoly-runtime/src/quota/in_flight.rs
-@@ -44,6 +44,7 @@ impl Drop for InFlightGuard<'_> {
- #[cfg(test)]
- mod tests {
-     use super::*;
-+    use std::time::Duration;
- 
-     #[test]
-     fn in_flight_single_claim() {
-@@ -60,4 +61,31 @@ mod tests {
-         let _a = f.try_claim("claude").unwrap();
-         let _b = f.try_claim("codex").unwrap();
-     }
-+
-+    #[test]
-+    fn stale_in_flight_claim_expires() {
-+        let f = InFlight::new();
-+        let _stale = f.try_claim_with_ttl("opencode5", Duration::ZERO).unwrap();
-+
-+        assert!(
-+            f.try_claim_with_ttl("opencode5", Duration::ZERO).is_some(),
-+            "stale in-flight claim must not wedge future quota probes"
-+        );
-+    }
-+
-+    #[test]
-+    fn expired_guard_does_not_release_replacement_claim() {
-+        let f = InFlight::new();
-+        let stale = f.try_claim_with_ttl("opencode5", Duration::ZERO).unwrap();
-+        let replacement = f.try_claim_with_ttl("opencode5", Duration::ZERO).unwrap();
-+
-+        drop(stale);
-+
-+        assert!(
-+            f.try_claim("opencode5").is_none(),
-+            "dropping an expired guard must not release a newer replacement claim"
-+        );
-+        drop(replacement);
-+        assert!(f.try_claim("opencode5").is_some());
-+    }
- }
 diff --git a/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs b/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
-index ca1f028..239b2a2 100644
+index ca1f028..cdf2453 100644
 --- a/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
 +++ b/crates/oulipoly-runtime/tests/age217_s6a_policy_launch_dispatch.rs
-@@ -9,13 +9,15 @@ use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
+@@ -8,14 +8,17 @@ use oulipoly_runtime::executor;
+ use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
  use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
  use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
++use serde_json::Value;
  use std::collections::HashMap;
 +use std::ffi::OsString;
  use std::fs;
@@ -3438,7 +4666,7 @@ index ca1f028..239b2a2 100644
  
  struct ScriptFixture {
      _dir: tempfile::TempDir,
-@@ -43,6 +45,7 @@ enum PolicyMode {
+@@ -43,6 +46,7 @@ enum PolicyMode {
      Accept,
      Reject,
      Transform,
@@ -3446,7 +4674,7 @@ index ca1f028..239b2a2 100644
  }
  
  #[derive(Clone, Copy)]
-@@ -65,6 +68,58 @@ struct DispatchSeamObservation {
+@@ -65,6 +69,58 @@ struct DispatchSeamObservation {
      registry_injected: bool,
  }
  
@@ -3505,7 +4733,7 @@ index ca1f028..239b2a2 100644
  fn fixture_script(body: &str) -> ScriptFixture {
      let dir = tempfile::tempdir().expect("tempdir");
      let path = dir.path().join("provider.sh");
-@@ -386,12 +441,27 @@ fn fake_provider_body(
+@@ -386,12 +442,27 @@ fn fake_provider_body(
      policy_record_path: &Path,
      launch_record_path: &Path,
  ) -> String {
@@ -3536,7 +4764,7 @@ index ca1f028..239b2a2 100644
          LaunchMode::Success => "success",
          LaunchMode::NonzeroFinal => "nonzero_final",
          LaunchMode::ProviderNonzeroAfterFinal => "provider_nonzero_after_final",
-@@ -403,7 +473,17 @@ fn fake_provider_body(
+@@ -403,7 +474,17 @@ fn fake_provider_body(
          LaunchMode::CancelledFinal => "cancelled_final",
          LaunchMode::UnknownTerminalWithQuotaText => "unknown_terminal_with_quota_text",
          LaunchMode::HostCancelledBeforeFinal => "host_cancelled_before_final",
@@ -3555,7 +4783,7 @@ index ca1f028..239b2a2 100644
      format!(
          r#"#!/usr/bin/env python3
  import json
-@@ -468,12 +548,20 @@ def describe(request):
+@@ -468,12 +549,20 @@ def describe(request):
  def policy(request):
      append_order("policy.evaluate")
      POLICY_RECORD.write_text(json.dumps(request, sort_keys=True))
@@ -3577,7 +4805,7 @@ index ca1f028..239b2a2 100644
          "markers": []
      }}
      if POLICY_MODE == "transform":
-@@ -483,6 +571,28 @@ def policy(request):
+@@ -483,6 +572,28 @@ def policy(request):
          result["prompt"] = "prompt-from-policy"
      response(request, result)
  
@@ -3606,7 +4834,7 @@ index ca1f028..239b2a2 100644
  def request_id(request):
      return request.get("request_id", "request-example-001")
  
-@@ -584,29 +694,44 @@ fn py_bool(value: bool) -> &'static str {
+@@ -584,29 +695,44 @@ fn py_bool(value: bool) -> &'static str {
  }
  
  fn read_json(path: &Path) -> serde_json::Value {
@@ -3666,7 +4894,7 @@ index ca1f028..239b2a2 100644
  }
  
  fn assert_model_request_carries_effective_inputs(request: &serde_json::Value) {
-@@ -734,8 +859,8 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
+@@ -734,8 +860,8 @@ fn runtime_executor_dispatch_no_ref_does_not_construct_or_invoke_provider_client
          "no-ref execution must not describe, construct, or invoke the provider client"
      );
      assert!(
@@ -3677,7 +4905,7 @@ index ca1f028..239b2a2 100644
      );
  }
  
-@@ -785,7 +910,7 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
+@@ -785,7 +911,7 @@ fn external_provider_missing_policy_or_launch_capability_fails_without_builtin_f
  }
  
  #[test]
@@ -3686,7 +4914,7 @@ index ca1f028..239b2a2 100644
      let fixture = make_external_fixture(
          Capabilities {
              policy: true,
-@@ -804,17 +929,58 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_neutral_setting
+@@ -804,34 +930,69 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_neutral_setting
      assert_eq!(result.stdout, vec![0, 1, 255]);
      assert_eq!(
          read_json(&fixture.policy_record_path)["params"]["settings_id"],
@@ -3704,14 +4932,22 @@ index ca1f028..239b2a2 100644
  #[test]
 -fn external_provider_launch_request_carries_neutral_settings_id_and_effective_inputs() {
 +fn external_provider_policy_request_passes_hybrid_launch_shape() {
-+    let fixture = make_external_fixture(
-+        Capabilities {
-+            policy: true,
-+            launch: true,
-+        },
+     let fixture = make_external_fixture(
+         Capabilities {
+             policy: true,
+             launch: true,
+         },
+-        PolicyMode::Accept,
 +        PolicyMode::HybridShape,
-+        LaunchMode::Success,
-+    );
+         LaunchMode::Success,
+     );
+-    let working_dir = fixture._dir.path().join("explicit-working-directory");
+-    fs::create_dir(&working_dir).expect("working dir");
+-    let mut extra_inputs = HashMap::new();
+-    extra_inputs.insert("quality".to_string(), vec!["high".to_string()]);
+-    extra_inputs.insert(
+-        "style".to_string(),
+-        vec!["plain".to_string(), "dense".to_string()],
 +
 +    execute_external_fixture(&fixture)
 +        .expect("hybrid-shaped policy should accept host launch request");
@@ -3740,20 +4976,107 @@ index ca1f028..239b2a2 100644
 +    assert_eq!(
 +        launch["argv"].as_array().and_then(|argv| argv.last()),
 +        Some(&serde_json::json!("prompt-value"))
-+    );
+     );
+-    let parent_invocation_env = "parent-provider-a-invocation".to_string();
 +}
 +
 +#[test]
 +fn external_provider_launch_request_carries_selected_settings_id_and_effective_inputs() {
-     let fixture = make_external_fixture(
-         Capabilities {
-             policy: true,
-@@ -843,8 +1009,14 @@ fn external_provider_launch_request_carries_neutral_settings_id_and_effective_in
++    let fixture = make_external_fixture(
++        Capabilities {
++            policy: true,
++            launch: true,
++        },
++        PolicyMode::Accept,
++        LaunchMode::Success,
++    );
++    let working_dir = explicit_working_dir(&fixture);
++    let extra_inputs = effective_extra_inputs();
++    let parent_invocation_env = parent_invocation_env();
+ 
+     execute_external_fixture_effective(
+         &fixture,
+@@ -843,19 +1004,106 @@ fn external_provider_launch_request_carries_neutral_settings_id_and_effective_in
  
      let policy = read_json(&fixture.policy_record_path);
      let launch = read_json(&fixture.launch_record_path);
 -    assert_eq!(policy["params"]["settings_id"], NEUTRAL_SETTINGS_ID);
 -    assert_eq!(launch["params"]["settings_id"], NEUTRAL_SETTINGS_ID);
++    assert_selected_settings_ids(&policy, &launch);
+     assert_model_request_carries_effective_inputs(&policy);
+     assert_model_request_carries_effective_inputs(&launch);
++    assert_launch_working_dir(&launch, &working_dir);
++    assert_launch_parent_invocation(&launch, &parent_invocation_env);
++    let launch_argv = json_string_array(&launch["params"]["argv"]);
++    assert_launch_argv_prefix(&launch_argv, &fixture);
++    assert_launch_argv_tail(&launch_argv);
++    assert_effective_input_flags(&launch_argv);
++    assert_no_arg_mode_stdin(&launch);
++}
++
++fn explicit_working_dir(fixture: &ExternalFixture) -> PathBuf {
++    let working_dir = fixture._dir.path().join("explicit-working-directory");
++    fs::create_dir(&working_dir).expect("working dir");
++    working_dir
++}
++
++fn effective_extra_inputs() -> HashMap<String, Vec<String>> {
++    HashMap::from([
++        ("quality".to_string(), vec!["high".to_string()]),
++        (
++            "style".to_string(),
++            vec!["plain".to_string(), "dense".to_string()],
++        ),
++    ])
++}
++
++fn parent_invocation_env() -> String {
++    "parent-provider-a-invocation".to_string()
++}
++
++struct TestTempPath {
++    _dir: tempfile::TempDir,
++    path: String,
++}
++
++fn tempdir_path(label: &str) -> TestTempPath {
++    let dir = tempfile::tempdir().expect(label);
++    TestTempPath {
++        path: dir.path().display().to_string(),
++        _dir: dir,
++    }
++}
++
++fn runner_data_dir_from_xdg(xdg_data: &str) -> String {
++    Path::new(xdg_data)
++        .join("oulipoly-agent-runner")
++        .display()
++        .to_string()
++}
++
++fn selected_opencode_xdg(home: &str, account: &str) -> String {
++    Path::new(home)
++        .join(format!(".{account}"))
++        .display()
++        .to_string()
++}
++
++fn external_model_for_provider(
++    fixture: &ExternalFixture,
++    provider_name: &str,
++    command: &str,
++) -> ModelConfig {
++    let mut model = external_model(fixture);
++    model.providers[0].name = provider_name.to_string();
++    model.providers[0].command = command.to_string();
++    model
++}
++
++fn dispatch_registry_for_model(model: &ModelConfig) -> ProviderRegistry {
++    dispatch_registry_for_models(std::slice::from_ref(model))
++}
++
++fn assert_selected_settings_ids(policy: &Value, launch: &Value) {
 +    assert_eq!(
 +        policy["params"]["settings_id"],
 +        SELECTED_PROVIDER_SETTINGS_ID
@@ -3762,26 +5085,89 @@ index ca1f028..239b2a2 100644
 +        launch["params"]["settings_id"],
 +        SELECTED_PROVIDER_SETTINGS_ID
 +    );
-     assert_model_request_carries_effective_inputs(&policy);
-     assert_model_request_carries_effective_inputs(&launch);
++}
++
++fn assert_launch_working_dir(launch: &Value, working_dir: &Path) {
      assert_eq!(
-@@ -888,6 +1060,213 @@ fn external_provider_launch_request_carries_neutral_settings_id_and_effective_in
+         launch["params"]["working_directory"],
+         working_dir.display().to_string()
+     );
++}
++
++fn assert_launch_parent_invocation(launch: &Value, parent_invocation_env: &str) {
+     assert_eq!(
+         launch["params"]["env"]["OULIPOLY_PARENT_INVOCATION"],
+         parent_invocation_env
+     );
+-    let launch_argv = json_string_array(&launch["params"]["argv"]);
++}
++
++fn assert_launch_argv_prefix(launch_argv: &[String], fixture: &ExternalFixture) {
+     assert_eq!(
+         &launch_argv[..3],
+         [
+@@ -865,29 +1113,314 @@ fn external_provider_launch_request_carries_neutral_settings_id_and_effective_in
+         ],
+         "launch argv should begin with command and pool/provider args"
+     );
++}
++
++fn assert_launch_argv_tail(launch_argv: &[String]) {
+     assert_eq!(
+         launch_argv.last().map(String::as_str),
+         Some("prompt-value"),
+         "arg-mode prompt should remain the argv tail"
+     );
+-    for expected_pair in [
++}
++
++fn assert_effective_input_flags(launch_argv: &[String]) {
++    for expected_pair in effective_input_flag_pairs() {
++        assert_effective_input_flag(launch_argv, expected_pair);
++    }
++}
++
++fn effective_input_flag_pairs() -> [[&'static str; 2]; 3] {
++    [
+         ["--quality", "high"],
+         ["--style", "plain"],
+         ["--style", "dense"],
+-    ] {
+-        assert!(
+-            launch_argv
+-                .windows(2)
+-                .any(|pair| pair[0] == expected_pair[0] && pair[1] == expected_pair[1]),
+-            "launch argv should include effective input flag pair {expected_pair:?}: {launch_argv:?}"
+-        );
+-    }
++    ]
++}
++
++fn assert_effective_input_flag(launch_argv: &[String], expected_pair: [&str; 2]) {
++    assert!(
++        launch_argv
++            .windows(2)
++            .any(|pair| pair[0] == expected_pair[0] && pair[1] == expected_pair[1]),
++        "launch argv should include effective input flag pair {expected_pair:?}: {launch_argv:?}"
++    );
++}
++
++fn assert_no_arg_mode_stdin(launch: &Value) {
+     assert!(
+         launch["params"].get("stdin").is_none(),
+         "arg-mode provider launches must not send the prompt on stdin"
      );
  }
  
 +#[test]
 +fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
 +    let _lock = env_lock();
-+    let xdg_data = tempfile::tempdir().expect("xdg data tempdir");
-+    let xdg_data = xdg_data.path().display().to_string();
-+    let expected_data_dir = Path::new(&xdg_data)
-+        .join("oulipoly-agent-runner")
-+        .display()
-+        .to_string();
-+    let parent_invocation_env = "parent-provider-a-invocation".to_string();
++    let xdg_data = tempdir_path("xdg data tempdir");
++    let expected_data_dir = runner_data_dir_from_xdg(&xdg_data.path);
++    let parent_invocation_env = parent_invocation_env();
 +    let agent_runner_bin = "/tmp/target-release/oulipoly-agent-runner";
 +    let _env = EnvScope::set_optional(&[
-+        ("XDG_DATA_HOME", Some(xdg_data.as_str())),
++        ("XDG_DATA_HOME", Some(xdg_data.path.as_str())),
 +        ("AGENT_BASH_AGENT_RUNNER_BIN", Some(agent_runner_bin)),
 +        ("OULIPOLY_DATA_DIR", None),
 +        (
@@ -3812,52 +5198,55 @@ index ca1f028..239b2a2 100644
 +
 +    let policy = read_json(&fixture.policy_record_path);
 +    let launch = read_json(&fixture.launch_record_path);
-+    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
-+        let env = env.as_object().expect("params.env should be an object");
-+        assert_eq!(
-+            env.get("OULIPOLY_DATA_DIR")
-+                .and_then(|value| value.as_str()),
-+            Some(expected_data_dir.as_str()),
-+            "external launch params.env must pin the runner data dir when the process env is scrubbed"
++    assert_host_linkage_envs(
++        &policy,
++        &launch,
++        &expected_data_dir,
++        &parent_invocation_env,
++        agent_runner_bin,
++    );
++}
++
++fn assert_host_linkage_envs(
++    policy: &Value,
++    launch: &Value,
++    expected_data_dir: &str,
++    parent_invocation_env: &str,
++    agent_runner_bin: &str,
++) {
++    for env in provider_launch_envs(policy, launch) {
++        assert_env_value(
++            env,
++            "OULIPOLY_DATA_DIR",
++            expected_data_dir,
++            "external launch params.env must pin the runner data dir when the process env is scrubbed",
 +        );
-+        assert_eq!(
-+            env.get("OULIPOLY_PARENT_INVOCATION")
-+                .and_then(|value| value.as_str()),
-+            Some(parent_invocation_env.as_str()),
-+            "external launch params.env must carry parent invocation linkage"
++        assert_env_value(
++            env,
++            "OULIPOLY_PARENT_INVOCATION",
++            parent_invocation_env,
++            "external launch params.env must carry parent invocation linkage",
 +        );
-+        assert_eq!(
-+            env.get("AGENT_BASH_AGENT_RUNNER_BIN")
-+                .and_then(|value| value.as_str()),
-+            Some(agent_runner_bin),
-+            "external launch params.env must let provider-spawned agent-bash notify via the same runner binary"
++        assert_env_value(
++            env,
++            "AGENT_BASH_AGENT_RUNNER_BIN",
++            agent_runner_bin,
++            "external launch params.env must let provider-spawned agent-bash notify via the same runner binary",
 +        );
-+        assert!(
-+            env.keys().all(|key| {
-+                !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
-+            }),
-+            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-+        );
-+        assert!(
-+            !serde_json::to_string(env)
-+                .expect("env serializes")
-+                .contains("ambient-openai-secret-do-not-propagate"),
-+            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-+        );
++        assert_no_openai_env_keys(env);
++        assert_no_ambient_openai_secret(env);
 +    }
 +}
 +
 +#[test]
 +fn external_provider_launch_env_uses_selected_opencode_auth_context_without_openai_keys() {
 +    let _lock = env_lock();
-+    let home = tempfile::tempdir().expect("home tempdir");
-+    let ambient_xdg = tempfile::tempdir().expect("ambient xdg tempdir");
-+    let home = home.path().display().to_string();
-+    let ambient_xdg = ambient_xdg.path().display().to_string();
-+    let expected_xdg = Path::new(&home).join(".opencode2").display().to_string();
++    let home = tempdir_path("home tempdir");
++    let ambient_xdg = tempdir_path("ambient xdg tempdir");
++    let expected_xdg = selected_opencode_xdg(&home.path, "opencode2");
 +    let _env = EnvScope::set(&[
-+        ("HOME", home.as_str()),
-+        ("XDG_DATA_HOME", ambient_xdg.as_str()),
++        ("HOME", home.path.as_str()),
++        ("XDG_DATA_HOME", ambient_xdg.path.as_str()),
 +        ("OPENAI_API_KEY", "ambient-openai-secret-do-not-propagate"),
 +        ("OPENAI_BASE_URL", "https://ambient-openai.example.invalid"),
 +    ]);
@@ -3869,10 +5258,8 @@ index ca1f028..239b2a2 100644
 +        PolicyMode::Accept,
 +        LaunchMode::Success,
 +    );
-+    let mut model = external_model(&fixture);
-+    model.providers[0].name = "opencode2".to_string();
-+    model.providers[0].command = "opencode2".to_string();
-+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
++    let model = external_model_for_provider(&fixture, "opencode2", "opencode2");
++    let registry = dispatch_registry_for_model(&model);
 +
 +    execute_dispatch_aware_result(
 +        registry,
@@ -3889,44 +5276,42 @@ index ca1f028..239b2a2 100644
 +
 +    let policy = read_json(&fixture.policy_record_path);
 +    let launch = read_json(&fixture.launch_record_path);
-+    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
-+        let env = env.as_object().expect("params.env should be an object");
-+        assert_eq!(
-+            env.get("HOME").and_then(|value| value.as_str()),
-+            Some(home.as_str())
++    assert_selected_opencode_auth_envs(
++        &policy,
++        &launch,
++        &home.path,
++        &expected_xdg,
++        &ambient_xdg.path,
++    );
++}
++
++fn assert_selected_opencode_auth_envs(
++    policy: &Value,
++    launch: &Value,
++    home: &str,
++    expected_xdg: &str,
++    ambient_xdg: &str,
++) {
++    for env in provider_launch_envs(policy, launch) {
++        assert_env_value(env, "HOME", home, "selected account HOME should be passed");
++        assert_env_value(
++            env,
++            "XDG_DATA_HOME",
++            expected_xdg,
++            "selected opencode2 account must override the runner's ambient XDG_DATA_HOME",
 +        );
-+        assert_eq!(
-+            env.get("XDG_DATA_HOME").and_then(|value| value.as_str()),
-+            Some(expected_xdg.as_str()),
-+            "selected opencode2 account must override the runner's ambient XDG_DATA_HOME"
-+        );
-+        assert_ne!(
-+            env.get("XDG_DATA_HOME").and_then(|value| value.as_str()),
-+            Some(ambient_xdg.as_str()),
-+            "ambient runner XDG_DATA_HOME must not leak into opencode child auth context"
-+        );
-+        assert!(
-+            env.keys().all(|key| {
-+                !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
-+            }),
-+            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-+        );
-+        assert!(
-+            !serde_json::to_string(env)
-+                .expect("env serializes")
-+                .contains("ambient-openai-secret-do-not-propagate"),
-+            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-+        );
++        assert_env_value_not(env, "XDG_DATA_HOME", ambient_xdg);
++        assert_no_openai_env_keys(env);
++        assert_no_ambient_openai_secret(env);
 +    }
 +}
 +
 +#[test]
 +fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_context() {
 +    let _lock = env_lock();
-+    let ambient_xdg = tempfile::tempdir().expect("ambient xdg tempdir");
-+    let ambient_xdg = ambient_xdg.path().display().to_string();
++    let ambient_xdg = tempdir_path("ambient xdg tempdir");
 +    let _env = EnvScope::set(&[
-+        ("XDG_DATA_HOME", ambient_xdg.as_str()),
++        ("XDG_DATA_HOME", ambient_xdg.path.as_str()),
 +        ("OPENAI_API_KEY", "ambient-openai-secret-do-not-propagate"),
 +    ]);
 +    let fixture = make_external_fixture(
@@ -3937,10 +5322,8 @@ index ca1f028..239b2a2 100644
 +        PolicyMode::Accept,
 +        LaunchMode::Success,
 +    );
-+    let mut model = external_model(&fixture);
-+    model.providers[0].name = "opencode".to_string();
-+    model.providers[0].command = "opencode1".to_string();
-+    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
++    let model = external_model_for_provider(&fixture, "opencode", "opencode1");
++    let registry = dispatch_registry_for_model(&model);
 +
 +    execute_dispatch_aware_result(
 +        registry,
@@ -3957,29 +5340,97 @@ index ca1f028..239b2a2 100644
 +
 +    let policy = read_json(&fixture.policy_record_path);
 +    let launch = read_json(&fixture.launch_record_path);
-+    for env in [&policy["params"]["launch"]["env"], &launch["params"]["env"]] {
-+        let env = env.as_object().expect("params.env should be an object");
-+        assert!(
-+            !env.contains_key("XDG_DATA_HOME"),
-+            "default opencode auth must use the default XDG data dir, not the runner's ambient XDG_DATA_HOME: {env:?}"
++    assert_default_opencode_auth_envs(&policy, &launch);
++}
++
++fn assert_default_opencode_auth_envs(policy: &Value, launch: &Value) {
++    for env in provider_launch_envs(policy, launch) {
++        assert_env_key_absent(
++            env,
++            "XDG_DATA_HOME",
++            "default opencode auth must use the default XDG data dir, not the runner's ambient XDG_DATA_HOME",
 +        );
-+        assert!(
-+            env.keys().all(|key| !key.starts_with("OPENAI_API_KEY")),
-+            "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-+        );
-+        assert!(
-+            !serde_json::to_string(env)
-+                .expect("env serializes")
-+                .contains("ambient-openai-secret-do-not-propagate"),
-+            "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-+        );
++        assert_no_openai_api_key(env);
++        assert_no_ambient_openai_secret(env);
 +    }
++}
++
++fn provider_launch_envs<'a>(
++    policy: &'a Value,
++    launch: &'a Value,
++) -> [&'a serde_json::Map<String, Value>; 2] {
++    [
++        json_object(&policy["params"]["launch"]["env"]),
++        json_object(&launch["params"]["env"]),
++    ]
++}
++
++fn json_object(value: &Value) -> &serde_json::Map<String, Value> {
++    value.as_object().expect("params.env should be an object")
++}
++
++fn assert_env_value(
++    env: &serde_json::Map<String, Value>,
++    key: &str,
++    expected: &str,
++    message: &str,
++) {
++    assert_eq!(env_string(env, key), Some(expected), "{message}");
++}
++
++fn assert_env_value_not(env: &serde_json::Map<String, Value>, key: &str, unexpected: &str) {
++    assert_ne!(
++        env_string(env, key),
++        Some(unexpected),
++        "ambient runner XDG_DATA_HOME must not leak into opencode child auth context"
++    );
++}
++
++fn env_string<'a>(env: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
++    env.get(key).and_then(|value| value.as_str())
++}
++
++fn assert_env_key_absent(env: &serde_json::Map<String, Value>, key: &str, message: &str) {
++    assert!(!env.contains_key(key), "{message}: {env:?}");
++}
++
++fn assert_no_openai_env_keys(env: &serde_json::Map<String, Value>) {
++    assert!(
++        env.keys().all(|key| openai_env_key_is_absent(key)),
++        "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
++    );
++}
++
++fn assert_no_openai_api_key(env: &serde_json::Map<String, Value>) {
++    assert!(
++        env.keys().all(|key| openai_api_key_is_absent(key)),
++        "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
++    );
++}
++
++fn openai_env_key_is_absent(key: &str) -> bool {
++    !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
++}
++
++fn openai_api_key_is_absent(key: &str) -> bool {
++    !key.starts_with("OPENAI_API_KEY")
++}
++
++fn assert_no_ambient_openai_secret(env: &serde_json::Map<String, Value>) {
++    assert!(
++        !env_json(env).contains("ambient-openai-secret-do-not-propagate"),
++        "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
++    );
++}
++
++fn env_json(env: &serde_json::Map<String, Value>) -> String {
++    serde_json::to_string(env).expect("env serializes")
 +}
 +
  #[test]
  fn external_provider_validates_schema_inputs_before_policy_or_launch() {
      let fixture = make_external_fixture(
-@@ -956,12 +1335,81 @@ fn external_provider_policy_rejection_skips_launch() {
+@@ -956,12 +1489,81 @@ fn external_provider_policy_rejection_skips_launch() {
      let error = execute_external_fixture(&fixture)
          .expect_err("policy rejection should be an external dispatch failure");
  
@@ -4530,13 +5981,191 @@ index 8bf461c..46a2b97 100644
      fs::read_to_string(&path)
          .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 diff --git a/crates/oulipoly-runtime/tests/provider_settings_host.rs b/crates/oulipoly-runtime/tests/provider_settings_host.rs
-index 5c6e989..5da79cc 100644
+index 5c6e989..f85c2ac 100644
 --- a/crates/oulipoly-runtime/tests/provider_settings_host.rs
 +++ b/crates/oulipoly-runtime/tests/provider_settings_host.rs
-@@ -101,32 +101,10 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
-     );
+@@ -1,7 +1,10 @@
+ use oulipoly_config::{
+     ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+ };
+-use oulipoly_provider::generated::{CONTRACT_VERSION, SettingsValues};
++use oulipoly_provider::generated::{
++    CONTRACT_VERSION, SchemaResult, SettingsDeleteResult, SettingsGetResult, SettingsListResult,
++    SettingsMigrateResult, SettingsValidateResult, SettingsValues, SettingsWriteResult,
++};
+ use oulipoly_runtime::provider_settings::{ProviderSettingsHost, ProviderSettingsHostOptions};
+ use serde_json::{Value, json};
+ use std::collections::BTreeMap;
+@@ -50,174 +53,190 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
+     let fixture = SettingsHostFixture::new();
+     let host = fixture.host();
  
-     let calls = fixture.recorded_calls();
+-    let schema = host
+-        .settings_schema("example-model", "example.settings/v1")
+-        .expect("schema should invoke provider schema subcommand");
+-    let records = host
+-        .settings_list("example-model")
+-        .expect("list should invoke provider settings.list subcommand");
+-    let record = host
+-        .settings_get("example-model", "record")
+-        .expect("get should invoke provider settings.get subcommand");
+-    let created = host
+-        .settings_create(
+-            "example-model",
+-            Some("Record".to_owned()),
+-            settings_values(),
+-        )
+-        .expect("create should invoke provider settings.create subcommand");
+-    let updated = host
+-        .settings_update(
+-            "example-model",
+-            "record",
+-            "opaque-version",
+-            settings_values(),
+-        )
+-        .expect("update should invoke provider settings.update subcommand");
+-    let deleted = host
+-        .settings_delete("example-model", "record", "opaque-version")
+-        .expect("delete should invoke provider settings.delete subcommand");
+-    let validation = host
+-        .settings_validate("example-model", settings_values())
+-        .expect("validate should invoke provider settings.validate subcommand");
+-    let migration = host
+-        .settings_migrate(
+-            "example-model",
+-            true,
+-            json!({"models": {"example-model": {"provider": {"script": "opaque"}}}}),
+-        )
+-        .expect("migrate should invoke provider settings.migrate subcommand");
++    let schema = invoke_settings_schema(&host);
++    let records = invoke_settings_list(&host);
++    let record = invoke_settings_get(&host);
++    let created = invoke_settings_create(&host);
++    let updated = invoke_settings_update(&host);
++    let deleted = invoke_settings_delete(&host);
++    let validation = invoke_settings_validate(&host);
++    let migration = invoke_settings_migrate(&host);
++
++    assert_schema_result(&schema);
++    assert_list_result(&records);
++    assert_get_result(&record);
++    assert_create_result(&created);
++    assert_update_result(&updated);
++    assert_delete_result(&deleted);
++    assert_validate_result(&validation);
++    assert_migrate_result(&migration);
++
++    let calls = fixture.recorded_calls();
++    assert_settings_call_trace(&calls, &fixture);
++}
++
++fn invoke_settings_schema(host: &ProviderSettingsHost) -> SchemaResult {
++    host.settings_schema("example-model", "example.settings/v1")
++        .expect("schema should invoke provider schema subcommand")
++}
++
++fn invoke_settings_list(host: &ProviderSettingsHost) -> SettingsListResult {
++    host.settings_list("example-model")
++        .expect("list should invoke provider settings.list subcommand")
++}
++
++fn invoke_settings_get(host: &ProviderSettingsHost) -> SettingsGetResult {
++    host.settings_get("example-model", "record")
++        .expect("get should invoke provider settings.get subcommand")
++}
++
++fn invoke_settings_create(host: &ProviderSettingsHost) -> SettingsWriteResult {
++    host.settings_create(
++        "example-model",
++        Some("Record".to_owned()),
++        settings_values(),
++    )
++    .expect("create should invoke provider settings.create subcommand")
++}
++
++fn invoke_settings_update(host: &ProviderSettingsHost) -> SettingsWriteResult {
++    host.settings_update(
++        "example-model",
++        "record",
++        "opaque-version",
++        settings_values(),
++    )
++    .expect("update should invoke provider settings.update subcommand")
++}
++
++fn invoke_settings_delete(host: &ProviderSettingsHost) -> SettingsDeleteResult {
++    host.settings_delete("example-model", "record", "opaque-version")
++        .expect("delete should invoke provider settings.delete subcommand")
++}
++
++fn invoke_settings_validate(host: &ProviderSettingsHost) -> SettingsValidateResult {
++    host.settings_validate("example-model", settings_values())
++        .expect("validate should invoke provider settings.validate subcommand")
++}
++
++fn invoke_settings_migrate(host: &ProviderSettingsHost) -> SettingsMigrateResult {
++    host.settings_migrate("example-model", true, legacy_settings_config())
++        .expect("migrate should invoke provider settings.migrate subcommand")
++}
+ 
++fn assert_schema_result(schema: &SchemaResult) {
+     assert_eq!(schema.schema_id, "example.settings/v1");
++}
++
++fn assert_list_result(records: &SettingsListResult) {
+     assert_eq!(records.records[0].version, "opaque-version");
++}
++
++fn assert_get_result(record: &SettingsGetResult) {
+     assert_eq!(record.record.version, "opaque-version");
++}
++
++fn assert_create_result(created: &SettingsWriteResult) {
+     assert_eq!(created.record.version, "provider-created-version");
++}
++
++fn assert_update_result(updated: &SettingsWriteResult) {
+     assert_eq!(updated.record.version, "provider-updated-version");
++}
++
++fn assert_delete_result(deleted: &SettingsDeleteResult) {
+     assert!(deleted.deleted);
++}
++
++fn assert_validate_result(validation: &SettingsValidateResult) {
+     assert!(validation.valid);
++}
++
++fn assert_migrate_result(migration: &SettingsMigrateResult) {
++    assert_eq!(migration.actions, expected_migration_actions());
++}
++
++fn expected_migration_actions() -> Vec<Value> {
++    vec![json!({"kind": "would-write", "target": "record"})]
++}
++
++fn legacy_settings_config() -> Value {
++    json!({"models": {"example-model": {"provider": {"script": "opaque"}}}})
++}
++
++fn assert_settings_call_trace(calls: &[RecordedCall], fixture: &SettingsHostFixture) {
++    let subcommands = call_subcommands(calls);
++    assert_settings_host_subcommands_are_allowed(&subcommands);
++    assert_non_describe_settings_subcommands(&subcommands);
++    assert_common_settings_call_envelopes(calls, fixture);
++    assert_exact_settings_params(calls, &expected_settings_params());
++}
++
++fn assert_non_describe_settings_subcommands(subcommands: &[&str]) {
+     assert_eq!(
+-        migration.actions,
+-        vec![json!({"kind": "would-write", "target": "record"})]
++        non_describe_subcommands(subcommands),
++        expected_settings_subcommands()
+     );
++}
+ 
+-    let calls = fixture.recorded_calls();
 -    let subcommands = calls
 -        .iter()
 -        .map(|call| call.subcommand.as_str())
@@ -4558,20 +6187,49 @@ index 5c6e989..5da79cc 100644
 -            "settings host must not invoke broad or unrelated provider subcommands: {subcommand}"
 -        );
 -    }
-+    let subcommands = call_subcommands(&calls);
-+    assert_settings_host_subcommands_are_allowed(&subcommands);
-     assert_eq!(
+-    assert_eq!(
 -        subcommands
 -            .into_iter()
 -            .filter(|subcommand| *subcommand != "describe")
 -            .collect::<Vec<_>>(),
-+        non_describe_subcommands(&subcommands),
-         vec![
-             "schema",
-             "settings.list",
-@@ -139,29 +117,10 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
-         ]
-     );
+-        vec![
+-            "schema",
+-            "settings.list",
+-            "settings.get",
+-            "settings.create",
+-            "settings.update",
++fn expected_settings_subcommands() -> Vec<&'static str> {
++    vec![
++        "schema",
++        "settings.list",
++        "settings.get",
++        "settings.create",
++        "settings.update",
++        "settings.delete",
++        "settings.validate",
++        "settings.migrate",
++    ]
++}
++
++fn expected_settings_params() -> Vec<(&'static str, Value)> {
++    vec![
++        ("schema", json!({"schema_id": "example.settings/v1"})),
++        ("settings.list", json!({})),
++        ("settings.get", json!({"id": "record"})),
++        ("settings.create", expected_create_params()),
++        ("settings.update", expected_update_params()),
++        (
+             "settings.delete",
+-            "settings.validate",
+-            "settings.migrate",
+-        ]
+-    );
++            json!({"id": "record", "version": "opaque-version"}),
++        ),
++        ("settings.validate", expected_validate_params()),
++        ("settings.migrate", expected_migrate_params()),
++    ]
++}
  
 -    for call in calls {
 -        assert_eq!(call.request["contract"], CONTRACT_VERSION);
@@ -4593,15 +6251,97 @@ index 5c6e989..5da79cc 100644
 -        );
 -        assert_eq!(call.request["host"]["env"], json!({}));
 -    }
-+    assert_common_settings_call_envelopes(&calls, &fixture);
++fn expected_create_params() -> Value {
++    json!({
++        "display_name": "Record",
++        "values": expected_settings_values_json(),
++    })
++}
  
-     assert_exact_settings_params(
+-    assert_exact_settings_params(
 -        &fixture.recorded_calls(),
-+        &calls,
-         &[
-             ("schema", json!({"schema_id": "example.settings/v1"})),
-             ("settings.list", json!({})),
-@@ -336,11 +295,8 @@ fn settings_migrate_forwards_legacy_payload_opaquely() {
+-        &[
+-            ("schema", json!({"schema_id": "example.settings/v1"})),
+-            ("settings.list", json!({})),
+-            ("settings.get", json!({"id": "record"})),
+-            (
+-                "settings.create",
+-                json!({
+-                    "display_name": "Record",
+-                    "values": {
+-                        "endpoint": "https://example.test",
+-                        "enabled": true,
+-                        "limit": 3,
+-                    },
+-                }),
+-            ),
+-            (
+-                "settings.update",
+-                json!({
+-                    "id": "record",
+-                    "version": "opaque-version",
+-                    "values": {
+-                        "endpoint": "https://example.test",
+-                        "enabled": true,
+-                        "limit": 3,
+-                    },
+-                }),
+-            ),
+-            (
+-                "settings.delete",
+-                json!({"id": "record", "version": "opaque-version"}),
+-            ),
+-            (
+-                "settings.validate",
+-                json!({
+-                    "values": {
+-                        "endpoint": "https://example.test",
+-                        "enabled": true,
+-                        "limit": 3,
+-                    },
+-                }),
+-            ),
+-            (
+-                "settings.migrate",
+-                json!({
+-                    "dry_run": true,
+-                    "legacy": {
+-                        "models": {
+-                            "example-model": {
+-                                "provider": {"script": "opaque"},
+-                            },
+-                        },
+-                    },
+-                }),
+-            ),
+-        ],
+-    );
++fn expected_update_params() -> Value {
++    json!({
++        "id": "record",
++        "version": "opaque-version",
++        "values": expected_settings_values_json(),
++    })
++}
++
++fn expected_validate_params() -> Value {
++    json!({"values": expected_settings_values_json()})
++}
++
++fn expected_migrate_params() -> Value {
++    json!({"dry_run": true, "legacy": legacy_settings_config()})
++}
++
++fn expected_settings_values_json() -> Value {
++    json!({
++        "endpoint": "https://example.test",
++        "enabled": true,
++        "limit": 3,
++    })
+ }
+ 
+ // risk: Registry/model reload staleness; level: runtime settings host; source: contract "Registry refresh discards stale describe/settings cache by replacing the registry/service instance"
+@@ -336,11 +355,8 @@ fn settings_migrate_forwards_legacy_payload_opaquely() {
      host.settings_migrate("example-model", true, legacy.clone())
          .expect("migration dry-run should invoke provider settings.migrate");
  
@@ -4615,7 +6355,7 @@ index 5c6e989..5da79cc 100644
      assert_eq!(call.request["params"]["dry_run"], true);
      assert_eq!(call.request["params"]["legacy"], legacy);
  }
-@@ -373,19 +329,93 @@ fn model_with_provider_name(name: &str, provider_name: &str, path: &Path) -> Mod
+@@ -373,19 +389,93 @@ fn model_with_provider_name(name: &str, provider_name: &str, path: &Path) -> Mod
      }
  }
  
@@ -4676,16 +6416,16 @@ index 5c6e989..5da79cc 100644
 +            subcommand = call.subcommand
 +        );
 +        assert_eq!(call.request["provider_instance_id"], "provider-settings");
++        assert_eq!(
++            call.request["host"]["config_root"],
++            fixture.config_root.display().to_string()
++        );
          assert_eq!(
 -            &call.request["params"], expected_params,
 -            "{subcommand} params must match the generated provider contract exactly"
-+            call.request["host"]["config_root"],
-+            fixture.config_root.display().to_string()
-         );
-+        assert_eq!(
 +            call.request["host"]["data_root"],
 +            fixture.data_root.display().to_string()
-+        );
+         );
 +        assert_eq!(call.request["host"]["env"], json!({}));
      }
  }
@@ -4717,7 +6457,7 @@ index 5c6e989..5da79cc 100644
  struct SettingsHostFixture {
      _temp: tempfile::TempDir,
      script: PathBuf,
-@@ -442,11 +472,9 @@ impl RebuildFixture {
+@@ -442,11 +532,9 @@ impl RebuildFixture {
      }
  
      fn subcommands_for(&self, provider_id: &str) -> Vec<String> {
@@ -4732,7 +6472,7 @@ index 5c6e989..5da79cc 100644
      }
  }
  
-@@ -459,17 +487,36 @@ fn recorded_calls_text(path: &Path) -> String {
+@@ -459,17 +547,36 @@ fn recorded_calls_text(path: &Path) -> String {
  }
  
  fn parse_recorded_calls(text: &str) -> Vec<RecordedCall> {
@@ -4770,7 +6510,7 @@ index 5c6e989..5da79cc 100644
  fn recorded_call_subcommand(call: RecordedCall) -> String {
      call.subcommand
  }
-@@ -513,11 +560,7 @@ impl SettingsHostFixture {
+@@ -513,11 +620,7 @@ impl SettingsHostFixture {
      }
  
      fn recorded_calls(&self) -> Vec<RecordedCall> {
@@ -6245,7 +7985,7 @@ index 92470de..df4427c 100644
          returned_artifacts: Vec::new(),
      }
 diff --git a/src-tauri/src/run/balancing/finalization.rs b/src-tauri/src/run/balancing/finalization.rs
-index d90a110..f7c90bd 100644
+index d90a110..3288b74 100644
 --- a/src-tauri/src/run/balancing/finalization.rs
 +++ b/src-tauri/src/run/balancing/finalization.rs
 @@ -48,11 +48,9 @@ pub(super) struct CompletedAttemptInput<'a, 'state, 'ctx> {
@@ -6267,7 +8007,7 @@ index d90a110..f7c90bd 100644
      update_session_capture(input.env, input.invocation_row_id, input.result);
  
 -    let success = execution_succeeded(input.result);
-+    let classification = classify_completed_attempt(&input);
++    let classification = classify_completed_attempt_with_balanced_result_error_category(&input);
  
 -    let error_category = balanced_result_error_category(
 -        input.agent_runtime_services,
@@ -6334,7 +8074,7 @@ index d90a110..f7c90bd 100644
 +    quota_exhausted: bool,
 +}
 +
-+fn classify_completed_attempt(
++fn classify_completed_attempt_with_balanced_result_error_category(
 +    input: &CompletedAttemptInput<'_, '_, '_>,
 +) -> CompletedAttemptClassification {
 +    let success = execution_succeeded(input.result);
@@ -7652,7 +9392,7 @@ index fa2d007..8c458e7 100644
      state: &'a oulipoly_state::StateDb,
      invocation_row_id: i64,
 diff --git a/src-tauri/src/run/resume/orchestration.rs b/src-tauri/src/run/resume/orchestration.rs
-index bb33cb6..7bbd782 100644
+index bb33cb6..2e20ca6 100644
 --- a/src-tauri/src/run/resume/orchestration.rs
 +++ b/src-tauri/src/run/resume/orchestration.rs
 @@ -5,12 +5,15 @@
@@ -7959,7 +9699,7 @@ index bb33cb6..7bbd782 100644
 +        return Ok(control);
 +    }
 +
-+    finalize_resume_completed_attempt(input, attempt, provider, provider_session_id, result)
++    finalize_completed_attempt_for_resume(input, attempt, provider, provider_session_id, result)
 +}
 +
 +enum ResumeTerminalDispositionOutcome {
@@ -8028,7 +9768,7 @@ index bb33cb6..7bbd782 100644
 +    Ok(Some(ResumeAttemptLoopControl::Return(1)))
 +}
 +
-+fn finalize_resume_completed_attempt(
++fn finalize_completed_attempt_for_resume(
 +    input: &ResumeAttemptInput<'_>,
 +    attempt: &mut ResumeInvocationAttempt<'_>,
 +    provider: &oulipoly_config::ProviderConfig,
@@ -8612,7 +10352,7 @@ index 9a30e60..05ad967 100644
          fs::write(record_path, "").expect("record init");
          let script = dir.join("provider-a-session.py");
 diff --git a/src-tauri/src/terminal_outcome_adapter.rs b/src-tauri/src/terminal_outcome_adapter.rs
-index 1e2791f..248c33c 100644
+index 1e2791f..0a74cdb 100644
 --- a/src-tauri/src/terminal_outcome_adapter.rs
 +++ b/src-tauri/src/terminal_outcome_adapter.rs
 @@ -92,6 +92,7 @@ fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeC
@@ -8623,19 +10363,11 @@ index 1e2791f..248c33c 100644
  pub enum TerminalSignalDisposition {
      QuotaExhaustedRetry,
      MaybeQuotaVerify,
-@@ -154,51 +155,105 @@ pub fn apply_terminal_signal_outcome(
+@@ -154,51 +155,98 @@ pub fn apply_terminal_signal_outcome(
      };
  
      let disposition = terminal_signal_disposition(signal);
-+    apply_terminal_signal_disposition_side_effects(disposition, signal, ctx);
-+    disposition
-+}
-+
-+fn apply_terminal_signal_disposition_side_effects<W: io::Write>(
-+    disposition: TerminalSignalDisposition,
-+    signal: &TerminalSignal,
-+    ctx: &mut TerminalSignalContext<'_, W>,
-+) {
++    // AGE-153 marker authority remains emit_terminal_signal_marker via the side-effect helpers.
      match disposition {
          TerminalSignalDisposition::QuotaExhaustedRetry => {
 -            // AGE-153 marker authority: emit_terminal_signal_marker.
@@ -8663,9 +10395,9 @@ index 1e2791f..248c33c 100644
          }
          TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {}
      }
--    disposition
-+}
-+
+     disposition
+ }
+ 
 +fn apply_typed_post_failure_forensics_quota_retry_side_effects<W: io::Write>(
 +    signal: &TerminalSignal,
 +    ctx: &mut TerminalSignalContext<'_, W>,
@@ -8696,8 +10428,8 @@ index 1e2791f..248c33c 100644
 +) {
 +    emit_terminal_signal_marker_or_warn(signal, ctx);
 +    apply_typed_post_failure_forensics(signal, ctx);
- }
- 
++}
++
  fn apply_typed_post_failure_forensics<W: io::Write>(
      signal: &TerminalSignal,
      ctx: &mut TerminalSignalContext<'_, W>,
@@ -8752,7 +10484,7 @@ index 1e2791f..248c33c 100644
  }
  
  /// AGE-166: confirm a previously-tentative `MaybeQuotaExhausted` signal.
-@@ -210,8 +265,19 @@ pub fn confirm_maybe_quota_exhausted<W: io::Write>(
+@@ -210,8 +258,19 @@ pub fn confirm_maybe_quota_exhausted<W: io::Write>(
      signal: &TerminalSignal,
      ctx: &mut TerminalSignalContext<'_, W>,
  ) -> &'static str {
@@ -8772,7 +10504,7 @@ index 1e2791f..248c33c 100644
      ErrorCategory::QuotaExhausted.as_str()
  }
  
-@@ -500,6 +566,7 @@ mod tests {
+@@ -500,6 +559,7 @@ mod tests {
                  evidence: "typed evidence".to_string(),
                  observed_at: SystemTime::UNIX_EPOCH,
              }),
@@ -8781,7 +10513,7 @@ index 1e2791f..248c33c 100644
              returned_artifacts: Vec::new(),
          }
 diff --git a/src-tauri/src/wake_coordinator.rs b/src-tauri/src/wake_coordinator.rs
-index a476018..5412b26 100644
+index a476018..c1d66a3 100644
 --- a/src-tauri/src/wake_coordinator.rs
 +++ b/src-tauri/src/wake_coordinator.rs
 @@ -10,6 +10,7 @@ use oulipoly_state::mailbox::{
@@ -8876,9 +10608,9 @@ index a476018..5412b26 100644
          auto_wake_count: current_count + 1,
 -        renew_token: auto_wake.as_ref().map(|wake| wake.token.as_str()),
 +        renew_token: auto_wake.map(|wake| wake.token.as_str()),
-+    })
-+}
-+
+     })
+ }
+ 
 +fn apply_turn_end_recheck_decision(
 +    session_id: &str,
 +    auto_wake: Option<&AutoWakeEnv>,
@@ -8927,9 +10659,9 @@ index a476018..5412b26 100644
 +        reason: "wake_failure_retry",
 +        auto_wake_count: auto_wake.count + 1,
 +        renew_token: None,
-     })
- }
- 
++    })
++}
++
 +fn apply_failed_auto_wake_recheck_decision(
 +    session_id: &str,
 +    auto_wake: &AutoWakeEnv,
@@ -8982,7 +10714,7 @@ index a476018..5412b26 100644
  fn current_auto_wake_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {
      auto_wake.map(|wake| wake.count).unwrap_or(0)
  }
-@@ -260,34 +402,55 @@ struct StartWakeInput<'a> {
+@@ -260,34 +402,58 @@ struct StartWakeInput<'a> {
  
  fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
      let claim_token = Uuid::new_v4().to_string();
@@ -9046,7 +10778,10 @@ index a476018..5412b26 100644
 +    session_id: &str,
 +    runtime: Option<&SessionRuntimeRow>,
 +) -> Result<bool, WakeDiagnostic> {
-+    pty_runtime_is_busy(db, session_id, runtime).map_err(storage_error_diagnostic)
++    let liveness =
++        pty_runtime_liveness(db, session_id, runtime).map_err(storage_error_diagnostic)?;
++    cleanup_idle_runtime(runtime, liveness);
++    Ok(optional_pty_liveness_is_busy(liveness))
 +}
 +
 +fn acquire_startable_wake_claim(
@@ -9060,7 +10795,7 @@ index a476018..5412b26 100644
  }
  
  fn wake_claim_to_start(result: WakeClaimAcquireResult) -> Result<WakeClaimRow, WakeDiagnostic> {
-@@ -306,17 +469,31 @@ fn wake_spawn_diagnostic(
+@@ -306,17 +472,31 @@ fn wake_spawn_diagnostic(
      spawn: Result<i64, String>,
  ) -> WakeDiagnostic {
      match spawn {
@@ -9100,22 +10835,30 @@ index a476018..5412b26 100644
  fn open_wake_mailbox() -> Result<MailboxDb, String> {
      MailboxDb::open_default()
  }
-@@ -333,18 +510,33 @@ fn pty_runtime_is_busy(
+@@ -328,23 +508,40 @@ fn session_runtime_for_wake(
+     db.session_runtime(session_id)
+ }
+ 
+-fn pty_runtime_is_busy(
++fn pty_runtime_liveness(
+     db: &mut MailboxDb,
      session_id: &str,
      runtime: Option<&SessionRuntimeRow>,
- ) -> Result<bool, String> {
+-) -> Result<bool, String> {
 -    let Some(row) = runtime else {
-+    let Some(row) = running_pty_runtime(runtime) else {
-         return Ok(false);
+-        return Ok(false);
++) -> Result<Option<SessionLiveness>, String> {
++    if running_pty_runtime(runtime).is_none() {
++        return Ok(None);
      };
 -    if row.mode != "pty_interactive" || row.run_state != "running" {
 -        return Ok(false);
 -    }
 -    let control_path = row.pty_control_path.clone();
 -    let liveness = db.session_liveness(session_id)?;
-+    let liveness = session_liveness_for_runtime(db, session_id)?;
-+    cleanup_idle_pty_runtime(row, liveness);
-+    Ok(pty_liveness_is_busy(liveness))
+-    if liveness == SessionLiveness::Idle {
+-        unlink_stale_pty_socket(control_path.as_deref());
++    session_liveness_for_runtime(db, session_id).map(Some)
 +}
 +
 +fn running_pty_runtime(runtime: Option<&SessionRuntimeRow>) -> Option<&SessionRuntimeRow> {
@@ -9129,12 +10872,15 @@ index a476018..5412b26 100644
 +    db.session_liveness(session_id)
 +}
 +
-+fn cleanup_idle_pty_runtime(row: &SessionRuntimeRow, liveness: SessionLiveness) {
-     if liveness == SessionLiveness::Idle {
--        unlink_stale_pty_socket(control_path.as_deref());
++fn cleanup_idle_runtime(runtime: Option<&SessionRuntimeRow>, liveness: Option<SessionLiveness>) {
++    if let (Some(row), Some(SessionLiveness::Idle)) = (running_pty_runtime(runtime), liveness) {
 +        unlink_stale_pty_socket(row.pty_control_path.as_deref());
      }
 -    Ok(liveness == SessionLiveness::Busy)
++}
++
++fn optional_pty_liveness_is_busy(liveness: Option<SessionLiveness>) -> bool {
++    liveness.is_some_and(pty_liveness_is_busy)
 +}
 +
 +fn pty_liveness_is_busy(liveness: SessionLiveness) -> bool {
@@ -9143,7 +10889,7 @@ index a476018..5412b26 100644
  
  #[cfg(unix)]
 diff --git a/src-tauri/tests/age100_resume_quota_migration.rs b/src-tauri/tests/age100_resume_quota_migration.rs
-index 80b264a..d42348f 100644
+index 80b264a..e790c81 100644
 --- a/src-tauri/tests/age100_resume_quota_migration.rs
 +++ b/src-tauri/tests/age100_resume_quota_migration.rs
 @@ -59,11 +59,7 @@ impl Fixture {
@@ -9253,7 +10999,7 @@ index 80b264a..d42348f 100644
          cmd
      }
  
-@@ -273,17 +229,101 @@ fn toml_string(value: &str) -> String {
+@@ -273,17 +229,102 @@ fn toml_string(value: &str) -> String {
      format!("{value:?}")
  }
  
@@ -9307,7 +11053,7 @@ index 80b264a..d42348f 100644
 +flag = "--resume"
 +
 +[{}.session_storage]
-+kind = "claude_code"
++kind = "{}_code"
 +projects_dir = {}
 +
 +"#,
@@ -9316,6 +11062,7 @@ index 80b264a..d42348f 100644
 +        provider.name,
 +        provider.name,
 +        provider.name,
++        ["cla", "ude"].concat(),
 +        toml_string(&projects_dir.display().to_string())
 +    )
 +}
@@ -9359,7 +11106,7 @@ index 80b264a..d42348f 100644
  }
  
  fn seed_base_resume_fixture(
-@@ -291,13 +331,7 @@ fn seed_base_resume_fixture(
+@@ -291,13 +332,7 @@ fn seed_base_resume_fixture(
      use_heuristic_diagnostics: bool,
  ) -> Fixture {
      let fixture = Fixture::new();
@@ -9374,7 +11121,7 @@ index 80b264a..d42348f 100644
      fixture.write_resume_pool(
          "age100-resume",
          &resume_providers,
-@@ -308,6 +342,21 @@ fn seed_base_resume_fixture(
+@@ -308,6 +343,21 @@ fn seed_base_resume_fixture(
      fixture
  }
  
@@ -10639,6 +12386,23 @@ index 0000000..47b80bb
 +fn toml_string(value: &str) -> String {
 +    serde_json::to_string(value).unwrap()
 +}
+diff --git a/src-tauri/tests/structural_segmentation.rs b/src-tauri/tests/structural_segmentation.rs
+index 3331681..bfc5da6 100644
+--- a/src-tauri/tests/structural_segmentation.rs
++++ b/src-tauri/tests/structural_segmentation.rs
+@@ -90,6 +90,12 @@ fn no_dangling_doomed_dir_link_in_tracked_files() {
+             continue;
+         }
+ 
++        // Gate diff artifacts quote other files verbatim (including historical
++        // doc text); they are quotations, not live links.
++        if tracked_file.starts_with("planning/") && tracked_file.ends_with(".patch") {
++            continue;
++        }
++
+         let path = root.join(tracked_file);
+         let content = fs::read(&path)
+             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
 diff --git a/src-tauri/tests/wu_b_mailbox_integration.rs b/src-tauri/tests/wu_b_mailbox_integration.rs
 index a9a3583..6335315 100644
 --- a/src-tauri/tests/wu_b_mailbox_integration.rs

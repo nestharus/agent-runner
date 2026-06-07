@@ -1,0 +1,4 @@
+OULIPOLY_INVOCATION={"source":"opencode2","id":"00a0d2d3-7754-4f53-ab22-016c1bef72bd"}
+OULIPOLY_TERMINAL_SIGNAL={"evidence":{"excerpt":"external provider transport failed: host_timeout"},"invocation_id":"00a0d2d3-7754-4f53-ab22-016c1bef72bd","kind":"SpawnError","session_id":null}
+OULIPOLY_RESULT={"agent_runner_chain_id":null,"agent_runner_invocation_id":"00a0d2d3-7754-4f53-ab22-016c1bef72bd","error_category":"spawn_error","exit_code":-1,"finished_at":"2026-06-06T21:50:24.397850718+00:00","id":"00a0d2d3-7754-4f53-ab22-016c1bef72bd","provider_name":"opencode2","provider_session_id":null,"status":"failed","success":false,"terminal_reason":"spawn_error"}
+Error: external provider transport failed: host_timeout

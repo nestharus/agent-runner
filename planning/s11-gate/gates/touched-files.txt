@@ -54,4 +54,5 @@ M	src-tauri/tests/age166_zero_turn_orchestration_e2e.rs
 M	src-tauri/tests/age240_relocated_support.rs
 M	src-tauri/tests/s10_external_provider_resume.rs
 A	src-tauri/tests/s11_external_provider_wake.rs
+M	src-tauri/tests/structural_segmentation.rs
 M	src-tauri/tests/wu_b_mailbox_integration.rs

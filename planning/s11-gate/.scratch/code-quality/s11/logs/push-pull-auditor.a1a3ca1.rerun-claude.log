@@ -1,0 +1,2 @@
+OULIPOLY_FAILURE={"agent_runner_chain_id":null,"agent_runner_invocation_id":null,"detail":{"attempted_providers":[],"model_name":"claude","provider_index":null,"reason":"Unknown model: claude"},"error_category":null,"exit_code":null,"failure_kind":"pre_invocation","finished_at":"2026-06-07T02:54:40.836005504+00:00","message":"provider_selection: Unknown model: claude","provider_name":null,"provider_session_id":null,"stage":"provider_selection","status":"failed","success":false,"terminal_reason":"pre_invocation_failure"}
+Error: Unknown model: claude

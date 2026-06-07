@@ -1,10 +1,10 @@
 # S11 Gate Evidence
 
-Audited net source range: `95699d6..a1a3ca1` plus the current working-tree S11 function-classification remediation.
+Audited net source range: `95699d6..549daaa`.
 
 Functional cutoff: `95699d6..1593ef8`.
 
-Auditor source inspection worktree for the current cycle: `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar` because the regenerated diff includes unstaged S11 remediation changes.
+Auditor source inspection worktree for the current cycle: `/home/nes/projects/agent-runner/worktrees/age-pid-sidecar` with generated artifacts refreshed against `95699d6..549daaa`.
 
 Gate artifact paths:
 
@@ -28,7 +28,7 @@ The post-cutoff remediation commit `1e043d3 Restore opencode-turns exec bit afte
 mode change 100644 => 100755 scripts/opencode-turns
 ```
 
-The transient `2b7ab03 Fallback opencode turns to SQLite on invalid export` content was reverted by `c3ab19c`; it is not present in the net source behavior. The attempt-4 commit `a1a3ca1` is included in the audited net range and adds external-provider transport timeout/account-unavailable rotation plus `crates/oulipoly-runtime/tests/age246_external_transport_rotation.rs`. The current working-tree remediation splits function-classification risk surfaces and adds provider/test fixtures for heartbeat-gap timeout coverage.
+The transient `2b7ab03 Fallback opencode turns to SQLite on invalid export` content was reverted by `c3ab19c`; it is not present in the net source behavior. The attempt-4 commit `a1a3ca1` is included in the audited net range and adds external-provider transport timeout/account-unavailable rotation plus `crates/oulipoly-runtime/tests/age246_external_transport_rotation.rs`. `dc2900d` adds launch heartbeat-gap supervision and coverage. `7ec42d4`, `dcfa938`, and `549daaa` commit the function-classification helper splits and gate-artifact refreshes. `72bb8c0` repairs the launch stdout-limit borrow split, and `d9606aa` records the structural segmentation lint exclusion for quoted gate patch artifacts.
 
 ## Isolated Command Gates
 
@@ -43,6 +43,16 @@ Current remediated workspace command results:
 - `cargo test -p oulipoly-agent-runner --test wu_d_proactive_wake_integration busy_then_turn_end_delivers -- --nocapture`: status `0`; this targeted rerun covered the only failure from the earlier full workspace attempt.
 - `cargo test --workspace`: status `0`; the final full workspace run completed successfully after the targeted rerun.
 
+Post-`549daaa` residual function-classification remediation validation:
+
+- `cargo fmt --all -- --check`: status `0`.
+- `cargo clippy --workspace --all-targets -- -D warnings`: status `0`.
+- `bash scripts/tests/opencode-turns.test.sh`: status `0`.
+- `cargo test -p oulipoly-provider --tests`: status `0`.
+- `cargo test -p oulipoly-runtime --test age217_s6a_policy_launch_dispatch --test provider_settings_host`: status `0`.
+- `cargo test -p oulipoly-agent-runner --test wu_d_proactive_wake_integration busy_then_turn_end_delivers -- --nocapture`: status `0`.
+- Source-only `git diff --check` over the six residual remediation files: status `0`. Full gate artifact diff-check still reports trailing whitespace inside generated `planning/s11-gate/gates/diff.patch`; source diffs are clean.
+
 The previous clean full-workspace gate for `1e043d3` is retained below only as historical continuity evidence.
 
 ## Targeted Evidence Run
@@ -53,7 +63,7 @@ Targeted status: `planning/s11-gate/evidence/targeted-tests.status` contains `ta
 
 Environment recorded in the current targeted log:
 
-- `head=a1a3ca1+working-tree-s11-remediation` (`targeted-tests.log:3`)
+- `head=a1a3ca1+working-tree-s11-remediation` (`targeted-tests.log:3`), the pre-commit label for the same remediated source now committed as `7ec42d4`.
 - `base=95699d6` (`targeted-tests.log:4`)
 - `worktree=/home/nes/projects/agent-runner/worktrees/age-pid-sidecar` (`targeted-tests.log:5`)
 - `CARGO_TARGET_DIR_PROVIDER=/tmp/s11-provider-test-target` (`targeted-tests.log:6`)

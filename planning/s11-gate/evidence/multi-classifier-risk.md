@@ -2,7 +2,7 @@
 
 This artifact is a pre-audit routing aid, not a waiver and not a verdict. The function-classification auditor remains authoritative for A1 single-classification scoring.
 
-The stale pre-remediation function-classification report is preserved separately at `planning/s11-gate/evidence/pre-split-multi-classifier-risk.md`. The current working tree contains a targeted S11 function-classification remediation: helper responsibilities were split across the provider client/process layer, external-provider request/context/policy helpers, runtime executor/provider-settings helpers, state/mailbox helpers, OpenCode turn adapter helpers, balancing/resume/terminal outcome helpers, and touched tests. Current function bodies remain blocking if they still mix A1 categories; this file is not a waiver.
+The stale pre-remediation function-classification report is preserved separately at `planning/s11-gate/evidence/pre-split-multi-classifier-risk.md`. Commits `7ec42d4`, `dcfa938`, and `549daaa` contain the targeted S11 function-classification remediation: helper responsibilities were split across the provider client/process layer, external-provider request/context/policy helpers, runtime executor/provider-settings helpers, state/mailbox helpers, OpenCode turn adapter helpers, balancing/resume/terminal outcome helpers, and touched tests. Current function bodies remain blocking if they still mix A1 categories; this file is not a waiver.
 
 ## Genuine Risk Surfaces
 
