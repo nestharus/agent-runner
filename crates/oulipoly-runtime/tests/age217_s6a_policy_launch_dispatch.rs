@@ -1390,14 +1390,14 @@ fn assert_env_key_absent(env: &serde_json::Map<String, Value>, key: &str, messag
 
 fn assert_no_openai_env_keys(env: &serde_json::Map<String, Value>) {
     assert!(
-        env.keys().all(openai_env_key_is_absent),
+        env.keys().all(|key| openai_env_key_is_absent(key)),
         "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
     );
 }
 
 fn assert_no_openai_api_key(env: &serde_json::Map<String, Value>) {
     assert!(
-        env.keys().all(openai_api_key_is_absent),
+        env.keys().all(|key| openai_api_key_is_absent(key)),
         "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
     );
 }

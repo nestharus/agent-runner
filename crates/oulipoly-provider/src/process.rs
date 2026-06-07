@@ -376,8 +376,16 @@ impl ProcessRunner {
         let terminated = wait_for_terminated_process(&mut child, self.limits.kill_after_grace);
         let diagnostics =
             map_termination_diagnostics(threads, terminated, host_cancellation_requested);
-        ProviderClientError::host_transport(kind, subcommand_for_error(&command), None, diagnostics)
+        termination_transport_error(kind, &command, diagnostics)
     }
+}
+
+fn termination_transport_error(
+    kind: HostErrorKind,
+    command: &ProcessCommand,
+    diagnostics: ProviderDiagnostics,
+) -> ProviderClientError {
+    ProviderClientError::host_transport(kind, subcommand_for_error(command), None, diagnostics)
 }
 
 fn spawn_provider_process<I, K, V>(
@@ -602,18 +610,24 @@ fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8])
 fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {
     for (index, byte) in bytes.iter().enumerate() {
         if let Err(error) = stdin.write_all(std::slice::from_ref(byte)) {
-            return error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock;
+            return stdin_write_closed_early(&error);
         }
         if index == 0 {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    stdin_flush_closed_early(&mut stdin)
+}
+
+fn stdin_flush_closed_early(stdin: &mut impl Write) -> bool {
     match stdin.flush() {
         Ok(()) => false,
-        Err(error) => {
-            error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
-        }
+        Err(error) => stdin_write_closed_early(&error),
     }
+}
+
+fn stdin_write_closed_early(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
 }
 
 fn join_capture(handle: thread::JoinHandle<CapturedBytes>) -> CapturedBytes {

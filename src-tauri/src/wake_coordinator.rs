@@ -440,7 +440,10 @@ fn wake_runtime_busy(
     session_id: &str,
     runtime: Option<&SessionRuntimeRow>,
 ) -> Result<bool, WakeDiagnostic> {
-    pty_runtime_is_busy(db, session_id, runtime).map_err(storage_error_diagnostic)
+    let liveness =
+        pty_runtime_liveness(db, session_id, runtime).map_err(storage_error_diagnostic)?;
+    cleanup_idle_runtime(runtime, liveness);
+    Ok(optional_pty_liveness_is_busy(liveness))
 }
 
 fn acquire_startable_wake_claim(
@@ -505,17 +508,15 @@ fn session_runtime_for_wake(
     db.session_runtime(session_id)
 }
 
-fn pty_runtime_is_busy(
+fn pty_runtime_liveness(
     db: &mut MailboxDb,
     session_id: &str,
     runtime: Option<&SessionRuntimeRow>,
-) -> Result<bool, String> {
-    let Some(row) = running_pty_runtime(runtime) else {
-        return Ok(false);
+) -> Result<Option<SessionLiveness>, String> {
+    if running_pty_runtime(runtime).is_none() {
+        return Ok(None);
     };
-    let liveness = session_liveness_for_runtime(db, session_id)?;
-    cleanup_idle_pty_runtime(row, liveness);
-    Ok(pty_liveness_is_busy(liveness))
+    session_liveness_for_runtime(db, session_id).map(Some)
 }
 
 fn running_pty_runtime(runtime: Option<&SessionRuntimeRow>) -> Option<&SessionRuntimeRow> {
@@ -529,10 +530,14 @@ fn session_liveness_for_runtime(
     db.session_liveness(session_id)
 }
 
-fn cleanup_idle_pty_runtime(row: &SessionRuntimeRow, liveness: SessionLiveness) {
-    if liveness == SessionLiveness::Idle {
+fn cleanup_idle_runtime(runtime: Option<&SessionRuntimeRow>, liveness: Option<SessionLiveness>) {
+    if let (Some(row), Some(SessionLiveness::Idle)) = (running_pty_runtime(runtime), liveness) {
         unlink_stale_pty_socket(row.pty_control_path.as_deref());
     }
+}
+
+fn optional_pty_liveness_is_busy(liveness: Option<SessionLiveness>) -> bool {
+    liveness.is_some_and(pty_liveness_is_busy)
 }
 
 fn pty_liveness_is_busy(liveness: SessionLiveness) -> bool {

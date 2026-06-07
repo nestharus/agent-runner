@@ -1,7 +1,10 @@
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
 };
-use oulipoly_provider::generated::{CONTRACT_VERSION, SettingsValues};
+use oulipoly_provider::generated::{
+    CONTRACT_VERSION, SchemaResult, SettingsDeleteResult, SettingsGetResult, SettingsListResult,
+    SettingsMigrateResult, SettingsValidateResult, SettingsValues, SettingsWriteResult,
+};
 use oulipoly_runtime::provider_settings::{ProviderSettingsHost, ProviderSettingsHostOptions};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -50,133 +53,190 @@ fn settings_host_invokes_only_schema_and_settings_subcommands_with_typed_envelop
     let fixture = SettingsHostFixture::new();
     let host = fixture.host();
 
-    let schema = host
-        .settings_schema("example-model", "example.settings/v1")
-        .expect("schema should invoke provider schema subcommand");
-    let records = host
-        .settings_list("example-model")
-        .expect("list should invoke provider settings.list subcommand");
-    let record = host
-        .settings_get("example-model", "record")
-        .expect("get should invoke provider settings.get subcommand");
-    let created = host
-        .settings_create(
-            "example-model",
-            Some("Record".to_owned()),
-            settings_values(),
-        )
-        .expect("create should invoke provider settings.create subcommand");
-    let updated = host
-        .settings_update(
-            "example-model",
-            "record",
-            "opaque-version",
-            settings_values(),
-        )
-        .expect("update should invoke provider settings.update subcommand");
-    let deleted = host
-        .settings_delete("example-model", "record", "opaque-version")
-        .expect("delete should invoke provider settings.delete subcommand");
-    let validation = host
-        .settings_validate("example-model", settings_values())
-        .expect("validate should invoke provider settings.validate subcommand");
-    let migration = host
-        .settings_migrate(
-            "example-model",
-            true,
-            json!({"models": {"example-model": {"provider": {"script": "opaque"}}}}),
-        )
-        .expect("migrate should invoke provider settings.migrate subcommand");
+    let schema = invoke_settings_schema(&host);
+    let records = invoke_settings_list(&host);
+    let record = invoke_settings_get(&host);
+    let created = invoke_settings_create(&host);
+    let updated = invoke_settings_update(&host);
+    let deleted = invoke_settings_delete(&host);
+    let validation = invoke_settings_validate(&host);
+    let migration = invoke_settings_migrate(&host);
 
-    assert_eq!(schema.schema_id, "example.settings/v1");
-    assert_eq!(records.records[0].version, "opaque-version");
-    assert_eq!(record.record.version, "opaque-version");
-    assert_eq!(created.record.version, "provider-created-version");
-    assert_eq!(updated.record.version, "provider-updated-version");
-    assert!(deleted.deleted);
-    assert!(validation.valid);
-    assert_eq!(
-        migration.actions,
-        vec![json!({"kind": "would-write", "target": "record"})]
-    );
+    assert_schema_result(&schema);
+    assert_list_result(&records);
+    assert_get_result(&record);
+    assert_create_result(&created);
+    assert_update_result(&updated);
+    assert_delete_result(&deleted);
+    assert_validate_result(&validation);
+    assert_migrate_result(&migration);
 
     let calls = fixture.recorded_calls();
-    let subcommands = call_subcommands(&calls);
+    assert_settings_call_trace(&calls, &fixture);
+}
+
+fn invoke_settings_schema(host: &ProviderSettingsHost) -> SchemaResult {
+    host.settings_schema("example-model", "example.settings/v1")
+        .expect("schema should invoke provider schema subcommand")
+}
+
+fn invoke_settings_list(host: &ProviderSettingsHost) -> SettingsListResult {
+    host.settings_list("example-model")
+        .expect("list should invoke provider settings.list subcommand")
+}
+
+fn invoke_settings_get(host: &ProviderSettingsHost) -> SettingsGetResult {
+    host.settings_get("example-model", "record")
+        .expect("get should invoke provider settings.get subcommand")
+}
+
+fn invoke_settings_create(host: &ProviderSettingsHost) -> SettingsWriteResult {
+    host.settings_create(
+        "example-model",
+        Some("Record".to_owned()),
+        settings_values(),
+    )
+    .expect("create should invoke provider settings.create subcommand")
+}
+
+fn invoke_settings_update(host: &ProviderSettingsHost) -> SettingsWriteResult {
+    host.settings_update(
+        "example-model",
+        "record",
+        "opaque-version",
+        settings_values(),
+    )
+    .expect("update should invoke provider settings.update subcommand")
+}
+
+fn invoke_settings_delete(host: &ProviderSettingsHost) -> SettingsDeleteResult {
+    host.settings_delete("example-model", "record", "opaque-version")
+        .expect("delete should invoke provider settings.delete subcommand")
+}
+
+fn invoke_settings_validate(host: &ProviderSettingsHost) -> SettingsValidateResult {
+    host.settings_validate("example-model", settings_values())
+        .expect("validate should invoke provider settings.validate subcommand")
+}
+
+fn invoke_settings_migrate(host: &ProviderSettingsHost) -> SettingsMigrateResult {
+    host.settings_migrate("example-model", true, legacy_settings_config())
+        .expect("migrate should invoke provider settings.migrate subcommand")
+}
+
+fn assert_schema_result(schema: &SchemaResult) {
+    assert_eq!(schema.schema_id, "example.settings/v1");
+}
+
+fn assert_list_result(records: &SettingsListResult) {
+    assert_eq!(records.records[0].version, "opaque-version");
+}
+
+fn assert_get_result(record: &SettingsGetResult) {
+    assert_eq!(record.record.version, "opaque-version");
+}
+
+fn assert_create_result(created: &SettingsWriteResult) {
+    assert_eq!(created.record.version, "provider-created-version");
+}
+
+fn assert_update_result(updated: &SettingsWriteResult) {
+    assert_eq!(updated.record.version, "provider-updated-version");
+}
+
+fn assert_delete_result(deleted: &SettingsDeleteResult) {
+    assert!(deleted.deleted);
+}
+
+fn assert_validate_result(validation: &SettingsValidateResult) {
+    assert!(validation.valid);
+}
+
+fn assert_migrate_result(migration: &SettingsMigrateResult) {
+    assert_eq!(migration.actions, expected_migration_actions());
+}
+
+fn expected_migration_actions() -> Vec<Value> {
+    vec![json!({"kind": "would-write", "target": "record"})]
+}
+
+fn legacy_settings_config() -> Value {
+    json!({"models": {"example-model": {"provider": {"script": "opaque"}}}})
+}
+
+fn assert_settings_call_trace(calls: &[RecordedCall], fixture: &SettingsHostFixture) {
+    let subcommands = call_subcommands(calls);
     assert_settings_host_subcommands_are_allowed(&subcommands);
+    assert_non_describe_settings_subcommands(&subcommands);
+    assert_common_settings_call_envelopes(calls, fixture);
+    assert_exact_settings_params(calls, &expected_settings_params());
+}
+
+fn assert_non_describe_settings_subcommands(subcommands: &[&str]) {
     assert_eq!(
-        non_describe_subcommands(&subcommands),
-        vec![
-            "schema",
-            "settings.list",
-            "settings.get",
-            "settings.create",
-            "settings.update",
+        non_describe_subcommands(subcommands),
+        expected_settings_subcommands()
+    );
+}
+
+fn expected_settings_subcommands() -> Vec<&'static str> {
+    vec![
+        "schema",
+        "settings.list",
+        "settings.get",
+        "settings.create",
+        "settings.update",
+        "settings.delete",
+        "settings.validate",
+        "settings.migrate",
+    ]
+}
+
+fn expected_settings_params() -> Vec<(&'static str, Value)> {
+    vec![
+        ("schema", json!({"schema_id": "example.settings/v1"})),
+        ("settings.list", json!({})),
+        ("settings.get", json!({"id": "record"})),
+        ("settings.create", expected_create_params()),
+        ("settings.update", expected_update_params()),
+        (
             "settings.delete",
-            "settings.validate",
-            "settings.migrate",
-        ]
-    );
+            json!({"id": "record", "version": "opaque-version"}),
+        ),
+        ("settings.validate", expected_validate_params()),
+        ("settings.migrate", expected_migrate_params()),
+    ]
+}
 
-    assert_common_settings_call_envelopes(&calls, &fixture);
+fn expected_create_params() -> Value {
+    json!({
+        "display_name": "Record",
+        "values": expected_settings_values_json(),
+    })
+}
 
-    assert_exact_settings_params(
-        &calls,
-        &[
-            ("schema", json!({"schema_id": "example.settings/v1"})),
-            ("settings.list", json!({})),
-            ("settings.get", json!({"id": "record"})),
-            (
-                "settings.create",
-                json!({
-                    "display_name": "Record",
-                    "values": {
-                        "endpoint": "https://example.test",
-                        "enabled": true,
-                        "limit": 3,
-                    },
-                }),
-            ),
-            (
-                "settings.update",
-                json!({
-                    "id": "record",
-                    "version": "opaque-version",
-                    "values": {
-                        "endpoint": "https://example.test",
-                        "enabled": true,
-                        "limit": 3,
-                    },
-                }),
-            ),
-            (
-                "settings.delete",
-                json!({"id": "record", "version": "opaque-version"}),
-            ),
-            (
-                "settings.validate",
-                json!({
-                    "values": {
-                        "endpoint": "https://example.test",
-                        "enabled": true,
-                        "limit": 3,
-                    },
-                }),
-            ),
-            (
-                "settings.migrate",
-                json!({
-                    "dry_run": true,
-                    "legacy": {
-                        "models": {
-                            "example-model": {
-                                "provider": {"script": "opaque"},
-                            },
-                        },
-                    },
-                }),
-            ),
-        ],
-    );
+fn expected_update_params() -> Value {
+    json!({
+        "id": "record",
+        "version": "opaque-version",
+        "values": expected_settings_values_json(),
+    })
+}
+
+fn expected_validate_params() -> Value {
+    json!({"values": expected_settings_values_json()})
+}
+
+fn expected_migrate_params() -> Value {
+    json!({"dry_run": true, "legacy": legacy_settings_config()})
+}
+
+fn expected_settings_values_json() -> Value {
+    json!({
+        "endpoint": "https://example.test",
+        "enabled": true,
+        "limit": 3,
+    })
 }
 
 // risk: Registry/model reload staleness; level: runtime settings host; source: contract "Registry refresh discards stale describe/settings cache by replacing the registry/service instance"

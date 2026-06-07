@@ -17,8 +17,19 @@ const CONTRACT: &str = "oulipoly.provider/v1";
 const REQUEST_ID: &str = "request-example-001";
 
 fn main() {
-    let mode = env::var("FAKE_PROVIDER_MODE").unwrap_or_else(|_| "success".to_owned());
-    let code = match mode.as_str() {
+    exit_fake_provider(dispatch_fake_provider_mode(&fake_provider_mode()));
+}
+
+fn fake_provider_mode() -> String {
+    env::var("FAKE_PROVIDER_MODE").unwrap_or_else(|_| "success".to_owned())
+}
+
+fn exit_fake_provider(code: i32) {
+    std::process::exit(code);
+}
+
+fn dispatch_fake_provider_mode(mode: &str) -> i32 {
+    match mode {
         "record-argv-stdin" => record_argv_stdin(),
         "s5-record-argv-stdin" => record_argv_stdin_with_response_kind(ResponseKind::S5Success),
         "stdin-eof" => stdin_eof(),
@@ -51,44 +62,26 @@ fn main() {
         "s7c-rotation-materialize-crash-after-artifact" => {
             s7c_rotation_materialize_crash_after_artifact()
         }
-        "s7c-rotation-materialize-crash-during-apply" => {
-            let _ = s7c_rotation_materialize_success(true);
-            write_stderr("crash_during_apply\n")
-        }
+        "s7c-rotation-materialize-crash-during-apply" => materialize_crash_during_apply(),
         "s7c-migration-plan-success" => s7c_migration_plan_success(),
         "s7c-migration-plan-protocol-invalid" => s7c_protocol_invalid_after_describe(),
         "s7c-migration-apply-success" => s7c_migration_apply_success(),
         "s7c-migration-apply-protocol-invalid" => s7c_protocol_invalid_after_describe(),
-        "success-then-nonzero" => {
-            success();
-            7
-        }
+        "success-then-nonzero" => success_then_nonzero(),
         "schema-invalid-success" => schema_invalid_success_after_describe(),
-        "invalid-utf8" => {
-            let _ = read_stdin_to_string();
-            write_bytes(&[0xff, 0xfe, 0xfd])
-        }
+        "invalid-utf8" => invalid_utf8(),
         "non-object-array" => read_then_write_stdout("[]\n"),
         "non-object-string" => read_then_write_stdout("\"x\"\n"),
         "non-object-number" => read_then_write_stdout("5\n"),
-        "missing-ok" => read_then_write_stdout(&format!(
-            "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"result\":{{}}}}\n"
-        )),
+        "missing-ok" => read_then_write_stdout(&missing_ok_json()),
         "invalid-json" => read_then_write_stdout("not json\n"),
-        "empty-stdout" => {
-            let _ = read_stdin_to_string();
-            0
-        }
+        "empty-stdout" => empty_stdout(),
         "multiple-json" => write_stdout("{}\n{}\n"),
         "leading-log" => write_stdout("log line\n{}"),
-        "trailing-junk" => write_stdout(&format!("{} junk\n", success_json())),
+        "trailing-junk" => write_stdout(&trailing_junk_json()),
         "stderr-envelope-only" => write_stderr(&success_json()),
-        "mismatched-contract" => {
-            write_stdout(&success_json().replace(CONTRACT, "example.contract/v0"))
-        }
-        "mismatched-request-id" => {
-            write_stdout(&success_json().replace(REQUEST_ID, "request-example-other"))
-        }
+        "mismatched-contract" => write_stdout(&mismatched_contract_json()),
+        "mismatched-request-id" => write_stdout(&mismatched_request_id_json()),
         "large-stdout-stderr" => large_stdout_stderr(),
         "pipe-pressure" => pipe_pressure(),
         "sleep" => sleep_forever(),
@@ -101,79 +94,33 @@ fn main() {
         "early-stdin-empty" => early_stdin_empty(),
         "launch-valid" => launch_valid(0),
         "launch-model-nonzero" => launch_valid(9),
-        "launch-provider-nonzero-after-final" => {
-            launch_valid(0);
-            6
-        }
-        "launch-provider-nonzero-no-final" => {
-            let request_id = read_request_id();
-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
-            8
-        }
-        "launch-cancelled-final-event" => {
-            let request_id = read_request_id();
-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
-            thread::sleep(Duration::from_millis(150));
-            write_jsonl(&cancelled_exit_event(&request_id, 2));
-            0
-        }
+        "launch-provider-nonzero-after-final" => launch_provider_nonzero_after_final(),
+        "launch-provider-nonzero-no-final" => launch_provider_nonzero_no_final(),
+        "launch-cancelled-final-event" => launch_cancelled_final_event(),
         "launch-malformed-line" => write_stdout("{not-json}\n"),
-        "launch-malformed-line-nonzero" => {
-            write_stdout("{not-json}\n");
-            8
-        }
-        "launch-malformed-line-stderr" => {
-            eprintln!("fake-provider launch diagnostic on stderr");
-            write_stdout("{not-json}\n")
-        }
-        "launch-blank-line" => {
-            let request_id = read_request_id();
-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
-            println!("   ");
-            write_jsonl(&exit_event(&request_id, 2, 0));
-            0
-        }
-        "launch-exit-then-large-stdout" => {
-            let request_id = read_request_id();
-            write_jsonl(&exit_event(&request_id, 1, 0));
-            print!("{}", "x".repeat(1024 * 1024));
-            let _ = io::stdout().flush();
-            0
-        }
-        "launch-invalid-base64" => {
-            let request_id = read_request_id();
-            write_jsonl(&stdout_event(&request_id, 1, "@@@"));
-            write_jsonl(&exit_event(&request_id, 2, 0));
-            0
-        }
-        "launch-duplicate-exit" => {
-            let request_id = read_request_id();
-            write_jsonl(&exit_event(&request_id, 1, 0));
-            write_jsonl(&exit_event(&request_id, 2, 0));
-            0
-        }
-        "launch-event-after-exit" => {
-            let request_id = read_request_id();
-            write_jsonl(&exit_event(&request_id, 1, 0));
-            write_jsonl(&stdout_event(&request_id, 2, "Yg=="));
-            0
-        }
-        "launch-partial-hang" => {
-            let request_id = read_request_id();
-            write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
-            let _ = io::stdout().flush();
-            sleep_forever()
-        }
+        "launch-malformed-line-nonzero" => launch_malformed_line_nonzero(),
+        "launch-malformed-line-stderr" => launch_malformed_line_stderr(),
+        "launch-blank-line" => launch_blank_line(),
+        "launch-exit-then-large-stdout" => launch_exit_then_large_stdout(),
+        "launch-invalid-base64" => launch_invalid_base64(),
+        "launch-duplicate-exit" => launch_duplicate_exit(),
+        "launch-event-after-exit" => launch_event_after_exit(),
+        "launch-partial-hang" => launch_partial_hang(),
         "launch-heartbeats-then-exit" => launch_heartbeats_then_exit(),
         "launch-heartbeat-then-child-grandchild-hang" => {
             launch_heartbeat_then_child_grandchild_hang()
         }
-        other => {
-            eprintln!("unknown fake-provider mode: {other}");
-            64
-        }
-    };
-    std::process::exit(code);
+        other => unknown_fake_provider_mode(other),
+    }
+}
+
+fn unknown_fake_provider_mode(mode: &str) -> i32 {
+    eprintln!("{}", unknown_fake_provider_mode_message(mode));
+    64
+}
+
+fn unknown_fake_provider_mode_message(mode: &str) -> String {
+    format!("unknown fake-provider mode: {mode}")
 }
 
 fn read_stdin_to_string() -> String {
@@ -204,6 +151,42 @@ fn write_stderr(text: &str) -> i32 {
     eprint!("{text}");
     let _ = io::stderr().flush();
     0
+}
+
+fn materialize_crash_during_apply() -> i32 {
+    let _ = s7c_rotation_materialize_success(true);
+    write_stderr("crash_during_apply\n")
+}
+
+fn success_then_nonzero() -> i32 {
+    success();
+    7
+}
+
+fn invalid_utf8() -> i32 {
+    let _ = read_stdin_to_string();
+    write_bytes(&[0xff, 0xfe, 0xfd])
+}
+
+fn empty_stdout() -> i32 {
+    let _ = read_stdin_to_string();
+    0
+}
+
+fn missing_ok_json() -> String {
+    format!("{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{REQUEST_ID}\",\"result\":{{}}}}\n")
+}
+
+fn trailing_junk_json() -> String {
+    format!("{} junk\n", success_json())
+}
+
+fn mismatched_contract_json() -> String {
+    success_json().replace(CONTRACT, "example.contract/v0")
+}
+
+fn mismatched_request_id_json() -> String {
+    success_json().replace(REQUEST_ID, "request-example-other")
 }
 
 fn record_argv_stdin() -> i32 {
@@ -265,25 +248,52 @@ fn write_invocation_record(path: &str, text: &str) {
 
 fn record_invocation_if_requested(stdin: &str) {
     increment_count_if_requested();
-    if let Ok(path) = env::var("FAKE_PROVIDER_RECORD_PATH") {
-        let record = InvocationRecord {
-            path,
-            argv: env::args().collect(),
-            stdin: stdin.to_string(),
-        };
+    if let Some(record) = invocation_record_if_requested(stdin) {
         write_invocation_record(&record.path, &format_invocation_record(&record));
     }
 }
 
+fn invocation_record_if_requested(stdin: &str) -> Option<InvocationRecord> {
+    let path = env::var("FAKE_PROVIDER_RECORD_PATH").ok()?;
+    Some(invocation_record(path, stdin))
+}
+
+fn invocation_record(path: String, stdin: &str) -> InvocationRecord {
+    InvocationRecord {
+        path,
+        argv: env::args().collect(),
+        stdin: stdin.to_string(),
+    }
+}
+
 fn increment_count_if_requested() {
-    let Ok(path) = env::var("FAKE_PROVIDER_COUNT_PATH") else {
+    let Some(path) = count_path_if_requested() else {
         return;
     };
-    let current = fs::read_to_string(&path)
+    write_count(&path, incremented_count(read_count(&path)));
+}
+
+fn count_path_if_requested() -> Option<String> {
+    env::var("FAKE_PROVIDER_COUNT_PATH").ok()
+}
+
+fn read_count(path: &str) -> u64 {
+    fs::read_to_string(path)
         .ok()
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    fs::write(path, (current + 1).to_string()).expect("count file should be writable");
+        .and_then(|text| parse_count(&text))
+        .unwrap_or(0)
+}
+
+fn parse_count(text: &str) -> Option<u64> {
+    text.trim().parse().ok()
+}
+
+fn incremented_count(current: u64) -> u64 {
+    current + 1
+}
+
+fn write_count(path: &str, count: u64) {
+    fs::write(path, count.to_string()).expect("count file should be writable");
 }
 
 fn write_response_for_kind(kind: ResponseKind, stdin: Option<&str>) -> i32 {
@@ -316,9 +326,17 @@ fn provider_error_fields<'a>(category: &'a str, code: &'a str) -> ProviderErrorF
     ProviderErrorFields {
         category,
         code,
-        retryable: category == "timeout",
-        message: format!("{category} from fake-provider"),
+        retryable: provider_error_retryable(category),
+        message: provider_error_message(category),
     }
+}
+
+fn provider_error_retryable(category: &str) -> bool {
+    category == "timeout"
+}
+
+fn provider_error_message(category: &str) -> String {
+    format!("{category} from fake-provider")
 }
 
 fn provider_error_json(request_id: &str, fields: &ProviderErrorFields<'_>) -> String {
@@ -371,13 +389,28 @@ fn launch_exit_event_json(request_id: &str, seq: u64, code: i32, signal: &str) -
 
 fn stdin_eof() -> i32 {
     let stdin = read_stdin_to_string();
-    if stdin.is_empty() {
-        eprintln!("stdin was empty before eof");
-        65
-    } else {
-        eprintln!("observed stdin eof");
-        success()
+    write_stdin_eof_result(&stdin)
+}
+
+fn write_stdin_eof_result(stdin: &str) -> i32 {
+    if stdin_empty(stdin) {
+        return write_empty_stdin_eof();
     }
+    write_observed_stdin_eof()
+}
+
+fn stdin_empty(stdin: &str) -> bool {
+    stdin.is_empty()
+}
+
+fn write_empty_stdin_eof() -> i32 {
+    eprintln!("stdin was empty before eof");
+    65
+}
+
+fn write_observed_stdin_eof() -> i32 {
+    eprintln!("observed stdin eof");
+    success()
 }
 
 fn success() -> i32 {
@@ -407,14 +440,14 @@ fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
 }
 
 fn provider_error_after_describe(category: &str, code: &str, exit_code: i32) -> i32 {
-    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
+    if s7c_describe_requested() {
         return describe_with_capabilities(true, true);
     }
     provider_error(category, code, exit_code)
 }
 
 fn exit_nonzero_after_describe() -> i32 {
-    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
+    if s7c_describe_requested() {
         return describe_with_capabilities(true, true);
     }
     let stdin = read_stdin_to_string();
@@ -422,16 +455,25 @@ fn exit_nonzero_after_describe() -> i32 {
     7
 }
 
+fn s7c_describe_requested() -> bool {
+    current_subcommand() == "describe" && s7c_runtime_fixture_requested()
+}
+
 fn schema_invalid_success_after_describe() -> i32 {
-    if current_subcommand() == "describe" && s7c_runtime_fixture_requested() {
+    s7c_runtime_describe_or_else(|| write_recorded_stdout(schema_invalid_success_json))
+}
+
+fn s7c_runtime_describe_or_else(run: impl FnOnce() -> i32) -> i32 {
+    if s7c_describe_requested() {
         return describe_with_capabilities(true, true);
     }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{}\",\"ok\":true,\"result\":{{}}}}\n",
-        request_id_from_stdin(&stdin)
-    ))
+    run()
+}
+
+fn schema_invalid_success_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{}}}}\n"
+    )
 }
 
 fn success_json() -> String {
@@ -450,6 +492,97 @@ fn describe_with_capabilities(rotation: bool, migration: bool) -> i32 {
     ))
 }
 
+fn describe_or_recorded_stdout(format_response: fn(&str) -> String) -> i32 {
+    describe_or_else(|| write_recorded_stdout(format_response))
+}
+
+fn describe_or_materialize_stdout(format_response: impl FnOnce(&str) -> String) -> i32 {
+    describe_or_else(|| write_recorded_materialize_stdout(format_response))
+}
+
+fn describe_or_else(run: impl FnOnce() -> i32) -> i32 {
+    if s7c_describe_subcommand_requested() {
+        return describe_with_capabilities(true, true);
+    }
+    run()
+}
+
+fn s7c_describe_subcommand_requested() -> bool {
+    current_subcommand() == "describe"
+}
+
+fn write_recorded_stdout(format_response: fn(&str) -> String) -> i32 {
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    write_stdout(&format_response(&request_id_from_stdin(&stdin)))
+}
+
+fn write_recorded_materialize_stdout(format_response: impl FnOnce(&str) -> String) -> i32 {
+    let stdin = read_stdin_to_string();
+    record_invocation_if_requested(&stdin);
+    let request_id = request_id_from_stdin(&stdin);
+    write_empty_materialize_artifact();
+    write_stdout(&format_response(&request_id))
+}
+
+fn s7c_rotation_assess_success_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":true,\"score\":80,\"reason\":\"target-provider accepted\",\"requirements\":[]}}}}\n"
+    )
+}
+
+fn s7c_rotation_assess_denied_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":false,\"score\":0,\"reason\":\"target-provider denied\",\"requirements\":[{{\"kind\":\"quota\"}}]}}}}\n"
+    )
+}
+
+fn s7c_rotation_materialize_success_json(request_id: &str, changed: bool) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":{changed},\"target_provider_session_id\":\"{}\",\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+        s7c_target_session_id(),
+        s7c_artifact_json(),
+        s7c_host_state_plan_json()
+    )
+}
+
+fn s7c_rotation_materialize_no_change_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+        s7c_artifact_json(),
+        s7c_host_state_plan_json()
+    )
+}
+
+fn s7c_rotation_materialize_wrong_chain_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
+        s7c_artifact_json(),
+        s7c_host_state_plan_json_with_chain("wrong-chain")
+    )
+}
+
+fn s7c_rotation_materialize_hash_mismatch_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":true,\"target_provider_session_id\":\"{}\",\"artifacts\":[{{\"kind\":\"file\",\"path\":\"{}\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}],\"host_state_plan\":{}}}}}\n",
+        s7c_target_session_id(),
+        json_escape(&s7c_artifact_path()),
+        s7c_host_state_plan_json()
+    )
+}
+
+fn s7c_migration_plan_success_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"actions\":[{{\"kind\":\"noop\"}}],\"warnings\":[],\"requires_backup\":false}}}}\n"
+    )
+}
+
+fn s7c_migration_apply_success_json(request_id: &str) -> String {
+    format!(
+        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"applied_actions\":[{{\"kind\":\"noop\"}}],\"artifacts\":[],\"warnings\":[],\"outcome\":{{\"changed\":false}}}}}}\n"
+    )
+}
+
 fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {
     format!(
         "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"provider_id\":\"fake-provider\",\"display_name\":\"Fake Provider\",\"contract_versions\":[\"{CONTRACT}\"],\"preferred_contract\":\"{CONTRACT}\",\"capabilities\":{{\"launch\":true,\"policy\":false,\"quota\":false,\"session\":false,\"terminal\":false,\"rotation\":{rotation},\"discovery\":false,\"settings\":false,\"setup_brain\":false,\"setup\":false,\"migration\":{migration}}},\"settings_schema_id\":\"fake-settings\",\"concurrency\":{{\"safe_for_parallel_invocation\":true,\"state_locking\":\"host\"}}}}}}\n"
@@ -457,131 +590,52 @@ fn describe_json(request_id: &str, rotation: bool, migration: bool) -> String {
 }
 
 fn s7c_rotation_assess_success() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":true,\"score\":80,\"reason\":\"target-provider accepted\",\"requirements\":[]}}}}\n"
-    ))
+    describe_or_recorded_stdout(s7c_rotation_assess_success_json)
 }
 
 fn s7c_rotation_assess_denied() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"allowed\":false,\"score\":0,\"reason\":\"target-provider denied\",\"requirements\":[{{\"kind\":\"quota\"}}]}}}}\n"
-    ))
+    describe_or_recorded_stdout(s7c_rotation_assess_denied_json)
 }
 
 fn s7c_rotation_materialize_success(changed: bool) -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_empty_materialize_artifact();
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":{changed},\"target_provider_session_id\":\"{}\",\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
-        s7c_target_session_id(),
-        s7c_artifact_json(),
-        s7c_host_state_plan_json()
-    ))
+    describe_or_materialize_stdout(|request_id| {
+        s7c_rotation_materialize_success_json(request_id, changed)
+    })
 }
 
 fn s7c_rotation_materialize_no_change() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
-        s7c_artifact_json(),
-        s7c_host_state_plan_json()
-    ))
+    describe_or_recorded_stdout(s7c_rotation_materialize_no_change_json)
 }
 
 fn s7c_rotation_materialize_no_change_wrong_chain() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":false,\"artifacts\":[{}],\"host_state_plan\":{}}}}}\n",
-        s7c_artifact_json(),
-        s7c_host_state_plan_json_with_chain("wrong-chain")
-    ))
+    describe_or_recorded_stdout(s7c_rotation_materialize_wrong_chain_json)
 }
 
 fn s7c_rotation_materialize_hash_mismatch() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_empty_materialize_artifact();
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"changed\":true,\"target_provider_session_id\":\"{}\",\"artifacts\":[{{\"kind\":\"file\",\"path\":\"{}\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}],\"host_state_plan\":{}}}}}\n",
-        s7c_target_session_id(),
-        json_escape(&s7c_artifact_path()),
-        s7c_host_state_plan_json()
-    ))
+    describe_or_materialize_stdout(s7c_rotation_materialize_hash_mismatch_json)
 }
 
 fn s7c_rotation_materialize_crash_after_artifact() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    s7c_rotation_materialize_hash_mismatch()
+    describe_or_else(s7c_rotation_materialize_hash_mismatch)
 }
 
 fn s7c_rotation_materialize_provider_error(code: &str) -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    provider_error("failed", code, 0)
+    describe_or_else(|| provider_error("failed", code, 0))
 }
 
 fn s7c_migration_plan_success() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"actions\":[{{\"kind\":\"noop\"}}],\"warnings\":[],\"requires_backup\":false}}}}\n"
-    ))
+    describe_or_recorded_stdout(s7c_migration_plan_success_json)
 }
 
 fn s7c_migration_apply_success() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
-    let stdin = read_stdin_to_string();
-    record_invocation_if_requested(&stdin);
-    let request_id = request_id_from_stdin(&stdin);
-    write_stdout(&format!(
-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"ok\":true,\"result\":{{\"applied_actions\":[{{\"kind\":\"noop\"}}],\"artifacts\":[],\"warnings\":[],\"outcome\":{{\"changed\":false}}}}}}\n"
-    ))
+    describe_or_recorded_stdout(s7c_migration_apply_success_json)
 }
 
 fn s7c_protocol_invalid_after_describe() -> i32 {
-    if current_subcommand() == "describe" {
-        return describe_with_capabilities(true, true);
-    }
+    describe_or_else(write_recorded_invalid_protocol)
+}
+
+fn write_recorded_invalid_protocol() -> i32 {
     let stdin = read_stdin_to_string();
     record_invocation_if_requested(&stdin);
     write_stdout("not json\n")
@@ -600,28 +654,53 @@ fn s7c_host_state_plan_json() -> String {
 }
 
 fn s7c_host_state_plan_json_with_chain(chain_id: &str) -> String {
-    let source_provider = s7c_env_or("S7C_SOURCE_PROVIDER", "source-provider");
-    let target_provider = s7c_env_or("S7C_TARGET_PROVIDER", "target-provider");
-    let source_session = s7c_env_or("S7C_SOURCE_SESSION_ID", "session-source");
-    let target_session = s7c_target_session_id();
+    let values = s7c_host_state_values(chain_id);
+    format_s7c_host_state_plan(&values)
+}
+
+struct S7cHostStateValues {
+    chain_id: String,
+    source_provider: String,
+    target_provider: String,
+    source_session: String,
+    target_session: String,
+}
+
+fn s7c_host_state_values(chain_id: &str) -> S7cHostStateValues {
+    S7cHostStateValues {
+        chain_id: chain_id.to_string(),
+        source_provider: s7c_env_or("S7C_SOURCE_PROVIDER", "source-provider"),
+        target_provider: s7c_env_or("S7C_TARGET_PROVIDER", "target-provider"),
+        source_session: s7c_env_or("S7C_SOURCE_SESSION_ID", "session-source"),
+        target_session: s7c_target_session_id(),
+    }
+}
+
+fn format_s7c_host_state_plan(values: &S7cHostStateValues) -> String {
     format!(
         "{{\"schema_version\":1,\"operation\":\"rotation.materialize\",\"chain_id\":\"{}\",\"source_provider\":\"{}\",\"target_provider\":\"{}\",\"source_session_id\":\"{}\",\"target_session_id\":\"{}\",\"transition_reason\":\"quota_threshold\",\"segments\":[{{\"provider\":\"{}\",\"session_id\":\"{}\",\"ended_at\":\"2026-05-01T00:00:00Z\"}},{{\"provider\":\"{}\",\"session_id\":\"{}\",\"started_at\":\"2026-05-01T00:00:00Z\"}}],\"artifacts\":[{}]}}",
-        json_escape(chain_id),
-        json_escape(&source_provider),
-        json_escape(&target_provider),
-        json_escape(&source_session),
-        json_escape(&target_session),
-        json_escape(&source_provider),
-        json_escape(&source_session),
-        json_escape(&target_provider),
-        json_escape(&target_session),
+        json_escape(&values.chain_id),
+        json_escape(&values.source_provider),
+        json_escape(&values.target_provider),
+        json_escape(&values.source_session),
+        json_escape(&values.target_session),
+        json_escape(&values.source_provider),
+        json_escape(&values.source_session),
+        json_escape(&values.target_provider),
+        json_escape(&values.target_session),
         s7c_artifact_json()
     )
 }
 
 fn write_empty_materialize_artifact() {
-    let artifact_path = s7c_artifact_path();
-    let path = std::path::Path::new(&artifact_path);
+    write_empty_file(&materialize_artifact_path());
+}
+
+fn materialize_artifact_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(s7c_artifact_path())
+}
+
+fn write_empty_file(path: &std::path::Path) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -661,22 +740,34 @@ fn large_stdout_stderr() -> i32 {
 }
 
 fn pipe_pressure() -> i32 {
-    let stdout_thread = thread::spawn(|| {
-        for _ in 0..128 {
-            print!("{}", "o".repeat(8192));
-            let _ = io::stdout().flush();
-        }
-    });
-    let stderr_thread = thread::spawn(|| {
-        for _ in 0..128 {
-            eprint!("{}", "e".repeat(8192));
-            let _ = io::stderr().flush();
-        }
-    });
+    let stdout_thread = thread::spawn(write_stdout_pressure_blocks);
+    let stderr_thread = thread::spawn(write_stderr_pressure_blocks);
     let _ = read_stdin_to_string();
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     0
+}
+
+fn write_stdout_pressure_blocks() {
+    for _ in 0..128 {
+        print!("{}", stdout_pressure_block());
+        let _ = io::stdout().flush();
+    }
+}
+
+fn write_stderr_pressure_blocks() {
+    for _ in 0..128 {
+        eprint!("{}", stderr_pressure_block());
+        let _ = io::stderr().flush();
+    }
+}
+
+fn stdout_pressure_block() -> String {
+    "o".repeat(8192)
+}
+
+fn stderr_pressure_block() -> String {
+    "e".repeat(8192)
 }
 
 fn sleep_forever() -> i32 {
@@ -761,13 +852,25 @@ fn ignore_sigterm() {
 fn ignore_sigterm() {}
 
 fn write_probe_pid(label: &str) {
-    let Ok(root) = env::var("FAKE_PROVIDER_PROBE_DIR") else {
+    let Some(root) = probe_root() else {
         return;
     };
-    let root = std::path::PathBuf::from(root);
-    let _ = fs::create_dir_all(&root);
-    let pid = std::process::id();
-    let _ = fs::write(root.join(format!("{label}-{pid}.pid")), pid.to_string());
+    write_pid_file(&root, label, std::process::id());
+}
+
+fn probe_root() -> Option<std::path::PathBuf> {
+    env::var("FAKE_PROVIDER_PROBE_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+fn write_pid_file(root: &std::path::Path, label: &str, pid: u32) {
+    let _ = fs::create_dir_all(root);
+    let _ = fs::write(probe_pid_path(root, label, pid), pid.to_string());
+}
+
+fn probe_pid_path(root: &std::path::Path, label: &str, pid: u32) -> std::path::PathBuf {
+    root.join(format!("{label}-{pid}.pid"))
 }
 
 fn early_stdin_success() -> i32 {
@@ -796,6 +899,83 @@ fn launch_valid(exit_code: i32) -> i32 {
     write_jsonl(&heartbeat_event(&request_id, 4));
     write_jsonl(&exit_event(&request_id, 5, exit_code));
     0
+}
+
+fn launch_provider_nonzero_after_final() -> i32 {
+    launch_valid(0);
+    6
+}
+
+fn launch_provider_nonzero_no_final() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    8
+}
+
+fn launch_cancelled_final_event() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    thread::sleep(Duration::from_millis(150));
+    write_jsonl(&cancelled_exit_event(&request_id, 2));
+    0
+}
+
+fn launch_malformed_line_nonzero() -> i32 {
+    write_stdout("{not-json}\n");
+    8
+}
+
+fn launch_malformed_line_stderr() -> i32 {
+    eprintln!("fake-provider launch diagnostic on stderr");
+    write_stdout("{not-json}\n")
+}
+
+fn launch_blank_line() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    println!("   ");
+    write_jsonl(&exit_event(&request_id, 2, 0));
+    0
+}
+
+fn launch_exit_then_large_stdout() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&exit_event(&request_id, 1, 0));
+    print!("{}", large_launch_stdout_block());
+    let _ = io::stdout().flush();
+    0
+}
+
+fn large_launch_stdout_block() -> String {
+    "x".repeat(1024 * 1024)
+}
+
+fn launch_invalid_base64() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "@@@"));
+    write_jsonl(&exit_event(&request_id, 2, 0));
+    0
+}
+
+fn launch_duplicate_exit() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&exit_event(&request_id, 1, 0));
+    write_jsonl(&exit_event(&request_id, 2, 0));
+    0
+}
+
+fn launch_event_after_exit() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&exit_event(&request_id, 1, 0));
+    write_jsonl(&stdout_event(&request_id, 2, "Yg=="));
+    0
+}
+
+fn launch_partial_hang() -> i32 {
+    let request_id = read_request_id();
+    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+    let _ = io::stdout().flush();
+    sleep_forever()
 }
 
 fn launch_heartbeats_then_exit() -> i32 {
