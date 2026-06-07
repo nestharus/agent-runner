@@ -1,0 +1,461 @@
+diff --git a/.gitignore b/.gitignore
+index e3bd147..d1b144c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -49,3 +49,4 @@ CODERABBIT_*.md
+ 
+ # Worktrees (per-PR isolation for phase 6)
+ /worktrees/
++.scratch/
+diff --git a/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs b/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+index bc78d6f..1f2bf8a 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+@@ -51,10 +51,7 @@ pub(super) fn supervised_output_from_terminal(
+             terminal_status.clone(),
+         )
+     });
+-    let exit_code = real_status
+-        .as_ref()
+-        .map(exit_code_from_status)
+-        .unwrap_or_else(|| synthetic_exit_code(&terminal_signal));
++    let exit_code = supervised_exit_code(&terminal_signal, real_status.as_ref());
+     let terminal_reason = terminal_reason_from_signal(&terminal_signal, real_status.as_ref());
+ 
+     SupervisedOutput {
+@@ -66,3 +63,77 @@ pub(super) fn supervised_output_from_terminal(
+         streamed_session_id: None,
+     }
+ }
++
++fn supervised_exit_code(terminal_signal: &TerminalSignal, real_status: Option<&ExitStatus>) -> i32 {
++    let synthetic = synthetic_exit_code(terminal_signal);
++    let Some(status) = real_status else {
++        return synthetic;
++    };
++    let real = exit_code_from_status(status);
++    if real == 0 && synthetic != 0 {
++        return synthetic;
++    }
++    real
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::executor::cli::provider_identity::ProviderRecognizer;
++    use crate::executor::terminal_signal::{TerminalSignalKind, TerminalStatusEvidence};
++
++    const INCIDENT_SQLITE_ERROR_EVENT: &[u8] = br#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#;
++
++    #[cfg(unix)]
++    #[test]
++    fn opencode_terminal_structured_error_exit_zero_carries_failure_reason_evidence() {
++        use std::os::unix::process::ExitStatusExt;
++
++        let output = supervised_output_from_terminal(
++            "opencode",
++            ProviderRecognizer::OpenCode,
++            INCIDENT_SQLITE_ERROR_EVENT.to_vec(),
++            Vec::new(),
++            TerminalStatusEvidence::Exited { code: 0 },
++            None,
++            Some(std::process::ExitStatus::from_raw(0)),
++        );
++
++        assert_eq!(output.exit_code, -1);
++        assert_eq!(output.terminal_signal.kind, TerminalSignalKind::Unknown);
++        let reason = output
++            .terminal_reason
++            .as_deref()
++            .expect("terminal structured errors must surface a terminal_reason");
++        assert!(
++            reason.contains("Failed to execute statement"),
++            "terminal_reason should retain the incident message: {reason}"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn opencode_error_event_followed_by_later_event_preserves_clean_exit() {
++        use std::os::unix::process::ExitStatusExt;
++
++        let output = supervised_output_from_terminal(
++            "opencode",
++            ProviderRecognizer::OpenCode,
++            concat!(
++                r#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#,
++                "\n",
++                r#"{"type":"assistant","message":"continued after transient provider error"}"#
++            )
++            .as_bytes()
++            .to_vec(),
++            Vec::new(),
++            TerminalStatusEvidence::Exited { code: 0 },
++            None,
++            Some(std::process::ExitStatus::from_raw(0)),
++        );
++
++        assert_eq!(output.exit_code, 0);
++        assert_eq!(output.terminal_signal.kind, TerminalSignalKind::CleanExit);
++        assert_eq!(output.terminal_reason, None);
++    }
++}
+diff --git a/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs b/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+index d15c169..2bb7464 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+@@ -40,6 +40,7 @@
+ //!       - terminal status and synthetic exit-code mapping
+ //!       - built-in terminal evidence construction
+ //!       - terminal reason canonicalization hook
++//!       - provider-error terminal-reason evidence preservation for Unknown signals
+ //! ```
+ 
+ #[cfg(unix)]
+@@ -60,6 +61,8 @@ use crate::executor::terminal_signal::{
+     TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalStatusEvidence,
+ };
+ 
++const PROVIDER_ERROR_EVIDENCE_PREFIX: &str = "provider error: ";
++
+ pub fn classify_terminal_reason(status: &std::process::ExitStatus) -> Option<String> {
+     if let Some(code) = status.code() {
+         return (code != 0).then(|| "exit_nonzero".to_string());
+@@ -157,16 +160,24 @@ pub(super) fn terminal_reason_from_signal(
+         | TerminalSignalKind::QuotaExhaustedInband
+         | TerminalSignalKind::MaybeQuotaExhausted
+         | TerminalSignalKind::RateLimited
+-        | TerminalSignalKind::SpawnError
+-        | TerminalSignalKind::Unknown => {
++        | TerminalSignalKind::SpawnError => {
+             crate::diagnostics::canonical_terminal_reason_for_kind(signal.kind).map(str::to_string)
+         }
++        TerminalSignalKind::Unknown => unknown_terminal_reason(signal),
+         TerminalSignalKind::CleanExit
+         | TerminalSignalKind::NonzeroExit
+         | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
+     }
+ }
+ 
++fn unknown_terminal_reason(signal: &TerminalSignal) -> Option<String> {
++    let evidence = signal.evidence.trim();
++    if evidence.starts_with(PROVIDER_ERROR_EVIDENCE_PREFIX) {
++        return Some(signal.evidence.clone());
++    }
++    crate::diagnostics::canonical_terminal_reason_for_kind(signal.kind).map(str::to_string)
++}
++
+ pub(super) fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {
+     match signal.kind {
+         TerminalSignalKind::CleanExit => 0,
+diff --git a/crates/oulipoly-runtime/src/executor/providers/opencode.rs b/crates/oulipoly-runtime/src/executor/providers/opencode.rs
+index b5aaeb7..f59b7e8 100644
+--- a/crates/oulipoly-runtime/src/executor/providers/opencode.rs
++++ b/crates/oulipoly-runtime/src/executor/providers/opencode.rs
+@@ -47,13 +47,10 @@ fn opencode_json_error_signal(
+ 
+ fn json_error_signal_from_stream(bytes: &[u8]) -> Option<(TerminalSignalKind, String)> {
+     let text = stream_text(bytes);
+-    for line in non_empty_stream_lines(text.as_ref()) {
+-        let Some(kind) = json_error_line_kind(line) else {
+-            continue;
+-        };
+-        return Some((kind, json_error_line_evidence(line)));
+-    }
+-    None
++    let lines = non_empty_stream_lines(text.as_ref());
++    let line = lines.last()?;
++    let kind = json_error_line_kind(line)?;
++    Some((kind, json_error_line_evidence(line)))
+ }
+ 
+ fn stream_text(bytes: &[u8]) -> Cow<'_, str> {
+@@ -61,14 +58,36 @@ fn stream_text(bytes: &[u8]) -> Cow<'_, str> {
+ }
+ 
+ fn non_empty_stream_lines(text: &str) -> Vec<&str> {
+-    text.lines()
+-        .map(str::trim)
+-        .filter(|line| !line.is_empty())
+-        .collect()
++    retain_non_empty_lines(trimmed_stream_lines(text))
++}
++
++fn trimmed_stream_lines(text: &str) -> Vec<&str> {
++    text.lines().map(str::trim).collect()
++}
++
++fn retain_non_empty_lines(lines: Vec<&str>) -> Vec<&str> {
++    lines.into_iter().filter(|line| !line.is_empty()).collect()
+ }
+ 
+ fn json_error_line_evidence(line: &str) -> String {
+-    bounded_excerpt(line, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
++    let evidence = parse_json_error_line(line)
++        .and_then(|value| json_error_evidence_from_value(&value))
++        .unwrap_or_else(|| line.to_string());
++    bounded_excerpt(&evidence, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
++}
++
++fn json_error_evidence_from_value(value: &Value) -> Option<String> {
++    let error = json_error_event_error(value)?;
++    Some(json_error_evidence(error))
++}
++
++fn json_error_evidence(error: &Value) -> String {
++    let name = error_name(error).unwrap_or("unknown");
++    let message = error_message(error);
++    if message.is_empty() {
++        return format!("provider error: opencode {name}");
++    }
++    format!("provider error: opencode {name}: {message}")
+ }
+ 
+ fn json_error_line_kind(line: &str) -> Option<TerminalSignalKind> {
+@@ -103,7 +122,7 @@ fn terminal_signal_kind_from_json_error(
+     if error_reports_persistent_quota(lower_message) {
+         return Some(TerminalSignalKind::QuotaExhaustedInband);
+     }
+-    None
++    Some(TerminalSignalKind::Unknown)
+ }
+ 
+ fn error_status_code(error: &Value) -> Option<i64> {
+@@ -126,6 +145,10 @@ fn error_message(error: &Value) -> String {
+         .to_string()
+ }
+ 
++fn error_name(error: &Value) -> Option<&str> {
++    value_at_paths(error, &["/name", "/data/name"]).and_then(Value::as_str)
++}
++
+ fn value_at_paths<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a Value> {
+     paths.iter().find_map(|path| value.pointer(path))
+ }
+@@ -162,12 +185,22 @@ mod tests {
+     };
+     use std::time::SystemTime;
+ 
++    const INCIDENT_SQLITE_ERROR_EVENT: &[u8] = br#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#;
++
+     fn evidence(stdout: &'static [u8], stderr: &'static [u8]) -> TerminalSignalEvidence<'static> {
++        evidence_with_status(stdout, stderr, TerminalStatusEvidence::Exited { code: 1 })
++    }
++
++    fn evidence_with_status(
++        stdout: &'static [u8],
++        stderr: &'static [u8],
++        terminal_status: TerminalStatusEvidence,
++    ) -> TerminalSignalEvidence<'static> {
+         TerminalSignalEvidence {
+             provider_name: "opencode",
+             stdout,
+             stderr,
+-            terminal_status: TerminalStatusEvidence::Exited { code: 1 },
++            terminal_status,
+             observed_at: SystemTime::UNIX_EPOCH,
+         }
+     }
+@@ -193,12 +226,67 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn unrelated_error_falls_back_to_nonzero_exit() {
++    fn terminal_unrelated_error_uses_structured_error_evidence_before_nonzero_exit() {
+         let signal = Recognizer.recognize(&evidence(
+             br#"{"type":"error","error":{"data":{"message":"syntax error"}}}"#,
+             b"",
+         ));
+ 
++        assert_eq!(signal.kind, TerminalSignalKind::Unknown);
++        assert!(signal.evidence.contains("syntax error"));
++    }
++
++    #[test]
++    fn terminal_structured_error_exit_zero_maps_to_failure_signal_with_incident_evidence() {
++        let signal = Recognizer.recognize(&evidence_with_status(
++            INCIDENT_SQLITE_ERROR_EVENT,
++            b"",
++            TerminalStatusEvidence::Exited { code: 0 },
++        ));
++
++        assert_eq!(signal.kind, TerminalSignalKind::Unknown);
++        assert!(
++            signal.evidence.contains("Failed to execute statement"),
++            "signal evidence should retain the incident message: {}",
++            signal.evidence
++        );
++    }
++
++    #[test]
++    fn recovered_session_error_followed_by_later_event_preserves_clean_exit() {
++        let signal = Recognizer.recognize(&evidence_with_status(
++            concat!(
++                r#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#,
++                "\n",
++                r#"{"type":"assistant","message":"continued after transient provider error"}"#
++            )
++            .as_bytes(),
++            b"",
++            TerminalStatusEvidence::Exited { code: 0 },
++        ));
++
++        assert_eq!(signal.kind, TerminalSignalKind::CleanExit);
++    }
++
++    #[test]
++    fn ordinary_output_quota_and_rate_text_preserves_clean_exit() {
++        let signal = Recognizer.recognize(&evidence_with_status(
++            b"assistant mentioned quota exhausted and rate limit exceeded without an error event",
++            b"",
++            TerminalStatusEvidence::Exited { code: 0 },
++        ));
++
++        assert_eq!(signal.kind, TerminalSignalKind::CleanExit);
++    }
++
++    #[test]
++    fn ordinary_output_quota_and_rate_text_preserves_nonzero_exit() {
++        let signal = Recognizer.recognize(&evidence_with_status(
++            b"assistant mentioned quota exhausted and rate limit exceeded without an error event",
++            b"",
++            TerminalStatusEvidence::Exited { code: 1 },
++        ));
++
+         assert_eq!(signal.kind, TerminalSignalKind::NonzeroExit);
+     }
+ }
+diff --git a/src-tauri/tests/opencode_terminal_error_exit_zero.rs b/src-tauri/tests/opencode_terminal_error_exit_zero.rs
+new file mode 100644
+index 0000000..3de254b
+--- /dev/null
++++ b/src-tauri/tests/opencode_terminal_error_exit_zero.rs
+@@ -0,0 +1,127 @@
++#![cfg(unix)]
++
++mod age153_support;
++
++use age153_support::{Age153Fixture, assert_result_envelope_shape};
++use oulipoly_state::InvocationStatus;
++
++const INCIDENT_MODEL: &str = "age-opencode-incident";
++const INCIDENT_PROVIDER: &str = "opencode";
++const INCIDENT_SQLITE_ERROR_EVENT: &str = r#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#;
++const RECOVERED_EVENT: &str =
++    r#"{"type":"assistant","message":"continued after transient provider error"}"#;
++const INCIDENT_TERMINAL_REASON: &str =
++    "provider error: opencode UnknownError: Failed to execute statement";
++
++#[test]
++fn opencode_terminal_error_exit_zero_finalizes_one_shot_as_failed() {
++    let fixture = opencode_fixture_with_body(
++        INCIDENT_MODEL,
++        &opencode_body(&[INCIDENT_SQLITE_ERROR_EVENT]),
++    );
++
++    let output = fixture.run_one_shot(INCIDENT_MODEL);
++
++    assert_ne!(output.status.code(), Some(0), "{output:?}");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let result = assert_result_envelope_shape(&stdout);
++    assert_eq!(result["status"], "failed");
++    assert_eq!(result["success"], false);
++    assert_eq!(result["exit_code"], -1);
++    assert_eq!(result["terminal_reason"], INCIDENT_TERMINAL_REASON);
++    assert_invocation_row(
++        &fixture,
++        InvocationStatus::Failed,
++        0,
++        -1,
++        Some(INCIDENT_TERMINAL_REASON),
++    );
++}
++
++#[test]
++fn opencode_error_event_followed_by_later_event_finalizes_one_shot_as_succeeded() {
++    let fixture = opencode_fixture_with_body(
++        INCIDENT_MODEL,
++        &opencode_body(&[INCIDENT_SQLITE_ERROR_EVENT, RECOVERED_EVENT]),
++    );
++
++    let output = fixture.run_one_shot(INCIDENT_MODEL);
++
++    assert_eq!(output.status.code(), Some(0), "{output:?}");
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let result = assert_result_envelope_shape(&stdout);
++    assert_eq!(result["status"], "succeeded");
++    assert_eq!(result["success"], true);
++    assert_eq!(result["exit_code"], 0);
++    assert!(result["terminal_reason"].is_null(), "{result}");
++    assert_invocation_row(&fixture, InvocationStatus::Succeeded, 1, 0, None);
++}
++
++#[test]
++fn opencode_terminal_error_exit_zero_finalizes_resume_as_failed() {
++    let fixture = Age153Fixture::new();
++    fixture.write_resume_pool(
++        INCIDENT_MODEL,
++        &[(
++            INCIDENT_PROVIDER,
++            opencode_body(&[INCIDENT_SQLITE_ERROR_EVENT]),
++        )],
++    );
++    fixture.seed_active_chain(INCIDENT_PROVIDER, INCIDENT_MODEL);
++
++    let output = fixture.run_resume(INCIDENT_MODEL);
++
++    assert_ne!(output.status.code(), Some(0), "{output:?}");
++    assert_invocation_row(
++        &fixture,
++        InvocationStatus::Failed,
++        0,
++        -1,
++        Some(INCIDENT_TERMINAL_REASON),
++    );
++}
++
++fn opencode_fixture_with_body(model_name: &str, body: &str) -> Age153Fixture {
++    let fixture = Age153Fixture::new();
++    fixture.write_model(model_name, &[INCIDENT_PROVIDER]);
++    fixture.write_providers_with_bodies(&[(INCIDENT_PROVIDER, body)]);
++    fixture
++}
++
++fn opencode_body(lines: &[&str]) -> String {
++    let mut body = lines
++        .iter()
++        .map(|line| format!("printf '%s\\n' '{line}'"))
++        .collect::<Vec<_>>()
++        .join("\n");
++    body.push_str("\nexit 0");
++    body
++}
++
++fn fetch_invocation_row(fixture: &Age153Fixture) -> (String, i64, i64, Option<String>) {
++    fixture
++        .conn()
++        .query_row(
++            "SELECT status, success, exit_code, terminal_reason
++             FROM invocations
++             WHERE provider_name = ?1",
++            [INCIDENT_PROVIDER],
++            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
++        )
++        .unwrap()
++}
++
++fn assert_invocation_row(
++    fixture: &Age153Fixture,
++    expected_status: InvocationStatus,
++    expected_success: i64,
++    expected_exit_code: i64,
++    expected_terminal_reason: Option<&str>,
++) {
++    let (status, success, exit_code, terminal_reason) = fetch_invocation_row(fixture);
++
++    assert_eq!(status, expected_status.as_str());
++    assert_eq!(success, expected_success);
++    assert_eq!(exit_code, expected_exit_code);
++    assert_eq!(terminal_reason.as_deref(), expected_terminal_reason);
++}

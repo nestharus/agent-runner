@@ -1,0 +1,5 @@
+.gitignore
+crates/oulipoly-runtime/src/executor/cli/supervision/terminal_outcome.rs
+crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+crates/oulipoly-runtime/src/executor/providers/opencode.rs
+src-tauri/tests/opencode_terminal_error_exit_zero.rs
