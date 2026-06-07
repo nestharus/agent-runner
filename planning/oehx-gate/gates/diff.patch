@@ -582,7 +582,7 @@ index d27d20b..c5a6e1e 100644
      }
  }
 diff --git a/src-tauri/tests/s10_external_provider_resume.rs b/src-tauri/tests/s10_external_provider_resume.rs
-index 059ebd2..21c6ae5 100644
+index 059ebd2..7315929 100644
 --- a/src-tauri/tests/s10_external_provider_resume.rs
 +++ b/src-tauri/tests/s10_external_provider_resume.rs
 @@ -1,5 +1,18 @@
@@ -590,12 +590,12 @@ index 059ebd2..21c6ae5 100644
  
 +//! ## Declared roles
 +//!
-+//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate.
++//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate, filter.
 +//!
 +//! TEST: external-provider launch/resume end-to-end fixtures — fake provider
 +//! CLI script formatters, fixture model mappers, record accessors, JSON/record
-+//! parsers, allowed-subcommand predicates, envelope/row validators, and test
-+//! orchestration.
++//! parsers, allowed-subcommand predicates, record-line/subcommand filters,
++//! envelope/row validators, and test orchestration.
 +
 +mod age153_support;
 +
