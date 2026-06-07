@@ -1,0 +1,3205 @@
+diff --git a/crates/oulipoly-provider/src/client.rs b/crates/oulipoly-provider/src/client.rs
+index 8667460..b8c129c 100644
+--- a/crates/oulipoly-provider/src/client.rs
++++ b/crates/oulipoly-provider/src/client.rs
+@@ -1,14 +1,64 @@
++//! ## Declared roles
++//!
++//! Roles: orchestration, validator, parser, mapper, accessor, predicate.
++//!
++//! - orchestration: `ProviderClient::{invoke_typed, invoke_json, launch}`
++//!   sequence schema checks, artifact resolution, subprocess execution,
++//!   launch-stream processing, diagnostics capture, and result delivery.
++//! - validator: `validate_json_request`, `validate_launch_request`,
++//!   `validate_json_success_envelope`, `validate_json_error_envelope`, and
++//!   the stdout-presence/limit/object-shape guards enforce host/provider
++//!   protocol invariants before mapping outcomes.
++//! - parser: `parse_one_stdout_object`, `parse_stdout_utf8`, and
++//!   `parse_stdout_json_value` parse one non-launch provider stdout envelope.
++//! - mapper: `map_json_invocation_outcome`, `map_valid_json_success_outcome`,
++//!   `map_valid_json_provider_error_outcome`, the `map_*_error` helpers,
++//!   `process_limits_for`, `process_command_from_resolved`,
++//!   `launch_diagnostics`, and `parse_launch_output` translate process,
++//!   schema, and stream outcomes into provider-client results/errors.
++//! - accessor: `ProviderClient::options`, `last_diagnostics`,
++//!   `last_invocation_argv`, `ProviderEnv::into_env_vec`, and
++//!   `response_envelope_ok` expose option, environment, and envelope fields.
++//! - predicate: `success_envelope_has_nonzero_process`, `provider_nonzero`,
++//!   and `trailing_stdout_error_kind` classify outcome and stdout conditions.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-provider/src/client.rs
++//!     role: adapter
++//!     Translates:
++//!       - provider-client-options-contract
++//!       - provider-cli-subprocess-contract
++//!       - oulipoly-provider-generated-dto-contract
++//!       - launch-jsonl-stream-contract
++//!       - byte-limit-capture-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/src/client.rs
++//!     role: intrinsic-surface
++//!     Domain: provider client transport orchestration
++//!     Owns:
++//!       - provider timeout and output-limit defaults
++//!       - typed JSON invocation and launch entrypoints
++//!       - request validation and response-envelope protocol mapping
++//!       - stdout envelope parsing and launch stdout stream handoff
++//!       - process diagnostics and last-invocation argv capture
++//! ```
++
+ use crate::error::{
+     HostErrorKind, ProviderCapabilityError, ProviderClientError, ProviderDiagnostics,
+     check_contract_and_request, request_id_from,
+ };
+ use crate::generated::ProcessStatus;
+-use crate::process::{ByteLimit, ProcessCommand, ProcessLimits, ProcessOutcome, ProcessRunner};
++use crate::process::{
++    ByteLimit, ProcessCommand, ProcessLimits, ProcessOutcome, ProcessRunner, StdoutDrainOutput,
++};
+ use crate::resolver::{
+     ProviderArtifactRef, ProviderResolveOptions, ProviderResolver, ResolvedProviderCommand,
+ };
+ use crate::schemas::{SchemaRegistry, SchemaValidationError};
+-use crate::stream::{LaunchJsonlReader, LaunchResult};
++use crate::stream::{LaunchResult, LaunchStdoutDrain, LaunchStdoutProcessor};
+ use serde::de::DeserializeOwned;
+ use serde_json::Value;
+ use std::ffi::OsString;
+@@ -253,25 +303,17 @@ impl ProviderClient {
+         let registry = SchemaRegistry::new();
+         validate_launch_request(&registry, &request, request_id.clone())?;
+         let resolved = self.resolve("launch", request_id.clone())?;
+-        let outcome = self.run_resolved(
+-            "launch",
+-            &resolved,
+-            request,
+-            envs,
+-            self.options.timeouts.launch,
+-        )?;
++        let outcome = self.run_launch_resolved(&resolved, request, envs)?;
+         let diagnostics = launch_diagnostics(&outcome);
+         self.record_process_state(&outcome, &diagnostics);
+-        ensure_launch_stdout_within_limit(&diagnostics, request_id.clone(), &outcome.status)?;
+-        parse_launch_output(
+-            outcome.stdout.bytes,
+-            diagnostics,
+-            outcome.status,
+-            request_id,
+-        )
++        parse_launch_output(outcome.stdout, diagnostics, outcome.status)
+     }
+ 
+-    fn record_process_state(&self, outcome: &ProcessOutcome, diagnostics: &ProviderDiagnostics) {
++    fn record_process_state<T: StdoutDrainOutput>(
++        &self,
++        outcome: &ProcessOutcome<T>,
++        diagnostics: &ProviderDiagnostics,
++    ) {
+         *self
+             .last_argv
+             .lock()
+@@ -322,6 +364,32 @@ impl ProviderClient {
+         };
+         result.map_err(|error| error.with_request_id_if_missing(request_id))
+     }
++
++    fn run_launch_resolved<I>(
++        &self,
++        resolved: &ResolvedProviderCommand,
++        request: Value,
++        envs: I,
++    ) -> Result<ProcessOutcome<LaunchStdoutDrain>, ProviderClientError>
++    where
++        I: ProviderEnv,
++    {
++        let request_id = request_id_from(&request);
++        let request_bytes = serialize_request_bytes("launch", &request, request_id.clone())?;
++        let limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
++        let command = process_command_from_resolved(resolved, "launch");
++        let stdout_processor =
++            LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit);
++        let runner = ProcessRunner::new(limits);
++        runner
++            .run_with_stdout_line_gap_timeout_and_stdout_processor(
++                command,
++                request_bytes,
++                envs.into_env_vec(),
++                stdout_processor,
++            )
++            .map_err(|error| error.with_request_id_if_missing(request_id))
++    }
+ }
+ 
+ fn deserialize_typed_result<T>(subcommand: &str, envelope: Value) -> Result<T, ProviderClientError>
+@@ -479,6 +547,15 @@ fn map_json_success_outcome(
+     request_id: &Option<String>,
+ ) -> Result<Value, ProviderClientError> {
+     validate_json_success_envelope(registry, subcommand, &envelope, &diagnostics, request_id)?;
++    map_valid_json_success_outcome(subcommand, envelope, outcome, diagnostics)
++}
++
++fn map_valid_json_success_outcome(
++    subcommand: &str,
++    envelope: Value,
++    outcome: &ProcessOutcome,
++    diagnostics: ProviderDiagnostics,
++) -> Result<Value, ProviderClientError> {
+     if success_envelope_has_nonzero_process(outcome) {
+         return Err(ProviderClientError::host_transport(
+             HostErrorKind::ProviderProcessNonzeroWithSuccess,
+@@ -499,16 +576,35 @@ fn map_json_provider_error_outcome(
+     request_id: &Option<String>,
+ ) -> Result<Value, ProviderClientError> {
+     validate_json_error_envelope(registry, subcommand, &envelope, &diagnostics, request_id)?;
+-    Err(ProviderClientError::from_capability(
+-        ProviderCapabilityError::from_valid_envelope(
+-            subcommand,
+-            envelope,
+-            diagnostics,
+-            Some(outcome.status),
+-        )?,
++    let error = map_valid_json_provider_error_outcome(subcommand, envelope, outcome, diagnostics)?;
++    Err(error)
++}
++
++fn map_valid_json_provider_error_outcome(
++    subcommand: &str,
++    envelope: Value,
++    outcome: ProcessOutcome,
++    diagnostics: ProviderDiagnostics,
++) -> Result<ProviderClientError, ProviderClientError> {
++    Ok(ProviderClientError::from_capability(
++        valid_provider_capability_error(subcommand, envelope, outcome, diagnostics)?,
+     ))
+ }
+ 
++fn valid_provider_capability_error(
++    subcommand: &str,
++    envelope: Value,
++    outcome: ProcessOutcome,
++    diagnostics: ProviderDiagnostics,
++) -> Result<ProviderCapabilityError, ProviderClientError> {
++    ProviderCapabilityError::from_valid_envelope(
++        subcommand,
++        envelope,
++        diagnostics,
++        Some(outcome.status),
++    )
++}
++
+ fn validate_json_success_envelope(
+     registry: &SchemaRegistry,
+     subcommand: &str,
+@@ -579,50 +675,19 @@ fn success_envelope_has_nonzero_process(outcome: &ProcessOutcome) -> bool {
+     !outcome.status.exited_successfully() && !outcome.stdin_closed_early
+ }
+ 
+-fn launch_diagnostics(outcome: &ProcessOutcome) -> ProviderDiagnostics {
++fn launch_diagnostics<T: StdoutDrainOutput>(outcome: &ProcessOutcome<T>) -> ProviderDiagnostics {
+     let mut diagnostics = outcome.diagnostics();
+     diagnostics.provider_exit_code = provider_exit_code(&outcome.status);
+     diagnostics.provider_process_nonzero = provider_nonzero(&outcome.status);
+     diagnostics
+ }
+ 
+-fn map_launch_stdout_limit_error(
+-    request_id: Option<String>,
+-    diagnostics: ProviderDiagnostics,
+-    status: ProcessStatus,
+-) -> ProviderClientError {
+-    ProviderClientError::host_transport(
+-        HostErrorKind::StdoutLimitExceeded,
+-        "launch",
+-        request_id,
+-        diagnostics.clone(),
+-    )
+-    .with_process_context(diagnostics, status)
+-}
+-
+-fn ensure_launch_stdout_within_limit(
+-    diagnostics: &ProviderDiagnostics,
+-    request_id: Option<String>,
+-    status: &ProcessStatus,
+-) -> Result<(), ProviderClientError> {
+-    if diagnostics.stdout.truncated {
+-        return Err(map_launch_stdout_limit_error(
+-            request_id,
+-            diagnostics.clone(),
+-            status.clone(),
+-        ));
+-    }
+-    Ok(())
+-}
+-
+ fn parse_launch_output(
+-    stdout: Vec<u8>,
++    stdout: LaunchStdoutDrain,
+     diagnostics: ProviderDiagnostics,
+     status: ProcessStatus,
+-    request_id: Option<String>,
+ ) -> Result<LaunchResult, ProviderClientError> {
+-    let reader = LaunchJsonlReader::new(request_id.unwrap_or_default());
+-    match reader.read(&stdout[..]) {
++    match stdout.result {
+         Ok(mut result) => {
+             result.diagnostics = diagnostics.clone();
+             Ok(result)
+@@ -718,7 +783,8 @@ fn parse_one_stdout_object(
+     diagnostics: &ProviderDiagnostics,
+     fallback_request_id: Option<String>,
+ ) -> Result<Value, ProviderClientError> {
+-    let text = parse_stdout_utf8(subcommand, bytes, diagnostics, &fallback_request_id)?;
++    validate_stdout_not_empty(subcommand, bytes, diagnostics, &fallback_request_id)?;
++    let text = map_stdout_utf8_result(parse_stdout_utf8(bytes), subcommand, &fallback_request_id)?;
+     let trimmed = validate_stdout_prefix(subcommand, text, diagnostics, &fallback_request_id)?;
+     let parsed = parse_stdout_json_value(subcommand, trimmed, diagnostics, &fallback_request_id)?;
+     validate_stdout_object_shape(
+@@ -735,12 +801,14 @@ struct ParsedStdoutJson {
+     byte_offset: usize,
+ }
+ 
+-fn parse_stdout_utf8<'a>(
++type StdoutJsonStream<'a> = serde_json::StreamDeserializer<'a, serde_json::de::StrRead<'a>, Value>;
++
++fn validate_stdout_not_empty(
+     subcommand: &str,
+-    bytes: &'a [u8],
++    bytes: &[u8],
+     diagnostics: &ProviderDiagnostics,
+     fallback_request_id: &Option<String>,
+-) -> Result<&'a str, ProviderClientError> {
++) -> Result<(), ProviderClientError> {
+     if bytes.is_empty() {
+         return Err(stdout_protocol_error(
+             HostErrorKind::EmptyStdout,
+@@ -749,7 +817,19 @@ fn parse_stdout_utf8<'a>(
+             diagnostics,
+         ));
+     }
+-    std::str::from_utf8(bytes).map_err(|error| {
++    Ok(())
++}
++
++fn parse_stdout_utf8(bytes: &[u8]) -> Result<&str, std::str::Utf8Error> {
++    std::str::from_utf8(bytes)
++}
++
++fn map_stdout_utf8_result<'a>(
++    result: Result<&'a str, std::str::Utf8Error>,
++    subcommand: &str,
++    fallback_request_id: &Option<String>,
++) -> Result<&'a str, ProviderClientError> {
++    result.map_err(|error| {
+         stdout_protocol_error_with_description(
+             HostErrorKind::InvalidUtf8,
+             subcommand,
+@@ -783,29 +863,63 @@ fn parse_stdout_json_value(
+     diagnostics: &ProviderDiagnostics,
+     fallback_request_id: &Option<String>,
+ ) -> Result<ParsedStdoutJson, ProviderClientError> {
+-    let mut stream = serde_json::Deserializer::from_str(trimmed).into_iter::<Value>();
+-    let Some(first) = stream.next() else {
+-        return Err(stdout_protocol_error(
++    let mut stream = parse_stdout_json_stream(trimmed);
++    let first = validate_stdout_json_present(
++        next_stdout_json_value(&mut stream),
++        subcommand,
++        diagnostics,
++        fallback_request_id,
++    )?;
++    let value = map_stdout_json_parse_result(first, subcommand, diagnostics, fallback_request_id)?;
++    Ok(parsed_stdout_json(value, stream.byte_offset()))
++}
++
++fn parse_stdout_json_stream(trimmed: &str) -> StdoutJsonStream<'_> {
++    serde_json::Deserializer::from_str(trimmed).into_iter::<Value>()
++}
++
++fn next_stdout_json_value(
++    stream: &mut StdoutJsonStream<'_>,
++) -> Option<Result<Value, serde_json::Error>> {
++    stream.next()
++}
++
++fn validate_stdout_json_present(
++    first: Option<Result<Value, serde_json::Error>>,
++    subcommand: &str,
++    diagnostics: &ProviderDiagnostics,
++    fallback_request_id: &Option<String>,
++) -> Result<Result<Value, serde_json::Error>, ProviderClientError> {
++    first.ok_or_else(|| {
++        stdout_protocol_error(
+             HostErrorKind::EmptyStdout,
+             subcommand,
+             fallback_request_id.clone(),
+             diagnostics,
+-        ));
+-    };
+-    let value = first.map_err(|_| {
++        )
++    })
++}
++
++fn map_stdout_json_parse_result(
++    first: Result<Value, serde_json::Error>,
++    subcommand: &str,
++    diagnostics: &ProviderDiagnostics,
++    fallback_request_id: &Option<String>,
++) -> Result<Value, ProviderClientError> {
++    first.map_err(|_| {
+         stdout_protocol_error(
+             HostErrorKind::InvalidJson,
+             subcommand,
+             fallback_request_id.clone(),
+             diagnostics,
+         )
+-    })?;
+-    Ok(ParsedStdoutJson {
+-        value,
+-        byte_offset: stream.byte_offset(),
+     })
+ }
+ 
++fn parsed_stdout_json(value: Value, byte_offset: usize) -> ParsedStdoutJson {
++    ParsedStdoutJson { value, byte_offset }
++}
++
+ fn validate_stdout_object_shape(
+     subcommand: &str,
+     trimmed: &str,
+diff --git a/crates/oulipoly-provider/src/process.rs b/crates/oulipoly-provider/src/process.rs
+index cf1619a..7d03ef0 100644
+--- a/crates/oulipoly-provider/src/process.rs
++++ b/crates/oulipoly-provider/src/process.rs
+@@ -1,3 +1,51 @@
++//! ## Declared roles
++//!
++//! Roles: orchestration, mapper, predicate, accessor, filter, validator.
++//!
++//! - orchestration: `ProcessRunner` starts provider subprocesses, drains
++//!   stdio on worker threads, supervises total-runtime or stdout-line-gap
++//!   liveness, and terminates/reaps process trees on timeout or cancellation.
++//! - mapper: `map_completed_process_outcome`, `termination_diagnostics_from_parts`,
++//!   `provider_process_command`, `host_process_error`, `process_status`, `exit_code`, and
++//!   `process_nonzero` translate OS process observations into provider DTOs
++//!   and diagnostics.
++//! - predicate: `chunk_metadata`, `timeout_expired`, `cancellation_requested`,
++//!   `cancellation_grace_expired`, `should_force_kill`, `is_executable`, and
++//!   byte-content predicates classify process and capture state.
++//! - accessor: `ByteLimit::bytes`, `ProcessCommand::argv`,
++//!   `ProcessOutcome::{argv, diagnostics}`, `CancellationToken::is_cancelled`,
++//!   and test-only stdout/stderr text accessors expose owned state.
++//! - filter: `capture_window`, `retain_prefix_chunk`, `retain_tail_chunk`,
++//!   `ByteAccumulator`, `ByteTailAccumulator`, and `alive_descendants` retain
++//!   bounded byte/process subsets from larger streams or process sets.
++//! - validator: embedded process-runner and byte-accumulator tests validate
++//!   pipe pressure, process-tree cleanup, cancellation, and truncation
++//!   contracts.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-provider/src/process.rs
++//!     role: adapter
++//!     Translates:
++//!       - provider-cli-subprocess-contract
++//!       - std-process-command-contract
++//!       - std-process-exit-status-contract
++//!       - process-supervision-liveness-contract
++//!       - byte-limit-capture-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/src/process.rs
++//!     role: intrinsic-surface
++//!     Domain: provider subprocess supervision and bounded byte capture
++//!     Owns:
++//!       - ByteLimit, CapturedBytes, and accumulator truncation semantics
++//!       - CancellationToken and ProcessLimits lifecycle inputs
++//!       - ProcessCommand, ProcessOutcome, and ProcessRunner public surfaces
++//!       - total-runtime and stdout-line-gap timeout behavior
++//!       - cross-platform process group termination and executable checks
++//! ```
++
+ use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
+ use crate::generated::ProcessStatus;
+ use std::ffi::{OsStr, OsString};
+@@ -19,6 +67,10 @@ impl ByteLimit {
+     pub fn new(bytes: usize) -> Self {
+         Self { bytes }
+     }
++
++    pub(crate) fn bytes(self) -> usize {
++        self.bytes
++    }
+ }
+ 
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+@@ -53,8 +105,16 @@ impl ByteAccumulator {
+     }
+ 
+     pub fn push(&mut self, chunk: &[u8]) {
+-        self.contains_nul |= chunk_contains_nul(chunk);
+-        self.contains_high_bit |= chunk_contains_high_bit(chunk);
++        self.record_chunk_metadata(chunk_metadata(chunk));
++        self.retain_prefix_chunk(chunk);
++    }
++
++    fn record_chunk_metadata(&mut self, metadata: ChunkMetadata) {
++        self.contains_nul |= metadata.contains_nul;
++        self.contains_high_bit |= metadata.contains_high_bit;
++    }
++
++    fn retain_prefix_chunk(&mut self, chunk: &[u8]) {
+         let window = capture_window(self.limit, self.bytes.len(), chunk.len());
+         self.bytes.extend_from_slice(&chunk[..window.captured_len]);
+         self.discarded_len += window.discarded_len;
+@@ -74,11 +134,124 @@ impl ByteAccumulator {
+     }
+ }
+ 
++#[derive(Debug, Clone)]
++pub(crate) struct ByteTailAccumulator {
++    limit: ByteLimit,
++    bytes: Vec<u8>,
++    discarded_len: usize,
++    contains_nul: bool,
++    contains_high_bit: bool,
++}
++
++impl ByteTailAccumulator {
++    pub(crate) fn new(limit: ByteLimit) -> Self {
++        Self {
++            limit,
++            bytes: Vec::new(),
++            discarded_len: 0,
++            contains_nul: false,
++            contains_high_bit: false,
++        }
++    }
++
++    pub(crate) fn push(&mut self, chunk: &[u8]) {
++        self.record_chunk_metadata(chunk_metadata(chunk));
++        self.retain_tail_chunk(chunk);
++    }
++
++    fn record_chunk_metadata(&mut self, metadata: ChunkMetadata) {
++        self.contains_nul |= metadata.contains_nul;
++        self.contains_high_bit |= metadata.contains_high_bit;
++    }
++
++    fn retain_tail_chunk(&mut self, chunk: &[u8]) {
++        if self.limit.bytes == 0 {
++            self.discarded_len += chunk.len();
++            return;
++        }
++
++        self.bytes.extend_from_slice(chunk);
++        if self.bytes.len() <= self.limit.bytes {
++            return;
++        }
++
++        let overflow = self.bytes.len() - self.limit.bytes;
++        self.bytes.drain(..overflow);
++        self.discarded_len += overflow;
++    }
++
++    pub(crate) fn finish(self) -> CapturedBytes {
++        let captured_len = self.bytes.len();
++        CapturedBytes {
++            bytes: self.bytes,
++            limit: self.limit.bytes,
++            captured_len,
++            discarded_len: self.discarded_len,
++            truncated: self.discarded_len > 0,
++            contains_nul: self.contains_nul,
++            contains_high_bit: self.contains_high_bit,
++        }
++    }
++}
++
++pub(crate) trait StdoutDrainOutput: Default + Send + 'static {
++    fn captured_bytes(&self) -> CapturedBytes;
++}
++
++impl StdoutDrainOutput for CapturedBytes {
++    fn captured_bytes(&self) -> CapturedBytes {
++        self.clone()
++    }
++}
++
++pub(crate) trait StdoutProcessor: Send + 'static {
++    type Output: StdoutDrainOutput;
++
++    fn push(&mut self, chunk: &[u8]);
++    fn finish(self) -> Self::Output;
++}
++
++struct ByteCaptureProcessor {
++    accumulator: ByteAccumulator,
++}
++
++impl ByteCaptureProcessor {
++    fn new(limit: ByteLimit) -> Self {
++        Self {
++            accumulator: ByteAccumulator::new(limit),
++        }
++    }
++}
++
++impl StdoutProcessor for ByteCaptureProcessor {
++    type Output = CapturedBytes;
++
++    fn push(&mut self, chunk: &[u8]) {
++        self.accumulator.push(chunk);
++    }
++
++    fn finish(self) -> Self::Output {
++        self.accumulator.finish()
++    }
++}
++
++struct ChunkMetadata {
++    contains_nul: bool,
++    contains_high_bit: bool,
++}
++
+ struct CaptureWindow {
+     captured_len: usize,
+     discarded_len: usize,
+ }
+ 
++fn chunk_metadata(chunk: &[u8]) -> ChunkMetadata {
++    ChunkMetadata {
++        contains_nul: chunk_contains_nul(chunk),
++        contains_high_bit: chunk_contains_high_bit(chunk),
++    }
++}
++
+ fn chunk_contains_nul(chunk: &[u8]) -> bool {
+     chunk.contains(&0)
+ }
+@@ -205,16 +378,16 @@ impl ProcessCommand {
+ }
+ 
+ #[derive(Debug, Clone)]
+-pub struct ProcessOutcome {
++pub struct ProcessOutcome<T = CapturedBytes> {
+     pub status: ProcessStatus,
+-    pub stdout: CapturedBytes,
++    pub stdout: T,
+     pub stderr: CapturedBytes,
+     pub stdin_closed_early: bool,
+     pub host_cancellation_requested: bool,
+     argv: Vec<OsString>,
+ }
+ 
+-impl ProcessOutcome {
++impl ProcessOutcome<CapturedBytes> {
+     #[cfg(test)]
+     pub fn stdout_text(&self) -> String {
+         String::from_utf8_lossy(&self.stdout.bytes).into_owned()
+@@ -224,14 +397,16 @@ impl ProcessOutcome {
+     pub fn stderr_text(&self) -> String {
+         String::from_utf8_lossy(&self.stderr.bytes).into_owned()
+     }
++}
+ 
++impl<T: StdoutDrainOutput> ProcessOutcome<T> {
+     pub fn argv(&self) -> &[OsString] {
+         &self.argv
+     }
+ 
+     pub fn diagnostics(&self) -> ProviderDiagnostics {
+         ProviderDiagnostics {
+-            stdout: self.stdout.clone(),
++            stdout: self.stdout.captured_bytes(),
+             stderr: self.stderr.clone(),
+             stdin_closed_early: self.stdin_closed_early,
+             host_cancellation_requested: self.host_cancellation_requested,
+@@ -247,8 +422,8 @@ pub struct ProcessRunner {
+     limits: ProcessLimits,
+ }
+ 
+-struct ProcessThreads {
+-    stdout: thread::JoinHandle<CapturedBytes>,
++struct ProcessThreads<T: StdoutDrainOutput> {
++    stdout: thread::JoinHandle<T>,
+     stderr: thread::JoinHandle<CapturedBytes>,
+     stdin: thread::JoinHandle<bool>,
+ }
+@@ -297,6 +472,28 @@ impl ProcessRunner {
+         self.run_with_timeout_mode(command, stdin_bytes, envs, TimeoutMode::StdoutLineGap)
+     }
+ 
++    pub(crate) fn run_with_stdout_line_gap_timeout_and_stdout_processor<I, K, V, P>(
++        &self,
++        command: ProcessCommand,
++        stdin_bytes: Vec<u8>,
++        envs: I,
++        stdout_processor: P,
++    ) -> Result<ProcessOutcome<P::Output>, ProviderClientError>
++    where
++        I: IntoIterator<Item = (K, V)>,
++        K: AsRef<OsStr>,
++        V: AsRef<OsStr>,
++        P: StdoutProcessor,
++    {
++        self.run_with_timeout_mode_and_stdout_processor(
++            command,
++            stdin_bytes,
++            envs,
++            TimeoutMode::StdoutLineGap,
++            stdout_processor,
++        )
++    }
++
+     fn run_with_timeout_mode<I, K, V>(
+         &self,
+         command: ProcessCommand,
+@@ -308,6 +505,29 @@ impl ProcessRunner {
+         I: IntoIterator<Item = (K, V)>,
+         K: AsRef<OsStr>,
+         V: AsRef<OsStr>,
++    {
++        self.run_with_timeout_mode_and_stdout_processor(
++            command,
++            stdin_bytes,
++            envs,
++            timeout_mode,
++            ByteCaptureProcessor::new(self.limits.stdout_limit),
++        )
++    }
++
++    fn run_with_timeout_mode_and_stdout_processor<I, K, V, P>(
++        &self,
++        command: ProcessCommand,
++        stdin_bytes: Vec<u8>,
++        envs: I,
++        timeout_mode: TimeoutMode,
++        stdout_processor: P,
++    ) -> Result<ProcessOutcome<P::Output>, ProviderClientError>
++    where
++        I: IntoIterator<Item = (K, V)>,
++        K: AsRef<OsStr>,
++        V: AsRef<OsStr>,
++        P: StdoutProcessor,
+     {
+         let argv = command.argv();
+         let mut child = spawn_provider_process(&command, envs)?;
+@@ -316,9 +536,9 @@ impl ProcessRunner {
+         let threads = start_process_threads(
+             &mut child,
+             stdin_bytes,
+-            self.limits.stdout_limit,
+             self.limits.stderr_limit,
+             stdout_line_activity,
++            stdout_processor,
+         );
+ 
+         let started = Instant::now();
+@@ -364,11 +584,11 @@ impl ProcessRunner {
+         }
+     }
+ 
+-    fn terminate_and_collect(
++    fn terminate_and_collect<T: StdoutDrainOutput>(
+         &self,
+         mut child: Child,
+         command: ProcessCommand,
+-        threads: ProcessThreads,
++        threads: ProcessThreads<T>,
+         kind: HostErrorKind,
+         host_cancellation_requested: bool,
+     ) -> ProviderClientError {
+@@ -404,6 +624,17 @@ where
+ }
+ 
+ fn build_provider_process<I, K, V>(command: &ProcessCommand, envs: I) -> Command
++where
++    I: IntoIterator<Item = (K, V)>,
++    K: AsRef<OsStr>,
++    V: AsRef<OsStr>,
++{
++    let mut process = provider_process_command(command, envs);
++    configure_provider_process(&mut process);
++    process
++}
++
++fn provider_process_command<I, K, V>(command: &ProcessCommand, envs: I) -> Command
+ where
+     I: IntoIterator<Item = (K, V)>,
+     K: AsRef<OsStr>,
+@@ -418,17 +649,20 @@ where
+     for (key, value) in envs {
+         process.env(key, value);
+     }
+-    configure_process_group(&mut process);
+     process
+ }
+ 
+-fn start_process_threads(
++fn configure_provider_process(process: &mut Command) {
++    configure_process_group(process);
++}
++
++fn start_process_threads<P: StdoutProcessor>(
+     child: &mut Child,
+     stdin_bytes: Vec<u8>,
+-    stdout_limit: ByteLimit,
+     stderr_limit: ByteLimit,
+     stdout_line_activity: Option<Sender<Instant>>,
+-) -> ProcessThreads {
++    stdout_processor: P,
++) -> ProcessThreads<P::Output> {
+     let stdout = child
+         .stdout
+         .take()
+@@ -439,7 +673,9 @@ fn start_process_threads(
+         .expect("stderr pipe should be configured");
+     let stdin = child.stdin.take().expect("stdin pipe should be configured");
+     ProcessThreads {
+-        stdout: thread::spawn(move || drain_reader(stdout, stdout_limit, stdout_line_activity)),
++        stdout: thread::spawn(move || {
++            drain_reader_with_processor(stdout, stdout_line_activity, stdout_processor)
++        }),
+         stderr: thread::spawn(move || drain_reader(stderr, stderr_limit, None)),
+         stdin: thread::spawn(move || write_stdin(stdin, stdin_bytes)),
+     }
+@@ -454,16 +690,16 @@ fn poll_child_status(
+         .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+ }
+ 
+-fn map_completed_process_outcome(
++fn map_completed_process_outcome<T: StdoutDrainOutput>(
+     status: ExitStatus,
+-    threads: ProcessThreads,
++    threads: ProcessThreads<T>,
+     cancellation_started: bool,
+     limits: &ProcessLimits,
+     argv: Vec<OsString>,
+-) -> ProcessOutcome {
++) -> ProcessOutcome<T> {
+     ProcessOutcome {
+         status: process_status(status),
+-        stdout: join_capture(threads.stdout),
++        stdout: join_stdout(threads.stdout),
+         stderr: join_capture(threads.stderr),
+         stdin_closed_early: join_stdin(threads.stdin),
+         host_cancellation_requested: host_cancellation_was_requested(cancellation_started, limits),
+@@ -548,15 +784,45 @@ fn should_force_kill(grace_started: &Instant, kill_after_grace: Duration) -> boo
+     grace_started.elapsed() >= kill_after_grace
+ }
+ 
+-fn map_termination_diagnostics(
+-    threads: ProcessThreads,
++fn map_termination_diagnostics<T: StdoutDrainOutput>(
++    threads: ProcessThreads<T>,
+     terminated: TerminatedProcess,
+     host_cancellation_requested: bool,
+ ) -> ProviderDiagnostics {
+-    let _stdin_closed_early = join_stdin(threads.stdin);
+-    let mut diagnostics = ProviderDiagnostics {
+-        stdout: join_capture(threads.stdout),
++    let joined = join_process_threads(threads);
++    termination_diagnostics_from_parts(
++        terminated,
++        host_cancellation_requested,
++        joined.stdout.captured_bytes(),
++        joined.stderr,
++    )
++}
++
++struct JoinedProcessThreads<T: StdoutDrainOutput> {
++    stdout: T,
++    stderr: CapturedBytes,
++    _stdin_closed_early: bool,
++}
++
++fn join_process_threads<T: StdoutDrainOutput>(
++    threads: ProcessThreads<T>,
++) -> JoinedProcessThreads<T> {
++    JoinedProcessThreads {
++        stdout: join_stdout(threads.stdout),
+         stderr: join_capture(threads.stderr),
++        _stdin_closed_early: join_stdin(threads.stdin),
++    }
++}
++
++fn termination_diagnostics_from_parts(
++    terminated: TerminatedProcess,
++    host_cancellation_requested: bool,
++    stdout: CapturedBytes,
++    stderr: CapturedBytes,
++) -> ProviderDiagnostics {
++    let mut diagnostics = ProviderDiagnostics {
++        stdout,
++        stderr,
+         process_was_force_killed: terminated.force_killed,
+         process_was_reaped: terminated.status.is_some(),
+         host_cancellation_requested,
+@@ -581,7 +847,18 @@ fn drain_reader(
+     limit: ByteLimit,
+     stdout_line_activity: Option<Sender<Instant>>,
+ ) -> CapturedBytes {
+-    let mut accumulator = ByteAccumulator::new(limit);
++    drain_reader_with_processor(
++        &mut reader,
++        stdout_line_activity,
++        ByteCaptureProcessor::new(limit),
++    )
++}
++
++fn drain_reader_with_processor<P: StdoutProcessor>(
++    mut reader: impl Read,
++    stdout_line_activity: Option<Sender<Instant>>,
++    mut processor: P,
++) -> P::Output {
+     let mut buffer = [0_u8; 8192];
+     loop {
+         match reader.read(&mut buffer) {
+@@ -589,44 +866,61 @@ fn drain_reader(
+             Ok(read) => {
+                 let chunk = &buffer[..read];
+                 notify_stdout_line_activity(&stdout_line_activity, chunk);
+-                accumulator.push(chunk);
++                processor.push(chunk);
+             }
+             Err(error) if error.kind() == ErrorKind::Interrupted => {}
+             Err(_) => break,
+         }
+     }
+-    accumulator.finish()
++    processor.finish()
+ }
+ 
+ fn notify_stdout_line_activity(activity: &Option<Sender<Instant>>, chunk: &[u8]) {
+     let Some(activity) = activity else {
+         return;
+     };
+-    for _ in chunk.iter().filter(|byte| **byte == b'\n') {
++    send_stdout_line_activity(activity, stdout_line_count(chunk));
++}
++
++fn stdout_line_count(chunk: &[u8]) -> usize {
++    chunk.iter().filter(|byte| **byte == b'\n').count()
++}
++
++fn send_stdout_line_activity(activity: &Sender<Instant>, count: usize) {
++    for _ in 0..count {
+         let _ = activity.send(Instant::now());
+     }
+ }
+ 
+ fn write_stdin(mut stdin: impl Write, bytes: Vec<u8>) -> bool {
++    match write_stdin_bytes(&mut stdin, &bytes) {
++        Ok(()) => stdin_flush_closed_early(&mut stdin),
++        Err(error) => stdin_error_closed_early(&error),
++    }
++}
++
++fn write_stdin_bytes(stdin: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+     for (index, byte) in bytes.iter().enumerate() {
+-        if let Err(error) = stdin.write_all(std::slice::from_ref(byte)) {
+-            return stdin_write_closed_early(&error);
+-        }
++        stdin.write_all(std::slice::from_ref(byte))?;
+         if index == 0 {
+             thread::sleep(Duration::from_millis(10));
+         }
+     }
+-    stdin_flush_closed_early(&mut stdin)
++    Ok(())
+ }
+ 
+ fn stdin_flush_closed_early(stdin: &mut impl Write) -> bool {
+-    match stdin.flush() {
++    match flush_stdin(stdin) {
+         Ok(()) => false,
+-        Err(error) => stdin_write_closed_early(&error),
++        Err(error) => stdin_error_closed_early(&error),
+     }
+ }
+ 
+-fn stdin_write_closed_early(error: &std::io::Error) -> bool {
++fn flush_stdin(stdin: &mut impl Write) -> std::io::Result<()> {
++    stdin.flush()
++}
++
++fn stdin_error_closed_early(error: &std::io::Error) -> bool {
+     error.kind() == ErrorKind::BrokenPipe || error.kind() == ErrorKind::WouldBlock
+ }
+ 
+@@ -634,6 +928,10 @@ fn join_capture(handle: thread::JoinHandle<CapturedBytes>) -> CapturedBytes {
+     handle.join().unwrap_or_default()
+ }
+ 
++fn join_stdout<T: StdoutDrainOutput>(handle: thread::JoinHandle<T>) -> T {
++    handle.join().unwrap_or_default()
++}
++
+ fn join_stdin(handle: thread::JoinHandle<bool>) -> bool {
+     handle.join().unwrap_or(true)
+ }
+diff --git a/crates/oulipoly-provider/src/stream.rs b/crates/oulipoly-provider/src/stream.rs
+index 38fe63c..e4bd451 100644
+--- a/crates/oulipoly-provider/src/stream.rs
++++ b/crates/oulipoly-provider/src/stream.rs
+@@ -1,12 +1,70 @@
++//! ## Declared roles
++//!
++//! Roles: parser, validator, mapper, accessor, filter, orchestration, formatter.
++//!
++//! - parser: `LaunchStreamParser::{push, process_pending_line}`,
++//!   `parse_line`, `parse_launch_event`, `parse_line_utf8`, and
++//!   `decode_base64` parse launch JSONL into decoded event/result structures.
++//! - validator: `event_kind`, `validate_event_schema`,
++//!   `LaunchStreamParser::{validate_sequence, validate_final_state}`, and
++//!   line-size/finality checks enforce launch stream contract, request
++//!   correlation, event schema, and sequence invariants.
++//! - mapper: `map_launch_event`, `LaunchStreamParser::into_launch_result`,
++//!   protocol/transport error helpers, and retained cost helpers translate
++//!   generated DTOs, base64 payloads, and parse failures into host-facing launch
++//!   events or provider-client errors.
++//! - accessor: `DecodedLaunchEvent::{seq, bytes}`, `LaunchResult` accessors,
++//!   and `LaunchJsonlReader::request_id` expose decoded event/result state.
++//! - filter: `LaunchEventRetention`, `LaunchMarkerRetention`,
++//!   `ByteAccumulator`, and `ByteTailAccumulator` keep bounded event, marker,
++//!   stdout, stderr, and raw-stdout evidence.
++//! - orchestration: `LaunchStdoutProcessor` connects live process stdout
++//!   draining to incremental launch stream parsing while preserving raw
++//!   diagnostics.
++//! - formatter: `pending_line_limit_description`, `line_limit_description`,
++//!   `blank_line_description`, and malformed-line helpers format stable
++//!   diagnostic descriptions for oversized or invalid launch JSONL input.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-provider/src/stream.rs
++//!     role: adapter
++//!     Translates:
++//!       - launch-jsonl-stream-contract
++//!       - oulipoly-provider-generated-dto-contract
++//!       - byte-limit-capture-contract
++//!       - provider-client-error-contract
++//!       - launch-event-retention-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/src/stream.rs
++//!     role: intrinsic-surface
++//!     Domain: launch JSONL decoding and bounded retention
++//!     Owns:
++//!       - DecodedLaunchEvent, LaunchExit, and LaunchResult shapes
++//!       - LaunchStreamLimits defaults and bounded-by projection
++//!       - event order, finality, contract, request-id, and schema checks
++//!       - retained event, marker, stdout, stderr, and raw stdout budgets
++//!       - launch stdout drain behavior for live subprocess integration
++//! ```
++
+ use crate::error::{
+     HostErrorKind, ProviderClientError, ProviderDiagnostics, check_contract_and_request,
+ };
+ use crate::generated::{LaunchEvent, ProcessStatus, TerminalSignal};
++use crate::process::{
++    ByteAccumulator, ByteLimit, ByteTailAccumulator, CapturedBytes, StdoutDrainOutput,
++    StdoutProcessor,
++};
+ use crate::schemas::{SchemaRegistry, SchemaValidationError};
+ use base64::Engine;
+ use serde_json::Value;
+ use std::io::Read;
+ 
++const DEFAULT_RETAINED_LAUNCH_EVENTS: usize = 1024;
++const DEFAULT_LAUNCH_RETAINED_BYTES: usize = 1024 * 1024;
++
+ #[derive(Debug, Clone, PartialEq)]
+ pub enum DecodedLaunchEvent {
+     Stdout {
+@@ -29,6 +87,28 @@ pub enum DecodedLaunchEvent {
+     Exit(LaunchExit),
+ }
+ 
++#[derive(Debug, Clone, PartialEq)]
++enum LaunchEventWithDecodedPayloads {
++    Stdout {
++        seq: u64,
++        data: Vec<u8>,
++    },
++    Stderr {
++        seq: u64,
++        data: Vec<u8>,
++    },
++    Marker {
++        seq: u64,
++        name: String,
++        value: Value,
++    },
++    Heartbeat {
++        seq: u64,
++        detail: Option<String>,
++    },
++    Exit(LaunchExit),
++}
++
+ impl DecodedLaunchEvent {
+     pub fn seq(&self) -> u64 {
+         match self {
+@@ -61,27 +141,74 @@ pub struct LaunchResult {
+     pub events: Vec<DecodedLaunchEvent>,
+     pub exit: LaunchExit,
+     pub diagnostics: ProviderDiagnostics,
++    stdout: CapturedBytes,
++    stderr: CapturedBytes,
++    retained_markers: Vec<RetainedLaunchMarker>,
++    retained_events_omitted: usize,
+ }
+ 
+ impl LaunchResult {
+     pub fn stdout_bytes(&self) -> Vec<u8> {
+-        let mut bytes = Vec::new();
+-        for event in &self.events {
+-            if let DecodedLaunchEvent::Stdout { data, .. } = event {
+-                bytes.extend_from_slice(data);
+-            }
+-        }
+-        bytes
++        self.stdout.bytes.clone()
+     }
+ 
+     pub fn stderr_bytes(&self) -> Vec<u8> {
+-        let mut bytes = Vec::new();
+-        for event in &self.events {
+-            if let DecodedLaunchEvent::Stderr { data, .. } = event {
+-                bytes.extend_from_slice(data);
+-            }
++        self.stderr.bytes.clone()
++    }
++
++    pub fn retained_events_omitted(&self) -> usize {
++        self.retained_events_omitted
++    }
++
++    pub fn retained_marker_value(&self, name: &str) -> Option<&Value> {
++        self.retained_markers
++            .iter()
++            .find(|marker| marker.name == name)
++            .map(|marker| &marker.value)
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++struct RetainedLaunchMarker {
++    name: String,
++    value: Value,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct LaunchStreamLimits {
++    pub retained_events: usize,
++    pub retained_event_bytes: usize,
++    pub retained_output_bytes: usize,
++    pub max_line_bytes: usize,
++}
++
++impl LaunchStreamLimits {
++    pub fn bounded_by(bytes: usize) -> Self {
++        launch_stream_limits_for_bytes(normalize_launch_stream_limit_bytes(bytes))
++    }
++}
++
++fn normalize_launch_stream_limit_bytes(bytes: usize) -> usize {
++    bytes.max(1)
++}
++
++fn launch_stream_limits_for_bytes(bytes: usize) -> LaunchStreamLimits {
++    LaunchStreamLimits {
++        retained_events: DEFAULT_RETAINED_LAUNCH_EVENTS,
++        retained_event_bytes: bytes,
++        retained_output_bytes: bytes,
++        max_line_bytes: bytes,
++    }
++}
++
++impl Default for LaunchStreamLimits {
++    fn default() -> Self {
++        Self {
++            retained_events: DEFAULT_RETAINED_LAUNCH_EVENTS,
++            retained_event_bytes: DEFAULT_LAUNCH_RETAINED_BYTES,
++            retained_output_bytes: DEFAULT_LAUNCH_RETAINED_BYTES,
++            max_line_bytes: DEFAULT_LAUNCH_RETAINED_BYTES,
+         }
+-        bytes
+     }
+ }
+ 
+@@ -89,6 +216,7 @@ impl LaunchResult {
+ pub struct LaunchJsonlReader {
+     request_id: String,
+     registry: SchemaRegistry,
++    limits: LaunchStreamLimits,
+ }
+ 
+ impl LaunchJsonlReader {
+@@ -96,113 +224,485 @@ impl LaunchJsonlReader {
+         Self {
+             request_id: request_id.into(),
+             registry: SchemaRegistry::new(),
++            limits: LaunchStreamLimits::default(),
+         }
+     }
+ 
++    pub fn with_limits(mut self, limits: LaunchStreamLimits) -> Self {
++        self.limits = limits;
++        self
++    }
++
+     pub fn request_id(&self) -> &str {
+         &self.request_id
+     }
+ 
+     pub fn read(&self, mut reader: impl Read) -> Result<LaunchResult, ProviderClientError> {
+-        let mut bytes = Vec::new();
+-        reader.read_to_end(&mut bytes).map_err(|error| {
+-            ProviderClientError::protocol(
+-                HostErrorKind::MalformedLine,
+-                "launch",
+-                Some(self.request_id.clone()),
+-                ProviderDiagnostics::with_description(error.to_string()),
+-            )
+-        })?;
+-        let text = std::str::from_utf8(&bytes).map_err(|error| {
+-            ProviderClientError::protocol(
+-                HostErrorKind::InvalidUtf8,
+-                "launch",
+-                Some(self.request_id.clone()),
+-                ProviderDiagnostics::with_description(error.to_string()),
+-            )
+-        })?;
+-
+-        let mut events = Vec::new();
+-        let mut exit = None;
+-        let mut expected_seq = 1_u64;
+-        let mut last_seq = None;
+-        let mut deferred_initial_skip = false;
+-        for (index, line) in text.lines().enumerate() {
+-            if line.trim().is_empty() {
+-                return Err(protocol_error_with_description(
+-                    HostErrorKind::MalformedLine,
+-                    &self.request_id,
+-                    format!(
+-                        "launch JSONL line {} was blank or whitespace-only",
+-                        index + 1
+-                    ),
+-                ));
+-            }
+-            if exit.is_some() {
+-                let value = parse_line(line, &self.request_id)?;
+-                let kind = value.get("kind").and_then(Value::as_str);
+-                let error_kind = if kind == Some("exit") {
+-                    HostErrorKind::DuplicateExit
+-                } else {
+-                    HostErrorKind::EventAfterExit
+-                };
+-                return Err(protocol_error(error_kind, &self.request_id));
++        let mut parser =
++            LaunchStreamParser::new(self.request_id.clone(), self.registry.clone(), self.limits);
++        let mut buffer = [0_u8; 8192];
++        loop {
++            match reader.read(&mut buffer) {
++                Ok(0) => break,
++                Ok(read) => parser.push(&buffer[..read])?,
++                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
++                Err(error) => return Err(map_launch_read_error(error, &self.request_id)),
+             }
+-            let value = parse_line(line, &self.request_id)?;
+-            let kind = event_kind(&value, &self.request_id)?;
+-            check_contract_and_request(
+-                &value,
+-                &self.request_id,
+-                "launch",
+-                ProviderDiagnostics::default(),
+-            )?;
+-            validate_event_schema(&self.registry, kind, &value, &self.request_id)?;
+-            let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
+-            if let Some(last) = last_seq {
+-                if seq == last {
+-                    return Err(protocol_error(
+-                        HostErrorKind::DuplicateSeq,
+-                        &self.request_id,
+-                    ));
+-                }
+-                if seq < last {
+-                    return Err(protocol_error(
+-                        HostErrorKind::DecreasingSeq,
+-                        &self.request_id,
+-                    ));
+-                }
+-                if seq > expected_seq {
+-                    return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
+-                }
+-            } else if seq > expected_seq {
+-                deferred_initial_skip = true;
+-            }
+-            if deferred_initial_skip && last_seq.is_some() {
+-                return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
+-            }
+-            last_seq = Some(seq);
+-            expected_seq = seq + 1;
++        }
++        parser.finish()
++    }
++}
+ 
+-            let decoded = decode_event(value, &self.request_id)?;
+-            if let DecodedLaunchEvent::Exit(decoded_exit) = &decoded {
+-                exit = Some(decoded_exit.clone());
+-            }
+-            events.push(decoded);
++#[derive(Debug)]
++pub(crate) struct LaunchStdoutProcessor {
++    parser: LaunchStreamParser,
++    raw_stdout: ByteTailAccumulator,
++    error: Option<ProviderClientError>,
++}
++
++impl LaunchStdoutProcessor {
++    pub(crate) fn new(request_id: impl Into<String>, stdout_limit: ByteLimit) -> Self {
++        let limit_bytes = stdout_limit.bytes();
++        Self {
++            parser: LaunchStreamParser::new(
++                request_id.into(),
++                SchemaRegistry::new(),
++                LaunchStreamLimits::bounded_by(limit_bytes),
++            ),
++            raw_stdout: ByteTailAccumulator::new(stdout_limit),
++            error: None,
++        }
++    }
++}
++
++impl StdoutProcessor for LaunchStdoutProcessor {
++    type Output = LaunchStdoutDrain;
++
++    fn push(&mut self, chunk: &[u8]) {
++        self.raw_stdout.push(chunk);
++        if self.error.is_some() {
++            return;
++        }
++        if let Err(error) = self.parser.push(chunk) {
++            self.error = Some(error);
+         }
+-        if deferred_initial_skip {
++    }
++
++    fn finish(self) -> Self::Output {
++        let captured = self.raw_stdout.finish();
++        let result = match self.error {
++            Some(error) => Err(error),
++            None => self.parser.finish(),
++        };
++        LaunchStdoutDrain { result, captured }
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct LaunchStdoutDrain {
++    pub(crate) result: Result<LaunchResult, ProviderClientError>,
++    captured: CapturedBytes,
++}
++
++impl Default for LaunchStdoutDrain {
++    fn default() -> Self {
++        Self {
++            result: Err(protocol_error(
++                HostErrorKind::MissingFinalExit,
++                "launch-stdout-drain",
++            )),
++            captured: CapturedBytes::default(),
++        }
++    }
++}
++
++impl StdoutDrainOutput for LaunchStdoutDrain {
++    fn captured_bytes(&self) -> CapturedBytes {
++        self.captured.clone()
++    }
++}
++
++#[derive(Debug, Clone)]
++struct LaunchStreamParser {
++    request_id: String,
++    registry: SchemaRegistry,
++    limits: LaunchStreamLimits,
++    pending_line: Vec<u8>,
++    line_number: usize,
++    retention: LaunchEventRetention,
++    markers: LaunchMarkerRetention,
++    stdout: ByteAccumulator,
++    stderr: ByteAccumulator,
++    exit: Option<LaunchExit>,
++    expected_seq: u64,
++    last_seq: Option<u64>,
++    deferred_initial_skip: bool,
++}
++
++impl LaunchStreamParser {
++    fn new(request_id: String, registry: SchemaRegistry, limits: LaunchStreamLimits) -> Self {
++        Self {
++            request_id,
++            registry,
++            limits,
++            pending_line: Vec::new(),
++            line_number: 0,
++            retention: LaunchEventRetention::new(
++                limits.retained_events,
++                limits.retained_event_bytes,
++            ),
++            markers: LaunchMarkerRetention::new(
++                limits.retained_events,
++                limits.retained_event_bytes,
++            ),
++            stdout: ByteAccumulator::new(ByteLimit::new(limits.retained_output_bytes)),
++            stderr: ByteAccumulator::new(ByteLimit::new(limits.retained_output_bytes)),
++            exit: None,
++            expected_seq: 1,
++            last_seq: None,
++            deferred_initial_skip: false,
++        }
++    }
++
++    fn push(&mut self, chunk: &[u8]) -> Result<(), ProviderClientError> {
++        self.pending_line.extend_from_slice(chunk);
++        while let Some(line) = self.next_pending_line() {
++            self.process_line_bytes(&line)?;
++        }
++        self.ensure_pending_line_within_limit()
++    }
++
++    fn next_pending_line(&mut self) -> Option<Vec<u8>> {
++        let newline = pending_line_newline_index(&self.pending_line)?;
++        Some(take_pending_line(&mut self.pending_line, newline))
++    }
++
++    fn finish(mut self) -> Result<LaunchResult, ProviderClientError> {
++        self.process_pending_line()?;
++        self.validate_final_state()?;
++        Ok(self.into_launch_result())
++    }
++
++    fn process_pending_line(&mut self) -> Result<(), ProviderClientError> {
++        if self.pending_line.is_empty() {
++            return Ok(());
++        }
++        let line = std::mem::take(&mut self.pending_line);
++        self.process_line_bytes(&line)
++    }
++
++    fn validate_final_state(&self) -> Result<(), ProviderClientError> {
++        if self.deferred_initial_skip {
+             return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
+         }
+-        let Some(exit) = exit else {
++        if self.exit.is_none() {
+             return Err(protocol_error(
+                 HostErrorKind::MissingFinalExit,
+                 &self.request_id,
+             ));
+         };
+-        Ok(LaunchResult {
+-            events,
++        Ok(())
++    }
++
++    fn into_launch_result(mut self) -> LaunchResult {
++        let exit = self
++            .exit
++            .take()
++            .expect("launch final state should include exit after validation");
++        LaunchResult {
++            events: self.retention.events,
+             exit,
+             diagnostics: ProviderDiagnostics::default(),
+-        })
++            stdout: self.stdout.finish(),
++            stderr: self.stderr.finish(),
++            retained_markers: self.markers.markers,
++            retained_events_omitted: self.retention.omitted,
++        }
++    }
++
++    fn ensure_pending_line_within_limit(&self) -> Result<(), ProviderClientError> {
++        if self.pending_line.len() > self.limits.max_line_bytes {
++            return Err(transport_error_with_description(
++                HostErrorKind::StdoutLimitExceeded,
++                &self.request_id,
++                pending_line_limit_description(self.limits.max_line_bytes),
++            ));
++        }
++        Ok(())
++    }
++
++    fn process_line_bytes(&mut self, line: &[u8]) -> Result<(), ProviderClientError> {
++        self.line_number += 1;
++        let line = normalize_line_bytes(line);
++        self.validate_line_bytes_within_limit(line)?;
++        let line = parse_line_utf8(line, &self.request_id)?;
++        self.process_line(line)
++    }
++
++    fn process_line(&mut self, line: &str) -> Result<(), ProviderClientError> {
++        self.validate_line_not_blank(line)?;
++        let value = parse_line(line, &self.request_id)?;
++        self.validate_line_before_exit(&value)?;
++        self.process_launch_event_value(value)
++    }
++
++    fn validate_line_bytes_within_limit(&self, line: &[u8]) -> Result<(), ProviderClientError> {
++        if line.len() > self.limits.max_line_bytes {
++            return Err(transport_error_with_description(
++                HostErrorKind::StdoutLimitExceeded,
++                &self.request_id,
++                line_limit_description(self.line_number, self.limits.max_line_bytes),
++            ));
++        }
++        Ok(())
++    }
++
++    fn validate_line_not_blank(&self, line: &str) -> Result<(), ProviderClientError> {
++        if line.trim().is_empty() {
++            return Err(protocol_error_with_description(
++                HostErrorKind::MalformedLine,
++                &self.request_id,
++                blank_line_description(self.line_number),
++            ));
++        }
++        Ok(())
++    }
++
++    fn validate_line_before_exit(&self, value: &Value) -> Result<(), ProviderClientError> {
++        if self.exit.is_some() {
++            return Err(protocol_error(
++                post_exit_error_kind(value),
++                &self.request_id,
++            ));
++        }
++        Ok(())
++    }
++
++    fn process_launch_event_value(&mut self, value: Value) -> Result<(), ProviderClientError> {
++        self.validate_launch_event_value(&value)?;
++        let decoded = decode_event(value, &self.request_id)?;
++        self.record_launch_event(decoded);
++        Ok(())
++    }
++
++    fn validate_launch_event_value(&mut self, value: &Value) -> Result<(), ProviderClientError> {
++        let kind = event_kind(value, &self.request_id)?;
++        check_contract_and_request(
++            value,
++            &self.request_id,
++            "launch",
++            ProviderDiagnostics::default(),
++        )?;
++        validate_event_schema(&self.registry, kind, value, &self.request_id)?;
++        self.validate_sequence(value)
++    }
++
++    fn validate_sequence(&mut self, value: &Value) -> Result<(), ProviderClientError> {
++        let seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
++        if let Some(last) = self.last_seq {
++            if seq == last {
++                return Err(protocol_error(
++                    HostErrorKind::DuplicateSeq,
++                    &self.request_id,
++                ));
++            }
++            if seq < last {
++                return Err(protocol_error(
++                    HostErrorKind::DecreasingSeq,
++                    &self.request_id,
++                ));
++            }
++            if seq > self.expected_seq {
++                return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
++            }
++        } else if seq > self.expected_seq {
++            self.deferred_initial_skip = true;
++        }
++        if self.deferred_initial_skip && self.last_seq.is_some() {
++            return Err(protocol_error(HostErrorKind::SkippedSeq, &self.request_id));
++        }
++        self.last_seq = Some(seq);
++        self.expected_seq = seq + 1;
++        Ok(())
++    }
++
++    fn record_decoded_bytes(&mut self, event: &DecodedLaunchEvent) {
++        match event {
++            DecodedLaunchEvent::Stdout { data, .. } => self.stdout.push(data),
++            DecodedLaunchEvent::Stderr { data, .. } => self.stderr.push(data),
++            _ => {}
++        }
++    }
++
++    fn record_marker(&mut self, event: &DecodedLaunchEvent) {
++        let DecodedLaunchEvent::Marker { name, value, .. } = event else {
++            return;
++        };
++        self.markers.push(name, value);
++    }
++
++    fn record_launch_event(&mut self, decoded: DecodedLaunchEvent) {
++        self.record_decoded_bytes(&decoded);
++        self.record_marker(&decoded);
++        self.record_exit(&decoded);
++        self.retention.push(decoded);
++    }
++
++    fn record_exit(&mut self, event: &DecodedLaunchEvent) {
++        let DecodedLaunchEvent::Exit(decoded_exit) = event else {
++            return;
++        };
++        self.exit = Some(decoded_exit.clone());
++    }
++}
++
++#[derive(Debug, Clone)]
++struct LaunchEventRetention {
++    events: Vec<DecodedLaunchEvent>,
++    omitted: usize,
++    max_events: usize,
++    max_bytes: usize,
++    retained_bytes: usize,
++}
++
++#[derive(Debug, Clone)]
++struct LaunchMarkerRetention {
++    markers: Vec<RetainedLaunchMarker>,
++    max_markers: usize,
++    max_bytes: usize,
++    retained_bytes: usize,
++}
++
++impl LaunchMarkerRetention {
++    fn new(max_markers: usize, max_bytes: usize) -> Self {
++        Self {
++            markers: Vec::new(),
++            max_markers,
++            max_bytes,
++            retained_bytes: 0,
++        }
++    }
++
++    fn push(&mut self, name: &str, value: &Value) {
++        if self.markers.iter().any(|marker| marker.name == name) {
++            return;
++        }
++        let cost = retained_marker_cost(name, value);
++        if self.markers.len() >= self.max_markers
++            || self.retained_bytes.saturating_add(cost) > self.max_bytes
++        {
++            return;
++        }
++        self.retained_bytes += cost;
++        self.markers.push(RetainedLaunchMarker {
++            name: name.to_owned(),
++            value: value.clone(),
++        });
++    }
++}
++
++impl LaunchEventRetention {
++    fn new(max_events: usize, max_bytes: usize) -> Self {
++        Self {
++            events: Vec::new(),
++            omitted: 0,
++            max_events,
++            max_bytes,
++            retained_bytes: 0,
++        }
++    }
++
++    fn push(&mut self, event: DecodedLaunchEvent) {
++        let cost = retained_event_cost(&event);
++        if self.events.len() < self.max_events
++            && self.retained_bytes.saturating_add(cost) <= self.max_bytes
++        {
++            self.retained_bytes += cost;
++            self.events.push(event);
++        } else {
++            self.omitted += 1;
++        }
++    }
++}
++
++fn retained_event_cost(event: &DecodedLaunchEvent) -> usize {
++    match event {
++        DecodedLaunchEvent::Stdout { data, .. } | DecodedLaunchEvent::Stderr { data, .. } => {
++            data.len()
++        }
++        DecodedLaunchEvent::Marker { name, value, .. } => name.len() + value.to_string().len(),
++        DecodedLaunchEvent::Heartbeat { detail, .. } => detail.as_ref().map_or(0, String::len),
++        DecodedLaunchEvent::Exit(exit) => exit
++            .session
++            .as_ref()
++            .map_or(0, |session| session.to_string().len()),
++    }
++}
++
++fn retained_marker_cost(name: &str, value: &Value) -> usize {
++    name.len() + value.to_string().len()
++}
++
++fn map_launch_read_error(error: std::io::Error, request_id: &str) -> ProviderClientError {
++    ProviderClientError::protocol(
++        HostErrorKind::MalformedLine,
++        "launch",
++        Some(request_id.to_owned()),
++        ProviderDiagnostics::with_description(error.to_string()),
++    )
++}
++
++fn normalize_line_bytes(line: &[u8]) -> &[u8] {
++    line.strip_suffix(b"\r").unwrap_or(line)
++}
++
++fn pending_line_newline_index(pending_line: &[u8]) -> Option<usize> {
++    pending_line.iter().position(|byte| *byte == b'\n')
++}
++
++fn take_pending_line(pending_line: &mut Vec<u8>, newline: usize) -> Vec<u8> {
++    let mut line = pending_line.drain(..=newline).collect::<Vec<_>>();
++    remove_line_terminator(&mut line);
++    line
++}
++
++fn remove_line_terminator(line: &mut Vec<u8>) {
++    line.pop();
++}
++
++fn parse_line_utf8<'a>(line: &'a [u8], request_id: &str) -> Result<&'a str, ProviderClientError> {
++    std::str::from_utf8(line).map_err(|error| map_invalid_utf8_line_error(error, request_id))
++}
++
++fn map_invalid_utf8_line_error(
++    error: std::str::Utf8Error,
++    request_id: &str,
++) -> ProviderClientError {
++    ProviderClientError::protocol(
++        HostErrorKind::InvalidUtf8,
++        "launch",
++        Some(request_id.to_owned()),
++        ProviderDiagnostics::with_description(error.to_string()),
++    )
++}
++
++fn pending_line_limit_description(max_line_bytes: usize) -> String {
++    format!("launch JSONL line exceeded {max_line_bytes} bytes")
++}
++
++fn line_limit_description(line_number: usize, max_line_bytes: usize) -> String {
++    format!("launch JSONL line {line_number} exceeded {max_line_bytes} bytes")
++}
++
++fn blank_line_description(line_number: usize) -> String {
++    format!("launch JSONL line {line_number} was blank or whitespace-only")
++}
++
++fn post_exit_error_kind(value: &Value) -> HostErrorKind {
++    if value.get("kind").and_then(Value::as_str) == Some("exit") {
++        HostErrorKind::DuplicateExit
++    } else {
++        HostErrorKind::EventAfterExit
+     }
+ }
+ 
+@@ -237,26 +737,38 @@ fn validate_event_schema(
+ }
+ 
+ fn decode_event(value: Value, request_id: &str) -> Result<DecodedLaunchEvent, ProviderClientError> {
+-    let event: LaunchEvent = serde_json::from_value(value)
+-        .map_err(|_| protocol_error(HostErrorKind::SchemaInvalidEvent, request_id))?;
++    let event = parse_launch_event(value, request_id)?;
++    let event = decode_launch_event_payloads(event, request_id)?;
++    Ok(map_launch_event(event))
++}
++
++fn parse_launch_event(value: Value, request_id: &str) -> Result<LaunchEvent, ProviderClientError> {
++    serde_json::from_value(value)
++        .map_err(|_| protocol_error(HostErrorKind::SchemaInvalidEvent, request_id))
++}
++
++fn decode_launch_event_payloads(
++    event: LaunchEvent,
++    request_id: &str,
++) -> Result<LaunchEventWithDecodedPayloads, ProviderClientError> {
+     match event {
+         LaunchEvent::Stdout {
+             seq, data_base64, ..
+-        } => Ok(DecodedLaunchEvent::Stdout {
++        } => Ok(LaunchEventWithDecodedPayloads::Stdout {
+             seq,
+             data: decode_base64(&data_base64, request_id)?,
+         }),
+         LaunchEvent::Stderr {
+             seq, data_base64, ..
+-        } => Ok(DecodedLaunchEvent::Stderr {
++        } => Ok(LaunchEventWithDecodedPayloads::Stderr {
+             seq,
+             data: decode_base64(&data_base64, request_id)?,
+         }),
+         LaunchEvent::Marker {
+             seq, name, value, ..
+-        } => Ok(DecodedLaunchEvent::Marker { seq, name, value }),
++        } => Ok(LaunchEventWithDecodedPayloads::Marker { seq, name, value }),
+         LaunchEvent::Heartbeat { seq, detail, .. } => {
+-            Ok(DecodedLaunchEvent::Heartbeat { seq, detail })
++            Ok(LaunchEventWithDecodedPayloads::Heartbeat { seq, detail })
+         }
+         LaunchEvent::Exit {
+             seq,
+@@ -264,7 +776,7 @@ fn decode_event(value: Value, request_id: &str) -> Result<DecodedLaunchEvent, Pr
+             terminal_signal,
+             session,
+             ..
+-        } => Ok(DecodedLaunchEvent::Exit(LaunchExit {
++        } => Ok(LaunchEventWithDecodedPayloads::Exit(LaunchExit {
+             seq,
+             status,
+             terminal_signal,
+@@ -273,6 +785,24 @@ fn decode_event(value: Value, request_id: &str) -> Result<DecodedLaunchEvent, Pr
+     }
+ }
+ 
++fn map_launch_event(event: LaunchEventWithDecodedPayloads) -> DecodedLaunchEvent {
++    match event {
++        LaunchEventWithDecodedPayloads::Stdout { seq, data } => {
++            DecodedLaunchEvent::Stdout { seq, data }
++        }
++        LaunchEventWithDecodedPayloads::Stderr { seq, data } => {
++            DecodedLaunchEvent::Stderr { seq, data }
++        }
++        LaunchEventWithDecodedPayloads::Marker { seq, name, value } => {
++            DecodedLaunchEvent::Marker { seq, name, value }
++        }
++        LaunchEventWithDecodedPayloads::Heartbeat { seq, detail } => {
++            DecodedLaunchEvent::Heartbeat { seq, detail }
++        }
++        LaunchEventWithDecodedPayloads::Exit(exit) => DecodedLaunchEvent::Exit(exit),
++    }
++}
++
+ fn decode_base64(text: &str, request_id: &str) -> Result<Vec<u8>, ProviderClientError> {
+     base64::engine::general_purpose::STANDARD
+         .decode(text)
+@@ -295,6 +825,19 @@ fn protocol_error_with_description(
+     )
+ }
+ 
++fn transport_error_with_description(
++    kind: HostErrorKind,
++    request_id: &str,
++    description: String,
++) -> ProviderClientError {
++    ProviderClientError::host_transport(
++        kind,
++        "launch",
++        Some(request_id.to_owned()),
++        ProviderDiagnostics::with_description(description),
++    )
++}
++
+ fn protocol_error_with_diagnostics(
+     kind: HostErrorKind,
+     request_id: &str,
+diff --git a/crates/oulipoly-provider/src/testkit.rs b/crates/oulipoly-provider/src/testkit.rs
+index 6fa3ec7..9ac72e2 100644
+--- a/crates/oulipoly-provider/src/testkit.rs
++++ b/crates/oulipoly-provider/src/testkit.rs
+@@ -1,3 +1,53 @@
++//! ## Declared roles
++//!
++//! Roles: orchestration, formatter, mapper, accessor, predicate, parser, filter, validator.
++//!
++//! - orchestration: `FakeProvider::{compile, run, run_with_env, spawn}` and
++//!   `LeakProbe` construct fixtures, launch fake provider binaries, coordinate
++//!   stdin/stdout collection, and supervise descendant cleanup.
++//! - formatter: `wrapper_script`, `unique_temp_dir`, and fixture environment
++//!   helpers format wrapper scripts, temp roots, and mode-specific env values.
++//! - mapper: `FakeProviderMode::{env, env_with_probe, env_with_record, as_str}`,
++//!   `normalize_envs`, and `record_env` map typed fixture modes and env inputs
++//!   onto subprocess environment vectors.
++//! - accessor: `FakeProvider::{path, is_executable, was_spawned}`,
++//!   `read_probe_dir`, and `probe_marker_text` expose fixture paths, marker
++//!   state, and descendant process observations.
++//! - predicate: `is_executable`, `process_alive`, and cleanup assertion helpers
++//!   classify filesystem/process liveness state.
++//! - parser: `parse_probe_pid` and `parse_probe_pid_texts` parse pid marker
++//!   files emitted by the fake-provider process-tree fixtures.
++//! - filter: `collect_readable_probe_entries`, `filter_probe_marker_texts`,
++//!   `filter_parsed_probe_pids`, and `alive_descendants` select readable marker
++//!   files, valid pid records, and still-running descendant pids.
++//! - validator: `assert_fake_provider_compiled`, `assert_descendants_observed`,
++//!   and `assert_descendants_cleaned` validate fixture compilation and leak
++//!   cleanup preconditions/results.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-provider/src/testkit.rs
++//!     role: adapter
++//!     Translates:
++//!       - fake-provider-fixture-contract
++//!       - provider-cli-subprocess-contract
++//!       - process-supervision-liveness-contract
++//!       - rustc-fixture-compilation-contract
++//!       - test-process-environment-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/src/testkit.rs
++//!     role: intrinsic-surface
++//!     Domain: provider client fixture harness
++//!     Owns:
++//!       - FakeProvider compile/run/spawn helper surface
++//!       - FakeProviderMode vocabulary and env projection
++//!       - LeakProbe descendant observation and cleanup assertions
++//!       - cross-platform fixture executable and process cleanup helpers
++//!       - temporary fixture root and wrapper script allocation
++//! ```
++
+ #![allow(dead_code)]
+ 
+ use std::ffi::{OsStr, OsString};
+@@ -17,7 +67,7 @@ impl FakeProvider {
+     pub fn compile(source: impl AsRef<Path>) -> Self {
+         let root = create_fixture_root("fake-provider");
+         let binary = compile_fake_provider_binary(&root, source.as_ref());
+-        let marker = root.join("spawned.marker");
++        let marker = marker_path(&root);
+         let path = wrapper_path(&root, &binary, &marker);
+         fake_provider_fixture(root, path, marker)
+     }
+@@ -81,12 +131,26 @@ fn compile_fake_provider_binary(root: &Path, source: &Path) -> PathBuf {
+     binary
+ }
+ 
++fn marker_path(root: &Path) -> PathBuf {
++    root.join("spawned.marker")
++}
++
+ fn run_rustc_fake_provider(source: &Path, binary: &Path) -> ExitStatus {
+-    Command::new("rustc")
++    run_rustc_command(rustc_fake_provider_command(source, binary))
++}
++
++fn rustc_fake_provider_command(source: &Path, binary: &Path) -> Command {
++    let mut command = Command::new("rustc");
++    command
+         .arg("--edition=2024")
+         .arg(source)
+         .arg("-o")
+-        .arg(binary)
++        .arg(binary);
++    command
++}
++
++fn run_rustc_command(mut command: Command) -> ExitStatus {
++    command
+         .status()
+         .expect("rustc should run for fake-provider fixture")
+ }
+@@ -223,6 +287,7 @@ pub enum FakeProviderMode {
+     LaunchProviderNonzeroAfterFinal,
+     LaunchProviderNonzeroNoFinal,
+     LaunchCancelledFinalEvent,
++    LaunchLongValidStream,
+     LaunchMalformedLine,
+     LaunchMalformedLineNonzero,
+     LaunchMalformedLineStderr,
+@@ -243,15 +308,11 @@ impl FakeProviderMode {
+ 
+     pub fn env_with_probe(self, probe: &LeakProbe) -> Vec<(String, String)> {
+         let mut env = self.env();
+-        env.push((
+-            "FAKE_PROVIDER_PROBE_DIR".to_owned(),
+-            probe.root.display().to_string(),
+-        ));
++        env.push(probe_dir_env_pair(probe_dir_env_value(&probe.root)));
+         env
+     }
+ 
+     pub fn env_with_record(self, record: &Path) -> Vec<(String, OsString)> {
+-        ensure_record_parent(record);
+         record_env(self, record)
+     }
+ 
+@@ -293,6 +354,7 @@ impl FakeProviderMode {
+             Self::LaunchProviderNonzeroAfterFinal => "launch-provider-nonzero-after-final",
+             Self::LaunchProviderNonzeroNoFinal => "launch-provider-nonzero-no-final",
+             Self::LaunchCancelledFinalEvent => "launch-cancelled-final-event",
++            Self::LaunchLongValidStream => "launch-long-valid-stream",
+             Self::LaunchMalformedLine => "launch-malformed-line",
+             Self::LaunchMalformedLineNonzero => "launch-malformed-line-nonzero",
+             Self::LaunchMalformedLineStderr => "launch-malformed-line-stderr",
+@@ -322,17 +384,19 @@ impl LeakProbe {
+     }
+ 
+     pub fn wait_for_descendants(&self) {
++        assert_descendant_wait_observed(self.wait_for_descendant_observation());
++    }
++
++    fn wait_for_descendant_observation(&self) -> Vec<u32> {
+         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+         while std::time::Instant::now() < deadline {
+-            if self.observed_pids().len() >= 2 {
+-                return;
++            let pids = self.observed_pids();
++            if descendant_observation_ready(&pids) {
++                return pids;
+             }
+             std::thread::sleep(Duration::from_millis(20));
+         }
+-        panic!(
+-            "expected fake provider to report at least two descendant pids, observed {:?}",
+-            self.observed_pids()
+-        );
++        self.observed_pids()
+     }
+ 
+     pub fn terminate_process_tree(&self, child: &mut Child) {
+@@ -349,21 +413,93 @@ impl LeakProbe {
+     }
+ 
+     fn observed_pids(&self) -> Vec<u32> {
+-        let Ok(entries) = fs::read_dir(&self.root) else {
+-            return Vec::new();
+-        };
+-        entries
+-            .filter_map(Result::ok)
+-            .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+-            .filter_map(|text| text.trim().parse::<u32>().ok())
+-            .collect()
++        observed_pids_from_probe_dir(read_probe_dir(&self.root))
+     }
+ }
+ 
+-fn ensure_record_parent(record: &Path) {
+-    if let Some(parent) = record.parent() {
+-        fs::create_dir_all(parent).expect("record directory should be created");
+-    }
++fn read_probe_dir(root: &Path) -> Option<fs::ReadDir> {
++    fs::read_dir(root).ok()
++}
++
++fn observed_pids_from_probe_dir(entries: Option<fs::ReadDir>) -> Vec<u32> {
++    let Some(entries) = entries else {
++        return Vec::new();
++    };
++    let entries = collect_readable_probe_entries(entries);
++    let marker_texts = filter_probe_marker_texts(entries);
++    filter_parsed_probe_pids(parse_probe_pid_texts(marker_texts))
++}
++
++fn collect_readable_probe_entries(entries: fs::ReadDir) -> Vec<fs::DirEntry> {
++    let candidates = probe_entry_options(entries);
++    let present = filter_present_probe_entries(candidates);
++    map_present_probe_entries(present)
++}
++
++fn probe_entry_options(entries: fs::ReadDir) -> Vec<Option<fs::DirEntry>> {
++    entries.map(Result::ok).collect()
++}
++
++fn filter_present_probe_entries(entries: Vec<Option<fs::DirEntry>>) -> Vec<Option<fs::DirEntry>> {
++    entries.into_iter().filter(Option::is_some).collect()
++}
++
++fn map_present_probe_entries(entries: Vec<Option<fs::DirEntry>>) -> Vec<fs::DirEntry> {
++    entries
++        .into_iter()
++        .map(|entry| entry.expect("probe entry was filtered as present"))
++        .collect()
++}
++
++fn filter_probe_marker_texts(entries: Vec<fs::DirEntry>) -> Vec<String> {
++    let candidates = probe_marker_text_options(entries);
++    let present = filter_present_marker_texts(candidates);
++    map_present_marker_texts(present)
++}
++
++fn probe_marker_text_options(entries: Vec<fs::DirEntry>) -> Vec<Option<String>> {
++    entries.into_iter().map(probe_marker_text).collect()
++}
++
++fn filter_present_marker_texts(texts: Vec<Option<String>>) -> Vec<Option<String>> {
++    texts.into_iter().filter(Option::is_some).collect()
++}
++
++fn map_present_marker_texts(texts: Vec<Option<String>>) -> Vec<String> {
++    texts
++        .into_iter()
++        .map(|text| text.expect("marker text was filtered as present"))
++        .collect()
++}
++
++fn probe_marker_text(entry: fs::DirEntry) -> Option<String> {
++    fs::read_to_string(entry.path()).ok()
++}
++
++fn parse_probe_pid_texts(texts: Vec<String>) -> Vec<Option<u32>> {
++    texts
++        .into_iter()
++        .map(|text| parse_probe_pid(&text))
++        .collect()
++}
++
++fn filter_parsed_probe_pids(pids: Vec<Option<u32>>) -> Vec<u32> {
++    let present = filter_present_probe_pids(pids);
++    map_present_probe_pids(present)
++}
++
++fn filter_present_probe_pids(pids: Vec<Option<u32>>) -> Vec<Option<u32>> {
++    pids.into_iter().filter(Option::is_some).collect()
++}
++
++fn map_present_probe_pids(pids: Vec<Option<u32>>) -> Vec<u32> {
++    pids.into_iter()
++        .map(|pid| pid.expect("probe pid was filtered as present"))
++        .collect()
++}
++
++fn parse_probe_pid(text: &str) -> Option<u32> {
++    text.trim().parse::<u32>().ok()
+ }
+ 
+ fn record_env(mode: FakeProviderMode, record: &Path) -> Vec<(String, OsString)> {
+@@ -383,6 +519,25 @@ fn leak_probe(root: PathBuf) -> LeakProbe {
+     LeakProbe { root }
+ }
+ 
++fn probe_dir_env_value(root: &Path) -> String {
++    root.display().to_string()
++}
++
++fn probe_dir_env_pair(value: String) -> (String, String) {
++    ("FAKE_PROVIDER_PROBE_DIR".to_owned(), value)
++}
++
++fn descendant_observation_ready(pids: &[u32]) -> bool {
++    pids.len() >= 2
++}
++
++fn assert_descendant_wait_observed(pids: Vec<u32>) {
++    assert!(
++        descendant_observation_ready(&pids),
++        "expected fake provider to report at least two descendant pids, observed {pids:?}"
++    );
++}
++
+ fn assert_descendants_observed(pids: &[u32]) {
+     assert!(
+         !pids.is_empty(),
+@@ -463,7 +618,7 @@ fn retry_spawn(mut build: impl FnMut() -> Command) -> std::io::Result<Child> {
+     for _ in 0..10 {
+         match build().spawn() {
+             Ok(child) => return Ok(child),
+-            Err(error) if error.raw_os_error() == Some(26) => {
++            Err(error) if executable_busy_error(&error) => {
+                 last_error = Some(error);
+                 std::thread::sleep(Duration::from_millis(20));
+             }
+@@ -473,6 +628,10 @@ fn retry_spawn(mut build: impl FnMut() -> Command) -> std::io::Result<Child> {
+     Err(last_error.expect("retry loop should retain last executable-busy error"))
+ }
+ 
++fn executable_busy_error(error: &std::io::Error) -> bool {
++    error.raw_os_error() == Some(26)
++}
++
+ #[cfg(unix)]
+ fn process_alive(pid: u32) -> bool {
+     unsafe { libc::kill(pid as i32, 0) == 0 }
+@@ -480,16 +639,38 @@ fn process_alive(pid: u32) -> bool {
+ 
+ #[cfg(windows)]
+ fn process_alive(pid: u32) -> bool {
+-    Command::new("cmd")
+-        .args([
+-            "/C",
+-            &format!("tasklist /FI \"PID eq {pid}\" | findstr {pid}"),
+-        ])
++    tasklist_status_found(run_tasklist_pid_filter(tasklist_pid_command(pid)))
++}
++
++#[cfg(windows)]
++fn tasklist_pid_command(pid: u32) -> Command {
++    let mut command = Command::new("cmd");
++    command
++        .arg("/C")
++        .arg(tasklist_pid_filter(pid))
+         .stdout(Stdio::null())
+-        .stderr(Stdio::null())
+-        .status()
+-        .map(|status| status.success())
+-        .unwrap_or(false)
++        .stderr(Stdio::null());
++    command
++}
++
++#[cfg(windows)]
++fn tasklist_pid_filter(pid: u32) -> String {
++    format!("tasklist /FI \"PID eq {pid}\" | findstr {pid}")
++}
++
++#[cfg(windows)]
++fn run_tasklist_pid_filter(mut command: Command) -> Option<ExitStatus> {
++    command.status().ok()
++}
++
++#[cfg(windows)]
++fn tasklist_status_found(status: Option<ExitStatus>) -> bool {
++    status.map(exit_status_success).unwrap_or(false)
++}
++
++#[cfg(windows)]
++fn exit_status_success(status: ExitStatus) -> bool {
++    status.success()
+ }
+ 
+ #[cfg(not(any(unix, windows)))]
+@@ -516,12 +697,22 @@ fn terminate_pid(_pid: u32) {}
+ 
+ #[cfg(unix)]
+ fn wrapper_path(root: &Path, binary: &Path, marker: &Path) -> PathBuf {
+-    let wrapper = root.join("fake-provider");
+-    write_wrapper_script(&wrapper, &wrapper_script(binary, marker));
+-    make_wrapper_executable(&wrapper);
++    let wrapper = fake_provider_wrapper_path(root);
++    materialize_wrapper(&wrapper, binary, marker);
+     wrapper
+ }
+ 
++#[cfg(unix)]
++fn fake_provider_wrapper_path(root: &Path) -> PathBuf {
++    root.join("fake-provider")
++}
++
++#[cfg(unix)]
++fn materialize_wrapper(wrapper: &Path, binary: &Path, marker: &Path) {
++    write_wrapper_script(wrapper, &wrapper_script(binary, marker));
++    make_wrapper_executable(wrapper);
++}
++
+ #[cfg(unix)]
+ fn wrapper_script(binary: &Path, marker: &Path) -> String {
+     format!(
+@@ -570,13 +761,31 @@ fn terminate_process_tree(child: &mut Child) {
+ fn configure_test_process_group(command: &mut Command) {
+     use std::os::unix::process::CommandExt;
+     unsafe {
+-        command.pre_exec(|| {
+-            if libc::setpgid(0, 0) != 0 {
+-                return Err(std::io::Error::last_os_error());
+-            }
+-            Ok(())
+-        });
++        command.pre_exec(configure_child_process_group);
++    }
++}
++
++#[cfg(unix)]
++fn configure_child_process_group() -> std::io::Result<()> {
++    validate_setpgid_result(set_current_process_group())
++}
++
++#[cfg(unix)]
++fn set_current_process_group() -> i32 {
++    unsafe { libc::setpgid(0, 0) }
++}
++
++#[cfg(unix)]
++fn validate_setpgid_result(result: i32) -> std::io::Result<()> {
++    if setpgid_failed(result) {
++        return Err(std::io::Error::last_os_error());
+     }
++    Ok(())
++}
++
++#[cfg(unix)]
++fn setpgid_failed(result: i32) -> bool {
++    result != 0
+ }
+ 
+ #[cfg(not(unix))]
+diff --git a/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs b/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
+index c3c0c46..cc48f40 100644
+--- a/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
++++ b/crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
+@@ -1,10 +1,50 @@
+ //! ## Declared roles
+-//! orchestration, accessor, mapper, formatter
++//!
++//! Roles: orchestration, accessor, mapper, formatter, parser, predicate, validator.
++//!
++//! - orchestration: `main`, `dispatch_fake_provider_mode`, launch fixture
++//!   modes, S7C/S5 fixture flows, sleep/hang modes, and probe child/grandchild
++//!   modes drive fake provider subprocess behavior for tests.
++//! - accessor: `fake_provider_mode`, `current_subcommand`, `s7c_env_or`,
++//!   `read_request_id`, `request_id_from_stdin`, and invocation/probe helpers
++//!   read environment, stdin, argv, and sidecar state.
++//! - mapper: mode dispatch, `response_json_for_kind`,
++//!   `s5_result_json_for_subcommand`, `provider_error_fields`,
++//!   `terminal_signal_for_exit_code`, and S7C value builders map fixture inputs
++//!   onto provider protocol payloads.
++//! - formatter: JSON envelope/event builders, invocation-record formatters,
++//!   S7C host-state/artifact formatters, and `json_escape` materialize stable
++//!   fake provider stdout/stderr/file payloads.
++//! - parser: `json_string_field`, `request_id_from_stdin`, and count helpers
++//!   parse minimal JSON/stdin and sidecar count state used by fixtures.
++//! - predicate: provider retryability, launch/describe/subcommand selectors,
++//!   stdin/probe env checks, and SIGTERM-ignore checks choose fixture branches.
++//! - validator: unknown-mode handling rejects unsupported fixture modes with a
++//!   stable diagnostic and exit code.
+ //!
+ //! ## Adapter declarations
++//!
++//! ```yaml
+ //! adapter_declarations:
+-//!   - component: s7c-fake-provider-fixture-adapter
++//!   - component: crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
+ //!     role: adapter
++//!     Translates:
++//!       - fake-provider-fixture-contract
++//!       - provider-cli-subprocess-contract
++//!       - launch-jsonl-stream-contract
++//!       - oulipoly-provider-generated-dto-contract
++//!       - process-supervision-liveness-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
++//!     role: intrinsic-surface
++//!     Domain: fake provider executable fixture modes and protocol payloads
++//!     Owns:
++//!       - fake-provider mode vocabulary and environment dispatch
++//!       - describe, settings, rotation, migration, and launch fixture payloads
++//!       - invocation record, count, artifact, and probe sidecar file behavior
++//!       - process-tree, hang, pipe-pressure, and signal-resistance scenarios
++//!       - request-id correlation fallback and JSON escaping helpers
++//! ```
+ 
+ use std::env;
+ use std::fs;
+@@ -97,6 +137,7 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
+         "launch-provider-nonzero-after-final" => launch_provider_nonzero_after_final(),
+         "launch-provider-nonzero-no-final" => launch_provider_nonzero_no_final(),
+         "launch-cancelled-final-event" => launch_cancelled_final_event(),
++        "launch-long-valid-stream" => launch_long_valid_stream(),
+         "launch-malformed-line" => write_stdout("{not-json}\n"),
+         "launch-malformed-line-nonzero" => launch_malformed_line_nonzero(),
+         "launch-malformed-line-stderr" => launch_malformed_line_stderr(),
+@@ -224,11 +265,19 @@ fn record_current_invocation() -> InvocationRecord {
+ }
+ 
+ fn current_invocation_record() -> InvocationRecord {
+-    InvocationRecord {
+-        path: env::var("FAKE_PROVIDER_RECORD_PATH").expect("record path should be set"),
+-        argv: env::args().collect(),
+-        stdin: read_stdin_to_string(),
+-    }
++    invocation_record_from_parts(record_path_env(), current_argv(), read_stdin_to_string())
++}
++
++fn record_path_env() -> String {
++    env::var("FAKE_PROVIDER_RECORD_PATH").expect("record path should be set")
++}
++
++fn current_argv() -> Vec<String> {
++    env::args().collect()
++}
++
++fn invocation_record_from_parts(path: String, argv: Vec<String>, stdin: String) -> InvocationRecord {
++    InvocationRecord { path, argv, stdin }
+ }
+ 
+ fn format_invocation_record(record: &InvocationRecord) -> String {
+@@ -259,11 +308,7 @@ fn invocation_record_if_requested(stdin: &str) -> Option<InvocationRecord> {
+ }
+ 
+ fn invocation_record(path: String, stdin: &str) -> InvocationRecord {
+-    InvocationRecord {
+-        path,
+-        argv: env::args().collect(),
+-        stdin: stdin.to_string(),
+-    }
++    invocation_record_from_parts(path, current_argv(), stdin.to_string())
+ }
+ 
+ fn increment_count_if_requested() {
+@@ -278,10 +323,15 @@ fn count_path_if_requested() -> Option<String> {
+ }
+ 
+ fn read_count(path: &str) -> u64 {
+-    fs::read_to_string(path)
+-        .ok()
+-        .and_then(|text| parse_count(&text))
+-        .unwrap_or(0)
++    parse_count_text(read_count_text(path)).unwrap_or(0)
++}
++
++fn read_count_text(path: &str) -> Option<String> {
++    fs::read_to_string(path).ok()
++}
++
++fn parse_count_text(text: Option<String>) -> Option<u64> {
++    text.and_then(|text| parse_count(&text))
+ }
+ 
+ fn parse_count(text: &str) -> Option<u64> {
+@@ -409,10 +459,14 @@ fn write_empty_stdin_eof() -> i32 {
+ }
+ 
+ fn write_observed_stdin_eof() -> i32 {
+-    eprintln!("observed stdin eof");
++    write_observed_stdin_eof_diagnostic();
+     success()
+ }
+ 
++fn write_observed_stdin_eof_diagnostic() {
++    eprintln!("observed stdin eof");
++}
++
+ fn success() -> i32 {
+     let _ = read_stdin_to_string();
+     write_stdout(&success_json())
+@@ -424,10 +478,14 @@ fn s5_success() -> i32 {
+ }
+ 
+ fn success_stderr() -> i32 {
+-    eprintln!("fake-provider diagnostic on stderr");
++    write_success_stderr_diagnostic();
+     success()
+ }
+ 
++fn write_success_stderr_diagnostic() {
++    eprintln!("fake-provider diagnostic on stderr");
++}
++
+ fn provider_error(category: &str, code: &str, exit_code: i32) -> i32 {
+     let stdin = read_stdin_to_string();
+     record_invocation_if_requested(&stdin);
+@@ -786,19 +844,7 @@ fn sigterm_resistant_child_grandchild() -> i32 {
+ }
+ 
+ fn spawn_probe_child(ignore_sigterm: bool) -> i32 {
+-    let current = env::current_exe().expect("current executable should be known");
+-    let mut child_command = Command::new(current);
+-    child_command
+-        .env("FAKE_PROVIDER_MODE", "probe-child")
+-        .stdin(Stdio::null())
+-        .stdout(Stdio::null())
+-        .stderr(Stdio::null());
+-    if ignore_sigterm {
+-        child_command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
+-    }
+-    if let Ok(probe_dir) = env::var("FAKE_PROVIDER_PROBE_DIR") {
+-        child_command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
+-    }
++    let mut child_command = probe_child_command(ignore_sigterm);
+     let mut child = child_command.spawn().expect("child should spawn");
+     let _ = child.wait();
+     sleep_forever()
+@@ -807,19 +853,7 @@ fn spawn_probe_child(ignore_sigterm: bool) -> i32 {
+ fn probe_child() -> i32 {
+     maybe_ignore_sigterm();
+     write_probe_pid("child");
+-    let current = env::current_exe().expect("current executable should be known");
+-    let mut command = Command::new(current);
+-    command
+-        .env("FAKE_PROVIDER_MODE", "probe-grandchild")
+-        .stdin(Stdio::null())
+-        .stdout(Stdio::null())
+-        .stderr(Stdio::null());
+-    if env::var_os("FAKE_PROVIDER_IGNORE_SIGTERM").is_some() {
+-        command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
+-    }
+-    if let Ok(probe_dir) = env::var("FAKE_PROVIDER_PROBE_DIR") {
+-        command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
+-    }
++    let mut command = probe_grandchild_command();
+     let _grandchild = command.spawn().expect("grandchild should spawn");
+     sleep_forever()
+ }
+@@ -831,11 +865,59 @@ fn probe_grandchild() -> i32 {
+ }
+ 
+ fn maybe_ignore_sigterm() {
+-    if env::var_os("FAKE_PROVIDER_IGNORE_SIGTERM").is_some() {
++    if ignore_sigterm_requested() {
+         ignore_sigterm();
+     }
+ }
+ 
++fn probe_child_command(ignore_sigterm: bool) -> Command {
++    let mut command = probe_process_command("probe-child");
++    apply_ignore_sigterm_env(&mut command, ignore_sigterm);
++    apply_probe_dir_env(&mut command, probe_dir_env());
++    command
++}
++
++fn probe_grandchild_command() -> Command {
++    let mut command = probe_process_command("probe-grandchild");
++    apply_ignore_sigterm_env(&mut command, ignore_sigterm_requested());
++    apply_probe_dir_env(&mut command, probe_dir_env());
++    command
++}
++
++fn probe_process_command(mode: &str) -> Command {
++    let mut command = Command::new(current_executable_path());
++    command
++        .env("FAKE_PROVIDER_MODE", mode)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null());
++    command
++}
++
++fn current_executable_path() -> std::path::PathBuf {
++    env::current_exe().expect("current executable should be known")
++}
++
++fn apply_ignore_sigterm_env(command: &mut Command, enabled: bool) {
++    if enabled {
++        command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
++    }
++}
++
++fn ignore_sigterm_requested() -> bool {
++    env::var_os("FAKE_PROVIDER_IGNORE_SIGTERM").is_some()
++}
++
++fn apply_probe_dir_env(command: &mut Command, probe_dir: Option<String>) {
++    if let Some(probe_dir) = probe_dir {
++        command.env("FAKE_PROVIDER_PROBE_DIR", probe_dir);
++    }
++}
++
++fn probe_dir_env() -> Option<String> {
++    env::var("FAKE_PROVIDER_PROBE_DIR").ok()
++}
++
+ #[cfg(unix)]
+ fn ignore_sigterm() {
+     const SIGTERM: i32 = 15;
+@@ -874,21 +956,23 @@ fn probe_pid_path(root: &std::path::Path, label: &str, pid: u32) -> std::path::P
+ }
+ 
+ fn early_stdin_success() -> i32 {
+-    let mut buffer = [0_u8; 1];
+-    let _ = io::stdin().read(&mut buffer);
++    read_one_stdin_byte();
+     write_stdout(&success_json())
+ }
+ 
+ fn early_stdin_error() -> i32 {
+-    let mut buffer = [0_u8; 1];
+-    let _ = io::stdin().read(&mut buffer);
++    read_one_stdin_byte();
+     provider_error("failed", "example_early_stdin", 0)
+ }
+ 
+ fn early_stdin_empty() -> i32 {
++    read_one_stdin_byte();
++    0
++}
++
++fn read_one_stdin_byte() {
+     let mut buffer = [0_u8; 1];
+     let _ = io::stdin().read(&mut buffer);
+-    0
+ }
+ 
+ fn launch_valid(exit_code: i32) -> i32 {
+@@ -920,30 +1004,85 @@ fn launch_cancelled_final_event() -> i32 {
+     0
+ }
+ 
++fn launch_long_valid_stream() -> i32 {
++    let request_id = read_request_id();
++    write_long_valid_launch_stream(&request_id);
++    0
++}
++
++fn write_long_valid_launch_stream(request_id: &str) {
++    write_launch_event_lines(&long_valid_launch_stream_events(request_id));
++}
++
++fn long_valid_launch_stream_events(request_id: &str) -> Vec<String> {
++    let detail = long_launch_heartbeat_detail();
++    let mut events = long_launch_heartbeat_events(request_id, &detail);
++    events.push(exit_event(request_id, 701, 0));
++    events
++}
++
++fn long_launch_heartbeat_events(request_id: &str, detail: &str) -> Vec<String> {
++    (1..=700)
++        .map(|seq| heartbeat_event_with_detail(request_id, seq, detail))
++        .collect()
++}
++
++fn long_launch_heartbeat_detail() -> String {
++    "h".repeat(4096)
++}
++
++fn write_launch_event_lines(events: &[String]) {
++    let mut stdout = io::stdout().lock();
++    for event in events {
++        let _ = writeln!(stdout, "{event}");
++    }
++    let _ = stdout.flush();
++}
++
+ fn launch_malformed_line_nonzero() -> i32 {
+     write_stdout("{not-json}\n");
+     8
+ }
+ 
+ fn launch_malformed_line_stderr() -> i32 {
+-    eprintln!("fake-provider launch diagnostic on stderr");
++    write_launch_malformed_line_diagnostic();
+     write_stdout("{not-json}\n")
+ }
+ 
++fn write_launch_malformed_line_diagnostic() {
++    eprintln!("fake-provider launch diagnostic on stderr");
++}
++
+ fn launch_blank_line() -> i32 {
+     let request_id = read_request_id();
+-    write_jsonl(&stdout_event(&request_id, 1, "YQ=="));
+-    println!("   ");
+-    write_jsonl(&exit_event(&request_id, 2, 0));
++    write_launch_blank_line_events(&request_id);
+     0
+ }
+ 
++fn write_launch_blank_line_events(request_id: &str) {
++    write_jsonl(&stdout_event(request_id, 1, "YQ=="));
++    write_blank_launch_line();
++    write_jsonl(&exit_event(request_id, 2, 0));
++}
++
++fn write_blank_launch_line() {
++    println!("   ");
++}
++
+ fn launch_exit_then_large_stdout() -> i32 {
+     let request_id = read_request_id();
++    write_exit_then_large_stdout(&request_id);
++    0
++}
++
++fn write_exit_then_large_stdout(request_id: &str) {
+     write_jsonl(&exit_event(&request_id, 1, 0));
++    write_large_launch_stdout();
++}
++
++fn write_large_launch_stdout() {
+     print!("{}", large_launch_stdout_block());
+     let _ = io::stdout().flush();
+-    0
+ }
+ 
+ fn large_launch_stdout_block() -> String {
+@@ -1050,9 +1189,14 @@ fn marker_event(request_id: &str, seq: u64) -> String {
+ }
+ 
+ fn heartbeat_event(request_id: &str, seq: u64) -> String {
++    heartbeat_event_with_detail(request_id, seq, "example heartbeat")
++}
++
++fn heartbeat_event_with_detail(request_id: &str, seq: u64, detail: &str) -> String {
+     let request_id = json_escape(request_id);
++    let detail = json_escape(detail);
+     format!(
+-        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"heartbeat\",\"detail\":\"example heartbeat\"}}",
++        "{{\"contract\":\"{CONTRACT}\",\"request_id\":\"{request_id}\",\"seq\":{seq},\"time_unix_ms\":{},\"kind\":\"heartbeat\",\"detail\":\"{detail}\"}}",
+         1000 + seq
+     )
+ }
+diff --git a/crates/oulipoly-provider/tests/launch_stream.rs b/crates/oulipoly-provider/tests/launch_stream.rs
+index 21245b6..daf2760 100644
+--- a/crates/oulipoly-provider/tests/launch_stream.rs
++++ b/crates/oulipoly-provider/tests/launch_stream.rs
+@@ -1,3 +1,43 @@
++//! ## Declared roles
++//!
++//! Roles: validator, orchestration, mapper, accessor, predicate.
++//!
++//! - validator: launch-stream integration tests assert valid stream decoding,
++//!   request-id correlation, model/provider nonzero handling, truncation,
++//!   protocol diagnostics, and exact launch argv/stdin behavior.
++//! - orchestration: each test compiles the fake provider, creates a
++//!   `ProviderClient`, invokes `ProviderClient::launch`, and inspects the
++//!   resulting success or transport error.
++//! - mapper: `launch_client` maps a fixture binary path and provider-client
++//!   options into the configured launch client under test.
++//! - accessor: tests read `LaunchResult` event, exit, diagnostic, stdout/stderr,
++//!   recorded-invocation, and last-argv surfaces.
++//! - predicate: `matches!`, `contains`, and nonzero/truncation assertions
++//!   classify expected event kinds and diagnostic states.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-provider/tests/launch_stream.rs
++//!     role: adapter
++//!     Translates:
++//!       - fake-provider-fixture-contract
++//!       - provider-client-options-contract
++//!       - provider-cli-subprocess-contract
++//!       - launch-jsonl-stream-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/tests/launch_stream.rs
++//!     role: intrinsic-surface
++//!     Domain: launch stream provider-client integration test suite
++//!     Owns:
++//!       - valid launch JSONL decoding and binary payload ordering coverage
++//!       - request-id echo and exact argv/stdin invocation coverage
++//!       - model exit versus provider process exit behavior coverage
++//!       - launch stdout truncation precedence coverage
++//!       - malformed protocol diagnostic and process-status preservation coverage
++//! ```
++
+ pub mod support {
+     pub mod provider_client;
+ }
+@@ -87,6 +127,23 @@ fn launch_provider_nonzero_after_valid_final_exit_is_nonfatal_diagnostic() {
+     assert_eq!(result.diagnostics.provider_exit_code, Some(6));
+ }
+ 
++#[test]
++fn launch_accepts_valid_stream_larger_than_transport_capture_limit() {
++    let fake = FakeProvider::compile(fake_provider_source());
++    let result = launch_client(fake.path())
++        .launch(
++            launch_request(),
++            FakeProviderMode::LaunchLongValidStream.env(),
++        )
++        .expect("valid launch streams must not fail on accumulated stdout volume");
++
++    assert_eq!(result.exit.status, ProcessStatus::Exited { code: 0 });
++    assert!(
++        result.diagnostics.stdout.truncated,
++        "diagnostics should record that bounded transport evidence was retained"
++    );
++}
++
+ #[test]
+ fn launch_provider_nonzero_without_final_exit_is_transport_error() {
+     let fake = FakeProvider::compile(fake_provider_source());
+diff --git a/crates/oulipoly-provider/tests/launch_stream_protocol.rs b/crates/oulipoly-provider/tests/launch_stream_protocol.rs
+index 0e9b47b..209ec4a 100644
+--- a/crates/oulipoly-provider/tests/launch_stream_protocol.rs
++++ b/crates/oulipoly-provider/tests/launch_stream_protocol.rs
+@@ -1,8 +1,47 @@
++//! ## Declared roles
++//!
++//! Roles: validator, orchestration, formatter, mapper, accessor.
++//!
++//! - validator: launch-stream protocol tests assert accepted event mixtures,
++//!   bounded retention, malformed/kind/schema/base64/correlation failures,
++//!   sequence errors, and final-exit requirements.
++//! - orchestration: tests build JSONL fixtures, configure `LaunchJsonlReader`,
++//!   run the parser, and compare returned results or transport errors.
++//! - formatter: `format!`, JSONL helper calls, and string joins materialize
++//!   valid and invalid launch-stream fixture payloads.
++//! - mapper: table-driven case arrays map fixture labels and JSONL payloads to
++//!   expected provider-client transport kinds.
++//! - accessor: tests read event counts, retained marker values, stdout/stderr
++//!   bytes, omitted-event counts, and exit sequence values.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-provider/tests/launch_stream_protocol.rs
++//!     role: adapter
++//!     Translates:
++//!       - launch-jsonl-stream-contract
++//!       - oulipoly-provider-generated-dto-contract
++//!       - byte-limit-capture-contract
++//!       - provider-client-error-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-provider/tests/launch_stream_protocol.rs
++//!     role: intrinsic-surface
++//!     Domain: launch JSONL protocol parser test suite
++//!     Owns:
++//!       - valid stdout, stderr, marker, heartbeat, and final-exit coverage
++//!       - bounded retention and output-byte budget coverage
++//!       - malformed line, unknown kind, and schema-invalid event coverage
++//!       - contract, request-id, and base64 rejection coverage
++//!       - sequence and finality error matrix coverage
++//! ```
++
+ pub mod support {
+     pub mod provider_client;
+ }
+ 
+-use oulipoly_provider::stream::LaunchJsonlReader;
++use oulipoly_provider::stream::{LaunchJsonlReader, LaunchStreamLimits};
+ use serde_json::json;
+ use support::provider_client::{
+     REQUEST_ID, json_line, launch_exit_event, launch_heartbeat_event, launch_marker_event,
+@@ -29,6 +68,36 @@ fn launch_reader_accepts_stdout_stderr_marker_heartbeat_and_final_exit() {
+     assert_eq!(result.stderr_bytes(), b"err".to_vec());
+ }
+ 
++#[test]
++fn launch_reader_retains_bounded_state_independent_of_stream_volume() {
++    let mut jsonl = String::new();
++    for seq in 1..=5_000 {
++        jsonl.push_str(&json_line(&launch_stdout_event(seq, "YQ==")));
++    }
++    jsonl.push_str(&json_line(&launch_marker_event(5_001)));
++    jsonl.push_str(&json_line(&launch_exit_event(5_002, 0)));
++
++    let limits = LaunchStreamLimits {
++        retained_events: 8,
++        retained_event_bytes: 128,
++        retained_output_bytes: 64,
++        max_line_bytes: 4096,
++    };
++    let result = LaunchJsonlReader::new(REQUEST_ID)
++        .with_limits(limits)
++        .read(jsonl.as_bytes())
++        .expect("large valid launch JSONL should parse with bounded retention");
++
++    assert_eq!(result.exit.seq, 5_002);
++    assert!(result.events.len() <= limits.retained_events);
++    assert!(result.retained_events_omitted() > 0);
++    assert_eq!(result.stdout_bytes().len(), limits.retained_output_bytes);
++    assert_eq!(
++        result.retained_marker_value("example-marker"),
++        Some(&json!({ "phase": "example" }))
++    );
++}
++
+ #[test]
+ fn launch_reader_rejects_malformed_line_unknown_kind_and_schema_invalid_event() {
+     let cases = [
+diff --git a/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs b/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+index 22f0a5d..5e3e34c 100644
+--- a/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
++++ b/crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+@@ -1,11 +1,48 @@
+-//! Role: mapper.
++//! ## Declared roles
++//!
++//! Roles: mapper, accessor, predicate.
++//!
++//! - mapper: `map_launch_result_with_terminal_classification`,
++//!   `launch_session_capture`, `launch_provider_session_id`, and
++//!   `submitted_user_turn_from_marker_value` translate provider launch results
++//!   into runtime execution, terminal, session-capture, and submitted-turn
++//!   surfaces.
++//! - accessor: `marker_string`, `nonempty_marker_string`, and
++//!   `raw_provider_session_id` read optional marker/session fields from launch
++//!   JSON values.
++//! - predicate: `provider_session_id_is_present` and `nonempty_marker_string`
++//!   reject empty marker/session identifiers before runtime capture.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
++//!     role: adapter
++//!     Translates:
++//!       - launch-jsonl-stream-contract
++//!       - runtime-execution-result-contract
++//!       - terminal-cancel-outcome-contract
++//!       - session-capture-contract
++//!       - submitted-user-turn-marker-contract
++//! intrinsic_surface_declarations:
++//!   - component: crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
++//!     role: intrinsic-surface
++//!     Domain: external-provider launch result mapping
++//!     Owns:
++//!       - LaunchResult stdout/stderr projection into ExecutionResult
++//!       - terminal classification override and fallback mapping
++//!       - launch session object to runtime session-capture mapping
++//!       - submitted-user-turn marker extraction semantics
++//!       - returned-artifact and child-invocation empty defaults for launch results
++//! ```
+ 
+ use super::terminal_cancel_mapper::map_terminal_cancel_outcome;
+ use crate::executor::{
+     ExecutionResult, SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn,
+ };
+ use crate::services::TerminalClassification;
+-use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchResult};
++use oulipoly_provider::stream::LaunchResult;
+ use serde_json::Value;
+ 
+ const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
+@@ -45,19 +82,8 @@ pub(crate) fn map_launch_result_with_terminal_classification(
+ 
+ fn submitted_user_turn(result: &LaunchResult) -> Option<SubmittedUserTurn> {
+     result
+-        .events
+-        .iter()
+-        .find_map(submitted_user_turn_from_event)
+-}
+-
+-fn submitted_user_turn_from_event(event: &DecodedLaunchEvent) -> Option<SubmittedUserTurn> {
+-    let DecodedLaunchEvent::Marker { name, value, .. } = event else {
+-        return None;
+-    };
+-    if name != SUBMITTED_USER_TURN_MARKER {
+-        return None;
+-    }
+-    submitted_user_turn_from_marker_value(value)
++        .retained_marker_value(SUBMITTED_USER_TURN_MARKER)
++        .and_then(submitted_user_turn_from_marker_value)
+ }
+ 
+ fn submitted_user_turn_from_marker_value(value: &Value) -> Option<SubmittedUserTurn> {
+diff --git a/src-tauri/tests/s10_external_provider_resume.rs b/src-tauri/tests/s10_external_provider_resume.rs
+index 7315929..16cfbdf 100644
+--- a/src-tauri/tests/s10_external_provider_resume.rs
++++ b/src-tauri/tests/s10_external_provider_resume.rs
+@@ -8,6 +8,30 @@
+ //! CLI script formatters, fixture model mappers, record accessors, JSON/record
+ //! parsers, allowed-subcommand predicates, record-line/subcommand filters,
+ //! envelope/row validators, and test orchestration.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: src-tauri/tests/s10_external_provider_resume.rs
++//!     role: adapter
++//!     Translates:
++//!       - external-provider-runtime-cli-contract
++//!       - provider-launch-jsonl-contract
++//!       - invocation-state-db-contract
++//!       - session-resume-contract
++//!       - test-fixture-process-contract
++//! intrinsic_surface_declarations:
++//!   - component: src-tauri/tests/s10_external_provider_resume.rs
++//!     role: intrinsic-surface
++//!     Domain: external-provider launch/resume CLI regression suite
++//!     Owns:
++//!       - isolated config/data fixture materialization
++//!       - external provider Python script generation and executable setup
++//!       - launch/resume command invocation and environment isolation
++//!       - provider record parsing and subcommand filtering assertions
++//!       - invocation session/outcome database assertions
++//! ```
+ 
+ mod age153_support;
+ 
+@@ -100,17 +124,7 @@ impl Fixture {
+     }
+ 
+     fn run_launch_with_env(&self, envs: &[(&str, &str)]) -> Output {
+-        let mut cmd = self.command();
+-        for (key, value) in envs {
+-            cmd.env(key, value);
+-        }
+-        cmd.current_dir(&self.workspace)
+-            .arg("--models-dir")
+-            .arg(&self.models_dir)
+-            .arg("--model")
+-            .arg(MODEL)
+-            .arg("first prompt");
+-        cmd.output().unwrap()
++        run_fixture_command(command_with_envs(self.launch_command(), envs))
+     }
+ 
+     fn run_resume(&self) -> Output {
+@@ -118,21 +132,19 @@ impl Fixture {
+     }
+ 
+     fn run_resume_with_env(&self, envs: &[(&str, &str)]) -> Output {
++        run_fixture_command(command_with_envs(self.resume_command(), envs))
++    }
++
++    fn launch_command(&self) -> Command {
+         let mut cmd = self.command();
+-        for (key, value) in envs {
+-            cmd.env(key, value);
+-        }
+-        cmd.current_dir(&self.hostile_cwd)
+-            .arg("resume")
+-            .arg("--models-dir")
+-            .arg(&self.models_dir)
+-            .arg("--model")
+-            .arg(MODEL)
+-            .arg("--session-id")
+-            .arg(SESSION_ID)
+-            .arg("--prompt")
+-            .arg("resume prompt");
+-        cmd.output().unwrap()
++        apply_launch_command_shape(&mut cmd, &self.workspace, &self.models_dir);
++        cmd
++    }
++
++    fn resume_command(&self) -> Command {
++        let mut cmd = self.command();
++        apply_resume_command_shape(&mut cmd, &self.hostile_cwd, &self.models_dir);
++        cmd
+     }
+ 
+     fn command(&self) -> Command {
+@@ -163,6 +175,43 @@ impl Fixture {
+     }
+ }
+ 
++fn command_with_envs(mut cmd: Command, envs: &[(&str, &str)]) -> Command {
++    apply_command_envs(&mut cmd, envs);
++    cmd
++}
++
++fn apply_command_envs(cmd: &mut Command, envs: &[(&str, &str)]) {
++    for (key, value) in envs {
++        cmd.env(key, value);
++    }
++}
++
++fn apply_launch_command_shape(cmd: &mut Command, workspace: &Path, models_dir: &Path) {
++    cmd.current_dir(workspace)
++        .arg("--models-dir")
++        .arg(models_dir)
++        .arg("--model")
++        .arg(MODEL)
++        .arg("first prompt");
++}
++
++fn apply_resume_command_shape(cmd: &mut Command, hostile_cwd: &Path, models_dir: &Path) {
++    cmd.current_dir(hostile_cwd)
++        .arg("resume")
++        .arg("--models-dir")
++        .arg(models_dir)
++        .arg("--model")
++        .arg(MODEL)
++        .arg("--session-id")
++        .arg(SESSION_ID)
++        .arg("--prompt")
++        .arg("resume prompt");
++}
++
++fn run_fixture_command(mut cmd: Command) -> Output {
++    cmd.output().unwrap()
++}
++
+ fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptions) {
+     create_fixture_directories(paths);
+     let provider_path = write_external_provider(root, &paths.record_path, options);
+@@ -288,17 +337,21 @@ fn invocation_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Invocatio
+ fn latest_invocation_outcome_from_db(path: &Path) -> InvocationOutcomeRow {
+     let conn = open_invocation_db(path);
+     conn.query_row(
+-        "SELECT status, success, exit_code, terminal_reason
+-           FROM invocations
+-          WHERE provider_name = ?1
+-          ORDER BY id DESC
+-          LIMIT 1",
++        latest_invocation_outcome_sql(),
+         [PROVIDER],
+         invocation_outcome_row,
+     )
+     .unwrap()
+ }
+ 
++fn latest_invocation_outcome_sql() -> &'static str {
++    "SELECT status, success, exit_code, terminal_reason
++       FROM invocations
++      WHERE provider_name = ?1
++      ORDER BY id DESC
++      LIMIT 1"
++}
++
+ fn invocation_outcome_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InvocationOutcomeRow> {
+     Ok(InvocationOutcomeRow {
+         status: row.get(0)?,
+@@ -321,7 +374,15 @@ fn parse_provider_records(text: &str) -> Vec<Value> {
+ }
+ 
+ fn provider_record_lines_with_content(text: &str) -> Vec<&str> {
++    filter_provider_record_lines(provider_record_lines(text))
++}
++
++fn provider_record_lines(text: &str) -> std::str::Lines<'_> {
+     text.lines()
++}
++
++fn filter_provider_record_lines<'a>(lines: std::str::Lines<'a>) -> Vec<&'a str> {
++    lines
+         .filter(|line| provider_record_line_has_content(line))
+         .collect()
+ }
+@@ -423,6 +484,18 @@ fn external_provider_resume_terminal_error_exit_zero_finalizes_as_failed() {
+     assert_latest_invocation_failed_with_terminal_error(&fixture);
+ }
+ 
++#[test]
++fn external_provider_launch_stream_over_capture_limit_finalizes_succeeded() {
++    let fixture = Fixture::new();
++
++    let output = fixture.run_launch_with_env(&[("S10_LAUNCH_LONG_STREAM", "1")]);
++
++    assert_success(&output);
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    assert!(stdout.contains("answer:first prompt"), "{stdout}");
++    assert_latest_invocation_succeeded(&fixture);
++}
++
+ fn assert_external_launch_session_capture_rows(rows: &[InvocationSessionRow]) {
+     assert_eq!(rows.len(), 2, "rows: {rows:?}");
+     assert_external_launch_session_capture_row(&rows[0]);
+@@ -493,6 +566,13 @@ fn assert_latest_invocation_failed_with_terminal_error(fixture: &Fixture) {
+     );
+ }
+ 
++fn assert_latest_invocation_succeeded(fixture: &Fixture) {
++    let row = fixture.latest_invocation_outcome();
++    assert_eq!(row.status, InvocationStatus::Succeeded.as_str(), "{row:?}");
++    assert_eq!(row.success, 1, "{row:?}");
++    assert_eq!(row.exit_code, 0, "{row:?}");
++}
++
+ fn records_for_subcommand<'a>(records: &'a [Value], subcommand: &str) -> Vec<&'a Value> {
+     records
+         .iter()
+@@ -612,52 +692,87 @@ def policy_evaluate():
+ def emit(event):
+     print(json.dumps(event, separators=(",", ":")))
+ 
+-def launch():
+-    payload = request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
+-    emit({{
++def launch_payload():
++    return request.get("params", {{}}).get("model", {{}}).get("inputs", {{}}).get("prompt", "")
++
++def launch_stdout_data(payload):
++    return base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii")
++
++def launch_stdout_event(seq, payload):
++    return {{
+         "contract": CONTRACT,
+         "request_id": request_id(),
+-        "seq": 1,
+-        "time_unix_ms": 1001,
++        "seq": seq,
++        "time_unix_ms": 1000 + seq,
+         "kind": "stdout",
+-        "data_base64": base64.b64encode(("answer:" + payload + "\n").encode("utf-8")).decode("ascii"),
+-    }})
+-    if os.environ.get("S10_PROVIDER_ERROR_EXIT_ZERO") == "1":
+-        emit({{
+-            "contract": CONTRACT,
+-            "request_id": request_id(),
+-            "seq": 2,
+-            "time_unix_ms": 1002,
+-            "kind": "exit",
+-            "status": {{"kind": "exited", "code": 0}},
+-            "terminal_signal": {{
+-                "kind": "unknown",
+-                "evidence": {incident_terminal_reason},
+-                "observed_at_unix_ms": 1002,
+-            }},
+-            "session": {{
+-                {launch_session_key}: SESSION_ID,
+-                "state": {{"cursor": "after-launch"}},
+-            }},
+-        }})
+-        return
+-    emit({{
++        "data_base64": launch_stdout_data(payload),
++    }}
++
++def launch_error_exit_requested():
++    return os.environ.get("S10_PROVIDER_ERROR_EXIT_ZERO") == "1"
++
++def launch_long_stream_requested():
++    return os.environ.get("S10_LAUNCH_LONG_STREAM") == "1"
++
++def launch_terminal_signal(kind, evidence, seq):
++    return {{
++        "kind": kind,
++        "evidence": evidence,
++        "observed_at_unix_ms": 1000 + seq,
++    }}
++
++def launch_session_state():
++    return {{
++        {launch_session_key}: SESSION_ID,
++        "state": {{"cursor": "after-launch"}},
++    }}
++
++def launch_exit_event(seq, terminal_signal):
++    return {{
+         "contract": CONTRACT,
+         "request_id": request_id(),
+-        "seq": 2,
+-        "time_unix_ms": 1002,
++        "seq": seq,
++        "time_unix_ms": 1000 + seq,
+         "kind": "exit",
+         "status": {{"kind": "exited", "code": 0}},
+-        "terminal_signal": {{
+-            "kind": "clean_exit",
+-            "evidence": "fixture clean exit",
+-            "observed_at_unix_ms": 1002,
+-        }},
+-        "session": {{
+-            {launch_session_key}: SESSION_ID,
+-            "state": {{"cursor": "after-launch"}},
+-        }},
+-    }})
++        "terminal_signal": terminal_signal,
++        "session": launch_session_state(),
++    }}
++
++def provider_error_exit_event():
++    return launch_exit_event(2, launch_terminal_signal("unknown", {incident_terminal_reason}, 2))
++
++def clean_exit_event(seq):
++    return launch_exit_event(seq, launch_terminal_signal("clean_exit", "fixture clean exit", seq))
++
++def launch_heartbeat_detail():
++    return "h" * 4096
++
++def launch_heartbeat_event(seq, detail):
++    return {{
++        "contract": CONTRACT,
++        "request_id": request_id(),
++        "seq": seq,
++        "time_unix_ms": 1000 + seq,
++        "kind": "heartbeat",
++        "detail": detail,
++    }}
++
++def emit_long_launch_heartbeats():
++    detail = launch_heartbeat_detail()
++    for seq in range(2, 702):
++        emit(launch_heartbeat_event(seq, detail))
++
++def launch():
++    emit(launch_stdout_event(1, launch_payload()))
++    if launch_error_exit_requested():
++        emit(provider_error_exit_event())
++        return
++    exit_seq = 2
++    if launch_long_stream_requested():
++        emit_long_launch_heartbeats()
++        exit_seq = 702
++    emit(clean_exit_event(exit_seq))
+ 
+ def read_turns():
+     params = request.get("params", {{}})

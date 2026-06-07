@@ -1,0 +1,241 @@
+# lsv runtime evidence @ 2fe6745 (latest rerun 2026-06-07T10:43:00Z)
+# env: XDG-isolated, OULIPOLY_DATA_DIR scrubbed
+
+## latest 2fe6745 validation summary
+cargo fmt --all -- --check: ok
+cargo clippy --workspace --all-targets -- -D warnings: ok
+cargo test -p oulipoly-provider -p oulipoly-runtime: ok
+cargo test -p oulipoly-agent-runner --test s10_external_provider_resume: ok, 5 passed
+
+## original detailed runtime evidence @ 8a11fba (2026-06-07T09:19:35Z)
+
+## cargo test -p oulipoly-provider
+test process::tests::byte_accumulator_is_byte_oriented_and_records_truncation_metadata ... ok
+test process::tests::early_stdin_close_continues_draining_stdout_stderr ... ok
+test process::tests::process_writes_one_json_object_closes_stdin_and_drains_stderr ... ok
+test process::tests::kill_after_grace_force_kills_and_reports_reaped_status ... ok
+test process::tests::explicit_cancellation_kills_process_group_and_reaps_child ... ok
+test process::tests::host_timeout_kills_direct_child_and_descendants ... ok
+test process::tests::cancellation_that_exits_during_grace_reports_no_force_kill ... ok
+test process::tests::process_concurrently_drains_stdout_and_stderr_under_pipe_pressure ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.34s
+test external_provider_launch_provider_client_token_cancellation_without_final_event_finalizes_at_adapter_seam ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s
+test s7c_rotation_host_state_plan_schema_is_strict_and_declared ... ok
+test s7c_fixture_matrix_covers_required_rotation_and_migration_cases ... ok
+test s7c_fake_provider_fixture_declares_every_matrix_mode ... ok
+test s7c_rotation_materialize_success_fixture_validates_against_current_schema ... ok
+test s7c_rotation_host_state_plan_schema_rejects_fixture_negative_cases ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test dummy_provider_can_implement_and_call_each_trait_method ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test capabilities_bundle_default_has_no_populated_slots ... ok
+test capabilities_bundle_represents_partial_implementations ... ok
+test locator_slot_accepts_test_local_marker_type ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test client_error_precedence_table_matches_contract ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.31s
+test invoke_describe_accepts_schema_valid_freeform_concurrency_metadata ... ok
+test invoke_script_uses_artifact_then_single_subcommand_arg ... ok
+test invoke_rejects_unknown_subcommand_before_spawn ... ok
+test invoke_early_stdin_close_without_valid_envelope_is_transport_error ... ok
+test invoke_rejects_schema_invalid_request_before_spawn ... ok
+test invoke_early_stdin_close_valid_ok_true_wins ... ok
+test invoke_rejects_mismatched_contract_and_request_id ... ok
+test invoke_success_returns_typed_result_and_keeps_stderr_diagnostics ... ok
+test invoke_writes_request_on_stdin_not_argv ... ok
+test invoke_early_stdin_close_valid_ok_false_wins_as_capability_error ... ok
+test invoke_settings_list_subcommand_returns_typed_result_through_one_shot_provider ... ok
+test invoke_schema_subcommand_returns_typed_result_through_one_shot_provider ... ok
+test invoke_rejects_invalid_stdout_protocol_shapes ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s
+test client_applies_stdout_and_stderr_caps_with_truncation_metadata ... ok
+test client_does_not_deadlock_when_output_exceeds_limits_while_stdin_is_written ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+test s2_completeness_matrix_covers_every_design_subcommand ... ok
+test completeness_matrix_declares_schema_dto_fixture_and_registry_targets ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test provider_crate_has_only_neutral_normal_dependencies ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test dto_discriminants_reject_schema_invalid_values ... ok
+test dto_roundtrip_covers_every_s2_contract_type ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test shared_error_object_requires_core_fields ... ok
+test error_response_fixtures_use_locked_error_categories ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test host_cancellation_is_transport_error_without_provider_category ... ok
+test host_timeout_is_transport_error_without_provider_category ... ok
+test missing_valid_error_envelope_with_nonzero_exit_is_transport_error ... ok
+test provider_capability_error_preserves_contract_error_object ... ok
+test valid_error_envelope_takes_precedence_over_nonzero_exit ... ok
+test provider_timeout_category_is_not_host_timeout ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test schema_validation_fixtures_cover_expected_matrix ... ok
+test policy_response_schema_permits_absent_empty_argv_and_env ... ok
+test launch_request_and_event_fixtures_validate_against_schema_targets ... ok
+test request_success_and_error_fixtures_validate_against_schema_targets ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test launch_event_variants_and_terminal_exit_are_locked ... ok
+test launch_fixture_sequence_has_monotonic_seq_and_terminal_exit ... ok
+test launch_stdout_stderr_payloads_remain_base64_strings ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test launch_malformed_protocol_is_not_masked_by_provider_nonzero_exit ... ok
+test launch_protocol_error_preserves_process_status_and_stderr_diagnostics ... ok
+test launch_provider_nonzero_without_final_exit_is_transport_error ... ok
+test launch_accepts_valid_jsonl_and_preserves_decoded_binary_order ... ok
+test launch_fake_provider_echoes_host_supplied_request_id ... ok
+test launch_provider_nonzero_after_valid_final_exit_is_nonfatal_diagnostic ... ok
+test launch_stdout_truncation_takes_precedence_over_parseable_exit_prefix ... ok
+test launch_model_nonzero_final_exit_is_outcome_not_provider_transport_failure ... ok
+test launch_uses_exact_launch_argv_and_request_stdin_only ... ok
+test launch_accepts_valid_stream_larger_than_transport_capture_limit ... ok
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+test launch_timeout_cleans_descendants_and_preserves_stderr_diagnostics ... ok
+test launch_cancellation_with_provider_emitted_cancelled_exit_uses_final_event ... ok
+test launch_heartbeat_gap_does_not_cap_total_turn_runtime ... ok
+test launch_heartbeat_gap_timeout_kills_process_tree_after_stream_stalls ... ok
+test launch_forced_kill_without_final_event_is_host_cancellation_not_missing_final ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+test launch_reader_rejects_invalid_base64_wrong_contract_and_wrong_request_id ... ok
+test launch_reader_rejects_malformed_line_unknown_kind_and_schema_invalid_event ... ok
+test launch_reader_accepts_stdout_stderr_marker_heartbeat_and_final_exit ... ok
+test launch_reader_rejects_sequence_and_finality_errors ... ok
+test launch_reader_retains_bounded_state_independent_of_stream_volume ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.63s
+test locator_contract_types_are_reachable_from_provider_root ... ok
+test neutral_unsupported_storage_reasons_are_constructible ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test capability_error_new_variant_is_additive_for_equality ... ok
+test locator_required_capabilities_expose_present_locator ... ok
+test locator_required_capabilities_reject_missing_locator ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test borrow_carrying_request_structs_keep_marker_anchors ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test client_process_substrate_does_not_deadlock_under_pipe_pressure ... ok
+test client_process_substrate_closes_stdin_and_drains_stderr ... ok
+test client_timeout_kills_descendants_observed_by_probe ... ok
+test client_cancellation_gracefully_reaps_sigterm_respecting_provider ... ok
+test client_cancellation_kills_descendants_observed_by_probe ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+test provider_capability_error_type_is_public_without_legacy_trait_imports ... ok
+test downstream_can_construct_client_resolver_options_and_name_errors ... ok
+test resolved_command_public_shape_is_exact_artifact_plus_subcommand ... ok
+test public_launch_stream_types_preserve_decoded_bytes_and_exit ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test owned_provider_contract_files_use_only_neutral_provider_vocabulary ... ok
+test provider_name_grep_baseline_does_not_increase ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test provider_manifest_has_no_internal_crate_dependencies ... ok
+test provider_source_uses_neutral_vocabulary ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test rejects_binary_outside_explicit_roots_or_allowlist ... ok
+test rejects_non_executable_script_without_shell_opt_in ... ok
+test rejects_runtime_disabled_crate_flavor ... ok
+test resolves_absolute_path_and_builds_exact_subcommand_argv ... ok
+test rejects_missing_directory_and_non_executable_paths ... ok
+test rejects_invalid_binary_names_before_searching_roots ... ok
+test resolves_direct_executable_script_without_shell_wrapper ... ok
+test rejects_binary_symlink_that_escapes_explicit_root ... ok
+test rejects_packaged_binary_present_but_not_allowlisted ... ok
+test resolves_binary_only_from_explicit_path_entries ... ok
+test resolves_packaged_binary_only_when_allowlisted_in_search_root ... ok
+test resolves_config_relative_path_against_config_directory ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test schema_file_inventory_matches_expected_contract_v1 ... ok
+test common_schema_owns_shared_contract_defs ... ok
+test locked_error_categories_match_contract ... ok
+test contract_v1_schemas_declare_draft_2020_12 ... ok
+test contract_v1_refs_resolve_to_checked_in_schema_defs ... ok
+test contract_v1_schemas_are_valid_draft_2020_12 ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test schema_registry_lookup_and_validation_helpers_cover_s2_matrix ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test settings_version_conflict_error_fixture_uses_conflict_category ... ok
+test settings_create_and_validate_do_not_require_persistence_version ... ok
+test settings_update_and_delete_requests_carry_required_version_preconditions ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test rich_terminal_dtos_are_reachable_from_provider_root ... ok
+test rich_terminal_status_evidence_and_trait_object_dispatch_are_contract_local ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test fake_provider_modes_are_deterministic ... ok
+test fake_provider_fixture_compiles_to_executable_and_cleans_up ... ok
+test leak_probe_reports_no_remaining_descendants_after_cleanup ... ok
+test fake_provider_records_argv_and_stdin_for_assertions ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.57s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## cargo test -p oulipoly-runtime (summary)
+test result: ok. 374 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.92s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.81s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.75s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.11s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.41s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+test result: ok. 54 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.61s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+## cargo test -p oulipoly-agent-runner --test s10_external_provider_resume
+test external_provider_launch_terminal_error_exit_zero_finalizes_as_failed ... ok
+test external_launch_session_id_alias_persists_external_capture_method_without_session_capability ... ok
+test external_provider_resume_terminal_error_exit_zero_finalizes_as_failed ... ok
+test external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd ... ok
+test external_provider_launch_stream_over_capture_limit_finalizes_succeeded ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s

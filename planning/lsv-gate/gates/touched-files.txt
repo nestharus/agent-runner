@@ -1,0 +1,9 @@
+crates/oulipoly-provider/src/client.rs
+crates/oulipoly-provider/src/process.rs
+crates/oulipoly-provider/src/stream.rs
+crates/oulipoly-provider/src/testkit.rs
+crates/oulipoly-provider/tests/fixtures/provider_client/fake_provider.rs
+crates/oulipoly-provider/tests/launch_stream.rs
+crates/oulipoly-provider/tests/launch_stream_protocol.rs
+crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
+src-tauri/tests/s10_external_provider_resume.rs
