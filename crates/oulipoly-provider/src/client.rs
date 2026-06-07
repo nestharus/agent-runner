@@ -262,13 +262,7 @@ impl ProviderClient {
         )?;
         let diagnostics = launch_diagnostics(&outcome);
         self.record_process_state(&outcome, &diagnostics);
-        if diagnostics.stdout.truncated {
-            return Err(map_launch_stdout_limit_error(
-                request_id,
-                diagnostics,
-                outcome.status,
-            ));
-        }
+        ensure_launch_stdout_within_limit(&diagnostics, request_id.clone(), &outcome.status)?;
         parse_launch_output(
             outcome.stdout.bytes,
             diagnostics,
@@ -604,6 +598,21 @@ fn map_launch_stdout_limit_error(
         diagnostics.clone(),
     )
     .with_process_context(diagnostics, status)
+}
+
+fn ensure_launch_stdout_within_limit(
+    diagnostics: &ProviderDiagnostics,
+    request_id: Option<String>,
+    status: &ProcessStatus,
+) -> Result<(), ProviderClientError> {
+    if diagnostics.stdout.truncated {
+        return Err(map_launch_stdout_limit_error(
+            request_id,
+            diagnostics.clone(),
+            status.clone(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_launch_output(
