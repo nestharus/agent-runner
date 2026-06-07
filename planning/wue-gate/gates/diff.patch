@@ -1,0 +1,3977 @@
+diff --git a/crates/oulipoly-runtime/src/executor/cli.rs b/crates/oulipoly-runtime/src/executor/cli.rs
+index b6d84c7..9a7960f 100644
+--- a/crates/oulipoly-runtime/src/executor/cli.rs
++++ b/crates/oulipoly-runtime/src/executor/cli.rs
+@@ -71,6 +71,8 @@ mod policy;
+ mod provider_execution;
+ mod provider_identity;
+ mod provider_lookup;
++#[cfg(unix)]
++pub mod pty_broker;
+ mod request;
+ mod result;
+ mod resume;
+diff --git a/crates/oulipoly-runtime/src/executor/cli/interactive.rs b/crates/oulipoly-runtime/src/executor/cli/interactive.rs
+index 75aabe9..f54f032 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/interactive.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/interactive.rs
+@@ -29,9 +29,12 @@ use super::super::TerminalSignal;
+ use super::launch::build_command;
+ use super::policy::apply_provider_policy;
+ use super::provider_identity::ProviderRecognizer;
++#[cfg(unix)]
++use super::pty_broker;
+ use super::resume::{ResumePayload, compose_resume_provider_args};
+ use super::spawn_identity::{
+-    SpawnRuntimeMode, context_from_parent_invocation_env, record_child_identity,
++    SpawnIdentityContext, SpawnRuntimeMode, context_from_parent_invocation_env,
++    record_child_identity,
+ };
+ use super::terminal_signal;
+ use oulipoly_config::ProviderConfig;
+@@ -79,19 +82,29 @@ pub fn execute_interactive_with_result_and_model_identity(
+ ) -> Result<InteractiveExecutionResult, String> {
+     let resume_session_id = resume.as_ref().map(|resume| resume.session_id);
+     let provider_args = interactive_provider_args(provider, resume)?;
+-    let cmd = interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
+-    let mut child = spawn_interactive_child(cmd, provider)?;
+-
+-    #[cfg(unix)]
+-    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
+-    record_interactive_child_identity(
+-        child.id(),
++    let spawn_identity = interactive_spawn_identity_context(
+         parent_invocation_env,
+         provider,
+         model_name,
+         resume_session_id,
+         working_dir,
+     );
++    #[cfg(unix)]
++    if pty_broker::controlling_terminal_available() {
++        let cmd =
++            interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
++        let status = pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?;
++        return Ok(interactive_result_from_status(provider, &status));
++    }
++
++    let mut cmd =
++        interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
++    configure_interactive_stdio(&mut cmd);
++    let mut child = spawn_interactive_child(cmd, provider)?;
++
++    #[cfg(unix)]
++    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
++    record_child_identity(child.id(), spawn_identity.as_ref());
+ 
+     let status = wait_for_interactive_child(&mut child)?;
+ 
+@@ -120,15 +133,13 @@ fn interactive_command(
+     working_dir: Option<&Path>,
+     parent_invocation_env: Option<&str>,
+ ) -> Result<Command, String> {
+-    let mut cmd = build_command(
++    build_command(
+         provider,
+         provider_args,
+         working_dir,
+         parent_invocation_env,
+         None,
+-    )?;
+-    configure_interactive_stdio(&mut cmd);
+-    Ok(cmd)
++    )
+ }
+ 
+ fn configure_interactive_stdio(cmd: &mut Command) {
+@@ -142,23 +153,21 @@ fn spawn_interactive_child(mut cmd: Command, provider: &ProviderConfig) -> Resul
+         .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))
+ }
+ 
+-fn record_interactive_child_identity(
+-    child_id: u32,
++fn interactive_spawn_identity_context(
+     parent_invocation_env: Option<&str>,
+     provider: &ProviderConfig,
+     model_name: Option<&str>,
+     resume_session_id: Option<&str>,
+     working_dir: Option<&Path>,
+-) {
+-    let spawn_identity = context_from_parent_invocation_env(
++) -> Option<SpawnIdentityContext> {
++    context_from_parent_invocation_env(
+         parent_invocation_env,
+         &provider.name,
+         model_name,
+         resume_session_id,
+         SpawnRuntimeMode::PtyInteractive,
+         working_dir,
+-    );
+-    record_child_identity(child_id, spawn_identity.as_ref());
++    )
+ }
+ 
+ fn wait_for_interactive_child(child: &mut Child) -> Result<ExitStatus, String> {
+diff --git a/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs b/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
+new file mode 100644
+index 0000000..de9533d
+--- /dev/null
++++ b/crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
+@@ -0,0 +1,1141 @@
++//! Unix PTY broker for live interactive sessions.
++
++use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
++use super::terminal_signal::{InteractiveSignalGuard, exit_code_from_status};
++use oulipoly_config::ProviderConfig;
++use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeIdleUpdate};
++use sha2::{Digest, Sha256};
++use std::fs::{self, File, OpenOptions, Permissions};
++use std::io::{self, Read, Write};
++use std::os::fd::{AsRawFd, FromRawFd, RawFd};
++use std::os::unix::ffi::OsStrExt;
++use std::os::unix::fs::PermissionsExt;
++use std::os::unix::net::{UnixListener, UnixStream};
++use std::path::{Path, PathBuf};
++use std::process::{Command, ExitStatus, Stdio};
++use std::time::{Duration, Instant};
++
++const CONTROL_MAGIC: &[u8; 4] = b"OPTY";
++const CONTROL_VERSION: u8 = 1;
++const CONTROL_OP_INJECT: u8 = 1;
++pub const CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
++const RELAY_BUFFER_BYTES: usize = 16 * 1024;
++const RELAY_POLL_TIMEOUT_MS: i32 = 25;
++const INJECT_DEBOUNCE: Duration = Duration::from_millis(250);
++const INJECT_WAIT_LIMIT: Duration = Duration::from_millis(1500);
++const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
++const UNIX_SOCKET_PATH_LIMIT: usize = 100;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PtyControlClientErrorKind {
++    Connect,
++    Protocol,
++    Oversize,
++    EmptyPayload,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PtyControlClientError {
++    pub kind: PtyControlClientErrorKind,
++    pub message: String,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PtyControlResponse {
++    pub ack: bool,
++    pub message: String,
++}
++
++pub fn inject_control_envelope(
++    path: impl AsRef<Path>,
++    payload: &str,
++) -> Result<PtyControlResponse, PtyControlClientError> {
++    let bytes = payload.as_bytes();
++    validate_client_payload(bytes)?;
++    let mut stream = UnixStream::connect(path.as_ref()).map_err(connect_error)?;
++    stream
++        .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
++        .map_err(protocol_error)?;
++    stream
++        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
++        .map_err(protocol_error)?;
++    write_inject_frame(&mut stream, bytes).map_err(protocol_error)?;
++    read_control_response(&mut stream)
++}
++
++pub fn control_socket_accepts_connection(path: impl AsRef<Path>) -> bool {
++    UnixStream::connect(path.as_ref()).is_ok()
++}
++
++pub fn unlink_control_socket_if_owned(path: impl AsRef<Path>) -> bool {
++    let path = path.as_ref();
++    control_socket_path_is_owned(path) && fs::remove_file(path).is_ok()
++}
++
++fn control_socket_path_is_owned(path: &Path) -> bool {
++    matches!(control_socket_dir(), Ok(dir) if path.starts_with(&dir))
++}
++
++pub(super) fn controlling_terminal_available() -> bool {
++    open_real_terminal().is_ok()
++}
++
++pub(super) fn execute_interactive_child(
++    mut cmd: Command,
++    provider: &ProviderConfig,
++    context: Option<&SpawnIdentityContext>,
++) -> Result<ExitStatus, String> {
++    let real_tty = RealTerminal::open()?;
++    let winsize = terminal_winsize(real_tty.fd())
++        .map_err(|err| format!("Failed to read terminal window size: {err}"))?;
++    let pty = PtyPair::open(&winsize, &real_tty.original)?;
++    let control = ControlSocket::bind_for(context)?;
++    configure_child_pty(&mut cmd, &pty)?;
++    let mut child = cmd
++        .spawn()
++        .map_err(|err| format!("Failed to spawn '{}': {err}", provider.command))?;
++    let recorded_context = control.as_ref().and_then(|control| {
++        context.map(|context| context.with_pty_control_path(control.path_string()))
++    });
++    record_child_identity(child.id(), recorded_context.as_ref().or(context));
++    let mut idle_guard = SessionRuntimeIdleGuard::new(context);
++    drop(pty.slave);
++
++    let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
++    let mut raw_tty = real_tty.into_raw_mode()?;
++    let status = relay_until_exit(&mut raw_tty, &pty.master, control.as_ref(), &mut child)?;
++    idle_guard.exit_code = Some(exit_code_from_status(&status));
++    drop(signal_guard);
++    Ok(status)
++}
++
++fn validate_client_payload(bytes: &[u8]) -> Result<(), PtyControlClientError> {
++    if bytes.is_empty() {
++        return Err(PtyControlClientError {
++            kind: PtyControlClientErrorKind::EmptyPayload,
++            message: "empty payload".to_string(),
++        });
++    }
++    if bytes.len() > CONTROL_MAX_PAYLOAD_BYTES {
++        return Err(PtyControlClientError {
++            kind: PtyControlClientErrorKind::Oversize,
++            message: format!("payload exceeds {CONTROL_MAX_PAYLOAD_BYTES} bytes"),
++        });
++    }
++    Ok(())
++}
++
++fn connect_error(err: io::Error) -> PtyControlClientError {
++    PtyControlClientError {
++        kind: PtyControlClientErrorKind::Connect,
++        message: err.to_string(),
++    }
++}
++
++fn protocol_error(err: io::Error) -> PtyControlClientError {
++    PtyControlClientError {
++        kind: PtyControlClientErrorKind::Protocol,
++        message: err.to_string(),
++    }
++}
++
++fn read_control_response(
++    stream: &mut UnixStream,
++) -> Result<PtyControlResponse, PtyControlClientError> {
++    let mut header = [0_u8; 12];
++    stream.read_exact(&mut header).map_err(protocol_error)?;
++    if &header[..4] != CONTROL_MAGIC || header[4] != CONTROL_VERSION {
++        return Err(PtyControlClientError {
++            kind: PtyControlClientErrorKind::Protocol,
++            message: "bad response header".to_string(),
++        });
++    }
++    let status = header[5];
++    if header[6] != 0 || header[7] != 0 {
++        return Err(PtyControlClientError {
++            kind: PtyControlClientErrorKind::Protocol,
++            message: "bad response reserved bytes".to_string(),
++        });
++    }
++    let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
++    if length > CONTROL_MAX_PAYLOAD_BYTES {
++        return Err(PtyControlClientError {
++            kind: PtyControlClientErrorKind::Protocol,
++            message: "oversized response".to_string(),
++        });
++    }
++    let mut message = vec![0_u8; length];
++    stream.read_exact(&mut message).map_err(protocol_error)?;
++    let message = String::from_utf8(message).map_err(|err| PtyControlClientError {
++        kind: PtyControlClientErrorKind::Protocol,
++        message: err.to_string(),
++    })?;
++    Ok(PtyControlResponse {
++        ack: status == 0,
++        message,
++    })
++}
++
++fn write_inject_frame(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
++    let mut header = [0_u8; 12];
++    header[..4].copy_from_slice(CONTROL_MAGIC);
++    header[4] = CONTROL_VERSION;
++    header[5] = CONTROL_OP_INJECT;
++    header[8..12].copy_from_slice(&(payload.len() as u32).to_be_bytes());
++    stream.write_all(&header)?;
++    stream.write_all(payload)
++}
++
++struct PtyPair {
++    master: File,
++    slave: File,
++}
++
++impl PtyPair {
++    fn open(winsize: &libc::winsize, termios: &libc::termios) -> Result<Self, String> {
++        let mut master_fd = -1;
++        let mut slave_fd = -1;
++        let size = *winsize;
++        let rc = unsafe {
++            libc::openpty(
++                &mut master_fd,
++                &mut slave_fd,
++                std::ptr::null_mut(),
++                termios,
++                &size,
++            )
++        };
++        if rc == -1 {
++            return Err(format!(
++                "Failed to allocate PTY: {}",
++                io::Error::last_os_error()
++            ));
++        }
++        let master = unsafe { File::from_raw_fd(master_fd) };
++        let slave = unsafe { File::from_raw_fd(slave_fd) };
++        Ok(Self { master, slave })
++    }
++}
++
++struct RealTerminal {
++    file: File,
++    original: libc::termios,
++}
++
++impl RealTerminal {
++    fn open() -> Result<Self, String> {
++        let file = open_real_terminal().map_err(|err| format!("Failed to open /dev/tty: {err}"))?;
++        let original = terminal_attrs(file.as_raw_fd())
++            .map_err(|err| format!("Failed to read terminal attributes: {err}"))?;
++        Ok(Self { file, original })
++    }
++
++    fn fd(&self) -> RawFd {
++        self.file.as_raw_fd()
++    }
++
++    fn into_raw_mode(self) -> Result<RawTerminalGuard, String> {
++        let mut raw = self.original;
++        unsafe { libc::cfmakeraw(&mut raw) };
++        set_terminal_attrs(self.fd(), &raw)
++            .map_err(|err| format!("Failed to enter terminal raw mode: {err}"))?;
++        Ok(RawTerminalGuard { inner: self })
++    }
++}
++
++struct RawTerminalGuard {
++    inner: RealTerminal,
++}
++
++impl RawTerminalGuard {
++    fn fd(&self) -> RawFd {
++        self.inner.fd()
++    }
++}
++
++impl Drop for RawTerminalGuard {
++    fn drop(&mut self) {
++        let _ = set_terminal_attrs(self.inner.fd(), &self.inner.original);
++    }
++}
++
++fn open_real_terminal() -> io::Result<File> {
++    OpenOptions::new().read(true).write(true).open("/dev/tty")
++}
++
++fn terminal_attrs(fd: RawFd) -> io::Result<libc::termios> {
++    let mut attrs = unsafe { std::mem::zeroed() };
++    if unsafe { libc::tcgetattr(fd, &mut attrs) } == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(attrs)
++}
++
++fn set_terminal_attrs(fd: RawFd, attrs: &libc::termios) -> io::Result<()> {
++    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, attrs) } == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(())
++}
++
++fn terminal_winsize(fd: RawFd) -> io::Result<libc::winsize> {
++    let mut winsize = unsafe { std::mem::zeroed() };
++    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) } == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(winsize)
++}
++
++fn set_pty_winsize(fd: RawFd, winsize: &libc::winsize) -> io::Result<()> {
++    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, winsize) } == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(())
++}
++
++fn configure_child_pty(cmd: &mut Command, pty: &PtyPair) -> Result<(), String> {
++    use std::os::unix::process::CommandExt;
++
++    let stdin = pty
++        .slave
++        .try_clone()
++        .map_err(|err| format!("Failed to clone PTY slave for stdin: {err}"))?;
++    let stdout = pty
++        .slave
++        .try_clone()
++        .map_err(|err| format!("Failed to clone PTY slave for stdout: {err}"))?;
++    let stderr = pty
++        .slave
++        .try_clone()
++        .map_err(|err| format!("Failed to clone PTY slave for stderr: {err}"))?;
++    let slave_fd = pty.slave.as_raw_fd();
++    let master_fd = pty.master.as_raw_fd();
++    cmd.stdin(Stdio::from(stdin));
++    cmd.stdout(Stdio::from(stdout));
++    cmd.stderr(Stdio::from(stderr));
++    unsafe {
++        cmd.pre_exec(move || {
++            if libc::setsid() == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            let pid = libc::getpid();
++            if libc::tcsetpgrp(slave_fd, pid) == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if master_fd > 2 {
++                libc::close(master_fd);
++            }
++            if slave_fd > 2 {
++                libc::close(slave_fd);
++            }
++            Ok(())
++        });
++    }
++    Ok(())
++}
++
++struct ControlSocket {
++    listener: UnixListener,
++    path: PathBuf,
++    owned_dir: PathBuf,
++}
++
++impl ControlSocket {
++    fn bind_for(context: Option<&SpawnIdentityContext>) -> Result<Option<Self>, String> {
++        let Some(context) = context else {
++            return Ok(None);
++        };
++        let Some(session_id) = context.session_id() else {
++            return Ok(None);
++        };
++        let (dir, path) = control_socket_location(session_id, context.invocation_uuid())?;
++        create_private_dir(&dir)?;
++        unlink_stale_or_refuse_active(&path, &dir)?;
++        let previous_umask = unsafe { libc::umask(0o077) };
++        let listener = UnixListener::bind(&path).map_err(|err| {
++            format!(
++                "Failed to bind PTY control socket {}: {err}",
++                path.display()
++            )
++        });
++        unsafe { libc::umask(previous_umask) };
++        let listener = listener?;
++        fs::set_permissions(&path, Permissions::from_mode(0o600)).map_err(|err| {
++            format!(
++                "Failed to chmod PTY control socket {}: {err}",
++                path.display()
++            )
++        })?;
++        Ok(Some(Self {
++            listener,
++            path,
++            owned_dir: dir,
++        }))
++    }
++
++    fn fd(&self) -> RawFd {
++        self.listener.as_raw_fd()
++    }
++
++    fn path_string(&self) -> String {
++        self.path.to_string_lossy().into_owned()
++    }
++}
++
++impl Drop for ControlSocket {
++    fn drop(&mut self) {
++        unlink_owned_socket(&self.path, &self.owned_dir);
++    }
++}
++
++fn control_socket_dir() -> Result<PathBuf, String> {
++    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
++        return Ok(PathBuf::from(runtime).join("oulipoly-agent-runner/pty"));
++    }
++    if let Some(state) = std::env::var_os("XDG_STATE_HOME") {
++        return Ok(PathBuf::from(state).join("oulipoly-agent-runner/runtime/pty"));
++    }
++    let base =
++        dirs::data_dir().ok_or_else(|| "Failed to resolve user data directory".to_string())?;
++    Ok(base.join("oulipoly-agent-runner/runtime/pty"))
++}
++
++fn create_private_dir(dir: &Path) -> Result<(), String> {
++    fs::create_dir_all(dir).map_err(|err| {
++        format!(
++            "Failed to create PTY control socket directory {}: {err}",
++            dir.display()
++        )
++    })?;
++    fs::set_permissions(dir, Permissions::from_mode(0o700)).map_err(|err| {
++        format!(
++            "Failed to chmod PTY control socket directory {}: {err}",
++            dir.display()
++        )
++    })
++}
++
++fn control_socket_location(
++    session_id: &str,
++    invocation_uuid: &str,
++) -> Result<(PathBuf, PathBuf), String> {
++    let dir = control_socket_dir()?;
++    Ok(control_socket_location_for_dir(
++        dir,
++        session_id,
++        invocation_uuid,
++    ))
++}
++
++fn control_socket_location_for_dir(
++    dir: PathBuf,
++    session_id: &str,
++    invocation_uuid: &str,
++) -> (PathBuf, PathBuf) {
++    let path = control_socket_path(&dir, session_id, invocation_uuid);
++    if path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_LIMIT {
++        return (dir, path);
++    }
++    let fallback = short_control_socket_dir();
++    (
++        fallback.clone(),
++        fallback.join(format!(
++            "{}.sock",
++            stable_socket_hash(session_id, invocation_uuid)
++        )),
++    )
++}
++
++fn control_socket_path(dir: &Path, session_id: &str, invocation_uuid: &str) -> PathBuf {
++    let basename = format!(
++        "{}.{}.sock",
++        short_component(session_id),
++        short_component(invocation_uuid)
++    );
++    let candidate = dir.join(&basename);
++    if candidate.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_LIMIT {
++        return candidate;
++    }
++    dir.join(format!(
++        "{}.sock",
++        stable_socket_hash(session_id, invocation_uuid)
++    ))
++}
++
++fn short_control_socket_dir() -> PathBuf {
++    let uid = unsafe { libc::geteuid() };
++    PathBuf::from("/tmp").join(format!("oulipoly-agent-runner-pty-{uid}"))
++}
++
++fn short_component(value: &str) -> String {
++    let sanitized = value
++        .chars()
++        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
++        .take(12)
++        .collect::<String>();
++    if sanitized.is_empty() {
++        "session".to_string()
++    } else {
++        sanitized
++    }
++}
++
++fn stable_socket_hash(session_id: &str, invocation_uuid: &str) -> String {
++    let mut hasher = Sha256::new();
++    hasher.update(session_id.as_bytes());
++    hasher.update([0]);
++    hasher.update(invocation_uuid.as_bytes());
++    let digest = hasher.finalize();
++    digest[..16]
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect()
++}
++
++fn unlink_stale_or_refuse_active(path: &Path, owned_dir: &Path) -> Result<(), String> {
++    if control_socket_is_absent(path) {
++        return Ok(());
++    }
++    validate_control_socket_not_active(path)?;
++    unlink_owned_socket(path, owned_dir);
++    Ok(())
++}
++
++fn control_socket_is_absent(path: &Path) -> bool {
++    !path.exists()
++}
++
++fn control_socket_is_active(path: &Path) -> bool {
++    UnixStream::connect(path).is_ok()
++}
++
++fn validate_control_socket_not_active(path: &Path) -> Result<(), String> {
++    if control_socket_is_active(path) {
++        return Err(format!(
++            "PTY control socket already active at {}",
++            path.display()
++        ));
++    }
++    Ok(())
++}
++
++fn unlink_owned_socket(path: &Path, owned_dir: &Path) {
++    if path.starts_with(owned_dir) {
++        let _ = fs::remove_file(path);
++    }
++}
++
++struct SessionRuntimeIdleGuard {
++    session_id: Option<String>,
++    invocation_uuid: Option<String>,
++    exit_code: Option<i32>,
++}
++
++impl SessionRuntimeIdleGuard {
++    fn new(context: Option<&SpawnIdentityContext>) -> Self {
++        Self {
++            session_id: context
++                .and_then(SpawnIdentityContext::session_id)
++                .map(str::to_string),
++            invocation_uuid: context.map(|context| context.invocation_uuid().to_string()),
++            exit_code: None,
++        }
++    }
++}
++
++impl Drop for SessionRuntimeIdleGuard {
++    fn drop(&mut self) {
++        let (Some(session_id), Some(invocation_uuid)) = (&self.session_id, &self.invocation_uuid)
++        else {
++            return;
++        };
++        if let Ok(mut db) = MailboxDb::open_default() {
++            let _ = db.mark_session_idle(SessionRuntimeIdleUpdate {
++                session_id,
++                invocation_uuid,
++                last_exit_code: self.exit_code,
++            });
++        }
++    }
++}
++
++fn relay_until_exit(
++    real_tty: &mut RawTerminalGuard,
++    master: &File,
++    control: Option<&ControlSocket>,
++    child: &mut std::process::Child,
++) -> Result<ExitStatus, String> {
++    let mut line_state = InputLineState::default();
++    let mut current_winsize = terminal_winsize(real_tty.fd()).ok();
++    let mut status = None;
++    let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
++    while status.is_none() {
++        maybe_propagate_winsize(
++            real_tty.fd(),
++            master.as_raw_fd(),
++            child.id(),
++            &mut current_winsize,
++        );
++        let ready = poll_relay_fds(
++            real_tty.fd(),
++            master.as_raw_fd(),
++            control.map(ControlSocket::fd),
++        )?;
++        if ready.real_input {
++            relay_real_input(
++                real_tty.fd(),
++                master.as_raw_fd(),
++                &mut line_state,
++                &mut buffer,
++            )?;
++        }
++        if ready.pty_output {
++            relay_pty_output(master.as_raw_fd(), real_tty.fd(), &mut buffer)?;
++        }
++        if ready.control
++            && let Some(control) = control
++        {
++            let _ = handle_control_request(
++                control,
++                real_tty.fd(),
++                master.as_raw_fd(),
++                &mut line_state,
++                &mut buffer,
++            );
++        }
++        status = child
++            .try_wait()
++            .map_err(|err| format!("Failed to poll interactive child: {err}"))?;
++    }
++    drain_pty_output(master.as_raw_fd(), real_tty.fd(), &mut buffer)?;
++    Ok(status.expect("status checked above"))
++}
++
++#[derive(Default)]
++struct ReadyFds {
++    real_input: bool,
++    pty_output: bool,
++    control: bool,
++}
++
++fn poll_relay_fds(
++    real_fd: RawFd,
++    master_fd: RawFd,
++    control_fd: Option<RawFd>,
++) -> Result<ReadyFds, String> {
++    let mut fds = vec![
++        libc::pollfd {
++            fd: real_fd,
++            events: libc::POLLIN,
++            revents: 0,
++        },
++        libc::pollfd {
++            fd: master_fd,
++            events: libc::POLLIN,
++            revents: 0,
++        },
++    ];
++    if let Some(fd) = control_fd {
++        fds.push(libc::pollfd {
++            fd,
++            events: libc::POLLIN,
++            revents: 0,
++        });
++    }
++    let rc = unsafe {
++        libc::poll(
++            fds.as_mut_ptr(),
++            fds.len() as libc::nfds_t,
++            RELAY_POLL_TIMEOUT_MS,
++        )
++    };
++    if rc < 0 {
++        let err = io::Error::last_os_error();
++        if err.raw_os_error() == Some(libc::EINTR) {
++            return Ok(ReadyFds::default());
++        }
++        return Err(format!("Failed to poll PTY relay fds: {err}"));
++    }
++    Ok(ReadyFds {
++        real_input: readable(fds[0].revents),
++        pty_output: readable(fds[1].revents),
++        control: fds.get(2).is_some_and(|fd| readable(fd.revents)),
++    })
++}
++
++fn readable(revents: i16) -> bool {
++    revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
++}
++
++fn relay_real_input(
++    real_fd: RawFd,
++    master_fd: RawFd,
++    line_state: &mut InputLineState,
++    buffer: &mut [u8],
++) -> Result<(), String> {
++    match read_fd(real_fd, buffer) {
++        Ok(0) => Ok(()),
++        Ok(n) => {
++            line_state.observe_user_input(&buffer[..n]);
++            write_all_fd(master_fd, &buffer[..n])
++                .map_err(|err| format!("Failed to write user input to PTY: {err}"))
++        }
++        Err(err) => Err(format!("Failed to read user terminal input: {err}")),
++    }
++}
++
++fn relay_pty_output(master_fd: RawFd, real_fd: RawFd, buffer: &mut [u8]) -> Result<(), String> {
++    match read_fd(master_fd, buffer) {
++        Ok(0) => Ok(()),
++        Ok(n) => write_all_fd(real_fd, &buffer[..n])
++            .map_err(|err| format!("Failed to write PTY output to terminal: {err}")),
++        Err(err) if is_pty_eof_error(&err) => Ok(()),
++        Err(err) => Err(format!("Failed to read PTY output: {err}")),
++    }
++}
++
++fn drain_pty_output(master_fd: RawFd, real_fd: RawFd, buffer: &mut [u8]) -> Result<(), String> {
++    loop {
++        let ready = poll_single_fd(master_fd)?;
++        if !ready {
++            return Ok(());
++        }
++        match read_fd(master_fd, buffer) {
++            Ok(0) => return Ok(()),
++            Ok(n) => write_all_fd(real_fd, &buffer[..n])
++                .map_err(|err| format!("Failed to drain PTY output to terminal: {err}"))?,
++            Err(err) if is_pty_eof_error(&err) => return Ok(()),
++            Err(err) => return Err(format!("Failed to drain PTY output: {err}")),
++        }
++    }
++}
++
++fn poll_single_fd(fd: RawFd) -> Result<bool, String> {
++    let mut pollfd = libc::pollfd {
++        fd,
++        events: libc::POLLIN,
++        revents: 0,
++    };
++    let rc = unsafe { libc::poll(&mut pollfd, 1, RELAY_POLL_TIMEOUT_MS) };
++    if rc == -1 {
++        let err = io::Error::last_os_error();
++        if err.raw_os_error() == Some(libc::EINTR) {
++            return Ok(false);
++        }
++        return Err(format!("Failed to poll PTY drain fd: {err}"));
++    }
++    Ok(rc > 0 && readable(pollfd.revents))
++}
++
++fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
++    loop {
++        let rc = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
++        if rc >= 0 {
++            return Ok(rc as usize);
++        }
++        let err = io::Error::last_os_error();
++        if err.raw_os_error() == Some(libc::EINTR) {
++            continue;
++        }
++        return Err(err);
++    }
++}
++
++fn write_all_fd(fd: RawFd, mut bytes: &[u8]) -> io::Result<()> {
++    while !bytes.is_empty() {
++        let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
++        if rc >= 0 {
++            bytes = &bytes[rc as usize..];
++            continue;
++        }
++        let err = io::Error::last_os_error();
++        if err.raw_os_error() == Some(libc::EINTR) {
++            continue;
++        }
++        return Err(err);
++    }
++    Ok(())
++}
++
++fn is_pty_eof_error(err: &io::Error) -> bool {
++    err.raw_os_error() == Some(libc::EIO)
++}
++
++fn maybe_propagate_winsize(
++    real_fd: RawFd,
++    master_fd: RawFd,
++    child_pid: u32,
++    current: &mut Option<libc::winsize>,
++) {
++    let Ok(next) = terminal_winsize(real_fd) else {
++        return;
++    };
++    if current.as_ref().is_some_and(|old| winsize_eq(old, &next)) {
++        return;
++    }
++    if set_pty_winsize(master_fd, &next).is_ok() {
++        send_signal_to_child_group(child_pid, libc::SIGWINCH);
++        *current = Some(next);
++    }
++}
++
++fn winsize_eq(left: &libc::winsize, right: &libc::winsize) -> bool {
++    left.ws_row == right.ws_row
++        && left.ws_col == right.ws_col
++        && left.ws_xpixel == right.ws_xpixel
++        && left.ws_ypixel == right.ws_ypixel
++}
++
++fn send_signal_to_child_group(child_pid: u32, signal: i32) {
++    let pgid = -(child_pid as i32);
++    let _ = unsafe { libc::kill(pgid, signal) };
++}
++
++#[derive(Debug, Clone)]
++struct InputLineState {
++    at_line_boundary: bool,
++    last_user_input_at: Option<Instant>,
++}
++
++impl Default for InputLineState {
++    fn default() -> Self {
++        Self {
++            at_line_boundary: true,
++            last_user_input_at: None,
++        }
++    }
++}
++
++impl InputLineState {
++    fn observe_user_input(&mut self, bytes: &[u8]) {
++        if bytes.is_empty() {
++            return;
++        }
++        self.last_user_input_at = Some(Instant::now());
++        for byte in bytes {
++            match *byte {
++                b'\r' | b'\n' | 0x03 | 0x04 | 0x15 => self.at_line_boundary = true,
++                _ => self.at_line_boundary = false,
++            }
++        }
++    }
++
++    fn is_safe_to_inject(&self) -> bool {
++        self.at_line_boundary
++            && self
++                .last_user_input_at
++                .map(|last| last.elapsed() >= INJECT_DEBOUNCE)
++                .unwrap_or(true)
++    }
++}
++
++fn handle_control_request(
++    control: &ControlSocket,
++    real_fd: RawFd,
++    master_fd: RawFd,
++    line_state: &mut InputLineState,
++    buffer: &mut [u8],
++) -> Result<(), String> {
++    let (mut stream, _) = control
++        .listener
++        .accept()
++        .map_err(|err| format!("Failed to accept PTY control connection: {err}"))?;
++    stream
++        .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
++        .map_err(|err| format!("Failed to set PTY control read timeout: {err}"))?;
++    stream
++        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
++        .map_err(|err| format!("Failed to set PTY control write timeout: {err}"))?;
++    let response = process_control_request(&mut stream, real_fd, master_fd, line_state, buffer);
++    let (ack, message) = match response {
++        Ok(()) => (true, "ok".to_string()),
++        Err(message) => (false, message),
++    };
++    write_control_response(&mut stream, ack, &message)
++        .map_err(|err| format!("Failed to write PTY control response: {err}"))
++}
++
++fn process_control_request(
++    stream: &mut UnixStream,
++    real_fd: RawFd,
++    master_fd: RawFd,
++    line_state: &mut InputLineState,
++    buffer: &mut [u8],
++) -> Result<(), String> {
++    validate_peer_uid(stream)?;
++    let payload = read_control_request(stream)?;
++    wait_until_safe_to_inject(real_fd, master_fd, line_state, buffer)?;
++    write_all_fd(master_fd, &payload).map_err(|err| format!("pty_write_failed: {err}"))?;
++    write_all_fd(master_fd, b"\n").map_err(|err| format!("pty_submit_failed: {err}"))?;
++    line_state.at_line_boundary = true;
++    line_state.last_user_input_at = None;
++    Ok(())
++}
++
++fn read_control_request(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
++    let mut header = [0_u8; 12];
++    stream
++        .read_exact(&mut header)
++        .map_err(|err| format!("read_failed: {err}"))?;
++    if &header[..4] != CONTROL_MAGIC {
++        return Err("bad_magic".to_string());
++    }
++    if header[4] != CONTROL_VERSION {
++        return Err("bad_version".to_string());
++    }
++    if header[5] != CONTROL_OP_INJECT {
++        return Err("bad_op".to_string());
++    }
++    if header[6] != 0 || header[7] != 0 {
++        return Err("bad_flags".to_string());
++    }
++    let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
++    if length == 0 {
++        return Err("empty_payload".to_string());
++    }
++    if length > CONTROL_MAX_PAYLOAD_BYTES {
++        return Err("oversize_frame".to_string());
++    }
++    let mut payload = vec![0_u8; length];
++    stream
++        .read_exact(&mut payload)
++        .map_err(|err| format!("read_payload_failed: {err}"))?;
++    std::str::from_utf8(&payload).map_err(|_| "invalid_utf8".to_string())?;
++    Ok(payload)
++}
++
++fn wait_until_safe_to_inject(
++    real_fd: RawFd,
++    master_fd: RawFd,
++    line_state: &mut InputLineState,
++    buffer: &mut [u8],
++) -> Result<(), String> {
++    let start = Instant::now();
++    while start.elapsed() < INJECT_WAIT_LIMIT {
++        if line_state.is_safe_to_inject() {
++            return Ok(());
++        }
++        let ready = poll_relay_fds(real_fd, master_fd, None)?;
++        if ready.real_input {
++            relay_real_input(real_fd, master_fd, line_state, buffer)?;
++        }
++        if ready.pty_output {
++            relay_pty_output(master_fd, real_fd, buffer)?;
++        }
++    }
++    if line_state.is_safe_to_inject() {
++        return Ok(());
++    }
++    Err("unsafe_mid_line".to_string())
++}
++
++fn write_control_response(stream: &mut UnixStream, ack: bool, message: &str) -> io::Result<()> {
++    let mut header = [0_u8; 12];
++    header[..4].copy_from_slice(CONTROL_MAGIC);
++    header[4] = CONTROL_VERSION;
++    header[5] = if ack { 0 } else { 1 };
++    let bytes = message.as_bytes();
++    header[8..12].copy_from_slice(&(bytes.len() as u32).to_be_bytes());
++    stream.write_all(&header)?;
++    stream.write_all(bytes)
++}
++
++#[cfg(target_os = "linux")]
++fn validate_peer_uid(stream: &UnixStream) -> Result<(), String> {
++    let mut cred = unsafe { std::mem::zeroed::<libc::ucred>() };
++    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
++    let rc = unsafe {
++        libc::getsockopt(
++            stream.as_raw_fd(),
++            libc::SOL_SOCKET,
++            libc::SO_PEERCRED,
++            (&mut cred as *mut libc::ucred).cast(),
++            &mut len,
++        )
++    };
++    if rc == -1 {
++        return Err(format!("peercred_failed: {}", io::Error::last_os_error()));
++    }
++    let expected = unsafe { libc::geteuid() };
++    if cred.uid != expected {
++        return Err("peer_uid_mismatch".to_string());
++    }
++    Ok(())
++}
++
++#[cfg(not(target_os = "linux"))]
++fn validate_peer_uid(_stream: &UnixStream) -> Result<(), String> {
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::thread;
++
++    #[test]
++    fn input_line_state_tracks_boundary_and_debounce() {
++        let mut state = InputLineState::default();
++        assert!(state.is_safe_to_inject());
++
++        state.observe_user_input(b"abc");
++        assert!(!state.at_line_boundary);
++        assert!(!state.is_safe_to_inject());
++
++        state.observe_user_input(b"\n");
++        assert!(state.at_line_boundary);
++        assert!(!state.is_safe_to_inject());
++        state.last_user_input_at =
++            Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
++        assert!(state.is_safe_to_inject());
++    }
++
++    #[test]
++    fn client_rejects_empty_or_oversize_payload() {
++        assert_eq!(
++            validate_client_payload(b"").unwrap_err().kind,
++            PtyControlClientErrorKind::EmptyPayload
++        );
++        let oversized = vec![b'x'; CONTROL_MAX_PAYLOAD_BYTES + 1];
++        assert_eq!(
++            validate_client_payload(&oversized).unwrap_err().kind,
++            PtyControlClientErrorKind::Oversize
++        );
++    }
++
++    #[test]
++    fn socket_path_uses_hash_when_runtime_dir_is_long() {
++        let dir = PathBuf::from(format!("/tmp/{}", "x".repeat(140)));
++        let path = control_socket_path(&dir, "session-a", "invocation-a");
++        assert!(
++            path.file_name()
++                .unwrap()
++                .to_string_lossy()
++                .ends_with(".sock")
++        );
++        assert!(path.file_name().unwrap().to_string_lossy().len() < 40);
++    }
++
++    #[test]
++    fn control_socket_location_falls_back_when_directory_is_too_long() {
++        let dir = PathBuf::from(format!("/tmp/{}", "x".repeat(140)));
++        let (_dir, path) = control_socket_location_for_dir(dir, "session-a", "invocation-a");
++
++        assert!(path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_LIMIT);
++        assert!(path.starts_with(short_control_socket_dir()));
++    }
++
++    #[test]
++    fn control_request_inject_writes_payload_and_submit_delimiter() {
++        let (mut client, mut server) = UnixStream::pair().unwrap();
++        write_inject_frame(&mut client, b"[OULIPOLY NOTIFICATIONS]").unwrap();
++        let (real_read_end, _real_write_end) = pipe_files();
++        let (read_end, write_end) = pipe_files();
++        let mut state = InputLineState::default();
++        let mut buffer = [0_u8; 256];
++
++        process_control_request(
++            &mut server,
++            real_read_end.as_raw_fd(),
++            write_end.as_raw_fd(),
++            &mut state,
++            &mut buffer,
++        )
++        .unwrap();
++        drop(write_end);
++
++        let mut read_end = read_end;
++        let mut received = String::new();
++        read_end.read_to_string(&mut received).unwrap();
++        assert_eq!(received, "[OULIPOLY NOTIFICATIONS]\n");
++    }
++
++    #[test]
++    fn control_request_wait_observes_newline_from_real_input() {
++        let (mut client, mut server) = UnixStream::pair().unwrap();
++        write_inject_frame(&mut client, b"notify").unwrap();
++        let (real_read_end, real_write_end) = pipe_files();
++        let (read_end, write_end) = pipe_files();
++        let mut state = InputLineState::default();
++        state.observe_user_input(b"partial");
++        let mut buffer = [0_u8; 256];
++        let writer = thread::spawn(move || {
++            thread::sleep(Duration::from_millis(50));
++            let mut real_write_end = real_write_end;
++            real_write_end.write_all(b"\n").unwrap();
++        });
++
++        process_control_request(
++            &mut server,
++            real_read_end.as_raw_fd(),
++            write_end.as_raw_fd(),
++            &mut state,
++            &mut buffer,
++        )
++        .unwrap();
++        writer.join().unwrap();
++        drop(write_end);
++
++        let mut read_end = read_end;
++        let mut received = String::new();
++        read_end.read_to_string(&mut received).unwrap();
++        assert_eq!(received, "\nnotify\n");
++    }
++
++    #[test]
++    fn control_request_unsafe_midline_returns_err() {
++        let (mut client, mut server) = UnixStream::pair().unwrap();
++        write_inject_frame(&mut client, b"notify").unwrap();
++        let (real_read_end, _real_write_end) = pipe_files();
++        let (_read_end, write_end) = pipe_files();
++        let mut state = InputLineState::default();
++        state.observe_user_input(b"partial");
++        let mut buffer = [0_u8; 256];
++
++        let err = process_control_request(
++            &mut server,
++            real_read_end.as_raw_fd(),
++            write_end.as_raw_fd(),
++            &mut state,
++            &mut buffer,
++        )
++        .unwrap_err();
++
++        assert_eq!(err, "unsafe_mid_line");
++    }
++
++    #[test]
++    fn control_request_rejects_bad_magic_or_oversize_frame() {
++        let (mut bad_client, mut bad_server) = UnixStream::pair().unwrap();
++        bad_client
++            .write_all(b"BAD!\x01\x01\x00\x00\x00\x00\x00\x04test")
++            .unwrap();
++        assert_eq!(
++            read_control_request(&mut bad_server).unwrap_err(),
++            "bad_magic"
++        );
++
++        let (mut big_client, mut big_server) = UnixStream::pair().unwrap();
++        let mut header = [0_u8; 12];
++        header[..4].copy_from_slice(CONTROL_MAGIC);
++        header[4] = CONTROL_VERSION;
++        header[5] = CONTROL_OP_INJECT;
++        header[8..12].copy_from_slice(&((CONTROL_MAX_PAYLOAD_BYTES as u32) + 1).to_be_bytes());
++        big_client.write_all(&header).unwrap();
++        assert_eq!(
++            read_control_request(&mut big_server).unwrap_err(),
++            "oversize_frame"
++        );
++    }
++
++    fn pipe_files() -> (File, File) {
++        let mut fds = [-1; 2];
++        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
++        let read_end = unsafe { File::from_raw_fd(fds[0]) };
++        let write_end = unsafe { File::from_raw_fd(fds[1]) };
++        (read_end, write_end)
++    }
++}
+diff --git a/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs b/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs
+index b05d5de..fe0766a 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs
+@@ -34,9 +34,26 @@ pub(super) struct SpawnIdentityContext {
+     model_name: Option<String>,
+     session_id: Option<String>,
+     mode: SpawnRuntimeMode,
++    pty_control_path: Option<String>,
+     effective_cwd: Option<String>,
+ }
+ 
++impl SpawnIdentityContext {
++    pub(super) fn invocation_uuid(&self) -> &str {
++        &self.invocation_uuid
++    }
++
++    pub(super) fn session_id(&self) -> Option<&str> {
++        self.session_id.as_deref()
++    }
++
++    pub(super) fn with_pty_control_path(&self, path: impl Into<String>) -> Self {
++        let mut cloned = self.clone();
++        cloned.pty_control_path = Some(path.into());
++        cloned
++    }
++}
++
+ pub(super) fn context_from_parent_invocation_env(
+     parent_invocation_env: Option<&str>,
+     provider_name: &str,
+@@ -52,6 +69,7 @@ pub(super) fn context_from_parent_invocation_env(
+         model_name: model_name.map(str::to_string),
+         session_id: session_id.map(str::to_string),
+         mode,
++        pty_control_path: None,
+         effective_cwd: effective_cwd.map(|path| path.to_string_lossy().into_owned()),
+     })
+ }
+@@ -119,6 +137,7 @@ fn session_runtime_running_update<'a>(
+         provider_name: Some(&context.provider_name),
+         model_name: context.model_name.as_deref(),
+         identity,
++        pty_control_path: context.pty_control_path.as_deref(),
+         turn_start_max_mailbox_seq: None,
+         models_dir: None,
+         effective_cwd: context.effective_cwd.as_deref(),
+diff --git a/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs b/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+index 22363f7..d15c169 100644
+--- a/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
++++ b/crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs
+@@ -229,9 +229,17 @@ pub(super) struct InteractiveSignalGuard {
+ #[cfg(unix)]
+ impl InteractiveSignalGuard {
+     pub(super) fn install(child: &mut Child) -> Result<Self, String> {
++        Self::install_for_target(SignalForwardTarget::ChildPid(child_signal_pid(child)))
++    }
++
++    pub(super) fn install_process_group(child_pid: u32) -> Result<Self, String> {
++        Self::install_for_target(SignalForwardTarget::ProcessGroup(child_pid as i32))
++    }
++
++    fn install_for_target(target: SignalForwardTarget) -> Result<Self, String> {
+         let signals = install_interactive_signals()?;
+         let handle = signals.handle();
+-        let thread = spawn_interactive_signal_thread(signals, child_signal_pid(child));
++        let thread = spawn_interactive_signal_thread(signals, target);
+ 
+         Ok(Self {
+             handle,
+@@ -256,24 +264,51 @@ fn child_signal_pid(child: &Child) -> i32 {
+ }
+ 
+ #[cfg(unix)]
+-fn spawn_interactive_signal_thread(mut signals: Signals, child_pid: i32) -> thread::JoinHandle<()> {
++#[derive(Clone, Copy)]
++enum SignalForwardTarget {
++    ChildPid(i32),
++    ProcessGroup(i32),
++}
++
++#[cfg(unix)]
++fn spawn_interactive_signal_thread(
++    mut signals: Signals,
++    target: SignalForwardTarget,
++) -> thread::JoinHandle<()> {
+     let forwarded_sigterm = Arc::new(AtomicBool::new(false));
+     let thread_forwarded_sigterm = Arc::clone(&forwarded_sigterm);
+ 
+     thread::spawn(move || {
+-        forward_interactive_signals(&mut signals, child_pid, &thread_forwarded_sigterm);
++        forward_interactive_signals(&mut signals, target, &thread_forwarded_sigterm);
+     })
+ }
+ 
+ #[cfg(unix)]
+ fn forward_interactive_signals(
+     signals: &mut Signals,
+-    child_pid: i32,
++    target: SignalForwardTarget,
+     forwarded_sigterm: &AtomicBool,
+ ) {
+     for signal in signals.forever() {
+-        if should_forward_interactive_sigterm(signal, forwarded_sigterm) {
+-            send_sigterm(child_pid);
++        if should_forward_interactive_signal(signal, target, forwarded_sigterm) {
++            send_signal(target, signal);
++        }
++    }
++}
++
++#[cfg(unix)]
++fn should_forward_interactive_signal(
++    signal: i32,
++    target: SignalForwardTarget,
++    forwarded_sigterm: &AtomicBool,
++) -> bool {
++    match target {
++        SignalForwardTarget::ChildPid(_) => {
++            should_forward_interactive_sigterm(signal, forwarded_sigterm)
++        }
++        SignalForwardTarget::ProcessGroup(_) => {
++            (signal == SIGINT || signal == SIGHUP)
++                || should_forward_interactive_sigterm(signal, forwarded_sigterm)
+         }
+     }
+ }
+@@ -294,12 +329,16 @@ impl Drop for InteractiveSignalGuard {
+ }
+ 
+ #[cfg(unix)]
+-fn send_sigterm(pid: i32) {
++fn send_signal(target: SignalForwardTarget, signal: i32) {
+     unsafe extern "C" {
+         fn kill(pid: i32, sig: i32) -> i32;
+     }
+ 
+-    let _ = unsafe { kill(pid, SIGTERM) };
++    let pid = match target {
++        SignalForwardTarget::ChildPid(pid) => pid,
++        SignalForwardTarget::ProcessGroup(pid) => -pid,
++    };
++    let _ = unsafe { kill(pid, signal) };
+ }
+ 
+ #[cfg(test)]
+diff --git a/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs b/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+index d07405f..d78a9c7 100644
+--- a/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
++++ b/crates/oulipoly-runtime/tests/age244_s7b_export_replace_dispatch.rs
+@@ -1243,6 +1243,7 @@ fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> V
+         "--",
+         ".",
+         ":(exclude)planning/*-gate/**",
++        ":(exclude)planning/wu-e/**",
+         ":(exclude)planning/opencode-contract/**",
+     ]);
+     args
+diff --git a/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs b/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs
+new file mode 100644
+index 0000000..96770c0
+--- /dev/null
++++ b/crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs
+@@ -0,0 +1,151 @@
++#![cfg(unix)]
++
++use oulipoly_config::{ProviderConfig, ResumeKind, ResumeStrategy};
++use oulipoly_runtime::executor::cli::{
++    ResumePayload, execute_interactive_with_result_and_model_identity,
++};
++use oulipoly_state::CompositeInvocationId;
++use oulipoly_state::mailbox::MailboxDb;
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::os::unix::process::CommandExt;
++use std::path::{Path, PathBuf};
++use std::process::Command;
++
++const INVOCATION_UUID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
++const SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
++const FALLBACK_HELPER_ENV: &str = "WU_E_FALLBACK_HELPER";
++const PROVIDER_SCRIPT_ENV: &str = "WU_E_PROVIDER_SCRIPT";
++const CHILD_RESULT_ENV: &str = "WU_E_CHILD_RESULT";
++
++#[test]
++fn no_controlling_terminal_fallback_records_no_pty_control_path() {
++    let dir = tempfile::tempdir().unwrap();
++    let config_home = dir.path().join("config");
++    let data_home = dir.path().join("data");
++    let runtime_dir = dir.path().join("runtime");
++    let state_home = dir.path().join("state");
++    let home_dir = dir.path().join("home");
++    fs::create_dir_all(&config_home).unwrap();
++    fs::create_dir_all(&data_home).unwrap();
++    fs::create_dir_all(&runtime_dir).unwrap();
++    fs::create_dir_all(&state_home).unwrap();
++    fs::create_dir_all(&home_dir).unwrap();
++    fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
++    let sidecar_path = data_home
++        .join("oulipoly-agent-runner")
++        .join("pid-identity.db");
++    let script = fixture_script(dir.path());
++    let child_result = dir.path().join("child-result.txt");
++
++    let mut cmd = Command::new(std::env::current_exe().unwrap());
++    cmd.arg("--exact")
++        .arg("helper_runs_no_controlling_terminal_fallback")
++        .arg("--nocapture")
++        .env(FALLBACK_HELPER_ENV, "1")
++        .env(PROVIDER_SCRIPT_ENV, &script)
++        .env(CHILD_RESULT_ENV, &child_result)
++        .env("XDG_CONFIG_HOME", &config_home)
++        .env("XDG_DATA_HOME", &data_home)
++        .env("XDG_RUNTIME_DIR", &runtime_dir)
++        .env("XDG_STATE_HOME", &state_home)
++        .env("HOME", &home_dir)
++        .env_remove("OULIPOLY_PARENT_INVOCATION");
++    unsafe {
++        cmd.pre_exec(|| {
++            if libc::setsid() == -1 {
++                return Err(std::io::Error::last_os_error());
++            }
++            Ok(())
++        });
++    }
++    let output = cmd.output().unwrap();
++    assert!(
++        output.status.success(),
++        "child failed: status={:?}\nstdout={}\nstderr={}",
++        output.status,
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++    assert_eq!(fs::read_to_string(&child_result).unwrap(), "ok\n");
++
++    let db = MailboxDb::open(&sidecar_path).unwrap();
++    let runtime = db.session_runtime(SESSION_ID).unwrap().unwrap();
++    assert_eq!(runtime.mode, "pty_interactive");
++    assert!(runtime.pty_control_path.is_none());
++}
++
++#[test]
++fn helper_runs_no_controlling_terminal_fallback() {
++    if std::env::var_os(FALLBACK_HELPER_ENV).is_none() {
++        return;
++    }
++    assert!(
++        fs::OpenOptions::new()
++            .read(true)
++            .write(true)
++            .open("/dev/tty")
++            .is_err(),
++        "setsid child unexpectedly retained a controlling terminal"
++    );
++    let script = PathBuf::from(std::env::var_os(PROVIDER_SCRIPT_ENV).unwrap());
++    let child_result = PathBuf::from(std::env::var_os(CHILD_RESULT_ENV).unwrap());
++    let provider = fixture_provider(&script);
++    let strategy = ResumeStrategy {
++        kind: ResumeKind::Flag,
++        flag: Some("--resume".to_string()),
++        subcommand: None,
++    };
++    let invocation_env = invocation_env();
++
++    let result = execute_interactive_with_result_and_model_identity(
++        &provider,
++        None,
++        Some(&invocation_env),
++        Some(ResumePayload {
++            session_id: SESSION_ID,
++            strategy: &strategy,
++        }),
++        Some("fixture-model"),
++    )
++    .unwrap();
++    assert_eq!(result.exit_code, 0);
++    fs::write(child_result, "ok\n").unwrap();
++}
++
++fn fixture_script(dir: &Path) -> PathBuf {
++    let path = dir.join("fixture-provider.sh");
++    fs::write(
++        &path,
++        "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'ok\\n'\n",
++    )
++    .unwrap();
++    let mut permissions = fs::metadata(&path).unwrap().permissions();
++    permissions.set_mode(0o755);
++    fs::set_permissions(&path, permissions).unwrap();
++    path
++}
++
++fn fixture_provider(script: &Path) -> ProviderConfig {
++    ProviderConfig {
++        name: "fixture-provider".to_string(),
++        command: script.to_string_lossy().into_owned(),
++        args: Vec::new(),
++        interactive_args: Some(Vec::new()),
++        resume: None,
++        session_capture: None,
++        resume_acceptance: None,
++        session_storage: None,
++        system_prompt_override: None,
++        tool_restrictions: None,
++        invocation_mode: Default::default(),
++    }
++}
++
++fn invocation_env() -> String {
++    serde_json::to_string(&CompositeInvocationId {
++        source: "fixture".to_string(),
++        id: INVOCATION_UUID.to_string(),
++    })
++    .unwrap()
++}
+diff --git a/crates/oulipoly-runtime/tests/wu_e_pty_broker.rs b/crates/oulipoly-runtime/tests/wu_e_pty_broker.rs
+new file mode 100644
+index 0000000..f44a14e
+--- /dev/null
++++ b/crates/oulipoly-runtime/tests/wu_e_pty_broker.rs
+@@ -0,0 +1,250 @@
++#![cfg(unix)]
++
++use oulipoly_config::ProviderConfig;
++use oulipoly_runtime::executor::cli::execute_interactive_with_result_and_model_identity;
++use std::fs::{self, File};
++use std::io;
++use std::os::fd::{AsRawFd, FromRawFd, RawFd};
++use std::os::unix::fs::PermissionsExt;
++use std::os::unix::process::CommandExt;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++use std::time::{Duration, Instant};
++
++const HELPER_ENV: &str = "WU_E_PTY_HELPER";
++const PROVIDER_SCRIPT_ENV: &str = "WU_E_PROVIDER_SCRIPT";
++const RESULT_PATH_ENV: &str = "WU_E_RESULT_PATH";
++
++#[test]
++fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
++    let dir = tempfile::tempdir().unwrap();
++    let provider = fixture_provider_script(dir.path());
++    let result_path = dir.path().join("result.txt");
++    let pty = OuterPty::open(33, 100);
++    let before = terminal_attrs(pty.slave.as_raw_fd()).unwrap();
++
++    let mut child = spawn_helper_under_pty(&pty, &provider, &result_path);
++    let output = read_until(
++        pty.master.as_raw_fd(),
++        "SIZE:33 100",
++        Duration::from_secs(5),
++    );
++    assert!(output.contains("TTY:yes"), "output was {output:?}");
++    assert!(output.contains("SIZE:33 100"), "output was {output:?}");
++    write_all_fd(pty.master.as_raw_fd(), b"hello broker\n").unwrap();
++    let output = read_until(
++        pty.master.as_raw_fd(),
++        "ECHO:hello broker",
++        Duration::from_secs(5),
++    );
++    assert!(
++        output.contains("ECHO:hello broker"),
++        "output was {output:?}"
++    );
++
++    let status = child.wait().unwrap();
++    assert!(status.success(), "helper failed with {status:?}");
++    let after = terminal_attrs(pty.slave.as_raw_fd()).unwrap();
++    assert_termios_eq(&before, &after);
++    assert_eq!(fs::read_to_string(result_path).unwrap(), "7\n");
++}
++
++#[test]
++fn helper_runs_broker_session() {
++    if std::env::var_os(HELPER_ENV).is_none() {
++        return;
++    }
++    let provider_script = PathBuf::from(std::env::var_os(PROVIDER_SCRIPT_ENV).unwrap());
++    let result_path = PathBuf::from(std::env::var_os(RESULT_PATH_ENV).unwrap());
++    let provider = fixture_provider(&provider_script);
++    let result = execute_interactive_with_result_and_model_identity(
++        &provider,
++        None,
++        None,
++        None,
++        Some("fixture-model"),
++    )
++    .unwrap();
++    fs::write(result_path, format!("{}\n", result.exit_code)).unwrap();
++}
++
++struct OuterPty {
++    master: File,
++    slave: File,
++}
++
++impl OuterPty {
++    fn open(rows: u16, cols: u16) -> Self {
++        let mut master_fd = -1;
++        let mut slave_fd = -1;
++        let winsize = libc::winsize {
++            ws_row: rows,
++            ws_col: cols,
++            ws_xpixel: 0,
++            ws_ypixel: 0,
++        };
++        let rc = unsafe {
++            libc::openpty(
++                &mut master_fd,
++                &mut slave_fd,
++                std::ptr::null_mut(),
++                std::ptr::null(),
++                &winsize,
++            )
++        };
++        assert_eq!(rc, 0, "openpty failed: {}", io::Error::last_os_error());
++        Self {
++            master: unsafe { File::from_raw_fd(master_fd) },
++            slave: unsafe { File::from_raw_fd(slave_fd) },
++        }
++    }
++}
++
++fn spawn_helper_under_pty(
++    pty: &OuterPty,
++    provider: &Path,
++    result_path: &Path,
++) -> std::process::Child {
++    let exe = std::env::current_exe().unwrap();
++    let stdin = pty.slave.try_clone().unwrap();
++    let stdout = pty.slave.try_clone().unwrap();
++    let stderr = pty.slave.try_clone().unwrap();
++    let slave_fd = pty.slave.as_raw_fd();
++    let master_fd = pty.master.as_raw_fd();
++    let mut cmd = Command::new(exe);
++    cmd.arg("--exact")
++        .arg("helper_runs_broker_session")
++        .arg("--nocapture")
++        .env(HELPER_ENV, "1")
++        .env(PROVIDER_SCRIPT_ENV, provider)
++        .env(RESULT_PATH_ENV, result_path)
++        .stdin(Stdio::from(stdin))
++        .stdout(Stdio::from(stdout))
++        .stderr(Stdio::from(stderr));
++    unsafe {
++        cmd.pre_exec(move || {
++            if libc::setsid() == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if libc::tcsetpgrp(slave_fd, libc::getpid()) == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if master_fd > 2 {
++                libc::close(master_fd);
++            }
++            Ok(())
++        });
++    }
++    cmd.spawn().unwrap()
++}
++
++fn fixture_provider_script(dir: &Path) -> PathBuf {
++    let path = dir.join("fixture-provider.sh");
++    fs::write(
++        &path,
++        r#"#!/usr/bin/env bash
++set -euo pipefail
++test -t 0
++test -t 1
++test -t 2
++printf 'TTY:yes\n'
++printf 'SIZE:%s\n' "$(stty size)"
++IFS= read -r line
++printf 'ECHO:%s\n' "$line"
++exit 7
++"#,
++    )
++    .unwrap();
++    let mut permissions = fs::metadata(&path).unwrap().permissions();
++    permissions.set_mode(0o755);
++    fs::set_permissions(&path, permissions).unwrap();
++    path
++}
++
++fn fixture_provider(script: &Path) -> ProviderConfig {
++    ProviderConfig {
++        name: "fixture-provider".to_string(),
++        command: script.to_string_lossy().into_owned(),
++        args: Vec::new(),
++        interactive_args: Some(Vec::new()),
++        resume: None,
++        session_capture: None,
++        resume_acceptance: None,
++        session_storage: None,
++        system_prompt_override: None,
++        tool_restrictions: None,
++        invocation_mode: Default::default(),
++    }
++}
++
++fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
++    let start = Instant::now();
++    let mut output = Vec::new();
++    let mut buffer = [0_u8; 4096];
++    while start.elapsed() < timeout {
++        if poll_readable(fd, Duration::from_millis(50)).unwrap() {
++            let n = read_fd(fd, &mut buffer).unwrap();
++            if n == 0 {
++                break;
++            }
++            output.extend_from_slice(&buffer[..n]);
++            let rendered = String::from_utf8_lossy(&output);
++            if rendered.contains(needle) {
++                return rendered.into_owned();
++            }
++        }
++    }
++    String::from_utf8_lossy(&output).into_owned()
++}
++
++fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
++    let mut pollfd = libc::pollfd {
++        fd,
++        events: libc::POLLIN,
++        revents: 0,
++    };
++    let rc = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as i32) };
++    if rc == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(rc > 0 && pollfd.revents & libc::POLLIN != 0)
++}
++
++fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
++    let rc = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
++    if rc == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(rc as usize)
++}
++
++fn write_all_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
++    let mut offset = 0;
++    while offset < bytes.len() {
++        let rc = unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
++        if rc == -1 {
++            return Err(io::Error::last_os_error());
++        }
++        offset += rc as usize;
++    }
++    Ok(())
++}
++
++fn terminal_attrs(fd: RawFd) -> io::Result<libc::termios> {
++    let mut attrs = unsafe { std::mem::zeroed() };
++    if unsafe { libc::tcgetattr(fd, &mut attrs) } == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(attrs)
++}
++
++fn assert_termios_eq(left: &libc::termios, right: &libc::termios) {
++    assert_eq!(left.c_iflag, right.c_iflag);
++    assert_eq!(left.c_oflag, right.c_oflag);
++    assert_eq!(left.c_cflag, right.c_cflag);
++    assert_eq!(left.c_lflag, right.c_lflag);
++    assert_eq!(left.c_cc, right.c_cc);
++}
+diff --git a/crates/oulipoly-state/src/mailbox.rs b/crates/oulipoly-state/src/mailbox.rs
+index cddbd4f..f933ff7 100644
+--- a/crates/oulipoly-state/src/mailbox.rs
++++ b/crates/oulipoly-state/src/mailbox.rs
+@@ -84,6 +84,7 @@ pub struct SessionRuntimeRunningUpdate<'a> {
+     pub provider_name: Option<&'a str>,
+     pub model_name: Option<&'a str>,
+     pub identity: &'a ProcessIdentity,
++    pub pty_control_path: Option<&'a str>,
+     pub turn_start_max_mailbox_seq: Option<i64>,
+     pub models_dir: Option<&'a str>,
+     pub effective_cwd: Option<&'a str>,
+@@ -580,6 +581,7 @@ impl MailboxDb {
+                 "UPDATE session_runtime
+                  SET run_state = 'idle',
+                      updated_at = ?3,
++                     pty_control_path = NULL,
+                      running_invocation_uuid = NULL,
+                      running_os_pid = NULL,
+                      running_os_boot_id = NULL,
+@@ -692,13 +694,14 @@ fn mark_session_running_row(
+             last_exit_code,
+             models_dir,
+             effective_cwd
+-         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, 'running', ?3, ?7, ?8, ?9, ?6, NULL, ?10, NULL, ?11, ?12)
++         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?3, ?8, ?9, ?10, ?7, NULL, ?11, NULL, ?12, ?13)
+          ON CONFLICT(session_id)
+          DO UPDATE SET
+             mode = excluded.mode,
+             invocation_uuid = excluded.invocation_uuid,
+             provider_name = excluded.provider_name,
+             model_name = excluded.model_name,
++            pty_control_path = excluded.pty_control_path,
+             updated_at = excluded.updated_at,
+             run_state = 'running',
+             running_invocation_uuid = excluded.running_invocation_uuid,
+@@ -717,6 +720,7 @@ fn mark_session_running_row(
+             input.invocation_uuid,
+             input.provider_name,
+             input.model_name,
++            input.pty_control_path,
+             now,
+             input.identity.os_pid,
+             &input.identity.os_boot_id,
+@@ -740,6 +744,7 @@ fn mark_session_idle_row(
+             "UPDATE session_runtime
+              SET run_state = 'idle',
+                  updated_at = ?3,
++                 pty_control_path = NULL,
+                  running_invocation_uuid = NULL,
+                  running_os_pid = NULL,
+                  running_os_boot_id = NULL,
+@@ -1279,6 +1284,7 @@ mod tests {
+             provider_name: Some("provider-a"),
+             model_name: Some("model-a"),
+             identity: &identity,
++            pty_control_path: None,
+             turn_start_max_mailbox_seq: Some(7),
+             models_dir: Some("/tmp/models"),
+             effective_cwd: Some("/tmp/work"),
+@@ -1308,6 +1314,34 @@ mod tests {
+         assert!(row.turn_ended_at.is_none());
+     }
+ 
++    #[test]
++    fn runtime_mark_running_records_pty_control_path_without_schema_change() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
++        let identity = current_identity();
++
++        db.mark_session_running(SessionRuntimeRunningUpdate {
++            session_id: "session-a",
++            mode: "pty_interactive",
++            invocation_uuid: "invocation-a",
++            provider_name: Some("provider-a"),
++            model_name: Some("model-a"),
++            identity: &identity,
++            pty_control_path: Some("/tmp/oulipoly-a.sock"),
++            turn_start_max_mailbox_seq: None,
++            models_dir: None,
++            effective_cwd: None,
++        })
++        .unwrap();
++
++        let row = db.session_runtime("session-a").unwrap().unwrap();
++        assert_eq!(row.mode, "pty_interactive");
++        assert_eq!(
++            row.pty_control_path.as_deref(),
++            Some("/tmp/oulipoly-a.sock")
++        );
++    }
++
+     #[test]
+     fn runtime_mark_idle_is_invocation_guarded() {
+         let dir = tempfile::tempdir().unwrap();
+@@ -1321,6 +1355,7 @@ mod tests {
+             provider_name: Some("provider-a"),
+             model_name: Some("model-a"),
+             identity: &identity,
++            pty_control_path: Some("/tmp/oulipoly-test.sock"),
+             turn_start_max_mailbox_seq: None,
+             models_dir: None,
+             effective_cwd: None,
+@@ -1354,6 +1389,7 @@ mod tests {
+         assert!(row.turn_ended_at.is_some());
+         assert!(row.running_invocation_uuid.is_none());
+         assert!(row.running_os_pid.is_none());
++        assert!(row.pty_control_path.is_none());
+     }
+ 
+     #[test]
+@@ -1368,6 +1404,7 @@ mod tests {
+             provider_name: None,
+             model_name: None,
+             identity: &identity,
++            pty_control_path: None,
+             turn_start_max_mailbox_seq: None,
+             models_dir: None,
+             effective_cwd: None,
+@@ -1397,6 +1434,7 @@ mod tests {
+             provider_name: None,
+             model_name: None,
+             identity: &identity,
++            pty_control_path: Some("/tmp/stale.sock"),
+             turn_start_max_mailbox_seq: None,
+             models_dir: None,
+             effective_cwd: None,
+@@ -1411,6 +1449,7 @@ mod tests {
+         assert_eq!(row.run_state, "idle");
+         assert!(row.running_invocation_uuid.is_none());
+         assert!(row.running_os_pid.is_none());
++        assert!(row.pty_control_path.is_none());
+     }
+ 
+     #[test]
+@@ -1458,6 +1497,7 @@ mod tests {
+             provider_name: None,
+             model_name: None,
+             identity: &identity,
++            pty_control_path: None,
+             turn_start_max_mailbox_seq: None,
+             models_dir: None,
+             effective_cwd: None,
+@@ -1577,6 +1617,7 @@ mod tests {
+                 provider_name: Some("provider-a"),
+                 model_name: Some("model-a"),
+                 identity: &identity,
++                pty_control_path: None,
+                 turn_start_max_mailbox_seq: None,
+                 models_dir: None,
+                 effective_cwd: None,
+diff --git a/planning/wu-e/proposal.md b/planning/wu-e/proposal.md
+new file mode 100644
+index 0000000..8317fce
+--- /dev/null
++++ b/planning/wu-e/proposal.md
+@@ -0,0 +1,603 @@
++# WU-E Proposal: PTY Broker Delivery for Live Interactive Sessions
++
++## Scope
++
++WU-E closes the remaining async-bash notification gap for live interactive
++sessions:
++
++```text
++headless = queue + deliver at next successful resume        (already done)
++PTY      = queue + forward whenever into the live session   (WU-E)
++```
++
++The implementation target is Unix/Linux v1. It must not change the versioned
++`state.db` schema. All new durable or semi-durable state stays in the existing
++PID identity sidecar DB and runtime socket files under XDG-isolated runtime or
++state directories.
++
++The current interactive path is
++`crates/oulipoly-runtime/src/executor/cli/interactive.rs::execute_interactive_with_result_and_model_identity`.
++It builds the provider command, sets `stdin/stdout/stderr` to
++`Stdio::inherit()`, spawns the child, records the child PID identity, installs
++the interactive signal guard, and waits. Because agent-runner keeps no writable
++terminal handle, `src-tauri/src/commands/notify.rs` can only enqueue and then
++ask `src-tauri/src/wake_coordinator.rs` to wake a headless resume. The wake
++coordinator already returns `busy` for `session_runtime.mode='pty_interactive'`,
++so queued mail for a live PTY session is not headless-woken, but it is also not
++forwarded.
++
++WU-E replaces inherited stdio for interactive launches with an agent-runner PTY
++broker. The provider child still sees a real TTY. The user still sees an
++interactive CLI. Agent-runner additionally owns the PTY master and a per-session
++control socket, so a later `agents notify agent-bash-complete ...` process can
++inject a rendered notification turn into the live child.
++
++## Prior Art and Reuse Recommendation
++
++The requested in-house prior-art repositories were checked first under
++`/home/nes/projects`; no local checkout exists for `nestharus/cli-proxy` or
++`nestharus/claude-cli-proxy`.
++
++The upstream GitHub repositories are public but currently empty from this
++environment:
++
++| Repo | Observed state | Description exposed by GitHub |
++|---|---|---|
++| `nestharus/cli-proxy` | empty clone, GitHub API `size: 0` | `Generic CLI proxy substrate (PTY driver, sentinel-counter framework, completion-detection traits)` |
++| `nestharus/claude-cli-proxy` | empty clone, GitHub API `size: 0` | `Claude-specific CLI proxy built on cli-proxy. Hook-driven completion detection for interactive Claude Code sessions.` |
++
++The `cli-proxy` crate name on crates.io appears unrelated to this substrate and
++is not attributable to `nestharus` or to the PTY-driver description.
++
++Recommendation: implement a minimal in-tree broker in `oulipoly-runtime` now,
++borrowing only the described architectural split: generic PTY driver substrate,
++provider-specific completion detection outside the driver, and a control-plane
++injection seam. Do not depend on or vendor the prior-art repos for WU-E because
++there is no code to review, license, test, or version. If those repos are later
++populated, compare their driver patterns against the in-tree broker and extract
++only after the WU-E tests prove the local contract.
++
++## Integration Points
++
++Primary runtime changes:
++
++| File | Change |
++|---|---|
++| `crates/oulipoly-runtime/src/executor/cli.rs` | Add a Unix-only `pty_broker` sibling module and expose only the small pieces needed by tests or by the notify-side control client. |
++| `crates/oulipoly-runtime/src/executor/cli/interactive.rs` | On Unix with a usable controlling terminal, call the PTY broker instead of configuring inherited stdio. Preserve the public entrypoint and `InteractiveExecutionResult` shape. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs` | Add a PTY-aware signal target that forwards external process signals to the child process group/session, not only to the child PID. Preserve terminal signal classification from `ExitStatus`. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs` | Carry the PTY control socket path into `SessionRuntimeRunningUpdate`, or perform an immediately-following guarded runtime update after child identity capture. |
++| `crates/oulipoly-state/src/mailbox.rs` | No schema change. Use the existing `session_runtime.pty_control_path` column, clear it on invocation-guarded idle/stale cleanup, and make liveness helpers clear stale socket paths. |
++
++Primary Tauri/CLI changes:
++
++| File | Change |
++|---|---|
++| `src-tauri/src/mailbox_delivery.rs` | Factor the existing pending-row batch selection and notification rendering so both headless resume and PTY injection use one envelope contract and one batch cap. |
++| `src-tauri/src/commands/notify.rs` | After enqueue or already-enqueued, attempt live PTY injection for the owner session before triggering a headless wake. Mark delivered only after socket ack. |
++| `src-tauri/src/wake_coordinator.rs` | Keep the no-headless-wake behavior for a live PTY session, but make the predicate live-aware so an exited/stale PTY row with no socket does not block future headless wake. |
++
++## PTY Ownership and Relay
++
++### Launch Shape
++
++For Unix interactive launches, `interactive.rs` delegates to a new
++`pty_broker::execute_interactive_child` helper after building the provider
++`Command` and before result mapping.
++
++The broker does this sequence:
++
++1. Resolve the real user terminal by opening `/dev/tty` read-write. If no
++   controlling terminal exists, v1 preserves current behavior by falling back to
++   the existing inherited-stdio path with no `pty_control_path` and therefore no
++   live injection. This avoids breaking non-terminal scripts while making normal
++   interactive use brokered.
++2. Read the current terminal window size with `TIOCGWINSZ` from the real
++   terminal.
++3. Allocate a PTY pair with `openpty`, passing the initial `winsize`.
++4. Allocate and bind the per-session Unix control socket before spawning the
++   child, so the path is ready as soon as runtime state is recorded.
++5. Spawn the provider child with the PTY slave as fd `0`, `1`, and `2`.
++6. In the child `pre_exec` hook, call `setsid()`, acquire the slave as the
++   controlling TTY with `ioctl(TIOCSCTTY)`, make the child process group/session
++   the foreground terminal process group, and close inherited broker-only fds.
++7. In the parent, close the slave, keep the master, record child PID identity,
++   record `session_runtime(mode='pty_interactive', run_state='running',
++   pty_control_path=<socket>)`, enter raw mode on the real terminal, and start
++   the relay loop.
++
++The child should observe `isatty(0)`, `isatty(1)`, and `isatty(2)` exactly as it
++does when launched directly from a terminal. Provider launch arguments, working
++directory, resume arguments, policy transforms, and result mapping remain owned
++by the existing `interactive.rs` flow.
++
++### Raw Mode and Restore
++
++The broker owns a `RealTerminalGuard`:
++
++```text
++open /dev/tty -> tcgetattr -> cfmakeraw/tcsetattr -> relay -> Drop restores original termios
++```
++
++The guard is created only after the PTY child is spawned and before the relay
++starts. It restores with `tcsetattr(TCSANOW)` on every normal return and during
++Rust unwinding. The interactive entrypoint should wrap the broker run in a
++small `catch_unwind` or equivalent guard boundary only if needed to ensure the
++guard is dropped before any panic continues outward. `SIGKILL` and process
++abort cannot be restored by process-local code; tests cover normal exit,
++non-zero exit, and panic/error paths.
++
++Raw mode is applied to the real terminal, not to the child PTY. Keyboard bytes
++are relayed to the PTY master. The child-side slave line discipline remains the
++provider's terminal, so control characters like `Ctrl-C` written to the master
++are interpreted by the slave TTY and delivered to the child foreground process
++group like a normal terminal.
++
++### Relay Loop
++
++V1 uses one simple `poll(2)` loop rather than a full async runtime:
++
++| FD | Direction | Action |
++|---|---|---|
++| real terminal input | user -> broker | read bytes, update input-line state, write all to PTY master |
++| PTY master | child -> broker | read bytes, write all to real terminal output, flush |
++| control listener | notify -> broker | accept one local connection, validate peer, read one frame, maybe inject |
++| accepted control sockets | notify -> broker | process bounded request synchronously, then close |
++
++The loop also polls child exit with `try_wait()` at a short interval, for
++example 20-50 ms. After child exit, it drains remaining PTY output until EOF or
++`EIO`, closes the listener, removes the socket, restores the real terminal, and
++returns the child's `ExitStatus` to `interactive_result_from_status`.
++
++Flow/perf rules:
++
++- Use fixed-size buffers, for example 8 KiB or 16 KiB.
++- Use `write_all` loops to avoid partial relay corruption.
++- Treat `EINTR` as retry and `EIO` on PTY master after child exit as EOF.
++- Do not parse provider output in the broker v1; provider-specific completion
++  detection remains out of scope.
++- Keep control requests bounded by the same 64 KiB rendered-prefix cap used by
++  headless delivery.
++
++### Window Size Propagation
++
++Initial size is copied from the real terminal to the PTY at allocation. The
++broker installs a `SIGWINCH` flag or signal-hook channel. When resize is seen,
++it reads `TIOCGWINSZ` from the real terminal, writes `TIOCSWINSZ` to the PTY
++master, and sends `SIGWINCH` to the child process group.
++
++This must be process-group based because the child is a session leader after
++`setsid`, and interactive providers commonly spawn subprocesses that should see
++the resize too.
++
++### Signal Forwarding
++
++The existing `terminal_signal.rs::InteractiveSignalGuard` currently installs
++handlers for `SIGINT`, `SIGTERM`, and `SIGHUP`, but the current forwarding logic
++only sends the first `SIGTERM` to the child PID. That was acceptable while the
++terminal was inherited, because keyboard-generated terminal signals reached the
++child directly from the user's terminal.
++
++With a brokered PTY, user keyboard `Ctrl-C` flows as byte `0x03` through the
++PTY master and is converted by the child slave TTY into `SIGINT` for the child
++foreground process group. External signals delivered to the runner process do
++not flow through the PTY, so the guard should be extended for the brokered path:
++
++- Forward external `SIGTERM`, `SIGHUP`, and `SIGINT` to `-child_pid`, the child
++  process group created by `setsid()`.
++- Keep the current single-forward guard for `SIGTERM` to avoid repeated
++  termination spam.
++- Restore the handler and join the signal thread before returning the final
++  status, as the current guard already does.
++- Preserve `classify_terminal_reason`, `exit_code_from_status`, and provider
++  recognizer evidence from the real child `ExitStatus`.
++
++## Control Socket and Injection Protocol
++
++### Path Allocation
++
++Socket directory selection:
++
++1. Prefer `$XDG_RUNTIME_DIR/oulipoly-agent-runner/pty/`.
++2. If no runtime dir exists, use `$XDG_STATE_HOME/oulipoly-agent-runner/runtime/pty/`.
++3. If `XDG_STATE_HOME` is absent, fall back to the platform state/data directory
++   already used by the sidecar, under `oulipoly-agent-runner/runtime/pty/`.
++
++Tests must set `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_DATA_HOME`,
++`XDG_CONFIG_HOME`, and `HOME` to temp directories. The socket directory must be
++created with mode `0700`. The socket basename should include the provider
++session id and running invocation UUID, or a stable hash of them if the full
++path would exceed Unix `sun_path` limits. Example:
++
++```text
++$XDG_RUNTIME_DIR/oulipoly-agent-runner/pty/<session-short>.<invocation-short>.sock
++```
++
++The full path is recorded in `session_runtime.pty_control_path` when the child
++is marked running and is cleared at invocation-guarded exit cleanup.
++
++Stale path handling at launch:
++
++- If the intended path exists, attempt a short connect/ping.
++- If ping succeeds, treat another broker as active and refuse a second live PTY
++  broker for that same session/invocation.
++- If ping fails with `ENOENT`, `ECONNREFUSED`, timeout, or bad protocol, unlink
++  the stale socket and bind a fresh listener.
++- Never unlink a path outside the owned `0700` broker directory.
++
++### Security
++
++The socket is same-user control-plane state. V1 protects it with:
++
++- `0700` parent directory.
++- `umask(077)` during bind or post-bind chmod where supported.
++- Linux `SO_PEERCRED` check on every accepted connection; the peer uid must
++  equal the broker process uid.
++- Request max length of 64 KiB.
++- No shell interpretation. The broker writes exactly the already-rendered
++  envelope bytes plus the final line delimiter to the PTY master.
++
++Same-uid processes are not fully isolated from each other on Unix; a malicious
++same-user process that can read the sidecar path could still attempt injection.
++That is acceptable for v1 and should be documented. A future hardening pass can
++add a random per-broker nonce stored only in memory and passed to the notify
++process through a protected sidecar field if needed.
++
++### Frame Format
++
++Use one request per Unix-stream connection. The protocol is intentionally small
++and binary so it can carry arbitrary UTF-8 notification bytes without escaping.
++
++Request:
++
++```text
++magic       4 bytes   "OPTY"
++version     1 byte    1
++op          1 byte    1 = inject
++flags       2 bytes   big-endian, v1 must be 0
++length      4 bytes   big-endian, 0 < length <= 65536
++payload     N bytes   rendered notification envelope, UTF-8 text
++```
++
++Response:
++
++```text
++magic       4 bytes   "OPTY"
++version     1 byte    1
++status      1 byte    0 = ack, 1 = err
++reserved    2 bytes   0
++length      4 bytes   big-endian, length of UTF-8 message
++message     N bytes   "ok" or a short error reason
++```
++
++The broker sends `ack` only after the envelope bytes and one trailing newline
++or carriage return have been written successfully to the PTY master. The ack
++does not prove the provider semantically processed the turn; it proves delivery
++to the live terminal input queue. That matches the WU-E delivery boundary and
++is the point where `notify` can mark mailbox rows delivered.
++
++### Injection Safety
++
++The broker tracks an approximate input-line state from bytes relayed from the
++real terminal to the PTY master:
++
++- `at_line_boundary = true` at broker start.
++- Printable input, paste bytes, or other non-newline text set it to `false`.
++- `\r`, `\n`, `Ctrl-C`, `Ctrl-D`, or `Ctrl-U` reset it to `true`.
++- Any user keystroke starts a short debounce window, for example 250 ms.
++
++V1 injection rule:
++
++```text
++inject only when at_line_boundary == true and no user input arrived during the debounce window
++```
++
++If the rule is not satisfied, the broker waits up to a small bounded timeout,
++for example 1500 ms. If the session becomes safe, it injects and acks. If it
++does not, it returns `err unsafe_mid_line`; `notify` leaves rows pending.
++
++This is deliberately conservative. It prevents appending a notification into a
++half-typed user command or prompt. It does not solve every terminal UI case:
++the provider may be mid-render, in an alternate-screen editor, or in a custom
++textarea that is visually at a prompt while the broker cannot know that. Better
++provider-aware readiness detection, prompt sentinels, bracketed-paste handling,
++and pending-in-broker queues are deferred.
++
++Envelope transport v1 should reuse the headless notification content but render
++it through one shared function with explicit PTY suitability constraints:
++
++- No inline log content.
++- Paths quoted and newline-sanitized as today.
++- Batch cap: 20 rows or 64 KiB, same as headless.
++- Append exactly one final submit delimiter after the envelope.
++
++If provider CLIs prove that multiline injected envelopes submit too early,
++the next iteration should add a PTY-specific single-line renderer or a
++provider capability flag for bracketed paste. Do not add provider-specific
++terminal heuristics to the generic broker in v1.
++
++## Notify Integration: Forward Whenever
++
++`notify` remains durability-first. The ordering is:
++
++1. Parse metadata and resolve owner exactly as WU-B does.
++2. Enqueue or return the already-enqueued row using the existing mailbox
++   idempotency contract.
++3. If enqueue conflicts with another session, return the existing conflict and
++   do not inject.
++4. For inserted or already-enqueued rows, read `session_runtime` for the owner
++   session.
++5. If runtime says live `pty_interactive` with a usable `pty_control_path`, list
++   pending rows for the session, select one ordered batch with the shared
++   mailbox batch cap, render the notification envelope, send an `inject` frame
++   to the socket, and wait for ack/err.
++6. On ack, mark every injected seq delivered with
++   `delivered_by_invocation_uuid = session_runtime.running_invocation_uuid`.
++   Do not trigger a headless wake for those delivered rows.
++7. On any failure, including missing path, dead socket, refused connection,
++   peer/protocol error, unsafe mid-line, oversized frame, or mark-delivered
++   failure, leave rows pending.
++8. If no rows were delivered, call `wake_coordinator::trigger_notify_wake` as
++   today. A truly live PTY session returns `busy`. A stale/exited PTY row should
++   be cleaned by liveness and may allow a headless wake.
++
++The inject batch must be selected from all pending rows, not only the newly
++enqueued row. This preserves per-session `seq ASC` ordering and avoids marking
++a later completion delivered before older pending mail.
++
++Recommended diagnostics in `NotifyResponse`:
++
++```json
++{
++  "status": "enqueued",
++  "seq": 42,
++  "pty_delivery": {
++    "attempted": true,
++    "status": "acked | no_runtime | not_pty | no_socket | unsafe_mid_line | connect_error | protocol_error | mark_delivered_error",
++    "control_path": "...",
++    "delivered_seqs": [40, 41, 42],
++    "remaining_pending": 0,
++    "message": "..."
++  },
++  "wake": null
++}
++```
++
++If PTY delivery fails and `trigger_notify_wake` runs, include both
++`pty_delivery` and `wake`. If PTY delivery acks, `wake` should be `null` or a
++diagnostic with `status='skipped_pty_delivered'`, but it must not spawn a
++headless resume.
++
++## Wake Coordinator Interplay
++
++Current `src-tauri/src/wake_coordinator.rs::pty_runtime_is_busy` returns true
++for any `session_runtime.mode == 'pty_interactive'`. That is safe for WU-D
++because it avoids headless-waking a live interactive session, but WU-E needs it
++to become liveness-aware so a stale PTY record does not block delivery forever.
++
++Proposed behavior:
++
++- A PTY runtime is busy only if `mode='pty_interactive'`,
++  `run_state='running'`, `running_invocation_uuid` is present, the recorded PID
++  identity is still live, and `pty_control_path` points to a socket that either
++  accepts ping or has not yet failed liveness probing.
++- If the recorded PID is dead or identity-mismatched, clear the stale running
++  fields and `pty_control_path`, unlink the socket if it is under the owned
++  broker directory, and continue as idle.
++- If the process is live but injection returns `unsafe_mid_line`, wake must
++  remain `busy`; the pending row stays queued for later delivery rather than
++  starting a competing headless resume.
++- Existing headless behavior remains unchanged for rows whose owner session is
++  idle or whose runtime row is absent.
++
++This keeps the WU-B/WU-D guarantee: no headless wake races against a live PTY
++turn, and at-least-once mailbox durability is preserved when live injection
++cannot be completed.
++
++## Liveness and Cleanup
++
++Interactive runtime state should be recorded and cleared with invocation guards.
++
++At spawn:
++
++- The existing spawn identity path already calls
++  `record_interactive_child_identity` with `SpawnRuntimeMode::PtyInteractive`.
++- Extend that path so `SessionRuntimeRunningUpdate` carries
++  `pty_control_path: Some(path)` for brokered launches.
++- If threading the path through `SpawnIdentityContext` is too invasive, record
++  child identity first and immediately call a new sidecar helper to set
++  `pty_control_path` only when `session_id` and `running_invocation_uuid` match
++  the current interactive invocation.
++
++At exit:
++
++- Close the control listener so no new injection requests are accepted.
++- Unlink the socket path if it is inside the owned broker directory.
++- Restore the real terminal termios.
++- Mark `session_runtime` idle with the current interactive invocation UUID and
++  exit code.
++- Clear `pty_control_path` in the same invocation-guarded update.
++- Keep `mode='pty_interactive'` as historical last mode, but ensure wake logic
++  uses `run_state` and liveness rather than mode alone.
++
++On crash or kill:
++
++- The sidecar row may remain `run_state='running'` and the socket file may
++  remain on disk.
++- `MailboxDb::session_liveness` already compares recorded PID identity against
++  live `/proc` identity; WU-E should make stale clearing also clear
++  `pty_control_path`.
++- Notify-side socket connect failures should run stale cleanup before deciding
++  whether to call `trigger_notify_wake`.
++
++## Repl Resume Drain Decision
++
++V1 does not add pre-launch mailbox drain for `agents repl --resume` or
++top-level interactive resume. Draining pending mail into the initial interactive
++prompt is not cheap because the broker cannot know when the provider UI has
++finished startup and is ready for a new turn. Injecting before the prompt is
++ready risks sending the envelope into startup output, a login flow, or a
++provider-specific editor state.
++
++WU-E only delivers mailbox rows that arrive while a brokered PTY session is
++live, plus any older pending rows included in the ordered batch triggered by
++that notify. Headless resume drain remains the reliable catch-up path for
++mail queued while no live PTY exists. A later work unit can add provider-aware
++readiness detection and `repl --resume` startup drain if product usage shows it
++is needed.
++
++## Scope Boundaries
++
++V1 includes:
++
++- Unix/Linux PTY broker for interactive launches with a real controlling TTY.
++- Child slave as stdin/stdout/stderr and controlling TTY.
++- Raw-mode real-terminal relay with restore on normal exit and unwind.
++- Initial and `SIGWINCH` window-size propagation.
++- External signal forwarding to child process group.
++- Per-session Unix control socket recorded in `session_runtime.pty_control_path`.
++- Framed local injection protocol with peer uid check and bounded request size.
++- Notify-side enqueue-first, inject-if-live, ack-then-mark-delivered flow.
++- Stale socket and stale runtime cleanup.
++- XDG-isolated tests.
++
++V1 excludes:
++
++- Windows PTY support.
++- Provider-specific prompt readiness detection.
++- Broker-side durable pending queues.
++- Bracketed-paste negotiation by default.
++- Any `state.db` schema change.
++- Any change to headless delivery semantics.
++
++## Risks
++
++| Risk | Mitigation |
++|---|---|
++| Termios restore failure leaves user terminal raw | RAII guard, explicit restore before return, panic/unwind test, and manual fallback instructions in error logs. |
++| Injection while user is mid-line corrupts input | Conservative line-boundary tracking plus debounce and bounded refusal. Failure leaves mailbox pending. |
++| Injection while provider is mid-render or in alternate screen | V1 cannot fully detect this. Keep envelope small, inject only after user-input debounce, and defer provider-aware readiness. |
++| Multiline envelope semantics vary by provider CLI | Share renderer initially, test fixtures, and be ready to add PTY-specific single-line renderer or provider capability flags. |
++| Ack before provider semantically consumes the turn | Define ack as successful write to PTY input queue. This is the delivery boundary. Include stable handles for semantic dedupe. |
++| Crash after PTY write but before mark-delivered duplicates later | At-least-once semantics already allow duplicates. Stable `handle` remains in the envelope. |
++| Crash after mark-delivered but before provider acts loses notification | Small residual risk inherent in ack-at-PTY boundary. Keep mark only after full write succeeds; do not mark on broker errors. |
++| Stale socket blocks future wake | Stale cleanup checks PID identity and unlinks only sockets under the owned broker directory. Wake predicate becomes live-aware. |
++| Socket injection by another same-uid process | `0700` dir, `0600` socket posture, Linux `SO_PEERCRED`, random-ish basename. Stronger nonce deferred. |
++| Process group signal mistakes kill the broker or miss grandchildren | Child uses `setsid`; forward to negative child pid only after spawn; tests cover SIGTERM and Ctrl-C behavior. |
++| Unix `sun_path` length overflow | Use short basenames or hash session/invocation when needed. Tests use long XDG temp paths. |
++
++## Proof plan
++
++Runtime claim: Brokered relay correctness: the child sees a TTY on stdio, user input reaches the child, child output reaches the user terminal, initial winsize is visible to the child, and raw mode is restored after clean exit.
++Proof method: `crates/oulipoly-runtime/tests/wu_e_pty_broker.rs::broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode`.
++Evidence-class match: The test launches the runtime interactive path under an outer PTY, so `/dev/tty`, termios, winsize, relay reads/writes, and child exit all exercise the actual Unix PTY broker rather than a mocked adapter.
++
++Runtime claim: Control-socket injection occurs only at a safe line boundary; otherwise the broker returns `unsafe_mid_line` and does not inject.
++Proof method: `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::tests::control_request_wait_observes_newline_from_real_input` and `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::tests::control_request_unsafe_midline_returns_err`.
++Evidence-class match: These tests call the broker's real control-request processing path with real Unix stream pairs and pipe fds, so the line-boundary wait/refusal logic is exercised at the same frame-processing seam used by live notify injection.
++
++Runtime claim: Socket ack marks the injected mailbox batch delivered; socket failure leaves the row pending and preserves wake-busy behavior for a live PTY session.
++Proof method: `src-tauri/tests/wu_e_pty_delivery_integration.rs::notify_live_pty_ack_marks_delivered_and_skips_headless_wake` and `src-tauri/tests/wu_e_pty_delivery_integration.rs::notify_live_pty_failure_leaves_pending_and_wake_busy`.
++Evidence-class match: These integration tests run the notify command against an isolated sidecar DB and real Unix control socket, then inspect `mark_delivered` side effects, pending rows, PTY diagnostics, and wake diagnostics instead of asserting only on helper return values.
++
++Runtime claim: Stale PTY socket/runtime state is cleaned so it does not permanently block future wake behavior.
++Proof method: `src-tauri/tests/wu_e_pty_delivery_integration.rs::notify_stale_socket_cleans_runtime_and_does_not_report_busy`.
++Evidence-class match: The test seeds a dead runtime identity plus stale socket path in the sidecar, runs the actual notify/wake path, and verifies the runtime row is idle, `pty_control_path` is cleared, and the stale socket file is removed.
++
++Runtime claim: When no controlling terminal exists, interactive launch falls back to inherited stdio and records no `pty_control_path`.
++Proof method: `crates/oulipoly-runtime/tests/wu_e_interactive_fallback.rs::no_controlling_terminal_fallback_records_no_pty_control_path`.
++Evidence-class match: The test spawns the runtime launch under a `setsid()` child with isolated XDG/HOME state, asserts the child cannot open `/dev/tty`, and then verifies the actual sidecar `session_runtime` row has `mode='pty_interactive'` with `pty_control_path == None`.
++
++Runtime claim: A real live interactive session receives an `agent-bash-complete` notification through the PTY control socket without exiting.
++Proof method: `src-tauri/tests/wu_e_pty_delivery_integration.rs::fixture_interactive_session_agent_bash_completion_arrives_live`.
++Evidence-class match: The test starts the compiled runner in `repl --resume` under an outer PTY, runs the compiled notify command with real metadata artifacts and caller identity resolution, observes PTY delivery ack, verifies the fixture child receives the `[OULIPOLY NOTIFICATIONS]` envelope while still live, and inspects the sidecar cleanup.
++
++## Test Plan
++
++All tests must isolate `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_DATA_HOME`,
++`XDG_CONFIG_HOME`, and `HOME` under `tempfile::TempDir`. Tests must assert that
++default user state paths are untouched, matching the WU-B integration pattern in
++`src-tauri/tests/wu_b_mailbox_integration.rs`.
++
++### Runtime PTY Broker Tests
++
++These can live in `crates/oulipoly-runtime/tests/wu_e_pty_broker.rs` or a
++Unix-only module near `executor/cli/pty_broker.rs`.
++
++| Test | Proof |
++|---|---|
++| `broker_child_sees_tty_on_all_stdio` | Fixture child asserts `isatty(0/1/2)` and exits 0. |
++| `broker_relays_user_input_and_child_output` | Outer test PTY drives runner input; fixture child echoes a line; test sees echoed output on outer PTY. |
++| `broker_preserves_exit_status` | Fixture child exits 7 and `InteractiveExecutionResult.exit_code` is 7. |
++| `broker_restores_raw_mode_on_clean_exit` | Capture outer terminal termios before launch and assert restored after child exits. |
++| `broker_restores_raw_mode_on_error_path` | Force broker error after raw mode entry and assert termios restored. |
++| `broker_initial_winsize_propagates` | Set outer PTY winsize, child reads `TIOCGWINSZ`, and output matches. |
++| `broker_sigwinch_updates_child_pty` | Resize outer PTY, signal runner, child reads updated winsize. |
++| `broker_ctrl_c_reaches_child_foreground_group` | Fixture child traps or observes SIGINT after test writes `0x03` through outer PTY. |
++| `broker_external_sigterm_forwards_to_child_group` | Send SIGTERM to runner and assert child process group terminates and status maps through terminal signal logic. |
++
++### Control Socket Protocol Tests
++
++| Test | Proof |
++|---|---|
++| `control_socket_created_under_xdg_runtime_with_0700_parent` | Broker records path in sidecar and filesystem permissions are correct. |
++| `control_socket_rejects_bad_magic_or_oversize_frame` | Client receives `err`, child receives no bytes. |
++| `control_socket_rejects_wrong_peer_uid_when_simulatable` | Linux-only helper or lower-level unit around peer credential validation. |
++| `control_socket_inject_ack_writes_to_child_tty` | Fixture child reads from its TTY and prints the injected envelope; client receives ack. |
++| `control_socket_unsafe_midline_returns_err` | Test types partial input, sends inject, broker returns `unsafe_mid_line`, child receives no envelope. |
++| `control_socket_injects_after_line_boundary_debounce` | Test types input plus newline, sends inject, broker waits/debounces and then acks. |
++
++### Notify and Mailbox Integration Tests
++
++These should live beside WU-B tests in `src-tauri/tests/wu_e_pty_delivery_integration.rs` and run the compiled
++`oulipoly-agent-runner` binary with isolated XDG/HOME.
++
++| Test | Proof |
++|---|---|
++| `notify_live_pty_ack_marks_delivered` | Seed owner identity/runtime or launch fixture interactive session, run notify, socket acks, row has `delivered_at` and `delivered_by_invocation_uuid` equal to live invocation. |
++| `notify_live_pty_failure_leaves_pending` | Break socket or force protocol err; notify exits 0, row remains pending. |
++| `notify_live_pty_unsafe_midline_leaves_pending_and_wake_busy` | User mid-line causes inject refusal; notify diagnostics show PTY failure and wake `busy`. |
++| `notify_stale_socket_cleans_runtime_and_wakes_headless` | Seed stale `pty_control_path` and dead PID identity; notify leaves pending, clears socket/runtime, and wake path is allowed to proceed. |
++| `notify_injects_pending_batch_in_seq_order` | Seed older pending rows, enqueue new row, live injection envelope contains rows in `seq ASC`, and all injected seqs mark delivered. |
++| `notify_ack_skips_headless_wake` | Live ack path returns no spawned wake diagnostic and no detached resume process is started. |
++| `notify_no_live_socket_preserves_headless_behavior` | Runtime absent or idle; notify enqueues and existing wake behavior matches WU-D. |
++
++### End-to-End Test
++
++`fixture_interactive_session_agent_bash_completion_arrives_live`:
++
++1. Start a fixture interactive model under the compiled runner through an outer
++   PTY harness.
++2. Fixture child prints readiness, reads turns from its TTY, and logs every
++   received turn to a temp file.
++3. The test seeds or captures a caller identity chain resolving to the fixture
++   provider session.
++4. Run `agents notify agent-bash-complete --caller-ppid ... --handle ...` with
++   real temp `meta.json`, `log`, and `rc` files.
++5. Assert notify reports PTY delivery ack.
++6. Assert the fixture child receives the `[OULIPOLY NOTIFICATIONS]` envelope in
++   the live session without the interactive process exiting.
++7. Assert the mailbox row is delivered and no default user XDG path was touched.
++
++### Regression Tests
++
++- Existing WU-B headless mailbox tests must continue to pass unchanged.
++- Existing terminal signal mapping tests in `terminal_signal.rs` must continue
++  to pass.
++- Add a non-Unix or no-controlling-terminal test that verifies fallback does not
++  record `pty_control_path` and leaves PTY immediate injection unavailable.
++
++## 12-Line Summary
++
++1. WU-E makes agent-runner the owner of interactive PTYs.
++2. Interactive children get a PTY slave for stdin, stdout, stderr, and controlling TTY.
++3. Agent-runner relays between the user's real terminal and the PTY master.
++4. Raw mode is guarded and restored on exit or unwind.
++5. Window size and external signals propagate to the child process group.
++6. A per-session Unix socket is recorded in `session_runtime.pty_control_path`.
++7. `notify` still enqueues first for durable at-least-once behavior.
++8. If a live PTY socket exists, `notify` injects the ordered pending batch.
++9. Socket ack means the envelope was written to the PTY input queue.
++10. Acked rows are marked delivered; failures stay pending.
++11. Live PTY sessions are not headless-woken; stale PTY rows are cleaned.
++12. V1 is Unix-only, sidecar-only, XDG-isolated, and uses a minimal in-tree broker.
+diff --git a/planning/wue-gate/contracts/wue.contract.md b/planning/wue-gate/contracts/wue.contract.md
+new file mode 100644
+index 0000000..2d580c4
+--- /dev/null
++++ b/planning/wue-gate/contracts/wue.contract.md
+@@ -0,0 +1,181 @@
++# WU-E Phase-6a Code-Quality Contract
++
++## Component declared roles
++
++Component: WU-E PTY broker delivery touched production component.
++
++Roles: `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator`.
++
++Rationale: the change spans a new Unix PTY/control-socket broker, notify-side live delivery integration, mailbox envelope reuse, signal forwarding, spawn identity state threading, and runtime-state liveness cleanup. This is the honest minimal component union, but per-file cohesion scoring is preferred because the broker, notify integration, and runtime-state surfaces are separate concerns.
++
++## Per-file declared roles
++
++| File | Declared roles | Rationale |
++|---|---|---|
++| `crates/oulipoly-runtime/src/executor/cli.rs` | `orchestration` | The touched line exposes the Unix broker module through the CLI facade; no production function changed. |
++| `crates/oulipoly-runtime/src/executor/cli/interactive.rs` | `formatter`, `mapper`, `orchestration`, `validator` | Existing interactive entrypoint roles remain; WU-E adds broker selection and spawn-identity mapping. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs` | `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator` | New broker owns PTY relay orchestration, control-frame parsing/formatting, terminal/kernel accessors, safety predicates, and protocol/peer validators. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs` | `accessor`, `formatter`, `mapper`, `orchestration`, `parser` | WU-E adds context accessors and PTY control-path mapping while retaining existing identity recording and env parsing roles. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs` | `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator` | WU-E extends signal forwarding target selection while preserving existing terminal status mapping and signal predicates. |
++| `crates/oulipoly-state/src/mailbox.rs` | `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator` | The touched storage surface is already broad; WU-E threads `pty_control_path` through running/idle/stale runtime row mapping. |
++| `src-tauri/src/commands/notify.rs` | `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`, `validator` | WU-E adds live PTY delivery orchestration, live socket filtering, and diagnostic mapping to the existing notify command. |
++| `src-tauri/src/mailbox_delivery.rs` | `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate` | WU-E adds PTY preparation and max-size access while reusing existing mailbox batch selection and envelope formatting. |
++| `src-tauri/src/wake_coordinator.rs` | `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator` | WU-E makes PTY busy checks liveness-aware and unlinks stale sockets while retaining wake orchestration and diagnostics. |
++
++## Function inventory
++
++| Function | A1 classification | Justification |
++|---|---|---|
++| `crates/oulipoly-runtime/src/executor/cli/interactive.rs::execute_interactive_with_result_and_model_identity` | `orchestration` | Sequences provider args, spawn identity, broker-vs-inherited-stdio launch, wait, guard lifetime, and result mapping. |
++| `crates/oulipoly-runtime/src/executor/cli/interactive.rs::interactive_command` | `mapper` | Maps provider launch inputs into a `Command` without configuring stdio. |
++| `crates/oulipoly-runtime/src/executor/cli/interactive.rs::interactive_spawn_identity_context` | `mapper` | Maps parent invocation, provider, model, resume session, mode, and cwd into optional spawn identity context. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::inject_control_envelope` | `orchestration` | Sequences client payload validation, Unix socket connection, timeout setup, frame write, and response read. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_accepts_connection` | `predicate` | Answers whether the socket path accepts a Unix-stream connection. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::unlink_control_socket_if_owned` | `orchestration` | Delegates owned-path selection to a predicate and removes the socket only when that predicate passes. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_path_is_owned` | `predicate` | Answers whether a candidate socket path is under the runner-owned broker directory. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::controlling_terminal_available` | `predicate` | Answers whether `/dev/tty` can be opened for brokered interactive launch. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::execute_interactive_child` | `orchestration` | Sequences terminal open, PTY allocation, socket bind, child spawn, identity record, signal guard, raw mode, relay, and exit status return. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::validate_client_payload` | `validator` | Accepts non-empty bounded payload bytes or returns client validation failure. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::connect_error` | `mapper` | Maps an `io::Error` into the structured connect client error. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::protocol_error` | `mapper` | Maps an `io::Error` into the structured protocol client error. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::read_control_response` | `parser` | Parses the binary control response frame into `PtyControlResponse` while rejecting malformed fields. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::write_inject_frame` | `formatter` | Formats payload bytes into the declared binary inject request frame. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::PtyPair::open` | `orchestration` | Sequences `openpty` allocation and conversion of returned fds into owned `File`s. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::RealTerminal::open` | `orchestration` | Sequences `/dev/tty` open and original terminal attribute capture. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::RealTerminal::fd` | `accessor` | Exposes the real terminal raw fd without changing its meaning. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::RealTerminal::into_raw_mode` | `orchestration` | Sequences raw termios construction, application, and guard construction. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::RawTerminalGuard::fd` | `accessor` | Exposes the guarded real terminal raw fd. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::RawTerminalGuard::drop` | `orchestration` | Restores original termios on guard drop. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::open_real_terminal` | `accessor` | Retrieves the process controlling terminal as a read-write file. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::terminal_attrs` | `accessor` | Retrieves termios attributes for a raw fd. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::set_terminal_attrs` | `orchestration` | Applies supplied termios attributes through `tcsetattr`. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::terminal_winsize` | `accessor` | Retrieves terminal window size through `TIOCGWINSZ`. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::set_pty_winsize` | `orchestration` | Applies PTY window size through `TIOCSWINSZ`. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::configure_child_pty` | `orchestration` | Sequences slave fd cloning, child stdio assignment, and child `pre_exec` session/ctty setup. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::ControlSocket::bind_for` | `orchestration` | Sequences context/session guards, socket path selection, directory setup, stale socket handling, bind, and permissions. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::ControlSocket::fd` | `accessor` | Exposes the listener raw fd for polling. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::ControlSocket::path_string` | `formatter` | Formats the socket path into a lossy string for sidecar storage. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::ControlSocket::drop` | `orchestration` | Removes the owned socket path when the listener guard drops. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_dir` | `mapper` | Maps XDG/platform environment state into the broker-owned socket directory path. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::create_private_dir` | `orchestration` | Sequences directory creation and `0700` permission application. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_location` | `mapper` | Maps session and invocation identifiers into a directory/path pair. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_location_for_dir` | `mapper` | Maps a candidate directory and identifiers into normal or fallback socket location. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_path` | `mapper` | Maps directory and identifiers into a bounded Unix socket path. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::short_control_socket_dir` | `mapper` | Maps effective uid into the short fallback broker socket directory. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::short_component` | `formatter` | Formats an identifier into a sanitized bounded socket-name component. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::stable_socket_hash` | `formatter` | Formats session and invocation identifiers into a stable hex socket hash. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::unlink_stale_or_refuse_active` | `orchestration` | Sequences absent-socket predicate, active-socket validator, and stale owned-socket unlink before bind. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_is_absent` | `predicate` | Answers whether the target control socket path is absent. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control_socket_is_active` | `predicate` | Answers whether the target control socket accepts a Unix-stream connection. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::validate_control_socket_not_active` | `validator` | Rejects an already-active control socket before stale cleanup and bind. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::unlink_owned_socket` | `orchestration` | Removes a socket path only after the owned-directory guard passes. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::SessionRuntimeIdleGuard::new` | `mapper` | Maps optional spawn identity context into idle-guard state. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::SessionRuntimeIdleGuard::drop` | `orchestration` | Opens the default sidecar and marks the guarded session idle on drop. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::relay_until_exit` | `orchestration` | Runs the relay loop by sequencing named window, poll, input, output, control, and child-status helpers. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::poll_relay_fds` | `mapper` | Maps `poll(2)` readiness over real terminal, PTY master, and optional control socket into `ReadyFds`. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::readable` | `predicate` | Answers whether poll revents indicate readable or terminal fd state. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::relay_real_input` | `orchestration` | Sequences real-terminal read, input-line state update, and PTY master write. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::relay_pty_output` | `orchestration` | Sequences PTY master read and real-terminal write while treating PTY EOF as success. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::drain_pty_output` | `orchestration` | Loops through poll/read/write helpers to drain remaining PTY output after child exit. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::poll_single_fd` | `predicate` | Answers whether a single fd is readable after a bounded poll. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::read_fd` | `accessor` | Reads bytes from a raw fd into a caller buffer while retrying `EINTR`. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::write_all_fd` | `orchestration` | Loops through raw `write` calls until all bytes are written or an error occurs. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::is_pty_eof_error` | `predicate` | Answers whether an `io::Error` is the PTY EOF `EIO` condition. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::maybe_propagate_winsize` | `orchestration` | Sequences window-size read, comparison, PTY resize, child-group signal, and cached-size update. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::winsize_eq` | `predicate` | Answers whether two `winsize` values are identical. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::send_signal_to_child_group` | `orchestration` | Sends a supplied signal to the child process group. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::InputLineState::default` | `mapper` | Constructs the initial line-boundary/debounce state. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::InputLineState::observe_user_input` | `mapper` | Maps observed user bytes into updated line-boundary and debounce state. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::InputLineState::is_safe_to_inject` | `predicate` | Answers whether line boundary and debounce conditions permit injection. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::handle_control_request` | `orchestration` | Sequences accept, timeout setup, request processing, and response write. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::process_control_request` | `orchestration` | Sequences peer validation, request parsing, safety wait, PTY payload write, submit delimiter, and line-state reset. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::read_control_request` | `parser` | Parses the binary inject request frame and payload into validated bytes. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::wait_until_safe_to_inject` | `orchestration` | Runs a bounded relay/wait loop until the named safety predicate passes or fails. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::write_control_response` | `formatter` | Formats ack/error status and message into the declared binary response frame. |
++| `crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::validate_peer_uid` | `validator` | Accepts same-uid Linux peers through `SO_PEERCRED` or accepts all peers on non-Linux Unix. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs::SpawnIdentityContext::invocation_uuid` | `accessor` | Exposes the invocation UUID stored in the spawn identity context. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs::SpawnIdentityContext::session_id` | `accessor` | Exposes the optional provider session id stored in the spawn identity context. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs::SpawnIdentityContext::with_pty_control_path` | `mapper` | Maps an existing spawn identity context into a cloned context with PTY control path attached. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs::context_from_parent_invocation_env` | `mapper` | Maps parsed parent invocation state into spawn identity context with explicit empty PTY path. |
++| `crates/oulipoly-runtime/src/executor/cli/spawn_identity.rs::session_runtime_running_update` | `mapper` | Maps spawn identity context and process identity into a runtime-running sidecar update including PTY path. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::InteractiveSignalGuard::install` | `orchestration` | Delegates child-PID target selection into the shared signal-guard install path. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::InteractiveSignalGuard::install_process_group` | `orchestration` | Delegates process-group target selection into the shared signal-guard install path. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::InteractiveSignalGuard::install_for_target` | `orchestration` | Sequences signal iterator installation, handle capture, forwarding-thread spawn, and guard construction. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::spawn_interactive_signal_thread` | `orchestration` | Spawns the forwarding thread with the selected child PID or process-group target. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::forward_interactive_signals` | `orchestration` | Runs the signal relay loop by sequencing the forwarding predicate and signal sender. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::should_forward_interactive_signal` | `predicate` | Answers whether a received signal should be forwarded for the selected target type. |
++| `crates/oulipoly-runtime/src/executor/cli/terminal_signal.rs::send_signal` | `orchestration` | Sends the selected signal to either the child PID or the negative process-group id. |
++| `crates/oulipoly-state/src/mailbox.rs::MailboxDb::mark_session_running` | `orchestration` | Sequences run-state validation, timestamp capture, turn-start seq calculation, and running-row update. |
++| `crates/oulipoly-state/src/mailbox.rs::MailboxDb::mark_session_idle` | `orchestration` | Sequences idle-state validation, timestamp capture, and invocation-guarded idle-row update. |
++| `crates/oulipoly-state/src/mailbox.rs::MailboxDb::clear_stale_running_row` | `mapper` | Maps a stale running runtime row into an idle SQL update that clears `pty_control_path`. |
++| `crates/oulipoly-state/src/mailbox.rs::mark_session_running_row` | `mapper` | Maps `SessionRuntimeRunningUpdate` into the sidecar `session_runtime` upsert including `pty_control_path`. |
++| `crates/oulipoly-state/src/mailbox.rs::mark_session_idle_row` | `mapper` | Maps `SessionRuntimeIdleUpdate` into an invocation-guarded idle SQL update that clears `pty_control_path`. |
++| `src-tauri/src/commands/notify.rs::enqueue_owner_notification` | `orchestration` | Sequences payload/enqueue construction, sidecar open, enqueue result handling, and post-enqueue PTY/wake delivery. |
++| `src-tauri/src/commands/notify.rs::delivery_and_wake_after_enqueue` | `orchestration` | Sequences PTY delivery attempt and headless wake trigger only when no PTY rows were delivered. |
++| `src-tauri/src/commands/notify.rs::attempt_pty_delivery` | `orchestration` | Drives runtime lookup, pending batch preparation, control-socket injection, ack handling, and failure diagnostics; MULTI-CLASSIFIER-RISK: also performs inline status selection, socket filtering, and size validation. |
++| `src-tauri/src/commands/notify.rs::live_pty_control_path` | `filter` | Selects a non-empty control path only from running PTY runtime rows. |
++| `src-tauri/src/commands/notify.rs::mark_pty_batch_delivered` | `orchestration` | Sequences running-invocation guard, mailbox mark-delivered call, and diagnostic result construction; MULTI-CLASSIFIER-RISK: mixes validation and diagnostic mapping with delivery mutation. |
++| `src-tauri/src/commands/notify.rs::pty_client_error_status` | `mapper` | Maps PTY client error kind and message into a notify PTY diagnostic. |
++| `src-tauri/src/commands/notify.rs::pending_count` | `accessor` | Retrieves pending mailbox count for diagnostics, degrading storage errors to `None`. |
++| `src-tauri/src/commands/notify.rs::pty_status` | `mapper` | Maps status fields into a `PtyDeliveryDiagnostic` DTO. |
++| `src-tauri/src/commands/notify.rs::notify_success_response` | `mapper` | Maps `NotifyOutcome` variants into response DTOs including PTY delivery and optional wake diagnostics. |
++| `src-tauri/src/commands/notify.rs::render_notify_error_value` | `formatter` | Formats notify error state into the JSON response shape. |
++| `src-tauri/src/commands/notify.rs::notify_response` | `mapper` | Maps notify command fields into the serializable response DTO. |
++| `src-tauri/src/mailbox_delivery.rs::prepare_pty_mailbox_delivery` | `orchestration` | Sequences pending-row retrieval, empty check, batch selection, seq extraction, envelope render, and PTY delivery preparation. |
++| `src-tauri/src/mailbox_delivery.rs::mailbox_prefix_max_bytes` | `accessor` | Exposes the shared mailbox envelope size cap. |
++| `src-tauri/src/mailbox_delivery.rs::headless_session_runtime_upsert` | `mapper` | Maps resolved headless resume state into runtime upsert with explicit no PTY control path. |
++| `src-tauri/src/wake_coordinator.rs::start_wake_chain` | `orchestration` | Sequences mailbox open, runtime read, live PTY busy check, wake-claim acquisition, detached resume spawn, and diagnostics. |
++| `src-tauri/src/wake_coordinator.rs::pty_runtime_is_busy` | `predicate` | Answers whether a PTY runtime is currently busy; MULTI-CLASSIFIER-RISK: also triggers stale liveness cleanup and socket unlink. |
++| `src-tauri/src/wake_coordinator.rs::unlink_stale_pty_socket` | `orchestration` | Delegates stale owned socket unlinking to the broker helper when a path is present. |
++
++## Adapter declarations
++
++```yaml
++adapter_declarations:
++  - component: crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::pty-driver
++    role: adapter
++    Translates:
++      - unix-kernel-pty-termios-signal-contract
++      - provider-interactive-tty-stdio-contract
++  - component: crates/oulipoly-runtime/src/executor/cli/pty_broker.rs::control-socket-protocol
++    role: adapter
++    Translates:
++      - wue-pty-control-inject-protocol-contract
++      - unix-stream-socket-peercred-contract
++  - component: src-tauri/src/commands/notify.rs::attempt_pty_delivery
++    role: adapter
++    Translates:
++      - mailbox-pending-delivery-contract
++      - wue-pty-control-inject-protocol-contract
++      - notify-pty-delivery-diagnostic-contract
++      - wake-coordinator-notify-wake-contract
++  - component: src-tauri/src/mailbox_delivery.rs::render_notification_prefix
++    role: adapter
++    Translates:
++      - mailbox-row-storage-contract
++      - oulipoly-notification-envelope-contract
++```
++
++## Intrinsic-surface declarations
++
++```yaml
++intrinsic_surface_declarations:
++  - component: crates/oulipoly-runtime/src/executor/cli/pty_broker.rs
++    role: intrinsic-surface
++    Domain: unix_pty_termios_signal_kernel_surface
++    Owns:
++      - /dev/tty controlling-terminal open
++      - openpty PTY pair allocation
++      - tcgetattr original termios capture
++      - cfmakeraw raw-mode construction
++      - tcsetattr raw-mode apply and restore
++      - TIOCSCTTY controlling TTY acquisition
++      - tcsetpgrp foreground process-group assignment
++      - TIOCGWINSZ real-terminal window-size read
++      - TIOCSWINSZ PTY window-size write
++      - SIGWINCH propagation to child process group
++      - setsid child session/process-group creation
++      - poll/read/write real-terminal and PTY-master relay
++```
++
++Other touched production files: none.
+diff --git a/src-tauri/src/commands/notify.rs b/src-tauri/src/commands/notify.rs
+index 01938cb..7405d2e 100644
+--- a/src-tauri/src/commands/notify.rs
++++ b/src-tauri/src/commands/notify.rs
+@@ -3,13 +3,20 @@
+ //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
+ //! `validator`
+ 
+-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
++use oulipoly_state::mailbox::{
++    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow, SessionRuntimeRow,
++};
+ use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
+ use oulipoly_state::{InvocationRecord, StateDb};
+ use serde::Serialize;
+ use serde_json::Value;
+ use std::path::Path;
+ 
++#[cfg(unix)]
++use oulipoly_runtime::executor::cli::pty_broker::{
++    PtyControlClientErrorKind, inject_control_envelope,
++};
++
+ use crate::wake_coordinator::WakeDiagnostic;
+ 
+ #[derive(Debug, Serialize)]
+@@ -24,9 +31,20 @@ struct NotifyResponse {
+     owner_session_id: Option<String>,
+     session_source: Option<String>,
+     seq: Option<i64>,
++    pty_delivery: Option<PtyDeliveryDiagnostic>,
+     wake: Option<WakeDiagnostic>,
+ }
+ 
++#[derive(Debug, Clone, Serialize)]
++struct PtyDeliveryDiagnostic {
++    attempted: bool,
++    status: String,
++    control_path: Option<String>,
++    delivered_seqs: Vec<i64>,
++    remaining_pending: Option<usize>,
++    message: Option<String>,
++}
++
+ #[derive(Debug, Clone)]
+ struct CallerIdentity {
+     chain_index: usize,
+@@ -120,12 +138,14 @@ enum NotifyOutcome {
+     Enqueued {
+         owner: ResolvedOwner,
+         row: MailboxRow,
+-        wake: WakeDiagnostic,
++        pty_delivery: PtyDeliveryDiagnostic,
++        wake: Option<WakeDiagnostic>,
+     },
+     AlreadyEnqueued {
+         owner: ResolvedOwner,
+         row: MailboxRow,
+-        wake: WakeDiagnostic,
++        pty_delivery: PtyDeliveryDiagnostic,
++        wake: Option<WakeDiagnostic>,
+     },
+     NoOwner,
+ }
+@@ -178,12 +198,24 @@ fn enqueue_owner_notification(
+         .map_err(NotifyError::Storage)?
+     {
+         EnqueueResult::Inserted(row) => {
+-            let wake = crate::wake_coordinator::trigger_notify_wake(&owner.session_id);
+-            Ok(NotifyOutcome::Enqueued { owner, row, wake })
++            let (pty_delivery, wake) =
++                delivery_and_wake_after_enqueue(&mut mailbox, &owner.session_id);
++            Ok(NotifyOutcome::Enqueued {
++                owner,
++                row,
++                pty_delivery,
++                wake,
++            })
+         }
+         EnqueueResult::AlreadyEnqueued(row) => {
+-            let wake = crate::wake_coordinator::trigger_notify_wake(&owner.session_id);
+-            Ok(NotifyOutcome::AlreadyEnqueued { owner, row, wake })
++            let (pty_delivery, wake) =
++                delivery_and_wake_after_enqueue(&mut mailbox, &owner.session_id);
++            Ok(NotifyOutcome::AlreadyEnqueued {
++                owner,
++                row,
++                pty_delivery,
++                wake,
++            })
+         }
+         EnqueueResult::Conflict { existing } => Err(NotifyError::Conflict {
+             existing: Box::new(existing),
+@@ -191,6 +223,212 @@ fn enqueue_owner_notification(
+     }
+ }
+ 
++fn delivery_and_wake_after_enqueue(
++    mailbox: &mut MailboxDb,
++    session_id: &str,
++) -> (PtyDeliveryDiagnostic, Option<WakeDiagnostic>) {
++    let pty_delivery = attempt_pty_delivery(mailbox, session_id);
++    let wake = if pty_delivery.delivered_seqs.is_empty() {
++        Some(crate::wake_coordinator::trigger_notify_wake(session_id))
++    } else {
++        None
++    };
++    (pty_delivery, wake)
++}
++
++#[cfg(unix)]
++fn attempt_pty_delivery(mailbox: &mut MailboxDb, session_id: &str) -> PtyDeliveryDiagnostic {
++    let runtime = match mailbox.session_runtime(session_id) {
++        Ok(Some(runtime)) => runtime,
++        Ok(None) => {
++            return pty_status(
++                false,
++                "no_runtime",
++                None,
++                Vec::new(),
++                pending_count(mailbox, session_id),
++                None,
++            );
++        }
++        Err(err) => return pty_status(false, "no_runtime", None, Vec::new(), None, Some(err)),
++    };
++    if runtime.mode != "pty_interactive" {
++        return pty_status(
++            false,
++            "not_pty",
++            None,
++            Vec::new(),
++            pending_count(mailbox, session_id),
++            None,
++        );
++    }
++    let Some(control_path) = live_pty_control_path(&runtime) else {
++        return pty_status(
++            false,
++            "no_socket",
++            runtime.pty_control_path,
++            Vec::new(),
++            pending_count(mailbox, session_id),
++            None,
++        );
++    };
++    let Some(prepared) =
++        (match crate::mailbox_delivery::prepare_pty_mailbox_delivery(mailbox, session_id) {
++            Ok(prepared) => prepared,
++            Err(err) => {
++                return pty_status(
++                    false,
++                    "protocol_error",
++                    Some(control_path),
++                    Vec::new(),
++                    None,
++                    Some(err),
++                );
++            }
++        })
++    else {
++        return pty_status(
++            false,
++            "no_pending",
++            Some(control_path),
++            Vec::new(),
++            Some(0),
++            None,
++        );
++    };
++    if prepared.envelope.len() > crate::mailbox_delivery::mailbox_prefix_max_bytes() {
++        return pty_status(
++            false,
++            "protocol_error",
++            Some(control_path),
++            Vec::new(),
++            pending_count(mailbox, session_id),
++            Some("oversize_frame".to_string()),
++        );
++    }
++    match inject_control_envelope(&control_path, &prepared.envelope) {
++        Ok(response) if response.ack => {
++            mark_pty_batch_delivered(mailbox, session_id, &runtime, &prepared.seqs, control_path)
++        }
++        Ok(response) => {
++            let status = if response.message == "unsafe_mid_line" {
++                "unsafe_mid_line"
++            } else {
++                "protocol_error"
++            };
++            pty_status(
++                true,
++                status,
++                Some(control_path),
++                Vec::new(),
++                pending_count(mailbox, session_id),
++                Some(response.message),
++            )
++        }
++        Err(err) => {
++            pty_client_error_status(mailbox, session_id, control_path, err.kind, err.message)
++        }
++    }
++}
++
++#[cfg(not(unix))]
++fn attempt_pty_delivery(_mailbox: &mut MailboxDb, _session_id: &str) -> PtyDeliveryDiagnostic {
++    pty_status(false, "not_pty", None, Vec::new(), None, None)
++}
++
++#[cfg(unix)]
++fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
++    (runtime.run_state == "running")
++        .then_some(runtime.pty_control_path.as_ref())
++        .flatten()
++        .filter(|path| !path.is_empty())
++        .cloned()
++}
++
++#[cfg(unix)]
++fn mark_pty_batch_delivered(
++    mailbox: &mut MailboxDb,
++    session_id: &str,
++    runtime: &SessionRuntimeRow,
++    seqs: &[i64],
++    control_path: String,
++) -> PtyDeliveryDiagnostic {
++    let Some(invocation_uuid) = runtime.running_invocation_uuid.as_deref() else {
++        return pty_status(
++            true,
++            "mark_delivered_error",
++            Some(control_path),
++            Vec::new(),
++            pending_count(mailbox, session_id),
++            Some("running invocation missing".to_string()),
++        );
++    };
++    match mailbox.mark_delivered(session_id, seqs, invocation_uuid) {
++        Ok(()) => pty_status(
++            true,
++            "acked",
++            Some(control_path),
++            seqs.to_vec(),
++            pending_count(mailbox, session_id),
++            Some("ok".to_string()),
++        ),
++        Err(err) => pty_status(
++            true,
++            "mark_delivered_error",
++            Some(control_path),
++            Vec::new(),
++            pending_count(mailbox, session_id),
++            Some(err),
++        ),
++    }
++}
++
++#[cfg(unix)]
++fn pty_client_error_status(
++    mailbox: &MailboxDb,
++    session_id: &str,
++    control_path: String,
++    kind: PtyControlClientErrorKind,
++    message: String,
++) -> PtyDeliveryDiagnostic {
++    let status = match kind {
++        PtyControlClientErrorKind::Connect => "connect_error",
++        PtyControlClientErrorKind::Protocol
++        | PtyControlClientErrorKind::Oversize
++        | PtyControlClientErrorKind::EmptyPayload => "protocol_error",
++    };
++    pty_status(
++        true,
++        status,
++        Some(control_path),
++        Vec::new(),
++        pending_count(mailbox, session_id),
++        Some(message),
++    )
++}
++
++fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
++    mailbox.list_pending(session_id).map(|rows| rows.len()).ok()
++}
++
++fn pty_status(
++    attempted: bool,
++    status: &str,
++    control_path: Option<String>,
++    delivered_seqs: Vec<i64>,
++    remaining_pending: Option<usize>,
++    message: Option<String>,
++) -> PtyDeliveryDiagnostic {
++    PtyDeliveryDiagnostic {
++        attempted,
++        status: status.to_string(),
++        control_path,
++        delivered_seqs,
++        remaining_pending,
++        message,
++    }
++}
++
+ fn agent_bash_complete_enqueue<'a>(
+     args: &'a AgentBashCompleteArgs<'_>,
+     payload_json: &'a str,
+@@ -558,23 +796,35 @@ fn notify_success_response(
+     outcome: NotifyOutcome,
+ ) -> NotifyResponse {
+     match outcome {
+-        NotifyOutcome::Enqueued { owner, row, wake } => notify_response(
++        NotifyOutcome::Enqueued {
++            owner,
++            row,
++            pty_delivery,
++            wake,
++        } => notify_response(
+             args,
+             "enqueued",
+             true,
+             Some(&owner),
+             Some(row.seq),
++            Some(pty_delivery),
+             Some(wake),
+         ),
+-        NotifyOutcome::AlreadyEnqueued { owner, row, wake } => notify_response(
++        NotifyOutcome::AlreadyEnqueued {
++            owner,
++            row,
++            pty_delivery,
++            wake,
++        } => notify_response(
+             args,
+             "already_enqueued",
+             true,
+             Some(&owner),
+             Some(row.seq),
++            Some(pty_delivery),
+             Some(wake),
+         ),
+-        NotifyOutcome::NoOwner => notify_response(args, "no_owner", false, None, None, None),
++        NotifyOutcome::NoOwner => notify_response(args, "no_owner", false, None, None, None, None),
+     }
+ }
+ 
+@@ -620,6 +870,7 @@ fn render_notify_error_value(
+         None,
+         None,
+         None,
++        None,
+     ))
+     .map_err(|err| format!("Failed to serialize notify response JSON: {err}"))?;
+     if let Some(message) = &render.message {
+@@ -643,7 +894,8 @@ fn notify_response(
+     enqueued: bool,
+     owner: Option<&ResolvedOwner>,
+     seq: Option<i64>,
+-    wake: Option<WakeDiagnostic>,
++    pty_delivery: Option<PtyDeliveryDiagnostic>,
++    wake: Option<Option<WakeDiagnostic>>,
+ ) -> NotifyResponse {
+     NotifyResponse {
+         status: status.to_string(),
+@@ -656,7 +908,8 @@ fn notify_response(
+         owner_session_id: owner.map(|owner| owner.session_id.clone()),
+         session_source: owner.map(|owner| owner.source.as_str().to_string()),
+         seq,
+-        wake,
++        pty_delivery,
++        wake: wake.flatten(),
+     }
+ }
+ 
+diff --git a/src-tauri/src/mailbox_delivery.rs b/src-tauri/src/mailbox_delivery.rs
+index 644624a..d1cf2fb 100644
+--- a/src-tauri/src/mailbox_delivery.rs
++++ b/src-tauri/src/mailbox_delivery.rs
+@@ -14,6 +14,29 @@ pub(crate) struct PreparedMailboxDelivery {
+     pub seqs: Vec<i64>,
+ }
+ 
++pub(crate) struct PreparedPtyMailboxDelivery {
++    pub envelope: String,
++    pub seqs: Vec<i64>,
++}
++
++pub(crate) fn prepare_pty_mailbox_delivery(
++    db: &MailboxDb,
++    session_id: &str,
++) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
++    let pending = pending_mailbox_rows(db, session_id)?;
++    if !has_pending_rows(&pending) {
++        return Ok(None);
++    }
++    let batch = select_batch(&pending);
++    let seqs = batch_seqs(&batch);
++    let envelope = render_notification_prefix(&batch.rows, batch.remaining_count);
++    Ok(Some(PreparedPtyMailboxDelivery { envelope, seqs }))
++}
++
++pub(crate) fn mailbox_prefix_max_bytes() -> usize {
++    MAILBOX_PREFIX_MAX_BYTES
++}
++
+ pub(crate) fn prepare_headless_resume_delivery(
+     resolved: &oulipoly_state::ResolvedResume,
+     answer: Option<String>,
+diff --git a/src-tauri/src/wake_coordinator.rs b/src-tauri/src/wake_coordinator.rs
+index e9c0069..a476018 100644
+--- a/src-tauri/src/wake_coordinator.rs
++++ b/src-tauri/src/wake_coordinator.rs
+@@ -4,14 +4,16 @@
+ //! `validator`
+ 
+ use oulipoly_state::mailbox::{
+-    MailboxDb, SessionRuntimeIdleUpdate, SessionRuntimeRow, WakeClaimAcquireResult,
+-    WakeClaimRequest, WakeClaimRow,
++    MailboxDb, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
++    WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow,
+ };
+ use serde::Serialize;
+ use std::path::PathBuf;
+ use std::process::{Child, Command, Stdio};
+ use uuid::Uuid;
+ 
++#[cfg(unix)]
++use oulipoly_runtime::executor::cli::pty_broker;
+ #[cfg(unix)]
+ use std::os::unix::process::CommandExt;
+ 
+@@ -266,8 +268,10 @@ fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
+         Ok(row) => row,
+         Err(err) => return storage_error_diagnostic(err),
+     };
+-    if pty_runtime_is_busy(runtime.as_ref()) {
+-        return WakeDiagnostic::status("busy");
++    match pty_runtime_is_busy(&mut db, input.session_id, runtime.as_ref()) {
++        Ok(true) => return WakeDiagnostic::status("busy"),
++        Ok(false) => {}
++        Err(err) => return storage_error_diagnostic(err),
+     }
+     let claim_result = match acquire_wake_claim(&mut db, input, &claim_token) {
+         Ok(result) => result,
+@@ -324,10 +328,35 @@ fn session_runtime_for_wake(
+     db.session_runtime(session_id)
+ }
+ 
+-fn pty_runtime_is_busy(runtime: Option<&SessionRuntimeRow>) -> bool {
+-    runtime.is_some_and(|row| row.mode == "pty_interactive")
++fn pty_runtime_is_busy(
++    db: &mut MailboxDb,
++    session_id: &str,
++    runtime: Option<&SessionRuntimeRow>,
++) -> Result<bool, String> {
++    let Some(row) = runtime else {
++        return Ok(false);
++    };
++    if row.mode != "pty_interactive" || row.run_state != "running" {
++        return Ok(false);
++    }
++    let control_path = row.pty_control_path.clone();
++    let liveness = db.session_liveness(session_id)?;
++    if liveness == SessionLiveness::Idle {
++        unlink_stale_pty_socket(control_path.as_deref());
++    }
++    Ok(liveness == SessionLiveness::Busy)
++}
++
++#[cfg(unix)]
++fn unlink_stale_pty_socket(path: Option<&str>) {
++    if let Some(path) = path {
++        let _ = pty_broker::unlink_control_socket_if_owned(path);
++    }
+ }
+ 
++#[cfg(not(unix))]
++fn unlink_stale_pty_socket(_path: Option<&str>) {}
++
+ fn acquire_wake_claim(
+     db: &mut MailboxDb,
+     input: StartWakeInput<'_>,
+diff --git a/src-tauri/tests/age245_s7c_rotation_source_guard.rs b/src-tauri/tests/age245_s7c_rotation_source_guard.rs
+index 905b7b0..527f342 100644
+--- a/src-tauri/tests/age245_s7c_rotation_source_guard.rs
++++ b/src-tauri/tests/age245_s7c_rotation_source_guard.rs
+@@ -119,6 +119,7 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
+             ":(exclude)src-tauri/target/**",
+             ":(exclude)target/**",
+             ":(exclude)planning/*-gate/**",
++            ":(exclude)planning/wu-e/**",
+             ":(exclude)planning/opencode-contract/**",
+         ])
+         .output()
+@@ -156,6 +157,8 @@ fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
+             "-g",
+             "!planning/*-gate/**",
+             "-g",
++            "!planning/wu-e/**",
++            "-g",
+             "!planning/opencode-contract/**",
+         ])
+         .output()
+@@ -207,6 +210,7 @@ fn is_ignored_generated_path(relative: &str) -> bool {
+     relative.starts_with("src-tauri/target/")
+         || relative.starts_with("target/")
+         || is_planning_gate_artifact(relative)
++        || relative.starts_with("planning/wu-e/")
+         || relative.starts_with("planning/opencode-contract/")
+ }
+ 
+diff --git a/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs b/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs
+index 9c47740..2a7f3e4 100644
+--- a/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs
++++ b/src-tauri/tests/age246_s8_setup_dispatch_source_guard.rs
+@@ -127,6 +127,7 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
+             "--",
+             ".",
+             ":(exclude)planning/*-gate/**",
++            ":(exclude)planning/wu-e/**",
+             ":(exclude)planning/opencode-contract/**",
+         ])
+         .output()
+@@ -156,6 +157,7 @@ fn tracked_added_provider_name_occurrences(root: &Path, pattern: &str) -> usize
+             "--",
+             ".",
+             ":(exclude)planning/*-gate/**",
++            ":(exclude)planning/wu-e/**",
+             ":(exclude)planning/opencode-contract/**",
+         ])
+         .output()
+@@ -226,6 +228,7 @@ fn is_ignored_source_guard_path(relative: &str) -> bool {
+     relative.starts_with("target/")
+         || relative.starts_with("src-tauri/target/")
+         || is_planning_gate_artifact(relative)
++        || relative.starts_with("planning/wu-e/")
+         || relative.starts_with("planning/opencode-contract/")
+ }
+ 
+diff --git a/src-tauri/tests/wu_e_pty_delivery_integration.rs b/src-tauri/tests/wu_e_pty_delivery_integration.rs
+new file mode 100644
+index 0000000..c260cd7
+--- /dev/null
++++ b/src-tauri/tests/wu_e_pty_delivery_integration.rs
+@@ -0,0 +1,654 @@
++#![cfg(unix)]
++
++use oulipoly_state::StateDb;
++use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRunningUpdate};
++use oulipoly_state::pid_identity::{
++    PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
++};
++use rusqlite::{Connection, params};
++use serde_json::{Value, json};
++use std::fs::{self, File};
++use std::io::{self, Read, Write};
++use std::os::fd::{AsRawFd, FromRawFd, RawFd};
++use std::os::unix::fs::PermissionsExt;
++use std::os::unix::net::{UnixListener, UnixStream};
++use std::os::unix::process::CommandExt;
++use std::path::{Path, PathBuf};
++use std::process::{Child, Command, Output, Stdio};
++use std::sync::{Arc, Mutex};
++use std::thread;
++use std::time::{Duration, Instant};
++
++const INVOCATION_A: &str = "11111111-1111-4111-8111-111111111111";
++const LIVE_INVOCATION: &str = "22222222-2222-4222-8222-222222222222";
++const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
++
++struct Fixture {
++    dir: tempfile::TempDir,
++    config_home: PathBuf,
++    data_home: PathBuf,
++    runtime_dir: PathBuf,
++    state_home: PathBuf,
++    home_dir: PathBuf,
++    app_config_dir: PathBuf,
++    models_dir: PathBuf,
++}
++
++struct NotifyArtifacts {
++    state_dir: PathBuf,
++    meta: PathBuf,
++    log: PathBuf,
++    rc: PathBuf,
++}
++
++impl Fixture {
++    fn new() -> Self {
++        let dir = tempfile::tempdir().unwrap();
++        let config_home = dir.path().join("xdg-config");
++        let data_home = dir.path().join("xdg-data");
++        let runtime_dir = dir.path().join("xdg-runtime");
++        let state_home = dir.path().join("xdg-state");
++        let home_dir = dir.path().join("home");
++        let app_config_dir = config_home.join("oulipoly-agent-runner");
++        let models_dir = app_config_dir.join("models");
++        fs::create_dir_all(&config_home).unwrap();
++        fs::create_dir_all(&data_home).unwrap();
++        fs::create_dir_all(&runtime_dir).unwrap();
++        fs::create_dir_all(&state_home).unwrap();
++        fs::create_dir_all(&home_dir).unwrap();
++        fs::create_dir_all(&models_dir).unwrap();
++        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
++        Self {
++            dir,
++            config_home,
++            data_home,
++            runtime_dir,
++            state_home,
++            home_dir,
++            app_config_dir,
++            models_dir,
++        }
++    }
++
++    fn sidecar_path(&self) -> PathBuf {
++        self.data_home
++            .join("oulipoly-agent-runner")
++            .join("pid-identity.db")
++    }
++
++    fn state_path(&self) -> PathBuf {
++        self.data_home
++            .join("oulipoly-agent-runner")
++            .join("state.db")
++    }
++
++    fn conn(&self) -> Connection {
++        let _ = StateDb::open(&self.state_path()).unwrap();
++        Connection::open(self.state_path()).unwrap()
++    }
++
++    fn run(&self, mut cmd: Command) -> Output {
++        cmd.env("XDG_CONFIG_HOME", &self.config_home);
++        cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
++        cmd.env("XDG_STATE_HOME", &self.state_home);
++        cmd.env("HOME", &self.home_dir);
++        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
++        cmd.output().unwrap()
++    }
++
++    fn run_notify(&self, handle: &str, metadata: Value) -> Output {
++        let artifacts = self.write_notify_artifacts(handle, metadata, 0);
++        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
++        cmd.arg("notify")
++            .arg("agent-bash-complete")
++            .arg("--caller-ppid")
++            .arg(std::process::id().to_string())
++            .arg("--handle")
++            .arg(handle)
++            .arg("--state-dir")
++            .arg(&artifacts.state_dir)
++            .arg("--meta")
++            .arg(&artifacts.meta)
++            .arg("--log")
++            .arg(&artifacts.log)
++            .arg("--rc")
++            .arg(&artifacts.rc)
++            .arg("--json");
++        self.run(cmd)
++    }
++
++    fn base_repl_command(&self, model_name: &str, session_id: &str) -> Command {
++        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
++        cmd.arg("repl")
++            .arg("--models-dir")
++            .arg(&self.models_dir)
++            .arg("--resume")
++            .arg(session_id)
++            .arg(model_name);
++        self.configure_env(&mut cmd);
++        cmd.current_dir(self.dir.path());
++        cmd
++    }
++
++    fn configure_env(&self, cmd: &mut Command) {
++        cmd.env("XDG_CONFIG_HOME", &self.config_home);
++        cmd.env("XDG_DATA_HOME", &self.data_home);
++        cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
++        cmd.env("XDG_STATE_HOME", &self.state_home);
++        cmd.env("HOME", &self.home_dir);
++        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
++    }
++
++    fn write_notify_artifacts(&self, handle: &str, metadata: Value, rc: i32) -> NotifyArtifacts {
++        let state_dir = self.dir.path().join(format!("notify-{handle}"));
++        fs::create_dir_all(&state_dir).unwrap();
++        let meta = state_dir.join("meta.json");
++        let log = state_dir.join("log");
++        let rc_path = state_dir.join("rc");
++        fs::write(&meta, serde_json::to_string_pretty(&metadata).unwrap()).unwrap();
++        fs::write(&log, format!("log for {handle}\n")).unwrap();
++        fs::write(&rc_path, format!("{rc}\n")).unwrap();
++        NotifyArtifacts {
++            state_dir,
++            meta,
++            log,
++            rc: rc_path,
++        }
++    }
++
++    fn record_owner_identity(&self, identity: &ProcessIdentity) {
++        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
++        sidecar
++            .record_identity(PidIdentityRecord {
++                identity,
++                os_pgid: None,
++                invocation_uuid: INVOCATION_A,
++                session_id: Some(SESSION_A),
++                provider_name: Some("fixture-provider"),
++                model_name: Some("fixture-model"),
++                recorded_at: "2026-06-04T12:00:00Z",
++            })
++            .unwrap();
++    }
++
++    fn mark_live_pty_runtime(&self, identity: &ProcessIdentity, control_path: &Path) {
++        let mut mailbox = MailboxDb::open(&self.sidecar_path()).unwrap();
++        mailbox
++            .mark_session_running(SessionRuntimeRunningUpdate {
++                session_id: SESSION_A,
++                mode: "pty_interactive",
++                invocation_uuid: LIVE_INVOCATION,
++                provider_name: Some("fixture-provider"),
++                model_name: Some("fixture-model"),
++                identity,
++                pty_control_path: Some(&path_string(control_path)),
++                turn_start_max_mailbox_seq: None,
++                models_dir: None,
++                effective_cwd: None,
++            })
++            .unwrap();
++    }
++
++    fn mailbox(&self) -> MailboxDb {
++        MailboxDb::open(&self.sidecar_path()).unwrap()
++    }
++
++    fn socket_path(&self, name: &str) -> PathBuf {
++        let dir = self.runtime_dir.join("oulipoly-agent-runner/pty");
++        fs::create_dir_all(&dir).unwrap();
++        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
++        dir.join(name)
++    }
++
++    fn write_interactive_model(&self, model_name: &str, provider_name: &str, script: &Path) {
++        fs::write(
++            self.models_dir.join(format!("{model_name}.toml")),
++            format!(
++                r#"[[providers]]
++name = "{provider_name}"
++args = []
++"#,
++            ),
++        )
++        .unwrap();
++        fs::write(
++            self.app_config_dir.join("providers.toml"),
++            format!(
++                r#"[{provider_name}]
++command = {}
++args = []
++interactive_args = []
++prompt_mode = "arg"
++
++[{provider_name}.resume]
++kind = "flag"
++flag = "--resume"
++"#,
++                toml_string(&path_string(script))
++            ),
++        )
++        .unwrap();
++    }
++
++    fn seed_active_chain(&self, chain_id: &str, provider: &str, session_id: &str, model: &str) {
++        let conn = self.conn();
++        conn.execute(
++            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
++             VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
++            params![chain_id, model],
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO session_chain_segments
++                (chain_id, provider_name, session_id, started_at, transition_reason)
++             VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
++            params![chain_id, provider, session_id],
++        )
++        .unwrap();
++    }
++
++    fn assert_default_user_paths_untouched(&self) {
++        assert!(
++            !self
++                .home_dir
++                .join(".local/share/oulipoly-agent-runner")
++                .exists()
++        );
++        assert!(!self.home_dir.join(".config/oulipoly-agent-runner").exists());
++    }
++}
++
++#[test]
++fn notify_live_pty_ack_marks_delivered_and_skips_headless_wake() {
++    let fixture = Fixture::new();
++    let identity = current_identity();
++    fixture.record_owner_identity(&identity);
++    let socket = fixture.socket_path("ack.sock");
++    let captured = Arc::new(Mutex::new(String::new()));
++    let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
++    fixture.mark_live_pty_runtime(&identity, &socket);
++
++    let output = fixture.run_notify("h-live-ack", caller_chain(&identity));
++    server.join().unwrap();
++
++    assert_success(&output);
++    let value = stdout_json(&output);
++    assert_eq!(value["status"], "enqueued");
++    assert_eq!(value["pty_delivery"]["status"], "acked");
++    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([1]));
++    assert!(value["wake"].is_null());
++    let payload = captured.lock().unwrap().clone();
++    assert!(payload.contains("[OULIPOLY NOTIFICATIONS]"));
++    assert!(payload.contains("handle: h-live-ack"));
++    assert!(!payload.contains("log for h-live-ack"));
++
++    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
++    assert_eq!(rows.len(), 1);
++    assert!(rows[0].delivered_at.is_some());
++    assert_eq!(
++        rows[0].delivered_by_invocation_uuid.as_deref(),
++        Some(LIVE_INVOCATION)
++    );
++    fixture.assert_default_user_paths_untouched();
++}
++
++#[test]
++fn notify_live_pty_failure_leaves_pending_and_wake_busy() {
++    let fixture = Fixture::new();
++    let identity = current_identity();
++    fixture.record_owner_identity(&identity);
++    let socket = fixture.socket_path("unsafe.sock");
++    let captured = Arc::new(Mutex::new(String::new()));
++    let server = spawn_control_server(&socket, false, "unsafe_mid_line", Arc::clone(&captured));
++    fixture.mark_live_pty_runtime(&identity, &socket);
++
++    let output = fixture.run_notify("h-unsafe", caller_chain(&identity));
++    server.join().unwrap();
++
++    assert_success(&output);
++    let value = stdout_json(&output);
++    assert_eq!(value["pty_delivery"]["status"], "unsafe_mid_line");
++    assert_eq!(value["wake"]["status"], "busy");
++    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
++    assert_eq!(rows.len(), 1);
++    assert!(rows[0].delivered_at.is_none());
++    assert!(captured.lock().unwrap().contains("h-unsafe"));
++    fixture.assert_default_user_paths_untouched();
++}
++
++#[test]
++fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
++    let fixture = Fixture::new();
++    let owner_identity = current_identity();
++    fixture.record_owner_identity(&owner_identity);
++    let stale_identity = ProcessIdentity {
++        os_pid: 9_999_999,
++        os_boot_id: "stale-boot".to_string(),
++        os_pid_starttime_ticks: 1,
++    };
++    let stale_socket = fixture.socket_path("stale.sock");
++    fs::write(&stale_socket, "stale").unwrap();
++    fixture.mark_live_pty_runtime(&stale_identity, &stale_socket);
++
++    let output = fixture.run_notify("h-stale", caller_chain(&owner_identity));
++
++    assert_success(&output);
++    let value = stdout_json(&output);
++    assert_eq!(value["pty_delivery"]["status"], "connect_error");
++    assert_ne!(value["wake"]["status"], "busy");
++    let runtime = fixture
++        .mailbox()
++        .session_runtime(SESSION_A)
++        .unwrap()
++        .unwrap();
++    assert_eq!(runtime.run_state, "idle");
++    assert!(runtime.pty_control_path.is_none());
++    assert!(!stale_socket.exists());
++    fixture.assert_default_user_paths_untouched();
++}
++
++#[test]
++fn fixture_interactive_session_agent_bash_completion_arrives_live() {
++    let fixture = Fixture::new();
++    let received_log = fixture.dir.path().join("received.log");
++    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
++    fixture.write_interactive_model("fixture", "fixture-provider", &script);
++    fixture.seed_active_chain(
++        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
++        "fixture-provider",
++        SESSION_A,
++        "fixture",
++    );
++    let pty = OuterPty::open(30, 100);
++    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture", SESSION_A);
++    let startup = read_until(
++        pty.master.as_raw_fd(),
++        "READY_FOR_NOTIFY",
++        Duration::from_secs(5),
++    );
++    assert!(
++        startup.contains("READY_FOR_NOTIFY"),
++        "startup was {startup:?}"
++    );
++    let invocation_uuid = wait_for_running_invocation(&fixture);
++    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
++
++    let output = fixture.run_notify("h-e2e-live", caller_chain(&child_identity));
++    assert_success(&output);
++    let value = stdout_json(&output);
++    assert_eq!(value["pty_delivery"]["status"], "acked");
++    assert!(value["wake"].is_null());
++
++    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
++    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
++    assert!(
++        repl.try_wait().unwrap().is_none(),
++        "interactive process should still be live when notification arrives"
++    );
++    let received = fs::read_to_string(&received_log).unwrap();
++    assert!(received.contains("[OULIPOLY NOTIFICATIONS]"));
++    assert!(received.contains("handle: h-e2e-live"));
++    assert!(!received.contains("log for h-e2e-live"));
++    assert!(repl.wait().unwrap().success());
++    let runtime = fixture
++        .mailbox()
++        .session_runtime(SESSION_A)
++        .unwrap()
++        .unwrap();
++    assert_eq!(runtime.run_state, "idle");
++    assert!(runtime.pty_control_path.is_none());
++    fixture.assert_default_user_paths_untouched();
++}
++
++fn spawn_control_server(
++    path: &Path,
++    ack: bool,
++    message: &'static str,
++    captured: Arc<Mutex<String>>,
++) -> thread::JoinHandle<()> {
++    let listener = UnixListener::bind(path).unwrap();
++    thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        let payload = read_inject_payload(&mut stream);
++        *captured.lock().unwrap() = payload;
++        write_response(&mut stream, ack, message);
++    })
++}
++
++struct OuterPty {
++    master: File,
++    slave: File,
++}
++
++impl OuterPty {
++    fn open(rows: u16, cols: u16) -> Self {
++        let mut master_fd = -1;
++        let mut slave_fd = -1;
++        let winsize = libc::winsize {
++            ws_row: rows,
++            ws_col: cols,
++            ws_xpixel: 0,
++            ws_ypixel: 0,
++        };
++        let rc = unsafe {
++            libc::openpty(
++                &mut master_fd,
++                &mut slave_fd,
++                std::ptr::null_mut(),
++                std::ptr::null(),
++                &winsize,
++            )
++        };
++        assert_eq!(rc, 0, "openpty failed: {}", io::Error::last_os_error());
++        Self {
++            master: unsafe { File::from_raw_fd(master_fd) },
++            slave: unsafe { File::from_raw_fd(slave_fd) },
++        }
++    }
++}
++
++fn spawn_repl_under_pty(
++    fixture: &Fixture,
++    pty: &OuterPty,
++    model_name: &str,
++    session_id: &str,
++) -> Child {
++    let stdin = pty.slave.try_clone().unwrap();
++    let stdout = pty.slave.try_clone().unwrap();
++    let stderr = pty.slave.try_clone().unwrap();
++    let slave_fd = pty.slave.as_raw_fd();
++    let master_fd = pty.master.as_raw_fd();
++    let mut cmd = fixture.base_repl_command(model_name, session_id);
++    cmd.stdin(Stdio::from(stdin))
++        .stdout(Stdio::from(stdout))
++        .stderr(Stdio::from(stderr));
++    unsafe {
++        cmd.pre_exec(move || {
++            if libc::setsid() == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if libc::tcsetpgrp(slave_fd, libc::getpid()) == -1 {
++                return Err(io::Error::last_os_error());
++            }
++            if master_fd > 2 {
++                libc::close(master_fd);
++            }
++            Ok(())
++        });
++    }
++    cmd.spawn().unwrap()
++}
++
++fn fixture_provider_waiting_for_notification(dir: &Path, received_log: &Path) -> PathBuf {
++    let path = dir.join("fixture-live-provider.sh");
++    fs::write(
++        &path,
++        format!(
++            r#"#!/usr/bin/env bash
++set -euo pipefail
++: > {received}
++test -t 0
++test -t 1
++test -t 2
++printf 'READY_FOR_NOTIFY\n'
++while IFS= read -r line; do
++  printf '%s\n' "$line" >> {received}
++  if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
++    printf 'GOT_NOTIFY\n'
++    sleep 1
++    exit 0
++  fi
++done
++"#,
++            received = shell_single_quote(&path_string(received_log))
++        ),
++    )
++    .unwrap();
++    let mut perms = fs::metadata(&path).unwrap().permissions();
++    perms.set_mode(0o755);
++    fs::set_permissions(&path, perms).unwrap();
++    path
++}
++
++fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
++    let start = Instant::now();
++    let mut output = Vec::new();
++    let mut buffer = [0_u8; 4096];
++    while start.elapsed() < timeout {
++        if poll_readable(fd, Duration::from_millis(50)).unwrap() {
++            let n = read_fd(fd, &mut buffer).unwrap();
++            if n == 0 {
++                break;
++            }
++            output.extend_from_slice(&buffer[..n]);
++            let rendered = String::from_utf8_lossy(&output);
++            if rendered.contains(needle) {
++                return rendered.into_owned();
++            }
++        }
++    }
++    String::from_utf8_lossy(&output).into_owned()
++}
++
++fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
++    let mut pollfd = libc::pollfd {
++        fd,
++        events: libc::POLLIN,
++        revents: 0,
++    };
++    let rc = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as i32) };
++    if rc == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(rc > 0 && pollfd.revents & libc::POLLIN != 0)
++}
++
++fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
++    let rc = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
++    if rc == -1 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(rc as usize)
++}
++
++fn wait_for_running_invocation(fixture: &Fixture) -> String {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while Instant::now() < deadline {
++        if let Ok(db) = MailboxDb::open(&fixture.sidecar_path())
++            && let Ok(Some(runtime)) = db.session_runtime(SESSION_A)
++            && let Some(invocation_uuid) = runtime.running_invocation_uuid
++        {
++            return invocation_uuid;
++        }
++        thread::sleep(Duration::from_millis(25));
++    }
++    panic!("timed out waiting for running invocation");
++}
++
++fn wait_for_child_identity(fixture: &Fixture, invocation_uuid: &str) -> ProcessIdentity {
++    let deadline = Instant::now() + Duration::from_secs(5);
++    while Instant::now() < deadline {
++        if let Ok(sidecar) = PidIdentityDb::open(&fixture.sidecar_path()) {
++            let rows = sidecar.lookup_by_invocation_uuid(invocation_uuid).unwrap();
++            if let Some(row) = rows.first() {
++                return row.identity();
++            }
++        }
++        thread::sleep(Duration::from_millis(25));
++    }
++    panic!("timed out waiting for child identity for {invocation_uuid}");
++}
++
++fn read_inject_payload(stream: &mut UnixStream) -> String {
++    let mut header = [0_u8; 12];
++    stream.read_exact(&mut header).unwrap();
++    assert_eq!(&header[..4], b"OPTY");
++    assert_eq!(header[4], 1);
++    assert_eq!(header[5], 1);
++    let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
++    let mut payload = vec![0_u8; length];
++    stream.read_exact(&mut payload).unwrap();
++    String::from_utf8(payload).unwrap()
++}
++
++fn write_response(stream: &mut UnixStream, ack: bool, message: &str) {
++    let mut header = [0_u8; 12];
++    header[..4].copy_from_slice(b"OPTY");
++    header[4] = 1;
++    header[5] = if ack { 0 } else { 1 };
++    header[8..12].copy_from_slice(&(message.len() as u32).to_be_bytes());
++    stream.write_all(&header).unwrap();
++    stream.write_all(message.as_bytes()).unwrap();
++}
++
++fn caller_chain(identity: &ProcessIdentity) -> Value {
++    json!({
++        "caller_chain": [{
++            "pid": identity.os_pid,
++            "starttime_ticks": identity.os_pid_starttime_ticks,
++            "boot_id": identity.os_boot_id,
++        }]
++    })
++}
++
++fn current_identity() -> ProcessIdentity {
++    read_live_process_identity(i64::from(std::process::id()))
++        .unwrap()
++        .unwrap()
++}
++
++fn stdout_json(output: &Output) -> Value {
++    serde_json::from_slice(&output.stdout).unwrap_or_else(|err| {
++        panic!(
++            "failed to parse stdout JSON: {err}\nstdout={}\nstderr={}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        )
++    })
++}
++
++fn assert_success(output: &Output) {
++    assert!(
++        output.status.success(),
++        "status={:?}\nstdout={}\nstderr={}",
++        output.status,
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++fn path_string(path: &Path) -> String {
++    path.to_string_lossy().into_owned()
++}
++
++fn toml_string(value: &str) -> String {
++    serde_json::to_string(value).unwrap()
++}
++
++fn shell_single_quote(value: &str) -> String {
++    format!("'{}'", value.replace('\'', "'\\''"))
++}
