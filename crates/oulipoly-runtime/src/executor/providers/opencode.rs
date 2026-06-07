@@ -47,13 +47,10 @@ fn opencode_json_error_signal(
 
 fn json_error_signal_from_stream(bytes: &[u8]) -> Option<(TerminalSignalKind, String)> {
     let text = stream_text(bytes);
-    for line in non_empty_stream_lines(text.as_ref()) {
-        let Some(kind) = json_error_line_kind(line) else {
-            continue;
-        };
-        return Some((kind, json_error_line_evidence(line)));
-    }
-    None
+    let lines = non_empty_stream_lines(text.as_ref());
+    let line = lines.last()?;
+    let kind = json_error_line_kind(line)?;
+    Some((kind, json_error_line_evidence(line)))
 }
 
 fn stream_text(bytes: &[u8]) -> Cow<'_, str> {
@@ -68,7 +65,24 @@ fn non_empty_stream_lines(text: &str) -> Vec<&str> {
 }
 
 fn json_error_line_evidence(line: &str) -> String {
-    bounded_excerpt(line, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
+    let evidence = parse_json_error_line(line)
+        .and_then(|value| json_error_evidence_from_value(&value))
+        .unwrap_or_else(|| line.to_string());
+    bounded_excerpt(&evidence, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN)
+}
+
+fn json_error_evidence_from_value(value: &Value) -> Option<String> {
+    let error = json_error_event_error(value)?;
+    Some(json_error_evidence(error))
+}
+
+fn json_error_evidence(error: &Value) -> String {
+    let name = error_name(error).unwrap_or("unknown");
+    let message = error_message(error);
+    if message.is_empty() {
+        return format!("provider error: opencode {name}");
+    }
+    format!("provider error: opencode {name}: {message}")
 }
 
 fn json_error_line_kind(line: &str) -> Option<TerminalSignalKind> {
@@ -103,7 +117,7 @@ fn terminal_signal_kind_from_json_error(
     if error_reports_persistent_quota(lower_message) {
         return Some(TerminalSignalKind::QuotaExhaustedInband);
     }
-    None
+    Some(TerminalSignalKind::Unknown)
 }
 
 fn error_status_code(error: &Value) -> Option<i64> {
@@ -124,6 +138,10 @@ fn error_message(error: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+fn error_name(error: &Value) -> Option<&str> {
+    value_at_paths(error, &["/name", "/data/name"]).and_then(Value::as_str)
 }
 
 fn value_at_paths<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a Value> {
@@ -162,12 +180,22 @@ mod tests {
     };
     use std::time::SystemTime;
 
+    const INCIDENT_SQLITE_ERROR_EVENT: &[u8] = br#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#;
+
     fn evidence(stdout: &'static [u8], stderr: &'static [u8]) -> TerminalSignalEvidence<'static> {
+        evidence_with_status(stdout, stderr, TerminalStatusEvidence::Exited { code: 1 })
+    }
+
+    fn evidence_with_status(
+        stdout: &'static [u8],
+        stderr: &'static [u8],
+        terminal_status: TerminalStatusEvidence,
+    ) -> TerminalSignalEvidence<'static> {
         TerminalSignalEvidence {
             provider_name: "opencode",
             stdout,
             stderr,
-            terminal_status: TerminalStatusEvidence::Exited { code: 1 },
+            terminal_status,
             observed_at: SystemTime::UNIX_EPOCH,
         }
     }
@@ -193,12 +221,45 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_error_falls_back_to_nonzero_exit() {
+    fn terminal_unrelated_error_uses_structured_error_evidence_before_nonzero_exit() {
         let signal = Recognizer.recognize(&evidence(
             br#"{"type":"error","error":{"data":{"message":"syntax error"}}}"#,
             b"",
         ));
 
-        assert_eq!(signal.kind, TerminalSignalKind::NonzeroExit);
+        assert_eq!(signal.kind, TerminalSignalKind::Unknown);
+        assert!(signal.evidence.contains("syntax error"));
+    }
+
+    #[test]
+    fn terminal_structured_error_exit_zero_maps_to_failure_signal_with_incident_evidence() {
+        let signal = Recognizer.recognize(&evidence_with_status(
+            INCIDENT_SQLITE_ERROR_EVENT,
+            b"",
+            TerminalStatusEvidence::Exited { code: 0 },
+        ));
+
+        assert_eq!(signal.kind, TerminalSignalKind::Unknown);
+        assert!(
+            signal.evidence.contains("Failed to execute statement"),
+            "signal evidence should retain the incident message: {}",
+            signal.evidence
+        );
+    }
+
+    #[test]
+    fn recovered_session_error_followed_by_later_event_preserves_clean_exit() {
+        let signal = Recognizer.recognize(&evidence_with_status(
+            concat!(
+                r#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":"continued after transient provider error"}"#
+            )
+            .as_bytes(),
+            b"",
+            TerminalStatusEvidence::Exited { code: 0 },
+        ));
+
+        assert_eq!(signal.kind, TerminalSignalKind::CleanExit);
     }
 }

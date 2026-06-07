@@ -60,6 +60,8 @@ use crate::executor::terminal_signal::{
     TerminalSignal, TerminalSignalEvidence, TerminalSignalKind, TerminalStatusEvidence,
 };
 
+const PROVIDER_ERROR_EVIDENCE_PREFIX: &str = "provider error: ";
+
 pub fn classify_terminal_reason(status: &std::process::ExitStatus) -> Option<String> {
     if let Some(code) = status.code() {
         return (code != 0).then(|| "exit_nonzero".to_string());
@@ -157,14 +159,22 @@ pub(super) fn terminal_reason_from_signal(
         | TerminalSignalKind::QuotaExhaustedInband
         | TerminalSignalKind::MaybeQuotaExhausted
         | TerminalSignalKind::RateLimited
-        | TerminalSignalKind::SpawnError
-        | TerminalSignalKind::Unknown => {
+        | TerminalSignalKind::SpawnError => {
             crate::diagnostics::canonical_terminal_reason_for_kind(signal.kind).map(str::to_string)
         }
+        TerminalSignalKind::Unknown => unknown_terminal_reason(signal),
         TerminalSignalKind::CleanExit
         | TerminalSignalKind::NonzeroExit
         | TerminalSignalKind::SignalExit => status.and_then(classify_terminal_reason),
     }
+}
+
+fn unknown_terminal_reason(signal: &TerminalSignal) -> Option<String> {
+    let evidence = signal.evidence.trim();
+    if evidence.starts_with(PROVIDER_ERROR_EVIDENCE_PREFIX) {
+        return Some(signal.evidence.clone());
+    }
+    crate::diagnostics::canonical_terminal_reason_for_kind(signal.kind).map(str::to_string)
 }
 
 pub(super) fn synthetic_exit_code(signal: &TerminalSignal) -> i32 {

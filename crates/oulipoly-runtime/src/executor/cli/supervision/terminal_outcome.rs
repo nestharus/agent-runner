@@ -66,3 +66,38 @@ pub(super) fn supervised_output_from_terminal(
         streamed_session_id: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::cli::provider_identity::ProviderRecognizer;
+    use crate::executor::terminal_signal::{TerminalSignalKind, TerminalStatusEvidence};
+
+    const INCIDENT_SQLITE_ERROR_EVENT: &[u8] = br#"{"type":"error","timestamp":1780808654364,"sessionID":"ses_15f9407ccffelCcB6CyXvpzdXK","error":{"name":"UnknownError","data":{"message":"Failed to execute statement"}}}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_terminal_structured_error_exit_zero_carries_failure_reason_evidence() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = supervised_output_from_terminal(
+            "opencode",
+            ProviderRecognizer::OpenCode,
+            INCIDENT_SQLITE_ERROR_EVENT.to_vec(),
+            Vec::new(),
+            TerminalStatusEvidence::Exited { code: 0 },
+            None,
+            Some(std::process::ExitStatus::from_raw(0)),
+        );
+
+        assert_eq!(output.terminal_signal.kind, TerminalSignalKind::Unknown);
+        let reason = output
+            .terminal_reason
+            .as_deref()
+            .expect("terminal structured errors must surface a terminal_reason");
+        assert!(
+            reason.contains("Failed to execute statement"),
+            "terminal_reason should retain the incident message: {reason}"
+        );
+    }
+}
