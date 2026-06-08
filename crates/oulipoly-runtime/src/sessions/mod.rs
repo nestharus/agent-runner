@@ -808,12 +808,36 @@ mod tests {
 
     fn fixture_script(body: &str) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("turn-script.sh");
-        std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        let path = fixture_script_path(dir.path());
+        write_script_file(&path, &formatted_fixture_script(body));
+        make_script_executable(&path);
         Fixture { _dir: dir, path }
+    }
+
+    fn fixture_script_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("turn-script.sh")
+    }
+
+    fn formatted_fixture_script(body: &str) -> String {
+        format!("#!/usr/bin/env bash\n{body}\n")
+    }
+
+    fn write_script_file(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn make_script_executable(path: &std::path::Path) {
+        let permissions = executable_permissions(script_permissions(path));
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn script_permissions(path: &std::path::Path) -> std::fs::Permissions {
+        std::fs::metadata(path).unwrap().permissions()
+    }
+
+    fn executable_permissions(mut permissions: std::fs::Permissions) -> std::fs::Permissions {
+        permissions.set_mode(0o755);
+        permissions
     }
 
     fn cfg_with(provider: &str, script_path: &std::path::Path) -> SessionsConfig {
@@ -844,6 +868,159 @@ mod tests {
             },
         );
         SessionsConfig { entries }
+    }
+
+    fn cfg_with_state_dir(
+        provider: &str,
+        script_path: &std::path::Path,
+        state_dir: std::path::PathBuf,
+    ) -> SessionsConfig {
+        let mut entries = HashMap::new();
+        entries.insert(
+            provider.to_string(),
+            SessionSourceEntry {
+                turn_script: script_path.to_string_lossy().into_owned(),
+                transcript_locator: None,
+                state_dir: Some(state_dir),
+            },
+        );
+        SessionsConfig { entries }
+    }
+
+    fn stored_turn_body(
+        db: &StateDb,
+        provider_name: &str,
+        session_id: &str,
+        turn_id: &str,
+    ) -> String {
+        db.connection()
+            .query_row(
+                "SELECT body FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3",
+                rusqlite::params![provider_name, session_id, turn_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn parsed_json_value(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    fn assert_edge_body_preserved(body: &serde_json::Value) {
+        assert_eq!(body, &expected_edge_body());
+    }
+
+    fn expected_edge_body() -> serde_json::Value {
+        serde_json::json!([{"type":"text","text":"line one\n日本語\n{\"escaped\":true}\u{0007}"}])
+    }
+
+    fn all_invalid_body_shape_errors(errors: &[String]) -> bool {
+        errors.iter().all(|error| {
+            error.contains("invalid body shape")
+                && error.contains("expected canonical content chunk array")
+        })
+    }
+
+    fn stored_turn_bodies(
+        db: &StateDb,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Vec<Option<String>> {
+        db.connection()
+            .prepare(
+                "SELECT body FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 ORDER BY turn_id",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![provider_name, session_id], |row| {
+                row.get(0)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn leaked_marker_script(marker_path: &std::path::Path) -> String {
+        format!(
+            "(sleep 2; printf leaked > {}) & wait",
+            marker_path.display()
+        )
+    }
+
+    fn assert_marker_does_not_exist(path: &std::path::Path) {
+        assert!(
+            path_does_not_exist(path),
+            "timed-out turn script left a process-group child running"
+        );
+    }
+
+    fn path_does_not_exist(path: &std::path::Path) -> bool {
+        !path.exists()
+    }
+
+    fn marker_contents(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    fn assert_contains_path(contents: &str, path: &std::path::Path) {
+        assert!(contents_contains_path(contents, path));
+    }
+
+    fn contents_contains_path(contents: &str, path: &std::path::Path) -> bool {
+        contents.contains(path_text(path))
+    }
+
+    fn path_text(path: &std::path::Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    fn assert_trimmed_eq(actual: &str, expected: &str) {
+        assert_eq!(trimmed_text(actual), expected);
+    }
+
+    fn trimmed_text(text: &str) -> &str {
+        text.trim()
+    }
+
+    fn session_turn_total(db: &StateDb, provider_name: &str, session_id: &str) -> u64 {
+        db.count_session_turns(provider_name, session_id)
+            .unwrap()
+            .total
+    }
+
+    fn assert_u64_eq(actual: u64, expected: u64) {
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_session_turn_total(
+        db: &StateDb,
+        provider_name: &str,
+        session_id: &str,
+        expected: u64,
+    ) {
+        assert_u64_eq(session_turn_total(db, provider_name, session_id), expected);
+    }
+
+    fn transcript_fixture_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("session.jsonl")
+    }
+
+    fn transcript_fixture_body() -> &'static str {
+        "{\"type\":\"system\"}\n"
+    }
+
+    fn write_transcript_fixture(path: &std::path::Path) {
+        std::fs::write(path, transcript_fixture_body()).unwrap();
+    }
+
+    fn locator_script_for_transcript(transcript: &std::path::Path) -> String {
+        format!(
+            r#"printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt"
+printf '%s\n' "{}""#,
+            transcript.display()
+        )
     }
 
     #[test]
@@ -922,20 +1099,9 @@ EOF"#,
 
         assert_eq!(report.errors, Vec::<String>::new());
         assert_eq!(report.new_turns, 1);
-        let raw_body: String = db
-            .connection()
-            .query_row(
-                "SELECT body FROM session_turns
-                 WHERE provider_name = 'p' AND session_id = 'S1' AND turn_id = 'edge-body'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&raw_body).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!([{"type":"text","text":"line one\n日本語\n{\"escaped\":true}\u{0007}"}])
-        );
+        let raw_body = stored_turn_body(&db, "p", "S1", "edge-body");
+        let body = parsed_json_value(&raw_body);
+        assert_edge_body_preserved(&body);
     }
 
     #[test]
@@ -954,22 +1120,8 @@ EOF"#,
 
         assert_eq!(report.new_turns, 2);
         assert_eq!(report.errors.len(), 2);
-        assert!(report.errors.iter().all(|error| {
-            error.contains("invalid body shape")
-                && error.contains("expected canonical content chunk array")
-        }));
-        let stored_bodies: Vec<Option<String>> = db
-            .connection()
-            .prepare(
-                "SELECT body FROM session_turns
-                 WHERE provider_name = 'p' AND session_id = 'S1'
-                 ORDER BY turn_id",
-            )
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        assert!(all_invalid_body_shape_errors(&report.errors));
+        let stored_bodies = stored_turn_bodies(&db, "p", "S1");
         assert_eq!(stored_bodies, vec![None, None]);
     }
 
@@ -1021,10 +1173,7 @@ EOF"#,
         let db = db();
         let dir = tempfile::tempdir().unwrap();
         let leaked_marker = dir.path().join("leaked");
-        let script = fixture_script(&format!(
-            "(sleep 2; printf leaked > {}) & wait",
-            leaked_marker.display()
-        ));
+        let script = fixture_script(&leaked_marker_script(&leaked_marker));
         let cfg = cfg_with("p", &script.path);
 
         let r = scan_provider_with_timeout("p", &cfg, &db, 1);
@@ -1033,10 +1182,7 @@ EOF"#,
         assert_eq!(r.new_turns, 0);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
-        assert!(
-            !leaked_marker.exists(),
-            "timed-out turn script left a process-group child running"
-        );
+        assert_marker_does_not_exist(&leaked_marker);
     }
 
     #[test]
@@ -1061,21 +1207,12 @@ EOF"#,
 echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
         );
         let tempdir = tempfile::tempdir().unwrap();
-        let mut entries = HashMap::new();
-        entries.insert(
-            "p".to_string(),
-            SessionSourceEntry {
-                turn_script: script.path.to_string_lossy().into_owned(),
-                transcript_locator: None,
-                state_dir: Some(tempdir.path().to_path_buf()),
-            },
-        );
-        let cfg = SessionsConfig { entries };
+        let cfg = cfg_with_state_dir("p", &script.path, tempdir.path().to_path_buf());
         let r = scan_provider("p", &cfg, &db);
         assert_eq!(r.errors, Vec::<String>::new());
         assert_eq!(r.new_turns, 1);
-        let marker = std::fs::read_to_string(tempdir.path().join("marker.txt")).unwrap();
-        assert!(marker.contains(tempdir.path().to_str().unwrap()));
+        let marker = marker_contents(tempdir.path(), "marker.txt");
+        assert_contains_path(&marker, tempdir.path());
     }
 
     #[test]
@@ -1086,24 +1223,15 @@ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
 printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt""#,
         );
         let tempdir = tempfile::tempdir().unwrap();
-        let mut entries = HashMap::new();
-        entries.insert(
-            "p".to_string(),
-            SessionSourceEntry {
-                turn_script: script.path.to_string_lossy().into_owned(),
-                transcript_locator: None,
-                state_dir: Some(tempdir.path().to_path_buf()),
-            },
-        );
-        let cfg = SessionsConfig { entries };
+        let cfg = cfg_with_state_dir("p", &script.path, tempdir.path().to_path_buf());
 
         let r = scan_provider_session("p", &cfg, &db, "session-123");
 
         assert_eq!(r.errors, Vec::<String>::new());
         assert_eq!(r.new_turns, 1);
-        assert_eq!(db.count_session_turns("p", "session-123").unwrap().total, 1);
-        let seen = std::fs::read_to_string(tempdir.path().join("seen-session.txt")).unwrap();
-        assert_eq!(seen.trim(), "session-123");
+        assert_session_turn_total(&db, "p", "session-123", 1);
+        let seen = marker_contents(tempdir.path(), "seen-session.txt");
+        assert_trimmed_eq(&seen, "session-123");
     }
 
     #[test]
@@ -1118,13 +1246,9 @@ printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt""#,
     #[test]
     fn locate_transcript_returns_script_stdout_path() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = dir.path().join("session.jsonl");
-        std::fs::write(&transcript, "{\"type\":\"system\"}\n").unwrap();
-        let script = fixture_script(&format!(
-            r#"printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt"
-printf '%s\n' "{}""#,
-            transcript.display()
-        ));
+        let transcript = transcript_fixture_path(dir.path());
+        write_transcript_fixture(&transcript);
+        let script = fixture_script(&locator_script_for_transcript(&transcript));
         let cfg = cfg_with_locator("p", &script.path, Some(dir.path().join("state")));
 
         let path = locate_transcript(&cfg, "p", "session-123")
@@ -1132,9 +1256,8 @@ printf '%s\n' "{}""#,
             .expect("locator should return a path");
 
         assert_eq!(path, transcript);
-        let seen =
-            std::fs::read_to_string(dir.path().join("state").join("seen-session.txt")).unwrap();
-        assert_eq!(seen.trim(), "session-123");
+        let seen = marker_contents(&dir.path().join("state"), "seen-session.txt");
+        assert_trimmed_eq(&seen, "session-123");
     }
 
     #[test]

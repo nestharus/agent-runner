@@ -581,21 +581,21 @@ impl MailboxDb {
                 continue;
             };
             let Some(claim) = self.wake_claim(&session_id)? else {
-                candidates.push(WakeSweepCandidate {
+                candidates.push(wake_sweep_candidate(
                     session_id,
-                    auto_wake_count: 1,
+                    1,
                     min_pending_seq,
                     max_pending_seq,
-                });
+                ));
                 continue;
             };
             if wake_claim_is_reclaimable(&self.conn, &claim, stale_after_seconds)? {
-                candidates.push(WakeSweepCandidate {
+                candidates.push(wake_sweep_candidate(
                     session_id,
-                    auto_wake_count: claim.auto_wake_count.saturating_add(1),
+                    claim.auto_wake_count.saturating_add(1),
                     min_pending_seq,
                     max_pending_seq,
-                });
+                ));
             }
         }
         Ok(candidates)
@@ -814,6 +814,20 @@ impl MailboxDb {
             )
             .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
         Ok(())
+    }
+}
+
+fn wake_sweep_candidate(
+    session_id: String,
+    auto_wake_count: i64,
+    min_pending_seq: i64,
+    max_pending_seq: i64,
+) -> WakeSweepCandidate {
+    WakeSweepCandidate {
+        session_id,
+        auto_wake_count,
+        min_pending_seq,
+        max_pending_seq,
     }
 }
 

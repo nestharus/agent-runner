@@ -1,0 +1,14 @@
+crates/oulipoly-runtime/src/sessions/mod.rs
+crates/oulipoly-state/src/db.rs
+crates/oulipoly-state/src/mailbox.rs
+scripts/opencode-turns
+scripts/tests/opencode-turns.test.sh
+src-tauri/src/dispatch.rs
+src-tauri/src/lib.rs
+src-tauri/src/mailbox_delivery.rs
+src-tauri/src/run/resume/orchestration.rs
+src-tauri/src/run_tauri.rs
+src-tauri/src/wake_coordinator.rs
+src-tauri/tests/s11_external_provider_wake.rs
+src-tauri/tests/wake_confirm_legacy_opencode.rs
+src-tauri/tests/wu_d_proactive_wake_integration.rs

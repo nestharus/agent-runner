@@ -1,0 +1,3430 @@
+diff --git a/crates/oulipoly-runtime/src/sessions/mod.rs b/crates/oulipoly-runtime/src/sessions/mod.rs
+index bdc79dc..09cfe45 100644
+--- a/crates/oulipoly-runtime/src/sessions/mod.rs
++++ b/crates/oulipoly-runtime/src/sessions/mod.rs
+@@ -101,6 +101,23 @@ pub fn scan_provider(
+     scan_provider_with_timeout(provider_name, sessions_cfg, db, SCRIPT_TIMEOUT_SECS)
+ }
+ 
++/// Run one provider's adapter script for a specific session and ingest every
++/// turn it emits. The configured script receives `SESSION_ID` in its env.
++pub fn scan_provider_session(
++    provider_name: &str,
++    sessions_cfg: &SessionsConfig,
++    db: &StateDb,
++    session_id: &str,
++) -> ScanReport {
++    scan_provider_session_with_timeout(
++        provider_name,
++        sessions_cfg,
++        db,
++        session_id,
++        SCRIPT_TIMEOUT_SECS,
++    )
++}
++
+ fn scan_provider_with_timeout(
+     provider_name: &str,
+     sessions_cfg: &SessionsConfig,
+@@ -127,6 +144,39 @@ fn scan_provider_with_timeout(
+     report
+ }
+ 
++fn scan_provider_session_with_timeout(
++    provider_name: &str,
++    sessions_cfg: &SessionsConfig,
++    db: &StateDb,
++    session_id: &str,
++    timeout_secs: u64,
++) -> ScanReport {
++    let mut report = ScanReport::default();
++    let Some(entry) = provider_session_source(sessions_cfg, provider_name) else {
++        return report;
++    };
++
++    let state_dir = resolve_state_dir(provider_name, entry);
++    if let Err(error) = create_session_state_dir(&state_dir) {
++        return scan_report_with_error(report, error);
++    }
++
++    let stdout = match run_session_script_with_timeout(
++        &entry.turn_script,
++        &state_dir,
++        Some(session_id),
++        "turn script",
++        timeout_secs,
++    ) {
++        Ok(stdout) => stdout,
++        Err(error) => return scan_report_with_error(report, error),
++    };
++
++    let batch = collect_turn_script_batch(provider_name, &stdout, &mut report);
++    persist_scanned_turns(provider_name, db, &batch, &mut report);
++    report
++}
++
+ fn provider_session_source<'a>(
+     sessions_cfg: &'a SessionsConfig,
+     provider_name: &str,
+@@ -758,14 +808,38 @@ mod tests {
+ 
+     fn fixture_script(body: &str) -> Fixture {
+         let dir = tempfile::tempdir().unwrap();
+-        let path = dir.path().join("turn-script.sh");
+-        std::fs::write(&path, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
+-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+-        perms.set_mode(0o755);
+-        std::fs::set_permissions(&path, perms).unwrap();
++        let path = fixture_script_path(dir.path());
++        write_script_file(&path, &formatted_fixture_script(body));
++        make_script_executable(&path);
+         Fixture { _dir: dir, path }
+     }
+ 
++    fn fixture_script_path(dir: &std::path::Path) -> std::path::PathBuf {
++        dir.join("turn-script.sh")
++    }
++
++    fn formatted_fixture_script(body: &str) -> String {
++        format!("#!/usr/bin/env bash\n{body}\n")
++    }
++
++    fn write_script_file(path: &std::path::Path, contents: &str) {
++        std::fs::write(path, contents).unwrap();
++    }
++
++    fn make_script_executable(path: &std::path::Path) {
++        let permissions = executable_permissions(script_permissions(path));
++        std::fs::set_permissions(path, permissions).unwrap();
++    }
++
++    fn script_permissions(path: &std::path::Path) -> std::fs::Permissions {
++        std::fs::metadata(path).unwrap().permissions()
++    }
++
++    fn executable_permissions(mut permissions: std::fs::Permissions) -> std::fs::Permissions {
++        permissions.set_mode(0o755);
++        permissions
++    }
++
+     fn cfg_with(provider: &str, script_path: &std::path::Path) -> SessionsConfig {
+         let mut entries = HashMap::new();
+         entries.insert(
+@@ -796,6 +870,159 @@ mod tests {
+         SessionsConfig { entries }
+     }
+ 
++    fn cfg_with_state_dir(
++        provider: &str,
++        script_path: &std::path::Path,
++        state_dir: std::path::PathBuf,
++    ) -> SessionsConfig {
++        let mut entries = HashMap::new();
++        entries.insert(
++            provider.to_string(),
++            SessionSourceEntry {
++                turn_script: script_path.to_string_lossy().into_owned(),
++                transcript_locator: None,
++                state_dir: Some(state_dir),
++            },
++        );
++        SessionsConfig { entries }
++    }
++
++    fn stored_turn_body(
++        db: &StateDb,
++        provider_name: &str,
++        session_id: &str,
++        turn_id: &str,
++    ) -> String {
++        db.connection()
++            .query_row(
++                "SELECT body FROM session_turns
++                 WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3",
++                rusqlite::params![provider_name, session_id, turn_id],
++                |row| row.get(0),
++            )
++            .unwrap()
++    }
++
++    fn parsed_json_value(raw: &str) -> serde_json::Value {
++        serde_json::from_str(raw).unwrap()
++    }
++
++    fn assert_edge_body_preserved(body: &serde_json::Value) {
++        assert_eq!(body, &expected_edge_body());
++    }
++
++    fn expected_edge_body() -> serde_json::Value {
++        serde_json::json!([{"type":"text","text":"line one\n日本語\n{\"escaped\":true}\u{0007}"}])
++    }
++
++    fn all_invalid_body_shape_errors(errors: &[String]) -> bool {
++        errors.iter().all(|error| {
++            error.contains("invalid body shape")
++                && error.contains("expected canonical content chunk array")
++        })
++    }
++
++    fn stored_turn_bodies(
++        db: &StateDb,
++        provider_name: &str,
++        session_id: &str,
++    ) -> Vec<Option<String>> {
++        db.connection()
++            .prepare(
++                "SELECT body FROM session_turns
++                 WHERE provider_name = ?1 AND session_id = ?2
++                 ORDER BY turn_id",
++            )
++            .unwrap()
++            .query_map(rusqlite::params![provider_name, session_id], |row| {
++                row.get(0)
++            })
++            .unwrap()
++            .map(Result::unwrap)
++            .collect()
++    }
++
++    fn leaked_marker_script(marker_path: &std::path::Path) -> String {
++        format!(
++            "(sleep 2; printf leaked > {}) & wait",
++            marker_path.display()
++        )
++    }
++
++    fn assert_marker_does_not_exist(path: &std::path::Path) {
++        assert!(
++            path_does_not_exist(path),
++            "timed-out turn script left a process-group child running"
++        );
++    }
++
++    fn path_does_not_exist(path: &std::path::Path) -> bool {
++        !path.exists()
++    }
++
++    fn marker_contents(dir: &std::path::Path, name: &str) -> String {
++        std::fs::read_to_string(dir.join(name)).unwrap()
++    }
++
++    fn assert_contains_path(contents: &str, path: &std::path::Path) {
++        assert!(contents_contains_path(contents, path));
++    }
++
++    fn contents_contains_path(contents: &str, path: &std::path::Path) -> bool {
++        contents.contains(path_text(path))
++    }
++
++    fn path_text(path: &std::path::Path) -> &str {
++        path.to_str().unwrap()
++    }
++
++    fn assert_trimmed_eq(actual: &str, expected: &str) {
++        assert_eq!(trimmed_text(actual), expected);
++    }
++
++    fn trimmed_text(text: &str) -> &str {
++        text.trim()
++    }
++
++    fn session_turn_total(db: &StateDb, provider_name: &str, session_id: &str) -> u64 {
++        db.count_session_turns(provider_name, session_id)
++            .unwrap()
++            .total
++    }
++
++    fn assert_u64_eq(actual: u64, expected: u64) {
++        assert_eq!(actual, expected);
++    }
++
++    fn assert_session_turn_total(
++        db: &StateDb,
++        provider_name: &str,
++        session_id: &str,
++        expected: u64,
++    ) {
++        assert_u64_eq(session_turn_total(db, provider_name, session_id), expected);
++    }
++
++    fn transcript_fixture_path(dir: &std::path::Path) -> std::path::PathBuf {
++        dir.join("session.jsonl")
++    }
++
++    fn transcript_fixture_body() -> &'static str {
++        "{\"type\":\"system\"}\n"
++    }
++
++    fn write_transcript_fixture(path: &std::path::Path) {
++        std::fs::write(path, transcript_fixture_body()).unwrap();
++    }
++
++    fn locator_script_for_transcript(transcript: &std::path::Path) -> String {
++        format!(
++            r#"printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt"
++printf '%s\n' "{}""#,
++            transcript.display()
++        )
++    }
++
+     #[test]
+     fn ingests_assistant_turns_and_advances_count() {
+         let db = db();
+@@ -872,20 +1099,9 @@ EOF"#,
+ 
+         assert_eq!(report.errors, Vec::<String>::new());
+         assert_eq!(report.new_turns, 1);
+-        let raw_body: String = db
+-            .connection()
+-            .query_row(
+-                "SELECT body FROM session_turns
+-                 WHERE provider_name = 'p' AND session_id = 'S1' AND turn_id = 'edge-body'",
+-                [],
+-                |row| row.get(0),
+-            )
+-            .unwrap();
+-        let body: serde_json::Value = serde_json::from_str(&raw_body).unwrap();
+-        assert_eq!(
+-            body,
+-            serde_json::json!([{"type":"text","text":"line one\n日本語\n{\"escaped\":true}\u{0007}"}])
+-        );
++        let raw_body = stored_turn_body(&db, "p", "S1", "edge-body");
++        let body = parsed_json_value(&raw_body);
++        assert_edge_body_preserved(&body);
+     }
+ 
+     #[test]
+@@ -904,22 +1120,8 @@ EOF"#,
+ 
+         assert_eq!(report.new_turns, 2);
+         assert_eq!(report.errors.len(), 2);
+-        assert!(report.errors.iter().all(|error| {
+-            error.contains("invalid body shape")
+-                && error.contains("expected canonical content chunk array")
+-        }));
+-        let stored_bodies: Vec<Option<String>> = db
+-            .connection()
+-            .prepare(
+-                "SELECT body FROM session_turns
+-                 WHERE provider_name = 'p' AND session_id = 'S1'
+-                 ORDER BY turn_id",
+-            )
+-            .unwrap()
+-            .query_map([], |row| row.get(0))
+-            .unwrap()
+-            .map(Result::unwrap)
+-            .collect();
++        assert!(all_invalid_body_shape_errors(&report.errors));
++        let stored_bodies = stored_turn_bodies(&db, "p", "S1");
+         assert_eq!(stored_bodies, vec![None, None]);
+     }
+ 
+@@ -971,10 +1173,7 @@ EOF"#,
+         let db = db();
+         let dir = tempfile::tempdir().unwrap();
+         let leaked_marker = dir.path().join("leaked");
+-        let script = fixture_script(&format!(
+-            "(sleep 2; printf leaked > {}) & wait",
+-            leaked_marker.display()
+-        ));
++        let script = fixture_script(&leaked_marker_script(&leaked_marker));
+         let cfg = cfg_with("p", &script.path);
+ 
+         let r = scan_provider_with_timeout("p", &cfg, &db, 1);
+@@ -983,10 +1182,7 @@ EOF"#,
+         assert_eq!(r.new_turns, 0);
+         assert_eq!(r.errors.len(), 1);
+         assert!(r.errors[0].contains("script_timeout"), "{:?}", r.errors);
+-        assert!(
+-            !leaked_marker.exists(),
+-            "timed-out turn script left a process-group child running"
+-        );
++        assert_marker_does_not_exist(&leaked_marker);
+     }
+ 
+     #[test]
+@@ -1011,21 +1207,31 @@ EOF"#,
+ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
+         );
+         let tempdir = tempfile::tempdir().unwrap();
+-        let mut entries = HashMap::new();
+-        entries.insert(
+-            "p".to_string(),
+-            SessionSourceEntry {
+-                turn_script: script.path.to_string_lossy().into_owned(),
+-                transcript_locator: None,
+-                state_dir: Some(tempdir.path().to_path_buf()),
+-            },
+-        );
+-        let cfg = SessionsConfig { entries };
++        let cfg = cfg_with_state_dir("p", &script.path, tempdir.path().to_path_buf());
+         let r = scan_provider("p", &cfg, &db);
+         assert_eq!(r.errors, Vec::<String>::new());
+         assert_eq!(r.new_turns, 1);
+-        let marker = std::fs::read_to_string(tempdir.path().join("marker.txt")).unwrap();
+-        assert!(marker.contains(tempdir.path().to_str().unwrap()));
++        let marker = marker_contents(tempdir.path(), "marker.txt");
++        assert_contains_path(&marker, tempdir.path());
++    }
++
++    #[test]
++    fn scan_provider_session_sets_session_id_env() {
++        let db = db();
++        let script = fixture_script(
++            r#"printf '{"session_id":"%s","turn_id":"t1","timestamp":"2026-04-17T08:00:00Z","role":"user"}\n' "$SESSION_ID"
++printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt""#,
++        );
++        let tempdir = tempfile::tempdir().unwrap();
++        let cfg = cfg_with_state_dir("p", &script.path, tempdir.path().to_path_buf());
++
++        let r = scan_provider_session("p", &cfg, &db, "session-123");
++
++        assert_eq!(r.errors, Vec::<String>::new());
++        assert_eq!(r.new_turns, 1);
++        assert_session_turn_total(&db, "p", "session-123", 1);
++        let seen = marker_contents(tempdir.path(), "seen-session.txt");
++        assert_trimmed_eq(&seen, "session-123");
+     }
+ 
+     #[test]
+@@ -1040,13 +1246,9 @@ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
+     #[test]
+     fn locate_transcript_returns_script_stdout_path() {
+         let dir = tempfile::tempdir().unwrap();
+-        let transcript = dir.path().join("session.jsonl");
+-        std::fs::write(&transcript, "{\"type\":\"system\"}\n").unwrap();
+-        let script = fixture_script(&format!(
+-            r#"printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt"
+-printf '%s\n' "{}""#,
+-            transcript.display()
+-        ));
++        let transcript = transcript_fixture_path(dir.path());
++        write_transcript_fixture(&transcript);
++        let script = fixture_script(&locator_script_for_transcript(&transcript));
+         let cfg = cfg_with_locator("p", &script.path, Some(dir.path().join("state")));
+ 
+         let path = locate_transcript(&cfg, "p", "session-123")
+@@ -1054,9 +1256,8 @@ printf '%s\n' "{}""#,
+             .expect("locator should return a path");
+ 
+         assert_eq!(path, transcript);
+-        let seen =
+-            std::fs::read_to_string(dir.path().join("state").join("seen-session.txt")).unwrap();
+-        assert_eq!(seen.trim(), "session-123");
++        let seen = marker_contents(&dir.path().join("state"), "seen-session.txt");
++        assert_trimmed_eq(&seen, "session-123");
+     }
+ 
+     #[test]
+diff --git a/crates/oulipoly-state/src/db.rs b/crates/oulipoly-state/src/db.rs
+index 7ec67ca..e249275 100755
+--- a/crates/oulipoly-state/src/db.rs
++++ b/crates/oulipoly-state/src/db.rs
+@@ -5879,6 +5879,34 @@ impl StateDb {
+         Ok(false)
+     }
+ 
++    pub fn has_session_user_turn_containing(
++        &self,
++        provider_name: &str,
++        session_id: &str,
++        needle: &str,
++    ) -> Result<bool, String> {
++        if needle.is_empty() {
++            return Ok(false);
++        }
++        let found: i64 = self
++            .conn
++            .query_row(
++                "SELECT EXISTS(
++                    SELECT 1
++                    FROM session_turns
++                    WHERE provider_name = ?1
++                      AND session_id = ?2
++                      AND role = 'user'
++                      AND body IS NOT NULL
++                      AND instr(body, ?3) > 0
++                )",
++                sqlite::params![provider_name, session_id, needle],
++                |row| row.get(0),
++            )
++            .map_err(|e| format!("Failed to query session user turn substring: {e}"))?;
++        Ok(found != 0)
++    }
++
+     fn session_user_turn_body(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+         row.get(0)
+     }
+@@ -10753,6 +10781,83 @@ name = "fixture-provider"
+         );
+     }
+ 
++    #[test]
++    fn has_session_user_turn_containing_matches_user_body_substring() {
++        let db = test_db();
++        let nonce = "11111111-2222-4333-8444-555555555555";
++
++        db.ingest_session_turns_batch(
++            "fixture-provider",
++            &[
++                SessionTurnIngest {
++                    session_id: "session-a".to_string(),
++                    turn_id: "user-quoted-delivery".to_string(),
++                    timestamp: ts("2026-04-17T08:00:00Z"),
++                    role: "user".to_string(),
++                    parent_turn_id: None,
++                    is_sidechain: false,
++                    is_compaction_boundary: false,
++                    body: Some(
++                        serde_json::json!([
++                            {
++                                "type": "text",
++                                "text": format!(
++                                    "\"[OULIPOLY NOTIFICATIONS]\n[OULIPOLY-DELIVERY {nonce}]\nbody\""
++                                )
++                            }
++                        ])
++                        .to_string(),
++                    ),
++                },
++                SessionTurnIngest {
++                    session_id: "session-a".to_string(),
++                    turn_id: "assistant-same-nonce".to_string(),
++                    timestamp: ts("2026-04-17T08:00:01Z"),
++                    role: "assistant".to_string(),
++                    parent_turn_id: None,
++                    is_sidechain: false,
++                    is_compaction_boundary: false,
++                    body: Some(
++                        serde_json::json!([
++                            {
++                                "type": "text",
++                                "text": format!("assistant [OULIPOLY-DELIVERY {nonce}]")
++                            }
++                        ])
++                        .to_string(),
++                    ),
++                },
++            ],
++        )
++        .unwrap();
++
++        assert!(
++            db.has_session_user_turn_containing("fixture-provider", "session-a", nonce)
++                .unwrap(),
++            "the delivery nonce should match inside a non-exact quote-wrapped user body"
++        );
++        assert!(
++            !db.has_session_user_turn_containing("fixture-provider", "session-a", "missing-nonce")
++                .unwrap(),
++            "missing nonce must not confirm delivery"
++        );
++        assert!(
++            !db.has_session_user_turn_containing("fixture-provider", "session-a", "")
++                .unwrap(),
++            "empty needles must not match every body"
++        );
++        assert!(
++            !db.has_session_user_turn_containing("other-provider", "session-a", nonce)
++                .unwrap(),
++            "provider identity must match"
++        );
++        assert!(
++            !db.has_session_user_turn_containing("fixture-provider", "other-session", nonce)
++                .unwrap(),
++            "session identity must match"
++        );
++    }
++
+     #[test]
+     fn composite_invocation_id_formats_and_round_trips() {
+         let composite = CompositeInvocationId {
+diff --git a/crates/oulipoly-state/src/mailbox.rs b/crates/oulipoly-state/src/mailbox.rs
+index bb41f2e..5de5b4c 100644
+--- a/crates/oulipoly-state/src/mailbox.rs
++++ b/crates/oulipoly-state/src/mailbox.rs
+@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
+ use crate::pid_identity::{self, ProcessIdentity};
+ 
+ pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
++pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+ pub struct MailboxRow {
+@@ -165,6 +166,14 @@ pub struct WakeClaimRow {
+     pub max_pending_seq_at_claim: Option<i64>,
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct WakeSweepCandidate {
++    pub session_id: String,
++    pub auto_wake_count: i64,
++    pub min_pending_seq: i64,
++    pub max_pending_seq: i64,
++}
++
+ pub struct MailboxDb {
+     conn: Connection,
+     path: PathBuf,
+@@ -321,6 +330,47 @@ impl MailboxDb {
+             .map_err(|err| format!("Failed to commit mailbox delivery failure transaction: {err}"))
+     }
+ 
++    pub fn mark_pending_abandoned(
++        &mut self,
++        session_id: &str,
++        delivery_error: &str,
++        limit: usize,
++    ) -> Result<usize, String> {
++        if limit == 0 {
++            return Ok(0);
++        }
++        let tx = self
++            .conn
++            .transaction()
++            .map_err(|err| format!("Failed to start mailbox abandonment transaction: {err}"))?;
++        let changed = tx
++            .execute(
++                "UPDATE mailbox
++                 SET delivery_error = ?2
++                 WHERE seq IN (
++                    SELECT seq
++                    FROM mailbox
++                    WHERE session_id = ?1
++                      AND delivered_at IS NULL
++                      AND (delivery_error IS NULL OR delivery_error != ?2)
++                    ORDER BY seq ASC
++                    LIMIT ?3
++                 )",
++                params![session_id, delivery_error, limit as i64],
++            )
++            .map_err(|err| format!("Failed to mark mailbox rows abandoned: {err}"))?;
++        if changed > 0 {
++            tx.execute(
++                "DELETE FROM session_wake_claim WHERE session_id = ?1",
++                params![session_id],
++            )
++            .map_err(|err| format!("Failed to release abandoned wake claim: {err}"))?;
++        }
++        tx.commit()
++            .map_err(|err| format!("Failed to commit mailbox abandonment transaction: {err}"))?;
++        Ok(changed)
++    }
++
+     pub fn upsert_session_runtime(
+         &mut self,
+         input: SessionRuntimeUpsert<'_>,
+@@ -427,10 +477,11 @@ impl MailboxDb {
+             return Ok(WakeClaimAcquireResult::NoPending);
+         };
+         if let Some(existing) = fresh_in_flight_wake_claim(
++            &tx,
+             wake_claim_tx(&tx, input.session_id)?,
+             input.stale_after_seconds,
+             renew_token,
+-        ) {
++        )? {
+             tx.commit().map_err(|err| {
+                 format!("Failed to commit existing wake claim transaction: {err}")
+             })?;
+@@ -484,6 +535,72 @@ impl MailboxDb {
+         Ok(changed > 0)
+     }
+ 
++    pub fn record_wake_claim_pid_identity(
++        &mut self,
++        session_id: &str,
++        claim_token: &str,
++        wake_pid: i64,
++        provider_name: Option<&str>,
++        model_name: Option<&str>,
++    ) -> Result<bool, String> {
++        if let Some(identity) = pid_identity::read_live_process_identity(wake_pid)? {
++            let recorded_at = now_rfc3339();
++            pid_identity::PidIdentityDb::open(self.path())?.record_identity(
++                pid_identity::PidIdentityRecord {
++                    identity: &identity,
++                    os_pgid: None,
++                    invocation_uuid: claim_token,
++                    session_id: Some(session_id),
++                    provider_name,
++                    model_name,
++                    recorded_at: &recorded_at,
++                },
++            )?;
++        }
++        self.record_wake_claim_pid(session_id, claim_token, wake_pid)
++    }
++
++    pub fn wake_sweep_candidates(
++        &mut self,
++        stale_after_seconds: i64,
++        limit: usize,
++    ) -> Result<Vec<WakeSweepCandidate>, String> {
++        if limit == 0 {
++            return Ok(Vec::new());
++        }
++        let mut candidates = Vec::new();
++        for session_id in self.pending_wake_session_ids(limit)? {
++            if candidates.len() >= limit {
++                break;
++            }
++            if self.session_is_busy(&session_id)? {
++                continue;
++            }
++            let Some((min_pending_seq, max_pending_seq)) = self.pending_seq_bounds(&session_id)?
++            else {
++                continue;
++            };
++            let Some(claim) = self.wake_claim(&session_id)? else {
++                candidates.push(wake_sweep_candidate(
++                    session_id,
++                    1,
++                    min_pending_seq,
++                    max_pending_seq,
++                ));
++                continue;
++            };
++            if wake_claim_is_reclaimable(&self.conn, &claim, stale_after_seconds)? {
++                candidates.push(wake_sweep_candidate(
++                    session_id,
++                    claim.auto_wake_count.saturating_add(1),
++                    min_pending_seq,
++                    max_pending_seq,
++                ));
++            }
++        }
++        Ok(candidates)
++    }
++
+     pub fn validate_wake_claim_for_child(
+         &mut self,
+         session_id: &str,
+@@ -533,6 +650,62 @@ impl MailboxDb {
+         collect_rows(rows)
+     }
+ 
++    fn pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
++        if limit == 0 {
++            return Ok(Vec::new());
++        }
++        let oldest_limit = limit.saturating_sub(limit / 2);
++        let newest_limit = limit.saturating_sub(oldest_limit);
++        let mut session_ids = self.oldest_pending_wake_session_ids(oldest_limit)?;
++        for session_id in self.newest_pending_wake_session_ids(newest_limit)? {
++            if session_ids.len() >= limit {
++                break;
++            }
++            if !session_ids.iter().any(|existing| existing == &session_id) {
++                session_ids.push(session_id);
++            }
++        }
++        Ok(session_ids)
++    }
++
++    fn oldest_pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
++        self.pending_wake_session_ids_by_oldest_seq(limit, "ASC")
++    }
++
++    fn newest_pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
++        self.pending_wake_session_ids_by_oldest_seq(limit, "DESC")
++    }
++
++    fn pending_wake_session_ids_by_oldest_seq(
++        &self,
++        limit: usize,
++        direction: &str,
++    ) -> Result<Vec<String>, String> {
++        let mut stmt = self
++            .conn
++            .prepare(&format!(
++                "SELECT session_id
++                 FROM mailbox
++                 WHERE delivered_at IS NULL
++                   AND (delivery_error IS NULL OR delivery_error != ?2)
++                 GROUP BY session_id
++                 ORDER BY MIN(seq) {direction}
++                 LIMIT ?1",
++            ))
++            .map_err(|err| format!("Failed to prepare pending wake session query: {err}"))?;
++        let rows = stmt
++            .query_map(params![limit as i64, WAKE_SWEEP_ABANDONED_ERROR], |row| {
++                row.get::<_, String>(0)
++            })
++            .map_err(|err| format!("Failed to query pending wake sessions: {err}"))?;
++        rows.collect::<Result<Vec<_>, _>>()
++            .map_err(|err| format!("Failed to read pending wake session row: {err}"))
++    }
++
++    fn pending_seq_bounds(&self, session_id: &str) -> Result<Option<(i64, i64)>, String> {
++        pending_seq_bounds_on(&self.conn, session_id)
++    }
++
+     #[cfg(test)]
+     fn enqueue_agent_bash_complete_then_rollback(
+         &mut self,
+@@ -644,6 +817,20 @@ impl MailboxDb {
+     }
+ }
+ 
++fn wake_sweep_candidate(
++    session_id: String,
++    auto_wake_count: i64,
++    min_pending_seq: i64,
++    max_pending_seq: i64,
++) -> WakeSweepCandidate {
++    WakeSweepCandidate {
++        session_id,
++        auto_wake_count,
++        min_pending_seq,
++        max_pending_seq,
++    }
++}
++
+ fn enqueue_agent_bash_complete_in_tx(
+     tx: &rusqlite::Transaction<'_>,
+     input: &AgentBashCompleteEnqueue<'_>,
+@@ -896,13 +1083,76 @@ fn session_liveness_from_decision(decision: &SessionRuntimeLivenessDecision) ->
+ }
+ 
+ fn fresh_in_flight_wake_claim(
++    tx: &rusqlite::Transaction<'_>,
+     existing: Option<WakeClaimRow>,
+     stale_after_seconds: i64,
+     renew_token: Option<&str>,
+-) -> Option<WakeClaimRow> {
+-    let existing = existing?;
++) -> Result<Option<WakeClaimRow>, String> {
++    let Some(existing) = existing else {
++        return Ok(None);
++    };
+     let renews_existing = renew_token == Some(existing.claim_token.as_str());
+-    (!claim_is_stale(&existing, stale_after_seconds) && !renews_existing).then_some(existing)
++    if renews_existing || wake_claim_is_reclaimable(tx, &existing, stale_after_seconds)? {
++        return Ok(None);
++    }
++    Ok(Some(existing))
++}
++
++fn wake_claim_is_reclaimable(
++    conn: &Connection,
++    claim: &WakeClaimRow,
++    stale_after_seconds: i64,
++) -> Result<bool, String> {
++    if claim.wake_pid.is_some() {
++        return wake_claim_pid_is_reclaimable(conn, claim);
++    }
++    Ok(claim_is_stale(claim, stale_after_seconds))
++}
++
++fn wake_claim_pid_is_reclaimable(conn: &Connection, claim: &WakeClaimRow) -> Result<bool, String> {
++    let Some(wake_pid) = claim.wake_pid else {
++        return Ok(false);
++    };
++    wake_claim_pid_is_live_identity_matched(conn, claim, wake_pid).map(|matched| !matched)
++}
++
++fn wake_claim_pid_is_live_identity_matched(
++    conn: &Connection,
++    claim: &WakeClaimRow,
++    wake_pid: i64,
++) -> Result<bool, String> {
++    let Some(live) = pid_identity::read_live_process_identity(wake_pid)? else {
++        return Ok(false);
++    };
++    wake_claim_live_identity_has_matching_sidecar_row(conn, claim, &live)
++}
++
++fn wake_claim_live_identity_has_matching_sidecar_row(
++    conn: &Connection,
++    claim: &WakeClaimRow,
++    live: &ProcessIdentity,
++) -> Result<bool, String> {
++    conn.query_row(
++        "SELECT EXISTS(
++            SELECT 1
++            FROM pid_identity
++            WHERE os_pid = ?1
++              AND os_boot_id = ?2
++              AND os_pid_starttime_ticks = ?3
++              AND invocation_uuid = ?4
++              AND session_id = ?5
++        )",
++        params![
++            live.os_pid,
++            &live.os_boot_id,
++            live.os_pid_starttime_ticks,
++            &claim.claim_token,
++            &claim.session_id,
++        ],
++        |row| row.get::<_, i64>(0),
++    )
++    .map(|value| value != 0)
++    .map_err(|err| format!("Failed to verify wake PID sidecar identity: {err}"))
+ }
+ 
+ fn acquire_wake_claim_tx(
+@@ -1137,8 +1387,30 @@ fn pending_seq_bounds_tx(
+     tx.query_row(
+         "SELECT MIN(seq), MAX(seq)
+          FROM mailbox
+-         WHERE session_id = ?1 AND delivered_at IS NULL",
+-        params![session_id],
++         WHERE session_id = ?1
++           AND delivered_at IS NULL
++           AND (delivery_error IS NULL OR delivery_error != ?2)",
++        params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
++        |row| {
++            let min_seq: Option<i64> = row.get(0)?;
++            let max_seq: Option<i64> = row.get(1)?;
++            Ok(min_seq.zip(max_seq))
++        },
++    )
++    .map_err(|err| format!("Failed to read pending mailbox seq bounds: {err}"))
++}
++
++fn pending_seq_bounds_on(
++    conn: &Connection,
++    session_id: &str,
++) -> Result<Option<(i64, i64)>, String> {
++    conn.query_row(
++        "SELECT MIN(seq), MAX(seq)
++         FROM mailbox
++         WHERE session_id = ?1
++           AND delivered_at IS NULL
++           AND (delivery_error IS NULL OR delivery_error != ?2)",
++        params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
+         |row| {
+             let min_seq: Option<i64> = row.get(0)?;
+             let max_seq: Option<i64> = row.get(1)?;
+@@ -1698,6 +1970,96 @@ mod tests {
+         assert_eq!(claim.auto_wake_count, 2);
+     }
+ 
++    #[test]
++    fn wake_dead_pid_claim_can_be_stolen_before_ttl() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
++        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
++            .unwrap();
++        assert!(matches!(
++            db.try_acquire_wake_claim(WakeClaimRequest {
++                session_id: "session-a",
++                claim_token: "token-a",
++                reason: "notify_idle",
++                auto_wake_count: 1,
++                wake_invocation_uuid: None,
++                stale_after_seconds: 600,
++            })
++            .unwrap(),
++            WakeClaimAcquireResult::Acquired(_)
++        ));
++        db.record_wake_claim_pid("session-a", "token-a", 999_999_999)
++            .unwrap();
++
++        let stolen = db
++            .try_acquire_wake_claim(WakeClaimRequest {
++                session_id: "session-a",
++                claim_token: "token-b",
++                reason: "wake_reclaim_sweep",
++                auto_wake_count: 2,
++                wake_invocation_uuid: None,
++                stale_after_seconds: 600,
++            })
++            .unwrap();
++
++        let WakeClaimAcquireResult::Acquired(claim) = stolen else {
++            panic!("expected dead PID claim to be stolen, got {stolen:?}");
++        };
++        assert_eq!(claim.claim_token, "token-b");
++    }
++
++    #[test]
++    fn wake_live_identity_matched_claim_is_not_stolen_after_ttl() {
++        let dir = tempfile::tempdir().unwrap();
++        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
++        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
++            .unwrap();
++        assert!(matches!(
++            db.try_acquire_wake_claim(WakeClaimRequest {
++                session_id: "session-a",
++                claim_token: "token-a",
++                reason: "notify_idle",
++                auto_wake_count: 1,
++                wake_invocation_uuid: None,
++                stale_after_seconds: 600,
++            })
++            .unwrap(),
++            WakeClaimAcquireResult::Acquired(_)
++        ));
++        let identity = current_identity();
++        let sidecar = pid_identity::PidIdentityDb::open(db.path()).unwrap();
++        sidecar
++            .record_identity(pid_identity::PidIdentityRecord {
++                identity: &identity,
++                os_pgid: None,
++                invocation_uuid: "token-a",
++                session_id: Some("session-a"),
++                provider_name: Some("wake"),
++                model_name: Some("model-a"),
++                recorded_at: "2026-06-08T00:00:00Z",
++            })
++            .unwrap();
++        db.record_wake_claim_pid("session-a", "token-a", identity.os_pid)
++            .unwrap();
++        db.force_wake_claim_age_for_test("session-a", 601).unwrap();
++
++        let result = db
++            .try_acquire_wake_claim(WakeClaimRequest {
++                session_id: "session-a",
++                claim_token: "token-b",
++                reason: "wake_reclaim_sweep",
++                auto_wake_count: 2,
++                wake_invocation_uuid: None,
++                stale_after_seconds: 600,
++            })
++            .unwrap();
++
++        let WakeClaimAcquireResult::AlreadyInFlight(claim) = result else {
++            panic!("expected live identity-matched claim to remain in flight, got {result:?}");
++        };
++        assert_eq!(claim.claim_token, "token-a");
++    }
++
+     #[test]
+     fn mailbox_operations_do_not_change_state_db_schema() {
+         let dir = tempfile::tempdir().unwrap();
+diff --git a/scripts/opencode-turns b/scripts/opencode-turns
+index 6cea337..103a2df 100755
+--- a/scripts/opencode-turns
++++ b/scripts/opencode-turns
+@@ -11,10 +11,11 @@ The command defaults to `opencode`, or to `opencodeN` when BASE_DIR contains
+   opencode session list --json
+   opencode export <sessionID>
+ 
+-When SESSION_ID arguments are supplied, they are used directly. BASE_DIR is
+-accepted for compatibility with existing session source configuration; implicit
+-discovery uses `opencode session list --json`, not OpenCode's private storage
+-layout.
++When SESSION_ID arguments are supplied, they are used directly. If no
++SESSION_ID arguments are supplied, the SESSION_ID environment variable is used
++as the direct target list. BASE_DIR is accepted for compatibility with existing
++session source configuration; implicit discovery uses `opencode session list
++--json`, not OpenCode's private storage layout.
+ 
+ Implicit discovery is bounded to the recent quota-balancing window. If the
+ session list does not expose timestamps, the adapter falls back to a small cap
+@@ -93,7 +94,14 @@ def env_float(name: str, default: float) -> float:
+ 
+ 
+ def parsed_env_float(name: str) -> float | None:
+-    value = os.environ.get(name)
++    return parsed_float_or_none(env_value(name))
++
++
++def env_value(name: str) -> str | None:
++    return os.environ.get(name)
++
++
++def parsed_float_or_none(value: str | None) -> float | None:
+     if value is None:
+         return None
+     try:
+@@ -113,7 +121,10 @@ def env_int(name: str, default: int) -> int:
+ 
+ 
+ def parsed_env_int(name: str) -> int | None:
+-    value = os.environ.get(name)
++    return parsed_int_or_none(env_value(name))
++
++
++def parsed_int_or_none(value: str | None) -> int | None:
+     if value is None:
+         return None
+     try:
+@@ -338,11 +349,12 @@ def session_list_session_id(obj: dict) -> str | None:
+ 
+ def session_list_session_id_candidates(obj: dict) -> list[str]:
+     candidates = []
+-    for key in SESSION_ID_KEYS:
+-        value = obj.get(key)
+-        if not isinstance(value, str):
+-            continue
+-        candidates.append(value)
++    for mapping in info_unwrapped_mappings(obj):
++        for key in SESSION_ID_KEYS:
++            value = mapping.get(key)
++            if not isinstance(value, str):
++                continue
++            candidates.append(value)
+     return candidates
+ 
+ 
+@@ -354,13 +366,47 @@ def parsed_session_id(value: str) -> str | None:
+ 
+ 
+ def session_list_timestamp(obj: dict) -> datetime | None:
+-    for key in SESSION_TIMESTAMP_KEYS:
+-        converted = timestamp_datetime(obj.get(key))
++    for value in timestamp_candidate_values(obj, SESSION_TIMESTAMP_KEYS):
++        converted = timestamp_datetime(value)
+         if converted:
+             return converted
+     return None
+ 
+ 
++def info_unwrapped_mappings(obj: dict) -> list[dict]:
++    mappings = [obj]
++    info = obj.get("info")
++    if isinstance(info, dict):
++        mappings.append(info)
++    return mappings
++
++
++def metadata_mappings_from_obj(obj: dict) -> list[dict]:
++    mappings = info_unwrapped_mappings(obj)
++    message = obj.get("message")
++    if isinstance(message, dict):
++        mappings.extend(info_unwrapped_mappings(message))
++    return mappings
++
++
++def timestamp_candidate_mappings(obj: dict) -> list[dict]:
++    mappings = []
++    for mapping in metadata_mappings_from_obj(obj):
++        mappings.append(mapping)
++        time_value = mapping.get("time")
++        if isinstance(time_value, dict):
++            mappings.append(time_value)
++    return mappings
++
++
++def timestamp_candidate_values(obj: dict, keys: tuple[str, ...]) -> list:
++    values = []
++    for mapping in timestamp_candidate_mappings(obj):
++        for key in keys:
++            values.append(mapping.get(key))
++    return values
++
++
+ def timestamp_datetime(value) -> datetime | None:
+     if isinstance(value, (int, float)):
+         return numeric_timestamp_datetime(value)
+@@ -411,9 +457,23 @@ def requested_session_ids(
+ ) -> tuple[list[str], bool]:
+     if args:
+         return unique_values(args), False
++    env_session_ids = session_ids_from_env()
++    if env_session_ids:
++        return env_session_ids, False
+     return discover_session_ids(options, deadline)
+ 
+ 
++def session_ids_from_env() -> list[str]:
++    value = os.environ.get("SESSION_ID")
++    if value is None:
++        return []
++    return unique_values(split_env_session_ids(value))
++
++
++def split_env_session_ids(value: str) -> list[str]:
++    return [item for item in re.split(r"[\s,]+", value.strip()) if item]
++
++
+ def numeric_timestamp(value) -> str | None:
+     accepted = accepted_numeric_timestamp(value)
+     if accepted is None:
+@@ -433,31 +493,35 @@ def formatted_numeric_timestamp(value: int | float) -> str:
+ 
+ 
+ def timestamp_from_obj(obj: dict) -> str | None:
+-    for key in ("timestamp", "createdAt", "created_at", "time"):
+-        value = obj.get(key)
+-        if isinstance(value, str) and value:
+-            return value
+-        converted = numeric_timestamp(value)
++    for value in timestamp_candidate_values(
++        obj, ("timestamp", "createdAt", "created_at", "time", "created")
++    ):
++        converted = timestamp_string(value)
+         if converted:
+             return converted
+     return None
+ 
+ 
++def timestamp_string(value) -> str | None:
++    if isinstance(value, str) and value:
++        return value
++    return numeric_timestamp(value)
++
++
+ def session_id_from_obj(obj: dict) -> str | None:
+-    for key in ("sessionID", "sessionId", "session_id"):
+-        value = obj.get(key)
+-        if isinstance(value, str) and value:
+-            return value
++    for mapping in metadata_mappings_from_obj(obj):
++        for key in ("sessionID", "sessionId", "session_id"):
++            value = mapping.get(key)
++            if isinstance(value, str) and value:
++                return value
+     return None
+ 
+ 
+ def role_from_obj(obj: dict) -> str | None:
+-    value = obj.get("role")
+-    if value in ("user", "assistant"):
+-        return value
+-    message = obj.get("message")
+-    if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+-        return message.get("role")
++    for mapping in metadata_mappings_from_obj(obj):
++        value = mapping.get("role")
++        if value in ("user", "assistant"):
++            return value
+     return None
+ 
+ 
+@@ -466,12 +530,10 @@ def turn_id_from_obj(obj: dict, default_session_id: str, index: int) -> str:
+ 
+ 
+ def turn_id_field_from_obj(obj: dict) -> str | None:
+-    value = turn_id_field_from_mapping(obj)
+-    if value:
+-        return value
+-    message = obj.get("message")
+-    if isinstance(message, dict):
+-        return turn_id_field_from_mapping(message)
++    for mapping in metadata_mappings_from_obj(obj):
++        value = turn_id_field_from_mapping(mapping)
++        if value:
++            return value
+     return None
+ 
+ 
+@@ -488,10 +550,26 @@ def fallback_turn_id(default_session_id: str, index: int) -> str:
+ 
+ 
+ def opencode_command() -> list[str]:
+-    configured = os.environ.get("OPENCODE_BIN")
++    configured = configured_opencode_command()
+     if configured is None:
+-        return [opencode_command_name_from_base_dir(base_dir_arg(sys.argv))]
+-    return shlex.split(configured) or ["opencode"]
++        return default_opencode_command(sys.argv)
++    return command_tokens_or_default(configured_command_tokens(configured))
++
++
++def configured_opencode_command() -> str | None:
++    return os.environ.get("OPENCODE_BIN")
++
++
++def configured_command_tokens(configured: str) -> list[str]:
++    return shlex.split(configured)
++
++
++def command_tokens_or_default(tokens: list[str]) -> list[str]:
++    return tokens or ["opencode"]
++
++
++def default_opencode_command(argv: list[str]) -> list[str]:
++    return [opencode_command_name_from_base_dir(base_dir_arg(argv))]
+ 
+ 
+ def opencode_command_name_from_base_dir(base_dir: str) -> str:
+diff --git a/scripts/tests/opencode-turns.test.sh b/scripts/tests/opencode-turns.test.sh
+old mode 100644
+new mode 100755
+index 3aed610..d89c5d1
+--- a/scripts/tests/opencode-turns.test.sh
++++ b/scripts/tests/opencode-turns.test.sh
+@@ -94,6 +94,81 @@ assert_stdout_not_contains() {
+   fi
+ }
+ 
++assert_current_export_records() {
++  local label="$1"
++
++  python3 - "$RUN_STDOUT" <<'PY' || fail "$label: current-format export records did not match"
++import json
++import sys
++
++path = sys.argv[1]
++with open(path, encoding="utf-8") as handle:
++    records = [json.loads(line) for line in handle if line.strip()]
++
++expected = [
++    {
++        "session_id": "ses_current_info",
++        "turn_id": "msg_user_current",
++        "timestamp": "2023-11-14T22:13:20Z",
++        "role": "user",
++        "body": [
++            {
++                "type": "text",
++                "text": "[OULIPOLY-DELIVERY 123e4567-e89b-12d3-a456-426614174000] wake please",
++            }
++        ],
++    },
++    {
++        "session_id": "ses_current_info",
++        "turn_id": "msg_assistant_current",
++        "timestamp": "2023-11-14T22:13:25Z",
++        "role": "assistant",
++        "body": [{"type": "text", "text": "confirmed"}],
++    },
++]
++
++if records != expected:
++    print("expected:", json.dumps(expected, indent=2), file=sys.stderr)
++    print("actual:", json.dumps(records, indent=2), file=sys.stderr)
++    raise SystemExit(1)
++PY
++}
++
++assert_session_id_env_export_records() {
++  local label="$1"
++
++  python3 - "$RUN_STDOUT" <<'PY' || fail "$label: SESSION_ID-env export records did not match"
++import json
++import sys
++
++path = sys.argv[1]
++with open(path, encoding="utf-8") as handle:
++    records = [json.loads(line) for line in handle if line.strip()]
++
++expected = [
++    {
++        "session_id": "ses_env_requested",
++        "turn_id": "msg_user_env",
++        "timestamp": "2023-11-14T22:13:20Z",
++        "role": "user",
++        "body": [{"type": "text", "text": "wake via SESSION_ID env"}],
++    },
++    {
++        "session_id": "ses_env_requested",
++        "turn_id": "msg_assistant_env",
++        "timestamp": "2023-11-14T22:13:25Z",
++        "role": "assistant",
++        "body": [{"type": "text", "text": "confirmed via env"}],
++    },
++]
++
++if records != expected:
++    print("expected:", json.dumps(expected, indent=2), file=sys.stderr)
++    print("actual:", json.dumps(records, indent=2), file=sys.stderr)
++    raise SystemExit(1)
++PY
++}
++
+ file_size_bytes() {
+   local path="$1"
+ 
+@@ -381,6 +456,129 @@ write_command_derivation_mock() {
+   write_executable_mock "$path" emit_command_derivation_mock_body
+ }
+ 
++emit_current_export_mock_body() {
++  cat <<'MOCK_OPENCODE'
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
++  cat <<'JSON'
++[
++  {"id":"ses_current_requested"}
++]
++JSON
++  exit 0
++fi
++
++if [[ "$1" == "export" ]]; then
++  session_id="$2"
++  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
++  cat <<'JSON'
++{
++  "info": {
++    "id": "ses_current_info",
++    "time": {"created": 1700000000000}
++  },
++  "messages": [
++    {
++      "info": {
++        "role": "user",
++        "time": {"created": 1700000000000},
++        "id": "msg_user_current",
++        "sessionID": "ses_current_info"
++      },
++      "parts": [
++        {
++          "type": "text",
++          "text": "[OULIPOLY-DELIVERY 123e4567-e89b-12d3-a456-426614174000] wake please"
++        }
++      ]
++    },
++    {
++      "info": {
++        "role": "assistant",
++        "time": {"created": 1700000005000},
++        "id": "msg_assistant_current",
++        "sessionID": "ses_current_info"
++      },
++      "parts": [{"type": "text", "text": "confirmed"}]
++    }
++  ]
++}
++JSON
++  exit 0
++fi
++
++echo "unexpected opencode args: $*" >&2
++exit 64
++MOCK_OPENCODE
++}
++
++write_current_export_mock() {
++  local path="$1"
++
++  write_executable_mock "$path" emit_current_export_mock_body
++}
++
++emit_session_id_env_mock_body() {
++  cat <<'MOCK_OPENCODE'
++#!/usr/bin/env bash
++set -euo pipefail
++
++if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
++  printf '[]\n'
++  exit 0
++fi
++
++if [[ "$1" == "export" ]]; then
++  session_id="$2"
++  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
++  if [[ "$session_id" != "ses_env_requested" ]]; then
++    printf '[]\n'
++    exit 0
++  fi
++  cat <<'JSON'
++{
++  "info": {
++    "id": "ses_env_requested",
++    "time": {"created": 1700000000000}
++  },
++  "messages": [
++    {
++      "info": {
++        "role": "user",
++        "time": {"created": 1700000000000},
++        "id": "msg_user_env",
++        "sessionID": "ses_env_requested"
++      },
++      "parts": [{"type": "text", "text": "wake via SESSION_ID env"}]
++    },
++    {
++      "info": {
++        "role": "assistant",
++        "time": {"created": 1700000005000},
++        "id": "msg_assistant_env",
++        "sessionID": "ses_env_requested"
++      },
++      "parts": [{"type": "text", "text": "confirmed via env"}]
++    }
++  ]
++}
++JSON
++  exit 0
++fi
++
++echo "unexpected opencode args: $*" >&2
++exit 64
++MOCK_OPENCODE
++}
++
++write_session_id_env_mock() {
++  local path="$1"
++
++  write_executable_mock "$path" emit_session_id_env_mock_body
++}
++
+ run_opencode_turns() {
+   local tmpdir="$1"
+   local opencode_bin="$2"
+@@ -402,6 +600,29 @@ run_opencode_turns() {
+   set -e
+ }
+ 
++run_opencode_turns_with_session_id_env_on_path() {
++  local tmpdir="$1"
++  local session_id="$2"
++
++  RUN_STDOUT="$tmpdir/stdout.jsonl"
++  RUN_STDERR="$tmpdir/stderr.txt"
++  OPENCODE_TURNS_EXPORT_LOG="$tmpdir/exports.log"
++  export OPENCODE_TURNS_EXPORT_LOG
++  : >"$OPENCODE_TURNS_EXPORT_LOG"
++
++  set +e
++  env -u OPENCODE_BIN \
++    PATH="$tmpdir/bin:$PATH" \
++    SESSION_ID="$session_id" \
++    OPENCODE_TURNS_WINDOW_HOURS=6 \
++    OPENCODE_TURNS_MAX_SESSIONS=25 \
++    OPENCODE_TURNS_CALL_TIMEOUT=20 \
++    OPENCODE_TURNS_DEADLINE=60 \
++    "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
++  RUN_STATUS=$?
++  set -e
++}
++
+ test_timestampless_session_list_applies_max_sessions_cap() {
+   local tmpdir
+   tmpdir="$(mktemp -d)"
+@@ -506,6 +727,7 @@ test_base_dir_suffix_selects_matching_opencode_command() {
+   set +e
+   env -u OPENCODE_BIN \
+     PATH="$tmpdir/bin:$PATH" \
++    SESSION_ID=ses_env_ignored \
+     OPENCODE_TURNS_WINDOW_HOURS=6 \
+     OPENCODE_TURNS_MAX_SESSIONS=25 \
+     OPENCODE_TURNS_CALL_TIMEOUT=20 \
+@@ -520,10 +742,42 @@ test_base_dir_suffix_selects_matching_opencode_command() {
+   assert_stdout_contains '"role":"user"' "$FUNCNAME user record"
+ }
+ 
++test_current_export_info_metadata_emits_turns() {
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++  trap "rm -rf '$tmpdir'" RETURN
++
++  mkdir -p "$tmpdir/bin"
++  write_current_export_mock "$tmpdir/bin/opencode"
++
++  run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
++
++  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
++  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_current_requested" "$FUNCNAME export"
++  assert_current_export_records "$FUNCNAME"
++}
++
++test_session_id_env_used_when_no_positional_sessions() {
++  local tmpdir
++  tmpdir="$(mktemp -d)"
++  trap "rm -rf '$tmpdir'" RETURN
++
++  mkdir -p "$tmpdir/bin"
++  write_session_id_env_mock "$tmpdir/bin/opencode"
++
++  run_opencode_turns_with_session_id_env_on_path "$tmpdir" "ses_env_requested"
++
++  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
++  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_env_requested" "$FUNCNAME export"
++  assert_session_id_env_export_records "$FUNCNAME"
++}
++
+ test_timestampless_session_list_applies_max_sessions_cap
+ test_exports_only_recent_window_sessions
+ test_timeout_emits_degraded_best_effort_and_exits_zero
+ test_timeout_kills_opencode_process_group_descendant
+ test_base_dir_suffix_selects_matching_opencode_command
++test_current_export_info_metadata_emits_turns
++test_session_id_env_used_when_no_positional_sessions
+ 
+ echo "opencode-turns tests passed"
+diff --git a/src-tauri/src/dispatch.rs b/src-tauri/src/dispatch.rs
+index cd33938..99566ed 100644
+--- a/src-tauri/src/dispatch.rs
++++ b/src-tauri/src/dispatch.rs
+@@ -84,6 +84,9 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
+     if let Err(err) = recover_pending_session_replaces() {
+         return Ok(handle_pending_session_replace_error(&err));
+     }
++    if startup_wake_reclaim_sweep_enabled(&cli) {
++        crate::wake_coordinator::run_startup_wake_reclaim_sweep();
++    }
+ 
+     if cli.new {
+         return run_default_provider_repl(&cli);
+@@ -114,6 +117,20 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
+     crate::commands::direct_model::run_agent_cli(&cli, &agent_runtime_services)
+ }
+ 
++fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
++    if cli.resume.is_some() {
++        return false;
++    }
++    !matches!(
++        &cli.command,
++        Some(Subcommands::Resume { .. })
++            | Some(Subcommands::Repl {
++                resume: Some(_),
++                ..
++            })
++    )
++}
++
+ fn recover_pending_session_replaces() -> Result<(), session_replace::ReplaceError> {
+     session_replace::recover_pending_replaces()
+ }
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index c935aec..809bcc2 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -19,6 +19,8 @@ mod app_paths;
+ mod app_state;
+ #[path = "lib_commands.rs"]
+ pub mod commands;
++#[allow(dead_code)]
++mod mailbox_delivery;
+ #[path = "commands/provider_settings.rs"]
+ pub mod provider_settings;
+ mod run_tauri;
+@@ -27,6 +29,8 @@ pub mod terminal_outcome_adapter;
+ #[path = "commands/test_model/mod.rs"]
+ pub mod test_model_command;
+ pub mod usage;
++#[allow(dead_code)]
++mod wake_coordinator;
+ mod wiring;
+ pub mod zero_turn_orchestration;
+ 
+diff --git a/src-tauri/src/mailbox_delivery.rs b/src-tauri/src/mailbox_delivery.rs
+index fee17b6..60c1a8f 100644
+--- a/src-tauri/src/mailbox_delivery.rs
++++ b/src-tauri/src/mailbox_delivery.rs
+@@ -2,12 +2,16 @@
+ //!
+ //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
+ 
+-use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeUpsert};
++use oulipoly_state::mailbox::{
++    MailboxDb, MailboxRow, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
++};
+ use std::path::Path;
+ use uuid::Uuid;
+ 
+ const MAILBOX_BATCH_MAX_ROWS: usize = 20;
+ const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
++const MAILBOX_DELIVERY_UNCONFIRMED: &str = "mailbox_delivery_unconfirmed";
++const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
+ const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
+ const DELIVERY_NONCE_SUFFIX: &str = "]";
+ const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
+@@ -57,12 +61,31 @@ pub(crate) fn prepare_headless_resume_delivery(
+     Ok(delivery_for_pending(session_id, pending, answer))
+ }
+ 
++pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, String> {
++    let Some(db) = open_mailbox_sidecar()? else {
++        return Ok(0);
++    };
++    pending_mailbox_rows(&db, session_id).map(|rows| rows.len())
++}
++
+ fn delivery_session_id(resolved: &oulipoly_state::ResolvedResume) -> String {
+     resolved.active_session_id.clone()
+ }
+ 
+ fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxRow>, String> {
+-    db.list_pending(session_id)
++    db.list_pending(session_id).map(deliverable_pending_rows)
++}
++
++fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
++    rows.into_iter()
++        .filter(mailbox_row_is_deliverable_pending)
++        .collect()
++}
++
++fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
++    row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
++        && (row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED)
++            || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS)
+ }
+ 
+ fn delivery_for_pending(
+diff --git a/src-tauri/src/run/resume/orchestration.rs b/src-tauri/src/run/resume/orchestration.rs
+index 2e20ca6..c52750c 100644
+--- a/src-tauri/src/run/resume/orchestration.rs
++++ b/src-tauri/src/run/resume/orchestration.rs
+@@ -7,12 +7,12 @@ use std::io::IsTerminal;
+ use std::path::Path;
+ use std::sync::Arc;
+ 
+-use oulipoly_runtime::executor;
+ use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+ use oulipoly_runtime::services::{
+     ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
+     ResumeServiceOutput, ServiceError,
+ };
++use oulipoly_runtime::{executor, sessions};
+ use sha2::{Digest, Sha256};
+ 
+ use super::disposition::{
+@@ -718,6 +718,8 @@ fn handle_resume_attempt_terminal_signal(
+         return Ok(control);
+     }
+ 
++    ingest_mailbox_delivery_confirmation_turn_if_needed(input, provider, result, zero_turn_action);
++
+     if let Some(control) = handle_unconfirmed_mailbox_delivery_if_needed(
+         input,
+         attempt,
+@@ -732,6 +734,35 @@ fn handle_resume_attempt_terminal_signal(
+     finalize_completed_attempt_for_resume(input, attempt, provider, provider_session_id, result)
+ }
+ 
++fn ingest_mailbox_delivery_confirmation_turn_if_needed(
++    input: &ResumeAttemptInput<'_>,
++    provider: &oulipoly_config::ProviderConfig,
++    result: &executor::ExecutionResult,
++    zero_turn_action: ZeroTurnAction,
++) {
++    if !mailbox_delivery_requires_turn_confirmation(input, &provider.name, result) {
++        return;
++    }
++    if mailbox_delivery_turn_confirmed(input, &provider.name, result, zero_turn_action) {
++        return;
++    }
++    let report = sessions::scan_provider_session(
++        &provider.name,
++        &input.env.sessions_cfg,
++        &input.env.state,
++        &input.resolved.active_session_id,
++    );
++    emit_pre_confirmation_session_scan_errors(&provider.name, report.errors);
++}
++
++fn emit_pre_confirmation_session_scan_errors(provider_name: &str, errors: Vec<String>) {
++    for error in errors {
++        formatter::emit_stderr(&format!(
++            "Warning: Session ingest failed for {provider_name}: {error}"
++        ));
++    }
++}
++
+ enum ResumeTerminalDispositionOutcome {
+     Continue(i32),
+     Return(i32),
+@@ -919,6 +950,18 @@ fn ingested_user_turn_confirms_mailbox_delivery(
+     input: &ResumeAttemptInput<'_>,
+     provider_name: &str,
+ ) -> bool {
++    if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
++        return input
++            .env
++            .state
++            .has_session_user_turn_containing(
++                provider_name,
++                &input.resolved.active_session_id,
++                delivery_nonce,
++            )
++            .unwrap_or(false);
++    }
++
+     let Some(answer) = input.answer else {
+         return false;
+     };
+diff --git a/src-tauri/src/run_tauri.rs b/src-tauri/src/run_tauri.rs
+index 46d315b..54f7421 100644
+--- a/src-tauri/src/run_tauri.rs
++++ b/src-tauri/src/run_tauri.rs
+@@ -31,6 +31,7 @@ pub fn run_tauri() {
+     let models_dir = default_models_dir();
+     let config_root = app_paths::models_config_root(&models_dir);
+     let runtime_paths = runtime_paths_for(&models_dir, &config_root);
++    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
+     let services = wiring::AgentRuntimeServices::production(runtime_paths)
+         .expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
+ 
+diff --git a/src-tauri/src/wake_coordinator.rs b/src-tauri/src/wake_coordinator.rs
+index c1d66a3..6ff4c0b 100644
+--- a/src-tauri/src/wake_coordinator.rs
++++ b/src-tauri/src/wake_coordinator.rs
+@@ -1,15 +1,19 @@
+ //! ## Declared roles
+ //!
+-//! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`,
+-//! `validator`
++//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
++//! `predicate`, `validator`
+ 
++use oulipoly_state::StateDb;
+ use oulipoly_state::mailbox::{
+-    MailboxDb, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
+-    WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow,
++    MailboxDb, MailboxRow, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
++    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow,
++    WakeSweepCandidate,
+ };
++use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
+ use serde::Serialize;
+ use std::path::PathBuf;
+ use std::process::{Child, Command, Stdio};
++use std::sync::OnceLock;
+ use std::time::Duration;
+ use uuid::Uuid;
+ 
+@@ -29,6 +33,13 @@ const DEFAULT_AUTO_WAKE_MAX: i64 = 5;
+ const DEFAULT_AUTO_WAKE_RETRY_BASE_MS: u64 = 1_000;
+ const AUTO_WAKE_RETRY_MAX_MS: u64 = 30_000;
+ const WAKE_CLAIM_STALE_AFTER_SECONDS: i64 = 10 * 60;
++const WAKE_RECLAIM_SWEEP_LIMIT: usize = 8;
++const WAKE_RECLAIM_SWEEP_SCAN_LIMIT: usize = WAKE_RECLAIM_SWEEP_LIMIT * 32;
++const WAKE_RECLAIM_REAP_SESSION_LIMIT: usize = 32;
++const WAKE_RECLAIM_REAP_ROWS_PER_SESSION: usize = 20;
++#[allow(dead_code)]
++const WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS: u64 = 60;
++const CONSUMED_NOTIFICATION_MARKER: &str = "[OULIPOLY NOTIFICATIONS]";
+ 
+ #[derive(Debug, Clone, Serialize)]
+ pub(crate) struct WakeDiagnostic {
+@@ -89,6 +100,327 @@ pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
+     })
+ }
+ 
++pub(crate) fn run_startup_wake_reclaim_sweep() {
++    if is_auto_wake_invocation() {
++        return;
++    }
++    run_wake_reclaim_sweep_or_warn("process_start");
++}
++
++#[allow(dead_code)]
++pub(crate) fn start_wake_reclaim_maintenance_driver() {
++    static DRIVER: OnceLock<()> = OnceLock::new();
++    DRIVER.get_or_init(spawn_wake_reclaim_maintenance_driver);
++}
++
++#[allow(dead_code)]
++fn spawn_wake_reclaim_maintenance_driver() {
++    let result = std::thread::Builder::new()
++        .name("oulipoly-wake-reclaim-sweep".to_string())
++        .spawn(wake_reclaim_maintenance_loop);
++    if let Err(err) = result {
++        tracing::warn!("Failed to start wake reclaim sweep driver: {err}");
++    }
++}
++
++#[allow(dead_code)]
++fn wake_reclaim_maintenance_loop() {
++    run_wake_reclaim_sweep_or_warn("maintenance_start");
++    loop {
++        std::thread::sleep(Duration::from_secs(WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS));
++        run_wake_reclaim_sweep_or_warn("maintenance_tick");
++    }
++}
++
++fn run_wake_reclaim_sweep_or_warn(trigger: &str) {
++    if let Err(err) = run_wake_reclaim_sweep(trigger) {
++        tracing::warn!(trigger, "Wake reclaim sweep failed: {err}");
++    }
++}
++
++fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
++    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
++        return Ok(());
++    };
++    let candidates = db.wake_sweep_candidates(
++        WAKE_CLAIM_STALE_AFTER_SECONDS,
++        WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
++    )?;
++    let plan = wake_sweep_plan(&mut db, candidates)?;
++    reap_abandoned_sweep_candidates(&mut db, &plan.reap)?;
++    drop(db);
++    for candidate in plan.start {
++        let diagnostic = start_wake_chain(StartWakeInput {
++            session_id: &candidate.session_id,
++            reason: trigger,
++            auto_wake_count: candidate.auto_wake_count,
++            renew_token: None,
++        });
++        trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
++    }
++    Ok(())
++}
++
++struct WakeSweepPlan {
++    start: Vec<WakeSweepCandidate>,
++    reap: Vec<WakeSweepCandidate>,
++}
++
++fn wake_sweep_plan(
++    db: &mut MailboxDb,
++    candidates: Vec<WakeSweepCandidate>,
++) -> Result<WakeSweepPlan, String> {
++    let (recoverable, reap) = partition_wake_sweep_candidates(db, candidates)?;
++    let start = select_recoverable_sweep_candidates(recoverable);
++    Ok(wake_sweep_plan_from_selected(start, reap))
++}
++
++fn partition_wake_sweep_candidates(
++    db: &mut MailboxDb,
++    candidates: Vec<WakeSweepCandidate>,
++) -> Result<(Vec<WakeSweepCandidate>, Vec<WakeSweepCandidate>), String> {
++    let state = open_default_state_read_only();
++    let mut recoverable = Vec::new();
++    let mut reap = Vec::new();
++    for candidate in candidates {
++        match wake_sweep_candidate_disposition(db, state.as_ref(), &candidate)? {
++            WakeSweepDisposition::Recoverable => {
++                recoverable.push(candidate);
++            }
++            WakeSweepDisposition::Abandoned => {
++                if reap.len() < WAKE_RECLAIM_REAP_SESSION_LIMIT {
++                    reap.push(candidate);
++                }
++            }
++            WakeSweepDisposition::Skip => {}
++        }
++    }
++    Ok((recoverable, reap))
++}
++
++fn wake_sweep_plan_from_selected(
++    start: Vec<WakeSweepCandidate>,
++    reap: Vec<WakeSweepCandidate>,
++) -> WakeSweepPlan {
++    WakeSweepPlan { start, reap }
++}
++
++fn select_recoverable_sweep_candidates(
++    mut candidates: Vec<WakeSweepCandidate>,
++) -> Vec<WakeSweepCandidate> {
++    if candidates.len() <= WAKE_RECLAIM_SWEEP_LIMIT {
++        return candidates;
++    }
++    candidates.sort_by_key(|candidate| candidate.min_pending_seq);
++    let oldest_slots = WAKE_RECLAIM_SWEEP_LIMIT.div_ceil(2);
++    let newest_slots = WAKE_RECLAIM_SWEEP_LIMIT.saturating_sub(oldest_slots);
++    let mut selected = candidates
++        .iter()
++        .take(oldest_slots)
++        .cloned()
++        .collect::<Vec<_>>();
++    for candidate in candidates.iter().rev().take(newest_slots) {
++        if !selected
++            .iter()
++            .any(|existing| existing.session_id == candidate.session_id)
++        {
++            selected.push(candidate.clone());
++        }
++    }
++    selected
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum WakeSweepDisposition {
++    Recoverable,
++    Abandoned,
++    Skip,
++}
++
++fn wake_sweep_candidate_disposition(
++    db: &MailboxDb,
++    state: Option<&StateDb>,
++    candidate: &WakeSweepCandidate,
++) -> Result<WakeSweepDisposition, String> {
++    // Recoverable means either an idle headless runtime with durable resume
++    // evidence, or a live owner PID identity that must not be reaped. Missing
++    // runtime/history with no live owner is abandoned debris, not resumable work.
++    if pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
++        return Ok(WakeSweepDisposition::Skip);
++    }
++    if wake_sweep_candidate_is_resumable(db, state, candidate)? {
++        return Ok(resumable_wake_sweep_disposition(candidate));
++    }
++    if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
++        return Ok(WakeSweepDisposition::Skip);
++    }
++    Ok(WakeSweepDisposition::Abandoned)
++}
++
++fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
++    if wake_sweep_candidate_reached_cap(candidate)
++        || !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id)
++    {
++        return WakeSweepDisposition::Skip;
++    }
++    WakeSweepDisposition::Recoverable
++}
++
++fn reap_abandoned_sweep_candidates(
++    db: &mut MailboxDb,
++    candidates: &[WakeSweepCandidate],
++) -> Result<(), String> {
++    for candidate in candidates {
++        db.mark_pending_abandoned(
++            &candidate.session_id,
++            WAKE_SWEEP_ABANDONED_ERROR,
++            WAKE_RECLAIM_REAP_ROWS_PER_SESSION,
++        )?;
++    }
++    Ok(())
++}
++
++fn wake_sweep_candidate_has_deliverable_pending(session_id: &str) -> bool {
++    crate::mailbox_delivery::deliverable_pending_count(session_id)
++        .map(|count| count > 0)
++        .unwrap_or(false)
++}
++
++fn wake_sweep_candidate_is_resumable(
++    db: &MailboxDb,
++    state: Option<&StateDb>,
++    candidate: &WakeSweepCandidate,
++) -> Result<bool, String> {
++    let Some(runtime) = db.session_runtime(&candidate.session_id)? else {
++        return Ok(false);
++    };
++    if !wake_sweep_runtime_can_resume(&runtime) {
++        return Ok(false);
++    }
++    wake_sweep_runtime_has_resume_evidence(state, &runtime)
++}
++
++fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
++    runtime.mode == "headless"
++        && runtime.run_state != "running"
++        && runtime
++            .provider_name
++            .as_deref()
++            .is_some_and(|provider| !provider.is_empty())
++}
++
++fn wake_sweep_runtime_has_resume_evidence(
++    state: Option<&StateDb>,
++    runtime: &SessionRuntimeRow,
++) -> Result<bool, String> {
++    let Some(state) = state else {
++        return Ok(false);
++    };
++    let Some(provider_name) = runtime.provider_name.as_deref() else {
++        return Ok(false);
++    };
++    if state
++        .chain_id_for_segment(provider_name, &runtime.session_id)
++        .map_err(|err| err.to_string())?
++        .is_some()
++    {
++        return Ok(true);
++    }
++    state
++        .count_session_turns(provider_name, &runtime.session_id)
++        .map(|counts| counts.total > 0)
++}
++
++fn wake_sweep_candidate_has_live_owner(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
++    for row in db.list_pending(session_id)? {
++        if mailbox_row_has_live_owner_identity(&row)? {
++            return Ok(true);
++        }
++    }
++    Ok(false)
++}
++
++fn mailbox_row_has_live_owner_identity(row: &MailboxRow) -> Result<bool, String> {
++    let Some(recorded) = mailbox_row_owner_identity(row) else {
++        return Ok(false);
++    };
++    read_live_process_identity(recorded.os_pid).map(|live| live.as_ref() == Some(&recorded))
++}
++
++fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
++    Some(ProcessIdentity {
++        os_pid: row.matched_os_pid?,
++        os_boot_id: row.matched_os_boot_id.clone()?,
++        os_pid_starttime_ticks: row.matched_os_pid_starttime_ticks?,
++    })
++}
++
++fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate) -> bool {
++    auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max())
++}
++
++fn pending_mailbox_consumed_marker_present(db: &MailboxDb, session_id: &str) -> bool {
++    let Ok(pending) = db.list_pending(session_id) else {
++        return false;
++    };
++    if pending.is_empty() {
++        return true;
++    }
++    let Some(provider_name) = pending_mailbox_provider_name(db, session_id) else {
++        return false;
++    };
++    let Some(state) = open_default_state_read_only() else {
++        return false;
++    };
++    session_has_consumed_notification_marker(&state, &provider_name, session_id)
++        && pending.iter().all(|row| {
++            state
++                .has_session_user_turn_containing(
++                    &provider_name,
++                    session_id,
++                    &mailbox_handle_marker(row),
++                )
++                .unwrap_or(false)
++        })
++}
++
++fn mailbox_handle_marker(row: &MailboxRow) -> String {
++    format!("handle: {}", row.handle)
++}
++
++fn open_default_state_read_only() -> Option<StateDb> {
++    let path = StateDb::default_path().ok()?;
++    if !path.exists() {
++        return None;
++    }
++    StateDb::open_read_only(&path).ok()
++}
++
++fn pending_mailbox_provider_name(db: &MailboxDb, session_id: &str) -> Option<String> {
++    db.session_runtime(session_id)
++        .ok()
++        .flatten()
++        .and_then(|runtime| runtime.provider_name)
++}
++
++fn session_has_consumed_notification_marker(
++    state: &StateDb,
++    provider_name: &str,
++    session_id: &str,
++) -> bool {
++    state
++        .has_session_user_turn_containing(provider_name, session_id, CONSUMED_NOTIFICATION_MARKER)
++        .unwrap_or(false)
++}
++
++fn trace_wake_sweep_candidate(session_id: &str, diagnostic: &WakeDiagnostic) {
++    tracing::debug!(
++        session_id,
++        status = diagnostic.status.as_str(),
++        "Wake reclaim sweep candidate evaluated"
++    );
++}
++
+ pub(crate) fn mark_successful_turn_idle_and_recheck(
+     session_id: &str,
+     invocation_uuid: &str,
+@@ -412,7 +744,13 @@ fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
+         &context.claim.claim_token,
+         input.auto_wake_count,
+     );
+-    wake_spawn_diagnostic(&mut context.db, input, context.claim, spawn)
++    wake_spawn_diagnostic(
++        &mut context.db,
++        input,
++        context.runtime.as_ref(),
++        context.claim,
++        spawn,
++    )
+ }
+ 
+ struct WakeStartContext {
+@@ -468,11 +806,12 @@ fn wake_claim_to_start(result: WakeClaimAcquireResult) -> Result<WakeClaimRow, W
+ fn wake_spawn_diagnostic(
+     db: &mut MailboxDb,
+     input: StartWakeInput<'_>,
++    runtime: Option<&SessionRuntimeRow>,
+     claim: WakeClaimRow,
+     spawn: Result<i64, String>,
+ ) -> WakeDiagnostic {
+     match spawn {
+-        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, claim, wake_pid),
++        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, runtime, claim, wake_pid),
+         Err(err) => failed_wake_spawn_diagnostic(db, input, claim, err),
+     }
+ }
+@@ -480,10 +819,11 @@ fn wake_spawn_diagnostic(
+ fn successful_wake_spawn_diagnostic(
+     db: &mut MailboxDb,
+     input: StartWakeInput<'_>,
++    runtime: Option<&SessionRuntimeRow>,
+     claim: WakeClaimRow,
+     wake_pid: i64,
+ ) -> WakeDiagnostic {
+-    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid);
++    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid, runtime);
+     spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
+ }
+ 
+@@ -581,8 +921,22 @@ fn already_in_flight_diagnostic(claim: WakeClaimRow) -> WakeDiagnostic {
+     diagnostic
+ }
+ 
+-fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &str, wake_pid: i64) {
+-    if let Err(err) = db.record_wake_claim_pid(session_id, claim_token, wake_pid) {
++fn record_wake_pid_or_warn(
++    db: &mut MailboxDb,
++    session_id: &str,
++    claim_token: &str,
++    wake_pid: i64,
++    runtime: Option<&SessionRuntimeRow>,
++) {
++    let provider_name = runtime.and_then(|row| row.provider_name.as_deref());
++    let model_name = runtime.and_then(|row| row.model_name.as_deref());
++    if let Err(err) = db.record_wake_claim_pid_identity(
++        session_id,
++        claim_token,
++        wake_pid,
++        provider_name,
++        model_name,
++    ) {
+         tracing::warn!(session_id, claim_token, "Failed to record wake PID: {err}");
+     }
+ }
+@@ -711,10 +1065,7 @@ fn configure_detached(cmd: &mut Command) {
+ fn configure_detached(_cmd: &mut Command) {}
+ 
+ fn pending_count(session_id: &str) -> Result<usize, String> {
+-    let Some(db) = MailboxDb::open_default_if_exists()? else {
+-        return Ok(0);
+-    };
+-    db.list_pending(session_id).map(|rows| rows.len())
++    crate::mailbox_delivery::deliverable_pending_count(session_id)
+ }
+ 
+ fn current_auto_wake() -> Option<AutoWakeEnv> {
+diff --git a/src-tauri/tests/s11_external_provider_wake.rs b/src-tauri/tests/s11_external_provider_wake.rs
+index 47b80bb..909e1f8 100644
+--- a/src-tauri/tests/s11_external_provider_wake.rs
++++ b/src-tauri/tests/s11_external_provider_wake.rs
+@@ -1,5 +1,39 @@
+ #![cfg(unix)]
+ 
++//! ## Declared roles
++//!
++//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
++//! predicate, filter.
++//!
++//! TEST: external-provider wake/resume end-to-end fixtures — fake provider
++//! CLI script formatters, fixture model mappers, state/sidecar accessors,
++//! JSON/record parsers, pending-delivery predicates and filters, durable row
++//! validators, and test orchestration.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: src-tauri/tests/s11_external_provider_wake.rs
++//!     role: adapter
++//!     Translates:
++//!       - external-provider-runtime-cli-contract
++//!       - wake-notification-delivery-contract
++//!       - pid-identity-sidecar-contract
++//!       - invocation-state-db-contract
++//!       - test-fixture-process-contract
++//! intrinsic_surface_declarations:
++//!   - component: src-tauri/tests/s11_external_provider_wake.rs
++//!     role: intrinsic-surface
++//!     Domain: external-provider wake CLI regression suite
++//!     Owns:
++//!       - isolated config/data fixture materialization
++//!       - external provider Python script generation and executable setup
++//!       - wake command invocation and environment isolation
++//!       - provider record parsing and subcommand filtering assertions
++//!       - sidecar wake-claim and mailbox delivery assertions
++//! ```
++
+ use oulipoly_state::mailbox::MailboxDb;
+ use rusqlite::{Connection, params};
+ use serde_json::Value;
+@@ -66,6 +100,10 @@ impl Fixture {
+             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
+             .env("S11_WORK_DIR", &self.work_dir)
+             .env_remove("OULIPOLY_DATA_DIR")
++            .env_remove("OULIPOLY_AUTO_WAKE")
++            .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
++            .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
++            .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
+             .env_remove("OULIPOLY_PARENT_INVOCATION")
+             .current_dir(self.dir.path());
+         cmd.output().unwrap()
+diff --git a/src-tauri/tests/wake_confirm_legacy_opencode.rs b/src-tauri/tests/wake_confirm_legacy_opencode.rs
+new file mode 100644
+index 0000000..b37c1f2
+--- /dev/null
++++ b/src-tauri/tests/wake_confirm_legacy_opencode.rs
+@@ -0,0 +1,655 @@
++#![cfg(unix)]
++
++//! ## Declared roles
++//!
++//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
++//! predicate, filter.
++//!
++//! TEST: legacy opencode wake-confirmation fixtures — fake CLI script
++//! formatters, model/config mappers, state and mailbox accessors, transcript
++//! parsers, consumed-notification predicates and filters, delivery/claim row
++//! validators, and test orchestration.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: src-tauri/tests/wake_confirm_legacy_opencode.rs
++//!     role: adapter
++//!     Translates:
++//!       - legacy-opencode-cli-contract
++//!       - wake-confirmation-transcript-contract
++//!       - mailbox-sidecar-contract
++//!       - invocation-state-db-contract
++//!       - test-fixture-process-contract
++//! intrinsic_surface_declarations:
++//!   - component: src-tauri/tests/wake_confirm_legacy_opencode.rs
++//!     role: intrinsic-surface
++//!     Domain: legacy opencode wake-confirmation regression suite
++//!     Owns:
++//!       - isolated config/data fixture materialization
++//!       - fake opencode script generation and executable setup
++//!       - transcript export fixture construction
++//!       - wake/resume command invocation and environment isolation
++//!       - delivery confirmation and consumed-notification assertions
++//! ```
++
++use oulipoly_state::StateDb;
++use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb};
++use rusqlite::{Connection, params};
++use std::fs;
++use std::os::unix::fs::PermissionsExt;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output};
++use std::sync::{Mutex, MutexGuard, OnceLock};
++use std::time::{Duration, Instant};
++
++const MODEL: &str = "wake-confirm-legacy-opencode";
++const PROVIDER: &str = "opencode";
++const SESSION: &str = "ses_wakeconfirmlegacy";
++const HANDLE: &str = "h-wake-confirm-legacy";
++const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
++
++struct Fixture {
++    dir: tempfile::TempDir,
++    config_home: PathBuf,
++    data_home: PathBuf,
++    home_dir: PathBuf,
++    app_config_dir: PathBuf,
++    models_dir: PathBuf,
++    bin_dir: PathBuf,
++    work_dir: PathBuf,
++    export_dir: PathBuf,
++}
++
++impl Fixture {
++    fn new() -> Self {
++        let dir = tempfile::tempdir().unwrap();
++        let config_home = dir.path().join("xdg-config");
++        let data_home = dir.path().join("xdg-data");
++        let home_dir = dir.path().join("home");
++        let app_config_dir = config_home.join("oulipoly-agent-runner");
++        let models_dir = app_config_dir.join("models");
++        let bin_dir = dir.path().join("bin");
++        let work_dir = dir.path().join("work");
++        let export_dir = dir.path().join("fake-opencode-export");
++        fs::create_dir_all(&models_dir).unwrap();
++        fs::create_dir_all(&bin_dir).unwrap();
++        fs::create_dir_all(&work_dir).unwrap();
++        fs::create_dir_all(&export_dir).unwrap();
++        fs::create_dir_all(&home_dir).unwrap();
++        Self {
++            dir,
++            config_home,
++            data_home,
++            home_dir,
++            app_config_dir,
++            models_dir,
++            bin_dir,
++            work_dir,
++            export_dir,
++        }
++    }
++
++    fn app_data_dir(&self) -> PathBuf {
++        self.data_home.join("oulipoly-agent-runner")
++    }
++
++    fn sidecar_path(&self) -> PathBuf {
++        self.app_data_dir().join("pid-identity.db")
++    }
++
++    fn state_path(&self) -> PathBuf {
++        self.app_data_dir().join("state.db")
++    }
++
++    fn run(&self, mut cmd: Command) -> Output {
++        cmd.env("XDG_CONFIG_HOME", &self.config_home)
++            .env("XDG_DATA_HOME", &self.data_home)
++            .env("HOME", &self.home_dir)
++            .env("PATH", self.path_env())
++            .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
++            .env("WAKE_CONFIRM_WORK_DIR", &self.work_dir)
++            .env("WAKE_CONFIRM_EXPORT_DIR", &self.export_dir)
++            .env_remove("OULIPOLY_DATA_DIR")
++            .env_remove("OULIPOLY_AUTO_WAKE")
++            .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
++            .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
++            .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
++            .env_remove("OULIPOLY_PARENT_INVOCATION")
++            .current_dir(self.dir.path());
++        cmd.output().unwrap()
++    }
++
++    fn path_env(&self) -> String {
++        let current = std::env::var("PATH").unwrap_or_default();
++        format!("{}:{current}", self.bin_dir.display())
++    }
++
++    fn run_agent(&self, prompt: &str) -> Output {
++        let mut cmd = Command::new(runner_bin());
++        cmd.env("WAKE_CONFIRM_NO_NOTIFY", "1")
++            .arg("-m")
++            .arg(MODEL)
++            .arg("--models-dir")
++            .arg(&self.models_dir)
++            .arg(prompt);
++        self.run(cmd)
++    }
++
++    fn run_resume_with_env(&self, envs: &[(&str, &str)]) -> Output {
++        let mut cmd = Command::new(runner_bin());
++        for (key, value) in envs {
++            cmd.env(key, value);
++        }
++        cmd.arg("resume")
++            .arg("--session-id")
++            .arg(SESSION)
++            .arg("-m")
++            .arg(MODEL)
++            .arg("--models-dir")
++            .arg(&self.models_dir);
++        self.run(cmd)
++    }
++
++    fn write_legacy_opencode(&self) {
++        self.write_executable("opencode", fake_opencode_script());
++        self.write_executable("opencode-turns", fake_opencode_turns_script());
++        fs::write(
++            self.models_dir.join(format!("{MODEL}.toml")),
++            format!(
++                r#"prompt_mode = "arg"
++
++[[providers]]
++name = "{PROVIDER}"
++args = []
++"#,
++            ),
++        )
++        .unwrap();
++        fs::write(
++            self.app_config_dir.join("providers.toml"),
++            format!(
++                r#"[{PROVIDER}]
++command = "opencode"
++args = ["run"]
++prompt_mode = "arg"
++
++[{PROVIDER}.session_capture]
++kind = "stdout_json_event"
++json_args = ["--json"]
++event_type = "step_start"
++event_id_path = "sessionID"
++
++[{PROVIDER}.resume]
++kind = "flag"
++flag = "--session"
++"#,
++            ),
++        )
++        .unwrap();
++        fs::write(
++            self.app_config_dir.join("sessions.toml"),
++            format!(
++                r#"[{PROVIDER}]
++turn_script = "opencode-turns"
++state_dir = {}
++"#,
++                toml_string(&path_string(&self.work_dir.join("turn-state")))
++            ),
++        )
++        .unwrap();
++    }
++
++    fn write_executable(&self, name: &str, body: &str) -> PathBuf {
++        let path = self.bin_dir.join(name);
++        fs::write(&path, body).unwrap();
++        let mut perms = fs::metadata(&path).unwrap().permissions();
++        perms.set_mode(0o755);
++        fs::set_permissions(&path, perms).unwrap();
++        path
++    }
++
++    fn mailbox(&self) -> MailboxDb {
++        MailboxDb::open(&self.sidecar_path()).unwrap()
++    }
++
++    fn state(&self) -> StateDb {
++        StateDb::open(&self.state_path()).unwrap()
++    }
++
++    fn ensure_active_chain_for_legacy_session(&self) {
++        if self
++            .state()
++            .chain_id_for_segment(PROVIDER, SESSION)
++            .unwrap()
++            .is_some()
++        {
++            return;
++        }
++        let conn = Connection::open(self.state_path()).unwrap();
++        conn.execute(
++            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
++             VALUES (?1, '2026-06-07T00:00:00Z', '2026-06-07T00:00:00Z', ?2)",
++            params![CHAIN_ID, MODEL],
++        )
++        .unwrap();
++        conn.execute(
++            "INSERT INTO session_chain_segments
++                (chain_id, provider_name, session_id, started_at, transition_reason)
++             VALUES (?1, ?2, ?3, '2026-06-07T00:00:00Z', 'initial')",
++            params![CHAIN_ID, PROVIDER, SESSION],
++        )
++        .unwrap();
++    }
++
++    fn seed_mailbox_notification(&self) {
++        let state_dir = self.work_dir.join(HANDLE);
++        fs::create_dir_all(&state_dir).unwrap();
++        let meta = state_dir.join("meta.json");
++        let log = state_dir.join("log");
++        let rc = state_dir.join("rc");
++        fs::write(&meta, r#"{"caller_chain":[]}"#).unwrap();
++        fs::write(&log, "legacy opencode workload completed\n").unwrap();
++        fs::write(&rc, "0\n").unwrap();
++        let payload_json = serde_json::json!({
++            "schema_version": 1,
++            "kind": "agent_bash_complete",
++            "handle": HANDLE,
++            "state_dir": path_string(&state_dir),
++            "meta_path": path_string(&meta),
++            "log_path": path_string(&log),
++            "rc_path": path_string(&rc),
++            "rc": 0,
++        })
++        .to_string();
++        let mut mailbox = self.mailbox();
++        mailbox
++            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
++                session_id: SESSION,
++                handle: HANDLE,
++                payload_json: &payload_json,
++                owner_invocation_uuid: None,
++                matched_os_pid: None,
++                matched_os_boot_id: None,
++                matched_os_pid_starttime_ticks: None,
++                matched_chain_index: None,
++                state_dir: &path_string(&state_dir),
++                meta_path: &path_string(&meta),
++                log_path: &path_string(&log),
++                rc_path: &path_string(&rc),
++                rc: 0,
++            })
++            .unwrap();
++    }
++
++    fn notification_prompt_path(&self) -> PathBuf {
++        self.work_dir.join("legacy-wake-resumed.txt")
++    }
++
++    fn export_path(&self) -> PathBuf {
++        self.export_dir.join(format!("{SESSION}.jsonl"))
++    }
++
++    fn export_text(&self) -> String {
++        fs::read_to_string(self.export_path()).unwrap_or_default()
++    }
++
++    fn unconfirmed_invocation_count(&self) -> i64 {
++        Connection::open(self.state_path())
++            .unwrap()
++            .query_row(
++                "SELECT COUNT(*) FROM invocations WHERE error_category = 'mailbox_delivery_unconfirmed'",
++                [],
++                |row| row.get(0),
++            )
++            .unwrap()
++    }
++
++    fn assert_xdg_isolated(&self) {
++        assert!(
++            !self.home_dir.join(".config/oulipoly-agent-runner").exists(),
++            "config must stay in isolated XDG_CONFIG_HOME"
++        );
++        assert!(
++            !self
++                .home_dir
++                .join(".local/share/oulipoly-agent-runner")
++                .exists(),
++            "state must stay in isolated XDG_DATA_HOME"
++        );
++    }
++}
++
++#[test]
++fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
++    let _guard = integration_test_guard();
++    let fixture = prepared_fixture();
++    fixture.seed_mailbox_notification();
++
++    let output = fixture.run_resume_with_env(&[]);
++    let prompt = wait_for_file(&fixture.notification_prompt_path());
++    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
++    assert!(prompt.contains("kind: agent_bash_complete"), "{prompt}");
++    assert!(prompt.contains("handle: h-wake-confirm-legacy"), "{prompt}");
++    assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
++    wait_until("fake opencode export contains delivery nonce", || {
++        let exported = fixture.export_text();
++        exported.contains("[OULIPOLY NOTIFICATIONS]") && exported.contains("[OULIPOLY-DELIVERY ")
++    });
++
++    assert_success(&output);
++    wait_until("legacy opencode delivery marked delivered", || {
++        let db = fixture.mailbox();
++        let rows = db.list_mailbox(SESSION, true).unwrap();
++        rows.len() == 1
++            && rows[0].delivered_at.is_some()
++            && rows[0].delivery_error.is_none()
++            && rows[0].delivery_attempts == 1
++            && rows[0].delivered_by_invocation_uuid.is_some()
++    });
++    assert!(
++        !fixture
++            .state()
++            .has_session_user_text_turn(PROVIDER, SESSION, &prompt)
++            .unwrap(),
++        "fixture should quote-wrap the delivered user body so exact-text confirmation stays red"
++    );
++    assert!(
++        fixture
++            .state()
++            .has_session_user_turn_containing(
++                PROVIDER,
++                SESSION,
++                &delivery_nonce_from_prompt(&prompt)
++            )
++            .unwrap(),
++        "session_turns should contain the delivery nonce in the quote-wrapped user body"
++    );
++    assert_eq!(fixture.unconfirmed_invocation_count(), 0);
++    assert!(fixture.mailbox().list_pending(SESSION).unwrap().is_empty());
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn legacy_opencode_resume_leaves_mailbox_pending_when_ingested_turn_omits_delivery_nonce() {
++    let _guard = integration_test_guard();
++    let fixture = prepared_fixture();
++    fixture.seed_mailbox_notification();
++
++    let output = fixture.run_resume_with_env(&[("WAKE_CONFIRM_STRIP_DELIVERY_NONCE", "1")]);
++    assert_exit_code(&output, 1);
++    let prompt = wait_for_file(&fixture.notification_prompt_path());
++    assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
++    wait_until(
++        "fake opencode export contains user turn without delivery nonce",
++        || {
++            let exported = fixture.export_text();
++            exported.contains("[OULIPOLY NOTIFICATIONS]")
++                && !exported.contains("[OULIPOLY-DELIVERY ")
++        },
++    );
++    wait_until(
++        "nonce-less export leaves mailbox pending unconfirmed",
++        || {
++            let db = fixture.mailbox();
++            let rows = db.list_mailbox(SESSION, true).unwrap();
++            rows.len() == 1
++                && rows[0].delivered_at.is_none()
++                && rows[0].delivery_attempts == 1
++                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
++                && rows[0].delivered_by_invocation_uuid.is_none()
++        },
++    );
++    assert!(
++        !fixture
++            .state()
++            .has_session_user_turn_containing(
++                PROVIDER,
++                SESSION,
++                &delivery_nonce_from_prompt(&prompt)
++            )
++            .unwrap(),
++        "stored resume turn without the delivery nonce must not confirm delivery"
++    );
++    assert_eq!(fixture.unconfirmed_invocation_count(), 1);
++    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn legacy_opencode_resume_leaves_mailbox_pending_when_export_omits_notification_turn() {
++    let _guard = integration_test_guard();
++    let fixture = prepared_fixture();
++    fixture.seed_mailbox_notification();
++
++    let output = fixture.run_resume_with_env(&[("WAKE_CONFIRM_OMIT_RESUME_USER_TURN", "1")]);
++    assert_exit_code(&output, 1);
++    let prompt = wait_for_file(&fixture.notification_prompt_path());
++    assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
++    wait_until("omitted export leaves mailbox pending unconfirmed", || {
++        let db = fixture.mailbox();
++        let rows = db.list_mailbox(SESSION, true).unwrap();
++        rows.len() == 1
++            && rows[0].delivered_at.is_none()
++            && rows[0].delivery_attempts == 1
++            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
++            && rows[0].delivered_by_invocation_uuid.is_none()
++    });
++    assert!(
++        !fixture
++            .state()
++            .has_session_user_text_turn(PROVIDER, SESSION, &prompt)
++            .unwrap(),
++        "omitted export must not create exact user-turn confirmation evidence"
++    );
++    assert_eq!(fixture.unconfirmed_invocation_count(), 1);
++    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
++    fixture.assert_xdg_isolated();
++}
++
++fn prepared_fixture() -> Fixture {
++    let fixture = Fixture::new();
++    fixture.write_legacy_opencode();
++    let output = fixture.run_agent("launch legacy opencode parent");
++    assert_success(&output);
++    fixture.ensure_active_chain_for_legacy_session();
++    wait_until("legacy opencode parent runtime idle", || {
++        fixture
++            .mailbox()
++            .session_runtime(SESSION)
++            .unwrap()
++            .is_some_and(|runtime| runtime.run_state == "idle")
++    });
++    fixture
++}
++
++fn fake_opencode_script() -> &'static str {
++    r#"#!/usr/bin/env python3
++import json
++import os
++import pathlib
++import re
++import sys
++
++SESSION = "ses_wakeconfirmlegacy"
++
++def work_dir():
++    return pathlib.Path(os.environ["WAKE_CONFIRM_WORK_DIR"])
++
++def export_dir():
++    return pathlib.Path(os.environ["WAKE_CONFIRM_EXPORT_DIR"])
++
++def session_path(session_id):
++    return export_dir() / f"{session_id}.jsonl"
++
++def next_turn_id(session_id, role):
++    path = session_path(session_id)
++    if not path.exists():
++        return f"{role}-1"
++    count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
++    return f"{role}-{count + 1}"
++
++def append_turn(session_id, role, text):
++    export_dir().mkdir(parents=True, exist_ok=True)
++    turn = {
++        "session_id": session_id,
++        "turn_id": next_turn_id(session_id, role),
++        "timestamp": "2026-06-07T00:00:00Z",
++        "role": role,
++        "body": [{"type": "text", "text": text}],
++    }
++    with session_path(session_id).open("a", encoding="utf-8") as handle:
++        handle.write(json.dumps(turn, separators=(",", ":")) + "\n")
++
++def stored_resume_prompt(prompt):
++    if os.environ.get("WAKE_CONFIRM_STRIP_DELIVERY_NONCE") == "1":
++        prompt = re.sub(r"^\[OULIPOLY-DELIVERY [^\n]*\]\n?", "", prompt, flags=re.MULTILINE)
++    return f'"{prompt}"'
++
++def parse_run(argv):
++    session_id = SESSION
++    prompt = ""
++    index = 0
++    while index < len(argv):
++        arg = argv[index]
++        if arg == "--session" and index + 1 < len(argv):
++            session_id = argv[index + 1]
++            index += 2
++            continue
++        if arg == "--json":
++            index += 1
++            continue
++        prompt = arg
++        index += 1
++    return session_id, prompt
++
++def run(argv):
++    session_id, prompt = parse_run(argv)
++    if "--session" in argv:
++        (work_dir() / "legacy-wake-resumed.txt").write_text(prompt, encoding="utf-8")
++        if os.environ.get("WAKE_CONFIRM_OMIT_RESUME_USER_TURN") != "1":
++            append_turn(session_id, "user", stored_resume_prompt(prompt))
++        append_turn(session_id, "assistant", "legacy wake acknowledged")
++        print("legacy wake acknowledged", flush=True)
++        return 0
++    print(json.dumps({"type": "step_start", "sessionID": SESSION}), flush=True)
++    append_turn(SESSION, "user", prompt)
++    append_turn(SESSION, "assistant", "legacy parent acknowledged")
++    print("legacy parent acknowledged", flush=True)
++    return 0
++
++def export_session(argv):
++    session_id = argv[0] if argv else SESSION
++    path = session_path(session_id)
++    if path.exists():
++        sys.stdout.write(path.read_text(encoding="utf-8"))
++    return 0
++
++def main():
++    subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
++    if subcommand == "export":
++        return export_session(sys.argv[2:])
++    if subcommand == "run":
++        return run(sys.argv[2:])
++    print(f"unsupported fake opencode subcommand: {subcommand}", file=sys.stderr)
++    return 64
++
++if __name__ == "__main__":
++    raise SystemExit(main())
++"#
++}
++
++fn fake_opencode_turns_script() -> &'static str {
++    r#"#!/usr/bin/env python3
++import os
++import subprocess
++import sys
++
++session_id = os.environ.get("SESSION_ID")
++if not session_id:
++    raise SystemExit(0)
++
++result = subprocess.run(
++    ["opencode", "export", session_id],
++    stdout=subprocess.PIPE,
++    stderr=subprocess.PIPE,
++    text=True,
++    check=False,
++)
++if result.returncode != 0:
++    sys.stderr.write(result.stderr)
++    raise SystemExit(result.returncode)
++sys.stdout.write(result.stdout)
++"#
++}
++
++fn assert_success(output: &Output) {
++    assert_exit_code(output, 0);
++}
++
++fn assert_exit_code(output: &Output, expected: i32) {
++    assert_eq!(
++        output.status.code(),
++        Some(expected),
++        "stdout={}\nstderr={}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++fn wait_for_file(path: &Path) -> String {
++    wait_for_path_exists(path);
++    fs::read_to_string(path).unwrap()
++}
++
++fn wait_for_path_exists(path: &Path) {
++    wait_until(&format!("{} exists", path.display()), || path.exists());
++}
++
++fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
++    let start = Instant::now();
++    while start.elapsed() < Duration::from_secs(10) {
++        if predicate() {
++            return;
++        }
++        std::thread::sleep(Duration::from_millis(50));
++    }
++    panic!("timed out waiting for {label}");
++}
++
++fn delivery_nonce_from_prompt(prompt: &str) -> String {
++    let prefix = "[OULIPOLY-DELIVERY ";
++    let start = prompt
++        .find(prefix)
++        .unwrap_or_else(|| panic!("prompt missing delivery nonce: {prompt}"))
++        + prefix.len();
++    let rest = &prompt[start..];
++    let end = rest
++        .find(']')
++        .unwrap_or_else(|| panic!("prompt has unterminated delivery nonce: {prompt}"));
++    rest[..end].to_string()
++}
++
++fn integration_test_lock() -> &'static Mutex<()> {
++    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
++    LOCK.get_or_init(|| Mutex::new(()))
++}
++
++fn integration_test_guard() -> MutexGuard<'static, ()> {
++    integration_test_lock()
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner())
++}
++
++fn runner_bin() -> &'static str {
++    env!("CARGO_BIN_EXE_oulipoly-agent-runner")
++}
++
++fn path_string(path: &Path) -> String {
++    path.to_string_lossy().into_owned()
++}
++
++fn toml_string(value: &str) -> String {
++    serde_json::to_string(value).unwrap()
++}
+diff --git a/src-tauri/tests/wu_d_proactive_wake_integration.rs b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+index 04433a5..89546a0 100644
+--- a/src-tauri/tests/wu_d_proactive_wake_integration.rs
++++ b/src-tauri/tests/wu_d_proactive_wake_integration.rs
+@@ -1,11 +1,47 @@
+ #![cfg(unix)]
+ 
++//! ## Declared roles
++//!
++//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
++//! predicate, filter.
++//!
++//! TEST: proactive wake and wake-reclaim end-to-end fixtures — fake CLI script
++//! formatters, model/config mappers, state and mailbox accessors, JSON/record
++//! parsers, liveness and delivery predicates/filters, wake-claim and durable
++//! mailbox validators, and test orchestration.
++//!
++//! ## Adapter declarations
++//!
++//! ```yaml
++//! adapter_declarations:
++//!   - component: src-tauri/tests/wu_d_proactive_wake_integration.rs
++//!     role: adapter
++//!     Translates:
++//!       - runtime-cli-dispatch-contract
++//!       - wake-claim-sidecar-contract
++//!       - pid-identity-sidecar-contract
++//!       - mailbox-delivery-contract
++//!       - test-fixture-process-contract
++//! intrinsic_surface_declarations:
++//!   - component: src-tauri/tests/wu_d_proactive_wake_integration.rs
++//!     role: intrinsic-surface
++//!     Domain: proactive wake and wake-reclaim regression suite
++//!     Owns:
++//!       - isolated config/data fixture materialization
++//!       - fake provider script generation and executable setup
++//!       - auto-wake command invocation and environment isolation
++//!       - sidecar wake-claim fixture construction
++//!       - mailbox delivery, busy suppression, and consumed suppression assertions
++//! ```
++
+ use chrono::{DateTime, Utc};
+ use oulipoly_state::mailbox::{
+-    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WakeClaimAcquireResult,
+-    WakeClaimRequest,
++    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
++    WakeClaimAcquireResult, WakeClaimRequest,
++};
++use oulipoly_state::pid_identity::{
++    PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
+ };
+-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
+ use oulipoly_state::{SessionTurnIngest, StateDb};
+ use rusqlite::Connection;
+ use serde_json::{Value, json};
+@@ -78,6 +114,10 @@ impl Fixture {
+             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
+             .env("WU_D_WORK_DIR", &self.work_dir)
+             .env_remove("OULIPOLY_DATA_DIR")
++            .env_remove("OULIPOLY_AUTO_WAKE")
++            .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
++            .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
++            .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
+             .env_remove("OULIPOLY_PARENT_INVOCATION")
+             .current_dir(self.dir.path());
+         cmd.output().unwrap()
+@@ -105,6 +145,16 @@ impl Fixture {
+         self.run(cmd)
+     }
+ 
++    fn run_mailbox_list(&self, session_id: &str) -> Output {
++        let mut cmd = Command::new(runner_bin());
++        cmd.arg("mailbox")
++            .arg("list")
++            .arg("--session-id")
++            .arg(session_id)
++            .arg("--json");
++        self.run(cmd)
++    }
++
+     fn write_provider(&self, body: &str) {
+         let script = self.write_script("provider.sh", body);
+         fs::write(
+@@ -239,13 +289,21 @@ flag = "--session"
+         Connection::open(self.sidecar_path()).unwrap()
+     }
+ 
++    fn state(&self) -> StateDb {
++        StateDb::open(&self.state_path()).unwrap()
++    }
++
+     fn seed_session_turn(&self) {
+-        let db = StateDb::open(&self.state_path()).unwrap();
++        self.seed_session_turn_for(PROVIDER, SESSION, "turn-a");
++    }
++
++    fn seed_session_turn_for(&self, provider_name: &str, session_id: &str, turn_id: &str) {
++        let db = self.state();
+         db.ingest_session_turns_batch(
+-            PROVIDER,
++            provider_name,
+             &[SessionTurnIngest {
+-                session_id: SESSION.to_string(),
+-                turn_id: "turn-a".to_string(),
++                session_id: session_id.to_string(),
++                turn_id: turn_id.to_string(),
+                 timestamp: ts("2026-06-04T12:00:00Z"),
+                 role: "assistant".to_string(),
+                 parent_turn_id: None,
+@@ -257,6 +315,24 @@ flag = "--session"
+         .unwrap();
+     }
+ 
++    fn seed_consumed_notification_turn(&self, handle: &str) {
++        self.state()
++            .ingest_session_turns_batch(
++                PROVIDER,
++                &[SessionTurnIngest {
++                    session_id: SESSION.to_string(),
++                    turn_id: format!("turn-consumed-{handle}"),
++                    timestamp: ts("2026-06-04T12:01:00Z"),
++                    role: "user".to_string(),
++                    parent_turn_id: None,
++                    is_sidechain: false,
++                    is_compaction_boundary: false,
++                    body: Some(format!("[OULIPOLY NOTIFICATIONS]\nhandle: {handle}\n")),
++                }],
++            )
++            .unwrap();
++    }
++
+     fn seed_idle_runtime(&self) {
+         self.seed_idle_runtime_for(SESSION, PROVIDER, MODEL);
+     }
+@@ -302,6 +378,15 @@ flag = "--session"
+     }
+ 
+     fn seed_mailbox(&self, session_id: &str, handle: &str) {
++        self.seed_mailbox_for(session_id, handle, Some(INVOCATION));
++    }
++
++    fn seed_mailbox_for(
++        &self,
++        session_id: &str,
++        handle: &str,
++        owner_invocation_uuid: Option<&str>,
++    ) {
+         let state_dir = self.work_dir.join(format!("seed-{handle}"));
+         fs::create_dir_all(&state_dir).unwrap();
+         let meta = state_dir.join("meta.json");
+@@ -315,7 +400,7 @@ flag = "--session"
+             session_id,
+             handle,
+             payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+-            owner_invocation_uuid: Some(INVOCATION),
++            owner_invocation_uuid,
+             matched_os_pid: Some(9_300),
+             matched_os_boot_id: Some("boot-seeded"),
+             matched_os_pid_starttime_ticks: Some(456),
+@@ -329,6 +414,30 @@ flag = "--session"
+         .unwrap();
+     }
+ 
++    fn age_mailbox_for(&self, session_id: &str, seconds_old: i64) {
++        let enqueued_at = (Utc::now() - chrono::Duration::seconds(seconds_old)).to_rfc3339();
++        self.sidecar_conn()
++            .execute(
++                "UPDATE mailbox SET enqueued_at = ?2 WHERE session_id = ?1",
++                rusqlite::params![session_id, enqueued_at],
++            )
++            .unwrap();
++    }
++
++    fn mark_mailbox_unconfirmed_twice(&self, session_id: &str, handle: &str) {
++        let mut db = self.mailbox();
++        let row = db
++            .list_mailbox(session_id, true)
++            .unwrap()
++            .into_iter()
++            .find(|row| row.handle == handle)
++            .unwrap_or_else(|| panic!("missing seeded mailbox row {handle}"));
++        db.mark_delivery_failed(session_id, &[row.seq], "mailbox_delivery_unconfirmed")
++            .unwrap();
++        db.mark_delivery_failed(session_id, &[row.seq], "mailbox_delivery_unconfirmed")
++            .unwrap();
++    }
++
+     fn record_identity(&self, identity: &ProcessIdentity) {
+         self.record_identity_for(identity, SESSION, PROVIDER, MODEL);
+     }
+@@ -753,6 +862,241 @@ fn batch_cap_followup_wake() {
+     fixture.assert_xdg_isolated();
+ }
+ 
++#[test]
++fn wake_sweep_reclaims_dead_claim_and_delivers_pending_mailbox() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script("", "", "sweep-reclaimed.txt"));
++    fixture.seed_session_turn();
++    fixture.seed_idle_runtime();
++    fixture.seed_mailbox(SESSION, "h-sweep-reclaim");
++    seed_dead_wake_claim(&fixture, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 601);
++
++    let output = fixture.run_mailbox_list(SESSION);
++    assert_success(&output);
++
++    let prompt = wait_for_file(&fixture.prompt_file("sweep-reclaimed.txt"));
++    assert!(prompt.contains("handle: h-sweep-reclaim"), "{prompt}");
++    wait_until("sweep reclaimed dead claim and delivered mailbox", || {
++        let db = fixture.mailbox();
++        let rows = db.list_mailbox(SESSION, true).unwrap();
++        rows.len() == 1
++            && rows[0].delivered_at.is_some()
++            && rows[0].delivery_error.is_none()
++            && db.wake_claim(SESSION).unwrap().is_none()
++    });
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script("", "", "live-claim-not-disturbed.txt"));
++    fixture.seed_session_turn();
++    fixture.seed_idle_runtime();
++    fixture.seed_mailbox(SESSION, "h-live-claim");
++    seed_live_wake_claim(&fixture, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
++
++    let output = fixture.run_mailbox_list(SESSION);
++    assert_success(&output);
++    std::thread::sleep(Duration::from_millis(300));
++
++    assert!(!fixture.prompt_file("live-claim-not-disturbed.txt").exists());
++    let claim = fixture.mailbox().wake_claim(SESSION).unwrap().unwrap();
++    assert_eq!(claim.claim_token, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
++    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script("", "", "consumed-not-rewoken.txt"));
++    fixture.seed_session_turn();
++    fixture.seed_idle_runtime();
++    fixture.seed_mailbox(SESSION, "h-consumed");
++    fixture.seed_consumed_notification_turn("h-consumed");
++    seed_dead_wake_claim(&fixture, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", 601);
++
++    let output = fixture.run_mailbox_list(SESSION);
++    assert_success(&output);
++    std::thread::sleep(Duration::from_millis(300));
++
++    assert!(!fixture.prompt_file("consumed-not-rewoken.txt").exists());
++    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script(
++        "",
++        "",
++        "twice-unconfirmed-not-rewoken.txt",
++    ));
++    fixture.seed_session_turn();
++    fixture.seed_idle_runtime();
++    fixture.seed_mailbox(SESSION, "h-unconfirmed");
++    fixture.mark_mailbox_unconfirmed_twice(SESSION, "h-unconfirmed");
++    seed_dead_wake_claim(&fixture, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", 601);
++
++    let output = fixture.run_mailbox_list(SESSION);
++    assert_success(&output);
++    std::thread::sleep(Duration::from_millis(300));
++
++    assert!(
++        !fixture
++            .prompt_file("twice-unconfirmed-not-rewoken.txt")
++            .exists()
++    );
++    let rows = fixture.mailbox().list_pending(SESSION).unwrap();
++    assert_eq!(rows.len(), 1);
++    assert_eq!(rows[0].handle, "h-unconfirmed");
++    assert_eq!(rows[0].delivery_attempts, 2);
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script("", "", "newer-after-unconfirmed.txt"));
++    fixture.seed_session_turn();
++    fixture.seed_idle_runtime();
++    fixture.seed_mailbox(SESSION, "h-unconfirmed-old");
++    fixture.seed_mailbox(SESSION, "h-newer");
++    fixture.mark_mailbox_unconfirmed_twice(SESSION, "h-unconfirmed-old");
++    seed_dead_wake_claim(&fixture, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", 601);
++
++    let output = fixture.run_mailbox_list(SESSION);
++    assert_success(&output);
++
++    let prompt = wait_for_file(&fixture.prompt_file("newer-after-unconfirmed.txt"));
++    assert!(!prompt.contains("handle: h-unconfirmed-old"), "{prompt}");
++    assert!(prompt.contains("handle: h-newer"), "{prompt}");
++    wait_until(
++        "newer mailbox delivered while exhausted row remains pending",
++        || {
++            let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
++            let old = rows.iter().find(|row| row.handle == "h-unconfirmed-old");
++            let newer = rows.iter().find(|row| row.handle == "h-newer");
++            old.is_some_and(|row| row.delivered_at.is_none() && row.delivery_attempts == 2)
++                && newer.is_some_and(|row| row.delivered_at.is_some())
++        },
++    );
++    fixture.assert_xdg_isolated();
++}
++
++#[test]
++fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris() {
++    let _guard = integration_test_guard();
++    let fixture = Fixture::new();
++    fixture.write_provider(&provider_script(
++        "",
++        r#"printf '%s' "$last" > "$work/backlog-$resume.txt""#,
++        "backlog-any.txt",
++    ));
++
++    let dead_sessions = (0..16)
++        .map(|index| format!("00000000-0000-4000-8000-{index:012x}"))
++        .collect::<Vec<_>>();
++    for (index, session_id) in dead_sessions.iter().enumerate() {
++        let handle = format!("h-dead-owner-{index}");
++        fixture.seed_mailbox_for(session_id, &handle, None);
++        fixture.age_mailbox_for(session_id, 86_400);
++        seed_dead_wake_claim_for(
++            &fixture,
++            session_id,
++            &format!("dead0000-0000-4000-8000-{index:012x}"),
++            601,
++        );
++    }
++
++    let idle_session = "11111111-1111-4111-8111-000000000001";
++    fixture.seed_active_chain_for(
++        "22222222-2222-4222-8222-000000000001",
++        PROVIDER,
++        idle_session,
++        MODEL,
++    );
++    fixture.seed_session_turn_for(PROVIDER, idle_session, "turn-idle-backlog");
++    fixture.seed_idle_runtime_for(idle_session, PROVIDER, MODEL);
++    fixture.seed_mailbox(idle_session, "h-idle-resumable-backlog");
++    fixture.age_mailbox_for(idle_session, 3_600);
++    seed_dead_wake_claim_for(
++        &fixture,
++        idle_session,
++        "eeee0000-0000-4000-8000-000000000001",
++        601,
++    );
++
++    let recent_session = "11111111-1111-4111-8111-000000000002";
++    fixture.seed_active_chain_for(
++        "22222222-2222-4222-8222-000000000002",
++        PROVIDER,
++        recent_session,
++        MODEL,
++    );
++    fixture.seed_session_turn_for(PROVIDER, recent_session, "turn-recent-backlog");
++    fixture.seed_idle_runtime_for(recent_session, PROVIDER, MODEL);
++    fixture.seed_mailbox(recent_session, "h-recent-leak-backlog");
++    seed_dead_wake_claim_for(
++        &fixture,
++        recent_session,
++        "eeee0000-0000-4000-8000-000000000002",
++        601,
++    );
++
++    let output = fixture.run_mailbox_list(recent_session);
++    assert_success(&output);
++
++    let idle_prompt = wait_for_file(&fixture.prompt_file(&format!("backlog-{idle_session}.txt")));
++    assert!(
++        idle_prompt.contains("handle: h-idle-resumable-backlog"),
++        "{idle_prompt}"
++    );
++    let recent_prompt =
++        wait_for_file(&fixture.prompt_file(&format!("backlog-{recent_session}.txt")));
++    assert!(
++        recent_prompt.contains("handle: h-recent-leak-backlog"),
++        "{recent_prompt}"
++    );
++
++    wait_until(
++        "backlog recoverable sessions delivered and debris reaped",
++        || {
++            let db = fixture.mailbox();
++            let idle_rows = db.list_mailbox(idle_session, true).unwrap();
++            let recent_rows = db.list_mailbox(recent_session, true).unwrap();
++            let recovered = idle_rows.len() == 1
++                && idle_rows[0].delivered_at.is_some()
++                && recent_rows.len() == 1
++                && recent_rows[0].delivered_at.is_some();
++            let debris_reaped = dead_sessions.iter().all(|session_id| {
++                let rows = db.list_mailbox(session_id, true).unwrap();
++                rows.len() == 1
++                    && rows[0].delivered_at.is_none()
++                    && rows[0].delivery_error.as_deref() == Some(WAKE_SWEEP_ABANDONED_ERROR)
++                    && db.wake_claim(session_id).unwrap().is_none()
++            });
++            recovered && debris_reaped
++        },
++    );
++    for session_id in dead_sessions {
++        assert!(
++            !fixture
++                .prompt_file(&format!("backlog-{session_id}.txt"))
++                .exists(),
++            "dead-owner debris must not be re-woken: {session_id}"
++        );
++    }
++    fixture.assert_xdg_isolated();
++}
++
+ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -> Command {
+     let state_dir = fixture.work_dir.join(format!("concurrent-{handle}"));
+     fs::create_dir_all(&state_dir).unwrap();
+@@ -795,6 +1139,82 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
+     cmd
+ }
+ 
++fn seed_dead_wake_claim(fixture: &Fixture, claim_token: &str, seconds_old: i64) {
++    seed_dead_wake_claim_for(fixture, SESSION, claim_token, seconds_old);
++}
++
++fn seed_dead_wake_claim_for(
++    fixture: &Fixture,
++    session_id: &str,
++    claim_token: &str,
++    seconds_old: i64,
++) {
++    acquire_seed_wake_claim_for(fixture, session_id, claim_token);
++    fixture
++        .mailbox()
++        .record_wake_claim_pid(session_id, claim_token, 999_999_999)
++        .unwrap();
++    age_wake_claim_for(fixture, session_id, seconds_old);
++}
++
++fn seed_live_wake_claim(fixture: &Fixture, claim_token: &str) {
++    acquire_seed_wake_claim(fixture, claim_token);
++    let identity = current_process_identity();
++    PidIdentityDb::open(&fixture.sidecar_path())
++        .unwrap()
++        .record_identity(PidIdentityRecord {
++            identity: &identity,
++            os_pgid: None,
++            invocation_uuid: claim_token,
++            session_id: Some(SESSION),
++            provider_name: Some(PROVIDER),
++            model_name: Some(MODEL),
++            recorded_at: "2026-06-04T12:02:00Z",
++        })
++        .unwrap();
++    fixture
++        .mailbox()
++        .record_wake_claim_pid(SESSION, claim_token, identity.os_pid)
++        .unwrap();
++}
++
++fn acquire_seed_wake_claim(fixture: &Fixture, claim_token: &str) {
++    acquire_seed_wake_claim_for(fixture, SESSION, claim_token);
++}
++
++fn acquire_seed_wake_claim_for(fixture: &Fixture, session_id: &str, claim_token: &str) {
++    let mut db = fixture.mailbox();
++    assert!(matches!(
++        db.try_acquire_wake_claim(WakeClaimRequest {
++            session_id,
++            claim_token,
++            reason: "notify_idle",
++            auto_wake_count: 1,
++            wake_invocation_uuid: None,
++            stale_after_seconds: 600,
++        })
++        .unwrap(),
++        WakeClaimAcquireResult::Acquired(_)
++    ));
++}
++
++fn age_wake_claim_for(fixture: &Fixture, session_id: &str, seconds_old: i64) {
++    let claimed_at = (Utc::now() - chrono::Duration::seconds(seconds_old)).to_rfc3339();
++    fixture
++        .sidecar_conn()
++        .execute(
++            "UPDATE session_wake_claim SET claimed_at = ?2 WHERE session_id = ?1",
++            rusqlite::params![session_id, claimed_at],
++        )
++        .unwrap();
++}
++
++fn current_process_identity() -> ProcessIdentity {
++    read_live_process_identity(i64::from(std::process::id()))
++        .unwrap()
++        .expect("test process should have a live identity")
++}
++
+ #[test]
+ fn provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes() {
+     let _guard = integration_test_guard();
+@@ -840,6 +1260,10 @@ export XDG_DATA_HOME="$work/shadow-xdg"
+ }
+ 
+ fn assert_notify_success(output: &Output) {
++    assert_success(output);
++}
++
++fn assert_success(output: &Output) {
+     assert!(
+         output.status.success(),
+         "stdout={} stderr={}",

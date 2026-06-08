@@ -1,7 +1,7 @@
 //! ## Declared roles
 //!
-//! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`,
-//! `validator`
+//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
+//! `predicate`, `validator`
 
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
@@ -170,6 +170,15 @@ fn wake_sweep_plan(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
 ) -> Result<WakeSweepPlan, String> {
+    let (recoverable, reap) = partition_wake_sweep_candidates(db, candidates)?;
+    let start = select_recoverable_sweep_candidates(recoverable);
+    Ok(wake_sweep_plan_from_selected(start, reap))
+}
+
+fn partition_wake_sweep_candidates(
+    db: &mut MailboxDb,
+    candidates: Vec<WakeSweepCandidate>,
+) -> Result<(Vec<WakeSweepCandidate>, Vec<WakeSweepCandidate>), String> {
     let state = open_default_state_read_only();
     let mut recoverable = Vec::new();
     let mut reap = Vec::new();
@@ -186,8 +195,14 @@ fn wake_sweep_plan(
             WakeSweepDisposition::Skip => {}
         }
     }
-    let start = select_recoverable_sweep_candidates(recoverable);
-    Ok(WakeSweepPlan { start, reap })
+    Ok((recoverable, reap))
+}
+
+fn wake_sweep_plan_from_selected(
+    start: Vec<WakeSweepCandidate>,
+    reap: Vec<WakeSweepCandidate>,
+) -> WakeSweepPlan {
+    WakeSweepPlan { start, reap }
 }
 
 fn select_recoverable_sweep_candidates(
@@ -363,10 +378,14 @@ fn pending_mailbox_consumed_marker_present(db: &MailboxDb, session_id: &str) -> 
                 .has_session_user_turn_containing(
                     &provider_name,
                     session_id,
-                    &format!("handle: {}", row.handle),
+                    &mailbox_handle_marker(row),
                 )
                 .unwrap_or(false)
         })
+}
+
+fn mailbox_handle_marker(row: &MailboxRow) -> String {
+    format!("handle: {}", row.handle)
 }
 
 fn open_default_state_read_only() -> Option<StateDb> {
