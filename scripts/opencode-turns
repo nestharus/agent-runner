@@ -11,10 +11,11 @@ The command defaults to `opencode`, or to `opencodeN` when BASE_DIR contains
   opencode session list --json
   opencode export <sessionID>
 
-When SESSION_ID arguments are supplied, they are used directly. BASE_DIR is
-accepted for compatibility with existing session source configuration; implicit
-discovery uses `opencode session list --json`, not OpenCode's private storage
-layout.
+When SESSION_ID arguments are supplied, they are used directly. If no
+SESSION_ID arguments are supplied, the SESSION_ID environment variable is used
+as the direct target list. BASE_DIR is accepted for compatibility with existing
+session source configuration; implicit discovery uses `opencode session list
+--json`, not OpenCode's private storage layout.
 
 Implicit discovery is bounded to the recent quota-balancing window. If the
 session list does not expose timestamps, the adapter falls back to a small cap
@@ -446,7 +447,21 @@ def requested_session_ids(
 ) -> tuple[list[str], bool]:
     if args:
         return unique_values(args), False
+    env_session_ids = session_ids_from_env()
+    if env_session_ids:
+        return env_session_ids, False
     return discover_session_ids(options, deadline)
+
+
+def session_ids_from_env() -> list[str]:
+    value = os.environ.get("SESSION_ID")
+    if value is None:
+        return []
+    return unique_values(split_env_session_ids(value))
+
+
+def split_env_session_ids(value: str) -> list[str]:
+    return [item for item in re.split(r"[\s,]+", value.strip()) if item]
 
 
 def numeric_timestamp(value) -> str | None:

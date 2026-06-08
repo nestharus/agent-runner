@@ -134,6 +134,41 @@ if records != expected:
 PY
 }
 
+assert_session_id_env_export_records() {
+  local label="$1"
+
+  python3 - "$RUN_STDOUT" <<'PY' || fail "$label: SESSION_ID-env export records did not match"
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    records = [json.loads(line) for line in handle if line.strip()]
+
+expected = [
+    {
+        "session_id": "ses_env_requested",
+        "turn_id": "msg_user_env",
+        "timestamp": "2023-11-14T22:13:20Z",
+        "role": "user",
+        "body": [{"type": "text", "text": "wake via SESSION_ID env"}],
+    },
+    {
+        "session_id": "ses_env_requested",
+        "turn_id": "msg_assistant_env",
+        "timestamp": "2023-11-14T22:13:25Z",
+        "role": "assistant",
+        "body": [{"type": "text", "text": "confirmed via env"}],
+    },
+]
+
+if records != expected:
+    print("expected:", json.dumps(expected, indent=2), file=sys.stderr)
+    print("actual:", json.dumps(records, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 file_size_bytes() {
   local path="$1"
 
@@ -485,6 +520,65 @@ write_current_export_mock() {
   write_executable_mock "$path" emit_current_export_mock_body
 }
 
+emit_session_id_env_mock_body() {
+  cat <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+  printf '[]\n'
+  exit 0
+fi
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  if [[ "$session_id" != "ses_env_requested" ]]; then
+    printf '[]\n'
+    exit 0
+  fi
+  cat <<'JSON'
+{
+  "info": {
+    "id": "ses_env_requested",
+    "time": {"created": 1700000000000}
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {"created": 1700000000000},
+        "id": "msg_user_env",
+        "sessionID": "ses_env_requested"
+      },
+      "parts": [{"type": "text", "text": "wake via SESSION_ID env"}]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {"created": 1700000005000},
+        "id": "msg_assistant_env",
+        "sessionID": "ses_env_requested"
+      },
+      "parts": [{"type": "text", "text": "confirmed via env"}]
+    }
+  ]
+}
+JSON
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+}
+
+write_session_id_env_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_session_id_env_mock_body
+}
+
 run_opencode_turns() {
   local tmpdir="$1"
   local opencode_bin="$2"
@@ -501,6 +595,29 @@ run_opencode_turns() {
     OPENCODE_TURNS_MAX_SESSIONS="${OPENCODE_TURNS_MAX_SESSIONS:-25}" \
     OPENCODE_TURNS_CALL_TIMEOUT="${OPENCODE_TURNS_CALL_TIMEOUT:-20}" \
     OPENCODE_TURNS_DEADLINE="${OPENCODE_TURNS_DEADLINE:-60}" \
+    "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
+  RUN_STATUS=$?
+  set -e
+}
+
+run_opencode_turns_with_session_id_env_on_path() {
+  local tmpdir="$1"
+  local session_id="$2"
+
+  RUN_STDOUT="$tmpdir/stdout.jsonl"
+  RUN_STDERR="$tmpdir/stderr.txt"
+  OPENCODE_TURNS_EXPORT_LOG="$tmpdir/exports.log"
+  export OPENCODE_TURNS_EXPORT_LOG
+  : >"$OPENCODE_TURNS_EXPORT_LOG"
+
+  set +e
+  env -u OPENCODE_BIN \
+    PATH="$tmpdir/bin:$PATH" \
+    SESSION_ID="$session_id" \
+    OPENCODE_TURNS_WINDOW_HOURS=6 \
+    OPENCODE_TURNS_MAX_SESSIONS=25 \
+    OPENCODE_TURNS_CALL_TIMEOUT=20 \
+    OPENCODE_TURNS_DEADLINE=60 \
     "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
   RUN_STATUS=$?
   set -e
@@ -610,6 +727,7 @@ test_base_dir_suffix_selects_matching_opencode_command() {
   set +e
   env -u OPENCODE_BIN \
     PATH="$tmpdir/bin:$PATH" \
+    SESSION_ID=ses_env_ignored \
     OPENCODE_TURNS_WINDOW_HOURS=6 \
     OPENCODE_TURNS_MAX_SESSIONS=25 \
     OPENCODE_TURNS_CALL_TIMEOUT=20 \
@@ -639,11 +757,27 @@ test_current_export_info_metadata_emits_turns() {
   assert_current_export_records "$FUNCNAME"
 }
 
+test_session_id_env_used_when_no_positional_sessions() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin"
+  write_session_id_env_mock "$tmpdir/bin/opencode"
+
+  run_opencode_turns_with_session_id_env_on_path "$tmpdir" "ses_env_requested"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_env_requested" "$FUNCNAME export"
+  assert_session_id_env_export_records "$FUNCNAME"
+}
+
 test_timestampless_session_list_applies_max_sessions_cap
 test_exports_only_recent_window_sessions
 test_timeout_emits_degraded_best_effort_and_exits_zero
 test_timeout_kills_opencode_process_group_descendant
 test_base_dir_suffix_selects_matching_opencode_command
 test_current_export_info_metadata_emits_turns
+test_session_id_env_used_when_no_positional_sessions
 
 echo "opencode-turns tests passed"
