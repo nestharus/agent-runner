@@ -338,11 +338,12 @@ def session_list_session_id(obj: dict) -> str | None:
 
 def session_list_session_id_candidates(obj: dict) -> list[str]:
     candidates = []
-    for key in SESSION_ID_KEYS:
-        value = obj.get(key)
-        if not isinstance(value, str):
-            continue
-        candidates.append(value)
+    for mapping in info_unwrapped_mappings(obj):
+        for key in SESSION_ID_KEYS:
+            value = mapping.get(key)
+            if not isinstance(value, str):
+                continue
+            candidates.append(value)
     return candidates
 
 
@@ -354,11 +355,45 @@ def parsed_session_id(value: str) -> str | None:
 
 
 def session_list_timestamp(obj: dict) -> datetime | None:
-    for key in SESSION_TIMESTAMP_KEYS:
-        converted = timestamp_datetime(obj.get(key))
+    for value in timestamp_candidate_values(obj, SESSION_TIMESTAMP_KEYS):
+        converted = timestamp_datetime(value)
         if converted:
             return converted
     return None
+
+
+def info_unwrapped_mappings(obj: dict) -> list[dict]:
+    mappings = [obj]
+    info = obj.get("info")
+    if isinstance(info, dict):
+        mappings.append(info)
+    return mappings
+
+
+def metadata_mappings_from_obj(obj: dict) -> list[dict]:
+    mappings = info_unwrapped_mappings(obj)
+    message = obj.get("message")
+    if isinstance(message, dict):
+        mappings.extend(info_unwrapped_mappings(message))
+    return mappings
+
+
+def timestamp_candidate_mappings(obj: dict) -> list[dict]:
+    mappings = []
+    for mapping in metadata_mappings_from_obj(obj):
+        mappings.append(mapping)
+        time_value = mapping.get("time")
+        if isinstance(time_value, dict):
+            mappings.append(time_value)
+    return mappings
+
+
+def timestamp_candidate_values(obj: dict, keys: tuple[str, ...]) -> list:
+    values = []
+    for mapping in timestamp_candidate_mappings(obj):
+        for key in keys:
+            values.append(mapping.get(key))
+    return values
 
 
 def timestamp_datetime(value) -> datetime | None:
@@ -433,31 +468,35 @@ def formatted_numeric_timestamp(value: int | float) -> str:
 
 
 def timestamp_from_obj(obj: dict) -> str | None:
-    for key in ("timestamp", "createdAt", "created_at", "time"):
-        value = obj.get(key)
-        if isinstance(value, str) and value:
-            return value
-        converted = numeric_timestamp(value)
+    for value in timestamp_candidate_values(
+        obj, ("timestamp", "createdAt", "created_at", "time", "created")
+    ):
+        converted = timestamp_string(value)
         if converted:
             return converted
     return None
 
 
+def timestamp_string(value) -> str | None:
+    if isinstance(value, str) and value:
+        return value
+    return numeric_timestamp(value)
+
+
 def session_id_from_obj(obj: dict) -> str | None:
-    for key in ("sessionID", "sessionId", "session_id"):
-        value = obj.get(key)
-        if isinstance(value, str) and value:
-            return value
+    for mapping in metadata_mappings_from_obj(obj):
+        for key in ("sessionID", "sessionId", "session_id"):
+            value = mapping.get(key)
+            if isinstance(value, str) and value:
+                return value
     return None
 
 
 def role_from_obj(obj: dict) -> str | None:
-    value = obj.get("role")
-    if value in ("user", "assistant"):
-        return value
-    message = obj.get("message")
-    if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
-        return message.get("role")
+    for mapping in metadata_mappings_from_obj(obj):
+        value = mapping.get("role")
+        if value in ("user", "assistant"):
+            return value
     return None
 
 
@@ -466,12 +505,10 @@ def turn_id_from_obj(obj: dict, default_session_id: str, index: int) -> str:
 
 
 def turn_id_field_from_obj(obj: dict) -> str | None:
-    value = turn_id_field_from_mapping(obj)
-    if value:
-        return value
-    message = obj.get("message")
-    if isinstance(message, dict):
-        return turn_id_field_from_mapping(message)
+    for mapping in metadata_mappings_from_obj(obj):
+        value = turn_id_field_from_mapping(mapping)
+        if value:
+            return value
     return None
 
 

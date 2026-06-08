@@ -94,6 +94,46 @@ assert_stdout_not_contains() {
   fi
 }
 
+assert_current_export_records() {
+  local label="$1"
+
+  python3 - "$RUN_STDOUT" <<'PY' || fail "$label: current-format export records did not match"
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    records = [json.loads(line) for line in handle if line.strip()]
+
+expected = [
+    {
+        "session_id": "ses_current_info",
+        "turn_id": "msg_user_current",
+        "timestamp": "2023-11-14T22:13:20Z",
+        "role": "user",
+        "body": [
+            {
+                "type": "text",
+                "text": "[OULIPOLY-DELIVERY 123e4567-e89b-12d3-a456-426614174000] wake please",
+            }
+        ],
+    },
+    {
+        "session_id": "ses_current_info",
+        "turn_id": "msg_assistant_current",
+        "timestamp": "2023-11-14T22:13:25Z",
+        "role": "assistant",
+        "body": [{"type": "text", "text": "confirmed"}],
+    },
+]
+
+if records != expected:
+    print("expected:", json.dumps(expected, indent=2), file=sys.stderr)
+    print("actual:", json.dumps(records, indent=2), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 file_size_bytes() {
   local path="$1"
 
@@ -381,6 +421,70 @@ write_command_derivation_mock() {
   write_executable_mock "$path" emit_command_derivation_mock_body
 }
 
+emit_current_export_mock_body() {
+  cat <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+  cat <<'JSON'
+[
+  {"id":"ses_current_requested"}
+]
+JSON
+  exit 0
+fi
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  cat <<'JSON'
+{
+  "info": {
+    "id": "ses_current_info",
+    "time": {"created": 1700000000000}
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {"created": 1700000000000},
+        "id": "msg_user_current",
+        "sessionID": "ses_current_info"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "[OULIPOLY-DELIVERY 123e4567-e89b-12d3-a456-426614174000] wake please"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {"created": 1700000005000},
+        "id": "msg_assistant_current",
+        "sessionID": "ses_current_info"
+      },
+      "parts": [{"type": "text", "text": "confirmed"}]
+    }
+  ]
+}
+JSON
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+}
+
+write_current_export_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_current_export_mock_body
+}
+
 run_opencode_turns() {
   local tmpdir="$1"
   local opencode_bin="$2"
@@ -520,10 +624,26 @@ test_base_dir_suffix_selects_matching_opencode_command() {
   assert_stdout_contains '"role":"user"' "$FUNCNAME user record"
 }
 
+test_current_export_info_metadata_emits_turns() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin"
+  write_current_export_mock "$tmpdir/bin/opencode"
+
+  run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_current_requested" "$FUNCNAME export"
+  assert_current_export_records "$FUNCNAME"
+}
+
 test_timestampless_session_list_applies_max_sessions_cap
 test_exports_only_recent_window_sessions
 test_timeout_emits_degraded_best_effort_and_exits_zero
 test_timeout_kills_opencode_process_group_descendant
 test_base_dir_suffix_selects_matching_opencode_command
+test_current_export_info_metadata_emits_turns
 
 echo "opencode-turns tests passed"
