@@ -101,6 +101,23 @@ pub fn scan_provider(
     scan_provider_with_timeout(provider_name, sessions_cfg, db, SCRIPT_TIMEOUT_SECS)
 }
 
+/// Run one provider's adapter script for a specific session and ingest every
+/// turn it emits. The configured script receives `SESSION_ID` in its env.
+pub fn scan_provider_session(
+    provider_name: &str,
+    sessions_cfg: &SessionsConfig,
+    db: &StateDb,
+    session_id: &str,
+) -> ScanReport {
+    scan_provider_session_with_timeout(
+        provider_name,
+        sessions_cfg,
+        db,
+        session_id,
+        SCRIPT_TIMEOUT_SECS,
+    )
+}
+
 fn scan_provider_with_timeout(
     provider_name: &str,
     sessions_cfg: &SessionsConfig,
@@ -118,6 +135,39 @@ fn scan_provider_with_timeout(
     }
 
     let stdout = match run_turn_script(&entry.turn_script, &state_dir, timeout_secs) {
+        Ok(stdout) => stdout,
+        Err(error) => return scan_report_with_error(report, error),
+    };
+
+    let batch = collect_turn_script_batch(provider_name, &stdout, &mut report);
+    persist_scanned_turns(provider_name, db, &batch, &mut report);
+    report
+}
+
+fn scan_provider_session_with_timeout(
+    provider_name: &str,
+    sessions_cfg: &SessionsConfig,
+    db: &StateDb,
+    session_id: &str,
+    timeout_secs: u64,
+) -> ScanReport {
+    let mut report = ScanReport::default();
+    let Some(entry) = provider_session_source(sessions_cfg, provider_name) else {
+        return report;
+    };
+
+    let state_dir = resolve_state_dir(provider_name, entry);
+    if let Err(error) = create_session_state_dir(&state_dir) {
+        return scan_report_with_error(report, error);
+    }
+
+    let stdout = match run_session_script_with_timeout(
+        &entry.turn_script,
+        &state_dir,
+        Some(session_id),
+        "turn script",
+        timeout_secs,
+    ) {
         Ok(stdout) => stdout,
         Err(error) => return scan_report_with_error(report, error),
     };
@@ -1026,6 +1076,34 @@ echo "STATE_DIR=$STATE_DIR" > "$STATE_DIR/marker.txt""#,
         assert_eq!(r.new_turns, 1);
         let marker = std::fs::read_to_string(tempdir.path().join("marker.txt")).unwrap();
         assert!(marker.contains(tempdir.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn scan_provider_session_sets_session_id_env() {
+        let db = db();
+        let script = fixture_script(
+            r#"printf '{"session_id":"%s","turn_id":"t1","timestamp":"2026-04-17T08:00:00Z","role":"user"}\n' "$SESSION_ID"
+printf '%s\n' "$SESSION_ID" > "$STATE_DIR/seen-session.txt""#,
+        );
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut entries = HashMap::new();
+        entries.insert(
+            "p".to_string(),
+            SessionSourceEntry {
+                turn_script: script.path.to_string_lossy().into_owned(),
+                transcript_locator: None,
+                state_dir: Some(tempdir.path().to_path_buf()),
+            },
+        );
+        let cfg = SessionsConfig { entries };
+
+        let r = scan_provider_session("p", &cfg, &db, "session-123");
+
+        assert_eq!(r.errors, Vec::<String>::new());
+        assert_eq!(r.new_turns, 1);
+        assert_eq!(db.count_session_turns("p", "session-123").unwrap().total, 1);
+        let seen = std::fs::read_to_string(tempdir.path().join("seen-session.txt")).unwrap();
+        assert_eq!(seen.trim(), "session-123");
     }
 
     #[test]

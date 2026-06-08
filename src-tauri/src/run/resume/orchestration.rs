@@ -7,12 +7,12 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::Arc;
 
-use oulipoly_runtime::executor;
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{
     ExecutorServiceRequest, InvocationLifecycleServicePort, MigrationServiceOutput,
     ResumeServiceOutput, ServiceError,
 };
+use oulipoly_runtime::{executor, sessions};
 use sha2::{Digest, Sha256};
 
 use super::disposition::{
@@ -718,6 +718,8 @@ fn handle_resume_attempt_terminal_signal(
         return Ok(control);
     }
 
+    ingest_mailbox_delivery_confirmation_turn_if_needed(input, provider, result, zero_turn_action);
+
     if let Some(control) = handle_unconfirmed_mailbox_delivery_if_needed(
         input,
         attempt,
@@ -730,6 +732,35 @@ fn handle_resume_attempt_terminal_signal(
     }
 
     finalize_completed_attempt_for_resume(input, attempt, provider, provider_session_id, result)
+}
+
+fn ingest_mailbox_delivery_confirmation_turn_if_needed(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    result: &executor::ExecutionResult,
+    zero_turn_action: ZeroTurnAction,
+) {
+    if !mailbox_delivery_requires_turn_confirmation(input, &provider.name, result) {
+        return;
+    }
+    if mailbox_delivery_turn_confirmed(input, &provider.name, result, zero_turn_action) {
+        return;
+    }
+    let report = sessions::scan_provider_session(
+        &provider.name,
+        &input.env.sessions_cfg,
+        &input.env.state,
+        &input.resolved.active_session_id,
+    );
+    emit_pre_confirmation_session_scan_errors(&provider.name, report.errors);
+}
+
+fn emit_pre_confirmation_session_scan_errors(provider_name: &str, errors: Vec<String>) {
+    for error in errors {
+        formatter::emit_stderr(&format!(
+            "Warning: Session ingest failed for {provider_name}: {error}"
+        ));
+    }
 }
 
 enum ResumeTerminalDispositionOutcome {

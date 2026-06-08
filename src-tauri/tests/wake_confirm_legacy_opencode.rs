@@ -297,8 +297,7 @@ fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
     assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
     wait_until("fake opencode export contains delivery nonce", || {
         let exported = fixture.export_text();
-        exported.contains("[OULIPOLY NOTIFICATIONS]")
-            && exported.contains("[OULIPOLY-DELIVERY ")
+        exported.contains("[OULIPOLY NOTIFICATIONS]") && exported.contains("[OULIPOLY-DELIVERY ")
     });
 
     assert_success(&output);
@@ -308,7 +307,7 @@ fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
         rows.len() == 1
             && rows[0].delivered_at.is_some()
             && rows[0].delivery_error.is_none()
-            && rows[0].delivery_attempts == 0
+            && rows[0].delivery_attempts == 1
             && rows[0].delivered_by_invocation_uuid.is_some()
     });
     assert!(
