@@ -1,5 +1,39 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
+//! predicate, filter.
+//!
+//! TEST: legacy opencode wake-confirmation fixtures — fake CLI script
+//! formatters, model/config mappers, state and mailbox accessors, transcript
+//! parsers, consumed-notification predicates and filters, delivery/claim row
+//! validators, and test orchestration.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/tests/wake_confirm_legacy_opencode.rs
+//!     role: adapter
+//!     Translates:
+//!       - legacy-opencode-cli-contract
+//!       - wake-confirmation-transcript-contract
+//!       - mailbox-sidecar-contract
+//!       - invocation-state-db-contract
+//!       - test-fixture-process-contract
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/wake_confirm_legacy_opencode.rs
+//!     role: intrinsic-surface
+//!     Domain: legacy opencode wake-confirmation regression suite
+//!     Owns:
+//!       - isolated config/data fixture materialization
+//!       - fake opencode script generation and executable setup
+//!       - transcript export fixture construction
+//!       - wake/resume command invocation and environment isolation
+//!       - delivery confirmation and consumed-notification assertions
+//! ```
+
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb};
 use rusqlite::{Connection, params};

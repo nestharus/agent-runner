@@ -1,5 +1,39 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
+//! predicate, filter.
+//!
+//! TEST: external-provider wake/resume end-to-end fixtures — fake provider
+//! CLI script formatters, fixture model mappers, state/sidecar accessors,
+//! JSON/record parsers, pending-delivery predicates and filters, durable row
+//! validators, and test orchestration.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/tests/s11_external_provider_wake.rs
+//!     role: adapter
+//!     Translates:
+//!       - external-provider-runtime-cli-contract
+//!       - wake-notification-delivery-contract
+//!       - pid-identity-sidecar-contract
+//!       - invocation-state-db-contract
+//!       - test-fixture-process-contract
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/s11_external_provider_wake.rs
+//!     role: intrinsic-surface
+//!     Domain: external-provider wake CLI regression suite
+//!     Owns:
+//!       - isolated config/data fixture materialization
+//!       - external provider Python script generation and executable setup
+//!       - wake command invocation and environment isolation
+//!       - provider record parsing and subcommand filtering assertions
+//!       - sidecar wake-claim and mailbox delivery assertions
+//! ```
+
 use oulipoly_state::mailbox::MailboxDb;
 use rusqlite::{Connection, params};
 use serde_json::Value;

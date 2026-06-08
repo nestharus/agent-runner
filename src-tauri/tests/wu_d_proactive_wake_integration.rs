@@ -1,5 +1,39 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
+//! predicate, filter.
+//!
+//! TEST: proactive wake and wake-reclaim end-to-end fixtures — fake CLI script
+//! formatters, model/config mappers, state and mailbox accessors, JSON/record
+//! parsers, liveness and delivery predicates/filters, wake-claim and durable
+//! mailbox validators, and test orchestration.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/tests/wu_d_proactive_wake_integration.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-cli-dispatch-contract
+//!       - wake-claim-sidecar-contract
+//!       - pid-identity-sidecar-contract
+//!       - mailbox-delivery-contract
+//!       - test-fixture-process-contract
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/tests/wu_d_proactive_wake_integration.rs
+//!     role: intrinsic-surface
+//!     Domain: proactive wake and wake-reclaim regression suite
+//!     Owns:
+//!       - isolated config/data fixture materialization
+//!       - fake provider script generation and executable setup
+//!       - auto-wake command invocation and environment isolation
+//!       - sidecar wake-claim fixture construction
+//!       - mailbox delivery, busy suppression, and consumed suppression assertions
+//! ```
+
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WakeClaimAcquireResult,
