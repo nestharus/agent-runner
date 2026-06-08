@@ -2,7 +2,9 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
-use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeUpsert};
+use oulipoly_state::mailbox::{
+    MailboxDb, MailboxRow, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
+};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -81,8 +83,9 @@ fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
 }
 
 fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
-    row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED)
-        || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS
+    row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
+        && (row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED)
+            || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS)
 }
 
 fn delivery_for_pending(

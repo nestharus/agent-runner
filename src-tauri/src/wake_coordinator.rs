@@ -5,9 +5,11 @@
 
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    MailboxDb, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
-    WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow, WakeSweepCandidate,
+    MailboxDb, MailboxRow, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
+    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow,
+    WakeSweepCandidate,
 };
+use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -32,6 +34,9 @@ const DEFAULT_AUTO_WAKE_RETRY_BASE_MS: u64 = 1_000;
 const AUTO_WAKE_RETRY_MAX_MS: u64 = 30_000;
 const WAKE_CLAIM_STALE_AFTER_SECONDS: i64 = 10 * 60;
 const WAKE_RECLAIM_SWEEP_LIMIT: usize = 8;
+const WAKE_RECLAIM_SWEEP_SCAN_LIMIT: usize = WAKE_RECLAIM_SWEEP_LIMIT * 32;
+const WAKE_RECLAIM_REAP_SESSION_LIMIT: usize = 32;
+const WAKE_RECLAIM_REAP_ROWS_PER_SESSION: usize = 20;
 #[allow(dead_code)]
 const WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS: u64 = 60;
 const CONSUMED_NOTIFICATION_MARKER: &str = "[OULIPOLY NOTIFICATIONS]";
@@ -137,11 +142,14 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    let candidates =
-        db.wake_sweep_candidates(WAKE_CLAIM_STALE_AFTER_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT)?;
-    let candidates = startable_sweep_candidates(&db, candidates);
+    let candidates = db.wake_sweep_candidates(
+        WAKE_CLAIM_STALE_AFTER_SECONDS,
+        WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+    )?;
+    let plan = wake_sweep_plan(&mut db, candidates)?;
+    reap_abandoned_sweep_candidates(&mut db, &plan.reap)?;
     drop(db);
-    for candidate in candidates {
+    for candidate in plan.start {
         let diagnostic = start_wake_chain(StartWakeInput {
             session_id: &candidate.session_id,
             reason: trigger,
@@ -153,26 +161,183 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn startable_sweep_candidates(
-    db: &MailboxDb,
-    candidates: Vec<WakeSweepCandidate>,
-) -> Vec<WakeSweepCandidate> {
-    candidates
-        .into_iter()
-        .filter(|candidate| wake_sweep_candidate_is_startable(db, candidate))
-        .collect()
+struct WakeSweepPlan {
+    start: Vec<WakeSweepCandidate>,
+    reap: Vec<WakeSweepCandidate>,
 }
 
-fn wake_sweep_candidate_is_startable(db: &MailboxDb, candidate: &WakeSweepCandidate) -> bool {
-    !wake_sweep_candidate_reached_cap(candidate)
-        && wake_sweep_candidate_has_deliverable_pending(&candidate.session_id)
-        && !pending_mailbox_consumed_marker_present(db, &candidate.session_id)
+fn wake_sweep_plan(
+    db: &mut MailboxDb,
+    candidates: Vec<WakeSweepCandidate>,
+) -> Result<WakeSweepPlan, String> {
+    let state = open_default_state_read_only();
+    let mut recoverable = Vec::new();
+    let mut reap = Vec::new();
+    for candidate in candidates {
+        match wake_sweep_candidate_disposition(db, state.as_ref(), &candidate)? {
+            WakeSweepDisposition::Recoverable => {
+                recoverable.push(candidate);
+            }
+            WakeSweepDisposition::Abandoned => {
+                if reap.len() < WAKE_RECLAIM_REAP_SESSION_LIMIT {
+                    reap.push(candidate);
+                }
+            }
+            WakeSweepDisposition::Skip => {}
+        }
+    }
+    let start = select_recoverable_sweep_candidates(recoverable);
+    Ok(WakeSweepPlan { start, reap })
+}
+
+fn select_recoverable_sweep_candidates(
+    mut candidates: Vec<WakeSweepCandidate>,
+) -> Vec<WakeSweepCandidate> {
+    if candidates.len() <= WAKE_RECLAIM_SWEEP_LIMIT {
+        return candidates;
+    }
+    candidates.sort_by_key(|candidate| candidate.min_pending_seq);
+    let oldest_slots = WAKE_RECLAIM_SWEEP_LIMIT.div_ceil(2);
+    let newest_slots = WAKE_RECLAIM_SWEEP_LIMIT.saturating_sub(oldest_slots);
+    let mut selected = candidates
+        .iter()
+        .take(oldest_slots)
+        .cloned()
+        .collect::<Vec<_>>();
+    for candidate in candidates.iter().rev().take(newest_slots) {
+        if !selected
+            .iter()
+            .any(|existing| existing.session_id == candidate.session_id)
+        {
+            selected.push(candidate.clone());
+        }
+    }
+    selected
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeSweepDisposition {
+    Recoverable,
+    Abandoned,
+    Skip,
+}
+
+fn wake_sweep_candidate_disposition(
+    db: &MailboxDb,
+    state: Option<&StateDb>,
+    candidate: &WakeSweepCandidate,
+) -> Result<WakeSweepDisposition, String> {
+    // Recoverable means either an idle headless runtime with durable resume
+    // evidence, or a live owner PID identity that must not be reaped. Missing
+    // runtime/history with no live owner is abandoned debris, not resumable work.
+    if pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
+        return Ok(WakeSweepDisposition::Skip);
+    }
+    if wake_sweep_candidate_is_resumable(db, state, candidate)? {
+        return Ok(resumable_wake_sweep_disposition(candidate));
+    }
+    if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
+        return Ok(WakeSweepDisposition::Skip);
+    }
+    Ok(WakeSweepDisposition::Abandoned)
+}
+
+fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
+    if wake_sweep_candidate_reached_cap(candidate)
+        || !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id)
+    {
+        return WakeSweepDisposition::Skip;
+    }
+    WakeSweepDisposition::Recoverable
+}
+
+fn reap_abandoned_sweep_candidates(
+    db: &mut MailboxDb,
+    candidates: &[WakeSweepCandidate],
+) -> Result<(), String> {
+    for candidate in candidates {
+        db.mark_pending_abandoned(
+            &candidate.session_id,
+            WAKE_SWEEP_ABANDONED_ERROR,
+            WAKE_RECLAIM_REAP_ROWS_PER_SESSION,
+        )?;
+    }
+    Ok(())
 }
 
 fn wake_sweep_candidate_has_deliverable_pending(session_id: &str) -> bool {
     crate::mailbox_delivery::deliverable_pending_count(session_id)
         .map(|count| count > 0)
         .unwrap_or(false)
+}
+
+fn wake_sweep_candidate_is_resumable(
+    db: &MailboxDb,
+    state: Option<&StateDb>,
+    candidate: &WakeSweepCandidate,
+) -> Result<bool, String> {
+    let Some(runtime) = db.session_runtime(&candidate.session_id)? else {
+        return Ok(false);
+    };
+    if !wake_sweep_runtime_can_resume(&runtime) {
+        return Ok(false);
+    }
+    wake_sweep_runtime_has_resume_evidence(state, &runtime)
+}
+
+fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
+    runtime.mode == "headless"
+        && runtime.run_state != "running"
+        && runtime
+            .provider_name
+            .as_deref()
+            .is_some_and(|provider| !provider.is_empty())
+}
+
+fn wake_sweep_runtime_has_resume_evidence(
+    state: Option<&StateDb>,
+    runtime: &SessionRuntimeRow,
+) -> Result<bool, String> {
+    let Some(state) = state else {
+        return Ok(false);
+    };
+    let Some(provider_name) = runtime.provider_name.as_deref() else {
+        return Ok(false);
+    };
+    if state
+        .chain_id_for_segment(provider_name, &runtime.session_id)
+        .map_err(|err| err.to_string())?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    state
+        .count_session_turns(provider_name, &runtime.session_id)
+        .map(|counts| counts.total > 0)
+}
+
+fn wake_sweep_candidate_has_live_owner(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
+    for row in db.list_pending(session_id)? {
+        if mailbox_row_has_live_owner_identity(&row)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn mailbox_row_has_live_owner_identity(row: &MailboxRow) -> Result<bool, String> {
+    let Some(recorded) = mailbox_row_owner_identity(row) else {
+        return Ok(false);
+    };
+    read_live_process_identity(recorded.os_pid).map(|live| live.as_ref() == Some(&recorded))
+}
+
+fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
+    Some(ProcessIdentity {
+        os_pid: row.matched_os_pid?,
+        os_boot_id: row.matched_os_boot_id.clone()?,
+        os_pid_starttime_ticks: row.matched_os_pid_starttime_ticks?,
+    })
 }
 
 fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate) -> bool {

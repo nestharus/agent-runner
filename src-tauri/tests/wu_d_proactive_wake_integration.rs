@@ -36,8 +36,8 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WakeClaimAcquireResult,
-    WakeClaimRequest,
+    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
+    WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -294,12 +294,16 @@ flag = "--session"
     }
 
     fn seed_session_turn(&self) {
+        self.seed_session_turn_for(PROVIDER, SESSION, "turn-a");
+    }
+
+    fn seed_session_turn_for(&self, provider_name: &str, session_id: &str, turn_id: &str) {
         let db = self.state();
         db.ingest_session_turns_batch(
-            PROVIDER,
+            provider_name,
             &[SessionTurnIngest {
-                session_id: SESSION.to_string(),
-                turn_id: "turn-a".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
                 timestamp: ts("2026-06-04T12:00:00Z"),
                 role: "assistant".to_string(),
                 parent_turn_id: None,
@@ -374,6 +378,15 @@ flag = "--session"
     }
 
     fn seed_mailbox(&self, session_id: &str, handle: &str) {
+        self.seed_mailbox_for(session_id, handle, Some(INVOCATION));
+    }
+
+    fn seed_mailbox_for(
+        &self,
+        session_id: &str,
+        handle: &str,
+        owner_invocation_uuid: Option<&str>,
+    ) {
         let state_dir = self.work_dir.join(format!("seed-{handle}"));
         fs::create_dir_all(&state_dir).unwrap();
         let meta = state_dir.join("meta.json");
@@ -387,7 +400,7 @@ flag = "--session"
             session_id,
             handle,
             payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
-            owner_invocation_uuid: Some(INVOCATION),
+            owner_invocation_uuid,
             matched_os_pid: Some(9_300),
             matched_os_boot_id: Some("boot-seeded"),
             matched_os_pid_starttime_ticks: Some(456),
@@ -399,6 +412,16 @@ flag = "--session"
             rc: 0,
         })
         .unwrap();
+    }
+
+    fn age_mailbox_for(&self, session_id: &str, seconds_old: i64) {
+        let enqueued_at = (Utc::now() - chrono::Duration::seconds(seconds_old)).to_rfc3339();
+        self.sidecar_conn()
+            .execute(
+                "UPDATE mailbox SET enqueued_at = ?2 WHERE session_id = ?1",
+                rusqlite::params![session_id, enqueued_at],
+            )
+            .unwrap();
     }
 
     fn mark_mailbox_unconfirmed_twice(&self, session_id: &str, handle: &str) {
@@ -968,6 +991,112 @@ fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() 
     fixture.assert_xdg_isolated();
 }
 
+#[test]
+fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        "",
+        r#"printf '%s' "$last" > "$work/backlog-$resume.txt""#,
+        "backlog-any.txt",
+    ));
+
+    let dead_sessions = (0..16)
+        .map(|index| format!("00000000-0000-4000-8000-{index:012x}"))
+        .collect::<Vec<_>>();
+    for (index, session_id) in dead_sessions.iter().enumerate() {
+        let handle = format!("h-dead-owner-{index}");
+        fixture.seed_mailbox_for(session_id, &handle, None);
+        fixture.age_mailbox_for(session_id, 86_400);
+        seed_dead_wake_claim_for(
+            &fixture,
+            session_id,
+            &format!("dead0000-0000-4000-8000-{index:012x}"),
+            601,
+        );
+    }
+
+    let idle_session = "11111111-1111-4111-8111-000000000001";
+    fixture.seed_active_chain_for(
+        "22222222-2222-4222-8222-000000000001",
+        PROVIDER,
+        idle_session,
+        MODEL,
+    );
+    fixture.seed_session_turn_for(PROVIDER, idle_session, "turn-idle-backlog");
+    fixture.seed_idle_runtime_for(idle_session, PROVIDER, MODEL);
+    fixture.seed_mailbox(idle_session, "h-idle-resumable-backlog");
+    fixture.age_mailbox_for(idle_session, 3_600);
+    seed_dead_wake_claim_for(
+        &fixture,
+        idle_session,
+        "eeee0000-0000-4000-8000-000000000001",
+        601,
+    );
+
+    let recent_session = "11111111-1111-4111-8111-000000000002";
+    fixture.seed_active_chain_for(
+        "22222222-2222-4222-8222-000000000002",
+        PROVIDER,
+        recent_session,
+        MODEL,
+    );
+    fixture.seed_session_turn_for(PROVIDER, recent_session, "turn-recent-backlog");
+    fixture.seed_idle_runtime_for(recent_session, PROVIDER, MODEL);
+    fixture.seed_mailbox(recent_session, "h-recent-leak-backlog");
+    seed_dead_wake_claim_for(
+        &fixture,
+        recent_session,
+        "eeee0000-0000-4000-8000-000000000002",
+        601,
+    );
+
+    let output = fixture.run_mailbox_list(recent_session);
+    assert_success(&output);
+
+    let idle_prompt = wait_for_file(&fixture.prompt_file(&format!("backlog-{idle_session}.txt")));
+    assert!(
+        idle_prompt.contains("handle: h-idle-resumable-backlog"),
+        "{idle_prompt}"
+    );
+    let recent_prompt =
+        wait_for_file(&fixture.prompt_file(&format!("backlog-{recent_session}.txt")));
+    assert!(
+        recent_prompt.contains("handle: h-recent-leak-backlog"),
+        "{recent_prompt}"
+    );
+
+    wait_until(
+        "backlog recoverable sessions delivered and debris reaped",
+        || {
+            let db = fixture.mailbox();
+            let idle_rows = db.list_mailbox(idle_session, true).unwrap();
+            let recent_rows = db.list_mailbox(recent_session, true).unwrap();
+            let recovered = idle_rows.len() == 1
+                && idle_rows[0].delivered_at.is_some()
+                && recent_rows.len() == 1
+                && recent_rows[0].delivered_at.is_some();
+            let debris_reaped = dead_sessions.iter().all(|session_id| {
+                let rows = db.list_mailbox(session_id, true).unwrap();
+                rows.len() == 1
+                    && rows[0].delivered_at.is_none()
+                    && rows[0].delivery_error.as_deref() == Some(WAKE_SWEEP_ABANDONED_ERROR)
+                    && db.wake_claim(session_id).unwrap().is_none()
+            });
+            recovered && debris_reaped
+        },
+    );
+    for session_id in dead_sessions {
+        assert!(
+            !fixture
+                .prompt_file(&format!("backlog-{session_id}.txt"))
+                .exists(),
+            "dead-owner debris must not be re-woken: {session_id}"
+        );
+    }
+    fixture.assert_xdg_isolated();
+}
+
 fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -> Command {
     let state_dir = fixture.work_dir.join(format!("concurrent-{handle}"));
     fs::create_dir_all(&state_dir).unwrap();
@@ -1011,12 +1140,21 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
 }
 
 fn seed_dead_wake_claim(fixture: &Fixture, claim_token: &str, seconds_old: i64) {
-    acquire_seed_wake_claim(fixture, claim_token);
+    seed_dead_wake_claim_for(fixture, SESSION, claim_token, seconds_old);
+}
+
+fn seed_dead_wake_claim_for(
+    fixture: &Fixture,
+    session_id: &str,
+    claim_token: &str,
+    seconds_old: i64,
+) {
+    acquire_seed_wake_claim_for(fixture, session_id, claim_token);
     fixture
         .mailbox()
-        .record_wake_claim_pid(SESSION, claim_token, 999_999_999)
+        .record_wake_claim_pid(session_id, claim_token, 999_999_999)
         .unwrap();
-    age_wake_claim(fixture, seconds_old);
+    age_wake_claim_for(fixture, session_id, seconds_old);
 }
 
 fn seed_live_wake_claim(fixture: &Fixture, claim_token: &str) {
@@ -1041,10 +1179,14 @@ fn seed_live_wake_claim(fixture: &Fixture, claim_token: &str) {
 }
 
 fn acquire_seed_wake_claim(fixture: &Fixture, claim_token: &str) {
+    acquire_seed_wake_claim_for(fixture, SESSION, claim_token);
+}
+
+fn acquire_seed_wake_claim_for(fixture: &Fixture, session_id: &str, claim_token: &str) {
     let mut db = fixture.mailbox();
     assert!(matches!(
         db.try_acquire_wake_claim(WakeClaimRequest {
-            session_id: SESSION,
+            session_id,
             claim_token,
             reason: "notify_idle",
             auto_wake_count: 1,
@@ -1056,13 +1198,13 @@ fn acquire_seed_wake_claim(fixture: &Fixture, claim_token: &str) {
     ));
 }
 
-fn age_wake_claim(fixture: &Fixture, seconds_old: i64) {
+fn age_wake_claim_for(fixture: &Fixture, session_id: &str, seconds_old: i64) {
     let claimed_at = (Utc::now() - chrono::Duration::seconds(seconds_old)).to_rfc3339();
     fixture
         .sidecar_conn()
         .execute(
             "UPDATE session_wake_claim SET claimed_at = ?2 WHERE session_id = ?1",
-            rusqlite::params![SESSION, claimed_at],
+            rusqlite::params![session_id, claimed_at],
         )
         .unwrap();
 }

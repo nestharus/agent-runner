@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::pid_identity::{self, ProcessIdentity};
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
+pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MailboxRow {
@@ -169,6 +170,8 @@ pub struct WakeClaimRow {
 pub struct WakeSweepCandidate {
     pub session_id: String,
     pub auto_wake_count: i64,
+    pub min_pending_seq: i64,
+    pub max_pending_seq: i64,
 }
 
 pub struct MailboxDb {
@@ -325,6 +328,47 @@ impl MailboxDb {
         }
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery failure transaction: {err}"))
+    }
+
+    pub fn mark_pending_abandoned(
+        &mut self,
+        session_id: &str,
+        delivery_error: &str,
+        limit: usize,
+    ) -> Result<usize, String> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| format!("Failed to start mailbox abandonment transaction: {err}"))?;
+        let changed = tx
+            .execute(
+                "UPDATE mailbox
+                 SET delivery_error = ?2
+                 WHERE seq IN (
+                    SELECT seq
+                    FROM mailbox
+                    WHERE session_id = ?1
+                      AND delivered_at IS NULL
+                      AND (delivery_error IS NULL OR delivery_error != ?2)
+                    ORDER BY seq ASC
+                    LIMIT ?3
+                 )",
+                params![session_id, delivery_error, limit as i64],
+            )
+            .map_err(|err| format!("Failed to mark mailbox rows abandoned: {err}"))?;
+        if changed > 0 {
+            tx.execute(
+                "DELETE FROM session_wake_claim WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map_err(|err| format!("Failed to release abandoned wake claim: {err}"))?;
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit mailbox abandonment transaction: {err}"))?;
+        Ok(changed)
     }
 
     pub fn upsert_session_runtime(
@@ -525,17 +569,23 @@ impl MailboxDb {
             return Ok(Vec::new());
         }
         let mut candidates = Vec::new();
-        for session_id in self.pending_wake_session_ids(limit.saturating_mul(4))? {
+        for session_id in self.pending_wake_session_ids(limit)? {
             if candidates.len() >= limit {
                 break;
             }
             if self.session_is_busy(&session_id)? {
                 continue;
             }
+            let Some((min_pending_seq, max_pending_seq)) = self.pending_seq_bounds(&session_id)?
+            else {
+                continue;
+            };
             let Some(claim) = self.wake_claim(&session_id)? else {
                 candidates.push(WakeSweepCandidate {
                     session_id,
                     auto_wake_count: 1,
+                    min_pending_seq,
+                    max_pending_seq,
                 });
                 continue;
             };
@@ -543,6 +593,8 @@ impl MailboxDb {
                 candidates.push(WakeSweepCandidate {
                     session_id,
                     auto_wake_count: claim.auto_wake_count.saturating_add(1),
+                    min_pending_seq,
+                    max_pending_seq,
                 });
             }
         }
@@ -599,22 +651,59 @@ impl MailboxDb {
     }
 
     fn pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let oldest_limit = limit.saturating_sub(limit / 2);
+        let newest_limit = limit.saturating_sub(oldest_limit);
+        let mut session_ids = self.oldest_pending_wake_session_ids(oldest_limit)?;
+        for session_id in self.newest_pending_wake_session_ids(newest_limit)? {
+            if session_ids.len() >= limit {
+                break;
+            }
+            if !session_ids.iter().any(|existing| existing == &session_id) {
+                session_ids.push(session_id);
+            }
+        }
+        Ok(session_ids)
+    }
+
+    fn oldest_pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
+        self.pending_wake_session_ids_by_oldest_seq(limit, "ASC")
+    }
+
+    fn newest_pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
+        self.pending_wake_session_ids_by_oldest_seq(limit, "DESC")
+    }
+
+    fn pending_wake_session_ids_by_oldest_seq(
+        &self,
+        limit: usize,
+        direction: &str,
+    ) -> Result<Vec<String>, String> {
         let mut stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT session_id
                  FROM mailbox
                  WHERE delivered_at IS NULL
+                   AND (delivery_error IS NULL OR delivery_error != ?2)
                  GROUP BY session_id
-                 ORDER BY MIN(seq) ASC
+                 ORDER BY MIN(seq) {direction}
                  LIMIT ?1",
-            )
+            ))
             .map_err(|err| format!("Failed to prepare pending wake session query: {err}"))?;
         let rows = stmt
-            .query_map(params![limit as i64], |row| row.get::<_, String>(0))
+            .query_map(params![limit as i64, WAKE_SWEEP_ABANDONED_ERROR], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|err| format!("Failed to query pending wake sessions: {err}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("Failed to read pending wake session row: {err}"))
+    }
+
+    fn pending_seq_bounds(&self, session_id: &str) -> Result<Option<(i64, i64)>, String> {
+        pending_seq_bounds_on(&self.conn, session_id)
     }
 
     #[cfg(test)]
@@ -1284,8 +1373,30 @@ fn pending_seq_bounds_tx(
     tx.query_row(
         "SELECT MIN(seq), MAX(seq)
          FROM mailbox
-         WHERE session_id = ?1 AND delivered_at IS NULL",
-        params![session_id],
+         WHERE session_id = ?1
+           AND delivered_at IS NULL
+           AND (delivery_error IS NULL OR delivery_error != ?2)",
+        params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
+        |row| {
+            let min_seq: Option<i64> = row.get(0)?;
+            let max_seq: Option<i64> = row.get(1)?;
+            Ok(min_seq.zip(max_seq))
+        },
+    )
+    .map_err(|err| format!("Failed to read pending mailbox seq bounds: {err}"))
+}
+
+fn pending_seq_bounds_on(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(i64, i64)>, String> {
+    conn.query_row(
+        "SELECT MIN(seq), MAX(seq)
+         FROM mailbox
+         WHERE session_id = ?1
+           AND delivered_at IS NULL
+           AND (delivery_error IS NULL OR delivery_error != ?2)",
+        params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
         |row| {
             let min_seq: Option<i64> = row.get(0)?;
             let max_seq: Option<i64> = row.get(1)?;
