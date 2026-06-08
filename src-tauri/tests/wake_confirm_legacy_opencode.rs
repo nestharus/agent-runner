@@ -311,14 +311,71 @@ fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
             && rows[0].delivered_by_invocation_uuid.is_some()
     });
     assert!(
-        fixture
+        !fixture
             .state()
             .has_session_user_text_turn(PROVIDER, SESSION, &prompt)
             .unwrap(),
-        "session_turns should contain the exact delivered user body"
+        "fixture should quote-wrap the delivered user body so exact-text confirmation stays red"
+    );
+    assert!(
+        fixture
+            .state()
+            .has_session_user_turn_containing(
+                PROVIDER,
+                SESSION,
+                &delivery_nonce_from_prompt(&prompt)
+            )
+            .unwrap(),
+        "session_turns should contain the delivery nonce in the quote-wrapped user body"
     );
     assert_eq!(fixture.unconfirmed_invocation_count(), 0);
     assert!(fixture.mailbox().list_pending(SESSION).unwrap().is_empty());
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn legacy_opencode_resume_leaves_mailbox_pending_when_ingested_turn_omits_delivery_nonce() {
+    let _guard = integration_test_guard();
+    let fixture = prepared_fixture();
+    fixture.seed_mailbox_notification();
+
+    let output = fixture.run_resume_with_env(&[("WAKE_CONFIRM_STRIP_DELIVERY_NONCE", "1")]);
+    assert_exit_code(&output, 1);
+    let prompt = wait_for_file(&fixture.notification_prompt_path());
+    assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
+    wait_until(
+        "fake opencode export contains user turn without delivery nonce",
+        || {
+            let exported = fixture.export_text();
+            exported.contains("[OULIPOLY NOTIFICATIONS]")
+                && !exported.contains("[OULIPOLY-DELIVERY ")
+        },
+    );
+    wait_until(
+        "nonce-less export leaves mailbox pending unconfirmed",
+        || {
+            let db = fixture.mailbox();
+            let rows = db.list_mailbox(SESSION, true).unwrap();
+            rows.len() == 1
+                && rows[0].delivered_at.is_none()
+                && rows[0].delivery_attempts == 1
+                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+                && rows[0].delivered_by_invocation_uuid.is_none()
+        },
+    );
+    assert!(
+        !fixture
+            .state()
+            .has_session_user_turn_containing(
+                PROVIDER,
+                SESSION,
+                &delivery_nonce_from_prompt(&prompt)
+            )
+            .unwrap(),
+        "stored resume turn without the delivery nonce must not confirm delivery"
+    );
+    assert_eq!(fixture.unconfirmed_invocation_count(), 1);
+    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
     fixture.assert_xdg_isolated();
 }
 
@@ -374,6 +431,7 @@ fn fake_opencode_script() -> &'static str {
 import json
 import os
 import pathlib
+import re
 import sys
 
 SESSION = "ses_wakeconfirmlegacy"
@@ -406,6 +464,11 @@ def append_turn(session_id, role, text):
     with session_path(session_id).open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(turn, separators=(",", ":")) + "\n")
 
+def stored_resume_prompt(prompt):
+    if os.environ.get("WAKE_CONFIRM_STRIP_DELIVERY_NONCE") == "1":
+        prompt = re.sub(r"^\[OULIPOLY-DELIVERY [^\n]*\]\n?", "", prompt, flags=re.MULTILINE)
+    return f'"{prompt}"'
+
 def parse_run(argv):
     session_id = SESSION
     prompt = ""
@@ -428,7 +491,7 @@ def run(argv):
     if "--session" in argv:
         (work_dir() / "legacy-wake-resumed.txt").write_text(prompt, encoding="utf-8")
         if os.environ.get("WAKE_CONFIRM_OMIT_RESUME_USER_TURN") != "1":
-            append_turn(session_id, "user", prompt)
+            append_turn(session_id, "user", stored_resume_prompt(prompt))
         append_turn(session_id, "assistant", "legacy wake acknowledged")
         print("legacy wake acknowledged", flush=True)
         return 0
@@ -515,6 +578,19 @@ fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("timed out waiting for {label}");
+}
+
+fn delivery_nonce_from_prompt(prompt: &str) -> String {
+    let prefix = "[OULIPOLY-DELIVERY ";
+    let start = prompt
+        .find(prefix)
+        .unwrap_or_else(|| panic!("prompt missing delivery nonce: {prompt}"))
+        + prefix.len();
+    let rest = &prompt[start..];
+    let end = rest
+        .find(']')
+        .unwrap_or_else(|| panic!("prompt has unterminated delivery nonce: {prompt}"));
+    rest[..end].to_string()
 }
 
 fn integration_test_lock() -> &'static Mutex<()> {

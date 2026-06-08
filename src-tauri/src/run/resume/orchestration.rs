@@ -950,6 +950,18 @@ fn ingested_user_turn_confirms_mailbox_delivery(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
 ) -> bool {
+    if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
+        return input
+            .env
+            .state
+            .has_session_user_turn_containing(
+                provider_name,
+                &input.resolved.active_session_id,
+                delivery_nonce,
+            )
+            .unwrap_or(false);
+    }
+
     let Some(answer) = input.answer else {
         return false;
     };
