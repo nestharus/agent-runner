@@ -3,13 +3,15 @@
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`,
 //! `validator`
 
+use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     MailboxDb, SessionLiveness, SessionRuntimeIdleUpdate, SessionRuntimeRow,
-    WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow,
+    WakeClaimAcquireResult, WakeClaimRequest, WakeClaimRow, WakeSweepCandidate,
 };
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -29,6 +31,10 @@ const DEFAULT_AUTO_WAKE_MAX: i64 = 5;
 const DEFAULT_AUTO_WAKE_RETRY_BASE_MS: u64 = 1_000;
 const AUTO_WAKE_RETRY_MAX_MS: u64 = 30_000;
 const WAKE_CLAIM_STALE_AFTER_SECONDS: i64 = 10 * 60;
+const WAKE_RECLAIM_SWEEP_LIMIT: usize = 8;
+#[allow(dead_code)]
+const WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS: u64 = 60;
+const CONSUMED_NOTIFICATION_MARKER: &str = "[OULIPOLY NOTIFICATIONS]";
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct WakeDiagnostic {
@@ -87,6 +93,141 @@ pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
         auto_wake_count: 1,
         renew_token: None,
     })
+}
+
+pub(crate) fn run_startup_wake_reclaim_sweep() {
+    if is_auto_wake_invocation() {
+        return;
+    }
+    run_wake_reclaim_sweep_or_warn("process_start");
+}
+
+#[allow(dead_code)]
+pub(crate) fn start_wake_reclaim_maintenance_driver() {
+    static DRIVER: OnceLock<()> = OnceLock::new();
+    DRIVER.get_or_init(spawn_wake_reclaim_maintenance_driver);
+}
+
+#[allow(dead_code)]
+fn spawn_wake_reclaim_maintenance_driver() {
+    let result = std::thread::Builder::new()
+        .name("oulipoly-wake-reclaim-sweep".to_string())
+        .spawn(wake_reclaim_maintenance_loop);
+    if let Err(err) = result {
+        tracing::warn!("Failed to start wake reclaim sweep driver: {err}");
+    }
+}
+
+#[allow(dead_code)]
+fn wake_reclaim_maintenance_loop() {
+    run_wake_reclaim_sweep_or_warn("maintenance_start");
+    loop {
+        std::thread::sleep(Duration::from_secs(WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS));
+        run_wake_reclaim_sweep_or_warn("maintenance_tick");
+    }
+}
+
+fn run_wake_reclaim_sweep_or_warn(trigger: &str) {
+    if let Err(err) = run_wake_reclaim_sweep(trigger) {
+        tracing::warn!(trigger, "Wake reclaim sweep failed: {err}");
+    }
+}
+
+fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(());
+    };
+    let candidates =
+        db.wake_sweep_candidates(WAKE_CLAIM_STALE_AFTER_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT)?;
+    let candidates = startable_sweep_candidates(&db, candidates);
+    drop(db);
+    for candidate in candidates {
+        let diagnostic = start_wake_chain(StartWakeInput {
+            session_id: &candidate.session_id,
+            reason: trigger,
+            auto_wake_count: candidate.auto_wake_count,
+            renew_token: None,
+        });
+        trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
+    }
+    Ok(())
+}
+
+fn startable_sweep_candidates(
+    db: &MailboxDb,
+    candidates: Vec<WakeSweepCandidate>,
+) -> Vec<WakeSweepCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| wake_sweep_candidate_is_startable(db, candidate))
+        .collect()
+}
+
+fn wake_sweep_candidate_is_startable(db: &MailboxDb, candidate: &WakeSweepCandidate) -> bool {
+    !wake_sweep_candidate_reached_cap(candidate)
+        && !pending_mailbox_consumed_marker_present(db, &candidate.session_id)
+}
+
+fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate) -> bool {
+    auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max())
+}
+
+fn pending_mailbox_consumed_marker_present(db: &MailboxDb, session_id: &str) -> bool {
+    let Ok(pending) = db.list_pending(session_id) else {
+        return false;
+    };
+    if pending.is_empty() {
+        return true;
+    }
+    let Some(provider_name) = pending_mailbox_provider_name(db, session_id) else {
+        return false;
+    };
+    let Some(state) = open_default_state_read_only() else {
+        return false;
+    };
+    session_has_consumed_notification_marker(&state, &provider_name, session_id)
+        && pending.iter().all(|row| {
+            state
+                .has_session_user_turn_containing(
+                    &provider_name,
+                    session_id,
+                    &format!("handle: {}", row.handle),
+                )
+                .unwrap_or(false)
+        })
+}
+
+fn open_default_state_read_only() -> Option<StateDb> {
+    let path = StateDb::default_path().ok()?;
+    if !path.exists() {
+        return None;
+    }
+    StateDb::open_read_only(&path).ok()
+}
+
+fn pending_mailbox_provider_name(db: &MailboxDb, session_id: &str) -> Option<String> {
+    db.session_runtime(session_id)
+        .ok()
+        .flatten()
+        .and_then(|runtime| runtime.provider_name)
+}
+
+fn session_has_consumed_notification_marker(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+) -> bool {
+    state
+        .has_session_user_turn_containing(provider_name, session_id, CONSUMED_NOTIFICATION_MARKER)
+        .unwrap_or(false)
+}
+
+fn trace_wake_sweep_candidate(session_id: &str, diagnostic: &WakeDiagnostic) {
+    tracing::debug!(
+        session_id,
+        status = diagnostic.status.as_str(),
+        "Wake reclaim sweep candidate evaluated"
+    );
 }
 
 pub(crate) fn mark_successful_turn_idle_and_recheck(
@@ -412,7 +553,13 @@ fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         &context.claim.claim_token,
         input.auto_wake_count,
     );
-    wake_spawn_diagnostic(&mut context.db, input, context.claim, spawn)
+    wake_spawn_diagnostic(
+        &mut context.db,
+        input,
+        context.runtime.as_ref(),
+        context.claim,
+        spawn,
+    )
 }
 
 struct WakeStartContext {
@@ -468,11 +615,12 @@ fn wake_claim_to_start(result: WakeClaimAcquireResult) -> Result<WakeClaimRow, W
 fn wake_spawn_diagnostic(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
+    runtime: Option<&SessionRuntimeRow>,
     claim: WakeClaimRow,
     spawn: Result<i64, String>,
 ) -> WakeDiagnostic {
     match spawn {
-        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, claim, wake_pid),
+        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, runtime, claim, wake_pid),
         Err(err) => failed_wake_spawn_diagnostic(db, input, claim, err),
     }
 }
@@ -480,10 +628,11 @@ fn wake_spawn_diagnostic(
 fn successful_wake_spawn_diagnostic(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
+    runtime: Option<&SessionRuntimeRow>,
     claim: WakeClaimRow,
     wake_pid: i64,
 ) -> WakeDiagnostic {
-    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid);
+    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid, runtime);
     spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
 }
 
@@ -581,8 +730,22 @@ fn already_in_flight_diagnostic(claim: WakeClaimRow) -> WakeDiagnostic {
     diagnostic
 }
 
-fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &str, wake_pid: i64) {
-    if let Err(err) = db.record_wake_claim_pid(session_id, claim_token, wake_pid) {
+fn record_wake_pid_or_warn(
+    db: &mut MailboxDb,
+    session_id: &str,
+    claim_token: &str,
+    wake_pid: i64,
+    runtime: Option<&SessionRuntimeRow>,
+) {
+    let provider_name = runtime.and_then(|row| row.provider_name.as_deref());
+    let model_name = runtime.and_then(|row| row.model_name.as_deref());
+    if let Err(err) = db.record_wake_claim_pid_identity(
+        session_id,
+        claim_token,
+        wake_pid,
+        provider_name,
+        model_name,
+    ) {
         tracing::warn!(session_id, claim_token, "Failed to record wake PID: {err}");
     }
 }

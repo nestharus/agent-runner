@@ -165,6 +165,12 @@ pub struct WakeClaimRow {
     pub max_pending_seq_at_claim: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeSweepCandidate {
+    pub session_id: String,
+    pub auto_wake_count: i64,
+}
+
 pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
@@ -427,10 +433,11 @@ impl MailboxDb {
             return Ok(WakeClaimAcquireResult::NoPending);
         };
         if let Some(existing) = fresh_in_flight_wake_claim(
+            &tx,
             wake_claim_tx(&tx, input.session_id)?,
             input.stale_after_seconds,
             renew_token,
-        ) {
+        )? {
             tx.commit().map_err(|err| {
                 format!("Failed to commit existing wake claim transaction: {err}")
             })?;
@@ -484,6 +491,64 @@ impl MailboxDb {
         Ok(changed > 0)
     }
 
+    pub fn record_wake_claim_pid_identity(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+        wake_pid: i64,
+        provider_name: Option<&str>,
+        model_name: Option<&str>,
+    ) -> Result<bool, String> {
+        if let Some(identity) = pid_identity::read_live_process_identity(wake_pid)? {
+            let recorded_at = now_rfc3339();
+            pid_identity::PidIdentityDb::open(self.path())?.record_identity(
+                pid_identity::PidIdentityRecord {
+                    identity: &identity,
+                    os_pgid: None,
+                    invocation_uuid: claim_token,
+                    session_id: Some(session_id),
+                    provider_name,
+                    model_name,
+                    recorded_at: &recorded_at,
+                },
+            )?;
+        }
+        self.record_wake_claim_pid(session_id, claim_token, wake_pid)
+    }
+
+    pub fn wake_sweep_candidates(
+        &mut self,
+        stale_after_seconds: i64,
+        limit: usize,
+    ) -> Result<Vec<WakeSweepCandidate>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut candidates = Vec::new();
+        for session_id in self.pending_wake_session_ids(limit.saturating_mul(4))? {
+            if candidates.len() >= limit {
+                break;
+            }
+            if self.session_is_busy(&session_id)? {
+                continue;
+            }
+            let Some(claim) = self.wake_claim(&session_id)? else {
+                candidates.push(WakeSweepCandidate {
+                    session_id,
+                    auto_wake_count: 1,
+                });
+                continue;
+            };
+            if wake_claim_is_reclaimable(&self.conn, &claim, stale_after_seconds)? {
+                candidates.push(WakeSweepCandidate {
+                    session_id,
+                    auto_wake_count: claim.auto_wake_count.saturating_add(1),
+                });
+            }
+        }
+        Ok(candidates)
+    }
+
     pub fn validate_wake_claim_for_child(
         &mut self,
         session_id: &str,
@@ -531,6 +596,25 @@ impl MailboxDb {
             .query_map(params![session_id], map_mailbox_row)
             .map_err(|err| format!("Failed to query mailbox rows: {err}"))?;
         collect_rows(rows)
+    }
+
+    fn pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id
+                 FROM mailbox
+                 WHERE delivered_at IS NULL
+                 GROUP BY session_id
+                 ORDER BY MIN(seq) ASC
+                 LIMIT ?1",
+            )
+            .map_err(|err| format!("Failed to prepare pending wake session query: {err}"))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get::<_, String>(0))
+            .map_err(|err| format!("Failed to query pending wake sessions: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read pending wake session row: {err}"))
     }
 
     #[cfg(test)]
@@ -896,13 +980,76 @@ fn session_liveness_from_decision(decision: &SessionRuntimeLivenessDecision) -> 
 }
 
 fn fresh_in_flight_wake_claim(
+    tx: &rusqlite::Transaction<'_>,
     existing: Option<WakeClaimRow>,
     stale_after_seconds: i64,
     renew_token: Option<&str>,
-) -> Option<WakeClaimRow> {
-    let existing = existing?;
+) -> Result<Option<WakeClaimRow>, String> {
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
     let renews_existing = renew_token == Some(existing.claim_token.as_str());
-    (!claim_is_stale(&existing, stale_after_seconds) && !renews_existing).then_some(existing)
+    if renews_existing || wake_claim_is_reclaimable(tx, &existing, stale_after_seconds)? {
+        return Ok(None);
+    }
+    Ok(Some(existing))
+}
+
+fn wake_claim_is_reclaimable(
+    conn: &Connection,
+    claim: &WakeClaimRow,
+    stale_after_seconds: i64,
+) -> Result<bool, String> {
+    if claim.wake_pid.is_some() {
+        return wake_claim_pid_is_reclaimable(conn, claim);
+    }
+    Ok(claim_is_stale(claim, stale_after_seconds))
+}
+
+fn wake_claim_pid_is_reclaimable(conn: &Connection, claim: &WakeClaimRow) -> Result<bool, String> {
+    let Some(wake_pid) = claim.wake_pid else {
+        return Ok(false);
+    };
+    wake_claim_pid_is_live_identity_matched(conn, claim, wake_pid).map(|matched| !matched)
+}
+
+fn wake_claim_pid_is_live_identity_matched(
+    conn: &Connection,
+    claim: &WakeClaimRow,
+    wake_pid: i64,
+) -> Result<bool, String> {
+    let Some(live) = pid_identity::read_live_process_identity(wake_pid)? else {
+        return Ok(false);
+    };
+    wake_claim_live_identity_has_matching_sidecar_row(conn, claim, &live)
+}
+
+fn wake_claim_live_identity_has_matching_sidecar_row(
+    conn: &Connection,
+    claim: &WakeClaimRow,
+    live: &ProcessIdentity,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM pid_identity
+            WHERE os_pid = ?1
+              AND os_boot_id = ?2
+              AND os_pid_starttime_ticks = ?3
+              AND invocation_uuid = ?4
+              AND session_id = ?5
+        )",
+        params![
+            live.os_pid,
+            &live.os_boot_id,
+            live.os_pid_starttime_ticks,
+            &claim.claim_token,
+            &claim.session_id,
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(|err| format!("Failed to verify wake PID sidecar identity: {err}"))
 }
 
 fn acquire_wake_claim_tx(
@@ -1696,6 +1843,96 @@ mod tests {
         assert_eq!(claim.claim_token, "token-b");
         assert_eq!(claim.reason, "turn_end_recheck");
         assert_eq!(claim.auto_wake_count, 2);
+    }
+
+    #[test]
+    fn wake_dead_pid_claim_can_be_stolen_before_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        assert!(matches!(
+            db.try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap(),
+            WakeClaimAcquireResult::Acquired(_)
+        ));
+        db.record_wake_claim_pid("session-a", "token-a", 999_999_999)
+            .unwrap();
+
+        let stolen = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-b",
+                reason: "wake_reclaim_sweep",
+                auto_wake_count: 2,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+
+        let WakeClaimAcquireResult::Acquired(claim) = stolen else {
+            panic!("expected dead PID claim to be stolen, got {stolen:?}");
+        };
+        assert_eq!(claim.claim_token, "token-b");
+    }
+
+    #[test]
+    fn wake_live_identity_matched_claim_is_not_stolen_after_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        assert!(matches!(
+            db.try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap(),
+            WakeClaimAcquireResult::Acquired(_)
+        ));
+        let identity = current_identity();
+        let sidecar = pid_identity::PidIdentityDb::open(db.path()).unwrap();
+        sidecar
+            .record_identity(pid_identity::PidIdentityRecord {
+                identity: &identity,
+                os_pgid: None,
+                invocation_uuid: "token-a",
+                session_id: Some("session-a"),
+                provider_name: Some("wake"),
+                model_name: Some("model-a"),
+                recorded_at: "2026-06-08T00:00:00Z",
+            })
+            .unwrap();
+        db.record_wake_claim_pid("session-a", "token-a", identity.os_pid)
+            .unwrap();
+        db.force_wake_claim_age_for_test("session-a", 601).unwrap();
+
+        let result = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-b",
+                reason: "wake_reclaim_sweep",
+                auto_wake_count: 2,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+
+        let WakeClaimAcquireResult::AlreadyInFlight(claim) = result else {
+            panic!("expected live identity-matched claim to remain in flight, got {result:?}");
+        };
+        assert_eq!(claim.claim_token, "token-a");
     }
 
     #[test]

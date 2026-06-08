@@ -31,6 +31,7 @@ pub fn run_tauri() {
     let models_dir = default_models_dir();
     let config_root = app_paths::models_config_root(&models_dir);
     let runtime_paths = runtime_paths_for(&models_dir, &config_root);
+    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
     let services = wiring::AgentRuntimeServices::production(runtime_paths)
         .expect(RUNTIME_SERVICES_INIT_EXPECT_MESSAGE);
 

@@ -84,6 +84,9 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = recover_pending_session_replaces() {
         return Ok(handle_pending_session_replace_error(&err));
     }
+    if startup_wake_reclaim_sweep_enabled(&cli) {
+        crate::wake_coordinator::run_startup_wake_reclaim_sweep();
+    }
 
     if cli.new {
         return run_default_provider_repl(&cli);
@@ -112,6 +115,20 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     }
 
     crate::commands::direct_model::run_agent_cli(&cli, &agent_runtime_services)
+}
+
+fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
+    if cli.resume.is_some() {
+        return false;
+    }
+    !matches!(
+        &cli.command,
+        Some(Subcommands::Resume { .. })
+            | Some(Subcommands::Repl {
+                resume: Some(_),
+                ..
+            })
+    )
 }
 
 fn recover_pending_session_replaces() -> Result<(), session_replace::ReplaceError> {

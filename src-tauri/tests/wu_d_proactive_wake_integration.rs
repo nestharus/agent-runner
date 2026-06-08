@@ -5,7 +5,9 @@ use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert, WakeClaimAcquireResult,
     WakeClaimRequest,
 };
-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
+use oulipoly_state::pid_identity::{
+    PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
+};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -102,6 +104,16 @@ impl Fixture {
             .arg(SESSION)
             .arg("--models-dir")
             .arg(&self.models_dir);
+        self.run(cmd)
+    }
+
+    fn run_mailbox_list(&self, session_id: &str) -> Output {
+        let mut cmd = Command::new(runner_bin());
+        cmd.arg("mailbox")
+            .arg("list")
+            .arg("--session-id")
+            .arg(session_id)
+            .arg("--json");
         self.run(cmd)
     }
 
@@ -239,8 +251,12 @@ flag = "--session"
         Connection::open(self.sidecar_path()).unwrap()
     }
 
+    fn state(&self) -> StateDb {
+        StateDb::open(&self.state_path()).unwrap()
+    }
+
     fn seed_session_turn(&self) {
-        let db = StateDb::open(&self.state_path()).unwrap();
+        let db = self.state();
         db.ingest_session_turns_batch(
             PROVIDER,
             &[SessionTurnIngest {
@@ -255,6 +271,24 @@ flag = "--session"
             }],
         )
         .unwrap();
+    }
+
+    fn seed_consumed_notification_turn(&self, handle: &str) {
+        self.state()
+            .ingest_session_turns_batch(
+                PROVIDER,
+                &[SessionTurnIngest {
+                    session_id: SESSION.to_string(),
+                    turn_id: format!("turn-consumed-{handle}"),
+                    timestamp: ts("2026-06-04T12:01:00Z"),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: false,
+                    body: Some(format!("[OULIPOLY NOTIFICATIONS]\nhandle: {handle}\n")),
+                }],
+            )
+            .unwrap();
     }
 
     fn seed_idle_runtime(&self) {
@@ -753,6 +787,73 @@ fn batch_cap_followup_wake() {
     fixture.assert_xdg_isolated();
 }
 
+#[test]
+fn wake_sweep_reclaims_dead_claim_and_delivers_pending_mailbox() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "sweep-reclaimed.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-sweep-reclaim");
+    seed_dead_wake_claim(&fixture, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 601);
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+
+    let prompt = wait_for_file(&fixture.prompt_file("sweep-reclaimed.txt"));
+    assert!(prompt.contains("handle: h-sweep-reclaim"), "{prompt}");
+    wait_until("sweep reclaimed dead claim and delivered mailbox", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && rows[0].delivery_error.is_none()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn wake_sweep_does_not_disturb_live_identity_matched_claim() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "live-claim-not-disturbed.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-live-claim");
+    seed_live_wake_claim(&fixture, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(!fixture.prompt_file("live-claim-not-disturbed.txt").exists());
+    let claim = fixture.mailbox().wake_claim(SESSION).unwrap().unwrap();
+    assert_eq!(claim.claim_token, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "consumed-not-rewoken.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-consumed");
+    fixture.seed_consumed_notification_turn("h-consumed");
+    seed_dead_wake_claim(&fixture, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", 601);
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(!fixture.prompt_file("consumed-not-rewoken.txt").exists());
+    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
+    fixture.assert_xdg_isolated();
+}
+
 fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -> Command {
     let state_dir = fixture.work_dir.join(format!("concurrent-{handle}"));
     fs::create_dir_all(&state_dir).unwrap();
@@ -793,6 +894,69 @@ fn notify_command(fixture: &Fixture, handle: &str, identity: &ProcessIdentity) -
         .stderr(Stdio::piped())
         .current_dir(fixture.dir.path());
     cmd
+}
+
+fn seed_dead_wake_claim(fixture: &Fixture, claim_token: &str, seconds_old: i64) {
+    acquire_seed_wake_claim(fixture, claim_token);
+    fixture
+        .mailbox()
+        .record_wake_claim_pid(SESSION, claim_token, 999_999_999)
+        .unwrap();
+    age_wake_claim(fixture, seconds_old);
+}
+
+fn seed_live_wake_claim(fixture: &Fixture, claim_token: &str) {
+    acquire_seed_wake_claim(fixture, claim_token);
+    let identity = current_process_identity();
+    PidIdentityDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .record_identity(PidIdentityRecord {
+            identity: &identity,
+            os_pgid: None,
+            invocation_uuid: claim_token,
+            session_id: Some(SESSION),
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL),
+            recorded_at: "2026-06-04T12:02:00Z",
+        })
+        .unwrap();
+    fixture
+        .mailbox()
+        .record_wake_claim_pid(SESSION, claim_token, identity.os_pid)
+        .unwrap();
+}
+
+fn acquire_seed_wake_claim(fixture: &Fixture, claim_token: &str) {
+    let mut db = fixture.mailbox();
+    assert!(matches!(
+        db.try_acquire_wake_claim(WakeClaimRequest {
+            session_id: SESSION,
+            claim_token,
+            reason: "notify_idle",
+            auto_wake_count: 1,
+            wake_invocation_uuid: None,
+            stale_after_seconds: 600,
+        })
+        .unwrap(),
+        WakeClaimAcquireResult::Acquired(_)
+    ));
+}
+
+fn age_wake_claim(fixture: &Fixture, seconds_old: i64) {
+    let claimed_at = (Utc::now() - chrono::Duration::seconds(seconds_old)).to_rfc3339();
+    fixture
+        .sidecar_conn()
+        .execute(
+            "UPDATE session_wake_claim SET claimed_at = ?2 WHERE session_id = ?1",
+            rusqlite::params![SESSION, claimed_at],
+        )
+        .unwrap();
+}
+
+fn current_process_identity() -> ProcessIdentity {
+    read_live_process_identity(i64::from(std::process::id()))
+        .unwrap()
+        .expect("test process should have a live identity")
 }
 
 #[test]
@@ -840,6 +1004,10 @@ export XDG_DATA_HOME="$work/shadow-xdg"
 }
 
 fn assert_notify_success(output: &Output) {
+    assert_success(output);
+}
+
+fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
         "stdout={} stderr={}",

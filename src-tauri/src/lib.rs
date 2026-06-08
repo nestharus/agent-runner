@@ -27,6 +27,8 @@ pub mod terminal_outcome_adapter;
 #[path = "commands/test_model/mod.rs"]
 pub mod test_model_command;
 pub mod usage;
+#[allow(dead_code)]
+mod wake_coordinator;
 mod wiring;
 pub mod zero_turn_orchestration;
 
