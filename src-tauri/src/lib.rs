@@ -19,6 +19,8 @@ mod app_paths;
 mod app_state;
 #[path = "lib_commands.rs"]
 pub mod commands;
+#[allow(dead_code)]
+mod mailbox_delivery;
 #[path = "commands/provider_settings.rs"]
 pub mod provider_settings;
 mod run_tauri;

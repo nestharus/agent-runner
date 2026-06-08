@@ -66,6 +66,10 @@ impl Fixture {
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
             .env("S11_WORK_DIR", &self.work_dir)
             .env_remove("OULIPOLY_DATA_DIR")
+            .env_remove("OULIPOLY_AUTO_WAKE")
+            .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
+            .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
+            .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .current_dir(self.dir.path());
         cmd.output().unwrap()

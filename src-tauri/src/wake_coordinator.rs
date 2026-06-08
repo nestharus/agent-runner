@@ -165,7 +165,14 @@ fn startable_sweep_candidates(
 
 fn wake_sweep_candidate_is_startable(db: &MailboxDb, candidate: &WakeSweepCandidate) -> bool {
     !wake_sweep_candidate_reached_cap(candidate)
+        && wake_sweep_candidate_has_deliverable_pending(&candidate.session_id)
         && !pending_mailbox_consumed_marker_present(db, &candidate.session_id)
+}
+
+fn wake_sweep_candidate_has_deliverable_pending(session_id: &str) -> bool {
+    crate::mailbox_delivery::deliverable_pending_count(session_id)
+        .map(|count| count > 0)
+        .unwrap_or(false)
 }
 
 fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate) -> bool {
@@ -874,10 +881,7 @@ fn configure_detached(cmd: &mut Command) {
 fn configure_detached(_cmd: &mut Command) {}
 
 fn pending_count(session_id: &str) -> Result<usize, String> {
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(0);
-    };
-    db.list_pending(session_id).map(|rows| rows.len())
+    crate::mailbox_delivery::deliverable_pending_count(session_id)
 }
 
 fn current_auto_wake() -> Option<AutoWakeEnv> {

@@ -80,6 +80,10 @@ impl Fixture {
             .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
             .env("WU_D_WORK_DIR", &self.work_dir)
             .env_remove("OULIPOLY_DATA_DIR")
+            .env_remove("OULIPOLY_AUTO_WAKE")
+            .env_remove("OULIPOLY_AUTO_WAKE_SESSION_ID")
+            .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
+            .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .current_dir(self.dir.path());
         cmd.output().unwrap()
@@ -361,6 +365,20 @@ flag = "--session"
             rc: 0,
         })
         .unwrap();
+    }
+
+    fn mark_mailbox_unconfirmed_twice(&self, session_id: &str, handle: &str) {
+        let mut db = self.mailbox();
+        let row = db
+            .list_mailbox(session_id, true)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.handle == handle)
+            .unwrap_or_else(|| panic!("missing seeded mailbox row {handle}"));
+        db.mark_delivery_failed(session_id, &[row.seq], "mailbox_delivery_unconfirmed")
+            .unwrap();
+        db.mark_delivery_failed(session_id, &[row.seq], "mailbox_delivery_unconfirmed")
+            .unwrap();
     }
 
     fn record_identity(&self, identity: &ProcessIdentity) {
@@ -851,6 +869,68 @@ fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
 
     assert!(!fixture.prompt_file("consumed-not-rewoken.txt").exists());
     assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        "",
+        "",
+        "twice-unconfirmed-not-rewoken.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-unconfirmed");
+    fixture.mark_mailbox_unconfirmed_twice(SESSION, "h-unconfirmed");
+    seed_dead_wake_claim(&fixture, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", 601);
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(
+        !fixture
+            .prompt_file("twice-unconfirmed-not-rewoken.txt")
+            .exists()
+    );
+    let rows = fixture.mailbox().list_pending(SESSION).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].handle, "h-unconfirmed");
+    assert_eq!(rows[0].delivery_attempts, 2);
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "newer-after-unconfirmed.txt"));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-unconfirmed-old");
+    fixture.seed_mailbox(SESSION, "h-newer");
+    fixture.mark_mailbox_unconfirmed_twice(SESSION, "h-unconfirmed-old");
+    seed_dead_wake_claim(&fixture, "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", 601);
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+
+    let prompt = wait_for_file(&fixture.prompt_file("newer-after-unconfirmed.txt"));
+    assert!(!prompt.contains("handle: h-unconfirmed-old"), "{prompt}");
+    assert!(prompt.contains("handle: h-newer"), "{prompt}");
+    wait_until(
+        "newer mailbox delivered while exhausted row remains pending",
+        || {
+            let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+            let old = rows.iter().find(|row| row.handle == "h-unconfirmed-old");
+            let newer = rows.iter().find(|row| row.handle == "h-newer");
+            old.is_some_and(|row| row.delivered_at.is_none() && row.delivery_attempts == 2)
+                && newer.is_some_and(|row| row.delivered_at.is_some())
+        },
+    );
     fixture.assert_xdg_isolated();
 }
 

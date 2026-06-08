@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
+const MAILBOX_DELIVERY_UNCONFIRMED: &str = "mailbox_delivery_unconfirmed";
+const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_NONCE_SUFFIX: &str = "]";
 const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
@@ -57,12 +59,30 @@ pub(crate) fn prepare_headless_resume_delivery(
     Ok(delivery_for_pending(session_id, pending, answer))
 }
 
+pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, String> {
+    let Some(db) = open_mailbox_sidecar()? else {
+        return Ok(0);
+    };
+    pending_mailbox_rows(&db, session_id).map(|rows| rows.len())
+}
+
 fn delivery_session_id(resolved: &oulipoly_state::ResolvedResume) -> String {
     resolved.active_session_id.clone()
 }
 
 fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxRow>, String> {
-    db.list_pending(session_id)
+    db.list_pending(session_id).map(deliverable_pending_rows)
+}
+
+fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
+    rows.into_iter()
+        .filter(mailbox_row_is_deliverable_pending)
+        .collect()
+}
+
+fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
+    row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED)
+        || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS
 }
 
 fn delivery_for_pending(
