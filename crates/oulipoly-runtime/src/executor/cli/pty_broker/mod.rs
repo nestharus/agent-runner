@@ -1,7 +1,19 @@
 //! Unix PTY broker for live interactive sessions.
+//!
+//! ## Declared roles
+//!
+//! Roles: orchestration, accessor, predicate, validator, formatter, parser,
+//! mapper, filter.
+//!
+//! This module owns PTY/control-socket orchestration. Accessor helpers retrieve
+//! terminal/socket/SQLite-sidecar data, predicate helpers answer availability or
+//! readiness questions, formatter helpers construct user-facing errors, parser
+//! helpers decode control frames, and mapper/filter helpers project low-level
+//! protocol values into runner records.
 
 use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
 use super::terminal_signal::{InteractiveSignalGuard, exit_code_from_status};
+use crate::observability::{ObservabilityRoot, ProductionObservabilitySnapshotService};
 use oulipoly_config::ProviderConfig;
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeIdleUpdate};
 use sha2::{Digest, Sha256};
@@ -14,6 +26,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+
+mod cancel;
+mod transcript_view;
+mod tui;
 
 const CONTROL_MAGIC: &[u8; 4] = b"OPTY";
 const CONTROL_VERSION: u8 = 1;
@@ -107,6 +123,138 @@ pub(super) fn execute_interactive_child(
     idle_guard.exit_code = Some(exit_code_from_status(&status));
     drop(signal_guard);
     Ok(status)
+}
+
+/// Launch the interactive child inside the split-pane observability TUI.
+///
+/// Identical lifecycle to [`execute_interactive_child`] except the child PTY is
+/// sized to the TOP pane (one row reserved for the collapsed monitor) and child
+/// output is relayed into a virtual terminal rendered by the TUI rather than
+/// written straight to the real terminal.
+pub(super) fn execute_interactive_child_observed(
+    mut cmd: Command,
+    provider: &ProviderConfig,
+    context: Option<&SpawnIdentityContext>,
+) -> Result<ExitStatus, String> {
+    let real_tty = RealTerminal::open()?;
+    let full = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
+    let child_winsize = tui::top_pane_winsize(&full);
+    let pty = PtyPair::open(&child_winsize, &real_tty.original)?;
+    let control = ControlSocket::bind_for(context)?;
+    configure_child_pty(&mut cmd, &pty)?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format_provider_spawn_error(&provider.command, err))?;
+    let recorded_context = control.as_ref().and_then(|control| {
+        context.map(|context| context.with_pty_control_path(control.path_string()))
+    });
+    let _ = record_child_identity(child.id(), recorded_context.as_ref().or(context));
+    let mut idle_guard = SessionRuntimeIdleGuard::new(context);
+    drop(pty.slave);
+
+    let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
+    let raw_tty = real_tty.into_raw_mode()?;
+    let writer = raw_tty
+        .writer_clone()
+        .map_err(format_tui_writer_clone_error)?;
+    let monitor =
+        ProductionObservabilitySnapshotService::for_session(provider.session_storage.clone());
+    let root = observability_root(provider, context);
+    let status = tui::relay_until_exit_observed(
+        raw_tty.fd(),
+        writer,
+        &pty.master,
+        control.as_ref(),
+        &mut child,
+        &monitor,
+        &root,
+    );
+    idle_guard.exit_code = status.as_ref().ok().map(exit_code_from_status);
+    drop(signal_guard);
+    drop(raw_tty);
+    status
+}
+
+fn format_terminal_window_size_error(err: io::Error) -> String {
+    format!("Failed to read terminal window size: {err}")
+}
+
+fn format_provider_spawn_error(command: &str, err: io::Error) -> String {
+    format!("Failed to spawn '{command}': {err}")
+}
+
+fn format_tui_writer_clone_error(err: io::Error) -> String {
+    format!("Failed to clone terminal for TUI: {err}")
+}
+
+/// Build the observability root for the monitor from the spawn identity context.
+fn observability_root(
+    provider: &ProviderConfig,
+    context: Option<&SpawnIdentityContext>,
+) -> ObservabilityRoot {
+    ObservabilityRoot {
+        invocation_uuid: context.map(|context| context.invocation_uuid().to_string()),
+        session_id: context
+            .and_then(SpawnIdentityContext::session_id)
+            .map(str::to_string),
+        provider_name: Some(provider.name.clone()),
+        model_name: None,
+    }
+}
+
+/// Whether the split-pane observability TUI should host this interactive
+/// session. Gated to a real controlling terminal that is large enough, with a
+/// usable `TERM`, outside auto-wake children, and not disabled by the operator.
+pub(super) fn observed_tui_enabled() -> bool {
+    if !controlling_terminal_available() {
+        return false;
+    }
+    if std::env::var_os("OULIPOLY_AUTO_WAKE").is_some() {
+        return false;
+    }
+    if tui_disabled_by_env() {
+        return false;
+    }
+    if terminal_is_dumb() {
+        return false;
+    }
+    terminal_dimensions_sufficient()
+}
+
+fn tui_disabled_by_env() -> bool {
+    matches!(
+        std::env::var("OULIPOLY_INTERACTIVE_TUI").ok().as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+fn terminal_is_dumb() -> bool {
+    matches!(
+        std::env::var("TERM").ok().as_deref(),
+        Some("dumb") | Some("")
+    )
+}
+
+fn terminal_dimensions_sufficient() -> bool {
+    let winsize = real_terminal_dimensions();
+    terminal_dimensions_are_sufficient(winsize.as_ref())
+}
+
+fn real_terminal_dimensions() -> Option<libc::winsize> {
+    let tty = open_real_terminal_for_dimension_check()?;
+    read_terminal_dimensions_for_check(&tty)
+}
+
+fn open_real_terminal_for_dimension_check() -> Option<File> {
+    open_real_terminal().ok()
+}
+
+fn read_terminal_dimensions_for_check(tty: &File) -> Option<libc::winsize> {
+    terminal_winsize(tty.as_raw_fd()).ok()
+}
+
+fn terminal_dimensions_are_sufficient(winsize: Option<&libc::winsize>) -> bool {
+    winsize.is_some_and(tui::dimensions_sufficient)
 }
 
 fn validate_client_payload(bytes: &[u8]) -> Result<(), PtyControlClientError> {
@@ -250,6 +398,11 @@ struct RawTerminalGuard {
 impl RawTerminalGuard {
     fn fd(&self) -> RawFd {
         self.inner.fd()
+    }
+
+    /// A writable clone of the real terminal for the TUI render backend.
+    fn writer_clone(&self) -> io::Result<File> {
+        self.inner.file.try_clone()
     }
 }
 
@@ -829,6 +982,11 @@ impl InputLineState {
                 .last_user_input_at
                 .map(|last| last.elapsed() >= INJECT_DEBOUNCE)
                 .unwrap_or(true)
+    }
+
+    fn mark_submitted(&mut self) {
+        self.at_line_boundary = true;
+        self.last_user_input_at = None;
     }
 }
 

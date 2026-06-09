@@ -93,7 +93,11 @@ pub fn execute_interactive_with_result_and_model_identity(
     if pty_broker::controlling_terminal_available() {
         let cmd =
             interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
-        let status = pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?;
+        let status = if pty_broker::observed_tui_enabled() {
+            pty_broker::execute_interactive_child_observed(cmd, provider, spawn_identity.as_ref())?
+        } else {
+            pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?
+        };
         return Ok(interactive_result_from_status(provider, &status));
     }
 

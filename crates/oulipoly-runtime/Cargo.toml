@@ -9,6 +9,8 @@ name = "oulipoly_runtime"
 
 [dependencies]
 base64 = "0.22"
+ratatui = "0.30"
+vt100 = "0.16"
 chrono.workspace = true
 dirs.workspace = true
 fs4.workspace = true

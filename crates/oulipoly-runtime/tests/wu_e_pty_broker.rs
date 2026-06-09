@@ -1,5 +1,11 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! `orchestration`, `accessor`, `mapper`, `formatter`, `validator`
+//!
+//! Unix outer-PTY integration harness for the plain broker opt-out path.
+
 use oulipoly_config::ProviderConfig;
 use oulipoly_runtime::executor::cli::execute_interactive_with_result_and_model_identity;
 use std::fs::{self, File};
@@ -116,6 +122,12 @@ fn spawn_helper_under_pty(
         .arg("helper_runs_broker_session")
         .arg("--nocapture")
         .env(HELPER_ENV, "1")
+        // This test validates the PLAIN PTY broker relay specifically. The
+        // split-pane observability TUI is the default for interactive sessions
+        // with a controlling terminal, so opt out here to exercise the plain
+        // path. The TUI path has its own end-to-end coverage in
+        // `pty_broker::tui::tests::observed_relay_gives_child_a_tty_*`.
+        .env("OULIPOLY_INTERACTIVE_TUI", "0")
         .env(PROVIDER_SCRIPT_ENV, provider)
         .env(RESULT_PATH_ENV, result_path)
         .stdin(Stdio::from(stdin))

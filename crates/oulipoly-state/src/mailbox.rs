@@ -127,6 +127,16 @@ pub enum SessionLiveness {
     Idle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRuntimeReadOnlyLiveness {
+    Busy,
+    Idle,
+    StaleMissingInvocation,
+    StaleMissingIdentity,
+    StaleDead,
+    StalePidReused,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionRuntimeLivenessDecision {
     Busy,
@@ -178,6 +188,12 @@ pub struct WakeSweepCandidate {
 pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
+}
+
+enum BoundedMailboxRowsError {
+    Prepare(rusqlite::Error),
+    Query(rusqlite::Error),
+    Row(rusqlite::Error),
 }
 
 impl MailboxDb {
@@ -269,6 +285,44 @@ impl MailboxDb {
         } else {
             self.list_pending(session_id)
         }
+    }
+
+    pub fn list_mailbox_bounded(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MailboxRow>, String> {
+        if bounded_mailbox_limit_is_zero(limit) {
+            return Ok(Vec::new());
+        }
+        self.bounded_mailbox_rows(session_id, bounded_mailbox_sql_limit(limit))
+            .map_err(format_bounded_mailbox_rows_error)
+    }
+
+    fn bounded_mailbox_rows(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailboxRow>, BoundedMailboxRowsError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, session_id, kind, handle, payload_json, enqueued_at,
+                        delivered_at, delivered_by_invocation_uuid, delivery_attempts,
+                        delivery_error, owner_invocation_uuid, matched_os_pid,
+                        matched_os_boot_id, matched_os_pid_starttime_ticks,
+                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc
+                 FROM mailbox
+                 WHERE session_id = ?1
+                 ORDER BY CASE WHEN delivered_at IS NULL THEN 0 ELSE 1 END, seq DESC
+                  LIMIT ?2",
+            )
+            .map_err(BoundedMailboxRowsError::Prepare)?;
+        let rows = stmt
+            .query_map(params![session_id, limit], map_mailbox_row)
+            .map_err(BoundedMailboxRowsError::Query)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BoundedMailboxRowsError::Row)
     }
 
     pub fn mark_delivered(
@@ -446,6 +500,14 @@ impl MailboxDb {
         let decision = session_runtime_liveness_decision(row.as_ref())?;
         self.clear_stale_running_row_for_liveness(session_id, &decision)?;
         Ok(session_liveness_from_decision(&decision))
+    }
+
+    pub fn classify_session_runtime_read_only(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeReadOnlyLiveness, String> {
+        let row = self.session_runtime(session_id)?;
+        classify_session_runtime_row_read_only(row.as_ref())
     }
 
     pub fn try_acquire_wake_claim(
@@ -915,6 +977,26 @@ fn next_auto_wake_count(persisted: i64, claim: Option<i64>) -> i64 {
         .max(1)
 }
 
+fn bounded_mailbox_limit_is_zero(limit: usize) -> bool {
+    limit == 0
+}
+
+fn bounded_mailbox_sql_limit(limit: usize) -> i64 {
+    limit as i64
+}
+
+fn format_bounded_mailbox_rows_error(err: BoundedMailboxRowsError) -> String {
+    match err {
+        BoundedMailboxRowsError::Prepare(err) => {
+            format!("Failed to prepare bounded mailbox query: {err}")
+        }
+        BoundedMailboxRowsError::Query(err) => {
+            format!("Failed to query bounded mailbox rows: {err}")
+        }
+        BoundedMailboxRowsError::Row(err) => format!("Failed to read mailbox row: {err}"),
+    }
+}
+
 fn enqueue_agent_bash_complete_in_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
@@ -1155,6 +1237,30 @@ fn session_runtime_liveness_decision(
     Ok(SessionRuntimeLivenessDecision::Stale {
         running_invocation_uuid: Some(invocation_uuid.to_string()),
     })
+}
+
+fn classify_session_runtime_row_read_only(
+    row: Option<&SessionRuntimeRow>,
+) -> Result<SessionRuntimeReadOnlyLiveness, String> {
+    let Some(row) = row else {
+        return Ok(SessionRuntimeReadOnlyLiveness::Idle);
+    };
+    if runtime_row_is_idle(row) {
+        return Ok(SessionRuntimeReadOnlyLiveness::Idle);
+    }
+    if row.running_invocation_uuid.is_none() {
+        return Ok(SessionRuntimeReadOnlyLiveness::StaleMissingInvocation);
+    }
+    let Some(recorded) = runtime_row_identity(row) else {
+        return Ok(SessionRuntimeReadOnlyLiveness::StaleMissingIdentity);
+    };
+    let Some(live) = live_process_identity_for_runtime(&recorded)? else {
+        return Ok(SessionRuntimeReadOnlyLiveness::StaleDead);
+    };
+    if live == recorded {
+        return Ok(SessionRuntimeReadOnlyLiveness::Busy);
+    }
+    Ok(SessionRuntimeReadOnlyLiveness::StalePidReused)
 }
 
 fn session_liveness_from_decision(decision: &SessionRuntimeLivenessDecision) -> SessionLiveness {
