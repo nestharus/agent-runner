@@ -70,6 +70,14 @@ pub(super) fn provider_resolution_error(provider_name: &str, reason: String) -> 
     }
 }
 
+pub(super) fn retired_provider_message(provider_name: &str, session_id: &str) -> String {
+    format!(
+        "session {session_id} was last active on provider {provider_name}, which is no longer \
+         configured, and no earlier segment of its chain is resumable; re-add the provider or \
+         migrate the chain to a configured provider"
+    )
+}
+
 pub(super) fn locator_error_to_metadata_error(
     provider_name: &str,
     error: LocatorError,

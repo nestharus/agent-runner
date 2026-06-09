@@ -10,6 +10,7 @@
 //! declaration `oulipoly_state_root_compatibility_api` covers the documented root-public DB
 //! compatibility facade; see `the AGE-160 proposal § Intrinsic-surface declarations`.
 
+mod chain_segments;
 mod db;
 pub mod deployment;
 pub mod invocation_marker;
@@ -26,6 +27,7 @@ pub mod schema_probe;
 pub type StateDbError = String;
 
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
+pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
 pub use db::ProviderRecord;
 pub use db::ReadOnlyOpenError;

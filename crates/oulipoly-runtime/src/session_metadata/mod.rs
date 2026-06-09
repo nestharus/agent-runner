@@ -64,11 +64,13 @@ use errors::{map_resume_error, metadata_db_result};
 use ids::{format_optional_uuid, format_uuid, parse_optional_uuid, parse_session_uuid};
 use metadata_shape::{SessionMetadataParts, session_metadata_from_parts};
 use mutability::is_metadata_mutable;
-use oulipoly_config::{ProvidersConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig};
-use oulipoly_state::{ModelStore, StateDb};
+use oulipoly_config::{
+    ModelConfig, ProvidersConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig,
+};
+use oulipoly_state::{ModelStore, ResolvedResume, StateDb};
 use resume::{
     active_segment_id_to_metadata_error_or_value, effective_provider_for_resolved,
-    fetch_active_segment_id, fetch_resume_previews,
+    fetch_active_segment_id, fetch_resume_previews, rebase_resolved_to_resumable_segment,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -324,8 +326,14 @@ fn load_builtin_metadata_facts(
     sessions_cfg: &SessionsConfig,
     input: &str,
 ) -> Result<BuiltinMetadataFacts, MetadataError> {
-    let resolved = resolve_metadata_session(state, models, input)?;
-    let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+    let mut resolved = resolve_metadata_session(state, models, input)?;
+    let provider = match effective_provider_for_resolved(&resolved, providers_cfg) {
+        Ok(provider) => provider,
+        Err(_) => {
+            resolved = rebase_builtin_resolved(state, providers_cfg, sessions_cfg, resolved)?;
+            effective_provider_for_resolved(&resolved, providers_cfg)?
+        }
+    };
     let provider_name = resolved.active_provider.clone();
     let active_segment_id = external_active_segment_id(state, &resolved)?;
     let located_transcript = available_jsonl_path(
@@ -347,6 +355,70 @@ fn load_builtin_metadata_facts(
         located_transcript,
         workspace_root,
     })
+}
+
+/// Rebase a resolved resume onto a resumable earlier chain segment when its
+/// active provider is no longer configured (builtin storage path).
+fn rebase_builtin_resolved(
+    state: &StateDb,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    resolved: ResolvedResume,
+) -> Result<ResolvedResume, MetadataError> {
+    let model = resolved.model.clone();
+    let model_name = resolved.model_name.clone();
+    let chain_id = resolved.chain_id.clone();
+    rebase_resolved_to_resumable_segment(state, resolved, |provider_name, session_id| {
+        builtin_segment_resumable(
+            providers_cfg,
+            sessions_cfg,
+            &model,
+            &model_name,
+            &chain_id,
+            provider_name,
+            session_id,
+        )
+    })
+}
+
+/// A builtin segment is resumable when its provider resolves and its transcript
+/// is reachable under that provider's storage.
+fn builtin_segment_resumable(
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    model: &Option<ModelConfig>,
+    model_name: &Option<String>,
+    chain_id: &str,
+    provider_name: &str,
+    session_id: &str,
+) -> bool {
+    let candidate = candidate_resolved(model, model_name, chain_id, provider_name, session_id);
+    match effective_provider_for_resolved(&candidate, providers_cfg) {
+        Ok(provider) => available_jsonl_path(
+            sessions_cfg,
+            provider.session_storage.as_ref(),
+            provider_name,
+            session_id,
+        )
+        .is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn candidate_resolved(
+    model: &Option<ModelConfig>,
+    model_name: &Option<String>,
+    chain_id: &str,
+    provider_name: &str,
+    session_id: &str,
+) -> ResolvedResume {
+    ResolvedResume {
+        chain_id: chain_id.to_string(),
+        model_name: model_name.clone(),
+        model: model.clone(),
+        active_provider: provider_name.to_string(),
+        active_session_id: session_id.to_string(),
+    }
 }
 
 fn map_builtin_session_metadata(
@@ -494,9 +566,17 @@ fn external_locate_describe(
 ) -> Result<oulipoly_provider::generated::DescribeResult, MetadataError> {
     registry
         .describe_model_provider(model_name)
-        .map_err(|error| MetadataError::Operational {
-            message: format!("session_provider_describe_failed: {error}"),
-        })
+        .map_err(describe_model_provider_error)
+}
+
+fn describe_model_provider_error<E: std::fmt::Display>(error: E) -> MetadataError {
+    MetadataError::Operational {
+        message: describe_model_provider_failed_message(error),
+    }
+}
+
+fn describe_model_provider_failed_message<E: std::fmt::Display>(error: E) -> String {
+    format!("session_provider_describe_failed: {error}")
 }
 
 fn external_identity_from_describe(
