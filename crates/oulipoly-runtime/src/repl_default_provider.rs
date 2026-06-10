@@ -297,19 +297,32 @@ fn valid_runtime_provider_keys<'a>(
     providers: &'a ProvidersConfig,
     keys: &[&'a str],
 ) -> Vec<&'a str> {
-    keys.iter()
-        .copied()
-        .filter(|key| runtime_provider_is_valid(providers, key))
-        .collect()
+    let mut valid = Vec::new();
+    for key in keys.iter().copied() {
+        collect_runtime_provider_key(providers, key, &mut valid);
+    }
+    valid
+}
+
+fn collect_runtime_provider_key<'a>(
+    providers: &ProvidersConfig,
+    key: &'a str,
+    valid: &mut Vec<&'a str>,
+) {
+    if runtime_provider_is_valid(providers, key) {
+        valid.push(key);
+    } else {
+        warn_invalid_runtime_provider_key(providers, key);
+    }
 }
 
 fn runtime_provider_is_valid(providers: &ProvidersConfig, key: &str) -> bool {
-    match providers.runtime_provider(key) {
-        Ok(_) => true,
-        Err(error) => {
-            warn_invalid_runtime_provider(key, error.as_str());
-            false
-        }
+    providers.runtime_provider(key).is_ok()
+}
+
+fn warn_invalid_runtime_provider_key(providers: &ProvidersConfig, key: &str) {
+    if let Err(error) = providers.runtime_provider(key) {
+        warn_invalid_runtime_provider(key, error.as_str());
     }
 }
 

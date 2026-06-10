@@ -722,19 +722,36 @@ fn finalize_spawn_error(input: super::mapper::SpawnErrorInput<'_, '_>) {
     if finalized {
         input.guard.mark_finalized();
     }
-    if let Some(session_id) = input.provider_session_id
-        && let Err(err) = crate::wake_coordinator::mark_session_idle_after_turn(
-            session_id,
-            input.invocation_id,
-            Some(1),
-        )
-    {
-        tracing::warn!(
-            session_id,
-            invocation_uuid = input.invocation_id,
-            "Failed to mark balanced spawn-error session idle: {err}"
-        );
+    mark_spawn_error_session_idle_if_present(&input);
+}
+
+fn mark_spawn_error_session_idle_if_present(input: &super::mapper::SpawnErrorInput<'_, '_>) {
+    if let Some(session_id) = input.provider_session_id {
+        let result = mark_spawn_error_session_idle(session_id, input.invocation_id);
+        warn_spawn_error_session_idle_failure_if_needed(session_id, input.invocation_id, result);
     }
+}
+
+fn mark_spawn_error_session_idle(session_id: &str, invocation_id: &str) -> Result<(), String> {
+    crate::wake_coordinator::mark_session_idle_after_turn(session_id, invocation_id, Some(1))
+}
+
+fn warn_spawn_error_session_idle_failure_if_needed(
+    session_id: &str,
+    invocation_id: &str,
+    result: Result<(), String>,
+) {
+    if let Err(err) = result {
+        warn_spawn_error_session_idle_failure(session_id, invocation_id, &err);
+    }
+}
+
+fn warn_spawn_error_session_idle_failure(session_id: &str, invocation_id: &str, err: &str) {
+    tracing::warn!(
+        session_id,
+        invocation_uuid = invocation_id,
+        "Failed to mark balanced spawn-error session idle: {err}"
+    );
 }
 
 fn spawn_error_signal(
