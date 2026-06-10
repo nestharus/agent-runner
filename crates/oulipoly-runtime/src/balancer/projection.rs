@@ -1,10 +1,21 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `mapper`, `accessor`, `predicate`, `filter`.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/projection.rs::window_projection_adapter
+//!     role: adapter
+//!     Translates:
+//!       - window helper calculations into provider projection scores
+//! ```
+
+mod window;
 
 use super::{
-    BalanceContext, EPS_HOURS, ERROR_THRESHOLD, ERROR_WINDOW_MINUTES,
-    HIDDEN_WINDOW_PENALTY_THRESHOLD,
+    BalanceContext, ERROR_THRESHOLD, ERROR_WINDOW_MINUTES, HIDDEN_WINDOW_PENALTY_THRESHOLD,
     burn_rate::{bootstrap_burn_rate, project_used_percent},
     eligibility::all_provider_indices,
     refresh_inputs::refresh_projection_inputs,
@@ -13,6 +24,11 @@ use super::{
 use chrono::Utc;
 use oulipoly_config::ModelConfig;
 use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
+pub(super) use window::live_window_count;
+use window::{
+    live_windows, pool_max_live_window_count, remaining_headroom, window_binding_score,
+    window_hours_until_reset, window_is_live,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderProjection {
@@ -90,29 +106,6 @@ impl ProjectionAssembly {
             projections: Vec::new(),
         }
     }
-}
-
-fn pool_max_live_window_count(
-    windows: &[Vec<QuotaWindow>],
-    candidates: &[usize],
-    now: chrono::DateTime<Utc>,
-) -> usize {
-    candidates
-        .iter()
-        .map(|&provider_index| live_window_count(&windows[provider_index], now))
-        .max()
-        .unwrap_or(0)
-}
-
-pub(super) fn live_window_count(windows: &[QuotaWindow], now: chrono::DateTime<Utc>) -> usize {
-    windows
-        .iter()
-        .filter(|window| window_is_live(window, now))
-        .count()
-}
-
-fn window_is_live(window: &QuotaWindow, now: chrono::DateTime<Utc>) -> bool {
-    window.resets_at > now
 }
 
 fn provider_projection_from_records(
@@ -245,15 +238,6 @@ fn any_live_window_near_cap(windows: &[QuotaWindow], now: chrono::DateTime<Utc>)
     })
 }
 
-fn live_windows(
-    windows: &[QuotaWindow],
-    now: chrono::DateTime<Utc>,
-) -> impl Iterator<Item = &QuotaWindow> {
-    windows
-        .iter()
-        .filter(move |window| window_is_live(window, now))
-}
-
 fn apply_window_projection(
     assembly: &mut ProjectionAssembly,
     provider_index: usize,
@@ -294,18 +278,6 @@ fn projected_live_window(
         hours_until_reset: hours,
         remaining_headroom,
     })
-}
-
-fn window_hours_until_reset(window: &QuotaWindow, now: chrono::DateTime<Utc>) -> f64 {
-    ((window.resets_at - now).num_seconds() as f64 / 3600.0).max(EPS_HOURS)
-}
-
-fn remaining_headroom(projected_used: f64) -> f64 {
-    (1.0 - projected_used).max(0.0)
-}
-
-fn window_binding_score(window: &WindowProjection) -> f64 {
-    window.remaining_headroom * window.hours_until_reset
 }
 
 fn assemble_provider_projection(

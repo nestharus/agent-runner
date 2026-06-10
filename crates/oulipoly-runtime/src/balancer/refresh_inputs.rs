@@ -1,3 +1,21 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `predicate`, `accessor`.
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/refresh_inputs.rs::contextual_refresh_surface
+//!     role: intrinsic-surface
+//!     Domain: quota_routing_orchestration
+//!     Owns:
+//!       - RefreshOutcome ignored/degraded routing result
+//!       - is_routing_stale route-selection refresh TTL
+//!       - is_stale projection refresh TTL
+//!       - refresh_provider projection refresh operation
+//!       - refresh_provider_for_routing route-selection refresh operation
+//!       - verify_or_clear_marker route-selection marker verification
+//!       - scan_provider session scan operation
+
 use super::BalanceContext;
 use crate::quota::{
     RefreshOutcome, is_routing_stale, is_stale, refresh_provider, refresh_provider_for_routing,

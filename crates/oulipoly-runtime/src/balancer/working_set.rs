@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `predicate`, `orchestration`, `accessor`, `mapper`.
+
 use crate::migration::MigrationError;
 use chrono::{DateTime, Utc};
 use oulipoly_config::ModelConfig;
