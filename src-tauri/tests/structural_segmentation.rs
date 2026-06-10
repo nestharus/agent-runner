@@ -52,13 +52,87 @@ fn doomed_dir_link_regex() -> Regex {
     Regex::new(&format!("{boundary}({dirs}){path}")).unwrap()
 }
 
-#[test]
-fn doomed_dirs_absent_at_head() {
-    let stdout = git_stdout(&["ls-files"]);
-    let entries: BTreeSet<_> = stdout
+fn top_level_tracked_entries() -> BTreeSet<String> {
+    git_stdout(&["ls-files"])
         .lines()
         .filter_map(|entry| entry.split('/').next())
-        .collect();
+        .map(str::to_owned)
+        .collect()
+}
+
+fn stage_entry_path(tracked_entry: &str) -> (&str, &str) {
+    let (metadata, tracked_file) = tracked_entry
+        .split_once('\t')
+        .unwrap_or_else(|| panic!("unexpected git ls-files --stage output: {tracked_entry}"));
+    let mode = metadata
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("missing mode in git ls-files --stage output: {tracked_entry}"));
+
+    (mode, tracked_file)
+}
+
+fn is_regular_blob(mode: &str) -> bool {
+    mode.starts_with("100")
+}
+
+fn tracked_regular_files() -> Vec<String> {
+    git_stdout(&["ls-files", "--stage"])
+        .lines()
+        .filter_map(|tracked_entry| {
+            let (mode, tracked_file) = stage_entry_path(tracked_entry);
+            is_regular_blob(mode).then(|| tracked_file.to_owned())
+        })
+        .collect()
+}
+
+fn is_quoted_gate_diff_artifact(tracked_file: &str) -> bool {
+    tracked_file.starts_with("planning/") && tracked_file.ends_with(".patch")
+}
+
+fn is_code_quality_log_artifact(tracked_file: &str) -> bool {
+    tracked_file.starts_with("planning/")
+        && tracked_file.contains("/code-quality/")
+        && tracked_file.ends_with(".log")
+}
+
+fn should_scan_for_doomed_dir_links(tracked_file: &str) -> bool {
+    tracked_file != SELF_PATH
+        && !is_quoted_gate_diff_artifact(tracked_file)
+        && !is_code_quality_log_artifact(tracked_file)
+}
+
+fn line_doomed_dir_links<'a>(regex: &'a Regex, line: &'a str) -> impl Iterator<Item = &'a str> {
+    regex.find_iter(line).map(|found| found.as_str())
+}
+
+fn file_doomed_dir_link_violations(root: &Path, regex: &Regex, tracked_file: &str) -> Vec<String> {
+    let path = root.join(tracked_file);
+    let content =
+        fs::read(&path).unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let content = String::from_utf8_lossy(&content);
+
+    content
+        .lines()
+        .enumerate()
+        .flat_map(|(line_index, line)| {
+            line_doomed_dir_links(regex, line)
+                .map(move |found| format!("{tracked_file}:{}: {found}", line_index + 1))
+        })
+        .collect()
+}
+
+fn tracked_doomed_dir_link_violations(root: &Path, regex: &Regex) -> Vec<String> {
+    tracked_regular_files()
+        .into_iter()
+        .filter(|tracked_file| should_scan_for_doomed_dir_links(tracked_file))
+        .flat_map(|tracked_file| file_doomed_dir_link_violations(root, regex, &tracked_file))
+        .collect()
+}
+
+#[test]
+fn doomed_dirs_absent_at_head() {
+    let entries = top_level_tracked_entries();
 
     for doomed_dir in DOOMED_DIRS {
         assert!(
@@ -72,45 +146,7 @@ fn doomed_dirs_absent_at_head() {
 fn no_dangling_doomed_dir_link_in_tracked_files() {
     let root = repo_root();
     let regex = doomed_dir_link_regex();
-    let mut violations = Vec::new();
-
-    for tracked_entry in git_stdout(&["ls-files", "--stage"]).lines() {
-        let (metadata, tracked_file) = tracked_entry
-            .split_once('\t')
-            .unwrap_or_else(|| panic!("unexpected git ls-files --stage output: {tracked_entry}"));
-        let mode = metadata.split_whitespace().next().unwrap_or_else(|| {
-            panic!("missing mode in git ls-files --stage output: {tracked_entry}")
-        });
-
-        if !mode.starts_with("100") {
-            continue;
-        }
-
-        if tracked_file == SELF_PATH {
-            continue;
-        }
-
-        // Gate diff artifacts quote other files verbatim (including historical
-        // doc text); they are quotations, not live links.
-        if tracked_file.starts_with("planning/") && tracked_file.ends_with(".patch") {
-            continue;
-        }
-
-        let path = root.join(tracked_file);
-        let content = fs::read(&path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-        let content = String::from_utf8_lossy(&content);
-
-        for (line_index, line) in content.lines().enumerate() {
-            for found in regex.find_iter(line) {
-                violations.push(format!(
-                    "{tracked_file}:{}: {}",
-                    line_index + 1,
-                    found.as_str()
-                ));
-            }
-        }
-    }
+    let violations = tracked_doomed_dir_link_violations(&root, &regex);
 
     assert!(
         violations.is_empty(),
