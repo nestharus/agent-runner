@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `parser`, `predicate`, `filter`, `formatter`, `mapper`.
+
 use chrono::{Duration, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
 use oulipoly_runtime::services::{

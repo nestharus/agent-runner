@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`.
+//! `orchestration`, `formatter`, `accessor`.
 
 use super::*;
 

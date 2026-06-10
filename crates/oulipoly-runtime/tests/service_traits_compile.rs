@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`.
+
 use oulipoly_config::{ModelConfig, PromptMode, SessionsConfig};
 use oulipoly_runtime::services::error::ServiceError;
 use oulipoly_runtime::services::*;

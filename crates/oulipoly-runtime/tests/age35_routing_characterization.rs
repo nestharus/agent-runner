@@ -1,5 +1,9 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `formatter`, `accessor`, `validator`, `predicate`.
+
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry,

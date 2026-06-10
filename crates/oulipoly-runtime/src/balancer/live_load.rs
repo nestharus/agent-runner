@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `predicate`.
+//! `accessor`, `mapper`, `predicate`, `orchestration`.
 
 use oulipoly_config::ModelConfig;
 use oulipoly_state::StateDb;
