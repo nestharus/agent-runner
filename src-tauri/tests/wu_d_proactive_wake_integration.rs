@@ -934,28 +934,28 @@ fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
 }
 
 #[test]
-fn wake_sweep_skips_resumable_session_missing_models_dir() {
+fn wake_sweep_delivers_resumable_session_missing_models_dir() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "missing-models-dir-resumed.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime_without_models_dir(SESSION);
     fixture.seed_mailbox_for(SESSION, "h-missing-models-dir", None);
+    seed_dead_wake_claim(&fixture, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", 601);
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    std::thread::sleep(Duration::from_millis(300));
 
-    assert!(
-        !fixture
-            .prompt_file("missing-models-dir-resumed.txt")
-            .exists()
-    );
-    let rows = fixture.mailbox().list_pending(SESSION).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].handle, "h-missing-models-dir");
-    assert!(rows[0].delivery_error.is_none());
-    assert!(fixture.mailbox().wake_claim(SESSION).unwrap().is_none());
+    let prompt = wait_for_file(&fixture.prompt_file("missing-models-dir-resumed.txt"));
+    assert!(prompt.contains("handle: h-missing-models-dir"), "{prompt}");
+    wait_until("missing models_dir wake delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && rows[0].delivery_error.is_none()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
     fixture.assert_xdg_isolated();
 }
 

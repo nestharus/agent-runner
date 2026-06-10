@@ -248,12 +248,8 @@ fn wake_sweep_candidate_disposition(
     if pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
         return Ok(WakeSweepDisposition::Skip);
     }
-    if wake_sweep_candidate_is_abandoned_transient(db, &candidate.session_id)? {
+    if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
         trace_abandoned_transient_wake_skip(&candidate.session_id);
-        return Ok(WakeSweepDisposition::Skip);
-    }
-    if wake_sweep_candidate_missing_models_dir_for_resume(db, state, candidate)? {
-        trace_missing_models_dir_wake_skip(&candidate.session_id);
         return Ok(WakeSweepDisposition::Skip);
     }
     if wake_sweep_candidate_is_resumable(db, state, candidate)? {
@@ -334,47 +330,13 @@ fn wake_sweep_runtime_is_resumable(
     wake_sweep_runtime_has_resume_evidence(state, runtime)
 }
 
-fn wake_sweep_candidate_missing_models_dir_for_resume(
-    db: &MailboxDb,
-    state: Option<&StateDb>,
-    candidate: &WakeSweepCandidate,
-) -> Result<bool, String> {
-    let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
-        return Ok(false);
-    };
-    wake_sweep_runtime_missing_models_dir_for_resume(state, &runtime)
-}
-
-fn wake_sweep_runtime_missing_models_dir_for_resume(
-    state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
-) -> Result<bool, String> {
-    if !wake_sweep_runtime_can_resume_except_models_dir(runtime)
-        || wake_runtime_has_models_dir(runtime)
-    {
-        return Ok(false);
-    }
-    wake_sweep_runtime_has_resume_evidence(state, runtime)
-}
-
-fn wake_sweep_runtime_can_resume_except_models_dir(runtime: &SessionRuntimeRow) -> bool {
+fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
     runtime.mode == "headless"
         && runtime.run_state != "running"
         && runtime
             .provider_name
             .as_deref()
             .is_some_and(|provider| !provider.is_empty())
-}
-
-fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
-    wake_sweep_runtime_can_resume_except_models_dir(runtime) && wake_runtime_has_models_dir(runtime)
-}
-
-fn wake_runtime_has_models_dir(runtime: &SessionRuntimeRow) -> bool {
-    runtime
-        .models_dir
-        .as_deref()
-        .is_some_and(|models_dir| !models_dir.is_empty())
 }
 
 fn wake_sweep_runtime_has_resume_evidence(
@@ -445,6 +407,20 @@ fn wake_sweep_candidate_is_abandoned_transient(
     pending_rows_are_abandoned_transient(&rows)
 }
 
+fn wake_sweep_candidate_is_unclaimed_abandoned_transient(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<bool, String> {
+    if wake_sweep_candidate_has_wake_claim(db, session_id)? {
+        return Ok(false);
+    }
+    wake_sweep_candidate_is_abandoned_transient(db, session_id)
+}
+
+fn wake_sweep_candidate_has_wake_claim(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
+    db.wake_claim(session_id).map(|claim| claim.is_some())
+}
+
 fn pending_rows_are_abandoned_transient(rows: &[MailboxRow]) -> Result<bool, String> {
     if !pending_rows_have_owner_identity(rows) {
         return Ok(false);
@@ -483,13 +459,6 @@ fn trace_abandoned_transient_wake_skip(session_id: &str) {
     tracing::warn!(
         session_id,
         "Skipping auto wake for abandoned transient session with dead owner lineage"
-    );
-}
-
-fn trace_missing_models_dir_wake_skip(session_id: &str) {
-    tracing::warn!(
-        session_id,
-        "Skipping auto wake for resumable session with missing session_runtime.models_dir"
     );
 }
 
@@ -919,7 +888,6 @@ fn prepare_wake_start_context<'a>(
     let mut db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
     let runtime =
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
-    validate_wake_runtime_models_dir(input.session_id, runtime.as_ref())?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
     validate_start_wake_cap(input)?;
     if wake_runtime_busy(&mut db, input.session_id, runtime.as_ref())? {
@@ -932,28 +900,6 @@ fn prepare_wake_start_context<'a>(
         runtime,
         claim,
     })
-}
-
-fn wake_runtime_missing_models_dir(runtime: Option<&SessionRuntimeRow>) -> bool {
-    runtime.is_some_and(|runtime| !wake_runtime_has_models_dir(runtime))
-}
-
-fn validate_wake_runtime_models_dir(
-    session_id: &str,
-    runtime: Option<&SessionRuntimeRow>,
-) -> Result<(), WakeDiagnostic> {
-    if wake_runtime_missing_models_dir(runtime) {
-        return Err(missing_models_dir_diagnostic(session_id));
-    }
-    Ok(())
-}
-
-fn missing_models_dir_diagnostic(session_id: &str) -> WakeDiagnostic {
-    WakeDiagnostic::with_message("models_dir_missing", missing_models_dir_message(session_id))
-}
-
-fn missing_models_dir_message(session_id: &str) -> String {
-    format!("Skipping auto wake for {session_id} because session_runtime.models_dir is missing")
 }
 
 fn normalize_start_wake_input<'a>(
