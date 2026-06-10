@@ -23,8 +23,12 @@ pub(in crate::balancer::tests) fn record_invocation_for_test(
 ) {
     let start = invocation_start_for_test(model_name, provider_name, provider_index);
     let id = db.start_invocation(&start).unwrap();
-    db.finalize_invocation(id, success, if success { 0 } else { 1 }, None, None)
+    db.finalize_invocation(id, success, exit_code_for_success(success), None, None)
         .unwrap();
+}
+
+fn exit_code_for_success(success: bool) -> i32 {
+    if success { 0 } else { 1 }
 }
 
 pub(in crate::balancer::tests) fn record_running_invocations_for_test(

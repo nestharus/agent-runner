@@ -58,11 +58,31 @@ fn age_running_invocations_for_test(
     provider_name: &str,
     created_at: chrono::DateTime<Utc>,
 ) {
-    Connection::open(path)
-        .unwrap()
+    let connection = Connection::open(path).unwrap();
+    update_running_invocation_created_at(
+        &connection,
+        provider_name,
+        &formatted_invocation_created_at(created_at),
+    );
+}
+
+fn update_running_invocation_created_at(
+    connection: &Connection,
+    provider_name: &str,
+    created_at: &str,
+) {
+    connection
         .execute(
-            "UPDATE invocations SET created_at = ?1 WHERE provider_name = ?2 AND status = 'running'",
-            rusqlite::params![created_at.to_rfc3339(), provider_name],
+            running_invocation_created_at_update_sql(),
+            rusqlite::params![created_at, provider_name],
         )
         .unwrap();
+}
+
+fn formatted_invocation_created_at(created_at: chrono::DateTime<Utc>) -> String {
+    created_at.to_rfc3339()
+}
+
+fn running_invocation_created_at_update_sql() -> &'static str {
+    "UPDATE invocations SET created_at = ?1 WHERE provider_name = ?2 AND status = 'running'"
 }

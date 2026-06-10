@@ -4,12 +4,14 @@
 
 use crate::services::{ProductionRoutingService, RoutingServicePort, RoutingServiceRequest};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
+use oulipoly_state::StateDb;
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::services::{
-    LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
+    LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, RoutingServiceOutput,
+    ServiceError,
 };
 
 pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
@@ -88,64 +90,134 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
 ) -> Result<i32, String> {
     let app_config_path = services.config_root.join("config.toml");
     let app = oulipoly_config::app::AppConfig::load(&app_config_path)?;
-    let family = app.default_provider.ok_or_else(|| {
-        format!(
-            "'default_provider' must be set in {} for '--new'",
-            app_config_path.display()
-        )
-    })?;
+    let family = require_default_provider(app.default_provider, &app_config_path)?;
 
     let providers_path = services.config_root.join("providers.toml");
     let providers = ProvidersConfig::load(&providers_path)?;
     let members = resolve_family_keys(&providers, &family);
-    if members.is_empty() {
-        return Err(format!(
-            "default_provider '{family}' resolved to an empty provider pool in {}",
-            providers_path.display()
-        ));
-    }
+    require_non_empty_family(&members, &family, &providers_path)?;
 
-    let carrier_model = ModelConfig {
-        name: format!("<provider-family:{family}>"),
+    let carrier_model = carrier_model(&family, &members);
+    let state = open_state(&services)?;
+    let provider_index = select_provider_index(&services.routing_service, &carrier_model, &state)?;
+    require_provider_index(provider_index, carrier_model.providers.len())?;
+    let member_name = provider_member_name(&members, provider_index)?;
+    let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
+    let launch_provider = launch_provider(carrier_model.name, provider);
+
+    launcher.launch(&launch_provider, services.working_dir.as_deref())
+}
+
+fn require_default_provider(
+    default_provider: Option<String>,
+    app_config_path: &Path,
+) -> Result<String, String> {
+    default_provider.ok_or_else(|| missing_default_provider_error(app_config_path))
+}
+
+fn missing_default_provider_error(app_config_path: &Path) -> String {
+    format!(
+        "'default_provider' must be set in {} for '--new'",
+        app_config_path.display()
+    )
+}
+
+fn require_non_empty_family(
+    members: &[&str],
+    family: &str,
+    providers_path: &Path,
+) -> Result<(), String> {
+    if members.is_empty() {
+        return Err(empty_family_error(family, providers_path));
+    }
+    Ok(())
+}
+
+fn empty_family_error(family: &str, providers_path: &Path) -> String {
+    format!(
+        "default_provider '{family}' resolved to an empty provider pool in {}",
+        providers_path.display()
+    )
+}
+
+fn carrier_model(family: &str, members: &[&str]) -> ModelConfig {
+    ModelConfig {
+        name: carrier_model_name(family),
         prompt_mode: PromptMode::Stdin,
-        providers: members
-            .iter()
-            .map(|member| ProviderConfig::model_provider(*member, Vec::new()))
-            .collect(),
+        providers: carrier_model_providers(members),
         inputs: Vec::new(),
         provider: None,
-    };
+    }
+}
 
-    let state = match services.state_db_path.as_ref() {
+fn carrier_model_name(family: &str) -> String {
+    format!("<provider-family:{family}>")
+}
+
+fn carrier_model_providers(members: &[&str]) -> Vec<ProviderConfig> {
+    members
+        .iter()
+        .map(|member| ProviderConfig::model_provider(*member, Vec::new()))
+        .collect()
+}
+
+fn open_state<O: StateDbOpener>(services: &RuntimeServices<O>) -> Result<StateDb, String> {
+    match services.state_db_path.as_ref() {
         Some(path) => services.state_db_opener.open_at(path),
         None => services.state_db_opener.open_default(),
-    }?;
+    }
+}
 
-    let provider_index = services
-        .routing_service
+fn select_provider_index(
+    routing_service: &Arc<dyn RoutingServicePort>,
+    carrier_model: &ModelConfig,
+    state: &StateDb,
+) -> Result<usize, String> {
+    select_provider_route(routing_service, carrier_model, state).map(|route| route.provider_index)
+}
+
+fn select_provider_route(
+    routing_service: &Arc<dyn RoutingServicePort>,
+    carrier_model: &ModelConfig,
+    state: &StateDb,
+) -> Result<RoutingServiceOutput, String> {
+    routing_service
         .select_route(RoutingServiceRequest {
-            model: &carrier_model,
-            state: &state,
+            model: carrier_model,
+            state,
             ctx: None,
             provider_pin: None,
         })
-        .map_err(|error| error.to_string())?
-        .provider_index;
-    if provider_index >= carrier_model.providers.len() {
-        return Err(format!(
-            "selected provider index {provider_index} is out of bounds"
-        ));
-    }
-    let member_name = members
-        .get(provider_index)
-        .ok_or_else(|| format!("selected provider index {provider_index} is out of bounds"))?;
-    let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
-    let launch_provider = ProviderConfig {
-        name: carrier_model.name,
-        ..provider
-    };
+        .map_err(routing_service_error)
+}
 
-    launcher.launch(&launch_provider, services.working_dir.as_deref())
+fn routing_service_error(error: ServiceError) -> String {
+    error.to_string()
+}
+
+fn require_provider_index(provider_index: usize, provider_count: usize) -> Result<(), String> {
+    if provider_index >= provider_count {
+        return Err(provider_index_out_of_bounds_error(provider_index));
+    }
+    Ok(())
+}
+
+fn provider_member_name<'a>(members: &[&'a str], provider_index: usize) -> Result<&'a str, String> {
+    members
+        .get(provider_index)
+        .copied()
+        .ok_or_else(|| provider_index_out_of_bounds_error(provider_index))
+}
+
+fn provider_index_out_of_bounds_error(provider_index: usize) -> String {
+    format!("selected provider index {provider_index} is out of bounds")
+}
+
+fn launch_provider(carrier_model_name: String, provider: ProviderConfig) -> ProviderConfig {
+    ProviderConfig {
+        name: carrier_model_name,
+        ..provider
+    }
 }
 
 #[allow(dead_code)]
@@ -153,46 +225,100 @@ pub(crate) fn resolve_family_keys<'a>(
     providers: &'a ProvidersConfig,
     family: &str,
 ) -> Vec<&'a str> {
-    let mut exact = Vec::new();
-    let mut suffixed = Vec::new();
-
-    for key in providers.entries.keys() {
-        let key = key.as_str();
-        if key == family {
-            exact.push(key);
-            continue;
-        }
-
-        let Some(suffix) = key.strip_prefix(family) else {
-            continue;
-        };
-        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-
-        suffixed.push((suffix, key));
-    }
-
+    let mut exact = exact_family_keys(providers, family);
+    let mut suffixed = suffixed_family_keys(providers, family);
     exact.sort_unstable();
-    suffixed.sort_by(|(left_suffix, left_key), (right_suffix, right_key)| {
+    sort_suffixed_family_keys(&mut suffixed);
+
+    valid_runtime_provider_keys(providers, ordered_family_keys(exact, suffixed).as_slice())
+}
+
+fn exact_family_keys<'a>(providers: &'a ProvidersConfig, family: &str) -> Vec<&'a str> {
+    providers
+        .entries
+        .keys()
+        .map(String::as_str)
+        .filter(|key| *key == family)
+        .collect()
+}
+
+fn suffixed_family_keys<'a>(
+    providers: &'a ProvidersConfig,
+    family: &str,
+) -> Vec<(&'a str, &'a str)> {
+    suffixed_family_key_values(
+        suffixed_family_key_names(providers, family).as_slice(),
+        family,
+    )
+}
+
+fn suffixed_family_key_names<'a>(providers: &'a ProvidersConfig, family: &str) -> Vec<&'a str> {
+    providers
+        .entries
+        .keys()
+        .map(String::as_str)
+        .filter(|key| has_digit_suffix_for_family(key, family))
+        .collect()
+}
+
+fn has_digit_suffix_for_family(key: &str, family: &str) -> bool {
+    key.strip_prefix(family)
+        .is_some_and(nonempty_ascii_digit_suffix)
+}
+
+fn nonempty_ascii_digit_suffix(suffix: &str) -> bool {
+    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn suffixed_family_key_values<'a>(keys: &[&'a str], family: &str) -> Vec<(&'a str, &'a str)> {
+    keys.iter()
+        .map(|key| (key.strip_prefix(family).unwrap(), *key))
+        .collect()
+}
+
+fn sort_suffixed_family_keys(keys: &mut [(&str, &str)]) {
+    keys.sort_by(|(left_suffix, left_key), (right_suffix, right_key)| {
         compare_digit_suffix(left_suffix, right_suffix).then_with(|| left_key.cmp(right_key))
     });
+}
 
+fn ordered_family_keys<'a>(exact: Vec<&'a str>, suffixed: Vec<(&'a str, &'a str)>) -> Vec<&'a str> {
     exact
         .into_iter()
-        .chain(suffixed.into_iter().map(|(_, key)| key))
-        .filter(|key| match providers.runtime_provider(key) {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(
-                    provider_name = *key,
-                    error = error.as_str(),
-                    "dropping invalid provider-family member"
-                );
-                false
-            }
-        })
+        .chain(suffixed.into_iter().map(suffixed_family_key))
         .collect()
+}
+
+fn suffixed_family_key<'a>((_suffix, key): (&'a str, &'a str)) -> &'a str {
+    key
+}
+
+fn valid_runtime_provider_keys<'a>(
+    providers: &'a ProvidersConfig,
+    keys: &[&'a str],
+) -> Vec<&'a str> {
+    keys.iter()
+        .copied()
+        .filter(|key| runtime_provider_is_valid(providers, key))
+        .collect()
+}
+
+fn runtime_provider_is_valid(providers: &ProvidersConfig, key: &str) -> bool {
+    match providers.runtime_provider(key) {
+        Ok(_) => true,
+        Err(error) => {
+            warn_invalid_runtime_provider(key, error.as_str());
+            false
+        }
+    }
+}
+
+fn warn_invalid_runtime_provider(key: &str, error: &str) {
+    tracing::warn!(
+        provider_name = key,
+        error,
+        "dropping invalid provider-family member"
+    );
 }
 
 fn compare_digit_suffix(left: &str, right: &str) -> std::cmp::Ordering {

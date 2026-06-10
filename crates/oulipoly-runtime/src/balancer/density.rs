@@ -162,11 +162,19 @@ fn projected_usage_value(window: &WindowProjection) -> f64 {
 }
 
 fn max_finite_value(values: &[f64]) -> Option<f64> {
+    max_value(finite_values(values).as_slice())
+}
+
+fn finite_values(values: &[f64]) -> Vec<f64> {
     values
         .iter()
         .copied()
         .filter(|value| value.is_finite())
-        .reduce(f64::max)
+        .collect()
+}
+
+fn max_value(values: &[f64]) -> Option<f64> {
+    values.iter().copied().reduce(f64::max)
 }
 
 fn soonest_relevant_reset_hours(projection: &ProviderProjection) -> Option<f64> {
@@ -187,10 +195,23 @@ fn reset_hours_for_worst_usage(
     projection: &ProviderProjection,
     worst_projected_used: f64,
 ) -> Vec<f64> {
+    reset_hours(worst_usage_reset_windows(projection, worst_projected_used).as_slice())
+}
+
+fn worst_usage_reset_windows(
+    projection: &ProviderProjection,
+    worst_projected_used: f64,
+) -> Vec<&WindowProjection> {
     projection
         .projections_per_window
         .iter()
         .filter(|window| reset_belongs_to_worst_usage(window, worst_projected_used))
+        .collect()
+}
+
+fn reset_hours(windows: &[&WindowProjection]) -> Vec<f64> {
+    windows
+        .iter()
         .map(|window| window.hours_until_reset)
         .collect()
 }
@@ -377,11 +398,25 @@ fn best_positive_binding_score(eligible: &[ProviderEval]) -> f64 {
 }
 
 fn positive_binding_scores(eligible: &[ProviderEval]) -> Vec<f64> {
-    eligible.iter().filter_map(positive_binding_score).collect()
+    binding_score_values(positive_binding_score_evals(eligible).as_slice())
 }
 
-fn positive_binding_score(eval: &ProviderEval) -> Option<f64> {
-    eval.binding_score.filter(|score| *score > 0.0)
+fn positive_binding_score_evals(eligible: &[ProviderEval]) -> Vec<&ProviderEval> {
+    eligible
+        .iter()
+        .filter(|eval| has_positive_binding_score(eval))
+        .collect()
+}
+
+fn has_positive_binding_score(eval: &ProviderEval) -> bool {
+    eval.binding_score.is_some_and(|score| score > 0.0)
+}
+
+fn binding_score_values(evals: &[&ProviderEval]) -> Vec<f64> {
+    evals
+        .iter()
+        .map(|eval| eval.binding_score.unwrap())
+        .collect()
 }
 
 fn max_score(scores: &[f64]) -> f64 {
