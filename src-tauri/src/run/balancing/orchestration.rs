@@ -1,6 +1,21 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `mapper`, `formatter`, `predicate`, `accessor`, `validator`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/run/balancing/orchestration.rs
+//!     role: intrinsic-surface
+//!     Domain: balanced_attempt_lifecycle
+//!     Owns:
+//!       - run_with_balancing retry and attempt loop
+//!       - provider selection, pin forwarding, and effective-provider resolution sequencing
+//!       - invocation lifecycle row start/finalization sequencing
+//!       - zero-turn baseline, classification, and retry sequencing
+//!       - terminal-signal branch dispatch and quota-exhaustion retry sequencing
+//! ```
 
 use std::collections::HashMap;
 use std::path::Path;
