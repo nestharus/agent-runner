@@ -25,7 +25,7 @@ pub(super) use rusqlite::ffi;
 pub(super) use rusqlite::params;
 pub(super) use rusqlite::params_from_iter;
 pub(super) use rusqlite::{
-    Connection, Error, OpenFlags, Result, Row, Statement, Transaction, types::Type,
+    Connection, Error, MappedRows, OpenFlags, Result, Row, Statement, Transaction, types::Type,
 };
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};

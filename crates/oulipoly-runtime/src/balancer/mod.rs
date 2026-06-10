@@ -237,19 +237,28 @@ pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 18
 
 #[cfg(test)]
 pub(crate) fn production_balancer_source(module_path: &str, source: &'static str) -> &'static str {
-    if [
+    if production_source_has_inline_tests(module_path) {
+        return source_before_inline_tests(source);
+    }
+    source
+}
+
+#[cfg(test)]
+fn production_source_has_inline_tests(module_path: &str) -> bool {
+    [
         "crates/oulipoly-runtime/src/balancer/mod.rs",
         "crates/oulipoly-runtime/src/balancer/migration.rs",
         "crates/oulipoly-runtime/src/balancer/working_set.rs",
     ]
     .contains(&module_path)
-    {
-        return source
-            .split("mod tests")
-            .next()
-            .expect("production source precedes tests");
-    }
+}
+
+#[cfg(test)]
+fn source_before_inline_tests(source: &'static str) -> &'static str {
     source
+        .split("mod tests")
+        .next()
+        .expect("production source precedes tests")
 }
 
 #[cfg(test)]

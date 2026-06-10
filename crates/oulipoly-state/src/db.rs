@@ -4366,17 +4366,41 @@ impl StateDb {
 
     pub fn get_invocation_by_uuid(&self, uuid: &str) -> Result<Option<InvocationRecord>, String> {
         let sql = Self::invocation_record_select_sql(&self.conn, "WHERE invocation_uuid = ?1")?;
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare invocation lookup: {e}"))?;
+        let mut stmt = self.prepare_invocation_lookup(&sql)?;
 
-        let result = stmt.query_row(sqlite::params![uuid], Self::map_invocation_row);
+        let result = Self::query_invocation_by_uuid(&mut stmt, uuid);
+        Self::optional_invocation_result(result)
+    }
+
+    fn prepare_invocation_lookup(&self, sql: &str) -> Result<sqlite::Statement<'_>, String> {
+        self.conn
+            .prepare(sql)
+            .map_err(Self::format_invocation_lookup_prepare_error)
+    }
+
+    fn format_invocation_lookup_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare invocation lookup: {err}")
+    }
+
+    fn query_invocation_by_uuid(
+        stmt: &mut sqlite::Statement<'_>,
+        uuid: &str,
+    ) -> sqlite::Result<InvocationRecord> {
+        stmt.query_row(sqlite::params![uuid], Self::map_invocation_row)
+    }
+
+    fn optional_invocation_result(
+        result: sqlite::Result<InvocationRecord>,
+    ) -> Result<Option<InvocationRecord>, String> {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query invocation: {e}")),
+            Err(e) => Err(Self::format_invocation_query_error(e)),
         }
+    }
+
+    fn format_invocation_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query invocation: {err}")
     }
 
     pub fn list_invocation_children(
@@ -4388,17 +4412,51 @@ impl StateDb {
             "WHERE parent_invocation_id = ?1
              ORDER BY created_at, id",
         )?;
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare invocation child lookup: {e}"))?;
+        let mut stmt = self.prepare_invocation_child_lookup(&sql)?;
 
-        let rows = stmt
-            .query_map(sqlite::params![parent_id], Self::map_invocation_row)
-            .map_err(|e| format!("Failed to query invocation children: {e}"))?;
+        let rows = Self::query_invocation_children(&mut stmt, parent_id)?;
 
+        Self::collect_invocation_children(rows)
+    }
+
+    fn prepare_invocation_child_lookup(&self, sql: &str) -> Result<sqlite::Statement<'_>, String> {
+        self.conn
+            .prepare(sql)
+            .map_err(Self::format_invocation_child_prepare_error)
+    }
+
+    fn format_invocation_child_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare invocation child lookup: {err}")
+    }
+
+    fn query_invocation_children<'stmt>(
+        stmt: &'stmt mut sqlite::Statement<'_>,
+        parent_id: i64,
+    ) -> Result<
+        sqlite::MappedRows<'stmt, fn(&sqlite::Row<'_>) -> sqlite::Result<InvocationRecord>>,
+        String,
+    > {
+        stmt.query_map(sqlite::params![parent_id], Self::invocation_row_mapper())
+            .map_err(Self::format_invocation_children_query_error)
+    }
+
+    fn invocation_row_mapper() -> fn(&sqlite::Row<'_>) -> sqlite::Result<InvocationRecord> {
+        Self::map_invocation_row
+    }
+
+    fn format_invocation_children_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query invocation children: {err}")
+    }
+
+    fn collect_invocation_children(
+        rows: sqlite::MappedRows<'_, fn(&sqlite::Row<'_>) -> sqlite::Result<InvocationRecord>>,
+    ) -> Result<Vec<InvocationRecord>, String> {
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to map invocation children: {e}"))
+            .map_err(Self::format_invocation_children_map_error)
+    }
+
+    fn format_invocation_children_map_error(err: sqlite::Error) -> String {
+        format!("Failed to map invocation children: {err}")
     }
 
     pub fn running_invocation_counts_by_provider(
@@ -4406,45 +4464,147 @@ impl StateDb {
         provider_names: &[&str],
         since: DateTime<Utc>,
     ) -> Result<HashMap<String, u64>, String> {
-        if provider_names.is_empty() {
+        if Self::provider_name_filter_is_empty(provider_names) {
             return Ok(HashMap::new());
         }
-        let placeholders = std::iter::repeat_n("?", provider_names.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
+        let sql = Self::running_invocation_count_sql(provider_names);
+        let since = Self::running_invocation_since_param(since);
+        let params = Self::running_invocation_count_params(provider_names, &since);
+        let mut stmt = self.prepare_running_invocation_count_query(&sql)?;
+        let rows = Self::query_running_invocation_counts(&mut stmt, params)?;
+        Self::collect_running_invocation_counts(rows)
+    }
+
+    fn provider_name_filter_is_empty(provider_names: &[&str]) -> bool {
+        provider_names.is_empty()
+    }
+
+    fn running_invocation_count_sql(provider_names: &[&str]) -> String {
+        let placeholders = Self::running_invocation_provider_placeholders(provider_names.len());
+        format!(
             "SELECT provider_name, COUNT(*)
              FROM invocations
              WHERE status = ? AND created_at >= ? AND provider_name IN ({placeholders})
              GROUP BY provider_name"
-        );
-        let since = since.to_rfc3339();
-        let params = std::iter::once(InvocationStatus::Running.as_str())
-            .chain(std::iter::once(since.as_str()))
+        )
+    }
+
+    fn running_invocation_provider_placeholders(provider_count: usize) -> String {
+        std::iter::repeat_n("?", provider_count)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn running_invocation_since_param(since: DateTime<Utc>) -> String {
+        since.to_rfc3339()
+    }
+
+    fn running_invocation_count_params<'a>(
+        provider_names: &'a [&'a str],
+        since: &'a str,
+    ) -> Vec<&'a str> {
+        std::iter::once(InvocationStatus::Running.as_str())
+            .chain(std::iter::once(since))
             .chain(provider_names.iter().copied())
-            .collect::<Vec<_>>();
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| format!("Failed to prepare running invocation count query: {e}"))?;
-        let rows = stmt
-            .query_map(sqlite::params_from_iter(params), |row| {
-                let count: i64 = row.get(1)?;
-                Ok((row.get::<_, String>(0)?, count.max(0) as u64))
-            })
-            .map_err(|e| format!("Failed to query running invocation counts: {e}"))?;
+            .collect()
+    }
+
+    fn prepare_running_invocation_count_query(
+        &self,
+        sql: &str,
+    ) -> Result<sqlite::Statement<'_>, String> {
+        self.conn
+            .prepare(sql)
+            .map_err(Self::format_running_invocation_count_prepare_error)
+    }
+
+    fn format_running_invocation_count_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare running invocation count query: {err}")
+    }
+
+    fn query_running_invocation_counts<'stmt>(
+        stmt: &'stmt mut sqlite::Statement<'_>,
+        params: Vec<&str>,
+    ) -> Result<
+        sqlite::MappedRows<'stmt, fn(&sqlite::Row<'_>) -> sqlite::Result<(String, u64)>>,
+        String,
+    > {
+        stmt.query_map(
+            sqlite::params_from_iter(params),
+            Self::running_invocation_count_row_mapper(),
+        )
+        .map_err(Self::format_running_invocation_count_query_error)
+    }
+
+    fn running_invocation_count_row_mapper() -> fn(&sqlite::Row<'_>) -> sqlite::Result<(String, u64)>
+    {
+        Self::map_running_invocation_count_row
+    }
+
+    fn format_running_invocation_count_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query running invocation counts: {err}")
+    }
+
+    fn map_running_invocation_count_row(row: &sqlite::Row<'_>) -> sqlite::Result<(String, u64)> {
+        Ok((
+            Self::running_invocation_count_provider(row)?,
+            Self::running_invocation_count_value(row)?,
+        ))
+    }
+
+    fn running_invocation_count_provider(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
+    }
+
+    fn running_invocation_count_value(row: &sqlite::Row<'_>) -> sqlite::Result<u64> {
+        let count: i64 = row.get(1)?;
+        Ok(Self::nonnegative_invocation_count(count))
+    }
+
+    fn nonnegative_invocation_count(count: i64) -> u64 {
+        count.max(0) as u64
+    }
+
+    fn collect_running_invocation_counts(
+        rows: sqlite::MappedRows<'_, fn(&sqlite::Row<'_>) -> sqlite::Result<(String, u64)>>,
+    ) -> Result<HashMap<String, u64>, String> {
         rows.collect::<Result<HashMap<_, _>, _>>()
-            .map_err(|e| format!("Failed to map running invocation counts: {e}"))
+            .map_err(Self::format_running_invocation_count_map_error)
+    }
+
+    fn format_running_invocation_count_map_error(err: sqlite::Error) -> String {
+        format!("Failed to map running invocation counts: {err}")
     }
 
     fn map_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<InvocationRecord> {
-        let created_at_raw: String = row.get(19)?;
-        let finished_at_raw: Option<String> = row.get(20)?;
-        let status_raw: String = row.get(6)?;
-        let created_at = Self::strict_rfc3339_at(&created_at_raw, 18)?;
-        let finished_at = Self::optional_strict_rfc3339_at(finished_at_raw, 19)?;
-        let status = Self::parse_invocation_status_at(&status_raw, 6)?;
+        let created_at = Self::invocation_created_at(row)?;
+        let finished_at = Self::invocation_finished_at(row)?;
+        let status = Self::invocation_status(row)?;
 
+        Self::invocation_record_from_row(row, created_at, finished_at, status)
+    }
+
+    fn invocation_created_at(row: &sqlite::Row<'_>) -> sqlite::Result<DateTime<Utc>> {
+        let created_at_raw: String = row.get(19)?;
+        Self::strict_rfc3339_at(&created_at_raw, 18)
+    }
+
+    fn invocation_finished_at(row: &sqlite::Row<'_>) -> sqlite::Result<Option<DateTime<Utc>>> {
+        let finished_at_raw: Option<String> = row.get(20)?;
+        Self::optional_strict_rfc3339_at(finished_at_raw, 19)
+    }
+
+    fn invocation_status(row: &sqlite::Row<'_>) -> sqlite::Result<InvocationStatus> {
+        let status_raw: String = row.get(6)?;
+        Self::parse_invocation_status_at(&status_raw, 6)
+    }
+
+    fn invocation_record_from_row(
+        row: &sqlite::Row<'_>,
+        created_at: DateTime<Utc>,
+        finished_at: Option<DateTime<Utc>>,
+        status: InvocationStatus,
+    ) -> sqlite::Result<InvocationRecord> {
         Ok(InvocationRecord {
             id: row.get(0)?,
             invocation_uuid: row.get(1)?,
@@ -4482,13 +4642,20 @@ impl StateDb {
         raw: &str,
         column_index: usize,
     ) -> sqlite::Result<InvocationStatus> {
-        raw.parse::<InvocationStatus>().map_err(|_| {
-            sqlite::Error::FromSqlConversionFailure(
-                column_index,
-                sqlite::Type::Text,
-                format!("Unknown invocation status: {raw}").into(),
-            )
-        })
+        raw.parse::<InvocationStatus>()
+            .map_err(|_| Self::invalid_invocation_status_error(raw, column_index))
+    }
+
+    fn invalid_invocation_status_error(raw: &str, column_index: usize) -> sqlite::Error {
+        sqlite::Error::FromSqlConversionFailure(
+            column_index,
+            sqlite::Type::Text,
+            Self::unknown_invocation_status_message(raw).into(),
+        )
+    }
+
+    fn unknown_invocation_status_message(raw: &str) -> String {
+        format!("Unknown invocation status: {raw}")
     }
 
     pub fn get_provider(
@@ -4496,33 +4663,64 @@ impl StateDb {
         model_name: &str,
         provider_name: &str,
     ) -> Result<Option<ProviderRecord>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT model_name, provider_name, invocation_count, error_count,
-                        last_error, last_error_at, last_invoked_at
-                 FROM providers
-                 WHERE model_name = ?1 AND provider_name = ?2",
-            )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+        let mut stmt = self.prepare_provider_lookup()?;
 
-        let result = stmt.query_row(sqlite::params![model_name, provider_name], |row| {
-            Ok(ProviderRecord {
-                model_name: row.get(0)?,
-                provider_name: row.get(1)?,
-                invocation_count: row.get(2)?,
-                error_count: row.get(3)?,
-                last_error: row.get(4)?,
-                last_error_at: row.get(5)?,
-                last_invoked_at: row.get(6)?,
-            })
-        });
+        let result = Self::query_provider_lookup(&mut stmt, model_name, provider_name);
+        Self::optional_provider_result(result)
+    }
 
+    fn prepare_provider_lookup(&self) -> Result<sqlite::Statement<'_>, String> {
+        self.conn
+            .prepare(Self::provider_lookup_sql())
+            .map_err(Self::format_provider_lookup_prepare_error)
+    }
+
+    fn provider_lookup_sql() -> &'static str {
+        "SELECT model_name, provider_name, invocation_count, error_count,
+                last_error, last_error_at, last_invoked_at
+         FROM providers
+         WHERE model_name = ?1 AND provider_name = ?2"
+    }
+
+    fn format_provider_lookup_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare query: {err}")
+    }
+
+    fn query_provider_lookup(
+        stmt: &mut sqlite::Statement<'_>,
+        model_name: &str,
+        provider_name: &str,
+    ) -> sqlite::Result<ProviderRecord> {
+        stmt.query_row(
+            sqlite::params![model_name, provider_name],
+            Self::map_provider_row,
+        )
+    }
+
+    fn map_provider_row(row: &sqlite::Row<'_>) -> sqlite::Result<ProviderRecord> {
+        Ok(ProviderRecord {
+            model_name: row.get(0)?,
+            provider_name: row.get(1)?,
+            invocation_count: row.get(2)?,
+            error_count: row.get(3)?,
+            last_error: row.get(4)?,
+            last_error_at: row.get(5)?,
+            last_invoked_at: row.get(6)?,
+        })
+    }
+
+    fn optional_provider_result(
+        result: sqlite::Result<ProviderRecord>,
+    ) -> Result<Option<ProviderRecord>, String> {
         match result {
             Ok(record) => Ok(Some(record)),
             Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query provider: {e}")),
+            Err(e) => Err(Self::format_provider_lookup_query_error(e)),
         }
+    }
+
+    fn format_provider_lookup_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query provider: {err}")
     }
 
     pub fn recent_error_count(
