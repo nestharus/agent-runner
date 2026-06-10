@@ -6,7 +6,9 @@
 //! predicates for proactive wake integration cases.
 
 use crate::fixtures::Fixture;
-use oulipoly_state::mailbox::WAKE_SWEEP_ABANDONED_ERROR;
+use oulipoly_state::mailbox::{
+    MailboxRow, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
+};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -25,22 +27,28 @@ pub(crate) fn wait_for_runtime_session(fixture: &Fixture) -> String {
 }
 
 pub(crate) fn wait_for_sidecar_session(fixture: &Fixture, table: &str) -> String {
-    let mut found = None;
     wait_until(&format!("{table} session id"), || {
-        found = sidecar_session_id(fixture, table);
-        found.is_some()
+        sidecar_session_id_exists(fixture, table)
     });
-    found.unwrap()
+    existing_sidecar_session_id(fixture, table)
 }
 
 pub(crate) fn sidecar_session_id(fixture: &Fixture, table: &str) -> Option<String> {
     let conn = fixture.sidecar_conn();
-    conn.query_row(
-        &format!("SELECT session_id FROM {table} ORDER BY session_id LIMIT 1"),
-        [],
-        |row| row.get(0),
-    )
-    .ok()
+    conn.query_row(&sidecar_session_id_query(table), [], |row| row.get(0))
+        .ok()
+}
+
+fn sidecar_session_id_query(table: &str) -> String {
+    format!("SELECT session_id FROM {table} ORDER BY session_id LIMIT 1")
+}
+
+fn sidecar_session_id_exists(fixture: &Fixture, table: &str) -> bool {
+    sidecar_session_id(fixture, table).is_some()
+}
+
+fn existing_sidecar_session_id(fixture: &Fixture, table: &str) -> String {
+    sidecar_session_id(fixture, table).unwrap()
 }
 
 pub(crate) fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
@@ -51,6 +59,10 @@ pub(crate) fn wait_until(label: &str, mut predicate: impl FnMut() -> bool) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    fail_wait_until(label);
+}
+
+fn fail_wait_until(label: &str) -> ! {
     panic!("timed out waiting for {label}");
 }
 
@@ -59,11 +71,7 @@ pub(crate) fn settle_wake_sweep() {
 }
 
 pub(crate) fn runtime_is_idle(fixture: &Fixture, session_id: &str) -> bool {
-    fixture
-        .mailbox()
-        .session_runtime(session_id)
-        .unwrap()
-        .is_some_and(|row| row.run_state == "idle")
+    session_runtime_row(fixture, session_id).is_some_and(|row| runtime_row_is_idle(&row))
 }
 
 pub(crate) fn delivered_rows_without_claim(
@@ -71,11 +79,8 @@ pub(crate) fn delivered_rows_without_claim(
     session_id: &str,
     expected_len: usize,
 ) -> bool {
-    let db = fixture.mailbox();
-    let rows = db.list_mailbox(session_id, true).unwrap();
-    rows.len() == expected_len
-        && rows.iter().all(|row| row.delivered_at.is_some())
-        && db.wake_claim(session_id).unwrap().is_none()
+    mailbox_rows_are_delivered(&mailbox_rows(fixture, session_id), expected_len)
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
 pub(crate) fn delivered_rows_without_pending_or_claim(
@@ -83,68 +88,39 @@ pub(crate) fn delivered_rows_without_pending_or_claim(
     session_id: &str,
     expected_len: usize,
 ) -> bool {
-    let db = fixture.mailbox();
-    let rows = db.list_mailbox(session_id, true).unwrap();
-    rows.len() == expected_len
-        && rows.iter().all(|row| row.delivered_at.is_some())
-        && db.list_pending(session_id).unwrap().is_empty()
-        && db.wake_claim(session_id).unwrap().is_none()
+    mailbox_rows_are_delivered(&mailbox_rows(fixture, session_id), expected_len)
+        && rows_are_empty(&pending_rows(fixture, session_id))
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
 pub(crate) fn delivered_single_row_without_error_or_claim(
     fixture: &Fixture,
     session_id: &str,
 ) -> bool {
-    let db = fixture.mailbox();
-    let rows = db.list_mailbox(session_id, true).unwrap();
-    rows.len() == 1
-        && rows[0].delivered_at.is_some()
-        && rows[0].delivery_error.is_none()
-        && db.wake_claim(session_id).unwrap().is_none()
+    single_row_is_delivered_without_error(&mailbox_rows(fixture, session_id))
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
 pub(crate) fn auto_wake_cap_left_pending(fixture: &Fixture, session_id: &str) -> bool {
-    let db = fixture.mailbox();
-    let pending = db.list_pending(session_id).unwrap();
-    pending.len() == 1
-        && pending[0].handle == "h-auto-2"
-        && db.wake_claim(session_id).unwrap().is_none()
-        && db
-            .session_runtime(session_id)
-            .unwrap()
-            .is_some_and(|row| row.auto_wake_count == 2)
+    pending_has_single_handle(&pending_rows(fixture, session_id), "h-auto-2")
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
+        && session_runtime_row(fixture, session_id).is_some_and(|row| auto_wake_count_is(&row, 2))
 }
 
 pub(crate) fn captured_opencode_mailbox_delivered(fixture: &Fixture, session_id: &str) -> bool {
-    let db = fixture.mailbox();
-    let rows = db.list_mailbox(session_id, true).unwrap();
-    rows.len() == 1
-        && rows[0].handle == "h-capture-midturn"
-        && rows[0].delivered_at.is_some()
-        && rows[0].owner_invocation_uuid.is_some()
-        && rows[0].matched_os_pid.is_some()
-        && rows[0].matched_chain_index == Some(0)
-        && db.wake_claim(session_id).unwrap().is_none()
+    captured_opencode_row_is_delivered(&mailbox_rows(fixture, session_id))
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
 pub(crate) fn shadow_xdg_mailbox_delivered(fixture: &Fixture, session_id: &str) -> bool {
-    let db = fixture.mailbox();
-    let rows = db.list_mailbox(session_id, true).unwrap();
-    rows.len() == 1
-        && rows[0].handle == "h-shadow-xdg"
-        && rows[0].delivered_at.is_some()
-        && db.wake_claim(session_id).unwrap().is_none()
+    single_row_with_handle_is_delivered(&mailbox_rows(fixture, session_id), "h-shadow-xdg")
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
 pub(crate) fn newer_mailbox_delivered_with_exhausted_old_pending(fixture: &Fixture) -> bool {
-    let rows = fixture
-        .mailbox()
-        .list_mailbox(crate::SESSION, true)
-        .unwrap();
-    let old = rows.iter().find(|row| row.handle == "h-unconfirmed-old");
-    let newer = rows.iter().find(|row| row.handle == "h-newer");
-    old.is_some_and(|row| row.delivered_at.is_none() && row.delivery_attempts == 2)
-        && newer.is_some_and(|row| row.delivered_at.is_some())
+    let rows = mailbox_rows(fixture, crate::SESSION);
+    old_mailbox_is_exhausted(row_with_handle(&rows, "h-unconfirmed-old"))
+        && mailbox_row_is_delivered(row_with_handle(&rows, "h-newer"))
 }
 
 pub(crate) fn backlog_recovered_and_debris_reaped(
@@ -153,19 +129,102 @@ pub(crate) fn backlog_recovered_and_debris_reaped(
     recent_session: &str,
     dead_sessions: &[String],
 ) -> bool {
-    let db = fixture.mailbox();
-    let idle_rows = db.list_mailbox(idle_session, true).unwrap();
-    let recent_rows = db.list_mailbox(recent_session, true).unwrap();
-    let recovered = idle_rows.len() == 1
-        && idle_rows[0].delivered_at.is_some()
-        && recent_rows.len() == 1
-        && recent_rows[0].delivered_at.is_some();
-    let debris_reaped = dead_sessions.iter().all(|session_id| {
-        let rows = db.list_mailbox(session_id, true).unwrap();
-        rows.len() == 1
-            && rows[0].delivered_at.is_none()
-            && rows[0].delivery_error.as_deref() == Some(WAKE_SWEEP_ABANDONED_ERROR)
-            && db.wake_claim(session_id).unwrap().is_none()
-    });
-    recovered && debris_reaped
+    recovered_backlog_is_delivered(
+        &mailbox_rows(fixture, idle_session),
+        &mailbox_rows(fixture, recent_session),
+    ) && dead_sessions
+        .iter()
+        .all(|session_id| dead_session_debris_is_reaped(fixture, session_id))
+}
+
+fn mailbox_rows(fixture: &Fixture, session_id: &str) -> Vec<MailboxRow> {
+    fixture.mailbox().list_mailbox(session_id, true).unwrap()
+}
+
+fn pending_rows(fixture: &Fixture, session_id: &str) -> Vec<MailboxRow> {
+    fixture.mailbox().list_pending(session_id).unwrap()
+}
+
+fn wake_claim(fixture: &Fixture, session_id: &str) -> Option<WakeClaimRow> {
+    fixture.mailbox().wake_claim(session_id).unwrap()
+}
+
+fn session_runtime_row(fixture: &Fixture, session_id: &str) -> Option<SessionRuntimeRow> {
+    fixture.mailbox().session_runtime(session_id).unwrap()
+}
+
+fn runtime_row_is_idle(row: &SessionRuntimeRow) -> bool {
+    row.run_state == "idle"
+}
+
+fn mailbox_rows_are_delivered(rows: &[MailboxRow], expected_len: usize) -> bool {
+    rows.len() == expected_len && rows.iter().all(mailbox_row_has_delivery)
+}
+
+fn mailbox_row_has_delivery(row: &MailboxRow) -> bool {
+    row.delivered_at.is_some()
+}
+
+fn wake_claim_is_absent(claim: &Option<WakeClaimRow>) -> bool {
+    claim.is_none()
+}
+
+fn rows_are_empty(rows: &[MailboxRow]) -> bool {
+    rows.is_empty()
+}
+
+fn single_row_is_delivered_without_error(rows: &[MailboxRow]) -> bool {
+    rows.len() == 1 && mailbox_row_has_delivery(&rows[0]) && rows[0].delivery_error.is_none()
+}
+
+fn pending_has_single_handle(rows: &[MailboxRow], handle: &str) -> bool {
+    rows.len() == 1 && rows[0].handle == handle
+}
+
+fn auto_wake_count_is(row: &SessionRuntimeRow, expected: i64) -> bool {
+    row.auto_wake_count == expected
+}
+
+fn captured_opencode_row_is_delivered(rows: &[MailboxRow]) -> bool {
+    rows.len() == 1
+        && rows[0].handle == "h-capture-midturn"
+        && mailbox_row_has_delivery(&rows[0])
+        && rows[0].owner_invocation_uuid.is_some()
+        && rows[0].matched_os_pid.is_some()
+        && rows[0].matched_chain_index == Some(0)
+}
+
+fn single_row_with_handle_is_delivered(rows: &[MailboxRow], handle: &str) -> bool {
+    rows.len() == 1 && rows[0].handle == handle && mailbox_row_has_delivery(&rows[0])
+}
+
+fn row_with_handle<'a>(rows: &'a [MailboxRow], handle: &str) -> Option<&'a MailboxRow> {
+    rows.iter().find(|row| row.handle == handle)
+}
+
+fn old_mailbox_is_exhausted(row: Option<&MailboxRow>) -> bool {
+    row.is_some_and(|row| row.delivered_at.is_none() && row.delivery_attempts == 2)
+}
+
+fn mailbox_row_is_delivered(row: Option<&MailboxRow>) -> bool {
+    row.is_some_and(mailbox_row_has_delivery)
+}
+
+fn recovered_backlog_is_delivered(idle_rows: &[MailboxRow], recent_rows: &[MailboxRow]) -> bool {
+    single_mailbox_row_is_delivered(idle_rows) && single_mailbox_row_is_delivered(recent_rows)
+}
+
+fn single_mailbox_row_is_delivered(rows: &[MailboxRow]) -> bool {
+    rows.len() == 1 && mailbox_row_has_delivery(&rows[0])
+}
+
+fn dead_session_debris_is_reaped(fixture: &Fixture, session_id: &str) -> bool {
+    dead_session_rows_are_reaped(&mailbox_rows(fixture, session_id))
+        && wake_claim_is_absent(&wake_claim(fixture, session_id))
+}
+
+fn dead_session_rows_are_reaped(rows: &[MailboxRow]) -> bool {
+    rows.len() == 1
+        && rows[0].delivered_at.is_none()
+        && rows[0].delivery_error.as_deref() == Some(WAKE_SWEEP_ABANDONED_ERROR)
 }

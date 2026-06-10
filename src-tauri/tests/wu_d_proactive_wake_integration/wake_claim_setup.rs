@@ -57,18 +57,25 @@ pub(crate) fn acquire_seed_wake_claim(fixture: &Fixture, claim_token: &str) {
 
 pub(crate) fn acquire_seed_wake_claim_for(fixture: &Fixture, session_id: &str, claim_token: &str) {
     let mut db = fixture.mailbox();
-    assert!(matches!(
-        db.try_acquire_wake_claim(WakeClaimRequest {
-            session_id,
-            claim_token,
-            reason: "notify_idle",
-            auto_wake_count: 1,
-            wake_invocation_uuid: None,
-            stale_after_seconds: 600,
-        })
-        .unwrap(),
-        WakeClaimAcquireResult::Acquired(_)
-    ));
+    assert_wake_claim_acquired(
+        db.try_acquire_wake_claim(seed_wake_claim_request(session_id, claim_token))
+            .unwrap(),
+    );
+}
+
+fn seed_wake_claim_request<'a>(session_id: &'a str, claim_token: &'a str) -> WakeClaimRequest<'a> {
+    WakeClaimRequest {
+        session_id,
+        claim_token,
+        reason: "notify_idle",
+        auto_wake_count: 1,
+        wake_invocation_uuid: None,
+        stale_after_seconds: 600,
+    }
+}
+
+fn assert_wake_claim_acquired(result: WakeClaimAcquireResult) {
+    assert!(matches!(result, WakeClaimAcquireResult::Acquired(_)));
 }
 
 pub(crate) fn age_wake_claim_for(fixture: &Fixture, session_id: &str, seconds_old: i64) {

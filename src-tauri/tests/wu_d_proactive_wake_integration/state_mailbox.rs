@@ -15,6 +15,18 @@ use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIden
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::Connection;
 use std::fs;
+use std::path::PathBuf;
+
+struct SeedMailboxArtifacts {
+    state_dir: PathBuf,
+    meta: PathBuf,
+    log: PathBuf,
+    rc: PathBuf,
+    state_dir_s: String,
+    meta_s: String,
+    log_s: String,
+    rc_s: String,
+}
 
 impl Fixture {
     pub(crate) fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> String {
@@ -161,30 +173,15 @@ impl Fixture {
         handle: &str,
         owner_invocation_uuid: Option<&str>,
     ) {
-        let state_dir = self.work_dir.join(format!("seed-{handle}"));
-        fs::create_dir_all(&state_dir).unwrap();
-        let meta = state_dir.join("meta.json");
-        let log = state_dir.join("log");
-        let rc = state_dir.join("rc");
-        fs::write(&meta, r#"{"caller_chain":[]}"#).unwrap();
-        fs::write(&log, format!("log {handle}\n")).unwrap();
-        fs::write(&rc, "0\n").unwrap();
+        let artifacts = self.seed_mailbox_artifacts(handle);
+        write_seed_mailbox_artifacts(&artifacts, handle);
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
-        db.enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+        db.enqueue_agent_bash_complete(&seed_mailbox_enqueue(
             session_id,
             handle,
-            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
             owner_invocation_uuid,
-            matched_os_pid: Some(9_300),
-            matched_os_boot_id: Some("boot-seeded"),
-            matched_os_pid_starttime_ticks: Some(456),
-            matched_chain_index: Some(0),
-            state_dir: &path_string(&state_dir),
-            meta_path: &path_string(&meta),
-            log_path: &path_string(&log),
-            rc_path: &path_string(&rc),
-            rc: 0,
-        })
+            &artifacts,
+        ))
         .unwrap();
     }
 
@@ -200,16 +197,8 @@ impl Fixture {
 
     pub(crate) fn mark_mailbox_unconfirmed_twice(&self, session_id: &str, handle: &str) {
         let mut db = self.mailbox();
-        let row = db
-            .list_mailbox(session_id, true)
-            .unwrap()
-            .into_iter()
-            .find(|row| row.handle == handle)
-            .unwrap_or_else(|| panic!("missing seeded mailbox row {handle}"));
-        db.mark_delivery_failed(session_id, &[row.seq], "mailbox_delivery_unconfirmed")
-            .unwrap();
-        db.mark_delivery_failed(session_id, &[row.seq], "mailbox_delivery_unconfirmed")
-            .unwrap();
+        let seq = mailbox_seq_for_handle(&db, session_id, handle);
+        mark_delivery_failed_twice(&mut db, session_id, seq);
     }
 
     pub(crate) fn record_identity(&self, identity: &ProcessIdentity) {
@@ -238,21 +227,40 @@ impl Fixture {
     }
 
     pub(crate) fn seed_dead_owner_backlog(&self) -> Vec<String> {
-        let dead_sessions = (0..16)
-            .map(|index| format!("00000000-0000-4000-8000-{index:012x}"))
-            .collect::<Vec<_>>();
+        let dead_sessions = dead_owner_session_ids();
         for (index, session_id) in dead_sessions.iter().enumerate() {
-            let handle = format!("h-dead-owner-{index}");
-            self.seed_mailbox_for(session_id, &handle, None);
-            self.age_mailbox_for(session_id, 86_400);
-            crate::wake_claim_setup::seed_dead_wake_claim_for(
-                self,
-                session_id,
-                &format!("dead0000-0000-4000-8000-{index:012x}"),
-                601,
-            );
+            self.seed_dead_owner_session(index, session_id);
         }
         dead_sessions
+    }
+
+    fn seed_mailbox_artifacts(&self, handle: &str) -> SeedMailboxArtifacts {
+        let state_dir = self.work_dir.join(seed_mailbox_dir_name(handle));
+        let meta = state_dir.join("meta.json");
+        let log = state_dir.join("log");
+        let rc = state_dir.join("rc");
+        SeedMailboxArtifacts {
+            state_dir_s: path_string(&state_dir),
+            meta_s: path_string(&meta),
+            log_s: path_string(&log),
+            rc_s: path_string(&rc),
+            state_dir,
+            meta,
+            log,
+            rc,
+        }
+    }
+
+    fn seed_dead_owner_session(&self, index: usize, session_id: &str) {
+        let handle = dead_owner_handle(index);
+        self.seed_mailbox_for(session_id, &handle, None);
+        self.age_mailbox_for(session_id, 86_400);
+        crate::wake_claim_setup::seed_dead_wake_claim_for(
+            self,
+            session_id,
+            &dead_owner_claim_token(index),
+            601,
+        );
     }
 
     pub(crate) fn seed_resumable_backlog_session(
@@ -273,4 +281,77 @@ impl Fixture {
         }
         crate::wake_claim_setup::seed_dead_wake_claim_for(self, session_id, claim_token, 601);
     }
+}
+
+fn seed_mailbox_dir_name(handle: &str) -> String {
+    format!("seed-{handle}")
+}
+
+fn write_seed_mailbox_artifacts(artifacts: &SeedMailboxArtifacts, handle: &str) {
+    fs::create_dir_all(&artifacts.state_dir).unwrap();
+    fs::write(&artifacts.meta, r#"{"caller_chain":[]}"#).unwrap();
+    fs::write(&artifacts.log, seed_mailbox_log(handle)).unwrap();
+    fs::write(&artifacts.rc, "0\n").unwrap();
+}
+
+fn seed_mailbox_log(handle: &str) -> String {
+    format!("log {handle}\n")
+}
+
+fn seed_mailbox_enqueue<'a>(
+    session_id: &'a str,
+    handle: &'a str,
+    owner_invocation_uuid: Option<&'a str>,
+    artifacts: &'a SeedMailboxArtifacts,
+) -> AgentBashCompleteEnqueue<'a> {
+    AgentBashCompleteEnqueue {
+        session_id,
+        handle,
+        payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+        owner_invocation_uuid,
+        matched_os_pid: Some(9_300),
+        matched_os_boot_id: Some("boot-seeded"),
+        matched_os_pid_starttime_ticks: Some(456),
+        matched_chain_index: Some(0),
+        state_dir: &artifacts.state_dir_s,
+        meta_path: &artifacts.meta_s,
+        log_path: &artifacts.log_s,
+        rc_path: &artifacts.rc_s,
+        rc: 0,
+    }
+}
+
+fn mailbox_seq_for_handle(db: &MailboxDb, session_id: &str, handle: &str) -> i64 {
+    db.list_mailbox(session_id, true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.handle == handle)
+        .unwrap_or_else(|| panic!("missing seeded mailbox row {handle}"))
+        .seq
+}
+
+fn mark_delivery_failed_twice(db: &mut MailboxDb, session_id: &str, seq: i64) {
+    mark_delivery_failed(db, session_id, seq);
+    mark_delivery_failed(db, session_id, seq);
+}
+
+fn mark_delivery_failed(db: &mut MailboxDb, session_id: &str, seq: i64) {
+    db.mark_delivery_failed(session_id, &[seq], "mailbox_delivery_unconfirmed")
+        .unwrap();
+}
+
+fn dead_owner_session_ids() -> Vec<String> {
+    (0..16).map(dead_owner_session_id).collect()
+}
+
+fn dead_owner_session_id(index: usize) -> String {
+    format!("00000000-0000-4000-8000-{index:012x}")
+}
+
+fn dead_owner_handle(index: usize) -> String {
+    format!("h-dead-owner-{index}")
+}
+
+fn dead_owner_claim_token(index: usize) -> String {
+    format!("dead0000-0000-4000-8000-{index:012x}")
 }
