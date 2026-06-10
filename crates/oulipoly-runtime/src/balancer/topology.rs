@@ -12,7 +12,7 @@
 //!     - accessor
 
 use super::BalanceContext;
-use super::live_window_count;
+use super::projection::live_window_count;
 use super::snapshot::{QuotaSnapshot, cached_quota_record, cached_quota_windows};
 use crate::quota::{
     RefreshOutcome, has_refresh_source, is_topology_probe_due, refresh_provider_for_routing,

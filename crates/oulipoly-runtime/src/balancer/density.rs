@@ -2,6 +2,8 @@
 //!
 //! `mapper`, `filter`, `predicate`, `formatter`, `orchestration`.
 
+mod trace;
+
 use super::{
     EPS_HOURS, ERROR_THRESHOLD,
     invocation_fallback::round_robin_fallback,
@@ -10,6 +12,7 @@ use super::{
 use chrono::Utc;
 use oulipoly_config::ModelConfig;
 use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
+use trace::trace_fanout_selection;
 
 pub const FANOUT_SCORE_BAND_RATIO: f64 = 2.0;
 
@@ -282,22 +285,4 @@ fn selected_fanout_candidate<'a>(band: &[&'a ProviderEval]) -> &'a ProviderEval 
         .copied()
         .min_by(|a, b| fanout_candidate_order(a, b))
         .unwrap()
-}
-
-fn trace_fanout_selection(model: &ModelConfig, band: &[&ProviderEval], selected: &ProviderEval) {
-    let selected_provider_name = &model.providers[selected.index].name;
-    let band_member_names = fanout_band_member_names(model, band);
-    tracing::info!(
-        selected_provider_name = selected_provider_name.as_str(),
-        band_member_names = band_member_names.as_str(),
-        selected_binding_score = selected.binding_score.unwrap(),
-        "fanout selected"
-    );
-}
-
-fn fanout_band_member_names(model: &ModelConfig, band: &[&ProviderEval]) -> String {
-    band.iter()
-        .map(|eval| model.providers[eval.index].name.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
 }

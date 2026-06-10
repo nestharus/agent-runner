@@ -1,3 +1,17 @@
+//! ## Declared roles
+//!
+//! `accessor`.
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/context.rs::balance_context_surface
+//!     role: intrinsic-surface
+//!     Domain: contextual-balancer-dependencies
+//!     Owns:
+//!       - ProvidersConfig quota refresh-source contract
+//!       - SessionsConfig session scan and adapter-derived refresh contract
+//!       - InFlight refresh deduplication carrier
+
 use crate::quota::InFlight;
 use oulipoly_config::{ProvidersConfig, SessionsConfig};
 

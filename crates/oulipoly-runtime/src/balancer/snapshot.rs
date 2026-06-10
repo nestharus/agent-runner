@@ -1,3 +1,17 @@
+//! ## Declared roles
+//!
+//! `mapper`, `accessor`.
+//!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/snapshot.rs::quota_snapshot_surface
+//!     role: intrinsic-surface
+//!     Domain: quota-cache-snapshot-access
+//!     Owns:
+//!       - QuotaRecord cached read accessor
+//!       - QuotaWindow cached read accessor
+//!       - QuotaSnapshot in-memory routing/projection cache
+
 use oulipoly_config::ModelConfig;
 use oulipoly_state::{QuotaRecord, QuotaWindow, StateDb};
 
