@@ -58,6 +58,7 @@ pub fn execute(
             None,
             SpawnRuntimeMode::Headless,
             working_dir,
+            None,
         ),
     )?;
     cleanup_temp_files(temp_files);
@@ -121,6 +122,7 @@ fn execute_effective_with_optional_supervisor_config(
             start_known_provider_session_id,
             SpawnRuntimeMode::Headless,
             request.working_dir,
+            request.models_dir,
         ),
         supervisor_config,
     )?;

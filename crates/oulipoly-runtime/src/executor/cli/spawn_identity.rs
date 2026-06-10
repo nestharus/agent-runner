@@ -38,6 +38,7 @@ pub(crate) struct SpawnIdentityContext {
     mode: SpawnRuntimeMode,
     pty_control_path: Option<String>,
     effective_cwd: Option<String>,
+    models_dir: Option<String>,
 }
 
 impl SpawnIdentityContext {
@@ -63,6 +64,7 @@ pub(crate) fn context_from_parent_invocation_env(
     session_id: Option<&str>,
     mode: SpawnRuntimeMode,
     effective_cwd: Option<&Path>,
+    models_dir: Option<&Path>,
 ) -> Option<SpawnIdentityContext> {
     let invocation = parse_parent_invocation_env(parent_invocation_env)?;
     Some(spawn_identity_context_from_invocation(
@@ -72,6 +74,7 @@ pub(crate) fn context_from_parent_invocation_env(
         session_id,
         mode,
         effective_cwd,
+        models_dir,
     ))
 }
 
@@ -88,6 +91,7 @@ fn spawn_identity_context_from_invocation(
     session_id: Option<&str>,
     mode: SpawnRuntimeMode,
     effective_cwd: Option<&Path>,
+    models_dir: Option<&Path>,
 ) -> SpawnIdentityContext {
     SpawnIdentityContext {
         invocation_uuid: invocation.id,
@@ -97,6 +101,7 @@ fn spawn_identity_context_from_invocation(
         mode,
         pty_control_path: None,
         effective_cwd: effective_cwd.map(|path| path.to_string_lossy().into_owned()),
+        models_dir: models_dir.map(|path| path.to_string_lossy().into_owned()),
     }
 }
 
@@ -190,7 +195,7 @@ fn session_runtime_running_update<'a>(
         identity,
         pty_control_path: context.pty_control_path.as_deref(),
         turn_start_max_mailbox_seq: None,
-        models_dir: None,
+        models_dir: context.models_dir.as_deref(),
         effective_cwd: context.effective_cwd.as_deref(),
     }
 }

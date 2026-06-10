@@ -160,6 +160,7 @@ fn execution_request(model: ModelConfig) -> ExecutorServiceRequest {
         provider_index: 0,
         prompt: "prompt-value".to_string(),
         working_dir: None,
+        models_dir: None,
         extra_inputs: HashMap::new(),
         parent_invocation_env: None,
     }

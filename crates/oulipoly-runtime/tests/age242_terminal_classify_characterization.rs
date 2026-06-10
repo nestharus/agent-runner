@@ -181,6 +181,7 @@ fn direct_execute_request<'a>(
         prompt_mode: PromptMode::Arg,
         prompt: "prompt-value",
         working_dir: None,
+        models_dir: None,
         extra_inputs,
         parent_invocation_env: None,
     }
@@ -215,6 +216,7 @@ fn service_facade_request(
         provider_index: 0,
         prompt: "prompt-value".to_string(),
         working_dir: None,
+        models_dir: None,
         extra_inputs,
         parent_invocation_env: None,
     }

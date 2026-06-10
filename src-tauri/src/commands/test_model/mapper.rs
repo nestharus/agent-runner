@@ -58,6 +58,7 @@ pub(crate) fn build_effective_executor_request(
         prompt_mode,
         prompt: prompt.to_string(),
         working_dir: None,
+        models_dir: None,
         extra_inputs: HashMap::new(),
         parent_invocation_env: None,
     }

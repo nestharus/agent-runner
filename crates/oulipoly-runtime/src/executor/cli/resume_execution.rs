@@ -70,6 +70,7 @@ pub fn execute_resume_optional_prompt(
         resume,
         None,
         None,
+        None,
     )
 }
 
@@ -86,6 +87,7 @@ pub fn execute_resume_optional_prompt_with_model_identity(
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
     model_name: &str,
+    models_dir: Option<&Path>,
 ) -> Result<ExecutionResult, String> {
     execute_resume_with_optional_supervisor_config(
         provider,
@@ -96,6 +98,7 @@ pub fn execute_resume_optional_prompt_with_model_identity(
         parent_invocation_env,
         resume,
         Some(model_name),
+        models_dir,
         None,
     )
 }
@@ -113,6 +116,7 @@ fn execute_resume_with_optional_supervisor_config(
     parent_invocation_env: Option<&str>,
     resume: ResumePayload<'_>,
     model_name: Option<&str>,
+    models_dir: Option<&Path>,
     supervisor_config: Option<SupervisorConfig>,
 ) -> Result<ExecutionResult, String> {
     let input = resume_execution_input(
@@ -121,6 +125,7 @@ fn execute_resume_with_optional_supervisor_config(
         parent_invocation_env,
         model_name,
         working_dir,
+        models_dir,
     )?;
     let (result, temp_files) = execute_provider_with_arg_parts_and_supervisor_config(
         &input.provider_without_capture,
@@ -157,6 +162,7 @@ fn resume_execution_input(
     parent_invocation_env: Option<&str>,
     model_name: Option<&str>,
     working_dir: Option<&Path>,
+    models_dir: Option<&Path>,
 ) -> Result<ResumeExecutionInput, String> {
     let session_id = resume.session_id.to_string();
     let provider_without_capture = provider_without_capture(provider);
@@ -168,6 +174,7 @@ fn resume_execution_input(
             model_name,
             &session_id,
             working_dir,
+            models_dir,
         ),
         provider_without_capture,
         session_id,
@@ -186,6 +193,7 @@ fn resume_spawn_identity(
     model_name: Option<&str>,
     session_id: &str,
     working_dir: Option<&Path>,
+    models_dir: Option<&Path>,
 ) -> Option<SpawnIdentityContext> {
     context_from_parent_invocation_env(
         parent_invocation_env,
@@ -194,6 +202,7 @@ fn resume_spawn_identity(
         Some(session_id),
         SpawnRuntimeMode::Headless,
         working_dir,
+        models_dir,
     )
 }
 

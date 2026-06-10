@@ -248,8 +248,19 @@ fn wake_sweep_candidate_disposition(
     if pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
         return Ok(WakeSweepDisposition::Skip);
     }
+    if wake_sweep_candidate_is_abandoned_transient(db, &candidate.session_id)? {
+        trace_abandoned_transient_wake_skip(&candidate.session_id);
+        return Ok(WakeSweepDisposition::Skip);
+    }
+    if wake_sweep_candidate_missing_models_dir_for_resume(db, state, candidate)? {
+        trace_missing_models_dir_wake_skip(&candidate.session_id);
+        return Ok(WakeSweepDisposition::Skip);
+    }
     if wake_sweep_candidate_is_resumable(db, state, candidate)? {
-        return Ok(resumable_wake_sweep_disposition(candidate));
+        return Ok(resumable_wake_sweep_disposition(
+            &candidate.session_id,
+            candidate,
+        ));
     }
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
@@ -257,10 +268,19 @@ fn wake_sweep_candidate_disposition(
     Ok(WakeSweepDisposition::Abandoned)
 }
 
-fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
-    if wake_sweep_candidate_reached_cap(candidate)
-        || !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id)
-    {
+fn resumable_wake_sweep_disposition(
+    session_id: &str,
+    candidate: &WakeSweepCandidate,
+) -> WakeSweepDisposition {
+    if wake_sweep_candidate_reached_cap(candidate) {
+        emit_auto_wake_cap_reached(
+            session_id,
+            candidate.auto_wake_count.saturating_sub(1),
+            auto_wake_max(),
+        );
+        return WakeSweepDisposition::Skip;
+    }
+    if !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id) {
         return WakeSweepDisposition::Skip;
     }
     WakeSweepDisposition::Recoverable
@@ -291,16 +311,53 @@ fn wake_sweep_candidate_is_resumable(
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<bool, String> {
-    let Some(runtime) = db.session_runtime(&candidate.session_id)? else {
+    let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
         return Ok(false);
     };
-    if !wake_sweep_runtime_can_resume(&runtime) {
-        return Ok(false);
-    }
-    wake_sweep_runtime_has_resume_evidence(state, &runtime)
+    wake_sweep_runtime_is_resumable(state, &runtime)
 }
 
-fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
+fn wake_sweep_candidate_runtime(
+    db: &MailboxDb,
+    candidate: &WakeSweepCandidate,
+) -> Result<Option<SessionRuntimeRow>, String> {
+    db.session_runtime(&candidate.session_id)
+}
+
+fn wake_sweep_runtime_is_resumable(
+    state: Option<&StateDb>,
+    runtime: &SessionRuntimeRow,
+) -> Result<bool, String> {
+    if !wake_sweep_runtime_can_resume(runtime) {
+        return Ok(false);
+    }
+    wake_sweep_runtime_has_resume_evidence(state, runtime)
+}
+
+fn wake_sweep_candidate_missing_models_dir_for_resume(
+    db: &MailboxDb,
+    state: Option<&StateDb>,
+    candidate: &WakeSweepCandidate,
+) -> Result<bool, String> {
+    let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
+        return Ok(false);
+    };
+    wake_sweep_runtime_missing_models_dir_for_resume(state, &runtime)
+}
+
+fn wake_sweep_runtime_missing_models_dir_for_resume(
+    state: Option<&StateDb>,
+    runtime: &SessionRuntimeRow,
+) -> Result<bool, String> {
+    if !wake_sweep_runtime_can_resume_except_models_dir(runtime)
+        || wake_runtime_has_models_dir(runtime)
+    {
+        return Ok(false);
+    }
+    wake_sweep_runtime_has_resume_evidence(state, runtime)
+}
+
+fn wake_sweep_runtime_can_resume_except_models_dir(runtime: &SessionRuntimeRow) -> bool {
     runtime.mode == "headless"
         && runtime.run_state != "running"
         && runtime
@@ -309,35 +366,98 @@ fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
             .is_some_and(|provider| !provider.is_empty())
 }
 
+fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
+    wake_sweep_runtime_can_resume_except_models_dir(runtime) && wake_runtime_has_models_dir(runtime)
+}
+
+fn wake_runtime_has_models_dir(runtime: &SessionRuntimeRow) -> bool {
+    runtime
+        .models_dir
+        .as_deref()
+        .is_some_and(|models_dir| !models_dir.is_empty())
+}
+
 fn wake_sweep_runtime_has_resume_evidence(
     state: Option<&StateDb>,
     runtime: &SessionRuntimeRow,
 ) -> Result<bool, String> {
+    let evidence = wake_sweep_runtime_resume_evidence(state, runtime)?;
+    Ok(resume_evidence_present(evidence))
+}
+
+struct WakeResumeEvidence {
+    has_chain: bool,
+    turn_count: u64,
+}
+
+fn wake_sweep_runtime_resume_evidence(
+    state: Option<&StateDb>,
+    runtime: &SessionRuntimeRow,
+) -> Result<Option<WakeResumeEvidence>, String> {
     let Some(state) = state else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(provider_name) = runtime.provider_name.as_deref() else {
-        return Ok(false);
+        return Ok(None);
     };
-    if state
+    let has_chain = state
         .chain_id_for_segment(provider_name, &runtime.session_id)
         .map_err(|err| err.to_string())?
-        .is_some()
-    {
-        return Ok(true);
-    }
-    state
+        .is_some();
+    let turn_count = state
         .count_session_turns(provider_name, &runtime.session_id)
-        .map(|counts| counts.total > 0)
+        .map(|counts| counts.total)?;
+    Ok(Some(WakeResumeEvidence {
+        has_chain,
+        turn_count,
+    }))
+}
+
+fn resume_evidence_present(evidence: Option<WakeResumeEvidence>) -> bool {
+    evidence
+        .map(|evidence| evidence.has_chain || evidence.turn_count > 0)
+        .unwrap_or(false)
 }
 
 fn wake_sweep_candidate_has_live_owner(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    for row in db.list_pending(session_id)? {
-        if mailbox_row_has_live_owner_identity(&row)? {
+    let rows = pending_mailbox_rows(db, session_id)?;
+    pending_rows_have_live_owner(&rows)
+}
+
+fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxRow>, String> {
+    db.list_pending(session_id)
+}
+
+fn pending_rows_have_live_owner(rows: &[MailboxRow]) -> Result<bool, String> {
+    for row in rows {
+        if mailbox_row_has_live_owner_identity(row)? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn wake_sweep_candidate_is_abandoned_transient(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<bool, String> {
+    let rows = pending_mailbox_rows(db, session_id)?;
+    pending_rows_are_abandoned_transient(&rows)
+}
+
+fn pending_rows_are_abandoned_transient(rows: &[MailboxRow]) -> Result<bool, String> {
+    if !pending_rows_have_owner_identity(rows) {
+        return Ok(false);
+    }
+    Ok(!pending_rows_have_live_owner(rows)?)
+}
+
+fn pending_rows_have_owner_identity(rows: &[MailboxRow]) -> bool {
+    rows.iter().any(mailbox_row_owner_identity_present)
+}
+
+fn mailbox_row_owner_identity_present(row: &MailboxRow) -> bool {
+    mailbox_row_owner_identity(row).is_some()
 }
 
 fn mailbox_row_has_live_owner_identity(row: &MailboxRow) -> Result<bool, String> {
@@ -359,24 +479,56 @@ fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate) -> bool {
     auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max())
 }
 
+fn trace_abandoned_transient_wake_skip(session_id: &str) {
+    tracing::warn!(
+        session_id,
+        "Skipping auto wake for abandoned transient session with dead owner lineage"
+    );
+}
+
+fn trace_missing_models_dir_wake_skip(session_id: &str) {
+    tracing::warn!(
+        session_id,
+        "Skipping auto wake for resumable session with missing session_runtime.models_dir"
+    );
+}
+
 fn pending_mailbox_consumed_marker_present(db: &MailboxDb, session_id: &str) -> bool {
-    let Ok(pending) = db.list_pending(session_id) else {
+    let Ok(pending) = pending_mailbox_rows(db, session_id) else {
         return false;
     };
     if pending.is_empty() {
         return true;
     }
-    let Some(provider_name) = pending_mailbox_provider_name(db, session_id) else {
+    let Some(context) = consumed_marker_context(db, session_id) else {
         return false;
     };
-    let Some(state) = open_default_state_read_only() else {
-        return false;
-    };
-    session_has_consumed_notification_marker(&state, &provider_name, session_id)
+    pending_rows_have_consumed_markers(&context.state, &context.provider_name, session_id, &pending)
+}
+
+struct ConsumedMarkerContext {
+    provider_name: String,
+    state: StateDb,
+}
+
+fn consumed_marker_context(db: &MailboxDb, session_id: &str) -> Option<ConsumedMarkerContext> {
+    Some(ConsumedMarkerContext {
+        provider_name: pending_mailbox_provider_name(db, session_id)?,
+        state: open_default_state_read_only()?,
+    })
+}
+
+fn pending_rows_have_consumed_markers(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    pending: &[MailboxRow],
+) -> bool {
+    session_has_consumed_notification_marker(state, provider_name, session_id)
         && pending.iter().all(|row| {
             state
                 .has_session_user_turn_containing(
-                    &provider_name,
+                    provider_name,
                     session_id,
                     &mailbox_handle_marker(row),
                 )
@@ -739,38 +891,95 @@ fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         Err(diagnostic) => return diagnostic,
     };
     let spawn = spawn_detached_resume(
-        input.session_id,
+        context.input.session_id,
         context.runtime.as_ref(),
         &context.claim.claim_token,
-        input.auto_wake_count,
+        context.input.auto_wake_count,
     );
     wake_spawn_diagnostic(
         &mut context.db,
-        input,
+        context.input,
         context.runtime.as_ref(),
         context.claim,
         spawn,
     )
 }
 
-struct WakeStartContext {
+struct WakeStartContext<'a> {
+    input: StartWakeInput<'a>,
     db: MailboxDb,
     runtime: Option<SessionRuntimeRow>,
     claim: WakeClaimRow,
 }
 
-fn prepare_wake_start_context(
-    input: StartWakeInput<'_>,
+fn prepare_wake_start_context<'a>(
+    input: StartWakeInput<'a>,
     claim_token: &str,
-) -> Result<WakeStartContext, WakeDiagnostic> {
+) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
     let mut db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
     let runtime =
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
+    validate_wake_runtime_models_dir(input.session_id, runtime.as_ref())?;
+    let input = normalize_start_wake_input(input, runtime.as_ref());
+    validate_start_wake_cap(input)?;
     if wake_runtime_busy(&mut db, input.session_id, runtime.as_ref())? {
         return Err(WakeDiagnostic::status("busy"));
     }
     let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
-    Ok(WakeStartContext { db, runtime, claim })
+    Ok(WakeStartContext {
+        input,
+        db,
+        runtime,
+        claim,
+    })
+}
+
+fn wake_runtime_missing_models_dir(runtime: Option<&SessionRuntimeRow>) -> bool {
+    runtime.is_some_and(|runtime| !wake_runtime_has_models_dir(runtime))
+}
+
+fn validate_wake_runtime_models_dir(
+    session_id: &str,
+    runtime: Option<&SessionRuntimeRow>,
+) -> Result<(), WakeDiagnostic> {
+    if wake_runtime_missing_models_dir(runtime) {
+        return Err(missing_models_dir_diagnostic(session_id));
+    }
+    Ok(())
+}
+
+fn missing_models_dir_diagnostic(session_id: &str) -> WakeDiagnostic {
+    WakeDiagnostic::with_message("models_dir_missing", missing_models_dir_message(session_id))
+}
+
+fn missing_models_dir_message(session_id: &str) -> String {
+    format!("Skipping auto wake for {session_id} because session_runtime.models_dir is missing")
+}
+
+fn normalize_start_wake_input<'a>(
+    input: StartWakeInput<'a>,
+    runtime: Option<&SessionRuntimeRow>,
+) -> StartWakeInput<'a> {
+    let persisted_next = runtime
+        .map(|runtime| runtime.auto_wake_count.saturating_add(1))
+        .unwrap_or(input.auto_wake_count);
+    StartWakeInput {
+        auto_wake_count: input.auto_wake_count.max(persisted_next).max(1),
+        ..input
+    }
+}
+
+fn start_wake_input_reached_cap(input: StartWakeInput<'_>) -> bool {
+    auto_wake_cap_reached(input.auto_wake_count.saturating_sub(1), auto_wake_max())
+}
+
+fn validate_start_wake_cap(input: StartWakeInput<'_>) -> Result<(), WakeDiagnostic> {
+    if !start_wake_input_reached_cap(input) {
+        return Ok(());
+    }
+    let current_count = input.auto_wake_count.saturating_sub(1);
+    emit_auto_wake_cap_reached(input.session_id, current_count, auto_wake_max());
+    Err(auto_wake_cap_diagnostic(current_count))
 }
 
 fn wake_runtime_busy(

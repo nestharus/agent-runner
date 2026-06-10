@@ -176,6 +176,7 @@ pub(super) struct BalancedExecutorRequestInput<'a> {
     pub(super) prompt_mode: PromptMode,
     pub(super) prompt: &'a str,
     pub(super) working_dir: Option<&'a Path>,
+    pub(super) models_dir: &'a Path,
     pub(super) extra_inputs: &'a HashMap<String, Vec<String>>,
     pub(super) invocation_env: &'a str,
     pub(super) start_known_provider_session_id: Option<String>,
@@ -188,6 +189,7 @@ pub(super) struct BalancedExecutorRequestInputSource<'a> {
     pub(super) prompt_mode: PromptMode,
     pub(super) prompt: &'a str,
     pub(super) working_dir: Option<&'a Path>,
+    pub(super) models_dir: &'a Path,
     pub(super) extra_inputs: &'a HashMap<String, Vec<String>>,
     pub(super) invocation_env: &'a str,
     pub(super) start_known_provider_session_id: Option<String>,
@@ -203,6 +205,7 @@ pub(super) fn balanced_executor_request_input(
         prompt_mode: source.prompt_mode,
         prompt: source.prompt,
         working_dir: source.working_dir,
+        models_dir: source.models_dir,
         extra_inputs: source.extra_inputs,
         invocation_env: source.invocation_env,
         start_known_provider_session_id: source.start_known_provider_session_id,
@@ -220,6 +223,7 @@ pub(super) fn balanced_executor_request(
             prompt_mode: input.prompt_mode,
             prompt: input.prompt.to_string(),
             working_dir: input.working_dir.map(PathBuf::from),
+            models_dir: Some(input.models_dir.to_path_buf()),
             extra_inputs: input.extra_inputs.clone(),
             parent_invocation_env: Some(input.invocation_env.to_string()),
             start_known_provider_session_id,
@@ -232,14 +236,19 @@ pub(super) fn balanced_executor_request(
         prompt_mode: input.prompt_mode,
         prompt: input.prompt.to_string(),
         working_dir: input.working_dir.map(PathBuf::from),
+        models_dir: Some(input.models_dir.to_path_buf()),
         extra_inputs: input.extra_inputs.clone(),
         parent_invocation_env: Some(input.invocation_env.to_string()),
     }
 }
 
 pub(super) type ExecutorModelInput<'a> = (&'a ModelConfig, &'a ProviderConfig, usize, PromptMode);
-pub(super) type ExecutorPromptInput<'a> =
-    (&'a str, Option<&'a Path>, &'a HashMap<String, Vec<String>>);
+pub(super) type ExecutorPromptInput<'a> = (
+    &'a str,
+    Option<&'a Path>,
+    &'a Path,
+    &'a HashMap<String, Vec<String>>,
+);
 pub(super) type ExecutorInvocationInput<'a> = (&'a str, Option<String>);
 
 pub(super) fn balanced_executor_request_for_attempt(
@@ -248,7 +257,7 @@ pub(super) fn balanced_executor_request_for_attempt(
     invocation_input: ExecutorInvocationInput<'_>,
 ) -> ExecutorServiceRequest {
     let (model, provider, provider_index, prompt_mode) = model_input;
-    let (prompt, working_dir, extra_inputs) = prompt_input;
+    let (prompt, working_dir, models_dir, extra_inputs) = prompt_input;
     let (invocation_env, start_known_provider_session_id) = invocation_input;
     balanced_executor_request(balanced_executor_request_input(
         BalancedExecutorRequestInputSource {
@@ -258,6 +267,7 @@ pub(super) fn balanced_executor_request_for_attempt(
             prompt_mode,
             prompt,
             working_dir,
+            models_dir,
             extra_inputs,
             invocation_env,
             start_known_provider_session_id,

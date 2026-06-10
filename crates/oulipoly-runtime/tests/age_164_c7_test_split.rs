@@ -500,6 +500,7 @@ fn cluster_7_public_re_exports_remain_at_executor_cli_path() {
         prompt_mode: PromptMode::Arg,
         prompt: "smoke",
         working_dir: None,
+        models_dir: None,
         extra_inputs: &extras,
         parent_invocation_env: None,
     };

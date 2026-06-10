@@ -118,6 +118,7 @@ pub struct SessionRuntimeRow {
     pub last_exit_code: Option<i32>,
     pub models_dir: Option<String>,
     pub effective_cwd: Option<String>,
+    pub auto_wake_count: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,38 +460,36 @@ impl MailboxDb {
         input: WakeClaimRequest<'_>,
         renew_token: Option<&str>,
     ) -> Result<WakeClaimAcquireResult, String> {
-        if !self.session_has_pending_mailbox(input.session_id)? {
-            return Ok(WakeClaimAcquireResult::NoPending);
-        }
-        if self.session_is_busy(input.session_id)? {
-            return Ok(WakeClaimAcquireResult::Busy);
+        if let Some(result) = self.wake_claim_start_blocker(input.session_id)? {
+            return Ok(result);
         }
         let now = now_rfc3339();
-        let tx = self
-            .conn
-            .transaction()
-            .map_err(|err| format!("Failed to start wake claim transaction: {err}"))?;
-        let pending_bounds = pending_seq_bounds_tx(&tx, input.session_id)?;
+        let tx = begin_wake_claim_transaction(&mut self.conn)?;
+        let pending_bounds = pending_seq_bounds_for_claim_tx(&tx, input.session_id)?;
         let Some((min_seq, max_seq)) = pending_bounds else {
-            tx.commit()
-                .map_err(|err| format!("Failed to commit empty wake claim transaction: {err}"))?;
+            commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::NoPending);
         };
-        if let Some(existing) = fresh_in_flight_wake_claim(
-            &tx,
-            wake_claim_tx(&tx, input.session_id)?,
-            input.stale_after_seconds,
-            renew_token,
-        )? {
-            tx.commit().map_err(|err| {
-                format!("Failed to commit existing wake claim transaction: {err}")
-            })?;
+        if let Some(existing) = fresh_in_flight_wake_claim_for_input(&tx, input, renew_token)? {
+            commit_existing_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
         }
         let claim = acquire_wake_claim_tx(&tx, input, &now, min_seq, max_seq)?;
-        tx.commit()
-            .map_err(|err| format!("Failed to commit wake claim transaction: {err}"))?;
+        commit_wake_claim_transaction(tx)?;
         Ok(WakeClaimAcquireResult::Acquired(claim))
+    }
+
+    fn wake_claim_start_blocker(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<WakeClaimAcquireResult>, String> {
+        if !self.session_has_pending_mailbox(session_id)? {
+            return Ok(Some(WakeClaimAcquireResult::NoPending));
+        }
+        if self.session_is_busy(session_id)? {
+            return Ok(Some(WakeClaimAcquireResult::Busy));
+        }
+        Ok(None)
     }
 
     pub fn wake_claim(&self, session_id: &str) -> Result<Option<WakeClaimRow>, String> {
@@ -582,8 +581,8 @@ impl MailboxDb {
             };
             let Some(claim) = self.wake_claim(&session_id)? else {
                 candidates.push(wake_sweep_candidate(
-                    session_id,
-                    1,
+                    session_id.clone(),
+                    self.next_auto_wake_count_for_session(&session_id, None)?,
                     min_pending_seq,
                     max_pending_seq,
                 ));
@@ -591,14 +590,33 @@ impl MailboxDb {
             };
             if wake_claim_is_reclaimable(&self.conn, &claim, stale_after_seconds)? {
                 candidates.push(wake_sweep_candidate(
-                    session_id,
-                    claim.auto_wake_count.saturating_add(1),
+                    session_id.clone(),
+                    self.next_auto_wake_count_for_session(&session_id, Some(&claim))?,
                     min_pending_seq,
                     max_pending_seq,
                 ));
             }
         }
         Ok(candidates)
+    }
+
+    fn next_auto_wake_count_for_session(
+        &self,
+        session_id: &str,
+        claim: Option<&WakeClaimRow>,
+    ) -> Result<i64, String> {
+        let persisted = self.persisted_auto_wake_count(session_id)?;
+        Ok(next_auto_wake_count(
+            persisted,
+            claim_auto_wake_count(claim),
+        ))
+    }
+
+    fn persisted_auto_wake_count(&self, session_id: &str) -> Result<i64, String> {
+        Ok(self
+            .session_runtime(session_id)?
+            .map(|runtime| runtime.auto_wake_count)
+            .unwrap_or(0))
     }
 
     pub fn validate_wake_claim_for_child(
@@ -831,6 +849,72 @@ fn wake_sweep_candidate(
     }
 }
 
+fn begin_wake_claim_transaction(
+    conn: &mut Connection,
+) -> Result<rusqlite::Transaction<'_>, String> {
+    conn.transaction().map_err(format_start_wake_claim_tx_error)
+}
+
+fn format_start_wake_claim_tx_error(err: rusqlite::Error) -> String {
+    format!("Failed to start wake claim transaction: {err}")
+}
+
+fn pending_seq_bounds_for_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<Option<(i64, i64)>, String> {
+    pending_seq_bounds_tx(tx, session_id)
+}
+
+fn fresh_in_flight_wake_claim_for_input(
+    tx: &rusqlite::Transaction<'_>,
+    input: WakeClaimRequest<'_>,
+    renew_token: Option<&str>,
+) -> Result<Option<WakeClaimRow>, String> {
+    fresh_in_flight_wake_claim(
+        tx,
+        wake_claim_tx(tx, input.session_id)?,
+        input.stale_after_seconds,
+        renew_token,
+    )
+}
+
+fn commit_empty_wake_claim_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.commit().map_err(format_empty_wake_claim_commit_error)
+}
+
+fn format_empty_wake_claim_commit_error(err: rusqlite::Error) -> String {
+    format!("Failed to commit empty wake claim transaction: {err}")
+}
+
+fn commit_existing_wake_claim_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.commit().map_err(format_existing_wake_claim_commit_error)
+}
+
+fn format_existing_wake_claim_commit_error(err: rusqlite::Error) -> String {
+    format!("Failed to commit existing wake claim transaction: {err}")
+}
+
+fn commit_wake_claim_transaction(tx: rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.commit().map_err(format_wake_claim_commit_error)
+}
+
+fn format_wake_claim_commit_error(err: rusqlite::Error) -> String {
+    format!("Failed to commit wake claim transaction: {err}")
+}
+
+fn claim_auto_wake_count(claim: Option<&WakeClaimRow>) -> Option<i64> {
+    claim.map(|claim| claim.auto_wake_count)
+}
+
+fn next_auto_wake_count(persisted: i64, claim: Option<i64>) -> i64 {
+    claim
+        .unwrap_or(persisted)
+        .max(persisted)
+        .saturating_add(1)
+        .max(1)
+}
+
 fn enqueue_agent_bash_complete_in_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
@@ -1006,7 +1090,7 @@ fn session_runtime_row(
                 pty_control_path, updated_at, run_state, running_invocation_uuid,
                 running_os_pid, running_os_boot_id, running_os_pid_starttime_ticks,
                 turn_started_at, turn_ended_at, turn_start_max_mailbox_seq,
-                last_exit_code, models_dir, effective_cwd
+                last_exit_code, models_dir, effective_cwd, auto_wake_count
          FROM session_runtime
          WHERE session_id = ?1",
         params![session_id],
@@ -1162,6 +1246,18 @@ fn acquire_wake_claim_tx(
     min_seq: i64,
     max_seq: i64,
 ) -> Result<WakeClaimRow, String> {
+    upsert_wake_claim_tx(tx, input, now, min_seq, max_seq)?;
+    update_session_runtime_auto_wake_count_tx(tx, input.session_id, input.auto_wake_count)?;
+    read_acquired_wake_claim_tx(tx, input.session_id)
+}
+
+fn upsert_wake_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: WakeClaimRequest<'_>,
+    now: &str,
+    min_seq: i64,
+    max_seq: i64,
+) -> Result<(), String> {
     tx.execute(
         "INSERT INTO session_wake_claim (
             session_id,
@@ -1195,9 +1291,35 @@ fn acquire_wake_claim_tx(
             max_seq,
         ],
     )
-    .map_err(|err| format!("Failed to acquire wake claim: {err}"))?;
-    wake_claim_tx(tx, input.session_id)?
+    .map_err(format_acquire_wake_claim_error)?;
+    Ok(())
+}
+
+fn format_acquire_wake_claim_error(err: rusqlite::Error) -> String {
+    format!("Failed to acquire wake claim: {err}")
+}
+
+fn read_acquired_wake_claim_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<WakeClaimRow, String> {
+    wake_claim_tx(tx, session_id)?
         .ok_or_else(|| "Wake claim missing immediately after acquisition".to_string())
+}
+
+fn update_session_runtime_auto_wake_count_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    auto_wake_count: i64,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE session_runtime
+         SET auto_wake_count = MAX(auto_wake_count, ?2)
+         WHERE session_id = ?1",
+        params![session_id, auto_wake_count],
+    )
+    .map_err(|err| format!("Failed to update session auto wake count: {err}"))?;
+    Ok(())
 }
 
 fn wake_claim_matches_child(claim: &WakeClaimRow, claim_token: &str) -> bool {
@@ -1288,7 +1410,8 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             turn_start_max_mailbox_seq       INTEGER,
             last_exit_code                   INTEGER,
             models_dir                       TEXT,
-            effective_cwd                    TEXT
+            effective_cwd                    TEXT,
+            auto_wake_count                  INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS session_wake_claim (
@@ -1318,7 +1441,7 @@ fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn session_runtime_column_additions() -> [(&'static str, &'static str); 11] {
+fn session_runtime_column_additions() -> [(&'static str, &'static str); 12] {
     [
         ("run_state", "TEXT NOT NULL DEFAULT 'idle'"),
         ("running_invocation_uuid", "TEXT"),
@@ -1331,6 +1454,7 @@ fn session_runtime_column_additions() -> [(&'static str, &'static str); 11] {
         ("last_exit_code", "INTEGER"),
         ("models_dir", "TEXT"),
         ("effective_cwd", "TEXT"),
+        ("auto_wake_count", "INTEGER NOT NULL DEFAULT 0"),
     ]
 }
 
@@ -1487,6 +1611,7 @@ fn map_session_runtime_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         last_exit_code: row.get(15)?,
         models_dir: row.get(16)?,
         effective_cwd: row.get(17)?,
+        auto_wake_count: row.get(18)?,
     })
 }
 
@@ -1858,6 +1983,49 @@ mod tests {
         assert_eq!(claim.auto_wake_count, 1);
         assert_eq!(claim.min_pending_seq_at_claim, Some(1));
         assert_eq!(claim.max_pending_seq_at_claim, Some(2));
+    }
+
+    #[test]
+    fn wake_claim_count_persists_on_session_runtime_after_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: Some("/tmp/models"),
+            effective_cwd: None,
+        })
+        .unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+
+        let result = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 5,
+                wake_invocation_uuid: Some("wake-a"),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+
+        assert!(matches!(result, WakeClaimAcquireResult::Acquired(_)));
+        assert_eq!(
+            db.session_runtime("session-a")
+                .unwrap()
+                .unwrap()
+                .auto_wake_count,
+            5
+        );
+        db.release_wake_claim("session-a", Some("token-a")).unwrap();
+        let candidates = db.wake_sweep_candidates(600, 10).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].auto_wake_count, 6);
     }
 
     #[test]
