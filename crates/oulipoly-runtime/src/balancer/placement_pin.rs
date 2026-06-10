@@ -11,34 +11,36 @@ pub(super) fn fresh_run_pin_provider() -> Option<String> {
 }
 
 fn pin_provider_from_args(args: impl IntoIterator<Item = OsString>) -> Option<String> {
-    let mut args = args.into_iter();
+    let args = args_before_prompt_separator(args);
+    pin_provider_value_token(args.as_slice())
+        .and_then(pin_value_from_os_string)
+        .and_then(validate_pin_provider_value)
+}
+
+fn args_before_prompt_separator(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    args.into_iter().take_while(|arg| arg != "--").collect()
+}
+
+fn pin_provider_value_token(args: &[OsString]) -> Option<OsString> {
+    let mut args = args.iter();
     while let Some(arg) = args.next() {
         let text = arg.to_string_lossy();
-        if text == "--" {
-            return None;
-        }
         if let Some(value) = text.strip_prefix("--pin-provider=") {
-            return nonempty_pin_value(value);
+            return Some(OsString::from(value));
         }
         if text == "--pin-provider" {
-            return args.next().and_then(pin_value_from_os_string);
+            return args.next().cloned();
         }
     }
     None
 }
 
 fn pin_value_from_os_string(value: OsString) -> Option<String> {
-    value.into_string().ok().and_then(|value| {
-        if value.starts_with('-') {
-            None
-        } else {
-            nonempty_pin_value(&value)
-        }
-    })
+    value.into_string().ok()
 }
 
-fn nonempty_pin_value(value: &str) -> Option<String> {
-    (!value.is_empty()).then(|| value.to_string())
+fn validate_pin_provider_value(value: String) -> Option<String> {
+    (!value.is_empty() && !value.starts_with('-')).then_some(value)
 }
 
 pub(super) fn select_pinned_provider(

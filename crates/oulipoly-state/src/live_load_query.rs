@@ -24,20 +24,62 @@ fn read_running_invocation_counts_by_provider(
     provider_names: &[&str],
     since: DateTime<Utc>,
 ) -> Result<HashMap<String, u64>, String> {
-    if provider_names.is_empty() {
-        return Ok(HashMap::new());
+    if provider_names_are_empty(provider_names) {
+        return Ok(empty_running_invocation_counts());
     }
+    read_running_invocation_counts(
+        conn,
+        running_invocation_count_request(provider_names, since),
+    )
+}
+
+struct RunningInvocationCountRequest {
+    sql: String,
+    params: Vec<String>,
+}
+
+struct RunningInvocationCountRow {
+    provider_name: String,
+    count: i64,
+}
+
+fn provider_names_are_empty(provider_names: &[&str]) -> bool {
+    provider_names.is_empty()
+}
+
+fn empty_running_invocation_counts() -> HashMap<String, u64> {
+    HashMap::new()
+}
+
+fn running_invocation_count_request(
+    provider_names: &[&str],
+    since: DateTime<Utc>,
+) -> RunningInvocationCountRequest {
     let sql = running_invocation_count_sql(provider_names.len());
-    let since = since.to_rfc3339();
+    let since = running_invocation_count_since_param(since);
     let params = running_invocation_count_params(provider_names, &since);
+    RunningInvocationCountRequest { sql, params }
+}
+
+fn read_running_invocation_counts(
+    conn: &rusqlite::Connection,
+    request: RunningInvocationCountRequest,
+) -> Result<HashMap<String, u64>, String> {
     let mut statement = conn
-        .prepare(&sql)
+        .prepare(&request.sql)
         .map_err(format_running_invocation_count_prepare_error)?;
     let rows = statement
-        .query_map(params_from_iter(params), map_running_invocation_count_row)
+        .query_map(
+            params_from_iter(request.params),
+            map_running_invocation_count_row,
+        )
         .map_err(format_running_invocation_count_query_error)?;
     rows.collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(format_running_invocation_count_map_error)
+}
+
+fn running_invocation_count_since_param(since: DateTime<Utc>) -> String {
+    since.to_rfc3339()
 }
 
 fn running_invocation_count_sql(provider_count: usize) -> String {
@@ -52,20 +94,43 @@ fn running_invocation_count_sql(provider_count: usize) -> String {
     )
 }
 
-fn running_invocation_count_params<'a>(
-    provider_names: &'a [&'a str],
-    since: &'a str,
-) -> Vec<&'a str> {
-    std::iter::once(InvocationStatus::Running.as_str())
-        .chain(std::iter::once(since))
-        .chain(provider_names.iter().copied())
+fn running_invocation_count_params(provider_names: &[&str], since: &str) -> Vec<String> {
+    std::iter::once(InvocationStatus::Running.as_str().to_string())
+        .chain(std::iter::once(since.to_string()))
+        .chain(
+            provider_names
+                .iter()
+                .map(|provider_name| provider_name.to_string()),
+        )
         .collect()
 }
 
 fn map_running_invocation_count_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, u64)> {
+    running_invocation_count_entry(parse_running_invocation_count_row(row)?)
+}
+
+fn parse_running_invocation_count_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RunningInvocationCountRow> {
     let provider_name = row.get(0)?;
-    let count: i64 = row.get(1)?;
-    Ok((provider_name, count.max(0) as u64))
+    let count = row.get(1)?;
+    Ok(RunningInvocationCountRow {
+        provider_name,
+        count,
+    })
+}
+
+fn running_invocation_count_entry(
+    row: RunningInvocationCountRow,
+) -> rusqlite::Result<(String, u64)> {
+    Ok((
+        row.provider_name,
+        normalized_running_invocation_count(row.count),
+    ))
+}
+
+fn normalized_running_invocation_count(count: i64) -> u64 {
+    count.max(0) as u64
 }
 
 fn format_running_invocation_count_prepare_error(error: rusqlite::Error) -> String {
