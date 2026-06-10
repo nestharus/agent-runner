@@ -52,7 +52,7 @@ use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ExitStatus};
@@ -66,6 +66,19 @@ const MIN_TERMINAL_ROWS: u16 = 10;
 const MIN_TERMINAL_COLS: u16 = 40;
 /// Reserved focus-toggle byte: Ctrl+O.
 const FOCUS_TOGGLE_BYTE: u8 = 0x0f;
+
+const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
+const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
+const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
+const MOUSE_PRESS_RELEASE_DISABLE: &[u8] = b"\x1b[?1000l";
+const MOUSE_BUTTON_MOTION_ENABLE: &[u8] = b"\x1b[?1002h";
+const MOUSE_BUTTON_MOTION_DISABLE: &[u8] = b"\x1b[?1002l";
+const MOUSE_ANY_MOTION_ENABLE: &[u8] = b"\x1b[?1003h";
+const MOUSE_ANY_MOTION_DISABLE: &[u8] = b"\x1b[?1003l";
+const MOUSE_UTF8_ENABLE: &[u8] = b"\x1b[?1005h";
+const MOUSE_UTF8_DISABLE: &[u8] = b"\x1b[?1005l";
+const MOUSE_SGR_ENABLE: &[u8] = b"\x1b[?1006h";
+const MOUSE_SGR_DISABLE: &[u8] = b"\x1b[?1006l";
 
 /// Map the real terminal window size to the child PTY window size, reserving the
 /// collapsed monitor row so the provider believes its terminal is the top pane.
@@ -118,6 +131,65 @@ struct RoutedInput {
     /// The operator toggled focus into the monitor (expand + focus bottom).
     focus_bottom: bool,
     redraw: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseRequest {
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+}
+
+impl MouseRequest {
+    fn disabled() -> Self {
+        Self {
+            mode: vt100::MouseProtocolMode::None,
+            encoding: vt100::MouseProtocolEncoding::Default,
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        self.mode != vt100::MouseProtocolMode::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseEvent {
+    button: u16,
+    col: u16,
+    row: u16,
+    released: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedMouseEvent {
+    event: MouseEvent,
+    consumed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MousePaneRoute {
+    Top(MouseEvent),
+    Bottom(MouseEvent),
+    Outside,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneAreas {
+    top: Rect,
+    bottom: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalMouseState {
+    request: MouseRequest,
+}
+
+impl TerminalMouseState {
+    fn new() -> Self {
+        Self {
+            request: MouseRequest::disabled(),
+        }
+    }
 }
 
 enum TopInputRoute {
@@ -329,6 +401,307 @@ fn classify_top_input(byte: u8) -> TopInputRoute {
         TopInputRoute::FocusBottom
     } else {
         TopInputRoute::Forward(byte)
+    }
+}
+
+fn mouse_request_from_screen(screen: &vt100::Screen) -> MouseRequest {
+    MouseRequest {
+        mode: screen.mouse_protocol_mode(),
+        encoding: screen.mouse_protocol_encoding(),
+    }
+}
+
+fn sync_terminal_mouse<W: Write>(
+    writer: &mut W,
+    state: &mut TerminalMouseState,
+    next: MouseRequest,
+) -> io::Result<()> {
+    let bytes = terminal_mouse_delta(state.request, next);
+    if !bytes.is_empty() {
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+    }
+    state.request = next;
+    Ok(())
+}
+
+fn terminal_mouse_delta(prev: MouseRequest, next: MouseRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    append_mouse_mode_disable(&mut bytes, prev.mode, next.mode);
+    append_mouse_encoding_disable(&mut bytes, prev.encoding, next.encoding);
+    append_mouse_encoding_enable(&mut bytes, prev.encoding, next.encoding);
+    append_mouse_mode_enable(&mut bytes, prev.mode, next.mode);
+    bytes
+}
+
+fn append_mouse_mode_disable(
+    bytes: &mut Vec<u8>,
+    prev: vt100::MouseProtocolMode,
+    next: vt100::MouseProtocolMode,
+) {
+    if prev != next {
+        bytes.extend_from_slice(mouse_mode_disable_sequence(prev));
+    }
+}
+
+fn append_mouse_mode_enable(
+    bytes: &mut Vec<u8>,
+    prev: vt100::MouseProtocolMode,
+    next: vt100::MouseProtocolMode,
+) {
+    if prev != next {
+        bytes.extend_from_slice(mouse_mode_enable_sequence(next));
+    }
+}
+
+fn append_mouse_encoding_disable(
+    bytes: &mut Vec<u8>,
+    prev: vt100::MouseProtocolEncoding,
+    next: vt100::MouseProtocolEncoding,
+) {
+    if prev != next {
+        bytes.extend_from_slice(mouse_encoding_disable_sequence(prev));
+    }
+}
+
+fn append_mouse_encoding_enable(
+    bytes: &mut Vec<u8>,
+    prev: vt100::MouseProtocolEncoding,
+    next: vt100::MouseProtocolEncoding,
+) {
+    if prev != next {
+        bytes.extend_from_slice(mouse_encoding_enable_sequence(next));
+    }
+}
+
+fn mouse_mode_enable_sequence(mode: vt100::MouseProtocolMode) -> &'static [u8] {
+    match mode {
+        vt100::MouseProtocolMode::None => b"",
+        vt100::MouseProtocolMode::Press => MOUSE_PRESS_ENABLE,
+        vt100::MouseProtocolMode::PressRelease => MOUSE_PRESS_RELEASE_ENABLE,
+        vt100::MouseProtocolMode::ButtonMotion => MOUSE_BUTTON_MOTION_ENABLE,
+        vt100::MouseProtocolMode::AnyMotion => MOUSE_ANY_MOTION_ENABLE,
+    }
+}
+
+fn mouse_mode_disable_sequence(mode: vt100::MouseProtocolMode) -> &'static [u8] {
+    match mode {
+        vt100::MouseProtocolMode::None => b"",
+        vt100::MouseProtocolMode::Press => MOUSE_PRESS_DISABLE,
+        vt100::MouseProtocolMode::PressRelease => MOUSE_PRESS_RELEASE_DISABLE,
+        vt100::MouseProtocolMode::ButtonMotion => MOUSE_BUTTON_MOTION_DISABLE,
+        vt100::MouseProtocolMode::AnyMotion => MOUSE_ANY_MOTION_DISABLE,
+    }
+}
+
+fn mouse_encoding_enable_sequence(encoding: vt100::MouseProtocolEncoding) -> &'static [u8] {
+    match encoding {
+        vt100::MouseProtocolEncoding::Default => b"",
+        vt100::MouseProtocolEncoding::Utf8 => MOUSE_UTF8_ENABLE,
+        vt100::MouseProtocolEncoding::Sgr => MOUSE_SGR_ENABLE,
+    }
+}
+
+fn mouse_encoding_disable_sequence(encoding: vt100::MouseProtocolEncoding) -> &'static [u8] {
+    match encoding {
+        vt100::MouseProtocolEncoding::Default => b"",
+        vt100::MouseProtocolEncoding::Utf8 => MOUSE_UTF8_DISABLE,
+        vt100::MouseProtocolEncoding::Sgr => MOUSE_SGR_DISABLE,
+    }
+}
+
+fn terminal_mouse_restore_sequence() -> Vec<u8> {
+    [
+        MOUSE_PRESS_DISABLE,
+        MOUSE_PRESS_RELEASE_DISABLE,
+        MOUSE_BUTTON_MOTION_DISABLE,
+        MOUSE_ANY_MOTION_DISABLE,
+        MOUSE_UTF8_DISABLE,
+        MOUSE_SGR_DISABLE,
+    ]
+    .concat()
+}
+
+fn parse_mouse_event(bytes: &[u8]) -> Option<ParsedMouseEvent> {
+    parse_sgr_mouse_event(bytes).or_else(|| parse_legacy_mouse_event(bytes))
+}
+
+fn parse_sgr_mouse_event(bytes: &[u8]) -> Option<ParsedMouseEvent> {
+    if !bytes.starts_with(b"\x1b[<") {
+        return None;
+    }
+    let terminator = sgr_mouse_terminator_index(bytes)?;
+    let event = decode_sgr_mouse_event(&bytes[3..terminator], bytes[terminator])?;
+    Some(ParsedMouseEvent {
+        event,
+        consumed: terminator + 1,
+    })
+}
+
+fn sgr_mouse_terminator_index(bytes: &[u8]) -> Option<usize> {
+    bytes.iter().position(|byte| matches!(byte, b'M' | b'm'))
+}
+
+fn decode_sgr_mouse_event(fields: &[u8], terminator: u8) -> Option<MouseEvent> {
+    let mut parts = fields.split(|byte| *byte == b';');
+    let button = parse_mouse_number(parts.next()?)?;
+    let col = parse_mouse_number(parts.next()?)?;
+    let row = parse_mouse_number(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(MouseEvent {
+        button,
+        col,
+        row,
+        released: terminator == b'm',
+    })
+}
+
+fn parse_mouse_number(bytes: &[u8]) -> Option<u16> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+fn parse_legacy_mouse_event(bytes: &[u8]) -> Option<ParsedMouseEvent> {
+    if bytes.len() < 6 || !bytes.starts_with(b"\x1b[M") {
+        return None;
+    }
+    let button = legacy_mouse_value(bytes[3])?;
+    let col = legacy_mouse_value(bytes[4])?;
+    let row = legacy_mouse_value(bytes[5])?;
+    Some(ParsedMouseEvent {
+        event: MouseEvent {
+            button,
+            col,
+            row,
+            released: legacy_button_is_release(button),
+        },
+        consumed: 6,
+    })
+}
+
+fn legacy_mouse_value(byte: u8) -> Option<u16> {
+    byte.checked_sub(32).map(u16::from)
+}
+
+fn legacy_button_is_release(button: u16) -> bool {
+    button & 0b11 == 3 && !mouse_button_is_wheel(button)
+}
+
+fn encode_mouse_event(
+    event: MouseEvent,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
+    match encoding {
+        vt100::MouseProtocolEncoding::Default => encode_default_mouse_event(event),
+        vt100::MouseProtocolEncoding::Utf8 => encode_utf8_mouse_event(event),
+        vt100::MouseProtocolEncoding::Sgr => Some(encode_sgr_mouse_event(event)),
+    }
+}
+
+fn encode_sgr_mouse_event(event: MouseEvent) -> Vec<u8> {
+    let terminator = if event.released { 'm' } else { 'M' };
+    format!(
+        "\x1b[<{};{};{}{}",
+        event.button, event.col, event.row, terminator
+    )
+    .into_bytes()
+}
+
+fn encode_default_mouse_event(event: MouseEvent) -> Option<Vec<u8>> {
+    let button = default_mouse_button(event);
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        encode_default_mouse_value(button)?,
+        encode_default_mouse_value(event.col)?,
+        encode_default_mouse_value(event.row)?,
+    ])
+}
+
+fn encode_default_mouse_value(value: u16) -> Option<u8> {
+    u8::try_from(value.checked_add(32)?).ok()
+}
+
+fn encode_utf8_mouse_event(event: MouseEvent) -> Option<Vec<u8>> {
+    let mut bytes = b"\x1b[M".to_vec();
+    append_utf8_mouse_value(&mut bytes, default_mouse_button(event))?;
+    append_utf8_mouse_value(&mut bytes, event.col)?;
+    append_utf8_mouse_value(&mut bytes, event.row)?;
+    Some(bytes)
+}
+
+fn append_utf8_mouse_value(bytes: &mut Vec<u8>, value: u16) -> Option<()> {
+    let codepoint = u32::from(value.checked_add(32)?);
+    bytes.extend(char::from_u32(codepoint)?.to_string().as_bytes());
+    Some(())
+}
+
+fn default_mouse_button(event: MouseEvent) -> u16 {
+    if event.released && !mouse_button_is_wheel(event.button) {
+        (event.button & !0b11) | 3
+    } else {
+        event.button
+    }
+}
+
+fn mouse_button_is_wheel(button: u16) -> bool {
+    button & 64 != 0
+}
+
+fn mouse_wheel_command(event: MouseEvent) -> Option<MonitorCommand> {
+    if !mouse_button_is_wheel(event.button) {
+        return None;
+    }
+    match event.button & 0b11 {
+        0 => Some(MonitorCommand::SelectPrev),
+        1 => Some(MonitorCommand::SelectNext),
+        _ => None,
+    }
+}
+
+fn pane_areas(area: Rect, pane: &MonitorPane) -> PaneAreas {
+    let bottom_rows = pane.bottom_rows(area.height);
+    let [top, bottom] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
+    PaneAreas { top, bottom }
+}
+
+fn pane_areas_for_winsize(winsize: &libc::winsize, pane: &MonitorPane) -> PaneAreas {
+    pane_areas(
+        Rect {
+            x: 0,
+            y: 0,
+            width: winsize.ws_col,
+            height: winsize.ws_row,
+        },
+        pane,
+    )
+}
+
+fn route_mouse_to_pane(event: MouseEvent, areas: PaneAreas) -> MousePaneRoute {
+    if rect_contains_mouse(areas.top, event) {
+        MousePaneRoute::Top(localize_mouse_event(event, areas.top))
+    } else if rect_contains_mouse(areas.bottom, event) {
+        MousePaneRoute::Bottom(event)
+    } else {
+        MousePaneRoute::Outside
+    }
+}
+
+fn rect_contains_mouse(rect: Rect, event: MouseEvent) -> bool {
+    event.col > rect.x
+        && event.col <= rect.x.saturating_add(rect.width)
+        && event.row > rect.y
+        && event.row <= rect.y.saturating_add(rect.height)
+}
+
+fn localize_mouse_event(event: MouseEvent, rect: Rect) -> MouseEvent {
+    MouseEvent {
+        col: event.col.saturating_sub(rect.x),
+        row: event.row.saturating_sub(rect.y),
+        ..event
     }
 }
 
@@ -1169,20 +1542,34 @@ fn liveness_glyph(liveness: LivenessStatus) -> &'static str {
 /// Guard that enters the alternate screen and restores the primary screen on drop.
 struct AltScreenGuard {
     writer: File,
+    mouse: TerminalMouseState,
 }
 
 impl AltScreenGuard {
     fn enter(mut writer: File) -> Result<Self, String> {
         execute!(writer, EnterAlternateScreen)
             .map_err(|err| format!("Failed to enter alternate screen: {err}"))?;
-        Ok(Self { writer })
+        Ok(Self {
+            writer,
+            mouse: TerminalMouseState::new(),
+        })
+    }
+
+    fn sync_mouse(&mut self, request: MouseRequest) -> Result<(), String> {
+        sync_terminal_mouse(&mut self.writer, &mut self.mouse, request)
+            .map_err(format_tui_mouse_sync_error)
     }
 }
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
+        let _ = self.writer.write_all(&terminal_mouse_restore_sequence());
         let _ = execute!(self.writer, LeaveAlternateScreen);
     }
+}
+
+fn format_tui_mouse_sync_error(err: io::Error) -> String {
+    format!("Failed to sync terminal mouse mode: {err}")
 }
 
 fn clone_terminal_writer(writer: &File) -> io::Result<File> {
@@ -1222,7 +1609,7 @@ pub(super) fn relay_until_exit_observed(
     let real_fd = input_fd;
     let master_fd = master.as_raw_fd();
     let alt_writer = clone_terminal_writer(&writer).map_err(format_tui_terminal_clone_error)?;
-    let _alt = AltScreenGuard::enter(alt_writer)?;
+    let mut alt = AltScreenGuard::enter(alt_writer)?;
     let mut terminal = new_tui_terminal(writer).map_err(format_tui_terminal_init_error)?;
 
     let mut pane = MonitorPane::new();
@@ -1253,6 +1640,8 @@ pub(super) fn relay_until_exit_observed(
                 real_fd,
                 master_fd,
                 &mut router,
+                &pane,
+                mouse_request_from_screen(parser.screen()),
                 &mut line_state,
                 &mut buffer,
             )?;
@@ -1264,17 +1653,19 @@ pub(super) fn relay_until_exit_observed(
         if ready.control
             && let Some(control) = control
         {
-            let _ = service_control(
-                control,
+            let mut control_io = ControlInjectionIo {
                 real_fd,
                 master_fd,
-                &mut router,
-                &mut parser,
-                &mut line_state,
-                &mut buffer,
-            );
+                router: &mut router,
+                pane: &pane,
+                parser: &mut parser,
+                line_state: &mut line_state,
+                buffer: &mut buffer,
+            };
+            let _ = service_control(control, &mut control_io);
             dirty = true;
         }
+        alt.sync_mouse(mouse_request_from_screen(parser.screen()))?;
         if dirty {
             draw(&mut terminal, &parser, router.focus, &pane)?;
         }
@@ -1379,17 +1770,79 @@ fn forward_real_input(
     real_fd: RawFd,
     master_fd: RawFd,
     router: &mut InputRouter,
+    pane: &MonitorPane,
+    mouse_request: MouseRequest,
     line_state: &mut InputLineState,
     buffer: &mut [u8],
 ) -> Result<RoutedInput, String> {
     match read_real_input(real_fd, buffer) {
         Ok(0) => Ok(RoutedInput::default()),
         Ok(n) => {
-            let routed = router.route_input(&buffer[..n]);
+            let full = terminal_winsize_with_fallback(read_terminal_winsize(real_fd));
+            let routed = route_real_input(&buffer[..n], router, pane, mouse_request, &full);
             forward_routed_child_input(master_fd, line_state, &routed)?;
             Ok(routed)
         }
         Err(err) => Err(format_user_terminal_input_read_error(err)),
+    }
+}
+
+fn route_real_input(
+    bytes: &[u8],
+    router: &mut InputRouter,
+    pane: &MonitorPane,
+    mouse_request: MouseRequest,
+    winsize: &libc::winsize,
+) -> RoutedInput {
+    if !mouse_request.is_enabled() {
+        return router.route_input(bytes);
+    }
+    route_mouse_aware_input(bytes, router, pane, mouse_request, winsize)
+}
+
+fn route_mouse_aware_input(
+    bytes: &[u8],
+    router: &mut InputRouter,
+    pane: &MonitorPane,
+    mouse_request: MouseRequest,
+    winsize: &libc::winsize,
+) -> RoutedInput {
+    let areas = pane_areas_for_winsize(winsize, pane);
+    let mut routed = RoutedInput::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(parsed) = parse_mouse_event(&bytes[i..]) {
+            route_mouse_event(parsed.event, areas, mouse_request, &mut routed);
+            i += parsed.consumed;
+        } else {
+            i += router.route_next_input(&bytes[i..], &mut routed);
+        }
+    }
+    routed
+}
+
+fn route_mouse_event(
+    event: MouseEvent,
+    areas: PaneAreas,
+    mouse_request: MouseRequest,
+    routed: &mut RoutedInput,
+) {
+    match route_mouse_to_pane(event, areas) {
+        MousePaneRoute::Top(local) => route_top_mouse_event(local, mouse_request, routed),
+        MousePaneRoute::Bottom(bottom) => route_bottom_mouse_event(bottom, routed),
+        MousePaneRoute::Outside => {}
+    }
+}
+
+fn route_top_mouse_event(event: MouseEvent, mouse_request: MouseRequest, routed: &mut RoutedInput) {
+    if let Some(bytes) = encode_mouse_event(event, mouse_request.encoding) {
+        routed.forward.extend(bytes);
+    }
+}
+
+fn route_bottom_mouse_event(event: MouseEvent, routed: &mut RoutedInput) {
+    if let Some(command) = mouse_wheel_command(event) {
+        apply_monitor_command(routed, command);
     }
 }
 
@@ -1565,28 +2018,22 @@ fn draw(
         .map_err(|err| format!("Failed to render TUI frame: {err}"))
 }
 
+struct ControlInjectionIo<'a> {
+    real_fd: RawFd,
+    master_fd: RawFd,
+    router: &'a mut InputRouter,
+    pane: &'a MonitorPane,
+    parser: &'a mut vt100::Parser,
+    line_state: &'a mut InputLineState,
+    buffer: &'a mut [u8],
+}
+
 /// Service a control-socket notify injection while the TUI owns the screen:
 /// inject the payload to the child at the next safe line boundary, pumping output
 /// into the virtual terminal (never to the real terminal) during the wait.
-fn service_control(
-    control: &ControlSocket,
-    real_fd: RawFd,
-    master_fd: RawFd,
-    router: &mut InputRouter,
-    parser: &mut vt100::Parser,
-    line_state: &mut InputLineState,
-    buffer: &mut [u8],
-) -> Result<(), String> {
+fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
-    let response = inject_control_payload(
-        &mut stream,
-        real_fd,
-        master_fd,
-        router,
-        parser,
-        line_state,
-        buffer,
-    );
+    let response = inject_control_payload(&mut stream, io);
     let (ack, message) = control_response_message(response);
     write_tui_control_response(&mut stream, ack, &message)
         .map_err(format_control_response_write_error)
@@ -1617,17 +2064,12 @@ fn format_control_response_write_error(err: io::Error) -> String {
 
 fn inject_control_payload(
     stream: &mut UnixStream,
-    real_fd: RawFd,
-    master_fd: RawFd,
-    router: &mut InputRouter,
-    parser: &mut vt100::Parser,
-    line_state: &mut InputLineState,
-    buffer: &mut [u8],
+    io: &mut ControlInjectionIo<'_>,
 ) -> Result<(), String> {
     validate_control_peer(stream)?;
     let payload = read_tui_control_payload(stream)?;
-    wait_until_safe_to_inject(real_fd, master_fd, router, parser, line_state, buffer)?;
-    submit_control_payload(master_fd, &payload, line_state)
+    wait_until_safe_to_inject(io)?;
+    submit_control_payload(io.master_fd, &payload, io.line_state)
 }
 
 fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
@@ -1667,19 +2109,12 @@ fn format_pty_submit_failed(err: io::Error) -> String {
 
 /// Wait until the child input is at a safe line boundary, pumping output into the
 /// virtual terminal and routing real input meanwhile, bounded by the inject limit.
-fn wait_until_safe_to_inject(
-    real_fd: RawFd,
-    master_fd: RawFd,
-    router: &mut InputRouter,
-    parser: &mut vt100::Parser,
-    line_state: &mut InputLineState,
-    buffer: &mut [u8],
-) -> Result<(), String> {
+fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let start = Instant::now();
-    while injection_wait_should_pump(start, line_state) {
-        pump_inject_wait_io(real_fd, master_fd, router, parser, line_state, buffer)?;
+    while injection_wait_should_pump(start, io.line_state) {
+        pump_inject_wait_io(io)?;
     }
-    validate_safe_to_inject(line_state)
+    validate_safe_to_inject(io.line_state)
 }
 
 fn injection_wait_should_pump(start: Instant, line_state: &InputLineState) -> bool {
@@ -1702,20 +2137,21 @@ fn validate_safe_to_inject(line_state: &InputLineState) -> Result<(), String> {
     }
 }
 
-fn pump_inject_wait_io(
-    real_fd: RawFd,
-    master_fd: RawFd,
-    router: &mut InputRouter,
-    parser: &mut vt100::Parser,
-    line_state: &mut InputLineState,
-    buffer: &mut [u8],
-) -> Result<(), String> {
-    let ready = poll_relay_fds(real_fd, master_fd, None)?;
+fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
+    let ready = poll_relay_fds(io.real_fd, io.master_fd, None)?;
     if ready.real_input {
-        forward_real_input(real_fd, master_fd, router, line_state, buffer)?;
+        forward_real_input(
+            io.real_fd,
+            io.master_fd,
+            io.router,
+            io.pane,
+            mouse_request_from_screen(io.parser.screen()),
+            io.line_state,
+            io.buffer,
+        )?;
     }
     if ready.pty_output {
-        let _ = pump_pty_output(master_fd, parser, buffer)?;
+        let _ = pump_pty_output(io.master_fd, io.parser, io.buffer)?;
     }
     Ok(())
 }
@@ -1826,6 +2262,130 @@ mod tests {
         let routed = router.route_input(&[FOCUS_TOGGLE_BYTE, FOCUS_TOGGLE_BYTE]);
         assert!(routed.forward.is_empty());
         assert_eq!(router.focus, Focus::Top);
+    }
+
+    #[test]
+    fn vt100_mouse_mode_mirrors_to_terminal_decsets_and_restore() {
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        parser.process(b"\x1b[?1006h\x1b[?1002h");
+        let enabled = mouse_request_from_screen(parser.screen());
+        assert_eq!(enabled.mode, vt100::MouseProtocolMode::ButtonMotion);
+        assert_eq!(enabled.encoding, vt100::MouseProtocolEncoding::Sgr);
+
+        let mut state = TerminalMouseState::new();
+        let mut written = Vec::new();
+        sync_terminal_mouse(&mut written, &mut state, enabled).unwrap();
+        assert_eq!(written, b"\x1b[?1006h\x1b[?1002h");
+
+        written.clear();
+        sync_terminal_mouse(&mut written, &mut state, MouseRequest::disabled()).unwrap();
+        assert_eq!(written, b"\x1b[?1002l\x1b[?1006l");
+
+        let restore = terminal_mouse_restore_sequence();
+        assert!(
+            restore
+                .windows(MOUSE_PRESS_DISABLE.len())
+                .any(|w| w == MOUSE_PRESS_DISABLE)
+        );
+        assert!(
+            restore
+                .windows(MOUSE_SGR_DISABLE.len())
+                .any(|w| w == MOUSE_SGR_DISABLE)
+        );
+    }
+
+    #[test]
+    fn mouse_event_parser_decodes_sgr_and_legacy_sequences() {
+        let sgr = parse_mouse_event(b"\x1b[<65;10;5Mrest").expect("sgr mouse");
+        assert_eq!(sgr.consumed, 11);
+        assert_eq!(
+            sgr.event,
+            MouseEvent {
+                button: 65,
+                col: 10,
+                row: 5,
+                released: false,
+            }
+        );
+
+        let legacy_bytes = [0x1b, b'[', b'M', 32 + 64, 32 + 4, 32 + 3, b'x'];
+        let legacy = parse_mouse_event(&legacy_bytes).expect("legacy mouse");
+        assert_eq!(legacy.consumed, 6);
+        assert_eq!(
+            legacy.event,
+            MouseEvent {
+                button: 64,
+                col: 4,
+                row: 3,
+                released: false,
+            }
+        );
+    }
+
+    #[test]
+    fn mouse_routing_forwards_top_events_and_consumes_bottom_wheel() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let request = MouseRequest {
+            mode: vt100::MouseProtocolMode::ButtonMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+
+        let routed = route_real_input(b"\x1b[<64;4;3M", &mut router, &pane, request, &winsize);
+        assert_eq!(routed.forward, b"\x1b[<64;4;3M".to_vec());
+        assert!(routed.commands.is_empty());
+
+        let routed = route_real_input(b"\x1b[<65;4;10M", &mut router, &pane, request, &winsize);
+        assert!(routed.forward.is_empty());
+        assert_eq!(routed.commands, vec![MonitorCommand::SelectNext]);
+    }
+
+    #[test]
+    fn mouse_routing_preserves_keyboard_behavior_when_child_mouse_is_disabled() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let routed = route_real_input(
+            b"abc",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert_eq!(routed.forward, b"abc".to_vec());
+    }
+
+    #[test]
+    fn mouse_encoder_targets_child_requested_encoding() {
+        let event = MouseEvent {
+            button: 64,
+            col: 4,
+            row: 3,
+            released: false,
+        };
+        assert_eq!(
+            encode_mouse_event(event, vt100::MouseProtocolEncoding::Sgr).unwrap(),
+            b"\x1b[<64;4;3M".to_vec()
+        );
+        assert_eq!(
+            encode_mouse_event(event, vt100::MouseProtocolEncoding::Default).unwrap(),
+            vec![0x1b, b'[', b'M', 96, 36, 35]
+        );
+        assert_eq!(
+            encode_mouse_event(event, vt100::MouseProtocolEncoding::Utf8).unwrap(),
+            vec![0x1b, b'[', b'M', 96, 36, 35]
+        );
     }
 
     #[test]
