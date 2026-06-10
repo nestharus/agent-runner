@@ -49,16 +49,16 @@ impl SessionTranscriptResolver {
         session_id: Option<&str>,
     ) -> Option<String> {
         let (provider_name, session_id) = self.resolvable_identity(provider_name, session_id)?;
+        self.resolve_identity(provider_name, session_id)
+    }
+
+    fn resolve_identity(&self, provider_name: &str, session_id: &str) -> Option<String> {
         let mut cache = self.lock_cache();
-        if !cache.session_matches(session_id) {
-            cache.reset_for_session(session_id);
-        }
-        if let Some(path) = cache.cached() {
+        prepare_cache_for_session(&mut cache, session_id);
+        if let Some(path) = cached_transcript_path(&cache) {
             return Some(path);
         }
-        let due = cache.attempt_due();
-        cache.advance();
-        if !due {
+        if !cache_attempt_due(&mut cache) {
             return None;
         }
         let resolved = self.locate(provider_name, session_id);
@@ -71,8 +71,8 @@ impl SessionTranscriptResolver {
         provider_name: Option<&'a str>,
         session_id: Option<&'a str>,
     ) -> Option<(&'a str, &'a str)> {
-        self.storage.as_ref()?;
-        Some((provider_name?, session_id?))
+        configured_storage(&self.storage)?;
+        required_transcript_identity(provider_name, session_id)
     }
 
     fn lock_cache(&self) -> MutexGuard<'_, TranscriptCache> {
@@ -82,17 +82,55 @@ impl SessionTranscriptResolver {
     }
 
     fn locate(&self, provider_name: &str, session_id: &str) -> Option<String> {
-        let sessions_cfg = SessionsConfig::default();
-        resolve_jsonl_path_for_provider_with_mode(
-            &sessions_cfg,
-            self.storage.as_ref(),
-            provider_name,
-            session_id,
-            TranscriptLookupMode::RequireExisting,
-        )
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
+        locate_transcript_path(self.storage.as_ref(), provider_name, session_id).map(path_string)
     }
+}
+
+fn configured_storage(storage: &Option<SessionStorage>) -> Option<&SessionStorage> {
+    storage.as_ref()
+}
+
+fn required_transcript_identity<'a>(
+    provider_name: Option<&'a str>,
+    session_id: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    Some((provider_name?, session_id?))
+}
+
+fn locate_transcript_path(
+    storage: Option<&SessionStorage>,
+    provider_name: &str,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let sessions_cfg = SessionsConfig::default();
+    resolve_jsonl_path_for_provider_with_mode(
+        &sessions_cfg,
+        storage,
+        provider_name,
+        session_id,
+        TranscriptLookupMode::RequireExisting,
+    )
+    .ok()
+}
+
+fn path_string(path: std::path::PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn prepare_cache_for_session(cache: &mut TranscriptCache, session_id: &str) {
+    if !cache.session_matches(session_id) {
+        cache.reset_for_session(session_id);
+    }
+}
+
+fn cached_transcript_path(cache: &TranscriptCache) -> Option<String> {
+    cache.cached()
+}
+
+fn cache_attempt_due(cache: &mut TranscriptCache) -> bool {
+    let due = cache.attempt_due();
+    cache.advance();
+    due
 }
 
 impl TranscriptCache {

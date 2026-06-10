@@ -279,10 +279,11 @@ fn visit_invocation_children(
     children: Vec<InvocationRecord>,
 ) {
     for child in children {
-        if !visited.insert(child.id) {
+        if child_was_visited(visited, child.id) {
             continue;
         }
         let child_id = child.id;
+        remember_visited_child(visited, child_id);
         build_invocation_node(
             state,
             pid,
@@ -294,8 +295,20 @@ fn visit_invocation_children(
             visited,
             projection,
         );
-        visited.remove(&child_id);
+        forget_visited_child(visited, child_id);
     }
+}
+
+fn child_was_visited(visited: &HashSet<i64>, child_id: i64) -> bool {
+    visited.contains(&child_id)
+}
+
+fn remember_visited_child(visited: &mut HashSet<i64>, child_id: i64) {
+    visited.insert(child_id);
+}
+
+fn forget_visited_child(visited: &mut HashSet<i64>, child_id: i64) {
+    visited.remove(&child_id);
 }
 
 fn selected_pid_row(
@@ -339,11 +352,25 @@ fn fallback_selected_pid_row(rows: &[PidIdentityRow]) -> Option<(PidIdentityRow,
 
 fn live_selected_row(row: &PidIdentityRow) -> Option<(PidIdentityRow, LivenessStatus)> {
     let liveness = pid_row_liveness(row);
-    (liveness == LivenessStatus::VerifiedLive).then(|| (row.clone(), liveness))
+    if !liveness_is_verified_live(liveness) {
+        return None;
+    }
+    Some(selected_row_tuple(row, liveness))
+}
+
+fn liveness_is_verified_live(liveness: LivenessStatus) -> bool {
+    liveness == LivenessStatus::VerifiedLive
+}
+
+fn selected_row_tuple(
+    row: &PidIdentityRow,
+    liveness: LivenessStatus,
+) -> (PidIdentityRow, LivenessStatus) {
+    (row.clone(), liveness)
 }
 
 fn fallback_selected_row(row: &PidIdentityRow) -> (PidIdentityRow, LivenessStatus) {
-    (row.clone(), pid_row_liveness(row))
+    selected_row_tuple(row, pid_row_liveness(row))
 }
 
 fn invocation_node(

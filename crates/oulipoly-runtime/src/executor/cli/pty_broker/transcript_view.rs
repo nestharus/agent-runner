@@ -2,10 +2,17 @@
 //!
 //! `parser`, `mapper`, `formatter`, `accessor`, `filter`, `orchestration`
 //!
-//! Project raw transcript JSONL lines into readable conversation lines for the
-//! inspect pane. Each input line is one transcript event; unparseable or
-//! uninteresting events are dropped. The byte-bounded tail can begin with a
-//! partial JSON fragment, which simply fails to parse and is skipped.
+//! Project located transcript JSONL lines into readable conversation lines for
+//! the inspect pane.
+//!
+//! ## Transcript display input contract
+//!
+//! The inspect pane consumes a small runner-owned display subset from located
+//! transcript JSONL: top-level `type` values `user` and `assistant`, optional
+//! `message.content` as either a string or an array of blocks, and block `type`
+//! values `text`, `tool_use`, and `tool_result` with optional `text`/`name`
+//! fields. Unparseable, partial, unsupported, or uninteresting events are
+//! ignored; the caller can fall back to raw tail lines when projection is empty.
 
 use serde_json::Value;
 
@@ -38,22 +45,33 @@ fn project_event(value: &Value) -> Vec<String> {
 }
 
 fn event_speaker(value: &Value) -> Option<&'static str> {
-    match event_type(value)? {
-        "user" => Some("you"),
-        "assistant" => Some("agent"),
-        _ => None,
-    }
+    supported_event_type(value).map(event_speaker_label)
 }
 
 fn event_type(value: &Value) -> Option<&str> {
     value.get("type").and_then(Value::as_str)
 }
 
+fn supported_event_type(value: &Value) -> Option<&str> {
+    event_type(value).filter(|event_type| event_type_has_speaker(event_type))
+}
+
+fn event_type_has_speaker(event_type: &str) -> bool {
+    matches!(event_type, "user" | "assistant")
+}
+
+fn event_speaker_label(event_type: &str) -> &'static str {
+    match event_type {
+        "user" => "you",
+        "assistant" => "agent",
+        _ => unreachable!("supported event type"),
+    }
+}
+
 fn project_message(speaker: &str, value: &Value) -> Vec<String> {
-    match message_content(value) {
-        Some(Value::String(text)) => speaker_lines(speaker, text),
-        Some(Value::Array(blocks)) => project_content_blocks(speaker, blocks),
-        _ => Vec::new(),
+    match supported_message_content(value) {
+        Some(content) => project_supported_message_content(speaker, content),
+        None => Vec::new(),
     }
 }
 
@@ -61,6 +79,22 @@ fn message_content(value: &Value) -> Option<&Value> {
     value
         .get("message")
         .and_then(|message| message.get("content"))
+}
+
+fn supported_message_content(value: &Value) -> Option<&Value> {
+    message_content(value).filter(|content| message_content_supported(content))
+}
+
+fn message_content_supported(content: &Value) -> bool {
+    matches!(content, Value::String(_) | Value::Array(_))
+}
+
+fn project_supported_message_content(speaker: &str, content: &Value) -> Vec<String> {
+    match content {
+        Value::String(text) => speaker_lines(speaker, text),
+        Value::Array(blocks) => project_content_blocks(speaker, blocks),
+        _ => unreachable!("supported message content"),
+    }
 }
 
 fn project_content_blocks(speaker: &str, blocks: &[Value]) -> Vec<String> {
@@ -71,18 +105,38 @@ fn project_content_blocks(speaker: &str, blocks: &[Value]) -> Vec<String> {
 }
 
 fn project_content_block(speaker: &str, block: &Value) -> Vec<String> {
-    match block_type(block) {
-        Some("text") => block_text(block)
-            .map(|text| speaker_lines(speaker, text))
-            .unwrap_or_default(),
-        Some("tool_use") => speaker_lines(speaker, &tool_use_summary(block)),
-        Some("tool_result") => speaker_lines(speaker, TOOL_RESULT_PLACEHOLDER),
-        _ => Vec::new(),
+    match supported_block_type(block) {
+        Some(block_type) => project_supported_content_block(speaker, block_type, block),
+        None => Vec::new(),
     }
 }
 
 fn block_type(block: &Value) -> Option<&str> {
     block.get("type").and_then(Value::as_str)
+}
+
+fn supported_block_type(block: &Value) -> Option<&str> {
+    block_type(block).filter(|block_type| block_type_supported(block_type))
+}
+
+fn block_type_supported(block_type: &str) -> bool {
+    matches!(block_type, "text" | "tool_use" | "tool_result")
+}
+
+fn project_supported_content_block(speaker: &str, block_type: &str, block: &Value) -> Vec<String> {
+    match block_type {
+        "text" => project_text_block(speaker, block),
+        "tool_use" => speaker_lines(speaker, &tool_use_summary(block)),
+        "tool_result" => speaker_lines(speaker, TOOL_RESULT_PLACEHOLDER),
+        _ => unreachable!("supported content block type"),
+    }
+}
+
+fn project_text_block(speaker: &str, block: &Value) -> Vec<String> {
+    match block_text(block) {
+        Some(text) => speaker_lines(speaker, text),
+        None => Vec::new(),
+    }
 }
 
 fn block_text(block: &Value) -> Option<&str> {
@@ -104,6 +158,10 @@ fn speaker_lines(speaker: &str, text: &str) -> Vec<String> {
     let Some((first, rest)) = lines.split_first() else {
         return Vec::new();
     };
+    format_speaker_lines(speaker, first, rest)
+}
+
+fn format_speaker_lines(speaker: &str, first: &str, rest: &[&str]) -> Vec<String> {
     let mut rendered = vec![format!("{speaker}: {first}")];
     rendered.extend(rest.iter().map(|line| format!("  {line}")));
     rendered

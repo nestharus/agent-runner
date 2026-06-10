@@ -125,9 +125,10 @@ fn push_wake_claim_node(
     pid: Option<&PidIdentityDb>,
     stale_after_seconds: i64,
 ) {
+    let liveness = wake_claim_liveness(claim, pid);
     projection
         .nodes
-        .push(wake_claim_node(claim, pid, stale_after_seconds));
+        .push(wake_claim_node(claim, liveness, stale_after_seconds));
 }
 
 fn runtime_row(
@@ -136,13 +137,24 @@ fn runtime_row(
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<SessionRuntimeRow> {
     let mailbox = mailbox?;
-    match mailbox.session_runtime(session_id) {
+    match read_runtime_row(mailbox, session_id) {
         Ok(row) => row,
         Err(err) => {
-            diagnostics.push(storage_diagnostic("mailbox:runtime-read", err));
+            diagnostics.push(runtime_read_diagnostic(err));
             None
         }
     }
+}
+
+fn read_runtime_row(
+    mailbox: &MailboxDb,
+    session_id: &str,
+) -> Result<Option<SessionRuntimeRow>, String> {
+    mailbox.session_runtime(session_id)
+}
+
+fn runtime_read_diagnostic(message: String) -> MonitorDiagnostic {
+    storage_diagnostic("mailbox:runtime-read", message)
 }
 
 fn runtime_liveness(
@@ -151,16 +163,24 @@ fn runtime_liveness(
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<SessionRuntimeReadOnlyLiveness> {
     let mailbox = mailbox?;
-    match mailbox.classify_session_runtime_read_only(session_id) {
+    match read_runtime_liveness(mailbox, session_id) {
         Ok(liveness) => Some(liveness),
         Err(err) => {
-            diagnostics.push(storage_diagnostic(
-                "mailbox:runtime-liveness-read-only",
-                err,
-            ));
+            diagnostics.push(runtime_liveness_read_diagnostic(err));
             None
         }
     }
+}
+
+fn read_runtime_liveness(
+    mailbox: &MailboxDb,
+    session_id: &str,
+) -> Result<SessionRuntimeReadOnlyLiveness, String> {
+    mailbox.classify_session_runtime_read_only(session_id)
+}
+
+fn runtime_liveness_read_diagnostic(message: String) -> MonitorDiagnostic {
+    storage_diagnostic("mailbox:runtime-liveness-read-only", message)
 }
 
 fn mailbox_rows(
@@ -172,13 +192,25 @@ fn mailbox_rows(
     let Some(mailbox) = mailbox else {
         return Vec::new();
     };
-    match mailbox.list_mailbox_bounded(session_id, limits.mailbox_cap) {
+    match read_bounded_mailbox_rows(mailbox, session_id, limits.mailbox_cap) {
         Ok(rows) => rows,
         Err(err) => {
-            diagnostics.push(storage_diagnostic("mailbox:bounded-read", err));
+            diagnostics.push(bounded_mailbox_read_diagnostic(err));
             Vec::new()
         }
     }
+}
+
+fn read_bounded_mailbox_rows(
+    mailbox: &MailboxDb,
+    session_id: &str,
+    cap: usize,
+) -> Result<Vec<MailboxRow>, String> {
+    mailbox.list_mailbox_bounded(session_id, cap)
+}
+
+fn bounded_mailbox_read_diagnostic(message: String) -> MonitorDiagnostic {
+    storage_diagnostic("mailbox:bounded-read", message)
 }
 
 fn wake_claim(
@@ -187,13 +219,21 @@ fn wake_claim(
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<WakeClaimRow> {
     let mailbox = mailbox?;
-    match mailbox.wake_claim(session_id) {
+    match read_wake_claim(mailbox, session_id) {
         Ok(claim) => claim,
         Err(err) => {
-            diagnostics.push(storage_diagnostic("mailbox:wake-claim-read", err));
+            diagnostics.push(wake_claim_read_diagnostic(err));
             None
         }
     }
+}
+
+fn read_wake_claim(mailbox: &MailboxDb, session_id: &str) -> Result<Option<WakeClaimRow>, String> {
+    mailbox.wake_claim(session_id)
+}
+
+fn wake_claim_read_diagnostic(message: String) -> MonitorDiagnostic {
+    storage_diagnostic("mailbox:wake-claim-read", message)
 }
 
 fn session_node(
@@ -246,7 +286,7 @@ fn mailbox_node(
         id: mailbox_node_id(session_id, row.seq),
         parent_id: mailbox_parent_id(row, session_id, invocation_uuids),
         kind: MonitorNodeKind::MailboxNotification,
-        label: format!("mailbox {} {}", row.seq, row.handle),
+        label: mailbox_label(row),
         status: mailbox_status(row),
         pid: row.matched_os_pid,
         pgid: None,
@@ -262,17 +302,20 @@ fn mailbox_node(
     }
 }
 
+fn mailbox_label(row: &MailboxRow) -> String {
+    format!("mailbox {} {}", row.seq, row.handle)
+}
+
 fn wake_claim_node(
     claim: &WakeClaimRow,
-    pid: Option<&PidIdentityDb>,
+    liveness: LivenessStatus,
     stale_after_seconds: i64,
 ) -> MonitorNode {
-    let liveness = wake_claim_liveness(claim, pid);
     MonitorNode {
         id: wake_node_id(&claim.session_id, &claim.claim_token),
         parent_id: Some(session_node_id(&claim.session_id)),
         kind: MonitorNodeKind::WakeClaim,
-        label: format!("wake claim {}", claim.claim_token),
+        label: wake_claim_label(claim),
         status: wake_status(claim, liveness, stale_after_seconds),
         pid: claim.wake_pid,
         pgid: None,
@@ -290,6 +333,10 @@ fn wake_claim_node(
     }
 }
 
+fn wake_claim_label(claim: &WakeClaimRow) -> String {
+    format!("wake claim {}", claim.claim_token)
+}
+
 fn wake_diagnostics(
     session_id: &str,
     pending_count: usize,
@@ -300,16 +347,28 @@ fn wake_diagnostics(
     limits: SnapshotLimits,
 ) -> Vec<MonitorDiagnostic> {
     let mut diagnostics = Vec::new();
-    if pending_mailbox_without_runtime(pending_count, runtime) {
+    if wake_needed_no_runtime(pending_count, runtime) {
         diagnostics.push(wake_needed_no_runtime_diagnostic(session_id));
     }
-    if pending_mailbox_idle_without_claim(pending_count, runtime_liveness, claim) {
+    if wake_needed_no_claim(pending_count, runtime_liveness, claim) {
         diagnostics.push(pending_no_claim_diagnostic(session_id));
     }
     if let Some(claim) = claim {
         diagnostics.extend(wake_claim_diagnostics(session_id, claim, pid, limits));
     }
     diagnostics
+}
+
+fn wake_needed_no_runtime(pending_count: usize, runtime: Option<&SessionRuntimeRow>) -> bool {
+    pending_mailbox_without_runtime(pending_count, runtime)
+}
+
+fn wake_needed_no_claim(
+    pending_count: usize,
+    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    claim: Option<&WakeClaimRow>,
+) -> bool {
+    pending_mailbox_idle_without_claim(pending_count, runtime_liveness, claim)
 }
 
 fn pending_mailbox_without_runtime(
@@ -336,13 +395,21 @@ fn wake_claim_diagnostics(
     limits: SnapshotLimits,
 ) -> Vec<MonitorDiagnostic> {
     let mut diagnostics = Vec::new();
-    if wake_claim_no_pid_is_stale(claim, limits.wake_claim_stale_after_seconds) {
+    if claim_has_stale_missing_pid(claim, limits.wake_claim_stale_after_seconds) {
         diagnostics.push(claim_no_pid_stale_diagnostic(session_id, claim));
     }
-    if wake_claim_liveness_is_stale(claim, pid) {
+    if claim_has_stale_liveness(claim, pid) {
         diagnostics.push(claim_dead_diagnostic(session_id, claim));
     }
     diagnostics
+}
+
+fn claim_has_stale_missing_pid(claim: &WakeClaimRow, stale_after_seconds: i64) -> bool {
+    wake_claim_no_pid_is_stale(claim, stale_after_seconds)
+}
+
+fn claim_has_stale_liveness(claim: &WakeClaimRow, pid: Option<&PidIdentityDb>) -> bool {
+    wake_claim_liveness_is_stale(claim, pid)
 }
 
 fn wake_claim_liveness_is_stale(claim: &WakeClaimRow, pid: Option<&PidIdentityDb>) -> bool {
@@ -431,11 +498,26 @@ fn mailbox_parent_id(
     session_id: &str,
     invocation_uuids: &HashSet<String>,
 ) -> Option<String> {
+    known_mailbox_owner_uuid(row, invocation_uuids)
+        .map(mailbox_owner_parent_id)
+        .or_else(|| Some(mailbox_session_parent_id(session_id)))
+}
+
+fn known_mailbox_owner_uuid<'a>(
+    row: &'a MailboxRow,
+    invocation_uuids: &HashSet<String>,
+) -> Option<&'a str> {
     row.owner_invocation_uuid
         .as_deref()
         .filter(|uuid| invocation_uuids.contains(*uuid))
-        .map(invocation_node_id)
-        .or_else(|| Some(session_node_id(session_id)))
+}
+
+fn mailbox_owner_parent_id(uuid: &str) -> String {
+    invocation_node_id(uuid)
+}
+
+fn mailbox_session_parent_id(session_id: &str) -> String {
+    session_node_id(session_id)
 }
 
 fn session_label(root: &ObservabilityRoot, runtime: Option<&SessionRuntimeRow>) -> String {

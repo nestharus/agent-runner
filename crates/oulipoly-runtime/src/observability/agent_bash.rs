@@ -17,9 +17,10 @@ use crate::observability::mailbox::mailbox_state;
 use crate::observability::state_access::storage_diagnostic;
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{AGENT_BASH_COMPLETE_KIND, MailboxRow};
-use oulipoly_state::pid_identity::{PidIdentityDb, ProcessIdentity};
+use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -86,17 +87,43 @@ struct ResolvedOwner {
     matched_chain_index: usize,
 }
 
+struct ProcessIdentityFields {
+    os_pid: i64,
+    os_boot_id: String,
+    os_pid_starttime_ticks: i64,
+}
+
 #[derive(Debug)]
 struct CandidateDir {
     state_dir: PathBuf,
     modified_at: Option<SystemTime>,
 }
 
+struct WorkloadLogSnapshot {
+    path: PathBuf,
+    tail: Option<String>,
+}
+
 pub(crate) fn default_agent_bash_root() -> Option<PathBuf> {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
+    default_agent_bash_state_root().map(agent_bash_root_dir)
+}
+
+fn default_agent_bash_state_root() -> Option<PathBuf> {
+    xdg_state_home_value()
+        .map(path_buf_from_os_string)
         .or_else(default_home_state_dir)
-        .map(|root| root.join("agent-bash"))
+}
+
+fn xdg_state_home_value() -> Option<OsString> {
+    std::env::var_os("XDG_STATE_HOME")
+}
+
+fn path_buf_from_os_string(value: OsString) -> PathBuf {
+    PathBuf::from(value)
+}
+
+fn agent_bash_root_dir(root: PathBuf) -> PathBuf {
+    root.join("agent-bash")
 }
 
 pub(crate) fn project_agent_bash(input: AgentBashProjectInput<'_>) -> AgentBashProjection {
@@ -146,7 +173,19 @@ fn agent_bash_projection(
 }
 
 fn default_home_state_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+    default_home_dir().map(home_state_dir)
+}
+
+fn default_home_dir() -> Option<PathBuf> {
+    home_value().map(path_buf_from_os_string)
+}
+
+fn home_value() -> Option<OsString> {
+    std::env::var_os("HOME")
+}
+
+fn home_state_dir(home: PathBuf) -> PathBuf {
+    home.join(".local/state")
 }
 
 fn mailbox_workload_nodes(
@@ -220,7 +259,7 @@ fn mailbox_workload_node(
     let state_dir = PathBuf::from(&row.state_dir);
     let meta_path = PathBuf::from(&row.meta_path);
     let meta = read_meta_for_node(cache, &state_dir, &meta_path, diagnostics);
-    let log_path = mailbox_log_path(row, meta.as_ref());
+    let log = mailbox_workload_log(row, meta.as_ref(), limits.log_tail_bytes);
     MonitorNode {
         id: agent_bash_node_id(&row.handle),
         parent_id: workload_parent_id(
@@ -241,9 +280,9 @@ fn mailbox_workload_node(
         started_at: meta.as_ref().and_then(|meta| meta.ready_at.clone()),
         updated_at: meta.as_ref().and_then(|meta| meta.completed_at.clone()),
         completed_at: meta.as_ref().and_then(|meta| meta.completed_at.clone()),
-        last_output_excerpt: read_log_tail(&log_path, limits.log_tail_bytes),
+        last_output_excerpt: log.tail,
         inspect_ref: Some(InspectRef::AgentBashLog {
-            path: log_path.to_string_lossy().into_owned(),
+            path: log.path.to_string_lossy().into_owned(),
             max_tail_bytes: limits.log_tail_bytes,
         }),
         cancel_ref: Some(CancelRef::AgentBashHandle {
@@ -253,6 +292,16 @@ fn mailbox_workload_node(
         wake: None,
         mailbox: Some(mailbox_state(row)),
     }
+}
+
+fn mailbox_workload_log(
+    row: &MailboxRow,
+    meta: Option<&AgentBashMeta>,
+    max_bytes: usize,
+) -> WorkloadLogSnapshot {
+    let path = mailbox_log_path(row, meta);
+    let tail = workload_log_tail(&path, max_bytes);
+    workload_log_snapshot(path, tail)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -336,7 +385,7 @@ fn meta_workload_node(
     invocation_uuids: &HashSet<String>,
     limits: SnapshotLimits,
 ) -> MonitorNode {
-    let log_path = meta_log_path(state_dir, meta);
+    let log = meta_workload_log(state_dir, meta, limits.log_tail_bytes);
     MonitorNode {
         id: agent_bash_node_id(&meta.handle),
         parent_id: workload_parent_id(
@@ -354,9 +403,9 @@ fn meta_workload_node(
         started_at: meta.ready_at.clone(),
         updated_at: meta.completed_at.clone(),
         completed_at: meta.completed_at.clone(),
-        last_output_excerpt: read_log_tail(&log_path, limits.log_tail_bytes),
+        last_output_excerpt: log.tail,
         inspect_ref: Some(InspectRef::AgentBashLog {
-            path: log_path.to_string_lossy().into_owned(),
+            path: log.path.to_string_lossy().into_owned(),
             max_tail_bytes: limits.log_tail_bytes,
         }),
         cancel_ref: Some(CancelRef::AgentBashHandle {
@@ -366,6 +415,24 @@ fn meta_workload_node(
         wake: None,
         mailbox: None,
     }
+}
+
+fn meta_workload_log(
+    state_dir: &Path,
+    meta: &AgentBashMeta,
+    max_bytes: usize,
+) -> WorkloadLogSnapshot {
+    let path = meta_log_path(state_dir, meta);
+    let tail = workload_log_tail(&path, max_bytes);
+    workload_log_snapshot(path, tail)
+}
+
+fn workload_log_tail(path: &Path, max_bytes: usize) -> Option<String> {
+    read_log_tail(path, max_bytes)
+}
+
+fn workload_log_snapshot(path: PathBuf, tail: Option<String>) -> WorkloadLogSnapshot {
+    WorkloadLogSnapshot { tail, path }
 }
 
 fn candidate_dirs(
@@ -411,11 +478,37 @@ fn candidate_dirs_from_entries(
 }
 
 fn candidate_dir(entry: std::fs::DirEntry) -> Option<CandidateDir> {
-    let metadata = entry.metadata().ok()?;
-    metadata.is_dir().then(|| CandidateDir {
-        state_dir: entry.path(),
-        modified_at: metadata.modified().ok(),
-    })
+    let metadata = candidate_dir_metadata(&entry).ok()?;
+    if !candidate_metadata_is_dir(&metadata) {
+        return None;
+    }
+    Some(candidate_dir_from_parts(
+        candidate_entry_path(&entry),
+        candidate_modified_at(&metadata),
+    ))
+}
+
+fn candidate_dir_metadata(entry: &std::fs::DirEntry) -> Result<std::fs::Metadata, std::io::Error> {
+    entry.metadata()
+}
+
+fn candidate_metadata_is_dir(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_dir()
+}
+
+fn candidate_entry_path(entry: &std::fs::DirEntry) -> PathBuf {
+    entry.path()
+}
+
+fn candidate_modified_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
+    metadata.modified().ok()
+}
+
+fn candidate_dir_from_parts(state_dir: PathBuf, modified_at: Option<SystemTime>) -> CandidateDir {
+    CandidateDir {
+        state_dir,
+        modified_at,
+    }
 }
 
 fn compare_candidate_dir(left: &CandidateDir, right: &CandidateDir) -> std::cmp::Ordering {
@@ -463,13 +556,17 @@ impl AgentBashMetaCache {
         };
         let modified_at = metadata.modified().ok();
         let size = metadata.len();
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.lock_entries();
         if let Some(cached) = matching_cached_meta(&entries, state_dir, modified_at, size) {
             return clone_cached_meta_result(cached);
         }
         let result = parse_meta_file(state_dir, meta_path);
         store_meta_result(&mut entries, state_dir, modified_at, size, result.clone());
         result
+    }
+
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<PathBuf, CachedAgentBashMeta>> {
+        self.entries.lock().unwrap()
     }
 }
 
@@ -487,7 +584,22 @@ fn matching_cached_meta<'a>(
     modified_at: Option<SystemTime>,
     size: u64,
 ) -> Option<&'a CachedAgentBashMeta> {
-    let cached = entries.get(state_dir)?;
+    let cached = cached_meta_entry(entries, state_dir)?;
+    matching_meta_entry(cached, modified_at, size)
+}
+
+fn cached_meta_entry<'a>(
+    entries: &'a HashMap<PathBuf, CachedAgentBashMeta>,
+    state_dir: &Path,
+) -> Option<&'a CachedAgentBashMeta> {
+    entries.get(state_dir)
+}
+
+fn matching_meta_entry(
+    cached: &CachedAgentBashMeta,
+    modified_at: Option<SystemTime>,
+    size: u64,
+) -> Option<&CachedAgentBashMeta> {
     cached_meta_matches(cached, modified_at, size).then_some(cached)
 }
 
@@ -563,8 +675,11 @@ fn parse_meta_value(state_dir: &Path, value: &Value) -> Result<AgentBashMeta, St
 }
 
 fn parse_meta_handle(state_dir: &Path, value: &Value) -> Result<String, String> {
-    let handle = optional_string(value, &["handle"]).or_else(|| state_dir_handle(state_dir));
-    required_meta_handle(handle)
+    required_meta_handle(parse_meta_handle_candidate(state_dir, value))
+}
+
+fn parse_meta_handle_candidate(state_dir: &Path, value: &Value) -> Option<String> {
+    optional_string(value, &["handle"]).or_else(|| state_dir_handle(state_dir))
 }
 
 fn state_dir_handle(state_dir: &Path) -> Option<String> {
@@ -642,17 +757,37 @@ fn parse_caller_identities(chain: &[Value]) -> Result<Vec<CallerIdentity>, Strin
 }
 
 fn parse_caller_identity((chain_index, value): (usize, &Value)) -> Result<CallerIdentity, String> {
-    Ok(CallerIdentity {
+    let fields = parse_process_identity_fields(value)?;
+    Ok(caller_identity_from_fields(
         chain_index,
-        identity: ProcessIdentity {
-            os_pid: required_i64(value, &["pid", "os_pid"])?,
-            os_boot_id: required_string(value, &["boot_id", "os_boot_id"])?,
-            os_pid_starttime_ticks: required_i64(
-                value,
-                &["starttime_ticks", "os_pid_starttime_ticks"],
-            )?,
-        },
+        process_identity_from_fields(fields),
+    ))
+}
+
+fn parse_process_identity_fields(value: &Value) -> Result<ProcessIdentityFields, String> {
+    Ok(ProcessIdentityFields {
+        os_pid: required_i64(value, &["pid", "os_pid"])?,
+        os_boot_id: required_string(value, &["boot_id", "os_boot_id"])?,
+        os_pid_starttime_ticks: required_i64(
+            value,
+            &["starttime_ticks", "os_pid_starttime_ticks"],
+        )?,
     })
+}
+
+fn process_identity_from_fields(fields: ProcessIdentityFields) -> ProcessIdentity {
+    ProcessIdentity {
+        os_pid: fields.os_pid,
+        os_boot_id: fields.os_boot_id,
+        os_pid_starttime_ticks: fields.os_pid_starttime_ticks,
+    }
+}
+
+fn caller_identity_from_fields(chain_index: usize, identity: ProcessIdentity) -> CallerIdentity {
+    CallerIdentity {
+        chain_index,
+        identity,
+    }
 }
 
 fn resolve_owner(
@@ -677,18 +812,36 @@ fn resolve_owner_for_entry(
     pid: &PidIdentityDb,
     entry: &CallerIdentity,
 ) -> Result<Option<ResolvedOwner>, String> {
-    let Some(row) = pid.lookup_by_identity(&entry.identity)? else {
+    let Some(row) = lookup_owner_pid_row(pid, entry)? else {
         return Ok(None);
     };
-    let session_id = row
-        .session_id
-        .clone()
-        .or_else(|| state_invocation_session(state, &row.invocation_uuid));
-    Ok(Some(ResolvedOwner {
+    Ok(Some(resolved_owner_from_row(state, entry.chain_index, row)))
+}
+
+fn lookup_owner_pid_row(
+    pid: &PidIdentityDb,
+    entry: &CallerIdentity,
+) -> Result<Option<PidIdentityRow>, String> {
+    pid.lookup_by_identity(&entry.identity)
+}
+
+fn resolved_owner_from_row(
+    state: Option<&StateDb>,
+    matched_chain_index: usize,
+    row: PidIdentityRow,
+) -> ResolvedOwner {
+    let session_id = owner_session_id(state, &row);
+    ResolvedOwner {
         session_id,
         invocation_uuid: row.invocation_uuid,
-        matched_chain_index: entry.chain_index,
-    }))
+        matched_chain_index,
+    }
+}
+
+fn owner_session_id(state: Option<&StateDb>, row: &PidIdentityRow) -> Option<String> {
+    row.session_id
+        .clone()
+        .or_else(|| state_invocation_session(state, &row.invocation_uuid))
 }
 
 fn state_invocation_session(state: Option<&StateDb>, invocation_uuid: &str) -> Option<String> {
@@ -852,9 +1005,13 @@ fn agent_bash_meta_diagnostic(state_dir: &Path, message: String) -> MonitorDiagn
     MonitorDiagnostic {
         code: "agent-bash:meta-corrupt".to_string(),
         severity: MonitorDiagnosticSeverity::Warning,
-        message: format!("{}: {message}", state_dir.display()),
+        message: agent_bash_meta_diagnostic_message(state_dir, message),
         node_id: None,
     }
+}
+
+fn agent_bash_meta_diagnostic_message(state_dir: &Path, message: String) -> String {
+    format!("{}: {message}", state_dir.display())
 }
 
 fn agent_bash_node_id(handle: &str) -> String {
@@ -862,16 +1019,31 @@ fn agent_bash_node_id(handle: &str) -> String {
 }
 
 fn optional_string(value: &Value, names: &[&str]) -> Option<String> {
+    let value = optional_raw_string(value, names)?;
+    let value = non_empty_string(value)?;
+    Some(owned_string(value))
+}
+
+fn optional_raw_string<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
     names
         .iter()
         .find_map(|name| value.get(*name).and_then(Value::as_str))
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+}
+
+fn non_empty_string(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn owned_string(value: &str) -> String {
+    value.to_string()
 }
 
 fn required_string(value: &Value, names: &[&str]) -> Result<String, String> {
-    optional_string(value, names)
-        .ok_or_else(|| format!("caller_chain entry missing string {names:?}"))
+    optional_string(value, names).ok_or_else(|| missing_string_field_error(names))
+}
+
+fn missing_string_field_error(names: &[&str]) -> String {
+    format!("caller_chain entry missing string {names:?}")
 }
 
 fn optional_i64(value: &Value, names: &[&str]) -> Option<i64> {
@@ -881,8 +1053,11 @@ fn optional_i64(value: &Value, names: &[&str]) -> Option<i64> {
 }
 
 fn required_i64(value: &Value, names: &[&str]) -> Result<i64, String> {
-    optional_i64(value, names)
-        .ok_or_else(|| format!("caller_chain entry missing integer {names:?}"))
+    optional_i64(value, names).ok_or_else(|| missing_integer_field_error(names))
+}
+
+fn missing_integer_field_error(names: &[&str]) -> String {
+    format!("caller_chain entry missing integer {names:?}")
 }
 
 fn optional_string_array(value: &Value, name: &str) -> Vec<String> {
@@ -898,7 +1073,15 @@ fn string_array_items<'a>(value: &'a Value, name: &str) -> Option<&'a [Value]> {
 }
 
 fn string_array_item_strings(items: &[Value]) -> Vec<&str> {
-    items.iter().filter_map(Value::as_str).collect()
+    present_string_array_items(parsed_string_array_items(items))
+}
+
+fn parsed_string_array_items(items: &[Value]) -> Vec<Option<&str>> {
+    items.iter().map(Value::as_str).collect()
+}
+
+fn present_string_array_items(values: Vec<Option<&str>>) -> Vec<&str> {
+    values.into_iter().flatten().collect()
 }
 
 fn owned_strings(values: Vec<&str>) -> Vec<String> {

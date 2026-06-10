@@ -30,31 +30,53 @@ struct EnvGuard {
     old_home: Option<OsString>,
 }
 
+struct EnvSnapshot {
+    old_oulipoly_data_dir: Option<OsString>,
+    old_xdg_state_home: Option<OsString>,
+    old_xdg_data_home: Option<OsString>,
+    old_xdg_config_home: Option<OsString>,
+    old_home: Option<OsString>,
+}
+
 impl EnvGuard {
     fn set(data_dir: &Path, xdg_state_home: &Path, home: &Path) -> Self {
         let lock = env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let old_oulipoly_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
-        let old_xdg_state_home = std::env::var_os("XDG_STATE_HOME");
-        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        let old_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-        let old_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("OULIPOLY_DATA_DIR", data_dir);
-            std::env::set_var("XDG_STATE_HOME", xdg_state_home);
-            std::env::set_var("XDG_DATA_HOME", data_dir.join("xdg-data"));
-            std::env::set_var("XDG_CONFIG_HOME", data_dir.join("xdg-config"));
-            std::env::set_var("HOME", home);
-        }
-        Self {
-            _lock: lock,
-            old_oulipoly_data_dir,
-            old_xdg_state_home,
-            old_xdg_data_home,
-            old_xdg_config_home,
-            old_home,
-        }
+        let snapshot = capture_env_snapshot();
+        apply_fixture_env(data_dir, xdg_state_home, home);
+        env_guard_from_snapshot(lock, snapshot)
+    }
+}
+
+fn capture_env_snapshot() -> EnvSnapshot {
+    EnvSnapshot {
+        old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
+        old_xdg_state_home: std::env::var_os("XDG_STATE_HOME"),
+        old_xdg_data_home: std::env::var_os("XDG_DATA_HOME"),
+        old_xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+        old_home: std::env::var_os("HOME"),
+    }
+}
+
+fn apply_fixture_env(data_dir: &Path, xdg_state_home: &Path, home: &Path) {
+    unsafe {
+        std::env::set_var("OULIPOLY_DATA_DIR", data_dir);
+        std::env::set_var("XDG_STATE_HOME", xdg_state_home);
+        std::env::set_var("XDG_DATA_HOME", data_dir.join("xdg-data"));
+        std::env::set_var("XDG_CONFIG_HOME", data_dir.join("xdg-config"));
+        std::env::set_var("HOME", home);
+    }
+}
+
+fn env_guard_from_snapshot(lock: MutexGuard<'static, ()>, snapshot: EnvSnapshot) -> EnvGuard {
+    EnvGuard {
+        _lock: lock,
+        old_oulipoly_data_dir: snapshot.old_oulipoly_data_dir,
+        old_xdg_state_home: snapshot.old_xdg_state_home,
+        old_xdg_data_home: snapshot.old_xdg_data_home,
+        old_xdg_config_home: snapshot.old_xdg_config_home,
+        old_home: snapshot.old_home,
     }
 }
 
@@ -75,21 +97,23 @@ struct Fixture {
     state_home: PathBuf,
 }
 
+struct FixturePaths {
+    data_dir: PathBuf,
+    state_home: PathBuf,
+    home: PathBuf,
+}
+
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("data");
-        let state_home = dir.path().join("state");
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        std::fs::create_dir_all(&state_home).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        let env = EnvGuard::set(&data_dir, &state_home, &home);
+        let paths = fixture_paths(dir.path());
+        create_fixture_dirs(&paths);
+        let env = EnvGuard::set(&paths.data_dir, &paths.state_home, &paths.home);
         Self {
             _dir: dir,
             _env: env,
-            data_dir,
-            state_home,
+            data_dir: paths.data_dir,
+            state_home: paths.state_home,
         }
     }
 
@@ -129,6 +153,20 @@ impl Fixture {
             model_name: Some("model-a".to_string()),
         }
     }
+}
+
+fn fixture_paths(root: &Path) -> FixturePaths {
+    FixturePaths {
+        data_dir: root.join("data"),
+        state_home: root.join("state"),
+        home: root.join("home"),
+    }
+}
+
+fn create_fixture_dirs(paths: &FixturePaths) {
+    std::fs::create_dir_all(&paths.data_dir).unwrap();
+    std::fs::create_dir_all(&paths.state_home).unwrap();
+    std::fs::create_dir_all(&paths.home).unwrap();
 }
 
 #[test]
@@ -575,9 +613,15 @@ fn seed_invocation(db: &StateDb, uuid: &str, parent: Option<i64>) -> i64 {
 }
 
 fn current_identity() -> ProcessIdentity {
+    expect_live_identity(read_current_identity().unwrap())
+}
+
+fn read_current_identity() -> Result<Option<ProcessIdentity>, String> {
     oulipoly_state::pid_identity::read_live_process_identity(i64::from(std::process::id()))
-        .unwrap()
-        .unwrap()
+}
+
+fn expect_live_identity(identity: Option<ProcessIdentity>) -> ProcessIdentity {
+    identity.unwrap()
 }
 
 fn dead_identity() -> ProcessIdentity {
@@ -594,7 +638,16 @@ fn record_identity(
     session_id: Option<&str>,
     identity: &ProcessIdentity,
 ) {
-    db.record_identity(PidIdentityRecord {
+    db.record_identity(pid_identity_record(invocation_uuid, session_id, identity))
+        .unwrap();
+}
+
+fn pid_identity_record<'a>(
+    invocation_uuid: &'a str,
+    session_id: Option<&'a str>,
+    identity: &'a ProcessIdentity,
+) -> PidIdentityRecord<'a> {
+    PidIdentityRecord {
         identity,
         os_pgid: Some(identity.os_pid),
         invocation_uuid,
@@ -602,8 +655,7 @@ fn record_identity(
         provider_name: Some("provider-a"),
         model_name: Some("model-a"),
         recorded_at: "2026-06-08T12:00:00Z",
-    })
-    .unwrap();
+    }
 }
 
 fn mailbox_input<'a>(handle: &'a str, session_id: &'a str) -> AgentBashCompleteEnqueue<'a> {
@@ -625,35 +677,49 @@ fn mailbox_input<'a>(handle: &'a str, session_id: &'a str) -> AgentBashCompleteE
 }
 
 fn runtime_row_bytes(path: &Path, session_id: &str) -> Vec<u8> {
+    runtime_row_text(path, session_id).into_bytes()
+}
+
+fn runtime_row_text(path: &Path, session_id: &str) -> String {
     let conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let value: String = conn
-        .query_row(
-            "SELECT COALESCE(session_id, '') || x'1f' || COALESCE(mode, '') || x'1f' ||
-                    COALESCE(invocation_uuid, '') || x'1f' || COALESCE(provider_name, '') || x'1f' ||
-                    COALESCE(model_name, '') || x'1f' || COALESCE(pty_control_path, '') || x'1f' ||
-                    COALESCE(updated_at, '') || x'1f' || COALESCE(run_state, '') || x'1f' ||
-                    COALESCE(running_invocation_uuid, '') || x'1f' || COALESCE(running_os_pid, '') || x'1f' ||
-                    COALESCE(running_os_boot_id, '') || x'1f' || COALESCE(running_os_pid_starttime_ticks, '') || x'1f' ||
-                    COALESCE(turn_started_at, '') || x'1f' || COALESCE(turn_ended_at, '') || x'1f' ||
-                    COALESCE(turn_start_max_mailbox_seq, '') || x'1f' || COALESCE(last_exit_code, '') || x'1f' ||
-                    COALESCE(models_dir, '') || x'1f' || COALESCE(effective_cwd, '')
-             FROM session_runtime WHERE session_id = ?1",
-            [session_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    value.into_bytes()
+    query_runtime_row_text(&conn, session_id)
+}
+
+fn query_runtime_row_text(conn: &rusqlite::Connection, session_id: &str) -> String {
+    conn.query_row(runtime_row_text_query(), [session_id], |row| row.get(0))
+        .unwrap()
+}
+
+fn runtime_row_text_query() -> &'static str {
+    "SELECT COALESCE(session_id, '') || x'1f' || COALESCE(mode, '') || x'1f' ||
+            COALESCE(invocation_uuid, '') || x'1f' || COALESCE(provider_name, '') || x'1f' ||
+            COALESCE(model_name, '') || x'1f' || COALESCE(pty_control_path, '') || x'1f' ||
+            COALESCE(updated_at, '') || x'1f' || COALESCE(run_state, '') || x'1f' ||
+            COALESCE(running_invocation_uuid, '') || x'1f' || COALESCE(running_os_pid, '') || x'1f' ||
+            COALESCE(running_os_boot_id, '') || x'1f' || COALESCE(running_os_pid_starttime_ticks, '') || x'1f' ||
+            COALESCE(turn_started_at, '') || x'1f' || COALESCE(turn_ended_at, '') || x'1f' ||
+            COALESCE(turn_start_max_mailbox_seq, '') || x'1f' || COALESCE(last_exit_code, '') || x'1f' ||
+            COALESCE(models_dir, '') || x'1f' || COALESCE(effective_cwd, '')
+     FROM session_runtime WHERE session_id = ?1"
 }
 
 fn write_agent_bash_meta(root: &Path, handle: &str, meta: &str, log: &str) -> PathBuf {
-    let state_dir = root.join(handle);
-    std::fs::create_dir_all(&state_dir).unwrap();
+    let state_dir = agent_bash_state_dir(root, handle);
+    write_agent_bash_meta_files(&state_dir, meta, log);
+    state_dir
+}
+
+fn agent_bash_state_dir(root: &Path, handle: &str) -> PathBuf {
+    root.join(handle)
+}
+
+fn write_agent_bash_meta_files(state_dir: &Path, meta: &str, log: &str) {
+    std::fs::create_dir_all(state_dir).unwrap();
     std::fs::write(state_dir.join("meta.json"), meta).unwrap();
     std::fs::write(state_dir.join("log"), log).unwrap();
     std::fs::write(state_dir.join("rc"), "0").unwrap();
-    state_dir
 }
 
 #[cfg(unix)]
@@ -662,7 +728,13 @@ fn set_dir_mtime(path: &Path, seconds: i64) {
     use std::os::unix::ffi::OsStrExt;
 
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-    let times = [
+    let times = dir_mtime_times(seconds);
+    set_dir_mtime_raw(c_path.as_ptr(), times.as_ptr(), path);
+}
+
+#[cfg(unix)]
+fn dir_mtime_times(seconds: i64) -> [libc::timespec; 2] {
+    [
         libc::timespec {
             tv_sec: seconds,
             tv_nsec: 0,
@@ -671,8 +743,12 @@ fn set_dir_mtime(path: &Path, seconds: i64) {
             tv_sec: seconds,
             tv_nsec: 0,
         },
-    ];
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    ]
+}
+
+#[cfg(unix)]
+fn set_dir_mtime_raw(path_ptr: *const libc::c_char, times_ptr: *const libc::timespec, path: &Path) {
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, path_ptr, times_ptr, 0) };
     assert_eq!(rc, 0, "failed to set mtime for {}", path.display());
 }
 
@@ -686,6 +762,16 @@ fn agent_bash_meta(
     workload_pid: Option<i64>,
     rc: Option<i32>,
 ) -> String {
+    agent_bash_meta_json(handle, state, identity, workload_pid, rc).to_string()
+}
+
+fn agent_bash_meta_json(
+    handle: &str,
+    state: &str,
+    identity: &ProcessIdentity,
+    workload_pid: Option<i64>,
+    rc: Option<i32>,
+) -> serde_json::Value {
     serde_json::json!({
         "handle": handle,
         "state": state,
@@ -704,7 +790,6 @@ fn agent_bash_meta(
         "rc": rc,
         "log_path": null,
     })
-    .to_string()
 }
 
 fn has_diagnostic(snapshot: &oulipoly_runtime::observability::MonitorSnapshot, code: &str) -> bool {
@@ -718,9 +803,20 @@ fn node<'a>(
     snapshot: &'a oulipoly_runtime::observability::MonitorSnapshot,
     id: &str,
 ) -> &'a oulipoly_runtime::observability::MonitorNode {
-    snapshot
-        .nodes
-        .iter()
-        .find(|node| node.id == id)
-        .unwrap_or_else(|| panic!("missing node {id}; nodes: {:#?}", snapshot.nodes))
+    expect_node(find_node(snapshot, id), snapshot, id)
+}
+
+fn find_node<'a>(
+    snapshot: &'a oulipoly_runtime::observability::MonitorSnapshot,
+    id: &str,
+) -> Option<&'a oulipoly_runtime::observability::MonitorNode> {
+    snapshot.nodes.iter().find(|node| node.id == id)
+}
+
+fn expect_node<'a>(
+    node: Option<&'a oulipoly_runtime::observability::MonitorNode>,
+    snapshot: &oulipoly_runtime::observability::MonitorSnapshot,
+    id: &str,
+) -> &'a oulipoly_runtime::observability::MonitorNode {
+    node.unwrap_or_else(|| panic!("missing node {id}; nodes: {:#?}", snapshot.nodes))
 }

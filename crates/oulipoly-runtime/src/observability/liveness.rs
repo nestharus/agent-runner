@@ -14,7 +14,18 @@ pub(crate) fn pid_row_liveness(row: &PidIdentityRow) -> LivenessStatus {
 }
 
 pub(crate) fn process_identity_liveness(identity: &ProcessIdentity) -> LivenessStatus {
-    match oulipoly_state::pid_identity::read_live_process_identity(identity.os_pid) {
+    live_process_identity_liveness(identity, read_process_identity(identity.os_pid))
+}
+
+fn read_process_identity(pid: i64) -> Result<Option<ProcessIdentity>, String> {
+    oulipoly_state::pid_identity::read_live_process_identity(pid)
+}
+
+fn live_process_identity_liveness(
+    identity: &ProcessIdentity,
+    live: Result<Option<ProcessIdentity>, String>,
+) -> LivenessStatus {
+    match live {
         Ok(Some(live)) if live == *identity => LivenessStatus::VerifiedLive,
         Ok(Some(_)) => LivenessStatus::PidReused,
         Ok(None) => LivenessStatus::Dead,
@@ -26,7 +37,13 @@ pub(crate) fn unverified_pid_liveness(pid: Option<i64>) -> LivenessStatus {
     let Some(pid) = pid else {
         return LivenessStatus::NotApplicable;
     };
-    match oulipoly_state::pid_identity::read_live_process_identity(pid) {
+    unverified_process_identity_liveness(read_process_identity(pid))
+}
+
+fn unverified_process_identity_liveness(
+    live: Result<Option<ProcessIdentity>, String>,
+) -> LivenessStatus {
+    match live {
         Ok(Some(_)) => LivenessStatus::UnverifiedLive,
         Ok(None) => LivenessStatus::Dead,
         Err(_) => LivenessStatus::Unknown,
@@ -58,10 +75,25 @@ pub(crate) fn wake_claim_liveness(
     claim: &WakeClaimRow,
     pid_db: Option<&PidIdentityDb>,
 ) -> LivenessStatus {
-    let Some(wake_pid) = wake_claim_pid(claim) else {
+    wake_claim_liveness_from_evidence(claim, pid_db, read_wake_claim_live_identity(claim))
+}
+
+fn read_wake_claim_live_identity(
+    claim: &WakeClaimRow,
+) -> Option<Result<Option<ProcessIdentity>, String>> {
+    let wake_pid = wake_claim_pid(claim)?;
+    Some(read_wake_live_identity(wake_pid))
+}
+
+fn wake_claim_liveness_from_evidence(
+    claim: &WakeClaimRow,
+    pid_db: Option<&PidIdentityDb>,
+    live: Option<Result<Option<ProcessIdentity>, String>>,
+) -> LivenessStatus {
+    let Some(live) = live else {
         return LivenessStatus::NotApplicable;
     };
-    let live = match read_wake_live_identity(wake_pid) {
+    let live = match live {
         Ok(Some(live)) => live,
         Ok(None) => return LivenessStatus::Dead,
         Err(_) => return LivenessStatus::Unknown,
@@ -125,11 +157,14 @@ fn wake_live_identity_matches_claim(
     let Some(pid_db) = pid_db else {
         return false;
     };
-    pid_db
-        .lookup_by_identity(live)
-        .ok()
-        .flatten()
-        .is_some_and(|row| wake_pid_row_matches_claim(claim, &row))
+    wake_live_identity_row(pid_db, live).is_some_and(|row| wake_pid_row_matches_claim(claim, &row))
+}
+
+fn wake_live_identity_row(
+    pid_db: &PidIdentityDb,
+    live: &ProcessIdentity,
+) -> Option<PidIdentityRow> {
+    pid_db.lookup_by_identity(live).ok().flatten()
 }
 
 fn wake_pid_row_matches_claim(claim: &WakeClaimRow, row: &PidIdentityRow) -> bool {
@@ -137,7 +172,13 @@ fn wake_pid_row_matches_claim(claim: &WakeClaimRow, row: &PidIdentityRow) -> boo
 }
 
 fn parse_rfc3339_utc(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
+    parse_rfc3339(value).map(utc_datetime)
+}
+
+fn parse_rfc3339(value: &str) -> Option<DateTime<chrono::FixedOffset>> {
+    DateTime::parse_from_rfc3339(value).ok()
+}
+
+fn utc_datetime(value: DateTime<chrono::FixedOffset>) -> DateTime<Utc> {
+    value.with_timezone(&Utc)
 }

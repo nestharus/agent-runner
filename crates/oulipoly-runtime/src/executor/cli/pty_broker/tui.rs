@@ -719,15 +719,38 @@ fn inspect_log_content_lines(path: &str, max_tail_bytes: usize) -> Vec<String> {
 /// Project the transcript tail into readable conversation lines, falling back to
 /// the raw tail when nothing projects (e.g. a single oversized message).
 fn inspect_transcript_content_lines(path: &str, max_tail_bytes: usize) -> Vec<String> {
-    let raw = tail_file(path, max_tail_bytes);
+    let raw = transcript_tail_lines(path, max_tail_bytes);
+    let projected = transcript_display_lines(&raw);
+    format_transcript_inspect_lines(path, &projected, &raw)
+}
+
+fn transcript_tail_lines(path: &str, max_tail_bytes: usize) -> Vec<String> {
+    tail_file(path, max_tail_bytes)
+}
+
+fn transcript_display_lines(raw: &[String]) -> Vec<String> {
+    project_transcript_tail(raw)
+}
+
+fn format_transcript_inspect_lines(
+    path: &str,
+    projected: &[String],
+    raw: &[String],
+) -> Vec<String> {
     let mut lines = vec![format_inspect_transcript_header(path)];
-    let projected = project_transcript_tail(&raw);
-    if projected.is_empty() {
-        lines.extend(raw);
-    } else {
-        lines.extend(projected);
-    }
+    lines.extend(
+        selected_transcript_display_lines(projected, raw)
+            .iter()
+            .cloned(),
+    );
     lines
+}
+
+fn selected_transcript_display_lines<'a>(
+    projected: &'a [String],
+    raw: &'a [String],
+) -> &'a [String] {
+    if projected.is_empty() { raw } else { projected }
 }
 
 fn format_inspect_log_header(path: &str) -> String {
@@ -908,9 +931,7 @@ fn render_inspect_pane(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
         height: area.height.saturating_sub(1),
         ..area
     };
-    let rows = body.height as usize;
-    let skip = pane.inspect.len().saturating_sub(rows);
-    for (line_index, line) in pane.inspect.iter().skip(skip).take(rows).enumerate() {
+    for (line_index, line) in visible_inspect_rows(pane, body.height).enumerate() {
         buf.set_string(
             body.x,
             body.y + line_index as u16,
@@ -918,6 +939,12 @@ fn render_inspect_pane(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
             Style::default().fg(Color::Gray),
         );
     }
+}
+
+fn visible_inspect_rows(pane: &MonitorPane, body_height: u16) -> impl Iterator<Item = &String> {
+    let rows = body_height as usize;
+    let skip = pane.inspect.len().saturating_sub(rows);
+    pane.inspect.iter().skip(skip).take(rows)
 }
 
 /// The single status row (the whole monitor when collapsed; the header when open).
@@ -981,15 +1008,51 @@ fn render_node_list(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
         );
         return;
     }
-    let rows = area.height as usize;
-    let offset = scroll_offset(pane.selected, snapshot.nodes.len(), rows);
-    for (index, node) in snapshot.nodes.iter().enumerate().skip(offset).take(rows) {
+    for VisibleNodeRow { index, y, node } in visible_node_rows(pane, snapshot, area) {
         let row = Rect {
-            y: area.y + (index - offset) as u16,
+            y,
             height: 1,
             ..area
         };
         render_node_row(buf, row, node, index == pane.selected);
+    }
+}
+
+struct VisibleNodeRow<'a> {
+    index: usize,
+    y: u16,
+    node: &'a MonitorNode,
+}
+
+fn visible_node_rows<'a>(
+    pane: &'a MonitorPane,
+    snapshot: &'a MonitorSnapshot,
+    area: Rect,
+) -> impl Iterator<Item = VisibleNodeRow<'a>> {
+    let rows = area.height as usize;
+    let offset = scroll_offset(pane.selected, snapshot.nodes.len(), rows);
+    visible_node_window(snapshot, offset, rows)
+        .map(move |(index, node)| visible_node_row(area.y, offset, index, node))
+}
+
+fn visible_node_window(
+    snapshot: &MonitorSnapshot,
+    offset: usize,
+    rows: usize,
+) -> impl Iterator<Item = (usize, &MonitorNode)> {
+    snapshot.nodes.iter().enumerate().skip(offset).take(rows)
+}
+
+fn visible_node_row(
+    area_y: u16,
+    offset: usize,
+    index: usize,
+    node: &MonitorNode,
+) -> VisibleNodeRow<'_> {
+    VisibleNodeRow {
+        index,
+        y: area_y + (index - offset) as u16,
+        node,
     }
 }
 
@@ -1225,13 +1288,25 @@ pub(super) fn relay_until_exit_observed(
 
 /// Initial child PTY size for the (collapsed) monitor at the current terminal size.
 fn child_pane_winsize(real_fd: RawFd, pane: &MonitorPane) -> libc::winsize {
-    let full = terminal_winsize(real_fd).unwrap_or(libc::winsize {
+    let full = terminal_winsize_with_fallback(read_terminal_winsize(real_fd));
+    child_winsize_for_pane(&full, pane)
+}
+
+fn terminal_winsize_with_fallback(winsize: Option<libc::winsize>) -> libc::winsize {
+    winsize.unwrap_or_else(minimum_terminal_winsize)
+}
+
+fn minimum_terminal_winsize() -> libc::winsize {
+    libc::winsize {
         ws_row: MIN_TERMINAL_ROWS,
         ws_col: MIN_TERMINAL_COLS,
         ws_xpixel: 0,
         ws_ypixel: 0,
-    });
-    child_winsize(&full, pane.bottom_rows(full.ws_row))
+    }
+}
+
+fn child_winsize_for_pane(full: &libc::winsize, pane: &MonitorPane) -> libc::winsize {
+    child_winsize(full, pane.bottom_rows(full.ws_row))
 }
 
 /// On a change to the terminal size OR the monitor's reserved rows, resize the
@@ -1248,7 +1323,7 @@ fn apply_sizing(
         return false;
     };
     let bottom = pane.bottom_rows(full.ws_row);
-    if sizing_already_applied(applied, &full, bottom) {
+    if !sizing_update_needed(applied, &full, bottom) {
         return false;
     }
     let child = child_winsize(&full, bottom);
@@ -1256,6 +1331,14 @@ fn apply_sizing(
     apply_child_pty_winsize(master_fd, child_pid, &child);
     record_applied_sizing(applied, full, bottom);
     true
+}
+
+fn sizing_update_needed(
+    applied: &Option<(libc::winsize, u16)>,
+    full: &libc::winsize,
+    bottom: u16,
+) -> bool {
+    !sizing_already_applied(applied, full, bottom)
 }
 
 fn read_terminal_winsize(real_fd: RawFd) -> Option<libc::winsize> {
@@ -1357,15 +1440,22 @@ fn apply_routed_to_pane(
     if routed.focus_bottom {
         pane.expand();
     }
-    let force_refresh = routed
-        .commands
-        .iter()
-        .fold(false, |force, command| pane.apply(*command) || force);
+    let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
-    if force_refresh || cancelled {
+    if pane_refresh_required(force_refresh, cancelled) {
         pane.refresh(monitor, root, Instant::now());
     }
     routed.redraw
+}
+
+fn apply_routed_commands(pane: &mut MonitorPane, commands: &[MonitorCommand]) -> bool {
+    commands
+        .iter()
+        .fold(false, |force, command| pane.apply(*command) || force)
+}
+
+fn pane_refresh_required(force_refresh: bool, cancelled: bool) -> bool {
+    force_refresh || cancelled
 }
 
 /// Execute a confirmed cancel request, if any, recording operator feedback.
@@ -1431,12 +1521,21 @@ fn pty_read_error_is_eof(err: &io::Error) -> bool {
 }
 
 fn process_pty_output(parser: &mut vt100::Parser, buffer: &[u8], output: PtyOutput) -> bool {
+    if !pty_output_has_bytes(&output) {
+        return false;
+    }
+    process_pty_bytes(parser, pty_output_bytes(buffer, &output));
+    true
+}
+
+fn pty_output_has_bytes(output: &PtyOutput) -> bool {
+    matches!(output, PtyOutput::Bytes(_))
+}
+
+fn pty_output_bytes<'a>(buffer: &'a [u8], output: &PtyOutput) -> &'a [u8] {
     match output {
-        PtyOutput::Empty => false,
-        PtyOutput::Bytes(len) => {
-            process_pty_bytes(parser, &buffer[..len]);
-            true
-        }
+        PtyOutput::Empty => &buffer[..0],
+        PtyOutput::Bytes(len) => &buffer[..*len],
     }
 }
 
@@ -1577,16 +1676,14 @@ fn wait_until_safe_to_inject(
     buffer: &mut [u8],
 ) -> Result<(), String> {
     let start = Instant::now();
-    while inject_wait_remaining(start) {
-        if safe_to_inject(line_state) {
-            return Ok(());
-        }
+    while injection_wait_should_pump(start, line_state) {
         pump_inject_wait_io(real_fd, master_fd, router, parser, line_state, buffer)?;
     }
-    if safe_to_inject(line_state) {
-        return Ok(());
-    }
-    Err(unsafe_mid_line_error())
+    validate_safe_to_inject(line_state)
+}
+
+fn injection_wait_should_pump(start: Instant, line_state: &InputLineState) -> bool {
+    inject_wait_remaining(start) && !safe_to_inject(line_state)
 }
 
 fn inject_wait_remaining(start: Instant) -> bool {
@@ -1595,6 +1692,14 @@ fn inject_wait_remaining(start: Instant) -> bool {
 
 fn safe_to_inject(line_state: &InputLineState) -> bool {
     line_state.is_safe_to_inject()
+}
+
+fn validate_safe_to_inject(line_state: &InputLineState) -> Result<(), String> {
+    if safe_to_inject(line_state) {
+        Ok(())
+    } else {
+        Err(unsafe_mid_line_error())
+    }
 }
 
 fn pump_inject_wait_io(
@@ -1801,46 +1906,81 @@ mod tests {
     /// Strip ANSI control sequences so the rendered terminal stream can be
     /// substring-checked for painted text.
     fn strip_ansi(bytes: &[u8]) -> String {
+        ansi_visible_tokens(bytes).into_iter().collect()
+    }
+
+    fn ansi_visible_tokens(bytes: &[u8]) -> Vec<char> {
         let mut out = String::new();
         let mut i = 0;
         while i < bytes.len() {
-            match bytes[i] {
-                0x1b => {
-                    i += 1;
-                    match bytes.get(i) {
-                        Some(b'[') => {
-                            i += 1;
-                            while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                                i += 1;
-                            }
-                            i += 1;
-                        }
-                        Some(b']') => {
-                            i += 1;
-                            while i < bytes.len() && bytes[i] != 0x07 && bytes[i] != 0x1b {
-                                i += 1;
-                            }
-                            if bytes.get(i) == Some(&0x1b) {
-                                i += 1;
-                            }
-                            i += 1;
-                        }
-                        Some(_) => i += 1,
-                        None => {}
-                    }
-                }
-                b'\r' | b'\n' => {
-                    out.push(' ');
-                    i += 1;
-                }
-                b if (0x20..0x7f).contains(&b) => {
-                    out.push(b as char);
-                    i += 1;
-                }
-                _ => i += 1,
-            }
+            let token = next_ansi_token(bytes, i);
+            out.extend(ansi_token_chars(&token));
+            i = token.next_index;
         }
-        out
+        out.chars().collect()
+    }
+
+    struct AnsiToken {
+        visible: Option<char>,
+        next_index: usize,
+    }
+
+    fn next_ansi_token(bytes: &[u8], index: usize) -> AnsiToken {
+        match bytes[index] {
+            0x1b => ansi_escape_token(bytes, index),
+            b'\r' | b'\n' => visible_ansi_token(' ', index + 1),
+            b if printable_ascii(b) => visible_ansi_token(b as char, index + 1),
+            _ => hidden_ansi_token(index + 1),
+        }
+    }
+
+    fn ansi_escape_token(bytes: &[u8], index: usize) -> AnsiToken {
+        let next = match bytes.get(index + 1) {
+            Some(b'[') => csi_escape_end(bytes, index + 2),
+            Some(b']') => osc_escape_end(bytes, index + 2),
+            Some(_) => index + 2,
+            None => index + 1,
+        };
+        hidden_ansi_token(next)
+    }
+
+    fn csi_escape_end(bytes: &[u8], mut index: usize) -> usize {
+        while index < bytes.len() && !(0x40..=0x7e).contains(&bytes[index]) {
+            index += 1;
+        }
+        index.saturating_add(1)
+    }
+
+    fn osc_escape_end(bytes: &[u8], mut index: usize) -> usize {
+        while index < bytes.len() && bytes[index] != 0x07 && bytes[index] != 0x1b {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&0x1b) {
+            index += 1;
+        }
+        index.saturating_add(1)
+    }
+
+    fn printable_ascii(byte: u8) -> bool {
+        (0x20..0x7f).contains(&byte)
+    }
+
+    fn visible_ansi_token(visible: char, next_index: usize) -> AnsiToken {
+        AnsiToken {
+            visible: Some(visible),
+            next_index,
+        }
+    }
+
+    fn hidden_ansi_token(next_index: usize) -> AnsiToken {
+        AnsiToken {
+            visible: None,
+            next_index,
+        }
+    }
+
+    fn ansi_token_chars(token: &AnsiToken) -> impl Iterator<Item = char> {
+        token.visible.into_iter()
     }
 
     // Outer-PTY end-to-end proof: the relay gives the child a real terminal,

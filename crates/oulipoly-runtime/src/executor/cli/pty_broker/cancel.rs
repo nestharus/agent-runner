@@ -138,14 +138,32 @@ fn identity_matches(recorded: &RecordedIdentity, live: &ProcessIdentity) -> bool
 }
 
 fn signal_process_group(pgid: i64) -> CancelOutcome {
-    let rc = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGTERM) };
-    if rc == 0 {
-        CancelOutcome::Signalled { pgid }
+    let rc = send_sigterm_to_process_group(pgid);
+    if signal_succeeded(rc) {
+        signalled_process_group_outcome(pgid)
     } else {
-        CancelOutcome::Failed {
-            errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-        }
+        failed_signal_outcome(last_signal_errno())
     }
+}
+
+fn send_sigterm_to_process_group(pgid: i64) -> i32 {
+    unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGTERM) }
+}
+
+fn signal_succeeded(rc: i32) -> bool {
+    rc == 0
+}
+
+fn signalled_process_group_outcome(pgid: i64) -> CancelOutcome {
+    CancelOutcome::Signalled { pgid }
+}
+
+fn last_signal_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+fn failed_signal_outcome(errno: i32) -> CancelOutcome {
+    CancelOutcome::Failed { errno }
 }
 
 /// A short operator-facing message describing a cancel outcome.

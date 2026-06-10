@@ -57,21 +57,42 @@ fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
 
 #[test]
 fn helper_runs_broker_session() {
-    if std::env::var_os(HELPER_ENV).is_none() {
+    if helper_env_missing() {
         return;
     }
-    let provider_script = PathBuf::from(std::env::var_os(PROVIDER_SCRIPT_ENV).unwrap());
-    let result_path = PathBuf::from(std::env::var_os(RESULT_PATH_ENV).unwrap());
+    let provider_script = required_env_path(PROVIDER_SCRIPT_ENV);
+    let result_path = required_env_path(RESULT_PATH_ENV);
     let provider = fixture_provider(&provider_script);
-    let result = execute_interactive_with_result_and_model_identity(
-        &provider,
+    let exit_code = run_broker_session(&provider);
+    write_exit_code_result(&result_path, exit_code);
+}
+
+fn helper_env_missing() -> bool {
+    std::env::var_os(HELPER_ENV).is_none()
+}
+
+fn required_env_path(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(name).unwrap())
+}
+
+fn run_broker_session(provider: &ProviderConfig) -> i32 {
+    execute_interactive_with_result_and_model_identity(
+        provider,
         None,
         None,
         None,
         Some("fixture-model"),
     )
-    .unwrap();
-    fs::write(result_path, format!("{}\n", result.exit_code)).unwrap();
+    .unwrap()
+    .exit_code
+}
+
+fn write_exit_code_result(path: &Path, exit_code: i32) {
+    fs::write(path, exit_code_result_text(exit_code)).unwrap();
+}
+
+fn exit_code_result_text(exit_code: i32) -> String {
+    format!("{exit_code}\n")
 }
 
 struct OuterPty {
@@ -81,28 +102,45 @@ struct OuterPty {
 
 impl OuterPty {
     fn open(rows: u16, cols: u16) -> Self {
-        let mut master_fd = -1;
-        let mut slave_fd = -1;
-        let winsize = libc::winsize {
-            ws_row: rows,
-            ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        let rc = unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                &winsize,
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed: {}", io::Error::last_os_error());
-        Self {
-            master: unsafe { File::from_raw_fd(master_fd) },
-            slave: unsafe { File::from_raw_fd(slave_fd) },
-        }
+        let winsize = pty_winsize(rows, cols);
+        let (rc, master_fd, slave_fd) = openpty_fds(&winsize);
+        assert_openpty_success(rc);
+        outer_pty_from_fds(master_fd, slave_fd)
+    }
+}
+
+fn pty_winsize(rows: u16, cols: u16) -> libc::winsize {
+    libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
+
+fn openpty_fds(winsize: &libc::winsize) -> (i32, RawFd, RawFd) {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            winsize,
+        )
+    };
+    (rc, master_fd, slave_fd)
+}
+
+fn assert_openpty_success(rc: i32) {
+    assert_eq!(rc, 0, "openpty failed: {}", io::Error::last_os_error());
+}
+
+fn outer_pty_from_fds(master_fd: RawFd, slave_fd: RawFd) -> OuterPty {
+    OuterPty {
+        master: unsafe { File::from_raw_fd(master_fd) },
+        slave: unsafe { File::from_raw_fd(slave_fd) },
     }
 }
 
@@ -111,12 +149,38 @@ fn spawn_helper_under_pty(
     provider: &Path,
     result_path: &Path,
 ) -> std::process::Child {
-    let exe = std::env::current_exe().unwrap();
-    let stdin = pty.slave.try_clone().unwrap();
-    let stdout = pty.slave.try_clone().unwrap();
-    let stderr = pty.slave.try_clone().unwrap();
-    let slave_fd = pty.slave.as_raw_fd();
-    let master_fd = pty.master.as_raw_fd();
+    let exe = current_test_exe();
+    let (stdin, stdout, stderr) = cloned_slave_stdio(pty);
+    let (slave_fd, master_fd) = pty_raw_fds(pty);
+    let mut cmd = helper_command(exe, provider, result_path, stdin, stdout, stderr);
+    install_helper_pre_exec(&mut cmd, slave_fd, master_fd);
+    cmd.spawn().unwrap()
+}
+
+fn current_test_exe() -> PathBuf {
+    std::env::current_exe().unwrap()
+}
+
+fn cloned_slave_stdio(pty: &OuterPty) -> (File, File, File) {
+    (
+        pty.slave.try_clone().unwrap(),
+        pty.slave.try_clone().unwrap(),
+        pty.slave.try_clone().unwrap(),
+    )
+}
+
+fn pty_raw_fds(pty: &OuterPty) -> (RawFd, RawFd) {
+    (pty.slave.as_raw_fd(), pty.master.as_raw_fd())
+}
+
+fn helper_command(
+    exe: PathBuf,
+    provider: &Path,
+    result_path: &Path,
+    stdin: File,
+    stdout: File,
+    stderr: File,
+) -> Command {
     let mut cmd = Command::new(exe);
     cmd.arg("--exact")
         .arg("helper_runs_broker_session")
@@ -133,31 +197,59 @@ fn spawn_helper_under_pty(
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
+    cmd
+}
+
+fn install_helper_pre_exec(cmd: &mut Command, slave_fd: RawFd, master_fd: RawFd) {
     unsafe {
-        cmd.pre_exec(move || {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::tcsetpgrp(slave_fd, libc::getpid()) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if master_fd > 2 {
-                libc::close(master_fd);
-            }
-            Ok(())
-        });
+        cmd.pre_exec(move || prepare_child_pty_session(slave_fd, master_fd));
     }
-    cmd.spawn().unwrap()
+}
+
+fn prepare_child_pty_session(slave_fd: RawFd, master_fd: RawFd) -> io::Result<()> {
+    validate_setsid()?;
+    validate_controlling_tty(slave_fd)?;
+    validate_foreground_process_group(slave_fd)?;
+    close_parent_master_fd(master_fd);
+    Ok(())
+}
+
+fn validate_setsid() -> io::Result<()> {
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn validate_controlling_tty(slave_fd: RawFd) -> io::Result<()> {
+    if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn validate_foreground_process_group(slave_fd: RawFd) -> io::Result<()> {
+    if unsafe { libc::tcsetpgrp(slave_fd, libc::getpid()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn close_parent_master_fd(master_fd: RawFd) {
+    if master_fd > 2 {
+        unsafe { libc::close(master_fd) };
+    }
 }
 
 fn fixture_provider_script(dir: &Path) -> PathBuf {
     let path = dir.join("fixture-provider.sh");
-    fs::write(
-        &path,
-        r#"#!/usr/bin/env bash
+    write_fixture_provider_script(&path);
+    make_fixture_provider_script_executable(&path);
+    path
+}
+
+fn fixture_provider_script_body() -> &'static str {
+    r#"#!/usr/bin/env bash
 set -euo pipefail
 test -t 0
 test -t 1
@@ -167,13 +259,17 @@ printf 'SIZE:%s\n' "$(stty size)"
 IFS= read -r line
 printf 'ECHO:%s\n' "$line"
 exit 7
-"#,
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
+"#
+}
+
+fn write_fixture_provider_script(path: &Path) {
+    fs::write(path, fixture_provider_script_body()).unwrap();
+}
+
+fn make_fixture_provider_script_executable(path: &Path) {
+    let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 fn fixture_provider(script: &Path) -> ProviderConfig {
@@ -193,26 +289,58 @@ fn fixture_provider(script: &Path) -> ProviderConfig {
 }
 
 fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
+    render_output(&read_until_bytes(fd, needle, timeout))
+}
+
+fn read_until_bytes(fd: RawFd, needle: &str, timeout: Duration) -> Vec<u8> {
     let start = Instant::now();
     let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
     while start.elapsed() < timeout {
-        if poll_readable(fd, Duration::from_millis(50)).unwrap() {
-            let n = read_fd(fd, &mut buffer).unwrap();
-            if n == 0 {
-                break;
-            }
-            output.extend_from_slice(&buffer[..n]);
-            let rendered = String::from_utf8_lossy(&output);
-            if rendered.contains(needle) {
-                return rendered.into_owned();
-            }
+        if read_until_step(fd, needle, &mut output, &mut buffer) {
+            break;
         }
     }
-    String::from_utf8_lossy(&output).into_owned()
+    output
+}
+
+fn read_until_step(fd: RawFd, needle: &str, output: &mut Vec<u8>, buffer: &mut [u8]) -> bool {
+    if !poll_readable(fd, Duration::from_millis(50)).unwrap() {
+        return false;
+    }
+    let n = read_fd(fd, buffer).unwrap();
+    append_read_bytes(output, buffer, n);
+    read_until_step_is_done(output, needle, n)
+}
+
+fn append_read_bytes(output: &mut Vec<u8>, buffer: &[u8], n: usize) {
+    output.extend_from_slice(&buffer[..n]);
+}
+
+fn read_until_step_is_done(output: &[u8], needle: &str, n: usize) -> bool {
+    read_reached_eof(n) || output_contains_needle_bytes(output, needle)
+}
+
+fn read_reached_eof(n: usize) -> bool {
+    n == 0
+}
+
+fn output_contains_needle_bytes(output: &[u8], needle: &str) -> bool {
+    output
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+fn render_output(output: &[u8]) -> String {
+    String::from_utf8_lossy(output).into_owned()
 }
 
 fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
+    let pollfd = poll_fd(fd, timeout)?;
+    Ok(pollfd_is_readable(&pollfd))
+}
+
+fn poll_fd(fd: RawFd, timeout: Duration) -> io::Result<libc::pollfd> {
     let mut pollfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -222,7 +350,11 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
     if rc == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(rc > 0 && pollfd.revents & libc::POLLIN != 0)
+    Ok(pollfd)
+}
+
+fn pollfd_is_readable(pollfd: &libc::pollfd) -> bool {
+    pollfd.revents & libc::POLLIN != 0
 }
 
 fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
@@ -236,13 +368,17 @@ fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
 fn write_all_fd(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < bytes.len() {
-        let rc = unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
-        if rc == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        offset += rc as usize;
+        offset += write_fd(fd, &bytes[offset..])?;
     }
     Ok(())
+}
+
+fn write_fd(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(rc as usize)
 }
 
 fn terminal_attrs(fd: RawFd) -> io::Result<libc::termios> {

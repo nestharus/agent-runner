@@ -76,23 +76,27 @@ pub(crate) fn storage_diagnostic(code: &str, message: String) -> MonitorDiagnost
 }
 
 fn open_state_read_only(diagnostics: &mut Vec<MonitorDiagnostic>) -> Option<StateDb> {
-    let path = match read_state_default_path() {
+    let path = match state_default_path() {
         Ok(path) => path,
         Err(err) => {
             diagnostics.push(state_path_diagnostic(err));
             return None;
         }
     };
-    if state_db_is_missing(&path) {
+    if path_is_missing(&path) {
         return None;
     }
-    match open_existing_state_read_only(&path) {
+    match read_existing_state(&path) {
         Ok(db) => Some(db),
         Err(err) => {
             diagnostics.push(state_open_read_only_diagnostic(err));
             None
         }
     }
+}
+
+fn state_default_path() -> Result<PathBuf, String> {
+    read_state_default_path()
 }
 
 fn read_state_default_path() -> Result<PathBuf, String> {
@@ -107,8 +111,16 @@ fn state_db_is_missing(path: &Path) -> bool {
     !path.exists()
 }
 
+fn path_is_missing(path: &Path) -> bool {
+    state_db_is_missing(path)
+}
+
 fn open_existing_state_read_only(path: &Path) -> Result<StateDb, ReadOnlyOpenError> {
     StateDb::open_read_only(path)
+}
+
+fn read_existing_state(path: &Path) -> Result<StateDb, ReadOnlyOpenError> {
+    open_existing_state_read_only(path)
 }
 
 fn state_open_read_only_diagnostic(err: ReadOnlyOpenError) -> MonitorDiagnostic {
@@ -119,30 +131,46 @@ fn open_pid_read_only(
     path: &Path,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<PidIdentityDb> {
-    if !path.exists() {
+    if path_is_missing(path) {
         return None;
     }
-    match PidIdentityDb::open_read_only(path) {
+    match read_existing_pid_identity(path) {
         Ok(db) => Some(db),
         Err(err) => {
-            diagnostics.push(storage_diagnostic("pid-identity:open-read-only", err));
+            diagnostics.push(pid_open_read_only_diagnostic(err));
             None
         }
     }
+}
+
+fn read_existing_pid_identity(path: &Path) -> Result<PidIdentityDb, String> {
+    PidIdentityDb::open_read_only(path)
+}
+
+fn pid_open_read_only_diagnostic(message: String) -> MonitorDiagnostic {
+    storage_diagnostic("pid-identity:open-read-only", message)
 }
 
 fn open_mailbox_read_only(
     path: &Path,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<MailboxDb> {
-    if !path.exists() {
+    if path_is_missing(path) {
         return None;
     }
-    match MailboxDb::open_read_only(path) {
+    match read_existing_mailbox(path) {
         Ok(db) => Some(db),
         Err(err) => {
-            diagnostics.push(storage_diagnostic("mailbox:open-read-only", err));
+            diagnostics.push(mailbox_open_read_only_diagnostic(err));
             None
         }
     }
+}
+
+fn read_existing_mailbox(path: &Path) -> Result<MailboxDb, String> {
+    MailboxDb::open_read_only(path)
+}
+
+fn mailbox_open_read_only_diagnostic(message: String) -> MonitorDiagnostic {
+    storage_diagnostic("mailbox:open-read-only", message)
 }

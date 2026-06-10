@@ -191,15 +191,29 @@ fn attach_transcript_inspect_ref(
 ) {
     let session_node = active_session_id.map(session_node_id);
     let root_invocation_node = root_invocation_uuid.map(invocation_node_id);
-    for node in nodes.iter_mut() {
-        if node_streams_session_transcript(
-            node,
-            session_node.as_deref(),
-            root_invocation_node.as_deref(),
-        ) {
-            node.inspect_ref = Some(session_transcript_inspect_ref(&path, max_tail_bytes));
-        }
+    let target_indices = transcript_inspect_target_indices(
+        nodes,
+        session_node.as_deref(),
+        root_invocation_node.as_deref(),
+    );
+    for index in target_indices {
+        nodes[index].inspect_ref = Some(session_transcript_inspect_ref(&path, max_tail_bytes));
     }
+}
+
+fn transcript_inspect_target_indices(
+    nodes: &[MonitorNode],
+    session_node_id: Option<&str>,
+    root_invocation_node_id: Option<&str>,
+) -> Vec<usize> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            node_streams_session_transcript(node, session_node_id, root_invocation_node_id)
+                .then_some(index)
+        })
+        .collect()
 }
 
 fn session_transcript_inspect_ref(path: &str, max_tail_bytes: usize) -> InspectRef {
