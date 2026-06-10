@@ -218,6 +218,7 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
         model: &model,
         state: &db,
         ctx: None,
+        provider_pin: None,
     };
     let lifecycle_start = InvocationLifecycleStartRequest {
         state: &db,

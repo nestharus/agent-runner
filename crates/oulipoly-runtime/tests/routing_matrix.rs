@@ -377,6 +377,7 @@ fn assert_route_winner(
             model,
             state: db,
             ctx: None,
+            provider_pin: None,
         })
         .unwrap_or_else(|err| panic!("case={case_label}: select_route failed: {err}"));
     let winner_name = model
@@ -776,6 +777,7 @@ async fn production_service_reports_all_quota_exhausted_pool() {
             model: &model,
             state: &db,
             ctx: None,
+            provider_pin: None,
         })
         .unwrap_err();
 

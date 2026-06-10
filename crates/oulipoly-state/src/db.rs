@@ -4401,6 +4401,42 @@ impl StateDb {
             .map_err(|e| format!("Failed to map invocation children: {e}"))
     }
 
+    pub fn running_invocation_counts_by_provider(
+        &self,
+        provider_names: &[&str],
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<String, u64>, String> {
+        if provider_names.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", provider_names.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT provider_name, COUNT(*)
+             FROM invocations
+             WHERE status = ? AND created_at >= ? AND provider_name IN ({placeholders})
+             GROUP BY provider_name"
+        );
+        let since = since.to_rfc3339();
+        let params = std::iter::once(InvocationStatus::Running.as_str())
+            .chain(std::iter::once(since.as_str()))
+            .chain(provider_names.iter().copied())
+            .collect::<Vec<_>>();
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare running invocation count query: {e}"))?;
+        let rows = stmt
+            .query_map(sqlite::params_from_iter(params), |row| {
+                let count: i64 = row.get(1)?;
+                Ok((row.get::<_, String>(0)?, count.max(0) as u64))
+            })
+            .map_err(|e| format!("Failed to query running invocation counts: {e}"))?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| format!("Failed to map running invocation counts: {e}"))
+    }
+
     fn map_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<InvocationRecord> {
         let created_at_raw: String = row.get(19)?;
         let finished_at_raw: Option<String> = row.get(20)?;

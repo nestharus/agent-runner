@@ -728,6 +728,7 @@ fn select_repl_direct_provider(
             model,
             state: &env.state,
             ctx: Some(ctx),
+            provider_pin: None,
         })
         .map_err(|err| err.to_string())?
         .provider_index;

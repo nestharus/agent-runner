@@ -344,6 +344,7 @@ pub struct RoutingServiceRequest<'a> {
     pub model: &'a oulipoly_config::ModelConfig,
     pub state: &'a oulipoly_state::StateDb,
     pub ctx: Option<&'a crate::balancer::BalanceContext<'a>>,
+    pub provider_pin: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

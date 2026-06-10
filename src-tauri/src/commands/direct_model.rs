@@ -35,6 +35,7 @@ struct CliExecutionContext {
     models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
     working_dir: Option<PathBuf>,
+    provider_pin: Option<String>,
     state_db_opener: ProductionStateDbOpener,
 }
 
@@ -45,6 +46,7 @@ fn load_cli_execution_context(cli: &Cli) -> Result<CliExecutionContext, String> 
         parts.models,
         parts.models_dir,
         parts.extra_inputs,
+        cli.pin_provider.clone(),
     ))
 }
 
@@ -99,12 +101,14 @@ fn cli_execution_context(
     models: HashMap<String, ModelConfig>,
     models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
+    provider_pin: Option<String>,
 ) -> CliExecutionContext {
     cli_execution_context_from_parts(
         models,
         models_dir,
         extra_inputs,
         cli_working_dir(cli),
+        provider_pin,
         ProductionStateDbOpener,
     )
 }
@@ -118,6 +122,7 @@ fn cli_execution_context_from_parts(
     models_dir: PathBuf,
     extra_inputs: HashMap<String, Vec<String>>,
     working_dir: Option<PathBuf>,
+    provider_pin: Option<String>,
     state_db_opener: ProductionStateDbOpener,
 ) -> CliExecutionContext {
     CliExecutionContext {
@@ -125,6 +130,7 @@ fn cli_execution_context_from_parts(
         models_dir,
         extra_inputs,
         working_dir,
+        provider_pin,
         state_db_opener,
     }
 }
@@ -183,7 +189,7 @@ fn dispatch_direct_model_balancing(
     model: &ModelConfig,
     prompt: &str,
 ) -> Result<i32, String> {
-    crate::run::balancing::run_with_balancing(
+    crate::run::balancing::run_with_balancing_with_pin(
         agent_runtime_services,
         &context.state_db_opener,
         model,
@@ -192,6 +198,7 @@ fn dispatch_direct_model_balancing(
         &context.models_dir,
         context.working_dir.as_deref(),
         &context.extra_inputs,
+        context.provider_pin.as_deref(),
     )
 }
 
@@ -308,7 +315,7 @@ fn dispatch_agent_cli_balancing(
     full_prompt: &str,
     provider_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
-    crate::run::balancing::run_with_balancing(
+    crate::run::balancing::run_with_balancing_with_pin(
         agent_runtime_services,
         &context.state_db_opener,
         model,
@@ -317,6 +324,7 @@ fn dispatch_agent_cli_balancing(
         &context.models_dir,
         context.working_dir.as_deref(),
         provider_inputs,
+        context.provider_pin.as_deref(),
     )
 }
 

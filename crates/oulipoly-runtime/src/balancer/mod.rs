@@ -72,9 +72,12 @@ mod density;
 mod eligibility;
 pub mod forensics;
 mod invocation_fallback;
+mod live_load;
 mod migration;
+mod placement_pin;
 mod projection;
 mod refresh_inputs;
+mod routing_error;
 mod snapshot;
 mod topology;
 mod working_set;
@@ -86,6 +89,7 @@ pub use migration::{
     ManualMigrationRejection, MigrationDecision, decide_manual_migration, decide_migration,
 };
 pub use projection::{ProviderProjection, WindowProjection, compute_projections};
+pub use routing_error::RoutingError;
 pub use working_set::{select_next_working_candidate, working_set_member};
 
 #[cfg(test)]
@@ -103,7 +107,6 @@ use oulipoly_state::QuotaRecord;
 #[cfg(test)]
 use oulipoly_state::QuotaWindow;
 use oulipoly_state::StateDb;
-use std::fmt;
 
 #[cfg(test)]
 use burn_rate::{
@@ -118,7 +121,10 @@ use density::{
 };
 use eligibility::eligible_provider_indices;
 use invocation_fallback::score_by_invocation_count;
+use live_load::live_loads_for_model;
+use placement_pin::select_pinned_provider;
 use refresh_inputs::refresh_routing_inputs;
+use routing_error::all_providers_quota_exhausted_error;
 use snapshot::{QuotaSnapshot, load_quota_snapshot};
 use topology::repair_routing_topology;
 
@@ -135,41 +141,19 @@ const EPS_HOURS: f64 = 1.0 / 60.0;
 /// not be torpedoed for it.
 const HIDDEN_WINDOW_PENALTY_THRESHOLD: f64 = 0.85;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RoutingError {
-    AllProvidersQuotaExhausted {
-        model_name: String,
-        provider_names: Vec<String>,
-    },
-}
-
-impl fmt::Display for RoutingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RoutingError::AllProvidersQuotaExhausted {
-                model_name,
-                provider_names,
-            } => {
-                let providers = if provider_names.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    provider_names.join(", ")
-                };
-                write!(
-                    f,
-                    "all providers in pool {model_name} are quota-exhausted: {providers}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for RoutingError {}
-
 pub fn select_provider(
     model: &ModelConfig,
     state: &StateDb,
     ctx: Option<&BalanceContext<'_>>,
+) -> Result<usize, RoutingError> {
+    select_provider_with_pin(model, state, ctx, None)
+}
+
+pub fn select_provider_with_pin(
+    model: &ModelConfig,
+    state: &StateDb,
+    ctx: Option<&BalanceContext<'_>>,
+    provider_pin: Option<&str>,
 ) -> Result<usize, RoutingError> {
     refresh_routing_inputs(model, state, ctx);
     let mut snapshot = load_quota_snapshot(model, state);
@@ -178,6 +162,9 @@ pub fn select_provider(
     }
 
     let filtered_indices = eligible_provider_indices(model, state, &snapshot, Utc::now());
+    if let Some(target_provider) = provider_pin {
+        return select_pinned_provider(model, filtered_indices.as_slice(), target_provider);
+    }
     if filtered_indices.is_empty() {
         return Err(all_providers_quota_exhausted_error(model));
     }
@@ -190,23 +177,13 @@ pub fn select_provider(
     ))
 }
 
-fn all_providers_quota_exhausted_error(model: &ModelConfig) -> RoutingError {
-    RoutingError::AllProvidersQuotaExhausted {
-        model_name: model.name.clone(),
-        provider_names: model
-            .providers
-            .iter()
-            .map(|provider| provider.name.clone())
-            .collect(),
-    }
-}
-
 fn score_routing_candidates(
     model: &ModelConfig,
     state: &StateDb,
     snapshot: &QuotaSnapshot,
     candidates: &[usize],
 ) -> usize {
+    let live_loads = live_loads_for_model(model, state);
     if candidates_have_windows(snapshot, candidates) {
         score_by_density(
             model,
@@ -214,9 +191,10 @@ fn score_routing_candidates(
             &snapshot.quotas,
             &snapshot.windows,
             candidates,
+            live_loads.as_slice(),
         )
     } else {
-        score_by_invocation_count(model, state, candidates)
+        score_by_invocation_count(model, state, candidates, live_loads.as_slice())
     }
 }
 
@@ -228,7 +206,7 @@ fn candidates_have_windows(snapshot: &QuotaSnapshot, candidates: &[usize]) -> bo
 
 #[cfg(test)]
 #[rustfmt::skip]
-pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 15] {
+pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 18] {
     macro_rules! source {
         ($path:literal, $file:literal) => { ($path, production_balancer_source($path, include_str!($file))) };
     }
@@ -243,6 +221,9 @@ pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 15
         source!("crates/oulipoly-runtime/src/balancer/density.rs", "density.rs"),
         source!("crates/oulipoly-runtime/src/balancer/density/trace.rs", "density/trace.rs"),
         source!("crates/oulipoly-runtime/src/balancer/invocation_fallback.rs", "invocation_fallback.rs"),
+        source!("crates/oulipoly-runtime/src/balancer/live_load.rs", "live_load.rs"),
+        source!("crates/oulipoly-runtime/src/balancer/placement_pin.rs", "placement_pin.rs"),
+        source!("crates/oulipoly-runtime/src/balancer/routing_error.rs", "routing_error.rs"),
         source!("crates/oulipoly-runtime/src/balancer/eligibility.rs", "eligibility.rs"),
         source!("crates/oulipoly-runtime/src/balancer/context.rs", "context.rs"),
         source!("crates/oulipoly-runtime/src/balancer/snapshot.rs", "snapshot.rs"),

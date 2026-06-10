@@ -123,6 +123,7 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
             model: &carrier_model,
             state: &state,
             ctx: None,
+            provider_pin: None,
         })
         .map_err(|error| error.to_string())?
         .provider_index;

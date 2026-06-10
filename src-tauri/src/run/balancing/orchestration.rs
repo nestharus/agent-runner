@@ -64,9 +64,49 @@ pub(crate) fn run_with_balancing(
         all_models,
         working_dir,
         extra_inputs,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_balancing_with_pin(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    state_db_opener: &dyn StateDbOpener,
+    model: &ModelConfig,
+    prompt: &str,
+    all_models: &HashMap<String, ModelConfig>,
+    models_dir: &Path,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    provider_pin: Option<&str>,
+) -> Result<i32, String> {
+    if provider_pin.is_none() {
+        return run_with_balancing(
+            agent_runtime_services,
+            state_db_opener,
+            model,
+            prompt,
+            all_models,
+            models_dir,
+            working_dir,
+            extra_inputs,
+        );
+    }
+    let mut env = load_balanced_execution_environment(state_db_opener)?;
+    env.models_dir = models_dir.to_path_buf();
+    run_with_balancing_environment(
+        agent_runtime_services,
+        env,
+        model,
+        prompt,
+        all_models,
+        working_dir,
+        extra_inputs,
+        provider_pin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_with_balancing_environment(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     env: BalancedExecutionEnvironment,
@@ -75,6 +115,7 @@ fn run_with_balancing_environment(
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
+    provider_pin: Option<&str>,
 ) -> Result<i32, String> {
     let in_flight = oulipoly_runtime::quota::InFlight::new();
     let ctx = super::mapper::balance_context(&env.providers_cfg, &env.sessions_cfg, &in_flight);
@@ -106,6 +147,7 @@ fn run_with_balancing_environment(
             &ctx,
             attempts,
             pending_verification.as_ref(),
+            provider_pin,
         )?;
         let provider_index = attempt_provider.provider_index;
         let provider = attempt_provider.provider;
@@ -200,6 +242,7 @@ fn resolve_balanced_attempt_provider(
     ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
     attempts: usize,
     pending_verification: Option<&(usize, Option<String>)>,
+    provider_pin: Option<&str>,
 ) -> Result<BalancedAttemptProvider, String> {
     let provider_index = attempt_provider_index(
         agent_runtime_services,
@@ -208,6 +251,7 @@ fn resolve_balanced_attempt_provider(
         ctx,
         attempts,
         pending_verification,
+        provider_pin,
     )?;
     let (provider, prompt_mode) = attempt_effective_provider(model, env, provider_index)?;
     Ok(BalancedAttemptProvider {
@@ -224,12 +268,18 @@ fn attempt_provider_index(
     ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
     attempts: usize,
     pending_verification: Option<&(usize, Option<String>)>,
+    provider_pin: Option<&str>,
 ) -> Result<usize, String> {
     match pending_verification {
         Some((provider_index, _)) => Ok(*provider_index),
-        None => {
-            select_provider_index_for_new_attempt(agent_runtime_services, model, env, ctx, attempts)
-        }
+        None => select_provider_index_for_new_attempt(
+            agent_runtime_services,
+            model,
+            env,
+            ctx,
+            attempts,
+            provider_pin,
+        ),
     }
 }
 
@@ -239,8 +289,9 @@ fn select_provider_index_for_new_attempt(
     env: &BalancedExecutionEnvironment,
     ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
     attempts: usize,
+    provider_pin: Option<&str>,
 ) -> Result<usize, String> {
-    match select_balanced_provider_index(agent_runtime_services, model, env, ctx) {
+    match select_balanced_provider_index(agent_runtime_services, model, env, ctx, provider_pin) {
         Ok(provider_index) => Ok(provider_index),
         Err(err) => {
             formatter::emit_provider_selection_pre_invocation_failure(
@@ -612,11 +663,15 @@ fn select_balanced_provider_index(
     model: &ModelConfig,
     env: &BalancedExecutionEnvironment,
     ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
+    provider_pin: Option<&str>,
 ) -> Result<usize, String> {
     agent_runtime_services
         .routing_service
         .select_route(super::mapper::routing_service_request(
-            model, &env.state, ctx,
+            model,
+            &env.state,
+            ctx,
+            provider_pin,
         ))
         .map(|route| route.provider_index)
         .map_err(|err| err.to_string())
@@ -632,7 +687,7 @@ fn exhausted_attempt_reason(
         .routing_service
         // routing_service.select_route(RoutingServiceRequest { ctx: Some(
         .select_route(super::mapper::routing_service_request(
-            model, &env.state, ctx,
+            model, &env.state, ctx, None,
         )) {
         Err(err) => Some(err.to_string()),
         Ok(_) => None,

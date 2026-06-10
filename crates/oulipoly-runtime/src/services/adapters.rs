@@ -147,10 +147,11 @@ impl RoutingServicePort for ProductionRoutingService {
         request: RoutingServiceRequest<'_>,
     ) -> Result<RoutingServiceOutput, ServiceError> {
         Ok(RoutingServiceOutput {
-            provider_index: crate::balancer::select_provider(
+            provider_index: crate::balancer::select_provider_with_pin(
                 request.model,
                 request.state,
                 request.ctx,
+                request.provider_pin,
             )
             .map_err(|error| ServiceError::Unavailable {
                 message: error.to_string(),

@@ -48,6 +48,7 @@ fn finite_fanout_fields_filter_nonfinite_values() {
             worst_projected_used: Some(f64::NAN),
             soonest_reset_hours: Some(f64::INFINITY),
         }),
+        live_load: 0,
     };
 
     assert_eq!(finite_fanout_usage(&eval), None);
@@ -74,6 +75,7 @@ fn select_binding_score_with_fanout_uses_argmax_escape_branches() {
                 worst_projected_used: Some(0.90),
                 soonest_reset_hours: Some(12.0),
             }),
+            live_load: 0,
         },
         provider_eval_with_fanout_usage(1, 2.0, Some(0.10), Some(1.0)),
     ];

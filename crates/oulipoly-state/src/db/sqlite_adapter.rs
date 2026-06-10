@@ -23,6 +23,7 @@
 pub(super) use rusqlite::OptionalExtension as RusqliteOptionalExtension;
 pub(super) use rusqlite::ffi;
 pub(super) use rusqlite::params;
+pub(super) use rusqlite::params_from_iter;
 pub(super) use rusqlite::{
     Connection, Error, OpenFlags, Result, Row, Statement, Transaction, types::Type,
 };

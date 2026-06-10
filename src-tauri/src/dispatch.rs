@@ -629,6 +629,38 @@ mod tests {
     }
 
     #[test]
+    fn top_level_fresh_run_parses_pin_provider() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--model",
+            "fixture",
+            "--pin-provider",
+            "provider2",
+            "ping",
+        ])
+        .unwrap();
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.pin_provider.as_deref(), Some("provider2"));
+        assert_eq!(cli.model.as_deref(), Some("fixture"));
+    }
+
+    #[test]
+    fn top_level_pin_provider_conflicts_with_rotate_provider() {
+        let err = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--pin-provider",
+            "provider2",
+            "--rotate-provider",
+            "provider3",
+            "ping",
+        ])
+        .unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn parser_accepts_long_new() {
         let cli = Cli::try_parse_from(["oulipoly-agent-runner", "--new"]).unwrap();
 

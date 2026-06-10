@@ -22,6 +22,7 @@ pub(super) struct ProviderEval {
     pub(super) binding_score: Option<f64>,
     pub(super) unlearned: bool,
     pub(super) fanout_usage: Option<FanoutUsageKey>,
+    pub(super) live_load: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -36,33 +37,41 @@ pub(super) fn score_by_density(
     quotas: &[Option<QuotaRecord>],
     windows: &[Vec<QuotaWindow>],
     candidates: &[usize],
+    live_loads: &[u64],
 ) -> usize {
     let projections =
         compute_projections_from_records(model, state, quotas, windows, candidates, Utc::now());
-    let evals = provider_evals_from_projections(projections.as_slice());
+    let evals = provider_evals_from_projections(projections.as_slice(), live_loads);
     let eligible = density_eligible_evals(evals.as_slice());
 
     if eligible.is_empty() {
-        return round_robin_fallback(model, state, candidates);
+        return round_robin_fallback(model, state, candidates, live_loads);
     }
 
     select_binding_score_with_fanout(model, &eligible)
 }
 
-fn provider_evals_from_projections(projections: &[ProviderProjection]) -> Vec<ProviderEval> {
+fn provider_evals_from_projections(
+    projections: &[ProviderProjection],
+    live_loads: &[u64],
+) -> Vec<ProviderEval> {
     projections
         .iter()
-        .map(provider_eval_from_projection)
+        .map(|projection| provider_eval_from_projection(projection, live_loads))
         .collect()
 }
 
-fn provider_eval_from_projection(projection: &ProviderProjection) -> ProviderEval {
+fn provider_eval_from_projection(
+    projection: &ProviderProjection,
+    live_loads: &[u64],
+) -> ProviderEval {
     ProviderEval {
         index: projection.provider_index,
         binding_score: projection.binding_score,
         unlearned: projection.binding_score.is_none()
             && projection.recent_error_count < ERROR_THRESHOLD as u32,
         fanout_usage: Some(fanout_usage_key(projection)),
+        live_load: super::live_load::live_load_at(live_loads, projection.provider_index),
     }
 }
 
@@ -215,7 +224,10 @@ fn fanout_reset_or_index_order(a: &ProviderEval, b: &ProviderEval) -> std::cmp::
             .unwrap_or(std::cmp::Ordering::Equal),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        _ => a.index.cmp(&b.index),
+        _ => a
+            .live_load
+            .cmp(&b.live_load)
+            .then_with(|| a.index.cmp(&b.index)),
     }
 }
 

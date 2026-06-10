@@ -27,6 +27,19 @@ pub(in crate::balancer::tests) fn record_invocation_for_test(
         .unwrap();
 }
 
+pub(in crate::balancer::tests) fn record_running_invocations_for_test(
+    db: &StateDb,
+    model_name: &str,
+    provider_name: &str,
+    provider_index: usize,
+    count: usize,
+) {
+    for _ in 0..count {
+        let start = invocation_start_for_test(model_name, provider_name, provider_index);
+        db.start_invocation(&start).unwrap();
+    }
+}
+
 pub(in crate::balancer::tests) fn invocation_start_for_test(
     model_name: &str,
     provider_name: &str,
@@ -55,6 +68,7 @@ pub(in crate::balancer::tests) fn provider_eval_with_fanout_usage(
             worst_projected_used,
             soonest_reset_hours,
         }),
+        live_load: 0,
     }
 }
 
