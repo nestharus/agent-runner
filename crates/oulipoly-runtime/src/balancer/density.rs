@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `mapper`, `filter`, `predicate`, `formatter`, `orchestration`.
+//! `mapper`, `filter`, `predicate`, `formatter`, `orchestration`, `validator`.
 
 mod trace;
 

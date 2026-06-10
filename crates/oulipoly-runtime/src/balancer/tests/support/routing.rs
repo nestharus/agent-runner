@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `validator`.
+//! `accessor`, `mapper`, `validator`, `orchestration`.
 
 use super::super::*;
 

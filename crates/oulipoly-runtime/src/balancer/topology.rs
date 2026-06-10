@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `predicate`, `mapper`, `orchestration`, `accessor`.
+//! `predicate`, `mapper`, `orchestration`, `accessor`, `formatter`.
 //!
 //! ## Component declared roles
 //! component_declared_roles:
@@ -10,6 +10,17 @@
 //!     - mapper
 //!     - orchestration
 //!     - accessor
+//!     - formatter
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/topology.rs::quota_snapshot_topology_adapter
+//!     role: adapter
+//!     Translates:
+//!       - quota refresh and snapshot state into topology repair decisions
+//! ```
 
 use super::BalanceContext;
 use super::projection::live_window_count;

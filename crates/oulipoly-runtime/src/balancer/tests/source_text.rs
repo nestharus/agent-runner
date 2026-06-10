@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `parser, predicate, filter, accessor`.
+//! `parser`, `predicate`, `filter`, `accessor`, `validator`, `mapper`.
 
 pub(in crate::balancer::tests) fn assert_age225_b4_balancer_modules_are_declared(
     guard_name: &str,

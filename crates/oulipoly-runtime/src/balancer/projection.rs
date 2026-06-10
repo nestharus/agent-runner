@@ -1,6 +1,16 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `mapper`, `accessor`, `predicate`, `filter`.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/projection.rs::window_projection_adapter
+//!     role: adapter
+//!     Translates:
+//!       - window helper calculations into provider projection scores
+//! ```
 
 mod window;
 

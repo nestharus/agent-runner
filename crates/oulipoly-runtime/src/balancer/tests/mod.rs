@@ -1,6 +1,16 @@
 //! ## Declared roles
 //!
 //! `orchestration`.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/tests/mod.rs::balancer_test_harness_adapter
+//!     role: adapter
+//!     Translates:
+//!       - balancer test module inventory into shared config and support fixtures
+//! ```
 
 use super::*;
 use crate::quota::InFlight;

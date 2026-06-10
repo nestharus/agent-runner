@@ -1,6 +1,16 @@
 //! ## Declared roles
 //!
-//! `mapper`, `accessor`, `validator`.
+//! `mapper`, `accessor`, `validator`, `orchestration`, `formatter`.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/tests/support/common.rs::balancer_state_fixture_adapter
+//!     role: adapter
+//!     Translates:
+//!       - balancer test fixture setup into StateDb and provider config rows
+//! ```
 
 use super::super::*;
 

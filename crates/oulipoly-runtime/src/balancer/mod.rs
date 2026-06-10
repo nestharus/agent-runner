@@ -3,6 +3,20 @@
 //! `orchestration`, `filter`, `predicate`, `mapper`, `accessor`, `formatter`, `validator`,
 //! `parser`.
 //!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::public_balancer_hub_adapter
+//!     role: adapter
+//!     Translates:
+//!       - public balancer API re-exports into internal routing concern modules
+//!   - component: crates/oulipoly-runtime/src/balancer/mod.rs::test_support_surface_adapter
+//!     role: adapter
+//!     Translates:
+//!       - balancer unit-test support re-exports into internal helper modules
+//! ```
+//!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
 //!   - component: crates/oulipoly-runtime/src/balancer/context.rs::balance_context_surface

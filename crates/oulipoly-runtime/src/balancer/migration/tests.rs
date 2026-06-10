@@ -1,6 +1,16 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`.
+//! `orchestration`, `mapper`, `validator`.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/migration/tests.rs::migration_decision_fixture_adapter
+//!     role: adapter
+//!     Translates:
+//!       - migration decision fixtures into config, projection, and state assertions
+//! ```
 
 use super::super::projection::WindowProjection;
 use super::*;

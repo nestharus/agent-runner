@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `predicate`, `mapper`, `accessor`.
+//! `orchestration`, `predicate`, `mapper`, `accessor`, `validator`.
 
 mod target_selection;
 
