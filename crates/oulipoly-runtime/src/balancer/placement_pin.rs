@@ -4,6 +4,42 @@
 
 use super::routing_error::{RoutingError, pinned_provider_not_in_model_error};
 use oulipoly_config::ModelConfig;
+use std::ffi::OsString;
+
+pub(super) fn fresh_run_pin_provider() -> Option<String> {
+    pin_provider_from_args(std::env::args_os().skip(1))
+}
+
+fn pin_provider_from_args(args: impl IntoIterator<Item = OsString>) -> Option<String> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let text = arg.to_string_lossy();
+        if text == "--" {
+            return None;
+        }
+        if let Some(value) = text.strip_prefix("--pin-provider=") {
+            return nonempty_pin_value(value);
+        }
+        if text == "--pin-provider" {
+            return args.next().and_then(pin_value_from_os_string);
+        }
+    }
+    None
+}
+
+fn pin_value_from_os_string(value: OsString) -> Option<String> {
+    value.into_string().ok().and_then(|value| {
+        if value.starts_with('-') {
+            None
+        } else {
+            nonempty_pin_value(&value)
+        }
+    })
+}
+
+fn nonempty_pin_value(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
 
 pub(super) fn select_pinned_provider(
     model: &ModelConfig,
@@ -46,5 +82,38 @@ fn pinned_provider_ineligible_error(model: &ModelConfig, target_provider: &str) 
     RoutingError::PinnedProviderIneligible {
         model_name: model.name.clone(),
         target_provider: target_provider.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parses_space_separated_pin_provider() {
+        assert_eq!(
+            pin_provider_from_args(args(&["--model", "fixture", "--pin-provider", "provider2"])),
+            Some("provider2".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_equals_pin_provider() {
+        assert_eq!(
+            pin_provider_from_args(args(&["--pin-provider=provider2"])),
+            Some("provider2".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_prompt_separator_tail() {
+        assert_eq!(
+            pin_provider_from_args(args(&["--", "--pin-provider", "provider2"])),
+            None
+        );
     }
 }

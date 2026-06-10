@@ -122,7 +122,7 @@ use density::{
 use eligibility::eligible_provider_indices;
 use invocation_fallback::score_by_invocation_count;
 use live_load::live_loads_for_model;
-use placement_pin::select_pinned_provider;
+use placement_pin::{fresh_run_pin_provider, select_pinned_provider};
 use refresh_inputs::refresh_routing_inputs;
 use routing_error::all_providers_quota_exhausted_error;
 use snapshot::{QuotaSnapshot, load_quota_snapshot};
@@ -146,7 +146,8 @@ pub fn select_provider(
     state: &StateDb,
     ctx: Option<&BalanceContext<'_>>,
 ) -> Result<usize, RoutingError> {
-    select_provider_with_pin(model, state, ctx, None)
+    let provider_pin = fresh_run_pin_provider();
+    select_provider_with_pin(model, state, ctx, provider_pin.as_deref())
 }
 
 pub fn select_provider_with_pin(

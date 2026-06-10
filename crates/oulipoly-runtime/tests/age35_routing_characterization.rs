@@ -1,9 +1,5 @@
 #![cfg(unix)]
 
-//! ## Declared roles
-//!
-//! `orchestration`, `mapper`, `formatter`, `accessor`, `validator`, `predicate`.
-
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig, SessionSourceEntry,
@@ -536,7 +532,6 @@ fn select_service_with_context(harness: &RouteHarness) -> usize {
             model: &harness.model,
             state: &harness.db,
             ctx: Some(&ctx),
-            provider_pin: None,
         })
         .unwrap()
         .provider_index
@@ -548,7 +543,6 @@ fn select_service_cached(model: &ModelConfig, db: &StateDb) -> usize {
             model,
             state: db,
             ctx: None,
-            provider_pin: None,
         })
         .unwrap()
         .provider_index

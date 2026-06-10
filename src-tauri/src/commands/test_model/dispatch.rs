@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `orchestration`
+//! `accessor`
 
 use oulipoly_config::ModelConfig;
 use oulipoly_runtime::executor::ExecutionResult;
@@ -21,7 +21,6 @@ pub(crate) fn select_test_model_route(
             model,
             state: db,
             ctx: None,
-            provider_pin: None,
         })
         .map(|output| output.provider_index)
         .map_err(|error| error.to_string())

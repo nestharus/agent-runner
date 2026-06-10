@@ -125,13 +125,11 @@ pub(super) fn routing_service_request<'a>(
     model: &'a ModelConfig,
     state: &'a StateDb,
     ctx: &'a balancer::BalanceContext<'a>,
-    provider_pin: Option<&'a str>,
 ) -> RoutingServiceRequest<'a> {
     RoutingServiceRequest {
         model,
         state,
         ctx: Some(ctx),
-        provider_pin,
     }
 }
 

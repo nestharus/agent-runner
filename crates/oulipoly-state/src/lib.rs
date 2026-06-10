@@ -15,6 +15,7 @@ mod db;
 pub mod deployment;
 pub mod invocation_marker;
 mod lifecycle_log;
+mod live_load_query;
 pub mod mailbox;
 pub mod migrations;
 pub mod paths;

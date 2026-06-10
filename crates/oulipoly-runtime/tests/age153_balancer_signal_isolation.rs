@@ -1,7 +1,3 @@
-//! ## Declared roles
-//!
-//! `orchestration`, `parser`, `predicate`, `filter`, `formatter`, `mapper`.
-
 use chrono::{Duration, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
 use oulipoly_runtime::services::{
@@ -423,7 +419,6 @@ fn production_routing_service_skips_provider_after_existing_exhausted_write_path
             model: &model,
             state: &db,
             ctx: None,
-            provider_pin: None,
         })
         .unwrap();
 
@@ -444,7 +439,6 @@ fn production_routing_service_reports_all_exhausted_after_existing_exhausted_wri
             model: &model,
             state: &db,
             ctx: None,
-            provider_pin: None,
         })
         .unwrap_err();
 

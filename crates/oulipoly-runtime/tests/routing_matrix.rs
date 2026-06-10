@@ -1,7 +1,3 @@
-//! ## Declared roles
-//!
-//! `orchestration`, `mapper`, `formatter`, `predicate`.
-
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_config::{ModelConfig, ProviderConfig, model::PromptMode};
 use oulipoly_runtime::services::{
@@ -93,29 +89,15 @@ fn reset_at(kind: WindowKind, proximity: RefreshProximity) -> DateTime<Utc> {
 }
 
 fn seed_windows(db: &StateDb, provider_name: &str, windows: &[WindowFixture], case_label: &str) {
-    let inputs = quota_window_inputs(windows);
+    let inputs: Vec<_> = windows
+        .iter()
+        .map(|window| QuotaWindowInput {
+            used_percent: remaining_to_used(window.remaining_pct),
+            resets_at: reset_at(window.kind, window.proximity),
+        })
+        .collect();
     db.upsert_quota_refresh(provider_name, &inputs)
         .unwrap_or_else(|err| panic!("case={case_label}: failed to seed {provider_name}: {err}"));
-    seed_window_deltas(db, provider_name, windows, case_label);
-}
-
-fn quota_window_inputs(windows: &[WindowFixture]) -> Vec<QuotaWindowInput> {
-    windows.iter().map(quota_window_input).collect()
-}
-
-fn quota_window_input(window: &WindowFixture) -> QuotaWindowInput {
-    QuotaWindowInput {
-        used_percent: remaining_to_used(window.remaining_pct),
-        resets_at: reset_at(window.kind, window.proximity),
-    }
-}
-
-fn seed_window_deltas(
-    db: &StateDb,
-    provider_name: &str,
-    windows: &[WindowFixture],
-    case_label: &str,
-) {
     for (window_id, window) in windows.iter().enumerate() {
         db.set_window_delta_for_test(
             provider_name,
@@ -283,38 +265,22 @@ fn seed_assistant_turns_since_refresh(
                 )
             });
     }
-    let turns = assistant_turn_ingests(provider_name, count, refreshed_at);
+    let turns: Vec<_> = (0..count)
+        .map(|i| SessionTurnIngest {
+            session_id: format!("{provider_name}-session"),
+            turn_id: format!("{provider_name}-turn-{i}"),
+            timestamp: refreshed_at + Duration::seconds((i + 1) as i64),
+            role: "assistant".to_string(),
+            parent_turn_id: None,
+            is_sidechain: false,
+            is_compaction_boundary: false,
+            body: None,
+        })
+        .collect();
     db.ingest_session_turns_batch(provider_name, &turns)
         .unwrap_or_else(|err| {
             panic!("case={case_label}: failed to seed assistant turns for {provider_name}: {err}")
         });
-}
-
-fn assistant_turn_ingests(
-    provider_name: &str,
-    count: usize,
-    refreshed_at: DateTime<Utc>,
-) -> Vec<SessionTurnIngest> {
-    (0..count)
-        .map(|i| assistant_turn_ingest(provider_name, i, refreshed_at))
-        .collect()
-}
-
-fn assistant_turn_ingest(
-    provider_name: &str,
-    index: usize,
-    refreshed_at: DateTime<Utc>,
-) -> SessionTurnIngest {
-    SessionTurnIngest {
-        session_id: format!("{provider_name}-session"),
-        turn_id: format!("{provider_name}-turn-{index}"),
-        timestamp: refreshed_at + Duration::seconds((index + 1) as i64),
-        role: "assistant".to_string(),
-        parent_turn_id: None,
-        is_sidechain: false,
-        is_compaction_boundary: false,
-        body: None,
-    }
 }
 
 fn seed_refresh_proximity_case(
@@ -384,7 +350,13 @@ fn record_successful_invocation(
     case_label: &str,
 ) {
     let id = db
-        .start_invocation(&invocation_start(model, provider_name, provider_index))
+        .start_invocation(&InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: model.name.clone(),
+            provider_name: provider_name.to_string(),
+            provider_index,
+            parent_invocation_id: None,
+        })
         .unwrap_or_else(|err| {
             panic!("case={case_label}: failed to start invocation for {provider_name}: {err}")
         });
@@ -392,20 +364,6 @@ fn record_successful_invocation(
         .unwrap_or_else(|err| {
             panic!("case={case_label}: failed to finalize invocation for {provider_name}: {err}")
         });
-}
-
-fn invocation_start(
-    model: &ModelConfig,
-    provider_name: &str,
-    provider_index: usize,
-) -> InvocationStart {
-    InvocationStart {
-        invocation_uuid: Uuid::new_v4().to_string(),
-        model_name: model.name.clone(),
-        provider_name: provider_name.to_string(),
-        provider_index,
-        parent_invocation_id: None,
-    }
 }
 
 fn assert_route_winner(
@@ -419,7 +377,6 @@ fn assert_route_winner(
             model,
             state: db,
             ctx: None,
-            provider_pin: None,
         })
         .unwrap_or_else(|err| panic!("case={case_label}: select_route failed: {err}"));
     let winner_name = model
@@ -819,7 +776,6 @@ async fn production_service_reports_all_quota_exhausted_pool() {
             model: &model,
             state: &db,
             ctx: None,
-            provider_pin: None,
         })
         .unwrap_err();
 

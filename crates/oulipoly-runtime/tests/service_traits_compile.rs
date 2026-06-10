@@ -1,7 +1,3 @@
-//! ## Declared roles
-//!
-//! `orchestration`, `mapper`.
-
 use oulipoly_config::{ModelConfig, PromptMode, SessionsConfig};
 use oulipoly_runtime::services::error::ServiceError;
 use oulipoly_runtime::services::*;
@@ -222,7 +218,6 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
         model: &model,
         state: &db,
         ctx: None,
-        provider_pin: None,
     };
     let lifecycle_start = InvocationLifecycleStartRequest {
         state: &db,

@@ -18,4 +18,4 @@ mod state_update;
 mod validator;
 
 pub(crate) use diagnostics::balanced_result_error_category;
-pub(crate) use orchestration::run_with_balancing_with_pin;
+pub(crate) use orchestration::run_with_balancing;

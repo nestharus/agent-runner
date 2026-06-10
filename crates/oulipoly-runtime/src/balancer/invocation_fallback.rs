@@ -37,35 +37,15 @@ fn invocation_count_score(
     state: &StateDb,
     provider_index: usize,
 ) -> (usize, f64) {
-    let signals = fallback_provider_signals(model, state, provider_index);
-    if fallback_provider_is_suppressed(signals.recent_errors) {
+    let recent_errors = fallback_recent_error_count(model, state, provider_index);
+    if fallback_provider_is_suppressed(recent_errors) {
         return (provider_index, f64::MAX);
     }
 
-    fallback_score_tuple(provider_index, signals)
-}
-
-#[derive(Copy, Clone)]
-struct FallbackProviderSignals {
-    recent_errors: i64,
-    invocation_count: i64,
-}
-
-fn fallback_provider_signals(
-    model: &ModelConfig,
-    state: &StateDb,
-    provider_index: usize,
-) -> FallbackProviderSignals {
-    FallbackProviderSignals {
-        recent_errors: fallback_recent_error_count(model, state, provider_index),
-        invocation_count: fallback_invocation_count(model, state, provider_index),
-    }
-}
-
-fn fallback_score_tuple(provider_index: usize, signals: FallbackProviderSignals) -> (usize, f64) {
     (
         provider_index,
-        signals.invocation_count as f64 + fallback_error_penalty(signals.recent_errors),
+        fallback_invocation_count(model, state, provider_index) as f64
+            + fallback_error_penalty(recent_errors),
     )
 }
 
@@ -149,47 +129,21 @@ fn round_robin_invocation_counts(
 }
 
 fn select_lowest_invocation_count(counts: &[(usize, i64)], live_loads: &[u64]) -> usize {
-    let mut best = initial_invocation_candidate(counts);
-    let mut min_count = initial_invocation_count();
+    let mut min_count = i64::MAX;
+    let mut best = counts
+        .first()
+        .map(|(provider_index, _)| *provider_index)
+        .unwrap_or(0);
 
     for &(provider_index, count) in counts {
-        if invocation_candidate_is_better(provider_index, count, best, min_count, live_loads) {
+        if count < min_count
+            || (count == min_count
+                && live_load_then_index_order(provider_index, best, live_loads).is_lt())
+        {
             min_count = count;
             best = provider_index;
         }
     }
 
     best
-}
-
-fn initial_invocation_candidate(counts: &[(usize, i64)]) -> usize {
-    counts
-        .first()
-        .map(|(provider_index, _)| *provider_index)
-        .unwrap_or(0)
-}
-
-fn initial_invocation_count() -> i64 {
-    i64::MAX
-}
-
-fn invocation_candidate_is_better(
-    provider_index: usize,
-    count: i64,
-    best: usize,
-    min_count: i64,
-    live_loads: &[u64],
-) -> bool {
-    count < min_count
-        || invocation_candidate_wins_tie(provider_index, count, best, min_count, live_loads)
-}
-
-fn invocation_candidate_wins_tie(
-    provider_index: usize,
-    count: i64,
-    best: usize,
-    min_count: i64,
-    live_loads: &[u64],
-) -> bool {
-    count == min_count && live_load_then_index_order(provider_index, best, live_loads).is_lt()
 }
