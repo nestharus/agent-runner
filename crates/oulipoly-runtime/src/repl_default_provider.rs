@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `orchestration`, `validator`, `formatter`, `filter`, `predicate`
+
 use crate::services::{ProductionRoutingService, RoutingServicePort, RoutingServiceRequest};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};

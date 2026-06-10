@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`
+//! `accessor`, `mapper`, `orchestration`
 
 use oulipoly_config::ModelConfig;
 use oulipoly_runtime::executor::ExecutionResult;
