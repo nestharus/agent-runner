@@ -439,6 +439,7 @@ fn execute_resume_attempt_command(
             strategy: strategy.expect("legacy resume target must have a resume strategy"),
         },
         input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
+        Some(&input.env.models_dir),
     )
 }
 
@@ -459,6 +460,7 @@ fn provider_ref_resume_executor_request(
             prompt_mode,
             prompt: input.answer.unwrap_or_default().to_string(),
             working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
+            models_dir: Some(input.env.models_dir.clone()),
             extra_inputs: HashMap::new(),
             parent_invocation_env: Some(invocation_env.to_string()),
             start_known_provider_session_id: input.resolved.active_session_id.clone(),

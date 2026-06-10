@@ -167,6 +167,7 @@ fn interactive_spawn_identity_context(
         resume_session_id,
         SpawnRuntimeMode::PtyInteractive,
         working_dir,
+        None,
     )
 }
 

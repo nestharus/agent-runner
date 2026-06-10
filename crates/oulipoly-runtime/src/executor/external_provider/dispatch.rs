@@ -171,6 +171,7 @@ fn external_launch_spawn_identity_context(
         context.start_known_provider_session_id.as_deref(),
         SpawnRuntimeMode::Headless,
         context.working_dir.as_deref(),
+        context.models_dir.as_deref(),
     )
 }
 

@@ -339,6 +339,12 @@ fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
     });
 
     assert_success(&output);
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let expected_models_dir = path_string(&fixture.models_dir);
+    assert_eq!(
+        runtime.models_dir.as_deref(),
+        Some(expected_models_dir.as_str())
+    );
     wait_until("legacy opencode delivery marked delivered", || {
         let db = fixture.mailbox();
         let rows = db.list_mailbox(SESSION, true).unwrap();

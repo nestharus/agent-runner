@@ -572,6 +572,7 @@ fn age230_forced_flag_readback_mismatch_uses_requested_observed_evidence() {
             prompt_mode: PromptMode::Arg,
             prompt: "prompt",
             working_dir: None,
+            models_dir: None,
             extra_inputs: &extra_inputs,
             parent_invocation_env: None,
         },

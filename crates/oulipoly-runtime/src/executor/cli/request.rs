@@ -26,6 +26,7 @@ pub struct EffectiveExecuteRequest<'a> {
     pub prompt_mode: PromptMode,
     pub prompt: &'a str,
     pub working_dir: Option<&'a Path>,
+    pub models_dir: Option<&'a Path>,
     pub extra_inputs: &'a HashMap<String, Vec<String>>,
     pub parent_invocation_env: Option<&'a str>,
 }

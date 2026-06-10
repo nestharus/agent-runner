@@ -221,6 +221,7 @@ fn diagnostic_execute_request<'a>(
         prompt_mode,
         prompt,
         working_dir,
+        models_dir: None,
         extra_inputs,
         parent_invocation_env: None,
     }

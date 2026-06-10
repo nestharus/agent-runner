@@ -23,6 +23,7 @@ pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) prompt: String,
     pub(crate) extra_inputs: HashMap<String, Vec<String>>,
     pub(crate) working_dir: Option<PathBuf>,
+    pub(crate) models_dir: Option<PathBuf>,
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
     pub(crate) settings_id: String,
@@ -37,6 +38,7 @@ pub(crate) struct ExternalProviderDispatchInput {
     pub(crate) prompt: String,
     pub(crate) extra_inputs: HashMap<String, Vec<String>>,
     pub(crate) working_dir: Option<PathBuf>,
+    pub(crate) models_dir: Option<PathBuf>,
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
 }
@@ -52,6 +54,7 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             prompt: input.prompt,
             extra_inputs: input.extra_inputs,
             working_dir: input.working_dir,
+            models_dir: input.models_dir,
             parent_invocation_env: input.parent_invocation_env,
             start_known_provider_session_id: input.start_known_provider_session_id,
             settings_id,

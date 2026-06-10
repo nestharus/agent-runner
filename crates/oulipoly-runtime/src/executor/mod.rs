@@ -183,6 +183,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             provider_index,
             prompt,
             working_dir,
+            models_dir: _,
             extra_inputs,
             parent_invocation_env,
         } => cli::execute(
@@ -200,6 +201,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             prompt_mode,
             prompt,
             working_dir,
+            models_dir,
             extra_inputs,
             parent_invocation_env,
         } => cli::execute_effective(cli::EffectiveExecuteRequest {
@@ -209,6 +211,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             prompt_mode,
             prompt: &prompt,
             working_dir: working_dir.as_deref(),
+            models_dir: models_dir.as_deref(),
             extra_inputs: &extra_inputs,
             parent_invocation_env: parent_invocation_env.as_deref(),
         }),
@@ -219,6 +222,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             prompt_mode,
             prompt,
             working_dir,
+            models_dir,
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
@@ -230,6 +234,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
                 prompt_mode,
                 prompt: &prompt,
                 working_dir: working_dir.as_deref(),
+                models_dir: models_dir.as_deref(),
                 extra_inputs: &extra_inputs,
                 parent_invocation_env: parent_invocation_env.as_deref(),
             },
@@ -256,6 +261,7 @@ fn external_provider_context_from_request(
             provider_index,
             prompt,
             working_dir,
+            models_dir,
             extra_inputs,
             parent_invocation_env,
         } => {
@@ -269,6 +275,7 @@ fn external_provider_context_from_request(
                 prompt,
                 extra_inputs,
                 working_dir,
+                models_dir,
                 parent_invocation_env,
                 start_known_provider_session_id: None,
             }
@@ -281,6 +288,7 @@ fn external_provider_context_from_request(
             prompt_mode,
             prompt,
             working_dir,
+            models_dir,
             extra_inputs,
             parent_invocation_env,
         } => ExternalProviderDispatchInput {
@@ -291,6 +299,7 @@ fn external_provider_context_from_request(
             prompt,
             extra_inputs,
             working_dir,
+            models_dir,
             parent_invocation_env,
             start_known_provider_session_id: None,
         }
@@ -302,6 +311,7 @@ fn external_provider_context_from_request(
             prompt_mode,
             prompt,
             working_dir,
+            models_dir,
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
@@ -313,6 +323,7 @@ fn external_provider_context_from_request(
             prompt,
             extra_inputs,
             working_dir,
+            models_dir,
             parent_invocation_env,
             start_known_provider_session_id: Some(start_known_provider_session_id),
         }
@@ -380,6 +391,7 @@ pub fn execute(
             provider_index,
             prompt: prompt.to_string(),
             working_dir: working_dir.map(Path::to_path_buf),
+            models_dir: None,
             extra_inputs: HashMap::new(),
             parent_invocation_env: None,
         })
@@ -402,6 +414,7 @@ pub fn execute_with_inputs(
             provider_index,
             prompt: prompt.to_string(),
             working_dir: working_dir.map(Path::to_path_buf),
+            models_dir: None,
             extra_inputs: extra_inputs.clone(),
             parent_invocation_env: None,
         })
@@ -425,6 +438,7 @@ pub fn execute_with_inputs_and_env(
             provider_index,
             prompt: prompt.to_string(),
             working_dir: working_dir.map(Path::to_path_buf),
+            models_dir: None,
             extra_inputs: extra_inputs.clone(),
             parent_invocation_env: parent_invocation_env.map(str::to_string),
         })
@@ -444,6 +458,7 @@ pub fn execute_effective_with_inputs_and_env(
             prompt_mode: request.prompt_mode,
             prompt: request.prompt.to_string(),
             working_dir: request.working_dir.map(Path::to_path_buf),
+            models_dir: request.models_dir.map(Path::to_path_buf),
             extra_inputs: request.extra_inputs.clone(),
             parent_invocation_env: request.parent_invocation_env.map(str::to_string),
         })
@@ -598,6 +613,7 @@ printf 'ok\n'"#,
             prompt_mode: PromptMode::Arg,
             prompt: "chosen",
             working_dir: None,
+            models_dir: None,
             extra_inputs: &HashMap::new(),
             parent_invocation_env: None,
         })

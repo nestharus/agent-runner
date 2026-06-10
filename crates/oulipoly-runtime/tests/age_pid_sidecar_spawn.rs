@@ -99,6 +99,7 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
                 prompt_mode: PromptMode::Arg,
                 prompt: "hello".to_string(),
                 working_dir: None,
+                models_dir: None,
                 extra_inputs: HashMap::new(),
                 parent_invocation_env: Some(invocation_env),
             })
@@ -138,6 +139,7 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
     let data_home = dir.path().join("data");
     let app_data_dir = data_home.join("oulipoly-agent-runner");
     let sidecar_path = app_data_dir.join("pid-identity.db");
+    let models_dir = dir.path().join("explicit-models");
     let script = stdout_json_event_fixture_script(dir.path(), CAPTURED_SESSION_ID);
     let mut provider = fixture_provider(&script);
     provider.session_capture = Some(stdout_json_event_capture());
@@ -154,6 +156,7 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
                 prompt_mode: PromptMode::Arg,
                 prompt: "hello".to_string(),
                 working_dir: None,
+                models_dir: Some(models_dir.clone()),
                 extra_inputs: HashMap::new(),
                 parent_invocation_env: Some(invocation_env),
             })
@@ -185,6 +188,11 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
     assert_eq!(runtime.invocation_uuid.as_deref(), Some(INVOCATION_UUID));
     assert_eq!(runtime.provider_name.as_deref(), Some("fixture-provider"));
     assert_eq!(runtime.model_name.as_deref(), Some("fixture-model"));
+    let expected_models_dir = models_dir.to_string_lossy();
+    assert_eq!(
+        runtime.models_dir.as_deref(),
+        Some(expected_models_dir.as_ref())
+    );
     assert_eq!(
         runtime.running_invocation_uuid.as_deref(),
         Some(INVOCATION_UUID)
@@ -233,6 +241,7 @@ fn stdout_json_event_capture_without_spawn_identity_does_not_backfill_sidecar() 
                 prompt_mode: PromptMode::Arg,
                 prompt: "hello".to_string(),
                 working_dir: None,
+                models_dir: None,
                 extra_inputs: HashMap::new(),
                 parent_invocation_env: None,
             })
@@ -275,6 +284,7 @@ fn spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child() {
                 prompt_mode: PromptMode::Arg,
                 prompt: "hello".to_string(),
                 working_dir: None,
+                models_dir: None,
                 extra_inputs: HashMap::new(),
                 parent_invocation_env: None,
             })
