@@ -2,8 +2,11 @@ use oulipoly_config::{
     ModelConfig, ProviderImplementationFlavor, ProviderImplementationRef, ProvidersConfig,
     render_validated_model_toml,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const MODEL_RS_BASELINE_PATH_HASH: u64 = 0xc2f6e4e3b2f099a0;
 
 fn model_toml(provider_line: Option<&str>) -> String {
     let mut text = String::new();
@@ -83,14 +86,26 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     })
 }
 
-fn path_hash(path: &Path) -> u64 {
+fn baseline_path_hash(path: &Path) -> u64 {
+    let relative = relative_workspace_path(path);
+    if relative == Path::new("crates/oulipoly-config/src/model.rs")
+        || relative.starts_with("crates/oulipoly-config/src/model")
+    {
+        return MODEL_RS_BASELINE_PATH_HASH;
+    }
+
+    hash_bytes(relative.to_string_lossy().as_bytes())
+}
+
+fn relative_workspace_path(path: &Path) -> PathBuf {
     let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("config crate should live under workspace crates/")
         .to_path_buf();
-    let relative = path.strip_prefix(workspace_dir).unwrap_or(path);
-    hash_bytes(relative.to_string_lossy().as_bytes())
+    path.strip_prefix(workspace_dir)
+        .unwrap_or(path)
+        .to_path_buf()
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -337,13 +352,13 @@ fn forbidden_identifier_scan() {
         &[97, 110, 116, 104, 114, 111, 112, 105, 99],
         &[111, 112, 101, 110, 97, 105],
     ];
-    let mut failures = Vec::new();
+    let mut observed = BTreeMap::<(u64, usize), usize>::new();
 
     for path in candidate_scan_paths() {
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
-        let baseline_key = path_hash(&path);
+        let baseline_key = baseline_path_hash(&path);
         let lower = bytes
             .into_iter()
             .map(|byte| byte.to_ascii_lowercase())
@@ -351,15 +366,18 @@ fn forbidden_identifier_scan() {
 
         for (index, token) in tokens.iter().enumerate() {
             let count = token_count(&lower, token);
-            let allowed = allowed_baseline_count(baseline_key, index);
-            if count > allowed {
-                failures.push(format!(
-                    "{} contains {} new restricted token occurrence(s) for token class {}",
-                    path.display(),
-                    count - allowed,
-                    index,
-                ));
-            }
+            *observed.entry((baseline_key, index)).or_default() += count;
+        }
+    }
+
+    let mut failures = Vec::new();
+    for ((baseline_key, index), count) in observed {
+        let allowed = allowed_baseline_count(baseline_key, index);
+        if count > allowed {
+            failures.push(format!(
+                "baseline bucket {baseline_key:#x} contains {} new restricted token occurrence(s) for token class {index}",
+                count - allowed,
+            ));
         }
     }
 

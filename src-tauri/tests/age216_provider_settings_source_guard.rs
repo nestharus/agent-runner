@@ -1,3 +1,7 @@
+//! ## Declared roles
+//! - Provider settings source guards that pin additive IPC behavior and prevent
+//!   accidental central config/runtime cutovers.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -111,7 +115,16 @@ fn settings_migration_packaging_is_read_only_and_separate_from_central_config_mi
 // risk: Migration mutating or interpreting central config; level: source guard; source: contract "S5 must not retire central config"
 #[test]
 fn s5_does_not_retire_central_provider_or_model_config_parsing() {
-    let model_source = read("../crates/oulipoly-config/src/model.rs");
+    let model_source = [
+        "../crates/oulipoly-config/src/model/mod.rs",
+        "../crates/oulipoly-config/src/model/model_config.rs",
+        "../crates/oulipoly-config/src/model/provider_config.rs",
+        "../crates/oulipoly-config/src/model/toml_io/mod.rs",
+    ]
+    .into_iter()
+    .map(read)
+    .collect::<Vec<_>>()
+    .join("\n");
     let providers_source = read("../crates/oulipoly-config/src/providers.rs");
     let tauri_source = [
         read("src/commands/models/reload.rs"),

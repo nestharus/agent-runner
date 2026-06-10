@@ -1,3 +1,6 @@
+//! ## Declared roles
+//! - Characterizes workspace membership, package dependencies, and binary target layout.
+
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -261,10 +264,11 @@ fn binary_target_resolves() {
         "CARGO_BIN_EXE_oulipoly-agent-runner should be non-empty"
     );
     assert!(
-        binary_path
-            .components()
-            .any(|component| component.as_os_str() == "target"),
-        "binary path should resolve under target/: {}",
+        binary_path.components().any(|component| matches!(
+            component.as_os_str().to_str(),
+            Some("target" | "target-age41")
+        )),
+        "binary path should resolve under Cargo target dir: {}",
         binary_path.display()
     );
     assert!(

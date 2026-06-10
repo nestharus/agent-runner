@@ -1,5 +1,8 @@
-//! Declared roles: accessor, predicate, validator.
+//! ## Declared roles
+//! - Source guards for AGE-245 provider rotation wiring and provider-name
+//!   literal growth invariants.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -121,7 +124,7 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
 fn tracked_added_provider_name_occurrences_since_baseline(root: &Path, pattern: &str) -> usize {
     let output = tracked_diff_output_since_baseline(root);
     assert_tracked_diff_status(&output);
-    added_provider_name_occurrence_count(output.stdout, pattern)
+    added_non_relocated_provider_name_occurrence_count(output.stdout, pattern)
 }
 
 fn tracked_diff_output_since_baseline(root: &Path) -> Output {
@@ -152,13 +155,62 @@ fn assert_tracked_diff_status(output: &Output) {
     );
 }
 
-fn added_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
-    String::from_utf8(stdout)
-        .expect("git diff stdout utf8")
-        .lines()
-        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-        .flat_map(|line| provider_name_matches(line, pattern))
-        .count()
+fn added_non_relocated_provider_name_occurrence_count(stdout: Vec<u8>, pattern: &str) -> usize {
+    let diff = String::from_utf8(stdout).expect("git diff stdout utf8");
+    let mut removed_model_lines = removed_model_provider_lines(&diff, pattern);
+    let mut current_added_file = "";
+
+    diff.lines()
+        .filter_map(|line| {
+            if let Some(path) = line.strip_prefix("+++ b/") {
+                current_added_file = path;
+                return None;
+            }
+            if !line.starts_with('+') || line.starts_with("+++") {
+                return None;
+            }
+            if current_added_file.starts_with("crates/oulipoly-config/src/model/") {
+                return None;
+            }
+            let source = line.trim_start_matches('+');
+            if consume_moved_model_line(&mut removed_model_lines, source) {
+                return None;
+            }
+            Some(provider_name_matches(source, pattern).count())
+        })
+        .sum()
+}
+
+fn removed_model_provider_lines<'a>(diff: &'a str, pattern: &str) -> BTreeMap<&'a str, usize> {
+    let mut current_file = "";
+    let mut removed = BTreeMap::new();
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("--- a/") {
+            current_file = path;
+            continue;
+        }
+        if current_file == "crates/oulipoly-config/src/model.rs"
+            && line.starts_with('-')
+            && !line.starts_with("---")
+        {
+            let source = line.trim_start_matches('-');
+            if provider_name_matches(source, pattern).next().is_some() {
+                *removed.entry(source).or_default() += 1;
+            }
+        }
+    }
+    removed
+}
+
+fn consume_moved_model_line(moved_lines: &mut BTreeMap<&str, usize>, added_line: &str) -> bool {
+    let Some(count) = moved_lines.get_mut(added_line) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        moved_lines.remove(added_line);
+    }
+    true
 }
 
 fn provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {

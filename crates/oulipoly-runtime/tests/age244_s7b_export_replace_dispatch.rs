@@ -1,3 +1,7 @@
+//! ## Declared roles
+//! - Source and service-level characterization for AGE-244 S7b session export
+//!   and replace dispatch through external provider boundaries.
+
 #![cfg(unix)]
 #![allow(dead_code)]
 

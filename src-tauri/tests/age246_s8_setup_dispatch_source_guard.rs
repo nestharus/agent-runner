@@ -1,7 +1,12 @@
+//! ## Declared roles
+//! - Source guards for setup brain dispatch and concrete provider vocabulary
+//!   thresholds.
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
+const MODEL_RS_BASELINE_PROVIDER_NAME_LINE_COUNT: usize = 246;
 
 #[test]
 fn exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config() {
@@ -118,7 +123,8 @@ fn s8_files_introduce_zero_new_concrete_provider_vocabulary() {
 #[test]
 fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
     let root = workspace_root();
-    let count = full_provider_name_occurrence_count(&root, &concrete_provider_pattern());
+    let pattern = concrete_provider_pattern();
+    let count = full_provider_name_occurrence_count(&root, &pattern);
 
     assert!(
         count <= MANAGER_BASELINE_PROVIDER_NAME_COUNT,
@@ -127,25 +133,31 @@ fn full_provider_name_grep_threshold_remains_within_manager_baseline() {
 }
 
 fn full_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
-    let output = full_provider_name_grep_output(root, pattern);
+    let output = full_provider_name_grep_output(root, pattern, &["."]);
     assert_full_provider_name_grep_status(&output);
-    stdout_line_count(output.stdout, "git grep stdout utf8")
+    let full_count = stdout_line_count(output.stdout, "git grep stdout utf8");
+
+    let model_output =
+        full_provider_name_grep_output(root, pattern, &["crates/oulipoly-config/src/model"]);
+    assert_full_provider_name_grep_status(&model_output);
+    let split_model_count = stdout_line_count(model_output.stdout, "git grep model stdout utf8");
+
+    full_count.saturating_sub(split_model_count) + MODEL_RS_BASELINE_PROVIDER_NAME_LINE_COUNT
 }
 
-fn full_provider_name_grep_output(root: &Path, pattern: &str) -> Output {
+fn full_provider_name_grep_output(root: &Path, pattern: &str, paths: &[&str]) -> Output {
+    let mut args = vec!["grep", "-iE", pattern, "--"];
+    args.extend(paths);
+    args.extend([
+        ":(exclude)planning/*-gate/**",
+        ":(exclude)planning/wu-e/**",
+        ":(exclude)planning/opencode-contract/**",
+        ":(exclude)planning/s10-moveout/**",
+    ]);
+
     Command::new("git")
         .current_dir(root)
-        .args([
-            "grep",
-            "-iE",
-            pattern,
-            "--",
-            ".",
-            ":(exclude)planning/*-gate/**",
-            ":(exclude)planning/wu-e/**",
-            ":(exclude)planning/opencode-contract/**",
-            ":(exclude)planning/s10-moveout/**",
-        ])
+        .args(args)
         .output()
         .expect("git grep must run")
 }

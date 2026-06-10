@@ -360,16 +360,66 @@ fn declaration_carriers_present_in_source() {
             "crates/oulipoly-config/src/sessions.rs",
             &["parser", "mapper", "accessor", "formatter", "predicate"][..],
         ),
+        ("crates/oulipoly-config/src/model/mod.rs", &["accessor"][..]),
         (
-            "crates/oulipoly-config/src/model.rs",
-            &[
-                "parser",
-                "validator",
-                "mapper",
-                "formatter",
-                "accessor",
-                "predicate",
-            ][..],
+            "crates/oulipoly-config/src/model/derive.rs",
+            &["mapper", "predicate"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/errors.rs",
+            &["formatter", "mapper", "predicate"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/input.rs",
+            &["mapper", "parser", "validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/model_config.rs",
+            &["accessor"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/provider_config.rs",
+            &["mapper"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/resume.rs",
+            &["validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/session_capture.rs",
+            &["validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/session_storage.rs",
+            &["accessor", "formatter", "mapper", "predicate", "validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/tool_restrictions.rs",
+            &["accessor", "formatter", "predicate"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/toml_io/mod.rs",
+            &["formatter", "orchestration", "parser", "validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/toml_io/files.rs",
+            &["accessor", "mapper", "orchestration", "parser", "validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/toml_io/format.rs",
+            &["formatter"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/toml_io/parse.rs",
+            &["mapper", "parser", "validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/toml_io/provider_validation.rs",
+            &["formatter", "mapper", "parser", "predicate", "validator"][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/toml_io/raw.rs",
+            &["parser"][..],
         ),
         (
             "crates/oulipoly-state/src/repositories/mod.rs",
@@ -424,6 +474,46 @@ fn declaration_carriers_present_in_source() {
                 "Domain: state_db_persistence",
                 "provider_quotas.exhausted_at",
                 "count_session_turns",
+            ][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/derive.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: model_provider_session_config",
+                "provider derivation",
+            ][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/model_config.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: model_provider_session_config",
+                "prompt mode (positional, file, stdin)",
+            ][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/resume.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: model_provider_session_config",
+                "provider resume strategy (resume command shape)",
+            ][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/session_capture.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: model_provider_session_config",
+                "session_capture configuration (stdout parse, jsonl tail, none)",
+            ][..],
+        ),
+        (
+            "crates/oulipoly-config/src/model/session_storage.rs",
+            &[
+                "## Intrinsic-surface declarations",
+                "Domain: model_provider_session_config",
+                "session_storage configuration (locator routing)",
             ][..],
         ),
         (
