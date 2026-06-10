@@ -1,0 +1,22 @@
+//! ## Declared roles
+//!
+//! `accessor`
+
+pub(super) const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
+pub(super) const AUTO_WAKE_SESSION_ID_ENV: &str = "OULIPOLY_AUTO_WAKE_SESSION_ID";
+pub(super) const AUTO_WAKE_TOKEN_ENV: &str = "OULIPOLY_AUTO_WAKE_TOKEN";
+pub(super) const AUTO_WAKE_COUNT_ENV: &str = "OULIPOLY_AUTO_WAKE_COUNT";
+pub(super) const AUTO_WAKE_MAX_ENV: &str = "OULIPOLY_AUTO_WAKE_MAX";
+pub(super) const AUTO_WAKE_RETRY_BASE_MS_ENV: &str = "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS";
+pub(super) const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+pub(super) const DEFAULT_AUTO_WAKE_MAX: i64 = 5;
+pub(super) const DEFAULT_AUTO_WAKE_RETRY_BASE_MS: u64 = 1_000;
+pub(super) const AUTO_WAKE_RETRY_MAX_MS: u64 = 30_000;
+pub(super) const WAKE_CLAIM_STALE_AFTER_SECONDS: i64 = 10 * 60;
+pub(super) const WAKE_RECLAIM_SWEEP_LIMIT: usize = 8;
+pub(super) const WAKE_RECLAIM_SWEEP_SCAN_LIMIT: usize = WAKE_RECLAIM_SWEEP_LIMIT * 32;
+pub(super) const WAKE_RECLAIM_REAP_SESSION_LIMIT: usize = 32;
+pub(super) const WAKE_RECLAIM_REAP_ROWS_PER_SESSION: usize = 20;
+#[allow(dead_code)]
+pub(super) const WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS: u64 = 60;
+pub(super) const CONSUMED_NOTIFICATION_MARKER: &str = "[OULIPOLY NOTIFICATIONS]";
