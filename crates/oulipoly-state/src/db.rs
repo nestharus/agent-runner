@@ -4280,23 +4280,45 @@ impl StateDb {
         invocation_row_id: i64,
     ) -> Result<Option<InvocationChainMintRow>, DbError> {
         let provider_session_expr = Self::provider_session_expr(conn, None)?;
-        let sql = format!(
+        let sql = Self::invocation_chain_mint_sql(&provider_session_expr);
+        Self::query_invocation_chain_mint_row(conn, invocation_row_id, &sql)
+    }
+
+    fn invocation_chain_mint_sql(provider_session_expr: &str) -> String {
+        format!(
             "SELECT model_name, provider_name, {provider_session_expr}, COALESCE(finished_at, created_at)
              FROM invocations
              WHERE id = ?1
                AND provider_name IS NOT NULL
                AND {provider_session_expr} IS NOT NULL"
-        );
+        )
+    }
+
+    fn query_invocation_chain_mint_row(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+        sql: &str,
+    ) -> Result<Option<InvocationChainMintRow>, DbError> {
         conn.query_row(&sql, sqlite::params![invocation_row_id], |row| {
-            Ok(InvocationChainMintRow {
-                model_name: row.get(0)?,
-                provider_name: row.get(1)?,
-                session_id: row.get(2)?,
-                raw_ts: row.get(3)?,
-            })
+            Self::map_invocation_chain_mint_row(row)
         })
         .optional()
-        .map_err(|e| format!("Failed to read invocation for chain mint: {e}"))
+        .map_err(Self::invocation_chain_mint_read_error)
+    }
+
+    fn map_invocation_chain_mint_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<InvocationChainMintRow> {
+        Ok(InvocationChainMintRow {
+            model_name: row.get(0)?,
+            provider_name: row.get(1)?,
+            session_id: row.get(2)?,
+            raw_ts: row.get(3)?,
+        })
+    }
+
+    fn invocation_chain_mint_read_error(error: sqlite::Error) -> String {
+        format!("Failed to read invocation for chain mint: {error}")
     }
 
     fn existing_chain_for_provider_session(
@@ -7718,10 +7740,12 @@ mod tests {
 
     fn db_without_table(table: &str) -> StateDb {
         let db = test_db();
-        db.conn
-            .execute_batch(&format!("DROP TABLE {table};"))
-            .unwrap();
+        db.conn.execute_batch(&drop_table_sql(table)).unwrap();
         db
+    }
+
+    fn drop_table_sql(table: &str) -> String {
+        format!("DROP TABLE {table};")
     }
 
     fn ts(value: &str) -> DateTime<Utc> {
@@ -8278,15 +8302,21 @@ mod tests {
     }
 
     fn table_columns_with_pk(conn: &sqlite::Connection, table_name: &str) -> Vec<(String, i64)> {
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info({table_name})"))
-            .unwrap();
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
-            })
-            .unwrap();
+        table_columns_with_pk_from_sql(conn, &table_info_sql(table_name))
+    }
+
+    fn table_info_sql(table_name: &str) -> String {
+        format!("PRAGMA table_info({table_name})")
+    }
+
+    fn table_columns_with_pk_from_sql(conn: &sqlite::Connection, sql: &str) -> Vec<(String, i64)> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.query_map([], table_column_with_pk).unwrap();
         rows.map(|row| row.unwrap()).collect()
+    }
+
+    fn table_column_with_pk(row: &sqlite::Row<'_>) -> sqlite::Result<(String, i64)> {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
     }
 
     fn provider_aggregate_snapshot(conn: &sqlite::Connection) -> Vec<ProviderAggregateSnapshot> {
@@ -11883,16 +11913,28 @@ interactive_args = ["launch"]
     }
 
     fn invocation_checksum(db: &StateDb) -> String {
-        let dual_id_cols = StateDb::invocations_have_dual_id_columns(&db.conn).unwrap();
-        let extra_cols = if dual_id_cols {
+        let dual_id_cols = invocation_checksum_has_dual_id_columns(db);
+        let sql = invocation_checksum_sql(invocation_checksum_extra_cols(dual_id_cols));
+        query_invocation_checksum(db, &sql)
+    }
+
+    fn invocation_checksum_has_dual_id_columns(db: &StateDb) -> bool {
+        StateDb::invocations_have_dual_id_columns(&db.conn).unwrap()
+    }
+
+    fn invocation_checksum_extra_cols(dual_id_cols: bool) -> &'static str {
+        if dual_id_cols {
             " || '|' || COALESCE(session_capture_method, '') \
              || '|' || COALESCE(provider_session_id, '') \
              || '|' || COALESCE(resume_input_id, '') \
              || '|' || COALESCE(provider_session_capture_method, '')"
         } else {
             ""
-        };
-        let sql = format!(
+        }
+    }
+
+    fn invocation_checksum_sql(extra_cols: &str) -> String {
+        format!(
             "SELECT COALESCE(group_concat(line, char(10)), '')
              FROM (
                  SELECT id || '|' || invocation_uuid || '|' || status || '|' ||
@@ -11901,7 +11943,10 @@ interactive_args = ["launch"]
                  FROM invocations
                  ORDER BY id
              )"
-        );
+        )
+    }
+
+    fn query_invocation_checksum(db: &StateDb, sql: &str) -> String {
         db.conn.query_row(&sql, [], |row| row.get(0)).unwrap()
     }
 
