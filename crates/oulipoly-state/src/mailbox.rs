@@ -127,6 +127,16 @@ pub enum SessionLiveness {
     Idle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRuntimeReadOnlyLiveness {
+    Busy,
+    Idle,
+    StaleMissingInvocation,
+    StaleMissingIdentity,
+    StaleDead,
+    StalePidReused,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionRuntimeLivenessDecision {
     Busy,
@@ -175,9 +185,22 @@ pub struct WakeSweepCandidate {
     pub max_pending_seq: i64,
 }
 
+struct WakeSweepSessionState {
+    session_id: String,
+    min_pending_seq: i64,
+    max_pending_seq: i64,
+    claim: Option<WakeClaimRow>,
+}
+
 pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
+}
+
+enum BoundedMailboxRowsError {
+    Prepare(rusqlite::Error),
+    Query(rusqlite::Error),
+    Row(rusqlite::Error),
 }
 
 impl MailboxDb {
@@ -269,6 +292,44 @@ impl MailboxDb {
         } else {
             self.list_pending(session_id)
         }
+    }
+
+    pub fn list_mailbox_bounded(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MailboxRow>, String> {
+        if bounded_mailbox_limit_is_zero(limit) {
+            return Ok(Vec::new());
+        }
+        self.bounded_mailbox_rows(session_id, bounded_mailbox_sql_limit(limit))
+            .map_err(format_bounded_mailbox_rows_error)
+    }
+
+    fn bounded_mailbox_rows(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailboxRow>, BoundedMailboxRowsError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, session_id, kind, handle, payload_json, enqueued_at,
+                        delivered_at, delivered_by_invocation_uuid, delivery_attempts,
+                        delivery_error, owner_invocation_uuid, matched_os_pid,
+                        matched_os_boot_id, matched_os_pid_starttime_ticks,
+                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc
+                 FROM mailbox
+                 WHERE session_id = ?1
+                 ORDER BY CASE WHEN delivered_at IS NULL THEN 0 ELSE 1 END, seq DESC
+                  LIMIT ?2",
+            )
+            .map_err(BoundedMailboxRowsError::Prepare)?;
+        let rows = stmt
+            .query_map(params![session_id, limit], map_mailbox_row)
+            .map_err(BoundedMailboxRowsError::Query)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(BoundedMailboxRowsError::Row)
     }
 
     pub fn mark_delivered(
@@ -448,6 +509,14 @@ impl MailboxDb {
         Ok(session_liveness_from_decision(&decision))
     }
 
+    pub fn classify_session_runtime_read_only(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionRuntimeReadOnlyLiveness, String> {
+        let row = self.session_runtime(session_id)?;
+        classify_session_runtime_row_read_only(row.as_ref())
+    }
+
     pub fn try_acquire_wake_claim(
         &mut self,
         input: WakeClaimRequest<'_>,
@@ -544,17 +613,15 @@ impl MailboxDb {
     ) -> Result<bool, String> {
         if let Some(identity) = pid_identity::read_live_process_identity(wake_pid)? {
             let recorded_at = now_rfc3339();
-            pid_identity::PidIdentityDb::open(self.path())?.record_identity(
-                pid_identity::PidIdentityRecord {
-                    identity: &identity,
-                    os_pgid: None,
-                    invocation_uuid: claim_token,
-                    session_id: Some(session_id),
-                    provider_name,
-                    model_name,
-                    recorded_at: &recorded_at,
-                },
-            )?;
+            let record = wake_claim_pid_identity_record(
+                &identity,
+                claim_token,
+                session_id,
+                provider_name,
+                model_name,
+                &recorded_at,
+            );
+            pid_identity::PidIdentityDb::open(self.path())?.record_identity(record)?;
         }
         self.record_wake_claim_pid(session_id, claim_token, wake_pid)
     }
@@ -564,40 +631,106 @@ impl MailboxDb {
         stale_after_seconds: i64,
         limit: usize,
     ) -> Result<Vec<WakeSweepCandidate>, String> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        let session_ids = self.pending_wake_session_ids(limit)?;
+        self.wake_sweep_candidates_for_sessions(stale_after_seconds, limit, session_ids)
+    }
+
+    fn wake_sweep_candidates_for_sessions(
+        &mut self,
+        stale_after_seconds: i64,
+        limit: usize,
+        session_ids: Vec<String>,
+    ) -> Result<Vec<WakeSweepCandidate>, String> {
         let mut candidates = Vec::new();
-        for session_id in self.pending_wake_session_ids(limit)? {
-            if candidates.len() >= limit {
+        for session_id in session_ids {
+            if wake_sweep_candidates_at_limit(&candidates, limit) {
                 break;
             }
-            if self.session_is_busy(&session_id)? {
-                continue;
-            }
-            let Some((min_pending_seq, max_pending_seq)) = self.pending_seq_bounds(&session_id)?
-            else {
-                continue;
-            };
-            let Some(claim) = self.wake_claim(&session_id)? else {
-                candidates.push(wake_sweep_candidate(
-                    session_id.clone(),
-                    self.next_auto_wake_count_for_session(&session_id, None)?,
-                    min_pending_seq,
-                    max_pending_seq,
-                ));
-                continue;
-            };
-            if wake_claim_is_reclaimable(&self.conn, &claim, stale_after_seconds)? {
-                candidates.push(wake_sweep_candidate(
-                    session_id.clone(),
-                    self.next_auto_wake_count_for_session(&session_id, Some(&claim))?,
-                    min_pending_seq,
-                    max_pending_seq,
-                ));
-            }
+            self.push_wake_sweep_candidate_for_session(
+                &mut candidates,
+                session_id,
+                stale_after_seconds,
+            )?;
         }
         Ok(candidates)
+    }
+
+    fn push_wake_sweep_candidate_for_session(
+        &mut self,
+        candidates: &mut Vec<WakeSweepCandidate>,
+        session_id: String,
+        stale_after_seconds: i64,
+    ) -> Result<(), String> {
+        if let Some(candidate) =
+            self.wake_sweep_candidate_for_session(session_id, stale_after_seconds)?
+        {
+            candidates.push(candidate);
+        }
+        Ok(())
+    }
+
+    fn wake_sweep_candidate_for_session(
+        &mut self,
+        session_id: String,
+        stale_after_seconds: i64,
+    ) -> Result<Option<WakeSweepCandidate>, String> {
+        let Some(state) = self.wake_sweep_session_state(session_id)? else {
+            return Ok(None);
+        };
+        self.wake_sweep_candidate_from_state(state, stale_after_seconds)
+    }
+
+    fn wake_sweep_session_state(
+        &mut self,
+        session_id: String,
+    ) -> Result<Option<WakeSweepSessionState>, String> {
+        if self.session_is_busy(&session_id)? {
+            return Ok(None);
+        }
+        let Some((min_pending_seq, max_pending_seq)) = self.pending_seq_bounds(&session_id)? else {
+            return Ok(None);
+        };
+        let claim = self.wake_claim(&session_id)?;
+        Ok(Some(WakeSweepSessionState {
+            session_id,
+            min_pending_seq,
+            max_pending_seq,
+            claim,
+        }))
+    }
+
+    fn wake_sweep_candidate_from_state(
+        &self,
+        state: WakeSweepSessionState,
+        stale_after_seconds: i64,
+    ) -> Result<Option<WakeSweepCandidate>, String> {
+        if !self.wake_sweep_state_is_candidate(&state, stale_after_seconds)? {
+            return Ok(None);
+        }
+        Ok(Some(self.wake_sweep_candidate_from_eligible_state(state)?))
+    }
+
+    fn wake_sweep_state_is_candidate(
+        &self,
+        state: &WakeSweepSessionState,
+        stale_after_seconds: i64,
+    ) -> Result<bool, String> {
+        match state.claim.as_ref() {
+            Some(claim) => wake_claim_is_reclaimable(&self.conn, claim, stale_after_seconds),
+            None => Ok(true),
+        }
+    }
+
+    fn wake_sweep_candidate_from_eligible_state(
+        &self,
+        state: WakeSweepSessionState,
+    ) -> Result<WakeSweepCandidate, String> {
+        Ok(wake_sweep_candidate(
+            state.session_id.clone(),
+            self.next_auto_wake_count_for_session(&state.session_id, state.claim.as_ref())?,
+            state.min_pending_seq,
+            state.max_pending_seq,
+        ))
     }
 
     fn next_auto_wake_count_for_session(
@@ -625,10 +758,8 @@ impl MailboxDb {
         claim_token: &str,
     ) -> Result<bool, String> {
         let claim = self.wake_claim(session_id)?;
-        if !wake_claim_is_valid_for_child(claim.as_ref(), claim_token) {
-            return Ok(false);
-        }
-        self.release_busy_child_wake_claim(session_id, claim_token)
+        let valid = wake_claim_is_valid_for_child(claim.as_ref(), claim_token);
+        self.release_after_child_claim_validation(session_id, claim_token, valid)
     }
 
     #[cfg(test)]
@@ -637,8 +768,7 @@ impl MailboxDb {
         session_id: &str,
         seconds_old: i64,
     ) -> Result<(), String> {
-        let claimed_at = (Utc::now() - Duration::seconds(seconds_old))
-            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let claimed_at = aged_wake_claim_timestamp(seconds_old);
         self.conn
             .execute(
                 "UPDATE session_wake_claim SET claimed_at = ?2 WHERE session_id = ?1",
@@ -674,16 +804,9 @@ impl MailboxDb {
         }
         let oldest_limit = limit.saturating_sub(limit / 2);
         let newest_limit = limit.saturating_sub(oldest_limit);
-        let mut session_ids = self.oldest_pending_wake_session_ids(oldest_limit)?;
-        for session_id in self.newest_pending_wake_session_ids(newest_limit)? {
-            if session_ids.len() >= limit {
-                break;
-            }
-            if !session_ids.iter().any(|existing| existing == &session_id) {
-                session_ids.push(session_id);
-            }
-        }
-        Ok(session_ids)
+        let oldest = self.oldest_pending_wake_session_ids(oldest_limit)?;
+        let newest = self.newest_pending_wake_session_ids(newest_limit)?;
+        Ok(merge_pending_wake_session_ids(limit, oldest, newest))
     }
 
     fn oldest_pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
@@ -699,17 +822,10 @@ impl MailboxDb {
         limit: usize,
         direction: &str,
     ) -> Result<Vec<String>, String> {
+        let query = pending_wake_session_ids_by_oldest_seq_query(direction);
         let mut stmt = self
             .conn
-            .prepare(&format!(
-                "SELECT session_id
-                 FROM mailbox
-                 WHERE delivered_at IS NULL
-                   AND (delivery_error IS NULL OR delivery_error != ?2)
-                 GROUP BY session_id
-                 ORDER BY MIN(seq) {direction}
-                 LIMIT ?1",
-            ))
+            .prepare(&query)
             .map_err(|err| format!("Failed to prepare pending wake session query: {err}"))?;
         let rows = stmt
             .query_map(params![limit as i64, WAKE_SWEEP_ABANDONED_ERROR], |row| {
@@ -718,6 +834,18 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to query pending wake sessions: {err}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|err| format!("Failed to read pending wake session row: {err}"))
+    }
+
+    fn release_after_child_claim_validation(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+        valid: bool,
+    ) -> Result<bool, String> {
+        if !valid {
+            return Ok(false);
+        }
+        self.release_busy_child_wake_claim(session_id, claim_token)
     }
 
     fn pending_seq_bounds(&self, session_id: &str) -> Result<Option<(i64, i64)>, String> {
@@ -824,15 +952,71 @@ impl MailboxDb {
                      running_os_boot_id = NULL,
                      running_os_pid_starttime_ticks = NULL,
                      turn_ended_at = COALESCE(turn_ended_at, ?3)
-                 WHERE session_id = ?1
-                   AND run_state = 'running'
-                   AND ((?2 IS NULL AND running_invocation_uuid IS NULL)
-                        OR running_invocation_uuid = ?2)",
+                  WHERE session_id = ?1
+                    AND run_state = 'running'
+                    AND ((?2 IS NULL AND running_invocation_uuid IS NULL)
+                         OR running_invocation_uuid = ?2)",
                 params![session_id, running_invocation_uuid, &now],
             )
             .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
         Ok(())
     }
+}
+
+fn wake_claim_pid_identity_record<'a>(
+    identity: &'a ProcessIdentity,
+    claim_token: &'a str,
+    session_id: &'a str,
+    provider_name: Option<&'a str>,
+    model_name: Option<&'a str>,
+    recorded_at: &'a str,
+) -> pid_identity::PidIdentityRecord<'a> {
+    pid_identity::PidIdentityRecord {
+        identity,
+        os_pgid: None,
+        invocation_uuid: claim_token,
+        session_id: Some(session_id),
+        provider_name,
+        model_name,
+        recorded_at,
+    }
+}
+
+#[cfg(test)]
+fn aged_wake_claim_timestamp(seconds_old: i64) -> String {
+    (Utc::now() - Duration::seconds(seconds_old)).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn merge_pending_wake_session_ids(
+    limit: usize,
+    mut oldest: Vec<String>,
+    newest: Vec<String>,
+) -> Vec<String> {
+    for session_id in newest {
+        if oldest.len() >= limit {
+            break;
+        }
+        if !oldest.iter().any(|existing| existing == &session_id) {
+            oldest.push(session_id);
+        }
+    }
+    oldest
+}
+
+fn wake_sweep_candidates_at_limit(candidates: &[WakeSweepCandidate], limit: usize) -> bool {
+    candidates.len() >= limit
+}
+
+fn pending_wake_session_ids_by_oldest_seq_query(direction: &str) -> String {
+    format!(
+        "SELECT session_id
+                  FROM mailbox
+                  WHERE delivered_at IS NULL
+                    AND (delivery_error IS NULL OR delivery_error != ?2)
+                  GROUP BY session_id
+                  ORDER BY MIN(seq) {direction}
+                  LIMIT ?1",
+    )
 }
 
 fn wake_sweep_candidate(
@@ -913,6 +1097,26 @@ fn next_auto_wake_count(persisted: i64, claim: Option<i64>) -> i64 {
         .max(persisted)
         .saturating_add(1)
         .max(1)
+}
+
+fn bounded_mailbox_limit_is_zero(limit: usize) -> bool {
+    limit == 0
+}
+
+fn bounded_mailbox_sql_limit(limit: usize) -> i64 {
+    limit as i64
+}
+
+fn format_bounded_mailbox_rows_error(err: BoundedMailboxRowsError) -> String {
+    match err {
+        BoundedMailboxRowsError::Prepare(err) => {
+            format!("Failed to prepare bounded mailbox query: {err}")
+        }
+        BoundedMailboxRowsError::Query(err) => {
+            format!("Failed to query bounded mailbox rows: {err}")
+        }
+        BoundedMailboxRowsError::Row(err) => format!("Failed to read mailbox row: {err}"),
+    }
 }
 
 fn enqueue_agent_bash_complete_in_tx(
@@ -1056,29 +1260,40 @@ fn mark_session_idle_row(
     input: SessionRuntimeIdleUpdate<'_>,
     now: &str,
 ) -> Result<bool, String> {
-    let changed = conn
-        .execute(
-            "UPDATE session_runtime
-             SET run_state = 'idle',
-                 updated_at = ?3,
-                 pty_control_path = NULL,
-                 running_invocation_uuid = NULL,
-                 running_os_pid = NULL,
-                 running_os_boot_id = NULL,
-                 running_os_pid_starttime_ticks = NULL,
-                 turn_ended_at = ?3,
-                 last_exit_code = ?4
-             WHERE session_id = ?1
-               AND running_invocation_uuid = ?2",
-            params![
-                input.session_id,
-                input.invocation_uuid,
-                now,
-                input.last_exit_code,
-            ],
-        )
-        .map_err(|err| format!("Failed to mark session runtime idle: {err}"))?;
-    Ok(changed > 0)
+    let changed = mark_session_idle_row_count(conn, input, now)?;
+    Ok(row_changed(changed))
+}
+
+fn mark_session_idle_row_count(
+    conn: &Connection,
+    input: SessionRuntimeIdleUpdate<'_>,
+    now: &str,
+) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE session_runtime
+         SET run_state = 'idle',
+             updated_at = ?3,
+             pty_control_path = NULL,
+             running_invocation_uuid = NULL,
+             running_os_pid = NULL,
+             running_os_boot_id = NULL,
+             running_os_pid_starttime_ticks = NULL,
+             turn_ended_at = ?3,
+             last_exit_code = ?4
+         WHERE session_id = ?1
+           AND running_invocation_uuid = ?2",
+        params![
+            input.session_id,
+            input.invocation_uuid,
+            now,
+            input.last_exit_code,
+        ],
+    )
+    .map_err(|err| format!("Failed to mark session runtime idle: {err}"))
+}
+
+fn row_changed(changed: usize) -> bool {
+    changed > 0
 }
 
 fn session_runtime_row(
@@ -1129,6 +1344,12 @@ fn runtime_identity_is_live(live: Option<&ProcessIdentity>, recorded: &ProcessId
     live.is_some_and(|live| live == recorded)
 }
 
+struct RuntimeLivenessEvidence {
+    invocation_uuid: Option<String>,
+    recorded: Option<ProcessIdentity>,
+    live: Option<ProcessIdentity>,
+}
+
 fn session_runtime_liveness_decision(
     row: Option<&SessionRuntimeRow>,
 ) -> Result<SessionRuntimeLivenessDecision, String> {
@@ -1138,23 +1359,135 @@ fn session_runtime_liveness_decision(
     if runtime_row_is_idle(row) {
         return Ok(SessionRuntimeLivenessDecision::Idle);
     }
-    let Some(invocation_uuid) = row.running_invocation_uuid.as_deref() else {
-        return Ok(SessionRuntimeLivenessDecision::Stale {
-            running_invocation_uuid: None,
-        });
+    let evidence = runtime_liveness_evidence(row)?;
+    Ok(session_runtime_liveness_from_evidence(evidence))
+}
+
+fn classify_session_runtime_row_read_only(
+    row: Option<&SessionRuntimeRow>,
+) -> Result<SessionRuntimeReadOnlyLiveness, String> {
+    let Some(row) = row else {
+        return Ok(SessionRuntimeReadOnlyLiveness::Idle);
     };
-    let Some(recorded) = runtime_row_identity(row) else {
-        return Ok(SessionRuntimeLivenessDecision::Stale {
-            running_invocation_uuid: Some(invocation_uuid.to_string()),
-        });
-    };
-    let live = live_process_identity_for_runtime(&recorded)?;
-    if runtime_identity_is_live(live.as_ref(), &recorded) {
-        return Ok(SessionRuntimeLivenessDecision::Busy);
+    if runtime_row_is_idle(row) {
+        return Ok(SessionRuntimeReadOnlyLiveness::Idle);
     }
-    Ok(SessionRuntimeLivenessDecision::Stale {
-        running_invocation_uuid: Some(invocation_uuid.to_string()),
-    })
+    let evidence = runtime_liveness_evidence(row)?;
+    Ok(read_only_liveness_from_evidence(evidence))
+}
+
+fn runtime_liveness_evidence(row: &SessionRuntimeRow) -> Result<RuntimeLivenessEvidence, String> {
+    let invocation_uuid = row.running_invocation_uuid.clone();
+    let recorded = runtime_liveness_recorded_identity(row, invocation_uuid.as_ref());
+    let live = live_process_identity_for_evidence(recorded.as_ref())?;
+    Ok(runtime_liveness_evidence_from_parts(
+        invocation_uuid,
+        recorded,
+        live,
+    ))
+}
+
+fn runtime_liveness_recorded_identity(
+    row: &SessionRuntimeRow,
+    invocation_uuid: Option<&String>,
+) -> Option<ProcessIdentity> {
+    invocation_uuid.and_then(|_| runtime_row_identity(row))
+}
+
+fn live_process_identity_for_evidence(
+    recorded: Option<&ProcessIdentity>,
+) -> Result<Option<ProcessIdentity>, String> {
+    match recorded {
+        Some(recorded) => live_process_identity_for_runtime(recorded),
+        None => Ok(None),
+    }
+}
+
+fn runtime_liveness_evidence_from_parts(
+    invocation_uuid: Option<String>,
+    recorded: Option<ProcessIdentity>,
+    live: Option<ProcessIdentity>,
+) -> RuntimeLivenessEvidence {
+    RuntimeLivenessEvidence {
+        invocation_uuid,
+        recorded,
+        live,
+    }
+}
+
+fn session_runtime_liveness_from_evidence(
+    evidence: RuntimeLivenessEvidence,
+) -> SessionRuntimeLivenessDecision {
+    if liveness_evidence_missing_invocation(&evidence) {
+        return stale_liveness_decision(None);
+    };
+    let recorded_missing = liveness_evidence_missing_recorded(&evidence);
+    let invocation_uuid = evidence.invocation_uuid.expect("invocation checked above");
+    if recorded_missing {
+        return stale_liveness_decision(Some(invocation_uuid));
+    };
+    let recorded = evidence.recorded.expect("recorded identity checked above");
+    if liveness_evidence_is_busy(&evidence.live, &recorded) {
+        return SessionRuntimeLivenessDecision::Busy;
+    }
+    stale_liveness_decision(Some(invocation_uuid))
+}
+
+fn liveness_evidence_missing_invocation(evidence: &RuntimeLivenessEvidence) -> bool {
+    evidence.invocation_uuid.is_none()
+}
+
+fn liveness_evidence_missing_recorded(evidence: &RuntimeLivenessEvidence) -> bool {
+    evidence.recorded.is_none()
+}
+
+fn liveness_evidence_is_busy(live: &Option<ProcessIdentity>, recorded: &ProcessIdentity) -> bool {
+    runtime_identity_is_live(live.as_ref(), recorded)
+}
+
+fn stale_liveness_decision(
+    running_invocation_uuid: Option<String>,
+) -> SessionRuntimeLivenessDecision {
+    SessionRuntimeLivenessDecision::Stale {
+        running_invocation_uuid,
+    }
+}
+
+fn read_only_liveness_from_evidence(
+    evidence: RuntimeLivenessEvidence,
+) -> SessionRuntimeReadOnlyLiveness {
+    if liveness_evidence_missing_recorded(&evidence) {
+        return read_only_missing_liveness(evidence.invocation_uuid.as_deref());
+    };
+    if read_only_liveness_evidence_missing_live(&evidence) {
+        return SessionRuntimeReadOnlyLiveness::StaleDead;
+    };
+    let recorded = evidence.recorded.expect("recorded identity checked above");
+    let live = evidence.live.expect("live identity checked above");
+    read_only_liveness_from_live_identity(&live, &recorded)
+}
+
+fn read_only_liveness_evidence_missing_live(evidence: &RuntimeLivenessEvidence) -> bool {
+    evidence.live.is_none()
+}
+
+fn read_only_liveness_from_live_identity(
+    live: &ProcessIdentity,
+    recorded: &ProcessIdentity,
+) -> SessionRuntimeReadOnlyLiveness {
+    if live == recorded {
+        SessionRuntimeReadOnlyLiveness::Busy
+    } else {
+        SessionRuntimeReadOnlyLiveness::StalePidReused
+    }
+}
+
+fn read_only_missing_liveness(invocation_uuid: Option<&str>) -> SessionRuntimeReadOnlyLiveness {
+    if invocation_uuid.is_some() {
+        SessionRuntimeReadOnlyLiveness::StaleMissingIdentity
+    } else {
+        SessionRuntimeReadOnlyLiveness::StaleMissingInvocation
+    }
 }
 
 fn session_liveness_from_decision(decision: &SessionRuntimeLivenessDecision) -> SessionLiveness {
@@ -1205,10 +1538,14 @@ fn wake_claim_pid_is_live_identity_matched(
     claim: &WakeClaimRow,
     wake_pid: i64,
 ) -> Result<bool, String> {
-    let Some(live) = pid_identity::read_live_process_identity(wake_pid)? else {
+    let Some(live) = wake_claim_live_process_identity(wake_pid)? else {
         return Ok(false);
     };
     wake_claim_live_identity_has_matching_sidecar_row(conn, claim, &live)
+}
+
+fn wake_claim_live_process_identity(wake_pid: i64) -> Result<Option<ProcessIdentity>, String> {
+    pid_identity::read_live_process_identity(wake_pid)
 }
 
 fn wake_claim_live_identity_has_matching_sidecar_row(
@@ -1216,6 +1553,15 @@ fn wake_claim_live_identity_has_matching_sidecar_row(
     claim: &WakeClaimRow,
     live: &ProcessIdentity,
 ) -> Result<bool, String> {
+    let exists = wake_claim_live_identity_matching_sidecar_exists(conn, claim, live)?;
+    Ok(sqlite_exists_value_to_bool(exists))
+}
+
+fn wake_claim_live_identity_matching_sidecar_exists(
+    conn: &Connection,
+    claim: &WakeClaimRow,
+    live: &ProcessIdentity,
+) -> Result<i64, String> {
     conn.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -1235,8 +1581,11 @@ fn wake_claim_live_identity_has_matching_sidecar_row(
         ],
         |row| row.get::<_, i64>(0),
     )
-    .map(|value| value != 0)
     .map_err(|err| format!("Failed to verify wake PID sidecar identity: {err}"))
+}
+
+fn sqlite_exists_value_to_bool(value: i64) -> bool {
+    value != 0
 }
 
 fn acquire_wake_claim_tx(
@@ -2286,16 +2635,34 @@ mod tests {
     }
 
     fn inserted_row(result: Result<EnqueueResult, String>) -> MailboxRow {
-        match result.unwrap() {
-            EnqueueResult::Inserted(row) => row,
-            other => panic!("expected inserted row, got {other:?}"),
+        let result = result.unwrap();
+        assert_inserted_result(&result);
+        inserted_result_row(result)
+    }
+
+    fn assert_inserted_result(result: &EnqueueResult) {
+        if !matches!(result, EnqueueResult::Inserted(_)) {
+            panic!("expected inserted row, got {result:?}");
         }
     }
 
+    fn inserted_result_row(result: EnqueueResult) -> MailboxRow {
+        let EnqueueResult::Inserted(row) = result else {
+            unreachable!("inserted result validated above");
+        };
+        row
+    }
+
     fn current_identity() -> ProcessIdentity {
+        expect_current_identity(read_current_identity().unwrap())
+    }
+
+    fn read_current_identity() -> Result<Option<ProcessIdentity>, String> {
         pid_identity::read_live_process_identity(std::process::id().into())
-            .unwrap()
-            .expect("test process should have a live identity")
+    }
+
+    fn expect_current_identity(identity: Option<ProcessIdentity>) -> ProcessIdentity {
+        identity.expect("test process should have a live identity")
     }
 
     fn user_version(conn: &Connection) -> i64 {
@@ -2304,10 +2671,13 @@ mod tests {
     }
 
     fn invocation_columns(conn: &Connection) -> Vec<String> {
+        read_invocation_columns(conn).unwrap()
+    }
+
+    fn read_invocation_columns(conn: &Connection) -> rusqlite::Result<Vec<String>> {
         let mut stmt = conn.prepare("PRAGMA table_info(invocations)").unwrap();
         stmt.query_map([], |row| row.get::<_, String>(1))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
-            .unwrap()
     }
 }

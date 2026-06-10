@@ -3,6 +3,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
 pub mod migration;
+pub mod observability;
 pub mod ports;
 pub mod provider_registry;
 pub mod provider_settings;

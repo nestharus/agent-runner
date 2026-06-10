@@ -38,6 +38,7 @@ use super::spawn_identity::{
 };
 use super::terminal_signal;
 use oulipoly_config::ProviderConfig;
+use std::io;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
@@ -93,7 +94,11 @@ pub fn execute_interactive_with_result_and_model_identity(
     if pty_broker::controlling_terminal_available() {
         let cmd =
             interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
-        let status = pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?;
+        let status = if pty_broker::observed_tui_enabled() {
+            pty_broker::execute_interactive_child_observed(cmd, provider, spawn_identity.as_ref())?
+        } else {
+            pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?
+        };
         return Ok(interactive_result_from_status(provider, &status));
     }
 
@@ -150,7 +155,11 @@ fn configure_interactive_stdio(cmd: &mut Command) {
 
 fn spawn_interactive_child(mut cmd: Command, provider: &ProviderConfig) -> Result<Child, String> {
     cmd.spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {e}", provider.command))
+        .map_err(|err| format_spawn_interactive_child_error(&provider.command, err))
+}
+
+fn format_spawn_interactive_child_error(command: &str, err: io::Error) -> String {
+    format!("Failed to spawn '{command}': {err}")
 }
 
 fn interactive_spawn_identity_context(
@@ -172,9 +181,11 @@ fn interactive_spawn_identity_context(
 }
 
 fn wait_for_interactive_child(child: &mut Child) -> Result<ExitStatus, String> {
-    child
-        .wait()
-        .map_err(|e| format!("Failed to wait for process: {e}"))
+    child.wait().map_err(format_interactive_wait_error)
+}
+
+fn format_interactive_wait_error(err: io::Error) -> String {
+    format!("Failed to wait for process: {err}")
 }
 
 fn validated_interactive_args(provider: &ProviderConfig) -> Result<Vec<String>, String> {
