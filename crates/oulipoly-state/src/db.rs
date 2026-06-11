@@ -2729,58 +2729,6 @@ impl StateDb {
             .map(|(session_id, _)| session_id)
             .collect()
     }
-
-    /// Count assistant turns ingested for a provider since `since` (exclusive).
-    /// `None` means count everything we've ever ingested for that provider.
-    pub fn count_assistant_turns_since(
-        &self,
-        provider_name: &str,
-        since: Option<&DateTime<Utc>>,
-    ) -> Result<u64, String> {
-        let count = self.query_assistant_turn_count(provider_name, since)?;
-        Ok(count.max(0) as u64)
-    }
-
-    fn query_assistant_turn_count(
-        &self,
-        provider_name: &str,
-        since: Option<&DateTime<Utc>>,
-    ) -> Result<i64, String> {
-        match since {
-            Some(ts) => self.query_assistant_turn_count_after(provider_name, ts),
-            None => self.query_all_assistant_turn_count(provider_name),
-        }
-    }
-
-    fn query_assistant_turn_count_after(
-        &self,
-        provider_name: &str,
-        since: &DateTime<Utc>,
-    ) -> Result<i64, String> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_turns
-                 WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
-                sqlite::params![provider_name, since.to_rfc3339()],
-                |row| row.get(0),
-            )
-            .map_err(Self::session_turn_count_error)
-    }
-
-    fn query_all_assistant_turn_count(&self, provider_name: &str) -> Result<i64, String> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_turns
-                 WHERE provider_name = ?1 AND role = 'assistant'",
-                sqlite::params![provider_name],
-                |row| row.get(0),
-            )
-            .map_err(Self::session_turn_count_error)
-    }
-
-    fn session_turn_count_error(e: sqlite::Error) -> String {
-        format!("Failed to count session turns: {e}")
-    }
 }
 
 #[allow(dead_code)]
