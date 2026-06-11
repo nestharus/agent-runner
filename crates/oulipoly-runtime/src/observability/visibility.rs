@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `filter`, `predicate`
+//! `filter`, `predicate`, `mapper`
 //!
 //! Snapshot node visibility rules for monitor views.
 
