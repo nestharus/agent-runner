@@ -88,6 +88,7 @@ mod provider_session_binding;
 mod providers;
 mod resume;
 mod returned_artifacts;
+mod schema_types;
 mod session_capture;
 mod session_markers;
 mod session_turns;
@@ -113,6 +114,10 @@ pub use self::provider_session_binding::ProviderSessionBinding;
 pub use self::providers::ProviderRecord;
 pub use self::resume::{
     ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview, WrongIdKindInput,
+};
+use self::schema_types::{
+    ColumnRepair, DropColumnRepair, InvocationDualIdProjection, InvocationsSchemaShape,
+    ProviderSessionProjection, ProvidersSchemaShape,
 };
 pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]
@@ -153,70 +158,6 @@ pub enum ReadOnlyOpenError {
 }
 
 pub type DbError = String;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderSessionProjection {
-    DualId,
-    LegacySessionId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvocationDualIdProjection {
-    Current,
-    CurrentWithoutResolvedAccount,
-    Legacy,
-}
-
-impl InvocationDualIdProjection {
-    fn select_columns(&self) -> (&'static str, &'static str, &'static str, &'static str) {
-        match self {
-            InvocationDualIdProjection::Current => (
-                "provider_session_id",
-                "resume_input_id",
-                "provider_session_capture_method",
-                "provider_session_resolved_account",
-            ),
-            InvocationDualIdProjection::CurrentWithoutResolvedAccount => (
-                "provider_session_id",
-                "resume_input_id",
-                "provider_session_capture_method",
-                "NULL AS provider_session_resolved_account",
-            ),
-            InvocationDualIdProjection::Legacy => (
-                "NULL AS provider_session_id",
-                "NULL AS resume_input_id",
-                "NULL AS provider_session_capture_method",
-                "NULL AS provider_session_resolved_account",
-            ),
-        }
-    }
-}
-
-enum InvocationsSchemaShape {
-    Empty,
-    Current,
-    LegacyPreUuid,
-    UnrecognizedPreUuid(Vec<String>),
-}
-
-enum ProvidersSchemaShape {
-    Empty,
-    Current,
-    LegacyIndexKeyed,
-    Unexpected(String),
-}
-
-struct ColumnRepair {
-    column_name: &'static str,
-    sql: &'static str,
-    error_context: &'static str,
-}
-
-struct DropColumnRepair {
-    column_name: &'static str,
-    sql: &'static str,
-    error_context: &'static str,
-}
 
 struct LifecycleInvocationRow {
     invocation_uuid: String,
