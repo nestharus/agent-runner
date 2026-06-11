@@ -6,6 +6,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotLimits {
+    pub include_terminal: bool,
     pub invocation_subtree_depth: usize,
     pub max_invocation_nodes: usize,
     pub mailbox_cap: usize,
@@ -18,6 +19,7 @@ pub struct SnapshotLimits {
 impl Default for SnapshotLimits {
     fn default() -> Self {
         Self {
+            include_terminal: false,
             invocation_subtree_depth: 64,
             max_invocation_nodes: 200,
             mailbox_cap: 100,
