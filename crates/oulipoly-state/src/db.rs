@@ -218,27 +218,6 @@ struct DropColumnRepair {
     error_context: &'static str,
 }
 
-struct LegacyInvocationRow {
-    model_name: String,
-    provider_index: i64,
-    success: i64,
-    exit_code: i64,
-    error_category: Option<String>,
-    created_at: String,
-}
-
-struct LegacyInvocationInsert {
-    invocation_uuid: String,
-    model_name: String,
-    provider_name: Option<String>,
-    provider_index: i64,
-    status: InvocationStatus,
-    success: i64,
-    exit_code: i64,
-    error_category: Option<String>,
-    created_at: String,
-}
-
 struct LifecycleInvocationRow {
     invocation_uuid: String,
     provider_name: Option<String>,
