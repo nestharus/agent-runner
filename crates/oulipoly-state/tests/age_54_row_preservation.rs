@@ -522,13 +522,20 @@ fn has_invocation_uuid_column(columns: &[String]) -> bool {
 
 // Declared role: accessor
 fn select_invocation_uuids(path: &Path) -> Vec<String> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")
-        .unwrap()
-        .query_map([], invocation_uuid_row)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_invocation_uuid_rows(read_invocation_uuid_rows(path))
+}
+
+// Declared role: accessor
+fn read_invocation_uuid_rows(path: &Path) -> rusqlite::Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")?;
+    stmt.query_map([], invocation_uuid_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_invocation_uuid_rows(result: rusqlite::Result<Vec<String>>) -> Vec<String> {
+    result.unwrap()
 }
 
 // Declared role: mapper
@@ -538,13 +545,22 @@ fn invocation_uuid_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
 
 // Declared role: accessor
 fn parent_links(path: &Path) -> Vec<(String, Option<String>)> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare(parent_links_sql())
-        .unwrap()
-        .query_map([], parent_link_row)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_parent_link_rows(read_parent_link_rows(path))
+}
+
+// Declared role: accessor
+fn read_parent_link_rows(path: &Path) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(parent_links_sql())?;
+    stmt.query_map([], parent_link_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_parent_link_rows(
+    result: rusqlite::Result<Vec<(String, Option<String>)>>,
+) -> Vec<(String, Option<String>)> {
+    result.unwrap()
 }
 
 // Declared role: accessor
@@ -568,12 +584,24 @@ fn table_columns(path: &Path, table: &str) -> Vec<String> {
 
 // Declared role: accessor
 fn query_table_columns(conn: &Connection, sql: &str) -> Vec<String> {
-    conn.prepare(sql)
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_table_column_rows(read_table_column_rows(conn, sql))
+}
+
+// Declared role: accessor
+fn read_table_column_rows(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    stmt.query_map([], table_column_name_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_table_column_rows(result: rusqlite::Result<Vec<String>>) -> Vec<String> {
+    result.unwrap()
+}
+
+// Declared role: mapper
+fn table_column_name_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get::<_, String>(1)
 }
 
 // Declared role: formatter
@@ -588,13 +616,25 @@ fn assert_provider_session_index_exists(indexes: &[String]) {
 
 // Declared role: accessor
 fn invocation_index_names(path: &Path) -> Vec<String> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare(invocation_index_names_sql())
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_invocation_index_rows(read_invocation_index_rows(path))
+}
+
+// Declared role: accessor
+fn read_invocation_index_rows(path: &Path) -> rusqlite::Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(invocation_index_names_sql())?;
+    stmt.query_map([], invocation_index_name_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_invocation_index_rows(result: rusqlite::Result<Vec<String>>) -> Vec<String> {
+    result.unwrap()
+}
+
+// Declared role: mapper
+fn invocation_index_name_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get::<_, String>(0)
 }
 
 // Declared role: accessor
@@ -627,17 +667,26 @@ type DualIdBackfillRow = (
 
 // Declared role: accessor
 fn actual_dual_id_backfill_rows(path: &Path) -> Vec<DualIdBackfillRow> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare(
+    require_dual_id_backfill_rows(read_dual_id_backfill_rows(path))
+}
+
+// Declared role: accessor
+fn read_dual_id_backfill_rows(path: &Path) -> rusqlite::Result<Vec<DualIdBackfillRow>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
         "SELECT invocation_uuid, session_id, provider_session_id, resume_input_id,
                     provider_session_capture_method
              FROM invocations ORDER BY id",
-    )
-    .unwrap()
-    .query_map([], dual_id_backfill_row)
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap()
+    )?;
+    stmt.query_map([], dual_id_backfill_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_dual_id_backfill_rows(
+    result: rusqlite::Result<Vec<DualIdBackfillRow>>,
+) -> Vec<DualIdBackfillRow> {
+    result.unwrap()
 }
 
 // Declared role: mapper
@@ -728,19 +777,44 @@ fn function_source_span(source: &str, name: &str) -> std::ops::Range<usize> {
 
 // Declared role: parser
 fn function_start(source: &str, name: &str) -> usize {
-    let signature = format!("fn {name}");
-    source.find(&signature).unwrap_or_else(|| {
-        panic!("missing function {name}");
-    })
+    let signature = function_signature_needle(name);
+    require_function_start(name, source.find(&signature))
+}
+
+// Declared role: formatter
+fn function_signature_needle(name: &str) -> String {
+    format!("fn {name}")
+}
+
+// Declared role: validator
+fn require_function_start(name: &str, start: Option<usize>) -> usize {
+    start.unwrap_or_else(|| panic!("missing function {name}"))
 }
 
 // Declared role: parser
 fn function_end(source: &str, start: usize, name: &str) -> usize {
-    let end_marker = "\n    /// Resolve `(model_name, provider_index) -> provider_name`";
-    source[start..]
-        .find(end_marker)
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing end marker after function {name}"))
+    let offset = require_function_end_offset(name, function_end_offset(source, start));
+    map_function_end(start, offset)
+}
+
+// Declared role: parser
+fn function_end_offset(source: &str, start: usize) -> Option<usize> {
+    source[start..].find(function_end_marker())
+}
+
+// Declared role: accessor
+fn function_end_marker() -> &'static str {
+    "\n    /// Resolve `(model_name, provider_index) -> provider_name`"
+}
+
+// Declared role: validator
+fn require_function_end_offset(name: &str, offset: Option<usize>) -> usize {
+    offset.unwrap_or_else(|| panic!("missing end marker after function {name}"))
+}
+
+// Declared role: mapper
+fn map_function_end(start: usize, offset: usize) -> usize {
+    start + offset
 }
 
 // Declared role: orchestration

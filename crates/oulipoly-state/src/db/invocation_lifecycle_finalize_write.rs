@@ -20,9 +20,16 @@ impl StateDb {
         id: i64,
     ) -> Result<FinalizeInvocationRow, String> {
         let columns = Self::query_invocation_row_for_finalize(conn, id)
-            .map_err(|err| Self::format_load_invocation_for_finalize_error(id, err))?
-            .ok_or_else(|| Self::format_invocation_not_found_error(id))?;
+            .map_err(|err| Self::format_load_invocation_for_finalize_error(id, err))?;
+        let columns = Self::require_invocation_row_for_finalize(id, columns)?;
         Ok(Self::map_invocation_row_for_finalize(columns))
+    }
+
+    pub(super) fn require_invocation_row_for_finalize(
+        id: i64,
+        columns: Option<FinalizeInvocationRowColumns>,
+    ) -> Result<FinalizeInvocationRowColumns, String> {
+        columns.ok_or_else(|| Self::format_invocation_not_found_error(id))
     }
 
     pub(super) fn query_invocation_row_for_finalize(

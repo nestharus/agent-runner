@@ -167,6 +167,14 @@ impl StateDb {
     /// Fetch every rolling-quota window a provider has reported, ordered by
     /// `window_id`. Empty vec if the provider has never been refreshed.
     pub fn get_windows(&self, provider_name: &str) -> Result<Vec<QuotaWindow>, String> {
+        let rows = self.read_raw_quota_windows(provider_name)?;
+        Self::quota_windows_from_raw(provider_name, rows)
+    }
+
+    fn read_raw_quota_windows(
+        &self,
+        provider_name: &str,
+    ) -> Result<Vec<RawQuotaWindowRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -177,14 +185,22 @@ impl StateDb {
             )
             .map_err(Self::format_windows_prepare_error)?;
         let rows = stmt
-            .query_map(sqlite::params![provider_name], |row| {
-                let raw = Self::raw_quota_window_row(row)?;
-                Self::quota_window_from_raw(provider_name, raw)
-            })
+            .query_map(sqlite::params![provider_name], Self::raw_quota_window_row)
             .map_err(Self::format_windows_query_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_window_row_error)
+    }
+
+    fn quota_windows_from_raw(
+        provider_name: &str,
+        rows: Vec<RawQuotaWindowRow>,
+    ) -> Result<Vec<QuotaWindow>, String> {
         let mut out = Vec::new();
         for r in rows {
-            out.push(r.map_err(Self::format_window_row_error)?);
+            out.push(
+                Self::quota_window_from_raw(provider_name, r)
+                    .map_err(Self::format_window_row_error)?,
+            );
         }
         Ok(out)
     }

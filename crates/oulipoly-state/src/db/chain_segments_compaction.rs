@@ -37,11 +37,7 @@ impl StateDb {
         session_id: &str,
     ) -> Result<Option<(String, DateTime<Utc>)>, DbError> {
         let row = self.latest_compaction_boundary_raw(provider_name, session_id)?;
-        row.map(|(turn_id, raw_ts)| {
-            let timestamp = Self::parse_compaction_boundary_timestamp(&raw_ts)?;
-            Ok(Self::map_compaction_boundary(turn_id, timestamp))
-        })
-        .transpose()
+        row.map(Self::map_compaction_boundary_raw).transpose()
     }
 
     fn latest_compaction_boundary_raw(
@@ -79,6 +75,14 @@ impl StateDb {
 
     fn parse_compaction_boundary_timestamp(raw_ts: &str) -> Result<DateTime<Utc>, DbError> {
         Self::strict_rfc3339_message(raw_ts, "compaction boundary timestamp")
+    }
+
+    fn map_compaction_boundary_raw(
+        row: (String, String),
+    ) -> Result<(String, DateTime<Utc>), DbError> {
+        let (turn_id, raw_ts) = row;
+        let timestamp = Self::parse_compaction_boundary_timestamp(&raw_ts)?;
+        Ok(Self::map_compaction_boundary(turn_id, timestamp))
     }
 
     fn map_compaction_boundary(

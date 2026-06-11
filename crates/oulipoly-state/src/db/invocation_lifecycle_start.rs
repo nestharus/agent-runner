@@ -57,11 +57,15 @@ impl StateDb {
             .query_row(
                 "SELECT invocation_uuid FROM invocations WHERE id = ?1",
                 sqlite::params![parent_id],
-                |row| row.get(0),
+                Self::map_parent_invocation_uuid_row,
             )
             .optional()
             .ok()
             .flatten()
+    }
+
+    fn map_parent_invocation_uuid_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     pub(super) fn build_start_context(

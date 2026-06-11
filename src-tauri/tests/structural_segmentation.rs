@@ -198,7 +198,15 @@ fn owned_tracked_files(tracked_files: Vec<&str>) -> Vec<String> {
 }
 
 fn regular_stage_paths(stdout: &str) -> Vec<&str> {
-    stdout.lines().filter_map(regular_stage_path).collect()
+    regular_paths_from_entries(stage_entries(stdout))
+}
+
+fn stage_entries(stdout: &str) -> Vec<&str> {
+    stdout.lines().collect()
+}
+
+fn regular_paths_from_entries(entries: Vec<&str>) -> Vec<&str> {
+    entries.into_iter().filter_map(regular_stage_path).collect()
 }
 
 fn regular_stage_path(tracked_entry: &str) -> Option<&str> {
@@ -235,7 +243,7 @@ fn doomed_dir_match_str(found: regex::Match<'_>) -> &str {
 }
 
 fn file_doomed_dir_link_violations(root: &Path, regex: &Regex, tracked_file: &str) -> Vec<String> {
-    let path = root.join(tracked_file);
+    let path = tracked_file_path(root, tracked_file);
     let content = read_tracked_file(&path);
     let content = decode_tracked_file(&content);
 

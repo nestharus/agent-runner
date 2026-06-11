@@ -31,11 +31,7 @@ struct SessionChainBackfillRow {
 impl StateDb {
     pub fn backfill_session_chains(&self) -> Result<BackfillReport, DbError> {
         if Self::session_chains_backfill_exists(&self.conn)? {
-            return Ok(BackfillReport {
-                skipped_existing: true,
-                chains_inserted: 0,
-                segments_inserted: 0,
-            });
+            return Ok(Self::session_chain_backfill_skipped_report());
         }
 
         let rows = Self::load_session_chain_backfill_rows(&self.conn)?;
@@ -49,28 +45,61 @@ impl StateDb {
         let mut segments_inserted = 0;
         for row in rows {
             let model_name = Self::infer_model_for_backfill_row(&tx, &provider_session_expr, &row)?;
-            let chain_id = Uuid::new_v4().to_string();
+            let chain_id = Self::new_session_chain_id();
             chains_inserted += Self::insert_backfill_chain(&tx, &chain_id, &row, &model_name)?;
             segments_inserted += Self::insert_backfill_segment(&tx, &chain_id, &row)?;
         }
         tx.commit()
             .map_err(Self::format_session_chain_backfill_commit_error)?;
-        Ok(BackfillReport {
+        Ok(Self::session_chain_backfill_report(
+            chains_inserted,
+            segments_inserted,
+        ))
+    }
+
+    fn session_chain_backfill_skipped_report() -> BackfillReport {
+        BackfillReport {
+            skipped_existing: true,
+            chains_inserted: 0,
+            segments_inserted: 0,
+        }
+    }
+
+    fn session_chain_backfill_report(
+        chains_inserted: u64,
+        segments_inserted: u64,
+    ) -> BackfillReport {
+        BackfillReport {
             skipped_existing: false,
             chains_inserted,
             segments_inserted,
-        })
+        }
+    }
+
+    fn new_session_chain_id() -> String {
+        Uuid::new_v4().to_string()
     }
 
     fn session_chains_backfill_exists(conn: &sqlite::Connection) -> Result<bool, DbError> {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_chains LIMIT 1)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(Self::format_session_chain_backfill_state_error)?;
-        Ok(exists != 0)
+        let exists = Self::read_session_chains_backfill_exists(conn)?;
+        Ok(Self::session_chains_backfill_exists_value(exists))
+    }
+
+    fn read_session_chains_backfill_exists(conn: &sqlite::Connection) -> Result<i64, DbError> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_chains LIMIT 1)",
+            [],
+            Self::map_session_chains_backfill_exists_row,
+        )
+        .map_err(Self::format_session_chain_backfill_state_error)
+    }
+
+    fn map_session_chains_backfill_exists_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn session_chains_backfill_exists_value(exists: i64) -> bool {
+        exists != 0
     }
 
     fn load_session_chain_backfill_rows(
@@ -138,11 +167,17 @@ impl StateDb {
         model_sql: &str,
         row: &SessionChainBackfillRow,
     ) -> Result<Option<String>, DbError> {
-        conn.query_row(model_sql, sqlite::params![row.session], |r| {
-            r.get::<_, String>(0)
-        })
+        conn.query_row(
+            model_sql,
+            sqlite::params![row.session],
+            Self::map_backfill_model_lookup_row,
+        )
         .optional()
         .map_err(Self::format_backfill_model_inference_error)
+    }
+
+    fn map_backfill_model_lookup_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn default_backfill_model_name(model_name: Option<String>) -> String {

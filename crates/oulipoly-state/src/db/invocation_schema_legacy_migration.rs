@@ -63,8 +63,16 @@ impl StateDb {
     }
 
     pub(super) fn legacy_invocations_count(conn: &sqlite::Connection) -> Result<i64, String> {
-        conn.query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
-            .map_err(Self::format_legacy_invocations_count_error)
+        conn.query_row(
+            "SELECT COUNT(*) FROM invocations",
+            [],
+            Self::map_invocation_count_row,
+        )
+        .map_err(Self::format_legacy_invocations_count_error)
+    }
+
+    fn map_invocation_count_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
     }
 
     fn format_legacy_invocations_count_error(err: sqlite::Error) -> String {
@@ -268,12 +276,10 @@ impl StateDb {
         row: LegacyInvocationRow,
         provider_names: &HashMap<(String, usize), String>,
     ) -> LegacyInvocationInsert {
-        let provider_name = provider_names
-            .get(&(row.model_name.clone(), row.provider_index as usize))
-            .cloned();
+        let provider_name = Self::legacy_provider_name(&row, provider_names);
         let status = Self::legacy_invocation_status(provider_name.as_ref(), row.success);
         LegacyInvocationInsert {
-            invocation_uuid: Uuid::new_v4().to_string(),
+            invocation_uuid: Self::new_legacy_invocation_uuid(),
             model_name: row.model_name,
             provider_name,
             provider_index: row.provider_index,
@@ -283,6 +289,19 @@ impl StateDb {
             error_category: row.error_category,
             created_at: row.created_at,
         }
+    }
+
+    fn legacy_provider_name(
+        row: &LegacyInvocationRow,
+        provider_names: &HashMap<(String, usize), String>,
+    ) -> Option<String> {
+        provider_names
+            .get(&(row.model_name.clone(), row.provider_index as usize))
+            .cloned()
+    }
+
+    fn new_legacy_invocation_uuid() -> String {
+        Uuid::new_v4().to_string()
     }
 
     pub(super) fn legacy_invocation_status(
@@ -297,8 +316,12 @@ impl StateDb {
     }
 
     pub(super) fn migrated_invocations_count(conn: &sqlite::Connection) -> Result<i64, String> {
-        conn.query_row("SELECT COUNT(*) FROM invocations_new", [], |row| row.get(0))
-            .map_err(Self::format_migrated_invocations_count_error)
+        conn.query_row(
+            "SELECT COUNT(*) FROM invocations_new",
+            [],
+            Self::map_invocation_count_row,
+        )
+        .map_err(Self::format_migrated_invocations_count_error)
     }
 
     fn format_migrated_invocations_count_error(err: sqlite::Error) -> String {

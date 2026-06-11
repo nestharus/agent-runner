@@ -2,10 +2,11 @@
 //!
 //! - accessor
 //! - formatter
+//! - mapper
 //! - orchestration
 //! - predicate
 //!
-//! Role set: { accessor, formatter, orchestration, predicate }
+//! Role set: { accessor, formatter, mapper, orchestration, predicate }
 //!
 //! Imported chain minting and active segment closing helpers.
 
@@ -40,8 +41,8 @@ impl StateDb {
         if Self::session_chain_segment_exists(&self.conn, provider_name, session_id)? {
             return Ok(());
         }
-        let chain_id = Uuid::new_v4().to_string();
-        let ts = started_at.to_rfc3339();
+        let chain_id = Self::new_imported_chain_id();
+        let ts = Self::segment_start_timestamp(started_at);
         let tx = self
             .conn
             .unchecked_transaction()
@@ -53,22 +54,45 @@ impl StateDb {
         Ok(())
     }
 
+    fn new_imported_chain_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn segment_start_timestamp(started_at: &DateTime<Utc>) -> String {
+        started_at.to_rfc3339()
+    }
+
     pub(super) fn session_chain_segment_exists(
         conn: &sqlite::Connection,
         provider_name: &str,
         session_id: &str,
     ) -> Result<bool, DbError> {
-        let exists: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM session_chain_segments
-                 WHERE provider_name = ?1 AND session_id = ?2
-                 LIMIT 1",
-                sqlite::params![provider_name, session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Self::format_session_chain_segment_exists_error)?;
-        Ok(exists.is_some())
+        let exists = Self::read_session_chain_segment_exists(conn, provider_name, session_id)?;
+        Ok(Self::session_chain_segment_exists_value(exists))
+    }
+
+    fn read_session_chain_segment_exists(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<Option<i64>, DbError> {
+        conn.query_row(
+            "SELECT 1 FROM session_chain_segments
+             WHERE provider_name = ?1 AND session_id = ?2
+             LIMIT 1",
+            sqlite::params![provider_name, session_id],
+            Self::map_session_chain_segment_exists_row,
+        )
+        .optional()
+        .map_err(Self::format_session_chain_segment_exists_error)
+    }
+
+    fn map_session_chain_segment_exists_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn session_chain_segment_exists_value(exists: Option<i64>) -> bool {
+        exists.is_some()
     }
 
     pub(super) fn insert_imported_chain(

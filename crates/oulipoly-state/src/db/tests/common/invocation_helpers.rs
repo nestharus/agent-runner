@@ -4,8 +4,9 @@
 //! - formatter
 //! - mapper
 //! - orchestration
+//! - validator
 //!
-//! Role set: { accessor, formatter, mapper, orchestration }
+//! Role set: { accessor, formatter, mapper, orchestration, validator }
 
 use super::super::*;
 pub(in crate::db::tests) fn insert_invocation_fixture(
@@ -75,17 +76,49 @@ pub(in crate::db::tests) fn record_provider_invocation(
 pub(in crate::db::tests) fn with_models_config(model_name: &str, body: &str, test: impl FnOnce()) {
     let _guard = env_lock().lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let app_dir = dir.path().join("oulipoly-agent-runner");
-    let models_dir = app_dir.join("models");
-    std::fs::create_dir_all(&models_dir).unwrap();
-    std::fs::write(models_dir.join(format!("{model_name}.toml")), body).unwrap();
+    write_model_config_fixture(dir.path(), model_name, body);
 
-    let old = std::env::var_os("XDG_CONFIG_HOME");
+    let old = current_xdg_config_home();
+    isolate_xdg_config_home(dir.path());
+    let result = run_models_config_test(test);
+    restore_xdg_config_home(old);
+    resume_models_config_panic(result);
+}
+
+fn write_model_config_fixture(dir: &std::path::Path, model_name: &str, body: &str) {
+    let models_dir = models_fixture_dir(dir);
+    std::fs::create_dir_all(&models_dir).unwrap();
+    std::fs::write(model_fixture_path(&models_dir, model_name), body).unwrap();
+}
+
+fn models_fixture_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("oulipoly-agent-runner").join("models")
+}
+
+fn model_fixture_path(models_dir: &std::path::Path, model_name: &str) -> std::path::PathBuf {
+    models_dir.join(model_fixture_filename(model_name))
+}
+
+fn model_fixture_filename(model_name: &str) -> String {
+    format!("{model_name}.toml")
+}
+
+fn current_xdg_config_home() -> Option<std::ffi::OsString> {
+    std::env::var_os("XDG_CONFIG_HOME")
+}
+
+fn isolate_xdg_config_home(dir: &std::path::Path) {
     // Tests need to isolate config-driven provider-name resolution.
     unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        std::env::set_var("XDG_CONFIG_HOME", dir);
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));
+}
+
+fn run_models_config_test(test: impl FnOnce()) -> std::thread::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(test))
+}
+
+fn restore_xdg_config_home(old: Option<std::ffi::OsString>) {
     match old {
         Some(value) => unsafe {
             std::env::set_var("XDG_CONFIG_HOME", value);
@@ -94,6 +127,9 @@ pub(in crate::db::tests) fn with_models_config(model_name: &str, body: &str, tes
             std::env::remove_var("XDG_CONFIG_HOME");
         },
     }
+}
+
+fn resume_models_config_panic(result: std::thread::Result<()>) {
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }

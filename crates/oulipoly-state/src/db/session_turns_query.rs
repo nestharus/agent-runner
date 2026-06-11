@@ -104,14 +104,23 @@ impl StateDb {
         provider_name: &str,
         since: &DateTime<Utc>,
     ) -> Result<i64, String> {
+        let since = Self::assistant_turn_count_cutoff(since);
         self.conn
             .query_row(
                 "SELECT COUNT(*) FROM session_turns
                  WHERE provider_name = ?1 AND role = 'assistant' AND timestamp > ?2",
-                sqlite::params![provider_name, since.to_rfc3339()],
-                |row| row.get(0),
+                sqlite::params![provider_name, since],
+                Self::map_assistant_turn_count_row,
             )
             .map_err(Self::session_turn_count_error)
+    }
+
+    fn map_assistant_turn_count_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn assistant_turn_count_cutoff(since: &DateTime<Utc>) -> String {
+        since.to_rfc3339()
     }
 
     pub(super) fn query_all_assistant_turn_count(
@@ -123,7 +132,7 @@ impl StateDb {
                 "SELECT COUNT(*) FROM session_turns
                  WHERE provider_name = ?1 AND role = 'assistant'",
                 sqlite::params![provider_name],
-                |row| row.get(0),
+                Self::map_assistant_turn_count_row,
             )
             .map_err(Self::session_turn_count_error)
     }
@@ -209,9 +218,13 @@ impl StateDb {
             .query_row(
                 SESSION_USER_TURN_SUBSTRING_SQL,
                 sqlite::params![provider_name, session_id, needle],
-                |row| row.get(0),
+                Self::map_session_user_turn_substring_exists_row,
             )
             .map_err(Self::format_session_user_turn_substring_query_error)
+    }
+
+    fn map_session_user_turn_substring_exists_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
     }
 
     fn sqlite_exists_value_is_true(found: i64) -> bool {

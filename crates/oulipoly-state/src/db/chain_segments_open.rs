@@ -70,12 +70,13 @@ impl StateDb {
         started_at: &DateTime<Utc>,
         reason: TransitionReason,
     ) -> Result<i64, DbError> {
+        let started_at = Self::open_segment_started_at(started_at);
         Self::upsert_open_chain_segment(
             &self.conn,
             chain_id,
             provider_name,
             session_id,
-            &started_at.to_rfc3339(),
+            &started_at,
             reason,
         )?;
         Self::read_open_chain_segment_id(&self.conn, chain_id, provider_name, session_id)
@@ -89,6 +90,7 @@ impl StateDb {
             .conn
             .unchecked_transaction()
             .map_err(Self::format_chain_segment_rotation_begin_error)?;
+        let changed_at = Self::rotation_segment_changed_at(input.changed_at);
         let closed_id =
             Self::require_active_source_segment(Self::close_expected_active_segment_returning_on(
                 &tx,
@@ -102,7 +104,7 @@ impl StateDb {
             input.chain_id,
             input.target_provider_name,
             input.target_session_id,
-            &input.changed_at.to_rfc3339(),
+            &changed_at,
             input.reason,
         )?;
         let opened_id = Self::read_open_chain_segment_id(
@@ -113,7 +115,19 @@ impl StateDb {
         )?;
         tx.commit()
             .map_err(Self::format_chain_segment_rotation_commit_error)?;
-        Ok((closed_id, opened_id))
+        Ok(Self::chain_segment_rotation_ids(closed_id, opened_id))
+    }
+
+    fn open_segment_started_at(started_at: &DateTime<Utc>) -> String {
+        started_at.to_rfc3339()
+    }
+
+    fn rotation_segment_changed_at(changed_at: &DateTime<Utc>) -> String {
+        changed_at.to_rfc3339()
+    }
+
+    fn chain_segment_rotation_ids(closed_id: i64, opened_id: i64) -> (i64, i64) {
+        (closed_id, opened_id)
     }
 
     pub fn active_chain_segment_snapshot(
@@ -189,9 +203,13 @@ impl StateDb {
                  WHERE chain_id = ?1 AND provider_name = ?2 AND session_id = ?3
                  ORDER BY id DESC LIMIT 1",
             sqlite::params![chain_id, provider_name, session_id],
-            |row| row.get(0),
+            Self::map_open_chain_segment_id_row,
         )
         .map_err(Self::format_open_chain_segment_id_read_error)
+    }
+
+    fn map_open_chain_segment_id_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
     }
 
     pub fn find_conflicting_active_segment(
@@ -211,10 +229,14 @@ impl StateDb {
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
                 sqlite::params![provider_name, session_id, own_chain_id],
-                |row| row.get(0),
+                Self::map_conflicting_active_segment_row,
             )
             .optional()
             .map_err(Self::format_conflicting_active_segment_check_error)
+    }
+
+    fn map_conflicting_active_segment_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn require_active_source_segment(segment_id: Option<i64>) -> Result<i64, DbError> {

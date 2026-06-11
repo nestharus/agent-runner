@@ -56,14 +56,34 @@ impl StateDb {
         conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<String, DbError> {
+        let uuid_text = Self::query_invocation_uuid_text(conn, invocation_row_id)
+            .map_err(Self::format_returned_artifact_invocation_load_error)?;
+        Self::require_invocation_uuid_text(invocation_row_id, uuid_text)
+    }
+
+    fn query_invocation_uuid_text(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+    ) -> sqlite::Result<Option<String>> {
         conn.query_row(
             "SELECT invocation_uuid FROM invocations WHERE id = ?1",
             sqlite::params![invocation_row_id],
-            |row| row.get(0),
+            Self::map_invocation_uuid_text_row,
         )
         .optional()
-        .map_err(Self::format_returned_artifact_invocation_load_error)?
-        .ok_or_else(|| Self::format_returned_artifact_invocation_not_found_error(invocation_row_id))
+    }
+
+    fn map_invocation_uuid_text_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
+    }
+
+    fn require_invocation_uuid_text(
+        invocation_row_id: i64,
+        uuid_text: Option<String>,
+    ) -> Result<String, DbError> {
+        uuid_text.ok_or_else(|| {
+            Self::format_returned_artifact_invocation_not_found_error(invocation_row_id)
+        })
     }
 
     fn format_returned_artifact_invocation_load_error(err: sqlite::Error) -> DbError {

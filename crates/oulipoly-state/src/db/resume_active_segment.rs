@@ -27,10 +27,14 @@ impl StateDb {
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
                 sqlite::params![chain_id, provider_name, session_id],
-                |row| row.get(0),
+                Self::map_active_segment_id_row,
             )
             .optional()
             .map_err(Self::format_active_chain_segment_id_read_error)
+    }
+
+    fn map_active_segment_id_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
     }
 
     fn format_active_chain_segment_id_read_error(err: sqlite::Error) -> String {
@@ -49,10 +53,14 @@ impl StateDb {
                  ORDER BY started_at DESC, id DESC
                  LIMIT 1",
                 sqlite::params![chain_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                Self::map_active_segment_for_chain_row,
             )
             .optional()
             .map_err(Self::format_active_chain_segment_read_error)
+    }
+
+    fn map_active_segment_for_chain_row(row: &sqlite::Row<'_>) -> sqlite::Result<(String, String)> {
+        Ok((row.get(0)?, row.get(1)?))
     }
 
     fn format_active_chain_segment_read_error(err: sqlite::Error) -> String {
@@ -64,10 +72,14 @@ impl StateDb {
             .query_row(
                 "SELECT model_name FROM session_chains WHERE chain_id = ?1",
                 sqlite::params![chain_id],
-                |row| row.get(0),
+                Self::map_chain_model_name_row,
             )
             .optional()
             .map_err(Self::format_session_chain_model_read_error)
+    }
+
+    fn map_chain_model_name_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn format_session_chain_model_read_error(err: sqlite::Error) -> String {
@@ -81,9 +93,17 @@ impl StateDb {
         let provider_session_expr = Self::provider_session_expr(&self.conn, Some("i."))?;
         let sql = Self::latest_invocation_model_sql(&provider_session_expr);
         self.conn
-            .query_row(&sql, sqlite::params![chain_id], |row| row.get(0))
+            .query_row(
+                &sql,
+                sqlite::params![chain_id],
+                Self::map_latest_invocation_model_row,
+            )
             .optional()
             .map_err(Self::format_latest_invocation_model_read_error)
+    }
+
+    fn map_latest_invocation_model_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn format_latest_invocation_model_read_error(err: sqlite::Error) -> String {

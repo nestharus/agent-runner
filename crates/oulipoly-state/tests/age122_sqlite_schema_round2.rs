@@ -112,14 +112,42 @@ fn sorted_migration_names() -> Vec<String> {
 }
 
 fn migration_names() -> Vec<String> {
-    std::fs::read_dir(migrations_dir())
-        .unwrap()
-        .map(|entry| migration_name(entry.unwrap()))
+    migration_entries()
+        .into_iter()
+        .map(migration_name)
         .collect()
 }
 
+fn migration_entries() -> Vec<std::fs::DirEntry> {
+    collect_migration_entries(require_migration_read_dir(read_migration_dir()))
+}
+
+fn read_migration_dir() -> std::io::Result<std::fs::ReadDir> {
+    std::fs::read_dir(migrations_dir())
+}
+
+fn require_migration_read_dir(result: std::io::Result<std::fs::ReadDir>) -> std::fs::ReadDir {
+    result.unwrap()
+}
+
+fn collect_migration_entries(entries: std::fs::ReadDir) -> Vec<std::fs::DirEntry> {
+    entries.map(require_migration_entry).collect()
+}
+
+fn require_migration_entry(result: std::io::Result<std::fs::DirEntry>) -> std::fs::DirEntry {
+    result.unwrap()
+}
+
 fn migration_name(entry: std::fs::DirEntry) -> String {
-    entry.file_name().to_string_lossy().into_owned()
+    format_migration_file_name(migration_file_name(entry))
+}
+
+fn migration_file_name(entry: std::fs::DirEntry) -> std::ffi::OsString {
+    entry.file_name()
+}
+
+fn format_migration_file_name(name: std::ffi::OsString) -> String {
+    name.to_string_lossy().into_owned()
 }
 
 fn migrations_dir() -> std::path::PathBuf {

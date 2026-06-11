@@ -4,8 +4,9 @@
 //! - formatter
 //! - mapper
 //! - orchestration
+//! - validator
 //!
-//! Role set: { accessor, formatter, mapper, orchestration }
+//! Role set: { accessor, formatter, mapper, orchestration, validator }
 
 use super::super::*;
 use super::*;
@@ -13,42 +14,57 @@ pub(in crate::db::tests) fn table_columns_with_pk(
     conn: &sqlite::Connection,
     table_name: &str,
 ) -> Vec<(String, i64)> {
-    let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table_name})"))
-        .unwrap();
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
-        })
-        .unwrap();
-    rows.map(|row| row.unwrap()).collect()
+    require_sqlite_rows(read_table_columns_with_pk(conn, table_name))
+}
+
+fn read_table_columns_with_pk(
+    conn: &sqlite::Connection,
+    table_name: &str,
+) -> sqlite::Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(&table_info_sql(table_name))?;
+    let rows = stmt.query_map([], table_column_with_pk_row)?;
+    rows.collect()
+}
+
+fn table_info_sql(table_name: &str) -> String {
+    format!("PRAGMA table_info({table_name})")
+}
+
+fn table_column_with_pk_row(row: &sqlite::Row<'_>) -> sqlite::Result<(String, i64)> {
+    Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
 }
 
 pub(in crate::db::tests) fn provider_aggregate_snapshot(
     conn: &sqlite::Connection,
 ) -> Vec<ProviderAggregateSnapshot> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT model_name, provider_name, invocation_count, error_count,
-                        last_error, last_error_at, last_invoked_at
-                   FROM providers
-                  ORDER BY model_name, provider_name",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(ProviderAggregateSnapshot {
-                model_name: row.get(0)?,
-                provider_name: row.get(1)?,
-                invocation_count: row.get(2)?,
-                error_count: row.get(3)?,
-                last_error: row.get(4)?,
-                last_error_at: row.get(5)?,
-                last_invoked_at: row.get(6)?,
-            })
-        })
-        .unwrap();
-    rows.map(|row| row.unwrap()).collect()
+    require_sqlite_rows(read_provider_aggregate_snapshot(conn))
+}
+
+fn read_provider_aggregate_snapshot(
+    conn: &sqlite::Connection,
+) -> sqlite::Result<Vec<ProviderAggregateSnapshot>> {
+    let mut stmt = conn.prepare(
+        "SELECT model_name, provider_name, invocation_count, error_count,
+                    last_error, last_error_at, last_invoked_at
+               FROM providers
+              ORDER BY model_name, provider_name",
+    )?;
+    let rows = stmt.query_map([], provider_aggregate_snapshot_row)?;
+    rows.collect()
+}
+
+fn provider_aggregate_snapshot_row(
+    row: &sqlite::Row<'_>,
+) -> sqlite::Result<ProviderAggregateSnapshot> {
+    Ok(ProviderAggregateSnapshot {
+        model_name: row.get(0)?,
+        provider_name: row.get(1)?,
+        invocation_count: row.get(2)?,
+        error_count: row.get(3)?,
+        last_error: row.get(4)?,
+        last_error_at: row.get(5)?,
+        last_invoked_at: row.get(6)?,
+    })
 }
 
 pub(in crate::db::tests) fn quoted_snapshot(
@@ -56,15 +72,30 @@ pub(in crate::db::tests) fn quoted_snapshot(
     schema_sql: &str,
     rows_sql: &str,
 ) -> Vec<String> {
-    let mut snapshot = Vec::new();
-    snapshot.push(
-        conn.query_row(schema_sql, [], |row| row.get::<_, String>(0))
-            .unwrap(),
-    );
-    let mut stmt = conn.prepare(rows_sql).unwrap();
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
-    snapshot.extend(rows.map(|row| row.unwrap()));
+    let mut snapshot = quoted_schema_snapshot(conn, schema_sql);
+    snapshot.extend(quoted_row_snapshot(conn, rows_sql));
     snapshot
+}
+
+fn quoted_schema_snapshot(conn: &sqlite::Connection, schema_sql: &str) -> Vec<String> {
+    vec![conn.query_row(schema_sql, [], quoted_string_row).unwrap()]
+}
+
+fn quoted_row_snapshot(conn: &sqlite::Connection, rows_sql: &str) -> Vec<String> {
+    require_sqlite_rows(read_quoted_row_snapshot(conn, rows_sql))
+}
+
+fn read_quoted_row_snapshot(
+    conn: &sqlite::Connection,
+    rows_sql: &str,
+) -> sqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(rows_sql)?;
+    let rows = stmt.query_map([], quoted_string_row)?;
+    rows.collect()
+}
+
+fn quoted_string_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get::<_, String>(0)
 }
 
 pub(in crate::db::tests) fn malformed_providers_snapshot(conn: &sqlite::Connection) -> Vec<String> {
@@ -139,11 +170,19 @@ pub(in crate::db::tests) fn invocation_table_sql(db: &StateDb) -> String {
 }
 
 pub(in crate::db::tests) fn invocation_columns(db: &StateDb) -> Vec<String> {
-    db.conn
-        .prepare("PRAGMA table_info(invocations)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    require_sqlite_rows(read_invocation_columns(db))
+}
+
+fn read_invocation_columns(db: &StateDb) -> sqlite::Result<Vec<String>> {
+    let mut stmt = db.conn.prepare("PRAGMA table_info(invocations)")?;
+    let rows = stmt.query_map([], invocation_column_row)?;
+    rows.collect()
+}
+
+fn require_sqlite_rows<T>(result: sqlite::Result<Vec<T>>) -> Vec<T> {
+    result.unwrap()
+}
+
+fn invocation_column_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get::<_, String>(1)
 }

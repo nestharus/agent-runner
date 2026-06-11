@@ -555,17 +555,23 @@ struct SchemaRow {
 
 // Declared role: accessor
 fn schema_rows(conn: &Connection) -> Vec<SchemaRow> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema
-             WHERE name NOT LIKE 'sqlite_%'
-             ORDER BY type, name",
-        )
-        .unwrap();
+    require_schema_rows(read_schema_rows(conn))
+}
+
+// Declared role: accessor
+fn read_schema_rows(conn: &Connection) -> rusqlite::Result<Vec<SchemaRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name",
+    )?;
     stmt.query_map([], schema_row)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_schema_rows(result: rusqlite::Result<Vec<SchemaRow>>) -> Vec<SchemaRow> {
+    result.unwrap()
 }
 
 // Declared role: mapper
@@ -592,13 +598,21 @@ type ForeignKeyEdge = (String, String);
 
 // Declared role: accessor
 fn memory_edge_foreign_keys(conn: &Connection) -> Vec<ForeignKeyEdge> {
-    let mut stmt = conn
-        .prepare("PRAGMA foreign_key_list(memory_edges)")
-        .unwrap();
+    require_memory_edge_foreign_keys(read_memory_edge_foreign_keys(conn))
+}
+
+// Declared role: accessor
+fn read_memory_edge_foreign_keys(conn: &Connection) -> rusqlite::Result<Vec<ForeignKeyEdge>> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_list(memory_edges)")?;
     stmt.query_map([], foreign_key_edge)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_memory_edge_foreign_keys(
+    result: rusqlite::Result<Vec<ForeignKeyEdge>>,
+) -> Vec<ForeignKeyEdge> {
+    result.unwrap()
 }
 
 // Declared role: mapper
@@ -676,14 +690,34 @@ fn function_body_range(source: &str, function_name: &str) -> Range<usize> {
 
 // Declared role: parser
 fn function_start(source: &str, function_name: &str) -> usize {
-    source
-        .find(&format!("{function_name}("))
-        .unwrap_or_else(|| panic!("missing function {function_name}"))
+    let needle = function_start_needle(function_name);
+    require_function_start(function_name, source.find(&needle))
+}
+
+// Declared role: formatter
+fn function_start_needle(function_name: &str) -> String {
+    format!("{function_name}(")
+}
+
+// Declared role: validator
+fn require_function_start(function_name: &str, start: Option<usize>) -> usize {
+    start.unwrap_or_else(|| panic!("missing function {function_name}"))
 }
 
 // Declared role: parser
 fn opening_brace(source: &str, start: usize) -> usize {
-    source[start..].find('{').unwrap() + start
+    let offset = require_opening_brace_offset(source[start..].find('{'));
+    map_opening_brace_offset(start, offset)
+}
+
+// Declared role: validator
+fn require_opening_brace_offset(offset: Option<usize>) -> usize {
+    offset.unwrap()
+}
+
+// Declared role: mapper
+fn map_opening_brace_offset(start: usize, offset: usize) -> usize {
+    offset + start
 }
 
 // Declared role: parser
@@ -708,9 +742,21 @@ fn closing_brace(source: &str, brace_start: usize) -> usize {
 
 // Declared role: filter
 fn mutating_sql_statements(rust_body: &str) -> Vec<String> {
+    filter_schema_mutations(sql_statements_from_body(rust_body))
+}
+
+// Declared role: parser
+fn sql_statements_from_body(rust_body: &str) -> Vec<String> {
     extract_rust_string_literals(rust_body)
         .into_iter()
         .flat_map(sql_statements_from_literal)
+        .collect()
+}
+
+// Declared role: filter
+fn filter_schema_mutations(statements: Vec<String>) -> Vec<String> {
+    statements
+        .into_iter()
         .filter(|statement| is_schema_mutation(statement))
         .collect()
 }
@@ -771,10 +817,22 @@ fn extract_rust_string_literals(source: &str) -> Vec<String> {
 
 // Declared role: parser
 fn strip_sql_comments(sql: &str) -> String {
-    sql.lines()
-        .map(|line| line.split_once("--").map_or(line, |(prefix, _)| prefix))
-        .collect::<Vec<_>>()
-        .join("\n")
+    join_sql_lines(sql_comment_prefixes(sql))
+}
+
+// Declared role: parser
+fn sql_comment_prefixes(sql: &str) -> Vec<&str> {
+    sql.lines().map(sql_comment_prefix).collect()
+}
+
+// Declared role: parser
+fn sql_comment_prefix(line: &str) -> &str {
+    line.split_once("--").map_or(line, |(prefix, _)| prefix)
+}
+
+// Declared role: formatter
+fn join_sql_lines(lines: Vec<&str>) -> String {
+    lines.join("\n")
 }
 
 // Declared role: predicate

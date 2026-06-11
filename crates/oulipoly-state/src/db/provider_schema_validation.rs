@@ -58,10 +58,14 @@ impl StateDb {
         conn.query_row(
             "SELECT type FROM sqlite_master WHERE name = 'providers'",
             [],
-            |row| row.get::<_, String>(0),
+            Self::map_providers_object_type_row,
         )
         .optional()
         .map_err(Self::format_providers_object_type_error)
+    }
+
+    fn map_providers_object_type_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn format_providers_object_type_error(e: sqlite::Error) -> String {

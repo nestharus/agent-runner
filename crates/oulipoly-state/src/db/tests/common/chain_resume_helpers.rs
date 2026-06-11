@@ -5,8 +5,9 @@
 //! - mapper
 //! - orchestration
 //! - parser
+//! - validator
 //!
-//! Role set: { accessor, formatter, mapper, orchestration, parser }
+//! Role set: { accessor, formatter, mapper, orchestration, parser, validator }
 
 use super::super::*;
 use super::*;
@@ -28,13 +29,36 @@ struct ParsedModelFixture {
 }
 
 fn parsed_model_fixtures(fixtures: &[(&str, &str)]) -> Vec<ParsedModelFixture> {
-    fixtures
-        .iter()
-        .map(|(name, body)| ParsedModelFixture {
-            name: (*name).to_string(),
-            config: oulipoly_config::ModelConfig::from_toml_with_name(name, body, None).unwrap(),
-        })
-        .collect()
+    fixtures.iter().map(parsed_model_fixture).collect()
+}
+
+fn parsed_model_fixture((name, body): &(&str, &str)) -> ParsedModelFixture {
+    ParsedModelFixture {
+        name: model_fixture_name(name),
+        config: parse_model_fixture(name, body),
+    }
+}
+
+fn model_fixture_name(name: &str) -> String {
+    name.to_string()
+}
+
+fn parse_model_fixture(name: &str, body: &str) -> oulipoly_config::ModelConfig {
+    let result = parse_model_fixture_result(name, body);
+    require_model_fixture(result)
+}
+
+fn parse_model_fixture_result(
+    name: &str,
+    body: &str,
+) -> Result<oulipoly_config::ModelConfig, oulipoly_config::ModelError> {
+    oulipoly_config::ModelConfig::from_toml_with_name(name, body, None)
+}
+
+fn require_model_fixture(
+    result: Result<oulipoly_config::ModelConfig, oulipoly_config::ModelError>,
+) -> oulipoly_config::ModelConfig {
+    result.unwrap()
 }
 
 fn collect_model_store(

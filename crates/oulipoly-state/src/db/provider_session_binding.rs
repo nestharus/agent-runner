@@ -64,14 +64,34 @@ impl StateDb {
         conn: &sqlite::Connection,
         invocation_row_id: i64,
     ) -> Result<Option<String>, String> {
+        let existing = Self::query_existing_provider_session_binding(conn, invocation_row_id)
+            .map_err(|e| Self::format_provider_session_binding_read_error(invocation_row_id, e))?;
+        Self::require_provider_session_binding_row(invocation_row_id, existing)
+    }
+
+    fn query_existing_provider_session_binding(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+    ) -> sqlite::Result<Option<Option<String>>> {
         conn.query_row(
             "SELECT provider_session_id FROM invocations WHERE id = ?1",
             sqlite::params![invocation_row_id],
-            |row| row.get::<_, Option<String>>(0),
+            Self::map_existing_provider_session_binding_row,
         )
         .optional()
-        .map_err(|e| Self::format_provider_session_binding_read_error(invocation_row_id, e))?
-        .ok_or_else(|| {
+    }
+
+    fn map_existing_provider_session_binding_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<Option<String>> {
+        row.get(0)
+    }
+
+    fn require_provider_session_binding_row(
+        invocation_row_id: i64,
+        existing: Option<Option<String>>,
+    ) -> Result<Option<String>, String> {
+        existing.ok_or_else(|| {
             Self::format_provider_session_binding_missing_invocation_error(invocation_row_id)
         })
     }
@@ -234,10 +254,16 @@ impl StateDb {
                  WHERE provider_name = ?1 AND session_id = ?2
                  LIMIT 1",
             sqlite::params![provider_name, session_id],
-            |row| row.get::<_, String>(0),
+            Self::map_existing_chain_for_provider_session_row,
         )
         .optional()
         .map_err(Self::format_existing_invocation_chain_error)
+    }
+
+    fn map_existing_chain_for_provider_session_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn format_existing_invocation_chain_error(e: sqlite::Error) -> DbError {
@@ -284,21 +310,45 @@ impl StateDb {
         row: &InvocationChainMintRow,
         ts: &DateTime<Utc>,
     ) -> Result<(), DbError> {
-        let chain_id = Uuid::new_v4().to_string();
+        let insert = Self::invocation_chain_insert(row, ts);
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)",
-            sqlite::params![chain_id, ts.to_rfc3339(), row.model_name],
+            sqlite::params![&insert.chain_id, &insert.started_at, &insert.model_name],
         )
         .map_err(Self::format_mint_invocation_session_chain_error)?;
         conn.execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'initial')",
-            sqlite::params![chain_id, row.provider_name, row.session_id, ts.to_rfc3339()],
+            sqlite::params![
+                &insert.chain_id,
+                row.provider_name,
+                row.session_id,
+                &insert.started_at
+            ],
         )
         .map_err(Self::format_mint_invocation_session_segment_error)?;
         Ok(())
+    }
+
+    fn invocation_chain_insert(
+        row: &InvocationChainMintRow,
+        ts: &DateTime<Utc>,
+    ) -> InvocationChainInsert {
+        InvocationChainInsert {
+            chain_id: Self::new_invocation_chain_id(),
+            started_at: Self::invocation_chain_timestamp(ts),
+            model_name: row.model_name.clone(),
+        }
+    }
+
+    fn new_invocation_chain_id() -> String {
+        Uuid::new_v4().to_string()
+    }
+
+    fn invocation_chain_timestamp(ts: &DateTime<Utc>) -> String {
+        ts.to_rfc3339()
     }
 
     fn format_mint_invocation_session_chain_error(e: sqlite::Error) -> DbError {
@@ -308,4 +358,10 @@ impl StateDb {
     fn format_mint_invocation_session_segment_error(e: sqlite::Error) -> DbError {
         format!("Failed to mint invocation session segment: {e}")
     }
+}
+
+struct InvocationChainInsert {
+    chain_id: String,
+    started_at: String,
+    model_name: String,
 }

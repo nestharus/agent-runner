@@ -13,8 +13,8 @@ pub(in crate::db::tests) fn returned_artifact_ref(
     artifact_name: &str,
     version: u64,
 ) -> ReturnedArtifactRef {
-    let workflow_run_id = format!("return:{invocation_uuid}");
-    let version_id = format!("store://return/{invocation_uuid}/{artifact_name}/{version}");
+    let workflow_run_id = returned_artifact_workflow_run_id(invocation_uuid);
+    let version_id = returned_artifact_version_id(invocation_uuid, artifact_name, version);
     ReturnedArtifactRef {
         version_id,
         name: artifact_name.to_string(),
@@ -34,4 +34,16 @@ pub(in crate::db::tests) fn returned_artifact_ref(
         producer_invocation_uuid: invocation_uuid,
         returned_at: ts("2026-04-17T08:00:00Z"),
     }
+}
+
+fn returned_artifact_workflow_run_id(invocation_uuid: Uuid) -> String {
+    format!("return:{invocation_uuid}")
+}
+
+fn returned_artifact_version_id(
+    invocation_uuid: Uuid,
+    artifact_name: &str,
+    version: u64,
+) -> String {
+    format!("store://return/{invocation_uuid}/{artifact_name}/{version}")
 }

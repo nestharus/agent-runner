@@ -44,15 +44,26 @@ impl StateDb {
         &self,
         chain_id: &str,
     ) -> Result<DateTime<Utc>, String> {
-        let raw_last: String = self
-            .conn
+        let raw_last = self.read_chain_preview_last_used_at_raw(chain_id)?;
+        Self::parse_chain_preview_last_used_at(&raw_last)
+    }
+
+    fn read_chain_preview_last_used_at_raw(&self, chain_id: &str) -> Result<String, String> {
+        self.conn
             .query_row(
                 "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
                 sqlite::params![chain_id],
-                |row| row.get(0),
+                Self::map_chain_preview_last_used_at_row,
             )
-            .map_err(Self::format_chain_preview_read_error)?;
-        Self::strict_rfc3339_message(&raw_last, "chain preview timestamp")
+            .map_err(Self::format_chain_preview_read_error)
+    }
+
+    fn map_chain_preview_last_used_at_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
+    }
+
+    fn parse_chain_preview_last_used_at(raw_last: &str) -> Result<DateTime<Utc>, String> {
+        Self::strict_rfc3339_message(raw_last, "chain preview timestamp")
     }
 
     fn format_chain_preview_read_error(err: sqlite::Error) -> String {
@@ -64,14 +75,26 @@ impl StateDb {
         active_provider: &str,
         active_session_id: &str,
     ) -> usize {
-        let turn_count: i64 = self
-            .conn
+        Self::normalized_preview_turn_count(
+            self.raw_preview_turn_count(active_provider, active_session_id),
+        )
+    }
+
+    fn raw_preview_turn_count(&self, active_provider: &str, active_session_id: &str) -> i64 {
+        self.conn
             .query_row(
                 "SELECT COUNT(*) FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
                 sqlite::params![active_provider, active_session_id],
-                |row| row.get(0),
+                Self::map_preview_turn_count_row,
             )
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    fn map_preview_turn_count_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn normalized_preview_turn_count(turn_count: i64) -> usize {
         turn_count.max(0) as usize
     }
 

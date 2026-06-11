@@ -51,10 +51,14 @@ impl StateDb {
              FROM sqlite_master
              WHERE name = 'invocation_returned_artifacts'",
             [],
-            |row| row.get::<_, String>(0),
+            Self::map_returned_artifacts_object_type_row,
         )
         .optional()
         .map_err(Self::format_returned_artifacts_schema_inspect_error)
+    }
+
+    fn map_returned_artifacts_object_type_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     fn format_returned_artifacts_schema_inspect_error(err: sqlite::Error) -> DbError {

@@ -173,6 +173,7 @@ impl StateDb {
         window: &QuotaWindowInput,
         delta: QuotaWindowDelta,
     ) -> Result<(), String> {
+        let row = Self::quota_window_insert_row(index, window, delta);
         conn.execute(
             "INSERT INTO provider_quota_windows
                 (provider_name, window_id, used_percent, resets_at,
@@ -180,11 +181,11 @@ impl StateDb {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             sqlite::params![
                 provider_name,
-                index as i64,
-                window.used_percent,
-                window.resets_at.to_rfc3339(),
-                delta.last_delta_percent,
-                delta.last_delta_calls.map(|value| value as i64),
+                row.window_id,
+                row.used_percent,
+                row.resets_at,
+                row.last_delta_percent,
+                row.last_delta_calls,
             ],
         )
         .map_err(Self::format_insert_window_error)?;
@@ -194,4 +195,34 @@ impl StateDb {
     fn format_insert_window_error(e: sqlite::Error) -> String {
         format!("Failed to insert window: {e}")
     }
+
+    fn quota_window_insert_row(
+        index: usize,
+        window: &QuotaWindowInput,
+        delta: QuotaWindowDelta,
+    ) -> QuotaWindowInsertRow {
+        QuotaWindowInsertRow {
+            window_id: index as i64,
+            used_percent: window.used_percent,
+            resets_at: Self::quota_window_reset_timestamp(window),
+            last_delta_percent: delta.last_delta_percent,
+            last_delta_calls: Self::quota_window_delta_calls(delta.last_delta_calls),
+        }
+    }
+
+    fn quota_window_reset_timestamp(window: &QuotaWindowInput) -> String {
+        window.resets_at.to_rfc3339()
+    }
+
+    fn quota_window_delta_calls(value: Option<u64>) -> Option<i64> {
+        value.map(|value| value as i64)
+    }
+}
+
+struct QuotaWindowInsertRow {
+    window_id: i64,
+    used_percent: f64,
+    resets_at: String,
+    last_delta_percent: Option<f64>,
+    last_delta_calls: Option<i64>,
 }

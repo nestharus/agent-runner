@@ -249,9 +249,13 @@ impl StateDb {
                  WHERE i.id = ?1
                  LIMIT 1",
                 sqlite::params![invocation_id],
-                |row| row.get(0),
+                Self::map_chain_id_for_invocation_row,
             )
             .optional()
+    }
+
+    fn map_chain_id_for_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
     }
 
     pub(super) fn map_lifecycle_chain_id(

@@ -23,7 +23,7 @@ impl StateDb {
         provider_name: &str,
         windows: &[QuotaWindowInput],
     ) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
+        let now = Self::quota_refresh_timestamp(Utc::now());
 
         let prior = self.get_quota(provider_name)?;
         let prior_windows = self.get_windows(provider_name)?;
@@ -51,6 +51,10 @@ impl StateDb {
         )?;
         tx.commit().map_err(Self::format_refresh_commit_error)?;
         Ok(())
+    }
+
+    fn quota_refresh_timestamp(now: DateTime<Utc>) -> String {
+        now.to_rfc3339()
     }
 
     fn format_refresh_begin_error(e: sqlite::Error) -> String {
@@ -156,10 +160,28 @@ impl StateDb {
     }
 
     pub(super) fn legacy_quota_projection(windows: &[QuotaWindowInput]) -> (f64, Option<String>) {
-        match windows.iter().max_by_key(|window| window.resets_at) {
-            Some(window) => (window.used_percent, Some(window.resets_at.to_rfc3339())),
-            None => (0.0, None),
-        }
+        Self::legacy_quota_window(windows)
+            .map(Self::legacy_quota_projection_for_window)
+            .unwrap_or_else(Self::empty_legacy_quota_projection)
+    }
+
+    fn legacy_quota_window(windows: &[QuotaWindowInput]) -> Option<&QuotaWindowInput> {
+        windows.iter().max_by_key(|window| window.resets_at)
+    }
+
+    fn legacy_quota_projection_for_window(window: &QuotaWindowInput) -> (f64, Option<String>) {
+        (
+            window.used_percent,
+            Some(Self::legacy_quota_reset_timestamp(window)),
+        )
+    }
+
+    fn legacy_quota_reset_timestamp(window: &QuotaWindowInput) -> String {
+        window.resets_at.to_rfc3339()
+    }
+
+    fn empty_legacy_quota_projection() -> (f64, Option<String>) {
+        (0.0, None)
     }
 
     pub(super) fn quota_topology_peak(

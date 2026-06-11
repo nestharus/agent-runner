@@ -3,8 +3,9 @@
 //! - accessor
 //! - mapper
 //! - orchestration
+//! - validator
 //!
-//! Role set: { accessor, mapper, orchestration }
+//! Role set: { accessor, mapper, orchestration, validator }
 
 use super::super::*;
 #[derive(Clone, Default)]
@@ -47,12 +48,17 @@ pub(in crate::db::tests) fn age160_lifecycle_records(
 }
 
 pub(in crate::db::tests) fn age160_record_keys(record: &serde_json::Value) -> Vec<&str> {
-    record
-        .as_object()
-        .expect("record object")
-        .keys()
-        .map(String::as_str)
-        .collect()
+    map_age160_record_keys(require_age160_record_object(record))
+}
+
+fn require_age160_record_object(
+    record: &serde_json::Value,
+) -> &serde_json::Map<String, serde_json::Value> {
+    record.as_object().expect("record object")
+}
+
+fn map_age160_record_keys(record: &serde_json::Map<String, serde_json::Value>) -> Vec<&str> {
+    record.keys().map(String::as_str).collect()
 }
 
 /// AGE-160 risk: A6 db.rs↔lifecycle_log facade narrowing.

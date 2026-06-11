@@ -81,7 +81,7 @@ impl StateDb {
         provider_name: &str,
         window_minutes: i64,
     ) -> Result<i64, String> {
-        let cutoff = (Utc::now() - chrono::Duration::minutes(window_minutes)).to_rfc3339();
+        let cutoff = Self::recent_error_cutoff(window_minutes);
 
         let count: i64 = self
             .conn
@@ -90,11 +90,19 @@ impl StateDb {
                  WHERE model_name = ?1 AND provider_name = ?2
                    AND success = 0 AND created_at > ?3",
                 sqlite::params![model_name, provider_name, &cutoff],
-                |row| row.get(0),
+                Self::map_recent_error_count_row,
             )
             .map_err(Self::format_recent_error_count_error)?;
 
         Ok(count)
+    }
+
+    fn map_recent_error_count_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn recent_error_cutoff(window_minutes: i64) -> String {
+        (Utc::now() - chrono::Duration::minutes(window_minutes)).to_rfc3339()
     }
 
     fn format_recent_error_count_error(e: sqlite::Error) -> String {
@@ -147,7 +155,7 @@ impl StateDb {
         new_index: usize,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let ts = now.to_rfc3339();
+        let cursor = Self::round_robin_cursor_write(new_index, now);
         self.conn
             .execute(
                 "INSERT INTO model_round_robin_cursor (model_name, last_index, updated_at)
@@ -155,10 +163,17 @@ impl StateDb {
                  ON CONFLICT (model_name) DO UPDATE SET
                     last_index = excluded.last_index,
                     updated_at = excluded.updated_at",
-                params![model_name, new_index as i64, ts],
+                params![model_name, cursor.last_index, cursor.updated_at],
             )
             .map_err(Self::format_advance_round_robin_cursor_error)?;
         Ok(())
+    }
+
+    fn round_robin_cursor_write(new_index: usize, now: DateTime<Utc>) -> RoundRobinCursorWrite {
+        RoundRobinCursorWrite {
+            last_index: new_index as i64,
+            updated_at: now.to_rfc3339(),
+        }
     }
 
     fn format_advance_round_robin_cursor_error(e: sqlite::Error) -> String {
@@ -228,4 +243,9 @@ impl StateDb {
             "Expected exactly one providers row for model_name={model_name}, provider_name={provider_name}, updated {updated}"
         )
     }
+}
+
+struct RoundRobinCursorWrite {
+    last_index: i64,
+    updated_at: String,
 }

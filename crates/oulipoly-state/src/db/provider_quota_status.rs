@@ -30,7 +30,7 @@ impl StateDb {
     }
 
     pub fn mark_exhausted(&self, provider_name: &str) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
+        let now = Self::current_provider_quota_timestamp();
         // Upsert so first-use quota failures land the flag even when the
         // provider has never produced a `provider_quotas` row (e.g.,
         // misconfigured quota_script that only ever fails, or a provider
@@ -60,7 +60,7 @@ impl StateDb {
         next_available_at: Option<DateTime<Utc>>,
         failure_class: &str,
     ) -> Result<(), String> {
-        let next_at = next_available_at.map(|ts| ts.to_rfc3339());
+        let next_at = Self::optional_provider_quota_timestamp(next_available_at);
         self.conn
             .execute(
                 "INSERT INTO provider_quotas
@@ -101,7 +101,7 @@ impl StateDb {
         provider_name: &str,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let ts = now.to_rfc3339();
+        let ts = Self::provider_quota_timestamp(now);
         self.conn
             .execute(
                 "INSERT INTO provider_quotas (provider_name, last_refresh_at)
@@ -133,7 +133,7 @@ impl StateDb {
     }
 
     pub fn record_topology_probe(&self, provider_name: &str) -> Result<(), String> {
-        let now = Utc::now().to_rfc3339();
+        let now = Self::current_provider_quota_timestamp();
         self.conn
             .execute(
                 "INSERT INTO provider_quotas (provider_name, last_topology_probe_at)
@@ -148,5 +148,17 @@ impl StateDb {
 
     fn format_record_topology_probe_error(e: sqlite::Error) -> String {
         format!("Failed to record topology probe: {e}")
+    }
+
+    fn current_provider_quota_timestamp() -> String {
+        Self::provider_quota_timestamp(Utc::now())
+    }
+
+    fn optional_provider_quota_timestamp(ts: Option<DateTime<Utc>>) -> Option<String> {
+        ts.map(Self::provider_quota_timestamp)
+    }
+
+    fn provider_quota_timestamp(ts: DateTime<Utc>) -> String {
+        ts.to_rfc3339()
     }
 }

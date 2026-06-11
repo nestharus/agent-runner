@@ -76,10 +76,16 @@ impl StateDb {
     ) -> Result<Vec<String>, StateDbError> {
         let mut stmt = Self::prepare_compact_summary_evidence_read(conn)?;
         let rows = stmt
-            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .query_map(params![session_id], Self::compact_summary_turn_uuid_row)
             .map_err(Self::format_compact_summary_evidence_query_error)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(Self::format_compact_summary_evidence_row_read_error)
+    }
+
+    pub(super) fn compact_summary_turn_uuid_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<String> {
+        row.get(0)
     }
 
     pub(super) fn compact_summary_evidence_read_sql() -> &'static str {
