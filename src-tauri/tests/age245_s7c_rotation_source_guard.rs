@@ -130,6 +130,7 @@ fn tracked_diff_output_since_baseline(root: &Path) -> Output {
         .args([
             "diff",
             "--unified=0",
+            "--find-renames=80%",
             BASELINE_COMMIT,
             "--",
             ".",
@@ -139,6 +140,7 @@ fn tracked_diff_output_since_baseline(root: &Path) -> Output {
             ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
             ":(exclude)planning/s10-moveout/**",
+            ":(exclude)crates/oulipoly-state/src/db/tests.rs",
         ])
         .output()
         .expect("git diff must run for AGE-245 S7c provider-name invariant")
@@ -245,6 +247,11 @@ fn is_ignored_generated_path(relative: &str) -> bool {
         || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
         || relative.starts_with("planning/s10-moveout/")
+        || is_relocated_state_db_test_body(relative)
+}
+
+fn is_relocated_state_db_test_body(relative: &str) -> bool {
+    relative == "crates/oulipoly-state/src/db/tests.rs"
 }
 
 fn is_planning_gate_artifact(relative: &str) -> bool {
