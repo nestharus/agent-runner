@@ -9,6 +9,21 @@
 use super::*;
 
 impl StateDb {
+    /// Bump `calls_since_refresh` for a provider. Creates the row with 1 call
+    /// and zeroed quota if the provider isn't tracked yet.
+    pub fn increment_calls_since_refresh(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, calls_since_refresh)
+                 VALUES (?1, 1)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    calls_since_refresh = calls_since_refresh + 1",
+                sqlite::params![provider_name],
+            )
+            .map_err(|e| format!("Failed to increment calls_since_refresh: {e}"))?;
+        Ok(())
+    }
+
     pub fn mark_exhausted(&self, provider_name: &str) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         // Upsert so first-use quota failures land the flag even when the
