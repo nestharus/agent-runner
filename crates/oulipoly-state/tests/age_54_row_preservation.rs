@@ -373,24 +373,29 @@ fn unexpected_hand_edit_marker(path: &Path) -> String {
 
 // Declared role: parser
 fn migrate_legacy_invocations_body() -> &'static str {
-    extract_function_body(
-        include_str!("../src/db/invocation_schema_legacy_migration.rs"),
-        "migrate_legacy_invocations",
-    )
+    extract_function_body(legacy_migration_source(), "migrate_legacy_invocations")
+}
+
+// Declared role: accessor
+fn legacy_migration_source() -> &'static str {
+    include_str!("../src/db/invocation_schema_legacy_migration.rs")
 }
 
 // Declared role: validator
 fn assert_legacy_row_count_guard_body(body: &str) {
-    assert_legacy_row_count_guard_fragments(body);
+    assert_legacy_row_count_guard_executable_fragments();
     assert_legacy_row_count_guard_order(&legacy_row_count_guard_offsets(body));
 }
 
 // Declared role: validator
-fn assert_legacy_row_count_guard_fragments(body: &str) {
+fn assert_legacy_row_count_guard_executable_fragments() {
     for guard in legacy_row_count_guard_fragments() {
+        let body = extract_function_body(legacy_migration_source(), guard.function_name);
         assert!(
-            body.contains(guard),
-            "legacy rebuild guard body must retain {guard:?}"
+            body.contains(guard.fragment),
+            "legacy rebuild helper {} must retain executable fragment {:?}",
+            guard.function_name,
+            guard.fragment
         );
     }
 }
@@ -460,15 +465,38 @@ fn source_offset(source: &str, needle: &str, message: &str) -> usize {
 }
 
 // Declared role: accessor
-fn legacy_row_count_guard_fragments() -> [&'static str; 6] {
+fn legacy_row_count_guard_fragments() -> [LegacyRowCountGuardFragment; 6] {
     [
-        "SELECT COUNT(*) FROM invocations",
-        "scanned {scanned} rows but table count was {old_count}",
-        "CREATE TABLE invocations_new",
-        "SELECT COUNT(*) FROM invocations_new",
-        "migrated {new_count} rows from {old_count}",
-        "DROP TABLE invocations;",
+        LegacyRowCountGuardFragment {
+            function_name: "legacy_invocations_count",
+            fragment: "SELECT COUNT(*) FROM invocations",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "format_legacy_invocation_scan_count_error",
+            fragment: "scanned {scanned} rows but table count was {old_count}",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "create_migrated_invocations_table",
+            fragment: "CREATE TABLE invocations_new",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "migrated_invocations_count",
+            fragment: "SELECT COUNT(*) FROM invocations_new",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "format_migrated_invocation_count_mismatch_error",
+            fragment: "migrated {new_count} rows from {old_count}",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "replace_invocations_with_migrated_table",
+            fragment: "DROP TABLE invocations;",
+        },
     ]
+}
+
+struct LegacyRowCountGuardFragment {
+    function_name: &'static str,
+    fragment: &'static str,
 }
 
 #[derive(Debug, PartialEq, Eq)]
