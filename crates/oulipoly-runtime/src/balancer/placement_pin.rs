@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `validator`, `filter`, `orchestration`, `mapper`.
+//! `validator`, `filter`, `orchestration`, `mapper`, `parser`.
 
 use super::routing_error::{RoutingError, pinned_provider_not_in_model_error};
 use oulipoly_config::ModelConfig;

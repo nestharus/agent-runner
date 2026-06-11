@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `filter`, `predicate`, `orchestration`.
+//! `accessor`, `mapper`, `filter`, `predicate`, `orchestration`, `validator`.
 
 use super::{ERROR_THRESHOLD, ERROR_WINDOW_MINUTES, live_load::live_load_then_index_order};
 use oulipoly_config::ModelConfig;

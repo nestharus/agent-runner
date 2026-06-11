@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! accessor, mapper, formatter
+//! accessor, mapper, formatter, predicate, orchestration
 //!
 //! Narrow live-load read surface for routing tie-breaks.
 
