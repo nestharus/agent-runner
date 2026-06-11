@@ -1,8 +1,10 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate, filter.
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
+//! predicate, filter.
 //!
-//! TEST: structural segmentation fixtures and tracked-file lint helpers: git inventory accessors/parsers, regex/link formatters, tracked-path predicates
+//! TEST: structural segmentation fixtures and tracked-file lint helpers: git
+//! inventory accessors/parsers, regex/link formatters, tracked-path predicates
 //! and filters, file-content scanners, and assertion validators for doomed-dir
 //! absence and dangling-link rejection.
 //!
@@ -85,20 +87,12 @@ fn doomed_dir_link_regex() -> Regex {
 
 fn doomed_dir_link_pattern() -> String {
     let boundary = r"(^|[^[:alnum:]_./~-])";
-    let dirs = join_doomed_dir_parts(escaped_doomed_dir_parts());
+    let dirs = DOOMED_DIRS
+        .iter()
+        .map(|dir| regex::escape(dir))
+        .collect::<Vec<_>>()
+        .join("|");
     let path = r"/[A-Za-z0-9._~@%+=:,;/-]*\.[A-Za-z0-9][A-Za-z0-9._~@%+=:,;/-]*";
-    format_doomed_dir_link_pattern(boundary, &dirs, path)
-}
-
-fn escaped_doomed_dir_parts() -> Vec<String> {
-    DOOMED_DIRS.iter().map(|dir| regex::escape(dir)).collect()
-}
-
-fn join_doomed_dir_parts(dirs: Vec<String>) -> String {
-    dirs.join("|")
-}
-
-fn format_doomed_dir_link_pattern(boundary: &str, dirs: &str, path: &str) -> String {
     format!("{boundary}({dirs}){path}")
 }
 
@@ -166,47 +160,19 @@ fn is_regular_blob(mode: &str) -> bool {
 }
 
 fn tracked_regular_files() -> Vec<String> {
-    collect_existing_regular_files(&repo_root(), &git_stdout(&["ls-files", "--stage"]))
+    collect_regular_files(&git_stdout(&["ls-files", "--stage"]))
 }
 
-fn collect_existing_regular_files(root: &Path, stdout: &str) -> Vec<String> {
-    let existing_regular_paths = existing_regular_stage_paths(root, stdout);
-    owned_tracked_files(existing_regular_paths)
-}
-
-fn existing_regular_stage_paths<'a>(root: &Path, stdout: &'a str) -> Vec<&'a str> {
-    regular_stage_paths(stdout)
-        .into_iter()
-        .filter(|tracked_file| tracked_file_exists(root, tracked_file))
-        .collect()
-}
-
-fn tracked_file_exists(root: &Path, tracked_file: &str) -> bool {
-    path_exists(&tracked_file_path(root, tracked_file))
-}
-
-fn tracked_file_path(root: &Path, tracked_file: &str) -> PathBuf {
-    root.join(tracked_file)
-}
-
-fn path_exists(path: &Path) -> bool {
-    path.exists()
-}
-
-fn owned_tracked_files(tracked_files: Vec<&str>) -> Vec<String> {
-    tracked_files.into_iter().map(str::to_owned).collect()
+fn collect_regular_files(stdout: &str) -> Vec<String> {
+    own_tracked_files(regular_stage_paths(stdout))
 }
 
 fn regular_stage_paths(stdout: &str) -> Vec<&str> {
-    regular_paths_from_entries(stage_entries(stdout))
+    stdout.lines().filter_map(regular_stage_path).collect()
 }
 
-fn stage_entries(stdout: &str) -> Vec<&str> {
-    stdout.lines().collect()
-}
-
-fn regular_paths_from_entries(entries: Vec<&str>) -> Vec<&str> {
-    entries.into_iter().filter_map(regular_stage_path).collect()
+fn own_tracked_files(tracked_files: Vec<&str>) -> Vec<String> {
+    tracked_files.into_iter().map(str::to_owned).collect()
 }
 
 fn regular_stage_path(tracked_entry: &str) -> Option<&str> {
@@ -231,19 +197,11 @@ fn should_scan_for_doomed_dir_links(tracked_file: &str) -> bool {
 }
 
 fn line_doomed_dir_links<'a>(regex: &'a Regex, line: &'a str) -> impl Iterator<Item = &'a str> {
-    doomed_dir_link_matches(regex, line).map(doomed_dir_match_str)
-}
-
-fn doomed_dir_link_matches<'a>(regex: &'a Regex, line: &'a str) -> regex::Matches<'a, 'a> {
-    regex.find_iter(line)
-}
-
-fn doomed_dir_match_str(found: regex::Match<'_>) -> &str {
-    found.as_str()
+    regex.find_iter(line).map(|found| found.as_str())
 }
 
 fn file_doomed_dir_link_violations(root: &Path, regex: &Regex, tracked_file: &str) -> Vec<String> {
-    let path = tracked_file_path(root, tracked_file);
+    let path = root.join(tracked_file);
     let content = read_tracked_file(&path);
     let content = decode_tracked_file(&content);
 
