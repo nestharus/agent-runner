@@ -12,9 +12,9 @@ fn migration_returning_clause_aborts_on_concurrent_close() {
     seed_test_chain(
         &db,
         CHAIN_A,
-        "claude",
+        "provider-a",
         SESSION_A,
-        "claude-opus",
+        "provider-a-opus",
         "2026-04-17T08:00:00Z",
     );
 

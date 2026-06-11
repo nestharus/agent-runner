@@ -42,7 +42,7 @@ fn recent_error_count_uses_provider_name_not_reused_index_history() {
         record_provider_invocation(
             &db,
             "routing-model",
-            "claude-old",
+            "provider-a-old",
             0,
             false,
             Some("rate_limit"),
@@ -51,13 +51,13 @@ fn recent_error_count_uses_provider_name_not_reused_index_history() {
     }
 
     assert_eq!(
-        db.recent_error_count("routing-model", "claude", 60)
+        db.recent_error_count("routing-model", "provider-a", 60)
             .unwrap(),
         0,
         "current provider name must not inherit recent failures from a prior occupant of index 0"
     );
     assert_eq!(
-        db.recent_error_count("routing-model", "claude-old", 60)
+        db.recent_error_count("routing-model", "provider-a-old", 60)
             .unwrap(),
         3,
         "the failed provider name still owns its own recent failures"
@@ -67,44 +67,44 @@ fn recent_error_count_uses_provider_name_not_reused_index_history() {
 #[test]
 fn provider_aggregate_round_trip_follows_name_after_reorder() {
     let db = test_db();
-    record_provider_invocation(&db, "routing-model", "claude2", 0, true, None, None);
+    record_provider_invocation(&db, "routing-model", "provider-a2", 0, true, None, None);
 
-    let claude2 = db
-        .get_provider("routing-model", "claude2")
+    let provider_a2 = db
+        .get_provider("routing-model", "provider-a2")
         .unwrap()
-        .expect("claude2 aggregate should exist by provider name");
-    assert_eq!(claude2.provider_name, "claude2");
-    assert_eq!(claude2.invocation_count, 1);
+        .expect("provider-a2 aggregate should exist by provider name");
+    assert_eq!(provider_a2.provider_name, "provider-a2");
+    assert_eq!(provider_a2.invocation_count, 1);
     assert!(
-        db.get_provider("routing-model", "claude")
+        db.get_provider("routing-model", "provider-a")
             .unwrap()
             .is_none(),
-        "claude must not inherit claude2 history after taking index 0"
+        "provider-a must not inherit provider-a2 history after taking index 0"
     );
 
     assert!(
-        db.get_provider("routing-model", "claude")
+        db.get_provider("routing-model", "provider-a")
             .unwrap()
             .is_none(),
-        "fallback scoring should treat the current claude provider as unused"
+        "fallback scoring should treat the current provider-a provider as unused"
     );
 }
 
 #[test]
 fn provider_aggregate_round_trip_does_not_inherit_renamed_provider_history() {
     let db = test_db();
-    record_provider_invocation(&db, "routing-model", "claude-old", 0, true, None, None);
+    record_provider_invocation(&db, "routing-model", "provider-a-old", 0, true, None, None);
 
     let old = db
-        .get_provider("routing-model", "claude-old")
+        .get_provider("routing-model", "provider-a-old")
         .unwrap()
         .expect("old provider name should retain its aggregate");
-    assert_eq!(old.provider_name, "claude-old");
+    assert_eq!(old.provider_name, "provider-a-old");
     assert_eq!(old.invocation_count, 1);
     assert!(
-        db.get_provider("routing-model", "claude")
+        db.get_provider("routing-model", "provider-a")
             .unwrap()
             .is_none(),
-        "renamed provider claude starts without aggregate history unless invocations use that name"
+        "renamed provider provider-a starts without aggregate history unless invocations use that name"
     );
 }

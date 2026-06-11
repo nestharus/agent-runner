@@ -2,7 +2,9 @@
 //!
 //! - orchestration
 //! - mapper
+//!
 //! Role set: { orchestration, mapper }
+//!
 //! Invocation finalize row and provider aggregate writes.
 
 use super::*;

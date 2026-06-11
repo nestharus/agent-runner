@@ -12,7 +12,7 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
     let timestamp = ts("2026-04-17T08:00:00Z");
     assert!(
         db.ingest_session_turn(
-            "claude",
+            "provider-a",
             SESSION_A,
             "single-turn",
             &timestamp,
@@ -23,7 +23,7 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
     );
     assert!(
         !db.ingest_session_turn(
-            "claude",
+            "provider-a",
             SESSION_A,
             "single-turn",
             &timestamp,
@@ -64,8 +64,14 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
             body: Some("world".to_string()),
         },
     ];
-    assert_eq!(db.ingest_session_turns_batch("claude", &turns).unwrap(), 2);
-    assert_eq!(db.ingest_session_turns_batch("claude", &turns).unwrap(), 0);
+    assert_eq!(
+        db.ingest_session_turns_batch("provider-a", &turns).unwrap(),
+        2
+    );
+    assert_eq!(
+        db.ingest_session_turns_batch("provider-a", &turns).unwrap(),
+        0
+    );
     let row: (Option<String>, i64, i64, Option<String>) = db
         .conn
         .query_row(
@@ -95,7 +101,7 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
     assert!(
         failing
             .ingest_session_turns_batch(
-                "claude",
+                "provider-a",
                 &[
                     SessionTurnIngest {
                         session_id: SESSION_A.to_string(),

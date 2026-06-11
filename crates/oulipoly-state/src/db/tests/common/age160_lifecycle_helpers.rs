@@ -31,8 +31,8 @@ pub(in crate::db::tests) fn age160_lifecycle_fixture() -> (
 pub(in crate::db::tests) fn age160_invocation_start(uuid: &str) -> InvocationStart {
     InvocationStart {
         invocation_uuid: uuid.to_string(),
-        model_name: "codex~high".to_string(),
-        provider_name: "codex2".to_string(),
+        model_name: "provider-b~high".to_string(),
+        provider_name: "provider-b2".to_string(),
         provider_index: 0,
         parent_invocation_id: None,
     }

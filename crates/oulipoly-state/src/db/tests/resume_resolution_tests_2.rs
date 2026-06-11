@@ -12,9 +12,9 @@ fn chain_last_used_at_updates_after_successful_invocation() {
     seed_test_chain(
         &db,
         CHAIN_A,
-        "claude",
+        "provider-a",
         SESSION_A,
-        "claude-opus",
+        "provider-a-opus",
         "2026-04-17T08:00:00Z",
     );
 
@@ -43,7 +43,7 @@ fn chain_identity_helpers_report_sql_errors() {
     let segment_open_err = segmentless
         .open_chain_segment(
             CHAIN_A,
-            "claude",
+            "provider-a",
             SESSION_A,
             &ts("2026-04-17T08:00:00Z"),
             oulipoly_core::TransitionReason::Initial,
@@ -56,10 +56,10 @@ fn chain_identity_helpers_report_sql_errors() {
 
     let mint_err = db_without_table("session_chain_segments")
         .mint_imported_chain_if_absent(
-            "claude",
+            "provider-a",
             SESSION_A,
             &ts("2026-04-17T08:00:00Z"),
-            "claude-opus",
+            "provider-a-opus",
         )
         .unwrap_err();
     assert!(
@@ -73,7 +73,7 @@ fn chain_identity_helpers_report_sql_errors() {
     assert!(update_err.contains("last_used_at"), "{update_err}");
 
     let chain_lookup_err = db_without_table("session_chain_segments")
-        .chain_id_for_segment("claude", SESSION_A)
+        .chain_id_for_segment("provider-a", SESSION_A)
         .unwrap_err();
     assert!(
         chain_lookup_err.contains("session chain id"),
@@ -91,13 +91,13 @@ fn compaction_and_preview_helpers_report_negative_paths() {
             .execute(
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, is_compaction_boundary)
-                 VALUES ('claude', ?1, 'bad-boundary', 'not-a-timestamp', 'assistant', '', '2026-04-17T08:00:00Z', 1)",
+                 VALUES ('provider-a', ?1, 'bad-boundary', 'not-a-timestamp', 'assistant', '', '2026-04-17T08:00:00Z', 1)",
                 sqlite::params![SESSION_A],
             )
             .unwrap();
 
     let boundary_err = db
-        .latest_compaction_boundary("claude", SESSION_A)
+        .latest_compaction_boundary("provider-a", SESSION_A)
         .unwrap_err();
     assert!(
         boundary_err.contains("Bad compaction boundary timestamp"),

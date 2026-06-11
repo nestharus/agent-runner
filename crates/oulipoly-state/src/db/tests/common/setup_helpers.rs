@@ -7,11 +7,11 @@
 use super::super::*;
 pub(in crate::db::tests) fn sample_provider() -> CliProviderRecord {
     CliProviderRecord {
-        cli_name: "claude".to_string(),
+        cli_name: "provider-a".to_string(),
         display_name: "Anthropic".to_string(),
         installed: true,
         version: Some("1.2.3".to_string()),
-        config_dir: Some("/home/user/.claude".to_string()),
+        config_dir: Some("/home/user/.provider-a".to_string()),
         last_synced: None,
     }
 }

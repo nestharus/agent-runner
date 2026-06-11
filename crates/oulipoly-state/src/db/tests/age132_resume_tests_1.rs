@@ -13,8 +13,8 @@ fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
     let id = db
         .start_invocation(&InvocationStart {
             invocation_uuid: invocation_uuid.to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 7,
             parent_invocation_id: None,
         })
@@ -40,8 +40,8 @@ fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
     let record = db.get_invocation_by_uuid(invocation_uuid).unwrap().unwrap();
     assert_eq!(record.id, id);
     assert_eq!(record.invocation_uuid, invocation_uuid);
-    assert_eq!(record.model_name, "claude-opus");
-    assert_eq!(record.provider_name.as_deref(), Some("claude"));
+    assert_eq!(record.model_name, "provider-a-opus");
+    assert_eq!(record.provider_name.as_deref(), Some("provider-a"));
     assert_eq!(record.provider_index, 7);
     assert_eq!(record.parent_invocation_id, None);
     assert_eq!(record.status, InvocationStatus::Succeeded);
@@ -96,7 +96,7 @@ fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
 fn age132_backfill_infers_model_from_latest_matching_invocation() {
     let db = test_db();
     db.ingest_session_turns_batch(
-        "claude",
+        "provider-a",
         &[
             SessionTurnIngest {
                 session_id: SESSION_A.to_string(),
@@ -123,15 +123,15 @@ fn age132_backfill_infers_model_from_latest_matching_invocation() {
     .unwrap();
     seed_invocation_for_session(
         &db,
-        "claude-haiku",
-        "claude",
+        "provider-a-haiku",
+        "provider-a",
         SESSION_A,
         "2026-04-17T08:00:30Z",
     );
     seed_invocation_for_session(
         &db,
-        "claude-opus",
-        "claude",
+        "provider-a-opus",
+        "provider-a",
         SESSION_A,
         "2026-04-17T08:01:30Z",
     );
@@ -151,5 +151,5 @@ fn age132_backfill_infers_model_from_latest_matching_invocation() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(model_name, "claude-opus");
+    assert_eq!(model_name, "provider-a-opus");
 }

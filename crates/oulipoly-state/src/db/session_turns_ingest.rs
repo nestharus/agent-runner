@@ -12,7 +12,7 @@ use super::*;
 use chrono::{DateTime, Utc};
 
 /// One turn ingested from a CLI session log. The unified store across
-/// every CLI we know how to parse — Claude Code, Codex, etc.
+/// every provider CLI we know how to parse.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SessionTurnRecord {

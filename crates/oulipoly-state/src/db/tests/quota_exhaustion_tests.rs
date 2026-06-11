@@ -141,17 +141,21 @@ fn advance_round_robin_index_persists_across_db_reopen() {
     let now = Utc::now();
     {
         let db = StateDb::open(&path).unwrap();
-        db.advance_round_robin_index("claude-opus", 2, now).unwrap();
+        db.advance_round_robin_index("provider-a-opus", 2, now)
+            .unwrap();
     }
     let db = StateDb::open(&path).unwrap();
     assert_eq!(
-        db.next_round_robin_index_for_model("claude-opus").unwrap(),
+        db.next_round_robin_index_for_model("provider-a-opus")
+            .unwrap(),
         Some(2)
     );
 
-    db.advance_round_robin_index("claude-opus", 5, now).unwrap();
+    db.advance_round_robin_index("provider-a-opus", 5, now)
+        .unwrap();
     assert_eq!(
-        db.next_round_robin_index_for_model("claude-opus").unwrap(),
+        db.next_round_robin_index_for_model("provider-a-opus")
+            .unwrap(),
         Some(5)
     );
 }

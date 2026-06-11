@@ -172,7 +172,7 @@ impl StateDb {
 /// produced a learned rate of ~0.05/turn that then got carried forward across
 /// subsequent no-change refreshes, projecting every provider near the ceiling
 /// and making the whole pool look unusable. The highest plausible real
-/// rate observed in live data is ~5e-4/turn on a 5h Claude window; 0.1/turn
+/// rate observed in live data is ~5e-4/turn on a 5h provider-a window; 0.1/turn
 /// is a 200x safety margin that still filters the spike case.
 pub(super) const MAX_LEARNABLE_BURN_RATE: f64 = 0.1;
 
@@ -185,7 +185,7 @@ pub(super) const MAX_LEARNABLE_BURN_RATE: f64 = 0.1;
 /// `last_delta_percent=0.01 / last_delta_calls=6` -> projected
 /// 0.65 + 193x0.00167 = 0.972, blocking the whole high-quota pool. 20
 /// turns is the empirical floor where per-turn rates stabilize to within
-/// ~2x of the long-run mean across observed Claude/Codex samples.
+/// ~2x of the long-run mean across observed provider-a/provider-b samples.
 pub(super) const MIN_LEARN_SAMPLE_CALLS: u64 = 20;
 
 /// Refuse to learn a burn rate from a sample where the window's

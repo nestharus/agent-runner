@@ -92,7 +92,7 @@ fn providers_migration_last_error_at_uses_most_recent_failure_not_later_success(
         rows,
         vec![ProviderAggregateSnapshot {
             model_name: "routing-model".to_string(),
-            provider_name: "claude".to_string(),
+            provider_name: "provider-a".to_string(),
             invocation_count: 3,
             error_count: 2,
             last_error: Some("auth_error".to_string()),
@@ -114,7 +114,7 @@ fn providers_migration_last_error_ties_use_highest_invocation_id() {
         rows,
         vec![ProviderAggregateSnapshot {
             model_name: "routing-model".to_string(),
-            provider_name: "claude".to_string(),
+            provider_name: "provider-a".to_string(),
             invocation_count: 2,
             error_count: 2,
             last_error: Some("auth_error".to_string()),

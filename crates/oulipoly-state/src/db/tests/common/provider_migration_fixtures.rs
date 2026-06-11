@@ -10,7 +10,7 @@ pub(in crate::db::tests) fn provider_rebuild_fixture_db() -> TempDir {
     legacy_providers_db(&[
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude2"),
+            provider_name: Some("provider-a2"),
             provider_index: 0,
             status: "succeeded",
             success: Some(1),
@@ -21,7 +21,7 @@ pub(in crate::db::tests) fn provider_rebuild_fixture_db() -> TempDir {
         },
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude2"),
+            provider_name: Some("provider-a2"),
             provider_index: 2,
             status: "failed",
             success: Some(0),
@@ -32,7 +32,7 @@ pub(in crate::db::tests) fn provider_rebuild_fixture_db() -> TempDir {
         },
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude"),
+            provider_name: Some("provider-a"),
             provider_index: 1,
             status: "succeeded",
             success: Some(1),
@@ -54,7 +54,7 @@ pub(in crate::db::tests) fn provider_rebuild_fixture_db() -> TempDir {
         },
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude3"),
+            provider_name: Some("provider-a3"),
             provider_index: 3,
             status: "running",
             success: None,
@@ -70,7 +70,7 @@ pub(in crate::db::tests) fn provider_last_error_fixture_db() -> TempDir {
     legacy_providers_db(&[
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude"),
+            provider_name: Some("provider-a"),
             provider_index: 0,
             status: "failed",
             success: Some(0),
@@ -81,7 +81,7 @@ pub(in crate::db::tests) fn provider_last_error_fixture_db() -> TempDir {
         },
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude"),
+            provider_name: Some("provider-a"),
             provider_index: 0,
             status: "succeeded",
             success: Some(1),
@@ -92,7 +92,7 @@ pub(in crate::db::tests) fn provider_last_error_fixture_db() -> TempDir {
         },
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude"),
+            provider_name: Some("provider-a"),
             provider_index: 0,
             status: "failed",
             success: Some(0),
@@ -108,7 +108,7 @@ pub(in crate::db::tests) fn provider_last_error_tie_fixture_db() -> TempDir {
     legacy_providers_db(&[
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude"),
+            provider_name: Some("provider-a"),
             provider_index: 0,
             status: "failed",
             success: Some(0),
@@ -119,7 +119,7 @@ pub(in crate::db::tests) fn provider_last_error_tie_fixture_db() -> TempDir {
         },
         ProviderMigrationInvocationFixture {
             model_name: "routing-model",
-            provider_name: Some("claude"),
+            provider_name: Some("provider-a"),
             provider_index: 0,
             status: "failed",
             success: Some(0),
@@ -153,7 +153,7 @@ pub(in crate::db::tests) fn malformed_providers_shape_db() -> TempDir {
                 model_name, provider_index, provider_name,
                 invocation_count, error_count, last_error, last_error_at, last_invoked_at
             ) VALUES (
-                'routing-model', 0, 'claude', 7, 1,
+                'routing-model', 0, 'provider-a', 7, 1,
                 'do-not-touch', '2026-04-20T10:00:00+00:00',
                 '2026-04-20T10:00:00+00:00'
             );",
@@ -163,7 +163,7 @@ pub(in crate::db::tests) fn malformed_providers_shape_db() -> TempDir {
         "INSERT INTO invocations (
                 invocation_uuid, model_name, provider_name, provider_index,
                 status, success, exit_code, error_category, created_at, finished_at
-             ) VALUES (?1, 'routing-model', 'claude', 0, 'failed', 0, 1,
+             ) VALUES (?1, 'routing-model', 'provider-a', 0, 'failed', 0, 1,
                        'rate_limit', '2026-04-20T10:00:00+00:00',
                        '2026-04-20T10:00:01+00:00')",
         sqlite::params![Uuid::new_v4().to_string()],

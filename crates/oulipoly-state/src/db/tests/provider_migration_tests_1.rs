@@ -75,7 +75,7 @@ fn providers_migration_rebuilds_aggregate_from_invocations_by_provider_name() {
         vec![
             ProviderAggregateSnapshot {
                 model_name: "routing-model".to_string(),
-                provider_name: "claude".to_string(),
+                provider_name: "provider-a".to_string(),
                 invocation_count: 1,
                 error_count: 0,
                 last_error: None,
@@ -84,7 +84,7 @@ fn providers_migration_rebuilds_aggregate_from_invocations_by_provider_name() {
             },
             ProviderAggregateSnapshot {
                 model_name: "routing-model".to_string(),
-                provider_name: "claude2".to_string(),
+                provider_name: "provider-a2".to_string(),
                 invocation_count: 2,
                 error_count: 1,
                 last_error: Some("rate_limit".to_string()),

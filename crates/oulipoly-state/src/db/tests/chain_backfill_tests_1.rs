@@ -10,21 +10,21 @@ use super::*;
 fn backfill_creates_one_chain_per_provider_session_pair() {
     let dir = pre_chain_db_with_turns(&[
         (
-            "claude",
+            "provider-a",
             SESSION_A,
             "turn-a1",
             "2026-04-17T08:00:00Z",
             "assistant",
         ),
         (
-            "claude",
+            "provider-a",
             SESSION_A,
             "turn-a2",
             "2026-04-17T08:00:01Z",
             "assistant",
         ),
         (
-            "claude2",
+            "provider-a2",
             SESSION_B,
             "turn-b1",
             "2026-04-17T09:00:00Z",
@@ -50,7 +50,7 @@ fn backfill_creates_one_chain_per_provider_session_pair() {
 #[test]
 fn backfill_idempotent_on_second_open() {
     let dir = pre_chain_db_with_turns(&[(
-        "claude",
+        "provider-a",
         SESSION_A,
         "turn-a1",
         "2026-04-17T08:00:00Z",
@@ -138,14 +138,14 @@ fn migration_backfill_resumed_chain_id_safe() {
         let conn = sqlite::Connection::open(dir.path().join("state.db")).unwrap();
         conn.execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'claude-opus')",
+                 VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', 'provider-a-opus')",
             sqlite::params![CHAIN_A],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, transition_reason)
-                 VALUES (?1, 'claude', ?2, '2026-04-17T08:00:00Z', 'initial')",
+                 VALUES (?1, 'provider-a', ?2, '2026-04-17T08:00:00Z', 'initial')",
             sqlite::params![CHAIN_A, SESSION_A],
         )
         .unwrap();
@@ -207,12 +207,12 @@ fn migration_backfill_non_resumed_with_session_id() {
 #[test]
 fn mint_chain_no_op_on_resume_of_existing_chain() {
     let db = test_db();
-    seed_chain_row(&db, CHAIN_A, "claude-opus", "2026-04-17T08:00:00Z");
+    seed_chain_row(&db, CHAIN_A, "provider-a-opus", "2026-04-17T08:00:00Z");
 
     let first_id = db
         .open_chain_segment(
             CHAIN_A,
-            "claude",
+            "provider-a",
             SESSION_A,
             &ts("2026-04-17T08:00:00Z"),
             oulipoly_core::TransitionReason::Initial,
@@ -221,7 +221,7 @@ fn mint_chain_no_op_on_resume_of_existing_chain() {
     let second_id = db
         .open_chain_segment(
             CHAIN_A,
-            "claude",
+            "provider-a",
             SESSION_A,
             &ts("2026-04-17T08:01:00Z"),
             oulipoly_core::TransitionReason::Initial,

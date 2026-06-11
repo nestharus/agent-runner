@@ -30,22 +30,22 @@ pub(in crate::db::tests) fn resolver_model_store()
 -> std::collections::HashMap<String, oulipoly_config::ModelConfig> {
     model_store_from_toml(&[
         (
-            "claude-opus",
+            "provider-a-opus",
             r#"
 [[providers]]
-name = "claude"
+name = "provider-a"
 interactive_args = ["launch"]
 
 [[providers]]
-name = "claude2"
+name = "provider-a2"
 interactive_args = ["launch"]
 "#,
         ),
         (
-            "claude-haiku",
+            "provider-a-haiku",
             r#"
 [[providers]]
-name = "claude"
+name = "provider-a"
 interactive_args = ["launch"]
 "#,
         ),
@@ -257,7 +257,7 @@ pub(in crate::db::tests) fn legacy_v4_invocation_dual_id_fixture(
                 (invocation_uuid, model_name, provider_name, provider_index, status, success,
                  exit_code, error_category, terminal_reason, session_id, session_capture_method,
                  created_at, finished_at)
-             VALUES (?1, 'claude-opus', 'claude', 0, ?2, NULL, NULL, ?3, ?4, ?5, ?6,
+             VALUES (?1, 'provider-a-opus', 'provider-a', 0, ?2, NULL, NULL, ?3, ?4, ?5, ?6,
                      '2026-04-17T08:00:00Z', NULL)",
         sqlite::params![
             invocation_uuid,

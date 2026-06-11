@@ -12,8 +12,8 @@ fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
     let memory_id = memory
         .start_invocation(&InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
         })
@@ -37,8 +37,8 @@ fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
     let id = db
         .start_invocation(&InvocationStart {
             invocation_uuid: invocation_uuid.to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
         })
@@ -53,8 +53,8 @@ fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
         serde_json::from_slice(&std::fs::read(&invocation_path).unwrap()).unwrap();
     assert_eq!(payload["id"], invocation_uuid);
     assert_eq!(payload["status"], "running");
-    assert_eq!(payload["model_name"], "claude-opus");
-    assert_eq!(payload["provider_name"], "claude");
+    assert_eq!(payload["model_name"], "provider-a-opus");
+    assert_eq!(payload["provider_name"], "provider-a");
     assert!(payload["pid"].as_u64().is_some());
     assert!(DateTime::parse_from_rfc3339(payload["started_at"].as_str().unwrap()).is_ok());
 
@@ -82,8 +82,8 @@ fn age132_invocation_artifact_contract_and_warning_only_failure_paths() {
     let id = failing
         .start_invocation(&InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
         })
@@ -109,8 +109,8 @@ fn age132_returned_artifacts_validate_identity_bounds_and_rollback_failed_retry(
     let id = db
         .start_invocation(&InvocationStart {
             invocation_uuid: invocation_uuid.to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
         })

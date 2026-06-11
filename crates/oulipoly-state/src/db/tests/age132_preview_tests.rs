@@ -12,17 +12,17 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
     seed_test_chain(
         &db,
         CHAIN_A,
-        "claude",
+        "provider-a",
         SESSION_A,
-        "claude-opus",
+        "provider-a-opus",
         "2026-04-17T08:00:00Z",
     );
     seed_test_chain(
         &db,
         CHAIN_B,
-        "claude2",
+        "provider-a2",
         SESSION_A,
-        "claude-opus",
+        "provider-a-opus",
         "2026-04-17T09:00:00Z",
     );
     let turns: Vec<_> = (0..4)
@@ -37,12 +37,13 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
             body: Some(format!("body-{i}")),
         })
         .collect();
-    db.ingest_session_turns_batch("claude2", &turns).unwrap();
+    db.ingest_session_turns_batch("provider-a2", &turns)
+        .unwrap();
 
     let previews = db.resume_previews(SESSION_A).unwrap();
     assert_eq!(previews.len(), 2);
     assert_eq!(previews[0].chain_id, CHAIN_B);
-    assert_eq!(previews[0].active_provider, "claude2");
+    assert_eq!(previews[0].active_provider, "provider-a2");
     assert_eq!(previews[0].turn_count, 4);
     assert_eq!(previews[0].recent_turns.len(), 3);
     assert_eq!(
@@ -63,7 +64,7 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
     let boundary_db = test_db();
     boundary_db
         .ingest_session_turns_batch(
-            "claude",
+            "provider-a",
             &[
                 SessionTurnIngest {
                     session_id: SESSION_A.to_string(),
@@ -109,35 +110,35 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
         )
         .unwrap();
     let latest = boundary_db
-        .latest_compaction_boundary("claude", SESSION_A)
+        .latest_compaction_boundary("provider-a", SESSION_A)
         .unwrap()
         .unwrap();
     assert_eq!(latest.0, "tie-second");
     assert_eq!(latest.1, ts("2026-04-17T08:01:00Z"));
     assert!(
         boundary_db
-            .flag_compaction_boundary("claude", SESSION_A, "not-yet-boundary")
+            .flag_compaction_boundary("provider-a", SESSION_A, "not-yet-boundary")
             .unwrap()
     );
     assert!(
         !boundary_db
-            .flag_compaction_boundary("claude", SESSION_A, "not-yet-boundary")
+            .flag_compaction_boundary("provider-a", SESSION_A, "not-yet-boundary")
             .unwrap()
     );
     assert!(
         !boundary_db
-            .flag_compaction_boundary("claude", SESSION_A, "missing-turn")
+            .flag_compaction_boundary("provider-a", SESSION_A, "missing-turn")
             .unwrap()
     );
     let latest = boundary_db
-        .latest_compaction_boundary("claude", SESSION_A)
+        .latest_compaction_boundary("provider-a", SESSION_A)
         .unwrap()
         .unwrap();
     assert_eq!(latest.0, "not-yet-boundary");
     assert_eq!(latest.1, ts("2026-04-17T08:02:00Z"));
     assert_eq!(
         test_db()
-            .latest_compaction_boundary("claude", SESSION_A)
+            .latest_compaction_boundary("provider-a", SESSION_A)
             .unwrap(),
         None
     );

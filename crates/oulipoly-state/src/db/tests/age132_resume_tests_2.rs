@@ -32,7 +32,7 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
     seed_test_chain(
         &unknown_model_db,
         CHAIN_A,
-        "claude",
+        "provider-a",
         SESSION_A,
         "missing-model",
         "2026-04-17T08:00:00Z",
@@ -46,13 +46,13 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
     seed_chain_row(
         &missing_segment_db,
         CHAIN_A,
-        "claude-opus",
+        "provider-a-opus",
         "2026-04-17T08:00:00Z",
     );
     seed_segment_row(
         &missing_segment_db,
         CHAIN_A,
-        "claude",
+        "provider-a",
         SESSION_A,
         "2026-04-17T08:00:00Z",
         Some("2026-04-17T08:30:00Z"),
@@ -68,8 +68,8 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
     let id = wrong_id_db
         .start_invocation(&InvocationStart {
             invocation_uuid: invocation_uuid.to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
         })
@@ -98,7 +98,7 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
         } => {
             assert_eq!(provider_session_id.as_deref(), Some(SESSION_A));
             assert!(chain_id.is_some());
-            assert_eq!(provider_name.as_deref(), Some("claude"));
+            assert_eq!(provider_name.as_deref(), Some("provider-a"));
             assert_eq!(agent_runner_invocation_id, invocation_uuid);
         }
         other => panic!("expected wrong-id-kind rejection, got {other:?}"),
@@ -136,7 +136,7 @@ interactive_args = ["run"]
 #[test]
 fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
     let db = test_db();
-    db.upsert_quota_refresh("claude", &[quota_input(0.40, "2026-04-22T00:00:00Z")])
+    db.upsert_quota_refresh("provider-a", &[quota_input(0.40, "2026-04-22T00:00:00Z")])
         .unwrap();
     db.conn
         .execute(
@@ -144,27 +144,27 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
                  SET refreshed_at = 'bad-refreshed',
                      exhausted_at = 'bad-exhausted',
                      last_topology_probe_at = 'bad-probe'
-                 WHERE provider_name = 'claude'",
+                 WHERE provider_name = 'provider-a'",
             [],
         )
         .unwrap();
-    let quota = db.get_quota("claude").unwrap().unwrap();
+    let quota = db.get_quota("provider-a").unwrap().unwrap();
     assert_eq!(quota.refreshed_at, None);
     assert_eq!(quota.exhausted_at, None);
     assert_eq!(quota.last_topology_probe_at, None);
     db.conn
             .execute(
-                "UPDATE provider_quota_windows SET resets_at = 'bad-window' WHERE provider_name = 'claude'",
+                "UPDATE provider_quota_windows SET resets_at = 'bad-window' WHERE provider_name = 'provider-a'",
                 [],
             )
             .unwrap();
-    assert!(db.get_windows("claude").is_err());
+    assert!(db.get_windows("provider-a").is_err());
 
     let id = db
         .start_invocation(&InvocationStart {
             invocation_uuid: Uuid::new_v4().to_string(),
-            model_name: "claude-opus".to_string(),
-            provider_name: "claude".to_string(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
             provider_index: 0,
             parent_invocation_id: None,
         })
@@ -183,7 +183,7 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
     let raw_started: String = db
             .conn
             .query_row(
-                "SELECT started_at FROM session_chain_segments WHERE provider_name = 'claude' AND session_id = ?1",
+                "SELECT started_at FROM session_chain_segments WHERE provider_name = 'provider-a' AND session_id = ?1",
                 sqlite::params![SESSION_A],
                 |row| row.get(0),
             )

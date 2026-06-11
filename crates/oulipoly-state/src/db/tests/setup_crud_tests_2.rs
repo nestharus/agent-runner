@@ -37,12 +37,14 @@ fn upsert_and_list_model_parameters() {
         },
     };
 
-    db.upsert_model_parameter("claude-opus-4", "claude", &temp_param)
+    db.upsert_model_parameter("provider-a-opus-4", "provider-a", &temp_param)
         .unwrap();
-    db.upsert_model_parameter("claude-opus-4", "claude", &model_param)
+    db.upsert_model_parameter("provider-a-opus-4", "provider-a", &model_param)
         .unwrap();
 
-    let params = db.list_model_parameters("claude-opus-4", "claude").unwrap();
+    let params = db
+        .list_model_parameters("provider-a-opus-4", "provider-a")
+        .unwrap();
     assert_eq!(params.len(), 2);
     // Ordered by name
     assert_eq!(params[0].name, "model");
@@ -84,16 +86,16 @@ fn upsert_model_parameter_updates_existing() {
             value_template: "".to_string(),
         },
     };
-    db.upsert_model_parameter("gpt-5.3", "codex", &param)
+    db.upsert_model_parameter("gpt-5.3", "provider-b", &param)
         .unwrap();
 
     // Update description
     let mut updated = param.clone();
     updated.description = "Toggle verbose mode".to_string();
-    db.upsert_model_parameter("gpt-5.3", "codex", &updated)
+    db.upsert_model_parameter("gpt-5.3", "provider-b", &updated)
         .unwrap();
 
-    let params = db.list_model_parameters("gpt-5.3", "codex").unwrap();
+    let params = db.list_model_parameters("gpt-5.3", "provider-b").unwrap();
     assert_eq!(params.len(), 1);
     assert_eq!(params[0].description, "Toggle verbose mode");
 }

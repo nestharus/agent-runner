@@ -12,7 +12,7 @@ fn age132_setup_crud_count_and_call_counter_edge_contracts() {
     db.upsert_cli_provider(&sample_provider()).unwrap();
     let expired = AccountRecord {
         id: "expired".to_string(),
-        provider: "claude".to_string(),
+        provider: "provider-a".to_string(),
         profile_name: "expired-profile".to_string(),
         auth_method: AuthMethod::OAuth,
         auth_status: AuthStatus::Expired,
@@ -25,17 +25,18 @@ fn age132_setup_crud_count_and_call_counter_edge_contracts() {
             [],
         )
         .unwrap();
-    let accounts = db.list_accounts(Some("claude")).unwrap();
+    let accounts = db.list_accounts(Some("provider-a")).unwrap();
     assert_eq!(accounts[0].auth_status, AuthStatus::Unknown);
-    assert!(!db.delete_account("missing", "claude").unwrap());
+    assert!(!db.delete_account("missing", "provider-a").unwrap());
     assert_eq!(
-        db.delete_stale_models("claude", "missing-version").unwrap(),
+        db.delete_stale_models("provider-a", "missing-version")
+            .unwrap(),
         0
     );
 
     let since = ts("2026-04-17T08:00:00Z");
     db.ingest_session_turns_batch(
-        "claude",
+        "provider-a",
         &[
             SessionTurnIngest {
                 session_id: SESSION_A.to_string(),
@@ -70,14 +71,20 @@ fn age132_setup_crud_count_and_call_counter_edge_contracts() {
         ],
     )
     .unwrap();
-    assert_eq!(db.count_assistant_turns_since("claude", None).unwrap(), 2);
     assert_eq!(
-        db.count_assistant_turns_since("claude", Some(&since))
+        db.count_assistant_turns_since("provider-a", None).unwrap(),
+        2
+    );
+    assert_eq!(
+        db.count_assistant_turns_since("provider-a", Some(&since))
             .unwrap(),
         1
     );
-    assert_eq!(db.count_assistant_turns_since("codex", None).unwrap(), 0);
-    db.increment_calls_since_refresh("claude").unwrap();
-    db.increment_calls_since_refresh("claude").unwrap();
-    assert_eq!(calls_since_refresh(&db, "claude"), 2);
+    assert_eq!(
+        db.count_assistant_turns_since("provider-b", None).unwrap(),
+        0
+    );
+    db.increment_calls_since_refresh("provider-a").unwrap();
+    db.increment_calls_since_refresh("provider-a").unwrap();
+    assert_eq!(calls_since_refresh(&db, "provider-a"), 2);
 }

@@ -29,7 +29,7 @@ fn upsert_quota_refresh_learns_sample_at_cap_boundary() {
 
 #[test]
 fn upsert_quota_refresh_rejects_learn_when_new_sample_near_rail() {
-    // Regression: live observation 2026-04-21 had codex2's 7-day window
+    // Regression: live observation 2026-04-21 had provider-b2's 7-day window
     // briefly read used_percent=1.0 from an upstream ChatGPT API spike,
     // paired with 34 turns since prior refresh. The learner computed
     // rate ≈ 0.029/turn on WEEKLY (real weekly rates are ~6e-5/turn;
@@ -77,12 +77,12 @@ fn upsert_quota_refresh_rejects_learn_when_new_sample_near_rail() {
 
 #[test]
 fn upsert_quota_refresh_rejects_small_sample_delta_as_noise() {
-    // Regression: live observation 2026-04-21 had claude2 with a learned
+    // Regression: live observation 2026-04-21 had provider-a2 with a learned
     // delta of 0.01/6 (rate 0.00167/turn). Paired with 193 turns since
     // refresh at scoring time, that projected 0.65 → 0.97, hard-blocking
-    // the whole claude-opus pool. Sample-size floor of MIN_LEARN_SAMPLE_CALLS
+    // the whole provider-a-opus pool. Sample-size floor of MIN_LEARN_SAMPLE_CALLS
     // rejects any delta learn below 20 turns and carries the prior
-    // learn forward. At claude2 scale, this would have kept the pool
+    // learn forward. At provider-a2 scale, this would have kept the pool
     // usable for the next invocation.
     let db = test_db();
     let provider = "p";

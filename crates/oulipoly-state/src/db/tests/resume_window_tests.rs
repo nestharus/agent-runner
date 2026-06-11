@@ -31,11 +31,11 @@ fn find_session_for_invocation_window_returns_fresh_in_window_candidate() {
             body: None,
         },
     ];
-    db.ingest_session_turns_batch("claude", &turns).unwrap();
+    db.ingest_session_turns_batch("provider-a", &turns).unwrap();
 
     let found = db
         .find_session_for_invocation_window(
-            "claude",
+            "provider-a",
             &ts("2026-04-17T08:00:01Z"),
             &ts("2026-04-17T08:00:03Z"),
         )
@@ -61,7 +61,7 @@ fn find_session_for_invocation_window_ranks_by_count_earliest_then_session_id() 
 
     let db = test_db();
     db.ingest_session_turns_batch(
-        "claude",
+        "provider-a",
         &[
             turn(SESSION_A, "a-1", "2026-04-17T08:00:03Z"),
             turn(SESSION_A, "a-2", "2026-04-17T08:00:05Z"),
@@ -71,7 +71,7 @@ fn find_session_for_invocation_window_ranks_by_count_earliest_then_session_id() 
     .unwrap();
     let found = db
         .find_session_for_invocation_window(
-            "claude",
+            "provider-a",
             &ts("2026-04-17T08:00:01Z"),
             &ts("2026-04-17T08:00:06Z"),
         )
@@ -84,7 +84,7 @@ fn find_session_for_invocation_window_ranks_by_count_earliest_then_session_id() 
 
     let db = test_db();
     db.ingest_session_turns_batch(
-        "claude",
+        "provider-a",
         &[
             turn(SESSION_A, "a-1", "2026-04-17T08:00:03Z"),
             turn(SESSION_A, "a-2", "2026-04-17T08:00:05Z"),
@@ -95,7 +95,7 @@ fn find_session_for_invocation_window_ranks_by_count_earliest_then_session_id() 
     .unwrap();
     let found = db
         .find_session_for_invocation_window(
-            "claude",
+            "provider-a",
             &ts("2026-04-17T08:00:01Z"),
             &ts("2026-04-17T08:00:06Z"),
         )
@@ -110,7 +110,7 @@ fn find_session_for_invocation_window_ranks_by_count_earliest_then_session_id() 
     let lexically_second = "22222222-2222-4222-8222-222222222222";
     let db = test_db();
     db.ingest_session_turns_batch(
-        "claude",
+        "provider-a",
         &[
             turn(lexically_second, "second-1", "2026-04-17T08:00:02Z"),
             turn(lexically_second, "second-2", "2026-04-17T08:00:05Z"),
@@ -121,7 +121,7 @@ fn find_session_for_invocation_window_ranks_by_count_earliest_then_session_id() 
     .unwrap();
     let found = db
         .find_session_for_invocation_window(
-            "claude",
+            "provider-a",
             &ts("2026-04-17T08:00:01Z"),
             &ts("2026-04-17T08:00:06Z"),
         )
