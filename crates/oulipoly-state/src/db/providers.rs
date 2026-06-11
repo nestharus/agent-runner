@@ -12,6 +12,14 @@
 
 use super::*;
 
+const PROVIDER_RECORD_SQL: &str = "SELECT model_name, provider_name, invocation_count, error_count,
+                        last_error, last_error_at, last_invoked_at
+                 FROM providers
+                 WHERE model_name = ?1 AND provider_name = ?2";
+
+const ROUND_ROBIN_CURSOR_SQL: &str =
+    "SELECT last_index FROM model_round_robin_cursor WHERE model_name = ?1";
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ProviderRecord {
@@ -32,31 +40,39 @@ impl StateDb {
     ) -> Result<Option<ProviderRecord>, String> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT model_name, provider_name, invocation_count, error_count,
-                        last_error, last_error_at, last_invoked_at
-                 FROM providers
-                 WHERE model_name = ?1 AND provider_name = ?2",
-            )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            .prepare(PROVIDER_RECORD_SQL)
+            .map_err(Self::format_provider_query_prepare_error)?;
 
-        let result = stmt.query_row(sqlite::params![model_name, provider_name], |row| {
-            Ok(ProviderRecord {
-                model_name: row.get(0)?,
-                provider_name: row.get(1)?,
-                invocation_count: row.get(2)?,
-                error_count: row.get(3)?,
-                last_error: row.get(4)?,
-                last_error_at: row.get(5)?,
-                last_invoked_at: row.get(6)?,
-            })
-        });
+        let result = stmt.query_row(
+            sqlite::params![model_name, provider_name],
+            Self::map_provider_record_row,
+        );
 
         match result {
             Ok(record) => Ok(Some(record)),
             Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query provider: {e}")),
+            Err(e) => Err(Self::format_provider_query_error(e)),
         }
+    }
+
+    fn map_provider_record_row(row: &sqlite::Row<'_>) -> sqlite::Result<ProviderRecord> {
+        Ok(ProviderRecord {
+            model_name: row.get(0)?,
+            provider_name: row.get(1)?,
+            invocation_count: row.get(2)?,
+            error_count: row.get(3)?,
+            last_error: row.get(4)?,
+            last_error_at: row.get(5)?,
+            last_invoked_at: row.get(6)?,
+        })
+    }
+
+    fn format_provider_query_prepare_error(e: sqlite::Error) -> String {
+        format!("Failed to prepare query: {e}")
+    }
+
+    fn format_provider_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query provider: {e}")
     }
 
     pub fn recent_error_count(
@@ -76,27 +92,53 @@ impl StateDb {
                 sqlite::params![model_name, provider_name, &cutoff],
                 |row| row.get(0),
             )
-            .map_err(|e| format!("Failed to count recent errors: {e}"))?;
+            .map_err(Self::format_recent_error_count_error)?;
 
         Ok(count)
+    }
+
+    fn format_recent_error_count_error(e: sqlite::Error) -> String {
+        format!("Failed to count recent errors: {e}")
     }
 
     pub fn next_round_robin_index_for_model(
         &self,
         model_name: &str,
     ) -> Result<Option<usize>, String> {
+        let Some(value) = self.raw_round_robin_index_for_model(model_name)? else {
+            return Ok(None);
+        };
+        Self::validate_round_robin_index(model_name, value).map(Some)
+    }
+
+    fn raw_round_robin_index_for_model(&self, model_name: &str) -> Result<Option<i64>, String> {
         let result = self.conn.query_row(
-            "SELECT last_index FROM model_round_robin_cursor WHERE model_name = ?1",
+            ROUND_ROBIN_CURSOR_SQL,
             params![model_name],
-            |row| row.get::<_, i64>(0),
+            Self::map_round_robin_index_row,
         );
         match result {
-            Ok(value) => usize::try_from(value)
-                .map(Some)
-                .map_err(|_| format!("Negative round-robin cursor for {model_name}")),
+            Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query round-robin cursor: {e}")),
+            Err(e) => Err(Self::format_round_robin_cursor_query_error(e)),
         }
+    }
+
+    fn map_round_robin_index_row(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn validate_round_robin_index(model_name: &str, value: i64) -> Result<usize, String> {
+        usize::try_from(value)
+            .map_err(|_| Self::format_negative_round_robin_cursor_error(model_name))
+    }
+
+    fn format_negative_round_robin_cursor_error(model_name: &str) -> String {
+        format!("Negative round-robin cursor for {model_name}")
+    }
+
+    fn format_round_robin_cursor_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query round-robin cursor: {e}")
     }
 
     pub fn advance_round_robin_index(
@@ -115,8 +157,12 @@ impl StateDb {
                     updated_at = excluded.updated_at",
                 params![model_name, new_index as i64, ts],
             )
-            .map_err(|e| format!("Failed to advance round-robin cursor: {e}"))?;
+            .map_err(Self::format_advance_round_robin_cursor_error)?;
         Ok(())
+    }
+
+    fn format_advance_round_robin_cursor_error(e: sqlite::Error) -> String {
+        format!("Failed to advance round-robin cursor: {e}")
     }
 
     /// Test-only: backdate a provider's `last_invoked_at` so tests can seed
@@ -147,7 +193,12 @@ impl StateDb {
                  WHERE model_name = ?2 AND provider_name = ?3",
                 sqlite::params![last_invoked_at.to_rfc3339(), model_name, provider_name],
             )
-            .map_err(|e| format!("Failed to set last_invoked_at: {e}"))
+            .map_err(Self::format_set_last_invoked_at_error)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_set_last_invoked_at_error(e: sqlite::Error) -> String {
+        format!("Failed to set last_invoked_at: {e}")
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -159,9 +210,22 @@ impl StateDb {
         if updated == 1 {
             Ok(())
         } else {
-            Err(format!(
-                "Expected exactly one providers row for model_name={model_name}, provider_name={provider_name}, updated {updated}"
+            Err(Self::format_last_invoked_at_test_update_error(
+                model_name,
+                provider_name,
+                updated,
             ))
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_last_invoked_at_test_update_error(
+        model_name: &str,
+        provider_name: &str,
+        updated: usize,
+    ) -> String {
+        format!(
+            "Expected exactly one providers row for model_name={model_name}, provider_name={provider_name}, updated {updated}"
+        )
     }
 }

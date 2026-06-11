@@ -2,10 +2,11 @@
 //!
 //! - accessor
 //! - filter
+//! - formatter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, filter, mapper, orchestration }
+//! Role set: { accessor, filter, formatter, mapper, orchestration }
 //!
 //! Provider account persistence methods for `StateDb`.
 
@@ -32,7 +33,7 @@ impl StateDb {
                     &account.created_at,
                 ],
             )
-            .map_err(|e| format!("Failed to insert account: {e}"))?;
+            .map_err(Self::format_account_insert_error)?;
         Ok(())
     }
 
@@ -68,19 +69,19 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(query.sql)
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            .map_err(Self::format_account_query_prepare_error)?;
 
         let rows = if let Some(provider) = query.provider {
             stmt.query_map(sqlite::params![provider], Self::account_row_mapper)
-                .map_err(|e| format!("Failed to query accounts: {e}"))?
+                .map_err(Self::format_accounts_query_error)?
         } else {
             stmt.query_map([], Self::account_row_mapper)
-                .map_err(|e| format!("Failed to query accounts: {e}"))?
+                .map_err(Self::format_accounts_query_error)?
         };
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| format!("Failed to read account row: {e}"))?);
+            result.push(row.map_err(Self::format_account_row_read_error)?);
         }
         Ok(result)
     }
@@ -93,8 +94,12 @@ impl StateDb {
                 "DELETE FROM accounts WHERE id = ?1 AND provider = ?2",
                 sqlite::params![id, provider],
             )
-            .map_err(|e| format!("Failed to delete account: {e}"))?;
-        Ok(changed > 0)
+            .map_err(Self::format_account_delete_error)?;
+        Ok(Self::account_rows_changed(changed))
+    }
+
+    fn account_rows_changed(changed: usize) -> bool {
+        changed > 0
     }
 
     /// Helper: map a rusqlite row to an AccountRecord.
@@ -117,5 +122,25 @@ impl StateDb {
 
     fn account_auth_status(raw: String) -> AuthStatus {
         AuthStatus::from_str(&raw)
+    }
+
+    fn format_account_insert_error(e: sqlite::Error) -> String {
+        format!("Failed to insert account: {e}")
+    }
+
+    fn format_account_query_prepare_error(e: sqlite::Error) -> String {
+        format!("Failed to prepare query: {e}")
+    }
+
+    fn format_accounts_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query accounts: {e}")
+    }
+
+    fn format_account_row_read_error(e: sqlite::Error) -> String {
+        format!("Failed to read account row: {e}")
+    }
+
+    fn format_account_delete_error(e: sqlite::Error) -> String {
+        format!("Failed to delete account: {e}")
     }
 }

@@ -59,7 +59,10 @@ fn state_db_open_preserves_invocation_row_count_for_schema4_fixture() {
     assert_eq!(after.uuids, before.uuids);
     assert_eq!(after.parent_links, before.parent_links);
     assert_eq!(after.user_version, CURRENT_SCHEMA_VERSION);
-    assert_dual_id_backfill_matrix(&db_path);
+    assert_dual_id_backfill_matrix(
+        &actual_dual_id_backfill_rows(&db_path),
+        &expected_dual_id_backfill_rows(),
+    );
 }
 
 // Risk: repeated trace/open drops further
@@ -89,8 +92,11 @@ fn state_db_open_is_idempotent_for_schema5_fixture() {
         after_schema, before_schema,
         "schema-5 fixtures should be upgraded to the current schema on first open"
     );
-    assert_provider_session_index_exists(&db_path);
-    assert_dual_id_backfill_matrix(&db_path);
+    assert_provider_session_index_exists(&invocation_index_names(&db_path));
+    assert_dual_id_backfill_matrix(
+        &actual_dual_id_backfill_rows(&db_path),
+        &expected_dual_id_backfill_rows(),
+    );
 }
 
 // Risk: duplicate owner drift
@@ -112,7 +118,7 @@ fn schema4_dual_id_column_or_index_drift_preserves_rows_or_rolls_back() {
     match result {
         Ok(db) => {
             assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
-            assert_provider_session_index_exists(&db_path);
+            assert_provider_session_index_exists(&invocation_index_names(&db_path));
         }
         Err(_) => {
             assert_eq!(after.user_version, 4);
@@ -375,14 +381,22 @@ fn migrate_legacy_invocations_body() -> &'static str {
 
 // Declared role: validator
 fn assert_legacy_row_count_guard_body(body: &str) {
-    let offsets = legacy_row_count_guard_offsets(body);
+    assert_legacy_row_count_guard_fragments(body);
+    assert_legacy_row_count_guard_order(&legacy_row_count_guard_offsets(body));
+}
+
+// Declared role: validator
+fn assert_legacy_row_count_guard_fragments(body: &str) {
     for guard in legacy_row_count_guard_fragments() {
         assert!(
             body.contains(guard),
             "legacy rebuild guard body must retain {guard:?}"
         );
     }
+}
 
+// Declared role: validator
+fn assert_legacy_row_count_guard_order(offsets: &LegacyRowCountGuardOffsets) {
     assert!(
         offsets.old_count < offsets.old_scan_guard && offsets.old_scan_guard < offsets.create_new,
         "old scan/count guard must run before invocations_new is created"
@@ -511,10 +525,15 @@ fn select_invocation_uuids(path: &Path) -> Vec<String> {
     let conn = Connection::open(path).unwrap();
     conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")
         .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([], invocation_uuid_row)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
+}
+
+// Declared role: mapper
+fn invocation_uuid_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
 }
 
 // Declared role: accessor
@@ -563,9 +582,8 @@ fn table_info_sql(table: &str) -> String {
 }
 
 // Declared role: validator
-fn assert_provider_session_index_exists(path: &Path) {
-    let indexes = invocation_index_names(path);
-    assert_contains_provider_session_index(&indexes);
+fn assert_provider_session_index_exists(indexes: &[String]) {
+    assert_contains_provider_session_index(indexes);
 }
 
 // Declared role: accessor
@@ -595,11 +613,8 @@ fn assert_contains_provider_session_index(indexes: &[String]) {
 }
 
 // Declared role: validator
-fn assert_dual_id_backfill_matrix(path: &Path) {
-    assert_eq!(
-        actual_dual_id_backfill_rows(path),
-        expected_dual_id_backfill_rows()
-    );
+fn assert_dual_id_backfill_matrix(actual: &[DualIdBackfillRow], expected: &[DualIdBackfillRow]) {
+    assert_eq!(actual, expected);
 }
 
 type DualIdBackfillRow = (

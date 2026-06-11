@@ -68,11 +68,23 @@ impl StateDb {
     }
 
     pub(super) fn validate_invocation_is_running(id: i64, status: &str) -> Result<(), String> {
-        if status.parse::<InvocationStatus>().ok() == Some(InvocationStatus::Running) {
+        if Self::invocation_status_is_running(Self::parse_invocation_status(status)) {
             Ok(())
         } else {
-            Err(format!("Invocation {id} is already finalized"))
+            Err(Self::format_invocation_already_finalized_error(id))
         }
+    }
+
+    fn parse_invocation_status(status: &str) -> Option<InvocationStatus> {
+        status.parse::<InvocationStatus>().ok()
+    }
+
+    fn invocation_status_is_running(status: Option<InvocationStatus>) -> bool {
+        status == Some(InvocationStatus::Running)
+    }
+
+    fn format_invocation_already_finalized_error(id: i64) -> String {
+        format!("Invocation {id} is already finalized")
     }
 
     pub(super) fn write_invocation_final_row(
@@ -132,10 +144,15 @@ impl StateDb {
         id: i64,
         updated: usize,
     ) -> Result<(), String> {
-        if updated == 0 {
-            return Err(format!("Invocation {id} is already finalized"));
+        if Self::invocation_final_row_was_updated(updated) {
+            Ok(())
+        } else {
+            Err(Self::format_invocation_already_finalized_error(id))
         }
-        Ok(())
+    }
+
+    fn invocation_final_row_was_updated(updated: usize) -> bool {
+        updated != 0
     }
 
     pub(super) fn format_invocation_final_row_update_error(id: i64, err: sqlite::Error) -> String {
@@ -281,14 +298,27 @@ impl StateDb {
         &self,
         invocation: &FinalizeInvocationRow,
     ) -> ResultEnvelopeFailureIdentity {
-        let agent_runner_chain_id =
-            match (&invocation.provider_name, &invocation.provider_session_id) {
-                (Some(provider_name), Some(provider_session_id)) => self
-                    .chain_id_for_segment(provider_name, provider_session_id)
-                    .ok()
-                    .flatten(),
-                _ => None,
-            };
+        let agent_runner_chain_id = self.result_artifact_agent_runner_chain_id(invocation);
+        Self::map_result_artifact_failure_identity(invocation, agent_runner_chain_id)
+    }
+
+    pub(super) fn result_artifact_agent_runner_chain_id(
+        &self,
+        invocation: &FinalizeInvocationRow,
+    ) -> Option<String> {
+        match (&invocation.provider_name, &invocation.provider_session_id) {
+            (Some(provider_name), Some(provider_session_id)) => self
+                .chain_id_for_segment(provider_name, provider_session_id)
+                .ok()
+                .flatten(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn map_result_artifact_failure_identity(
+        invocation: &FinalizeInvocationRow,
+        agent_runner_chain_id: Option<String>,
+    ) -> ResultEnvelopeFailureIdentity {
         ResultEnvelopeFailureIdentity {
             agent_runner_invocation_id: invocation.invocation_uuid.clone(),
             provider_name: invocation.provider_name.clone(),

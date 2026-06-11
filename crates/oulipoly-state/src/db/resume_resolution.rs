@@ -39,13 +39,25 @@ impl StateDb {
     }
 
     pub(super) fn validate_resume_input_id(input: &str) -> Result<(), ResumeError> {
-        if Uuid::parse_str(input).is_ok() || Self::is_opencode_provider_session_id(input) {
+        if Self::resume_input_id_is_valid(input) {
             return Ok(());
         }
 
-        Err(ResumeError::InvalidUuid {
+        Err(Self::invalid_resume_uuid_error(input))
+    }
+
+    fn resume_input_id_is_valid(input: &str) -> bool {
+        Self::resume_input_id_is_uuid(input) || Self::is_opencode_provider_session_id(input)
+    }
+
+    fn resume_input_id_is_uuid(input: &str) -> bool {
+        Uuid::parse_str(input).is_ok()
+    }
+
+    fn invalid_resume_uuid_error(input: &str) -> ResumeError {
+        ResumeError::InvalidUuid {
             input: input.to_string(),
-        })
+        }
     }
 
     pub(super) fn is_opencode_provider_session_id(input: &str) -> bool {
@@ -99,12 +111,20 @@ impl StateDb {
         input: &str,
         chain_ids: &[String],
     ) -> Result<(), ResumeError> {
-        if chain_ids.is_empty() {
-            Err(ResumeError::NoChainFound {
-                input: input.to_string(),
-            })
-        } else {
+        if Self::resume_chain_candidates_exist(chain_ids) {
             Ok(())
+        } else {
+            Err(Self::no_resume_chain_found_error(input))
+        }
+    }
+
+    fn resume_chain_candidates_exist(chain_ids: &[String]) -> bool {
+        !chain_ids.is_empty()
+    }
+
+    fn no_resume_chain_found_error(input: &str) -> ResumeError {
+        ResumeError::NoChainFound {
+            input: input.to_string(),
         }
     }
 
@@ -112,10 +132,14 @@ impl StateDb {
         let previews = self
             .chain_previews(input)
             .map_err(|message| ResumeError::Db { message })?;
-        Ok(ResumeError::Ambiguous {
+        Ok(Self::map_ambiguous_resume_error(input, previews))
+    }
+
+    fn map_ambiguous_resume_error(input: &str, previews: Vec<ChainPreview>) -> ResumeError {
+        ResumeError::Ambiguous {
             input: input.to_string(),
             previews,
-        })
+        }
     }
 
     pub(super) fn require_active_segment(
@@ -124,9 +148,13 @@ impl StateDb {
     ) -> Result<(String, String), ResumeError> {
         self.active_segment_for_chain(chain_id)
             .map_err(|message| ResumeError::Db { message })?
-            .ok_or_else(|| ResumeError::ActiveSegmentMissing {
-                chain_id: chain_id.to_string(),
-            })
+            .ok_or_else(|| Self::active_segment_missing_error(chain_id))
+    }
+
+    fn active_segment_missing_error(chain_id: &str) -> ResumeError {
+        ResumeError::ActiveSegmentMissing {
+            chain_id: chain_id.to_string(),
+        }
     }
 
     pub(super) fn resolve_resume_model_name(
@@ -196,9 +224,13 @@ impl StateDb {
         models
             .get(model_name)
             .cloned()
-            .ok_or_else(|| ResumeError::UnknownModel {
-                model_name: model_name.to_string(),
-            })
+            .ok_or_else(|| Self::unknown_resume_model_error(model_name))
+    }
+
+    fn unknown_resume_model_error(model_name: &str) -> ResumeError {
+        ResumeError::UnknownModel {
+            model_name: model_name.to_string(),
+        }
     }
 
     pub(super) fn validate_resume_provider_for_model(
@@ -210,11 +242,23 @@ impl StateDb {
         if Self::model_has_provider(model, active_provider) {
             Ok(())
         } else {
-            Err(ResumeError::ProviderModelMismatch {
-                model_name: model_name.to_string(),
-                active_provider: active_provider.to_string(),
-                suggestions: Self::model_names_for_provider(models, active_provider),
-            })
+            Err(Self::provider_model_mismatch_error(
+                models,
+                model_name,
+                active_provider,
+            ))
+        }
+    }
+
+    fn provider_model_mismatch_error(
+        models: &ModelStore,
+        model_name: &str,
+        active_provider: &str,
+    ) -> ResumeError {
+        ResumeError::ProviderModelMismatch {
+            model_name: model_name.to_string(),
+            active_provider: active_provider.to_string(),
+            suggestions: Self::model_names_for_provider(models, active_provider),
         }
     }
 
@@ -229,13 +273,24 @@ impl StateDb {
         models: &ModelStore,
         active_provider: &str,
     ) -> Vec<String> {
-        let mut suggestions = models
-            .iter()
-            .filter(|(_, model)| Self::model_has_provider(model, active_provider))
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
+        let compatible_models = Self::models_for_provider(models, active_provider);
+        let mut suggestions = Self::model_names_from_entries(compatible_models);
         suggestions.sort();
         suggestions
+    }
+
+    fn models_for_provider<'a>(
+        models: &'a ModelStore,
+        active_provider: &str,
+    ) -> Vec<(&'a String, &'a ModelConfig)> {
+        models
+            .iter()
+            .filter(|(_, model)| Self::model_has_provider(model, active_provider))
+            .collect()
+    }
+
+    fn model_names_from_entries(entries: Vec<(&String, &ModelConfig)>) -> Vec<String> {
+        entries.into_iter().map(|(name, _)| name.clone()).collect()
     }
 
     pub(super) fn assemble_resolved_resume(

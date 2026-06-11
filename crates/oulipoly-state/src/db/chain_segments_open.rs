@@ -1,16 +1,37 @@
 //! ## Declared roles
 //!
+//! - formatter
 //! - mapper
 //! - orchestration
 //! - accessor
 //!
-//! Role set: { mapper, orchestration, accessor }
+//! Role set: { formatter, mapper, orchestration, accessor }
 //!
 //! Session-chain segment open, rotate, and active snapshot operations.
 
 use super::*;
 use chrono::{DateTime, Utc};
 use oulipoly_core::TransitionReason;
+
+const ACTIVE_CHAIN_SEGMENT_SNAPSHOT_SQL: &str = "SELECT sc.chain_id,
+                        s.provider_name,
+                        s.session_id,
+                        s.started_at,
+                        s.ended_at,
+                        s.last_turn_id,
+                        (
+                            SELECT st.timestamp
+                            FROM session_turns st
+                            WHERE st.provider_name = s.provider_name
+                              AND st.session_id = s.session_id
+                            ORDER BY st.timestamp DESC, st.id DESC
+                            LIMIT 1
+                        )
+                 FROM session_chains sc
+                 JOIN session_chain_segments s ON s.chain_id = sc.chain_id
+                 WHERE sc.chain_id = ?1 AND s.ended_at IS NULL
+                 ORDER BY s.started_at DESC, s.id DESC
+                 LIMIT 1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveChainSegmentSnapshot {
@@ -67,15 +88,15 @@ impl StateDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin session chain rotation transaction: {e}"))?;
-        let closed_id = Self::close_expected_active_segment_returning_on(
-            &tx,
-            input.chain_id,
-            input.source_provider_name,
-            input.source_session_id,
-            input.changed_at,
-        )?
-        .ok_or_else(|| "validated source segment was no longer active".to_string())?;
+            .map_err(Self::format_chain_segment_rotation_begin_error)?;
+        let closed_id =
+            Self::require_active_source_segment(Self::close_expected_active_segment_returning_on(
+                &tx,
+                input.chain_id,
+                input.source_provider_name,
+                input.source_session_id,
+                input.changed_at,
+            )?)?;
         Self::upsert_open_chain_segment(
             &tx,
             input.chain_id,
@@ -91,7 +112,7 @@ impl StateDb {
             input.target_session_id,
         )?;
         tx.commit()
-            .map_err(|e| format!("Failed to commit session chain rotation transaction: {e}"))?;
+            .map_err(Self::format_chain_segment_rotation_commit_error)?;
         Ok((closed_id, opened_id))
     }
 
@@ -101,40 +122,30 @@ impl StateDb {
     ) -> Result<Option<ActiveChainSegmentSnapshot>, DbError> {
         self.conn
             .query_row(
-                "SELECT sc.chain_id,
-                        s.provider_name,
-                        s.session_id,
-                        s.started_at,
-                        s.ended_at,
-                        s.last_turn_id,
-                        (
-                            SELECT st.timestamp
-                            FROM session_turns st
-                            WHERE st.provider_name = s.provider_name
-                              AND st.session_id = s.session_id
-                            ORDER BY st.timestamp DESC, st.id DESC
-                            LIMIT 1
-                        )
-                 FROM session_chains sc
-                 JOIN session_chain_segments s ON s.chain_id = sc.chain_id
-                 WHERE sc.chain_id = ?1 AND s.ended_at IS NULL
-                 ORDER BY s.started_at DESC, s.id DESC
-                 LIMIT 1",
+                ACTIVE_CHAIN_SEGMENT_SNAPSHOT_SQL,
                 sqlite::params![chain_id],
-                |row| {
-                    Ok(ActiveChainSegmentSnapshot {
-                        chain_id: row.get(0)?,
-                        active_provider: row.get(1)?,
-                        active_session_id: row.get(2)?,
-                        active_started_at: row.get(3)?,
-                        active_ended_at: row.get(4)?,
-                        active_last_turn_id: row.get(5)?,
-                        latest_turn_at: row.get(6)?,
-                    })
-                },
+                Self::map_active_chain_segment_snapshot_row,
             )
             .optional()
-            .map_err(|e| format!("Failed to read active chain segment snapshot: {e}"))
+            .map_err(Self::format_active_chain_segment_snapshot_error)
+    }
+
+    fn map_active_chain_segment_snapshot_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<ActiveChainSegmentSnapshot> {
+        Ok(ActiveChainSegmentSnapshot {
+            chain_id: row.get(0)?,
+            active_provider: row.get(1)?,
+            active_session_id: row.get(2)?,
+            active_started_at: row.get(3)?,
+            active_ended_at: row.get(4)?,
+            active_last_turn_id: row.get(5)?,
+            latest_turn_at: row.get(6)?,
+        })
+    }
+
+    fn format_active_chain_segment_snapshot_error(e: sqlite::Error) -> DbError {
+        format!("Failed to read active chain segment snapshot: {e}")
     }
 
     pub(super) fn upsert_open_chain_segment(
@@ -163,7 +174,7 @@ impl StateDb {
                 reason.as_str()
             ],
         )
-        .map_err(|e| format!("Failed to open session chain segment: {e}"))?;
+        .map_err(Self::format_open_chain_segment_error)?;
         Ok(())
     }
 
@@ -180,7 +191,7 @@ impl StateDb {
             sqlite::params![chain_id, provider_name, session_id],
             |row| row.get(0),
         )
-        .map_err(|e| format!("Failed to read session chain segment id: {e}"))
+        .map_err(Self::format_open_chain_segment_id_read_error)
     }
 
     pub fn find_conflicting_active_segment(
@@ -203,6 +214,34 @@ impl StateDb {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| format!("Failed to check conflicting active session segment: {e}"))
+            .map_err(Self::format_conflicting_active_segment_check_error)
+    }
+
+    fn require_active_source_segment(segment_id: Option<i64>) -> Result<i64, DbError> {
+        segment_id.ok_or_else(Self::format_inactive_source_segment_error)
+    }
+
+    fn format_inactive_source_segment_error() -> DbError {
+        "validated source segment was no longer active".to_string()
+    }
+
+    fn format_chain_segment_rotation_begin_error(e: sqlite::Error) -> DbError {
+        format!("Failed to begin session chain rotation transaction: {e}")
+    }
+
+    fn format_chain_segment_rotation_commit_error(e: sqlite::Error) -> DbError {
+        format!("Failed to commit session chain rotation transaction: {e}")
+    }
+
+    fn format_open_chain_segment_error(e: sqlite::Error) -> DbError {
+        format!("Failed to open session chain segment: {e}")
+    }
+
+    fn format_open_chain_segment_id_read_error(e: sqlite::Error) -> DbError {
+        format!("Failed to read session chain segment id: {e}")
+    }
+
+    fn format_conflicting_active_segment_check_error(e: sqlite::Error) -> DbError {
+        format!("Failed to check conflicting active session segment: {e}")
     }
 }

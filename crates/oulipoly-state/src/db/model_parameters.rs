@@ -76,8 +76,12 @@ impl StateDb {
                     &json.cli_mapping_json,
                 ],
             )
-            .map_err(|e| format!("Failed to upsert model parameter: {e}"))?;
+            .map_err(Self::format_model_parameter_upsert_error)?;
         Ok(())
+    }
+
+    fn format_model_parameter_upsert_error(err: sqlite::Error) -> String {
+        format!("Failed to upsert model parameter: {err}")
     }
 
     fn serialize_param_type(param_type: &ParamType) -> Result<String, String> {
@@ -115,20 +119,32 @@ impl StateDb {
                  WHERE model_name = ?1 AND provider = ?2
                  ORDER BY name",
             )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            .map_err(Self::format_model_parameter_query_prepare_error)?;
 
         let rows = stmt
             .query_map(
                 sqlite::params![model_name, provider],
                 Self::model_parameter_row_mapper,
             )
-            .map_err(|e| format!("Failed to query model parameters: {e}"))?;
+            .map_err(Self::format_model_parameter_query_error)?;
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| format!("Failed to read parameter row: {e}"))?);
+            result.push(row.map_err(Self::format_model_parameter_row_read_error)?);
         }
         Ok(result)
+    }
+
+    fn format_model_parameter_query_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare query: {err}")
+    }
+
+    fn format_model_parameter_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query model parameters: {err}")
+    }
+
+    fn format_model_parameter_row_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read parameter row: {err}")
     }
 
     fn model_parameter_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<ModelParameterRawRow> {
@@ -143,13 +159,20 @@ impl StateDb {
 
     fn parse_model_parameter_raw_row(raw: ModelParameterRawRow) -> Result<ModelParameter, String> {
         let parsed = Self::parse_model_parameter_serialized_fields(&raw)?;
-        Ok(ModelParameter {
+        Ok(Self::map_model_parameter_raw_row(raw, parsed))
+    }
+
+    fn map_model_parameter_raw_row(
+        raw: ModelParameterRawRow,
+        parsed: ModelParameterParsedFields,
+    ) -> ModelParameter {
+        ModelParameter {
             name: raw.name,
             display_name: raw.display_name,
             param_type: parsed.param_type,
             description: raw.description,
             cli_mapping: parsed.cli_mapping,
-        })
+        }
     }
 
     fn parse_model_parameter_serialized_fields(
@@ -162,10 +185,18 @@ impl StateDb {
     }
 
     fn parse_param_type_json(raw: &str) -> Result<ParamType, String> {
-        serde_json::from_str(raw).map_err(|e| format!("Failed to deserialize param_type: {e}"))
+        serde_json::from_str(raw).map_err(Self::format_param_type_deserialize_error)
     }
 
     fn parse_cli_mapping_json(raw: &str) -> Result<CliMapping, String> {
-        serde_json::from_str(raw).map_err(|e| format!("Failed to deserialize cli_mapping: {e}"))
+        serde_json::from_str(raw).map_err(Self::format_cli_mapping_deserialize_error)
+    }
+
+    fn format_param_type_deserialize_error(err: serde_json::Error) -> String {
+        format!("Failed to deserialize param_type: {err}")
+    }
+
+    fn format_cli_mapping_deserialize_error(err: serde_json::Error) -> String {
+        format!("Failed to deserialize cli_mapping: {err}")
     }
 }

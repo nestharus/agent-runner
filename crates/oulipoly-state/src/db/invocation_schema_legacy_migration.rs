@@ -13,9 +13,7 @@ use super::*;
 impl StateDb {
     pub(super) fn migrate_legacy_invocations(conn: &sqlite::Connection) -> Result<(), String> {
         let provider_names = Self::provider_name_lookup()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin invocation migration: {e}"))?;
+        let tx = Self::begin_invocation_migration(conn)?;
         Self::validate_providers_schema(&tx)?;
         // Guardrail order: SELECT COUNT(*) FROM invocations
         let old_count = Self::legacy_invocations_count(&tx)?;
@@ -31,34 +29,94 @@ impl StateDb {
         Self::validate_migrated_invocation_count(new_count, old_count)?;
         // Guardrail order: DROP TABLE invocations;
         Self::replace_invocations_with_migrated_table(&tx)?;
-        tx.execute_batch(Self::invocations_index_sql())
-            .map_err(|e| format!("Failed to create migrated invocation indexes: {e}"))?;
+        Self::create_migrated_invocation_indexes(&tx)?;
         Self::ensure_invocations_row_version_support(&tx)?;
 
+        Self::commit_invocation_migration(tx)
+    }
+
+    fn begin_invocation_migration(conn: &sqlite::Connection) -> Result<Transaction<'_>, String> {
+        conn.unchecked_transaction()
+            .map_err(Self::format_invocation_migration_begin_error)
+    }
+
+    fn format_invocation_migration_begin_error(err: sqlite::Error) -> String {
+        format!("Failed to begin invocation migration: {err}")
+    }
+
+    fn commit_invocation_migration(tx: Transaction<'_>) -> Result<(), String> {
         tx.commit()
-            .map_err(|e| format!("Failed to commit invocation migration: {e}"))
+            .map_err(Self::format_invocation_migration_commit_error)
+    }
+
+    fn format_invocation_migration_commit_error(err: sqlite::Error) -> String {
+        format!("Failed to commit invocation migration: {err}")
+    }
+
+    fn create_migrated_invocation_indexes(conn: &sqlite::Connection) -> Result<(), String> {
+        conn.execute_batch(Self::invocations_index_sql())
+            .map_err(Self::format_migrated_invocation_indexes_error)
+    }
+
+    fn format_migrated_invocation_indexes_error(err: sqlite::Error) -> String {
+        format!("Failed to create migrated invocation indexes: {err}")
     }
 
     pub(super) fn legacy_invocations_count(conn: &sqlite::Connection) -> Result<i64, String> {
         conn.query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
-            .map_err(|e| format!("Failed to count legacy invocations before rebuild: {e}"))
+            .map_err(Self::format_legacy_invocations_count_error)
+    }
+
+    fn format_legacy_invocations_count_error(err: sqlite::Error) -> String {
+        format!("Failed to count legacy invocations before rebuild: {err}")
     }
 
     pub(super) fn load_legacy_invocation_rows(
         conn: &sqlite::Connection,
     ) -> Result<Vec<LegacyInvocationRow>, String> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT model_name, provider_index, success, exit_code, error_category, created_at
+        let mut stmt = Self::prepare_legacy_invocation_rows_query(conn)?;
+        Self::read_legacy_invocation_rows(&mut stmt)
+    }
+
+    fn prepare_legacy_invocation_rows_query(
+        conn: &sqlite::Connection,
+    ) -> Result<sqlite::Statement<'_>, String> {
+        conn.prepare(
+            "SELECT model_name, provider_index, success, exit_code, error_category, created_at
                  FROM invocations
                  ORDER BY id",
-            )
-            .map_err(|e| format!("Failed to read legacy invocations: {e}"))?;
+        )
+        .map_err(Self::format_legacy_invocations_read_error)
+    }
+
+    fn format_legacy_invocations_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read legacy invocations: {err}")
+    }
+
+    fn read_legacy_invocation_rows(
+        stmt: &mut sqlite::Statement<'_>,
+    ) -> Result<Vec<LegacyInvocationRow>, String> {
         let rows = stmt
             .query_map([], Self::map_legacy_invocation_row)
-            .map_err(|e| format!("Failed to scan legacy invocations: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to parse legacy invocation: {e}"))
+            .map_err(Self::format_legacy_invocations_scan_error)?;
+        Self::collect_legacy_invocation_rows(rows)
+    }
+
+    fn format_legacy_invocations_scan_error(err: sqlite::Error) -> String {
+        format!("Failed to scan legacy invocations: {err}")
+    }
+
+    fn collect_legacy_invocation_rows<I>(rows: I) -> Result<Vec<LegacyInvocationRow>, String>
+    where
+        I: IntoIterator<Item = sqlite::Result<LegacyInvocationRow>>,
+    {
+        rows.into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_legacy_invocation_parse_error)
+    }
+
+    fn format_legacy_invocation_parse_error(err: sqlite::Error) -> String {
+        format!("Failed to parse legacy invocation: {err}")
     }
 
     pub(super) fn map_legacy_invocation_row(
@@ -78,13 +136,23 @@ impl StateDb {
         scanned: usize,
         old_count: i64,
     ) -> Result<(), String> {
-        if scanned as i64 == old_count {
+        if Self::legacy_invocation_scan_count_matches(scanned, old_count) {
             Ok(())
         } else {
-            Err(format!(
-                "Legacy invocation rebuild aborted before replacement: scanned {scanned} rows but table count was {old_count}"
+            Err(Self::format_legacy_invocation_scan_count_error(
+                scanned, old_count,
             ))
         }
+    }
+
+    fn legacy_invocation_scan_count_matches(scanned: usize, old_count: i64) -> bool {
+        scanned as i64 == old_count
+    }
+
+    fn format_legacy_invocation_scan_count_error(scanned: usize, old_count: i64) -> String {
+        format!(
+            "Legacy invocation rebuild aborted before replacement: scanned {scanned} rows but table count was {old_count}"
+        )
     }
 
     pub(super) fn create_migrated_invocations_table(
@@ -116,7 +184,11 @@ impl StateDb {
                 row_version INTEGER NOT NULL DEFAULT 0
             );",
         )
-        .map_err(|e| format!("Failed to create migrated invocations table: {e}"))
+        .map_err(Self::format_migrated_invocations_table_create_error)
+    }
+
+    fn format_migrated_invocations_table_create_error(err: sqlite::Error) -> String {
+        format!("Failed to create migrated invocations table: {err}")
     }
 
     pub(super) fn insert_migrated_invocation_rows(
@@ -124,26 +196,47 @@ impl StateDb {
         rows: Vec<LegacyInvocationRow>,
         provider_names: &HashMap<(String, usize), String>,
     ) -> Result<(), String> {
-        let mut insert = conn
-            .prepare(Self::migrated_invocation_insert_sql())
-            .map_err(|e| format!("Failed to prepare migrated invocation insert: {e}"))?;
+        let mut insert = Self::prepare_migrated_invocation_insert(conn)?;
         for row in rows {
             let migrated = Self::map_legacy_invocation_insert(row, provider_names);
-            insert
-                .execute(sqlite::params![
-                    migrated.invocation_uuid,
-                    migrated.model_name,
-                    migrated.provider_name,
-                    migrated.provider_index,
-                    migrated.status.as_str(),
-                    migrated.success,
-                    migrated.exit_code,
-                    migrated.error_category,
-                    migrated.created_at,
-                ])
-                .map_err(|e| format!("Failed to copy legacy invocation: {e}"))?;
+            Self::execute_migrated_invocation_insert(&mut insert, migrated)?;
         }
         Ok(())
+    }
+
+    fn prepare_migrated_invocation_insert(
+        conn: &sqlite::Connection,
+    ) -> Result<sqlite::Statement<'_>, String> {
+        conn.prepare(Self::migrated_invocation_insert_sql())
+            .map_err(Self::format_migrated_invocation_insert_prepare_error)
+    }
+
+    fn format_migrated_invocation_insert_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare migrated invocation insert: {err}")
+    }
+
+    fn execute_migrated_invocation_insert(
+        insert: &mut sqlite::Statement<'_>,
+        migrated: LegacyInvocationInsert,
+    ) -> Result<(), String> {
+        insert
+            .execute(sqlite::params![
+                migrated.invocation_uuid,
+                migrated.model_name,
+                migrated.provider_name,
+                migrated.provider_index,
+                migrated.status.as_str(),
+                migrated.success,
+                migrated.exit_code,
+                migrated.error_category,
+                migrated.created_at,
+            ])
+            .map_err(Self::format_legacy_invocation_copy_error)?;
+        Ok(())
+    }
+
+    fn format_legacy_invocation_copy_error(err: sqlite::Error) -> String {
+        format!("Failed to copy legacy invocation: {err}")
     }
 
     pub(super) fn migrated_invocation_insert_sql() -> &'static str {
@@ -205,20 +298,34 @@ impl StateDb {
 
     pub(super) fn migrated_invocations_count(conn: &sqlite::Connection) -> Result<i64, String> {
         conn.query_row("SELECT COUNT(*) FROM invocations_new", [], |row| row.get(0))
-            .map_err(|e| format!("Failed to count migrated invocations before replacement: {e}"))
+            .map_err(Self::format_migrated_invocations_count_error)
+    }
+
+    fn format_migrated_invocations_count_error(err: sqlite::Error) -> String {
+        format!("Failed to count migrated invocations before replacement: {err}")
     }
 
     pub(super) fn validate_migrated_invocation_count(
         new_count: i64,
         old_count: i64,
     ) -> Result<(), String> {
-        if new_count == old_count {
+        if Self::migrated_invocation_count_matches(new_count, old_count) {
             Ok(())
         } else {
-            Err(format!(
-                "Legacy invocation rebuild aborted before replacement: migrated {new_count} rows from {old_count}"
+            Err(Self::format_migrated_invocation_count_mismatch_error(
+                new_count, old_count,
             ))
         }
+    }
+
+    fn migrated_invocation_count_matches(new_count: i64, old_count: i64) -> bool {
+        new_count == old_count
+    }
+
+    fn format_migrated_invocation_count_mismatch_error(new_count: i64, old_count: i64) -> String {
+        format!(
+            "Legacy invocation rebuild aborted before replacement: migrated {new_count} rows from {old_count}"
+        )
     }
 
     pub(super) fn replace_invocations_with_migrated_table(
@@ -228,7 +335,11 @@ impl StateDb {
             "DROP TABLE invocations;
              ALTER TABLE invocations_new RENAME TO invocations;",
         )
-        .map_err(|e| format!("Failed to replace invocations table: {e}"))
+        .map_err(Self::format_invocations_table_replace_error)
+    }
+
+    fn format_invocations_table_replace_error(err: sqlite::Error) -> String {
+        format!("Failed to replace invocations table: {err}")
     }
 
     /// Resolve `(model_name, provider_index) -> provider_name` from the

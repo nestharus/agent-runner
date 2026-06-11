@@ -30,8 +30,13 @@ impl StateDb {
                 "UPDATE provider_quotas SET refreshed_at = ?1 WHERE provider_name = ?2",
                 sqlite::params![refreshed_at.to_rfc3339(), provider_name],
             )
-            .map_err(|e| format!("Failed to set refreshed_at: {e}"))?;
+            .map_err(Self::format_set_refreshed_at_error)?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_set_refreshed_at_error(e: sqlite::Error) -> String {
+        format!("Failed to set refreshed_at: {e}")
     }
 
     /// Test-only: seed the PR 3 per-window burn-rate learning columns without
@@ -58,8 +63,13 @@ impl StateDb {
                     last_delta_calls as i64
                 ],
             )
-            .map_err(|e| format!("Failed to set window delta: {e}"))?;
+            .map_err(Self::format_set_window_delta_error)?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_set_window_delta_error(e: sqlite::Error) -> String {
+        format!("Failed to set window delta: {e}")
     }
 
     /// Test-only: seed a provider quota row without any window rows.
@@ -81,14 +91,24 @@ impl StateDb {
                     refreshed_at = ?2",
                 sqlite::params![provider_name, refreshed_at.to_rfc3339()],
             )
-            .map_err(|e| format!("Failed to insert quota row: {e}"))?;
+            .map_err(Self::format_insert_quota_row_error)?;
         self.conn
             .execute(
                 "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
                 sqlite::params![provider_name],
             )
-            .map_err(|e| format!("Failed to clear quota windows: {e}"))?;
+            .map_err(Self::format_clear_quota_windows_error)?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_insert_quota_row_error(e: sqlite::Error) -> String {
+        format!("Failed to insert quota row: {e}")
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_clear_quota_windows_error(e: sqlite::Error) -> String {
+        format!("Failed to clear quota windows: {e}")
     }
 
     /// Test-only: make a cached quota row unreadable through the public
@@ -106,8 +126,13 @@ impl StateDb {
                  WHERE provider_name = ?1",
                 sqlite::params![provider_name],
             )
-            .map_err(|e| format!("Failed to force unreadable cached quota: {e}"))?;
+            .map_err(Self::format_force_unreadable_cached_quota_error)?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_force_unreadable_cached_quota_error(e: sqlite::Error) -> String {
+        format!("Failed to force unreadable cached quota: {e}")
     }
 
     /// Test-only: make cached window rows unreadable through the public
@@ -125,7 +150,12 @@ impl StateDb {
                  WHERE provider_name = ?1",
                 sqlite::params![provider_name],
             )
-            .map_err(|e| format!("Failed to force unreadable cached windows: {e}"))?;
+            .map_err(Self::format_force_unreadable_cached_windows_error)?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn format_force_unreadable_cached_windows_error(e: sqlite::Error) -> String {
+        format!("Failed to force unreadable cached windows: {e}")
     }
 }

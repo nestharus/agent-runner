@@ -14,6 +14,10 @@ use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
+const INVOCATION_WINDOW_TURNS_SQL: &str = "SELECT session_id, timestamp
+                 FROM session_turns
+                 WHERE provider_name = ?1";
+
 struct InvocationWindowTurnRow {
     session_id: String,
     timestamp_raw: String,
@@ -57,22 +61,37 @@ impl StateDb {
     ) -> Result<Vec<InvocationWindowTurnRow>, String> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT session_id, timestamp
-                 FROM session_turns
-                 WHERE provider_name = ?1",
-            )
-            .map_err(|e| format!("Failed to prepare invocation session lookup: {e}"))?;
+            .prepare(INVOCATION_WINDOW_TURNS_SQL)
+            .map_err(Self::format_invocation_session_lookup_prepare_error)?;
         let rows = stmt
-            .query_map(sqlite::params![provider_name], |row| {
-                Ok(InvocationWindowTurnRow {
-                    session_id: row.get(0)?,
-                    timestamp_raw: row.get(1)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query invocation session lookup: {e}"))?;
+            .query_map(
+                sqlite::params![provider_name],
+                Self::map_invocation_window_turn_row,
+            )
+            .map_err(Self::format_invocation_session_lookup_query_error)?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read invocation session lookup row: {e}"))
+            .map_err(Self::format_invocation_session_lookup_read_error)
+    }
+
+    fn map_invocation_window_turn_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<InvocationWindowTurnRow> {
+        Ok(InvocationWindowTurnRow {
+            session_id: row.get(0)?,
+            timestamp_raw: row.get(1)?,
+        })
+    }
+
+    fn format_invocation_session_lookup_prepare_error(e: sqlite::Error) -> String {
+        format!("Failed to prepare invocation session lookup: {e}")
+    }
+
+    fn format_invocation_session_lookup_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query invocation session lookup: {e}")
+    }
+
+    fn format_invocation_session_lookup_read_error(e: sqlite::Error) -> String {
+        format!("Failed to read invocation session lookup row: {e}")
     }
 
     fn accumulate_invocation_window_candidate(

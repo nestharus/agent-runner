@@ -51,7 +51,7 @@ impl StateDb {
     }
 
     fn ensure_artifact_dir(dir: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all({}): {e}", dir.display()))
+        std::fs::create_dir_all(dir).map_err(|e| Self::format_create_artifact_dir_error(dir, e))
     }
 
     fn invocation_artifact_bytes(
@@ -59,7 +59,7 @@ impl StateDb {
         started_at: &str,
     ) -> Result<Vec<u8>, String> {
         let payload = Self::invocation_artifact_payload(start, started_at);
-        serde_json::to_vec(&payload).map_err(|e| format!("serialize invocation artifact: {e}"))
+        serde_json::to_vec(&payload).map_err(Self::format_invocation_artifact_serialize_error)
     }
 
     fn invocation_artifact_payload(start: &InvocationStart, started_at: &str) -> serde_json::Value {
@@ -86,14 +86,9 @@ impl StateDb {
         bytes: &[u8],
     ) -> Result<(), String> {
         std::fs::write(tmp_path, bytes)
-            .map_err(|e| format!("write({}): {e}", tmp_path.display()))?;
-        std::fs::rename(tmp_path, final_path).map_err(|e| {
-            format!(
-                "rename({} -> {}): {e}",
-                tmp_path.display(),
-                final_path.display()
-            )
-        })
+            .map_err(|e| Self::format_artifact_write_error(tmp_path, e))?;
+        std::fs::rename(tmp_path, final_path)
+            .map_err(|e| Self::format_artifact_rename_error(tmp_path, final_path, e))
     }
 
     pub(super) fn write_result_artifact(
@@ -111,7 +106,7 @@ impl StateDb {
 
     fn result_artifact_bytes(input: ResultEnvelopeInput<'_>) -> Result<Vec<u8>, String> {
         let payload = Self::result_artifact_payload(input);
-        serde_json::to_vec(&payload).map_err(|e| format!("serialize result artifact: {e}"))
+        serde_json::to_vec(&payload).map_err(Self::format_result_artifact_serialize_error)
     }
 
     fn result_artifact_payload(input: ResultEnvelopeInput<'_>) -> serde_json::Value {
@@ -166,5 +161,33 @@ impl StateDb {
             RawArtifactKind::EventsJsonl => "events.jsonl",
         };
         format!("{uuid}.{suffix}")
+    }
+
+    fn format_create_artifact_dir_error(dir: &Path, e: std::io::Error) -> String {
+        format!("create_dir_all({}): {e}", dir.display())
+    }
+
+    fn format_invocation_artifact_serialize_error(e: serde_json::Error) -> String {
+        format!("serialize invocation artifact: {e}")
+    }
+
+    fn format_artifact_write_error(tmp_path: &Path, e: std::io::Error) -> String {
+        format!("write({}): {e}", tmp_path.display())
+    }
+
+    fn format_artifact_rename_error(
+        tmp_path: &Path,
+        final_path: &Path,
+        e: std::io::Error,
+    ) -> String {
+        format!(
+            "rename({} -> {}): {e}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    }
+
+    fn format_result_artifact_serialize_error(e: serde_json::Error) -> String {
+        format!("serialize result artifact: {e}")
     }
 }

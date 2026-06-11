@@ -54,7 +54,11 @@ impl StateDb {
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|e| format!("Failed to inspect returned-artifacts schema: {e}"))
+        .map_err(Self::format_returned_artifacts_schema_inspect_error)
+    }
+
+    fn format_returned_artifacts_schema_inspect_error(err: sqlite::Error) -> DbError {
+        format!("Failed to inspect returned-artifacts schema: {err}")
     }
 
     pub(super) fn unexpected_returned_artifacts_object_error(object_type: &str) -> DbError {
@@ -90,16 +94,28 @@ impl StateDb {
                  WHERE invocation_id = ?1
                  ORDER BY ordinal ASC",
             )
-            .map_err(|e| format!("Failed to prepare returned-artifacts query: {e}"))?;
+            .map_err(Self::format_returned_artifacts_query_prepare_error)?;
         let rows = stmt
             .query_map(
                 sqlite::params![invocation_row_id],
                 Self::map_returned_artifact_raw_row,
             )
-            .map_err(|e| format!("Failed to query returned artifacts: {e}"))?;
+            .map_err(Self::format_returned_artifacts_query_error)?;
 
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read returned artifact row: {e}"))
+            .map_err(Self::format_returned_artifact_row_read_error)
+    }
+
+    fn format_returned_artifacts_query_prepare_error(err: sqlite::Error) -> DbError {
+        format!("Failed to prepare returned-artifacts query: {err}")
+    }
+
+    fn format_returned_artifacts_query_error(err: sqlite::Error) -> DbError {
+        format!("Failed to query returned artifacts: {err}")
+    }
+
+    fn format_returned_artifact_row_read_error(err: sqlite::Error) -> DbError {
+        format!("Failed to read returned artifact row: {err}")
     }
 
     pub(super) fn map_returned_artifact_raw_row(
@@ -141,38 +157,92 @@ impl StateDb {
     pub(super) fn parse_returned_artifact_field_values(
         row: &ReturnedArtifactRawRow,
     ) -> Result<ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError> {
-        Ok(ParsedReturnedArtifactFieldValues {
-            source: serde_json::from_str(&row.source_json)
-                .map_err(ReturnedArtifactFieldError::SourceJson)?,
-            returned_at: DateTime::parse_from_rfc3339(&row.returned_at_text)
-                .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|err| ReturnedArtifactFieldError::ReturnedAt {
-                    raw: row.returned_at_text.clone(),
-                    err,
-                })?,
-            producer_invocation_uuid: returned_artifact_producer_uuid(&row.workflow_run_id)
-                .map_err(ReturnedArtifactFieldError::ProducerUuid)?,
+        let source = Self::parse_returned_artifact_source(&row.source_json)?;
+        let returned_at = Self::parse_returned_artifact_returned_at(&row.returned_at_text)?;
+        let producer_invocation_uuid =
+            Self::parse_returned_artifact_producer_uuid(&row.workflow_run_id)?;
+        Ok(Self::map_returned_artifact_field_values(
+            row,
+            source,
+            returned_at,
+            producer_invocation_uuid,
+        ))
+    }
+
+    fn parse_returned_artifact_source(
+        raw: &str,
+    ) -> Result<oulipoly_agent_messenger::ReturnedArtifactSource, ReturnedArtifactFieldError> {
+        serde_json::from_str(raw).map_err(ReturnedArtifactFieldError::SourceJson)
+    }
+
+    fn parse_returned_artifact_returned_at(
+        raw: &str,
+    ) -> Result<DateTime<Utc>, ReturnedArtifactFieldError> {
+        DateTime::parse_from_rfc3339(raw)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|err| Self::returned_artifact_returned_at_error(raw, err))
+    }
+
+    fn returned_artifact_returned_at_error(
+        raw: &str,
+        err: chrono::ParseError,
+    ) -> ReturnedArtifactFieldError {
+        ReturnedArtifactFieldError::ReturnedAt {
+            raw: raw.to_string(),
+            err,
+        }
+    }
+
+    fn parse_returned_artifact_producer_uuid(
+        workflow_run_id: &str,
+    ) -> Result<uuid::Uuid, ReturnedArtifactFieldError> {
+        returned_artifact_producer_uuid(workflow_run_id)
+            .map_err(ReturnedArtifactFieldError::ProducerUuid)
+    }
+
+    fn map_returned_artifact_field_values(
+        row: &ReturnedArtifactRawRow,
+        source: oulipoly_agent_messenger::ReturnedArtifactSource,
+        returned_at: DateTime<Utc>,
+        producer_invocation_uuid: uuid::Uuid,
+    ) -> ParsedReturnedArtifactFieldValues {
+        ParsedReturnedArtifactFieldValues {
+            source,
+            returned_at,
+            producer_invocation_uuid,
             version: row.version,
             content_len: row.content_len,
-        })
+        }
     }
 
     pub(super) fn validate_returned_artifact_field_values(
         parsed: ParsedReturnedArtifactFieldValues,
     ) -> Result<ValidatedReturnedArtifactFieldValues, ReturnedArtifactFieldError> {
-        Ok(ValidatedReturnedArtifactFieldValues {
+        let version =
+            Self::validate_returned_artifact_nonnegative_integer(parsed.version, "version")?;
+        let content_len = Self::validate_returned_artifact_nonnegative_integer(
+            parsed.content_len,
+            "content_len",
+        )?;
+        Ok(Self::map_validated_returned_artifact_field_values(
+            parsed,
+            version,
+            content_len,
+        ))
+    }
+
+    fn map_validated_returned_artifact_field_values(
+        parsed: ParsedReturnedArtifactFieldValues,
+        version: u64,
+        content_len: u64,
+    ) -> ValidatedReturnedArtifactFieldValues {
+        ValidatedReturnedArtifactFieldValues {
             source: parsed.source,
             returned_at: parsed.returned_at,
             producer_invocation_uuid: parsed.producer_invocation_uuid,
-            version: Self::validate_returned_artifact_nonnegative_integer(
-                parsed.version,
-                "version",
-            )?,
-            content_len: Self::validate_returned_artifact_nonnegative_integer(
-                parsed.content_len,
-                "content_len",
-            )?,
-        })
+            version,
+            content_len,
+        }
     }
 
     pub(super) fn validate_returned_artifact_nonnegative_integer(

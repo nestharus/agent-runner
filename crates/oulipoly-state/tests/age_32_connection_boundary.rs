@@ -41,13 +41,17 @@ fn assert_no_forbidden_state_db_impl_escape(state_db_impl: &str) {
 }
 
 fn assert_read_only_connection_smoke() {
+    assert_eq!(read_only_connection_smoke_value(), 1);
+}
+
+fn read_only_connection_smoke_value() -> i64 {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("state.db");
     let state = oulipoly_state::StateDb::open(&db_path).unwrap();
     let read_only_connection: &rusqlite::Connection = state.connection();
     read_only_connection
         .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-        .unwrap();
+        .unwrap()
 }
 
 fn assert_with_write_txn_surface(opening_source: &str) {
@@ -79,10 +83,17 @@ fn opening_source() -> &'static str {
 }
 
 fn state_db_impl(opening_source: &str) -> &str {
+    require_state_db_impl(parse_state_db_impl(opening_source))
+}
+
+fn parse_state_db_impl(opening_source: &str) -> Option<&str> {
     opening_source
         .split_once("impl StateDb {")
         .map(|(_, body)| body)
-        .expect("split opening modules should contain the StateDb impl")
+}
+
+fn require_state_db_impl(body: Option<&str>) -> &str {
+    body.expect("split opening modules should contain the StateDb impl")
 }
 
 #[test]

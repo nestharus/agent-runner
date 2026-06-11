@@ -17,17 +17,13 @@ impl StateDb {
         match Self::providers_object_type(conn)? {
             None => return Ok(()),
             Some(object_type) if object_type != "table" => {
-                return Err(format!(
-                    "Unexpected providers schema shape: object type={object_type}"
-                ));
+                return Err(Self::unexpected_providers_object_type_error(&object_type));
             }
             _ => {}
         }
 
         if Self::providers_has_foreign_keys(conn)? {
-            return Err(
-                "Unexpected providers schema shape: foreign-key constraints present".to_string(),
-            );
+            return Err(Self::unexpected_providers_foreign_keys_error());
         }
 
         let columns = Self::providers_columns(conn)?;
@@ -38,10 +34,22 @@ impl StateDb {
             return Ok(());
         }
 
-        Err(format!(
+        Err(Self::unexpected_providers_columns_error(&columns))
+    }
+
+    fn unexpected_providers_object_type_error(object_type: &str) -> String {
+        format!("Unexpected providers schema shape: object type={object_type}")
+    }
+
+    fn unexpected_providers_foreign_keys_error() -> String {
+        "Unexpected providers schema shape: foreign-key constraints present".to_string()
+    }
+
+    fn unexpected_providers_columns_error(columns: &[ProviderColumn]) -> String {
+        format!(
             "Unexpected providers schema shape: {}",
-            Self::describe_columns(&columns)
-        ))
+            Self::describe_columns(columns)
+        )
     }
 
     pub(super) fn providers_object_type(
@@ -53,20 +61,32 @@ impl StateDb {
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|e| format!("Failed to inspect providers object type: {e}"))
+        .map_err(Self::format_providers_object_type_error)
+    }
+
+    fn format_providers_object_type_error(e: sqlite::Error) -> String {
+        format!("Failed to inspect providers object type: {e}")
     }
 
     pub(super) fn providers_has_foreign_keys(conn: &sqlite::Connection) -> Result<bool, String> {
         let mut stmt = conn
             .prepare("PRAGMA foreign_key_list(providers)")
-            .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
+            .map_err(Self::format_inspect_providers_foreign_keys_error)?;
         let mut rows = stmt
             .query([])
-            .map_err(|e| format!("Failed to inspect providers foreign keys: {e}"))?;
+            .map_err(Self::format_inspect_providers_foreign_keys_error)?;
         Ok(rows
             .next()
-            .map_err(|e| format!("Failed to read providers foreign keys: {e}"))?
+            .map_err(Self::format_read_providers_foreign_keys_error)?
             .is_some())
+    }
+
+    fn format_inspect_providers_foreign_keys_error(e: sqlite::Error) -> String {
+        format!("Failed to inspect providers foreign keys: {e}")
+    }
+
+    fn format_read_providers_foreign_keys_error(e: sqlite::Error) -> String {
+        format!("Failed to read providers foreign keys: {e}")
     }
 
     pub(super) fn providers_columns(

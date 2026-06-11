@@ -63,6 +63,18 @@ pub(super) fn shm_path(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}-shm", path.display()))
 }
 
+fn sidecar_is_unreadable(sidecar: &Path) -> bool {
+    sidecar.exists() && path_is_unreadable(sidecar)
+}
+
+fn unreadable_sidecar_error(path: &Path, sidecar: &Path) -> ReadOnlyOpenError {
+    read_only_wal_sidecar_error(path.to_path_buf(), unreadable_sidecar_message(sidecar))
+}
+
+fn unreadable_sidecar_message(sidecar: &Path) -> String {
+    format!("SQLite sidecar is not readable: {}", sidecar.display())
+}
+
 #[cfg(unix)]
 pub(super) fn path_is_unreadable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -98,11 +110,8 @@ impl StateDb {
 
     pub(super) fn validate_read_only_sidecars(path: &Path) -> Result<(), ReadOnlyOpenError> {
         for sidecar in [wal_path(path), shm_path(path)] {
-            if sidecar.exists() && path_is_unreadable(&sidecar) {
-                return Err(ReadOnlyOpenError::WalSidecarError {
-                    path: path.to_path_buf(),
-                    message: format!("SQLite sidecar is not readable: {}", sidecar.display()),
-                });
+            if sidecar_is_unreadable(&sidecar) {
+                return Err(unreadable_sidecar_error(path, &sidecar));
             }
         }
         Ok(())

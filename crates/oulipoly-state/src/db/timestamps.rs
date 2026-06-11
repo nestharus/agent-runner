@@ -32,7 +32,11 @@ impl StateDb {
     ) -> Result<DateTime<Utc>, String> {
         DateTime::parse_from_rfc3339(raw)
             .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| format!("Bad {field_name} {raw}: {e}"))
+            .map_err(|e| Self::format_bad_rfc3339_message(raw, field_name, e))
+    }
+
+    fn format_bad_rfc3339_message(raw: &str, field_name: &str, err: chrono::ParseError) -> String {
+        format!("Bad {field_name} {raw}: {err}")
     }
 
     pub(super) fn optional_forgiving_rfc3339(raw: Option<String>) -> Option<DateTime<Utc>> {

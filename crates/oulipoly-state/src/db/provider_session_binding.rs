@@ -39,7 +39,7 @@ impl StateDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin provider session binding tx: {e}"))?;
+            .map_err(Self::format_provider_session_binding_begin_error)?;
 
         let existing = Self::load_existing_provider_session_binding(&tx, invocation_row_id)?;
         Self::validate_provider_session_rebind(invocation_row_id, binding, existing.as_deref())?;
@@ -49,7 +49,15 @@ impl StateDb {
             Self::mint_chain_for_invocation_session_on(&tx, invocation_row_id)?;
         }
         tx.commit()
-            .map_err(|e| format!("Failed to commit provider session binding tx: {e}"))
+            .map_err(Self::format_provider_session_binding_commit_error)
+    }
+
+    fn format_provider_session_binding_begin_error(e: sqlite::Error) -> String {
+        format!("Failed to begin provider session binding tx: {e}")
+    }
+
+    fn format_provider_session_binding_commit_error(e: sqlite::Error) -> String {
+        format!("Failed to commit provider session binding tx: {e}")
     }
 
     fn load_existing_provider_session_binding(
@@ -62,8 +70,21 @@ impl StateDb {
             |row| row.get::<_, Option<String>>(0),
         )
         .optional()
-        .map_err(|e| format!("Failed to read invocation {invocation_row_id}: {e}"))?
-        .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))
+        .map_err(|e| Self::format_provider_session_binding_read_error(invocation_row_id, e))?
+        .ok_or_else(|| {
+            Self::format_provider_session_binding_missing_invocation_error(invocation_row_id)
+        })
+    }
+
+    fn format_provider_session_binding_read_error(
+        invocation_row_id: i64,
+        e: sqlite::Error,
+    ) -> String {
+        format!("Failed to read invocation {invocation_row_id}: {e}")
+    }
+
+    fn format_provider_session_binding_missing_invocation_error(invocation_row_id: i64) -> String {
+        format!("Invocation {invocation_row_id} not found")
     }
 
     fn validate_provider_session_rebind(
@@ -74,12 +95,23 @@ impl StateDb {
         if let Some(existing) = existing
             && existing != binding.provider_session_id
         {
-            return Err(format!(
-                "Invocation {invocation_row_id} is already bound to provider session {existing}; refusing to bind {}",
-                binding.provider_session_id
+            return Err(Self::format_provider_session_rebind_error(
+                invocation_row_id,
+                existing,
+                &binding.provider_session_id,
             ));
         }
         Ok(())
+    }
+
+    fn format_provider_session_rebind_error(
+        invocation_row_id: i64,
+        existing: &str,
+        provider_session_id: &str,
+    ) -> String {
+        format!(
+            "Invocation {invocation_row_id} is already bound to provider session {existing}; refusing to bind {provider_session_id}"
+        )
     }
 
     fn write_provider_session_binding(
@@ -110,10 +142,15 @@ impl StateDb {
                 invocation_row_id
             ],
         )
-        .map_err(|e| {
-            format!("Failed to bind provider session for invocation {invocation_row_id}: {e}")
-        })?;
+        .map_err(|e| Self::format_provider_session_binding_write_error(invocation_row_id, e))?;
         Ok(())
+    }
+
+    fn format_provider_session_binding_write_error(
+        invocation_row_id: i64,
+        e: sqlite::Error,
+    ) -> String {
+        format!("Failed to bind provider session for invocation {invocation_row_id}: {e}")
     }
 
     fn provider_session_binding_should_mint_chain(binding: &ProviderSessionBinding) -> bool {
@@ -152,23 +189,39 @@ impl StateDb {
         invocation_row_id: i64,
     ) -> Result<Option<InvocationChainMintRow>, DbError> {
         let provider_session_expr = Self::provider_session_expr(conn, None)?;
-        let sql = format!(
+        let sql = Self::invocation_chain_mint_sql(&provider_session_expr);
+        conn.query_row(
+            &sql,
+            sqlite::params![invocation_row_id],
+            Self::map_invocation_chain_mint_row,
+        )
+        .optional()
+        .map_err(Self::format_invocation_chain_mint_read_error)
+    }
+
+    fn invocation_chain_mint_sql(provider_session_expr: &str) -> String {
+        format!(
             "SELECT model_name, provider_name, {provider_session_expr}, COALESCE(finished_at, created_at)
              FROM invocations
              WHERE id = ?1
                AND provider_name IS NOT NULL
                AND {provider_session_expr} IS NOT NULL"
-        );
-        conn.query_row(&sql, sqlite::params![invocation_row_id], |row| {
-            Ok(InvocationChainMintRow {
-                model_name: row.get(0)?,
-                provider_name: row.get(1)?,
-                session_id: row.get(2)?,
-                raw_ts: row.get(3)?,
-            })
+        )
+    }
+
+    fn map_invocation_chain_mint_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<InvocationChainMintRow> {
+        Ok(InvocationChainMintRow {
+            model_name: row.get(0)?,
+            provider_name: row.get(1)?,
+            session_id: row.get(2)?,
+            raw_ts: row.get(3)?,
         })
-        .optional()
-        .map_err(|e| format!("Failed to read invocation for chain mint: {e}"))
+    }
+
+    fn format_invocation_chain_mint_read_error(e: sqlite::Error) -> DbError {
+        format!("Failed to read invocation for chain mint: {e}")
     }
 
     fn existing_chain_for_provider_session(
@@ -184,7 +237,11 @@ impl StateDb {
             |row| row.get::<_, String>(0),
         )
         .optional()
-        .map_err(|e| format!("Failed to check existing invocation chain: {e}"))
+        .map_err(Self::format_existing_invocation_chain_error)
+    }
+
+    fn format_existing_invocation_chain_error(e: sqlite::Error) -> DbError {
+        format!("Failed to check existing invocation chain: {e}")
     }
 
     fn promote_existing_invocation_chain(
@@ -200,7 +257,7 @@ impl StateDb {
                  WHERE chain_id = ?1 AND model_name = '<unknown>'",
             sqlite::params![chain_id, model_name],
         )
-        .map_err(|e| format!("Failed to update invocation session chain model: {e}"))?;
+        .map_err(Self::format_update_invocation_session_chain_model_error)?;
         conn.execute(
             "UPDATE session_chain_segments
                  SET transition_reason = 'initial'
@@ -210,8 +267,16 @@ impl StateDb {
                    AND transition_reason = 'imported'",
             sqlite::params![chain_id, provider_name, session_id],
         )
-        .map_err(|e| format!("Failed to promote imported session chain segment: {e}"))?;
+        .map_err(Self::format_promote_imported_session_chain_segment_error)?;
         Ok(())
+    }
+
+    fn format_update_invocation_session_chain_model_error(e: sqlite::Error) -> DbError {
+        format!("Failed to update invocation session chain model: {e}")
+    }
+
+    fn format_promote_imported_session_chain_segment_error(e: sqlite::Error) -> DbError {
+        format!("Failed to promote imported session chain segment: {e}")
     }
 
     fn insert_invocation_chain(
@@ -225,14 +290,22 @@ impl StateDb {
              VALUES (?1, ?2, ?2, ?3)",
             sqlite::params![chain_id, ts.to_rfc3339(), row.model_name],
         )
-        .map_err(|e| format!("Failed to mint invocation session chain: {e}"))?;
+        .map_err(Self::format_mint_invocation_session_chain_error)?;
         conn.execute(
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, ?4, 'initial')",
             sqlite::params![chain_id, row.provider_name, row.session_id, ts.to_rfc3339()],
         )
-        .map_err(|e| format!("Failed to mint invocation session segment: {e}"))?;
+        .map_err(Self::format_mint_invocation_session_segment_error)?;
         Ok(())
+    }
+
+    fn format_mint_invocation_session_chain_error(e: sqlite::Error) -> DbError {
+        format!("Failed to mint invocation session chain: {e}")
+    }
+
+    fn format_mint_invocation_session_segment_error(e: sqlite::Error) -> DbError {
+        format!("Failed to mint invocation session segment: {e}")
     }
 }

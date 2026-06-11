@@ -99,9 +99,24 @@ impl StateDb {
         query_context: &str,
         read_context: &str,
     ) -> Result<Vec<String>, String> {
-        let mut stmt = conn
-            .prepare(pragma)
-            .map_err(|e| Self::format_contextual_sqlite_error(inspect_context, e))?;
+        let mut stmt = Self::prepare_table_column_names_query(conn, pragma, inspect_context)?;
+        Self::read_table_column_names(&mut stmt, query_context, read_context)
+    }
+
+    fn prepare_table_column_names_query<'conn>(
+        conn: &'conn sqlite::Connection,
+        pragma: &str,
+        inspect_context: &str,
+    ) -> Result<sqlite::Statement<'conn>, String> {
+        conn.prepare(pragma)
+            .map_err(|e| Self::format_contextual_sqlite_error(inspect_context, e))
+    }
+
+    fn read_table_column_names(
+        stmt: &mut sqlite::Statement<'_>,
+        query_context: &str,
+        read_context: &str,
+    ) -> Result<Vec<String>, String> {
         let rows = stmt
             .query_map([], Self::column_name_row_mapper)
             .map_err(|e| Self::format_contextual_sqlite_error(query_context, e))?;

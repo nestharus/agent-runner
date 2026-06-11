@@ -75,8 +75,8 @@ impl StateDb {
         role: &str,
         source_file: &str,
     ) -> Result<bool, String> {
-        let now = Utc::now().to_rfc3339();
-        let ts = timestamp.to_rfc3339();
+        let now = Self::current_rfc3339_timestamp();
+        let ts = Self::format_session_turn_timestamp(timestamp);
         let changed = self
             .conn
             .execute(
@@ -94,8 +94,12 @@ impl StateDb {
                     Option::<&str>::None,
                 ],
             )
-            .map_err(|e| format!("Failed to ingest session turn: {e}"))?;
+            .map_err(Self::format_session_turn_ingest_error)?;
         Ok(changed > 0)
+    }
+
+    fn format_session_turn_ingest_error(err: sqlite::Error) -> String {
+        format!("Failed to ingest session turn: {err}")
     }
 
     /// Bulk-insert turns inside a single transaction with a prepared
@@ -110,15 +114,23 @@ impl StateDb {
         if Self::session_turn_batch_is_empty(turns) {
             return Ok(0);
         }
-        let now = Utc::now().to_rfc3339();
+        let now = Self::current_rfc3339_timestamp();
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+            .map_err(Self::format_session_turn_batch_begin_error)?;
         let new_count = Self::insert_session_turn_batch_rows(&tx, provider_name, turns, &now)?;
         tx.commit()
-            .map_err(|e| format!("Failed to commit batch: {e}"))?;
+            .map_err(Self::format_session_turn_batch_commit_error)?;
         Ok(new_count)
+    }
+
+    fn format_session_turn_batch_begin_error(err: sqlite::Error) -> String {
+        format!("Failed to begin transaction: {err}")
+    }
+
+    fn format_session_turn_batch_commit_error(err: sqlite::Error) -> String {
+        format!("Failed to commit batch: {err}")
     }
 
     pub(super) fn session_turn_batch_is_empty(turns: &[SessionTurnIngest]) -> bool {
@@ -186,13 +198,17 @@ impl StateDb {
         SessionTurnBindValues {
             session_id: &turn.session_id,
             turn_id: &turn.turn_id,
-            timestamp: turn.timestamp.to_rfc3339(),
+            timestamp: Self::format_session_turn_timestamp(&turn.timestamp),
             role: &turn.role,
             parent_turn_id: turn.parent_turn_id.as_deref(),
             is_sidechain: Self::sqlite_bool(turn.is_sidechain),
             is_compaction_boundary: Self::sqlite_bool(turn.is_compaction_boundary),
             body: turn.body.as_deref(),
         }
+    }
+
+    fn format_session_turn_timestamp(timestamp: &DateTime<Utc>) -> String {
+        timestamp.to_rfc3339()
     }
 
     pub(super) fn sqlite_bool(value: bool) -> i64 {
@@ -217,6 +233,10 @@ impl StateDb {
             ingested_at,
             binds.body,
         ])
-        .map_err(|e| format!("Batch insert row failed: {e}"))
+        .map_err(Self::format_session_turn_batch_insert_error)
+    }
+
+    fn format_session_turn_batch_insert_error(err: sqlite::Error) -> String {
+        format!("Batch insert row failed: {err}")
     }
 }

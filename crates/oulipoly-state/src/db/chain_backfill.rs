@@ -43,7 +43,7 @@ impl StateDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin session chain backfill: {e}"))?;
+            .map_err(Self::format_session_chain_backfill_begin_error)?;
         let provider_session_expr = Self::provider_session_expr(&tx, None)?;
         let mut chains_inserted = 0;
         let mut segments_inserted = 0;
@@ -54,7 +54,7 @@ impl StateDb {
             segments_inserted += Self::insert_backfill_segment(&tx, &chain_id, &row)?;
         }
         tx.commit()
-            .map_err(|e| format!("Failed to commit session chain backfill: {e}"))?;
+            .map_err(Self::format_session_chain_backfill_commit_error)?;
         Ok(BackfillReport {
             skipped_existing: false,
             chains_inserted,
@@ -69,7 +69,7 @@ impl StateDb {
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| format!("Failed to check session chain backfill state: {e}"))?;
+            .map_err(Self::format_session_chain_backfill_state_error)?;
         Ok(exists != 0)
     }
 
@@ -93,12 +93,12 @@ impl StateDb {
                  FROM session_turns st
                  GROUP BY st.provider_name, st.session_id",
             )
-            .map_err(|e| format!("Failed to prepare session chain backfill: {e}"))?;
+            .map_err(Self::format_session_chain_backfill_prepare_error)?;
         let iter = stmt
             .query_map([], Self::map_session_chain_backfill_row)
-            .map_err(|e| format!("Failed to query session chain backfill rows: {e}"))?;
+            .map_err(Self::format_session_chain_backfill_query_error)?;
         iter.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read session chain backfill rows: {e}"))
+            .map_err(Self::format_session_chain_backfill_rows_read_error)
     }
 
     fn map_session_chain_backfill_row(
@@ -142,7 +142,7 @@ impl StateDb {
             r.get::<_, String>(0)
         })
         .optional()
-        .map_err(|e| format!("Failed to infer model during backfill: {e}"))
+        .map_err(Self::format_backfill_model_inference_error)
     }
 
     fn default_backfill_model_name(model_name: Option<String>) -> String {
@@ -161,7 +161,7 @@ impl StateDb {
             sqlite::params![chain_id, row.started_at, row.last_used_at, model_name],
         )
         .map(|changed| changed as u64)
-        .map_err(|e| format!("Failed to insert session chain during backfill: {e}"))
+        .map_err(Self::format_backfill_chain_insert_error)
     }
 
     fn insert_backfill_segment(
@@ -176,6 +176,42 @@ impl StateDb {
             sqlite::params![chain_id, row.provider, row.session, row.started_at, row.last_turn_id],
         )
         .map(|changed| changed as u64)
-        .map_err(|e| format!("Failed to insert session chain segment during backfill: {e}"))
+        .map_err(Self::format_backfill_segment_insert_error)
+    }
+
+    fn format_session_chain_backfill_begin_error(e: sqlite::Error) -> DbError {
+        format!("Failed to begin session chain backfill: {e}")
+    }
+
+    fn format_session_chain_backfill_commit_error(e: sqlite::Error) -> DbError {
+        format!("Failed to commit session chain backfill: {e}")
+    }
+
+    fn format_session_chain_backfill_state_error(e: sqlite::Error) -> DbError {
+        format!("Failed to check session chain backfill state: {e}")
+    }
+
+    fn format_session_chain_backfill_prepare_error(e: sqlite::Error) -> DbError {
+        format!("Failed to prepare session chain backfill: {e}")
+    }
+
+    fn format_session_chain_backfill_query_error(e: sqlite::Error) -> DbError {
+        format!("Failed to query session chain backfill rows: {e}")
+    }
+
+    fn format_session_chain_backfill_rows_read_error(e: sqlite::Error) -> DbError {
+        format!("Failed to read session chain backfill rows: {e}")
+    }
+
+    fn format_backfill_model_inference_error(e: sqlite::Error) -> DbError {
+        format!("Failed to infer model during backfill: {e}")
+    }
+
+    fn format_backfill_chain_insert_error(e: sqlite::Error) -> DbError {
+        format!("Failed to insert session chain during backfill: {e}")
+    }
+
+    fn format_backfill_segment_insert_error(e: sqlite::Error) -> DbError {
+        format!("Failed to insert session chain segment during backfill: {e}")
     }
 }

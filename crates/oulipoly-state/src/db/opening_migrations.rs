@@ -101,11 +101,19 @@ impl StateDb {
 
     pub(super) fn apply_returned_artifacts_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(invocation_returned_artifacts_schema_sql!())
-            .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))
+            .map_err(Self::format_returned_artifacts_schema_error)
+    }
+
+    fn format_returned_artifacts_schema_error(err: sqlite::Error) -> String {
+        format!("Failed to ensure returned-artifacts schema: {err}")
     }
 
     pub(super) fn set_wal_mode(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| format!("Failed to set WAL mode: {e}; run `agents migrate --rebuild`"))
+            .map_err(Self::format_wal_mode_error)
+    }
+
+    fn format_wal_mode_error(err: sqlite::Error) -> String {
+        format!("Failed to set WAL mode: {err}; run `agents migrate --rebuild`")
     }
 }

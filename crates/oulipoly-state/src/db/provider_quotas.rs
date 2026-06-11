@@ -1,11 +1,12 @@
 //! ## Declared roles
 //!
-//! - validator
-//! - orchestration
 //! - accessor
+//! - formatter
 //! - mapper
+//! - orchestration
+//! - validator
 //!
-//! Role set: { validator, orchestration, accessor, mapper }
+//! Role set: { accessor, formatter, mapper, orchestration, validator }
 //!
 //! Provider quota schema validation, repair orchestration, and row mapping types.
 
@@ -102,8 +103,12 @@ impl StateDb {
         conn: &sqlite::Connection,
     ) -> Result<(), String> {
         conn.execute(Self::provider_quotas_topology_backfill_sql(), [])
-            .map_err(|e| format!("Failed to backfill provider_quotas topology peak counts: {e}"))?;
+            .map_err(Self::format_provider_quotas_topology_backfill_error)?;
         Ok(())
+    }
+
+    fn format_provider_quotas_topology_backfill_error(e: sqlite::Error) -> String {
+        format!("Failed to backfill provider_quotas topology peak counts: {e}")
     }
 
     fn provider_quotas_topology_backfill_sql() -> &'static str {

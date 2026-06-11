@@ -44,8 +44,12 @@ impl StateDb {
 
     pub(super) fn initialize_invocations_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_schema_sql())
-            .map_err(|e| format!("Failed to initialize invocations schema: {e}"))?;
+            .map_err(Self::format_initialize_invocations_schema_error)?;
         Self::ensure_invocations_row_version_support(conn)
+    }
+
+    fn format_initialize_invocations_schema_error(err: sqlite::Error) -> String {
+        format!("Failed to initialize invocations schema: {err}")
     }
 
     pub(super) fn repair_current_invocations_schema(
@@ -53,15 +57,30 @@ impl StateDb {
         columns: &[String],
     ) -> Result<(), String> {
         Self::execute_column_repairs(conn, columns, Self::invocations_column_repairs().as_slice())?;
-        let drop_repairs = [DropColumnRepair {
+        Self::execute_drop_column_repairs(
+            conn,
+            columns,
+            Self::invocations_drop_column_repairs().as_slice(),
+        )?;
+        Self::ensure_invocation_indexes(conn)?;
+        Self::ensure_invocations_row_version_support(conn)
+    }
+
+    fn invocations_drop_column_repairs() -> [DropColumnRepair; 1] {
+        [DropColumnRepair {
             column_name: "quota_tight_routing",
             sql: "ALTER TABLE invocations DROP COLUMN quota_tight_routing",
             error_context: "Failed to drop invocations.quota_tight_routing",
-        }];
-        Self::execute_drop_column_repairs(conn, columns, drop_repairs.as_slice())?;
+        }]
+    }
+
+    fn ensure_invocation_indexes(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_index_sql())
-            .map_err(|e| format!("Failed to ensure invocation indexes: {e}"))?;
-        Self::ensure_invocations_row_version_support(conn)
+            .map_err(Self::format_invocation_indexes_error)
+    }
+
+    fn format_invocation_indexes_error(err: sqlite::Error) -> String {
+        format!("Failed to ensure invocation indexes: {err}")
     }
 
     pub(super) fn invocations_column_repairs() -> [ColumnRepair; 5] {
@@ -146,15 +165,27 @@ impl StateDb {
         conn: &sqlite::Connection,
         columns: &[String],
     ) -> Result<(), String> {
-        if Self::has_column(columns, "row_version") {
+        if Self::invocations_row_version_column_exists(columns) {
             return Ok(());
         }
+        Self::add_invocations_row_version_column(conn)
+    }
+
+    fn invocations_row_version_column_exists(columns: &[String]) -> bool {
+        Self::has_column(columns, "row_version")
+    }
+
+    fn add_invocations_row_version_column(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute(
             "ALTER TABLE invocations ADD COLUMN row_version INTEGER NOT NULL DEFAULT 0",
             [],
         )
-        .map_err(|e| format!("Failed to add invocations.row_version during repair: {e}"))?;
+        .map_err(Self::format_invocations_row_version_add_error)?;
         Ok(())
+    }
+
+    fn format_invocations_row_version_add_error(err: sqlite::Error) -> String {
+        format!("Failed to add invocations.row_version during repair: {err}")
     }
 
     pub(super) fn install_invocations_row_version_triggers(
@@ -162,15 +193,29 @@ impl StateDb {
     ) -> Result<(), String> {
         let registration = Self::invocations_row_version_registration()?;
         let trigger_sql = Self::row_version_trigger_sql(registration);
-        conn.execute_batch(&trigger_sql)
-            .map_err(|e| format!("Failed to install invocation row-version triggers: {e}"))
+        Self::execute_invocations_row_version_triggers(conn, &trigger_sql)
+    }
+
+    fn execute_invocations_row_version_triggers(
+        conn: &sqlite::Connection,
+        trigger_sql: &str,
+    ) -> Result<(), String> {
+        conn.execute_batch(trigger_sql)
+            .map_err(Self::format_invocations_row_version_triggers_error)
+    }
+
+    fn format_invocations_row_version_triggers_error(err: sqlite::Error) -> String {
+        format!("Failed to install invocation row-version triggers: {err}")
     }
 
     pub(super) fn invocations_row_version_registration()
     -> Result<&'static crate::deployment::row_version::registry::TableRegistration, String> {
-        crate::deployment::row_version::registry::lookup("invocations").ok_or_else(|| {
-            "Missing row-version registry entry for invocations during repair".to_string()
-        })
+        crate::deployment::row_version::registry::lookup("invocations")
+            .ok_or_else(Self::format_missing_invocations_row_version_registration_error)
+    }
+
+    fn format_missing_invocations_row_version_registration_error() -> String {
+        "Missing row-version registry entry for invocations during repair".to_string()
     }
 
     pub(super) fn row_version_trigger_sql(

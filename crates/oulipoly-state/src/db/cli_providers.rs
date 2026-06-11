@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, mapper, orchestration }
+//! Role set: { accessor, formatter, mapper, orchestration }
 //!
 //! CLI provider discovery persistence methods for `StateDb`.
 
@@ -33,7 +34,7 @@ impl StateDb {
                     &provider.last_synced,
                 ],
             )
-            .map_err(|e| format!("Failed to upsert CLI provider: {e}"))?;
+            .map_err(Self::format_cli_provider_upsert_error)?;
         Ok(())
     }
 
@@ -45,15 +46,15 @@ impl StateDb {
                 "SELECT cli_name, display_name, installed, version, config_dir, last_synced
                  FROM cli_providers ORDER BY cli_name",
             )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            .map_err(Self::format_cli_providers_query_prepare_error)?;
 
         let rows = stmt
             .query_map([], Self::map_cli_provider_row)
-            .map_err(|e| format!("Failed to query CLI providers: {e}"))?;
+            .map_err(Self::format_cli_providers_query_error)?;
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| format!("Failed to read provider row: {e}"))?);
+            result.push(row.map_err(Self::format_cli_provider_row_read_error)?);
         }
         Ok(result)
     }
@@ -66,14 +67,14 @@ impl StateDb {
                 "SELECT cli_name, display_name, installed, version, config_dir, last_synced
                  FROM cli_providers WHERE cli_name = ?1",
             )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            .map_err(Self::format_cli_providers_query_prepare_error)?;
 
         let result = stmt.query_row(sqlite::params![cli_name], Self::map_cli_provider_row);
 
         match result {
             Ok(record) => Ok(Some(record)),
             Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query CLI provider: {e}")),
+            Err(e) => Err(Self::format_cli_provider_query_error(e)),
         }
     }
 
@@ -86,5 +87,25 @@ impl StateDb {
             config_dir: row.get(4)?,
             last_synced: row.get(5)?,
         })
+    }
+
+    fn format_cli_provider_upsert_error(e: sqlite::Error) -> String {
+        format!("Failed to upsert CLI provider: {e}")
+    }
+
+    fn format_cli_providers_query_prepare_error(e: sqlite::Error) -> String {
+        format!("Failed to prepare query: {e}")
+    }
+
+    fn format_cli_providers_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query CLI providers: {e}")
+    }
+
+    fn format_cli_provider_row_read_error(e: sqlite::Error) -> String {
+        format!("Failed to read provider row: {e}")
+    }
+
+    fn format_cli_provider_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query CLI provider: {e}")
     }
 }

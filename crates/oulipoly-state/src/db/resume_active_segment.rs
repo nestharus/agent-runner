@@ -30,7 +30,11 @@ impl StateDb {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| format!("Failed to read active chain segment id: {e}"))
+            .map_err(Self::format_active_chain_segment_id_read_error)
+    }
+
+    fn format_active_chain_segment_id_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read active chain segment id: {err}")
     }
 
     pub(super) fn active_segment_for_chain(
@@ -48,7 +52,11 @@ impl StateDb {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|e| format!("Failed to read active chain segment: {e}"))
+            .map_err(Self::format_active_chain_segment_read_error)
+    }
+
+    fn format_active_chain_segment_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read active chain segment: {err}")
     }
 
     pub(super) fn chain_model_name(&self, chain_id: &str) -> Result<Option<String>, String> {
@@ -59,7 +67,11 @@ impl StateDb {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| format!("Failed to read session chain model: {e}"))
+            .map_err(Self::format_session_chain_model_read_error)
+    }
+
+    fn format_session_chain_model_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read session chain model: {err}")
     }
 
     pub(super) fn latest_invocation_model_for_chain(
@@ -71,7 +83,11 @@ impl StateDb {
         self.conn
             .query_row(&sql, sqlite::params![chain_id], |row| row.get(0))
             .optional()
-            .map_err(|e| format!("Failed to infer session chain model from invocations: {e}"))
+            .map_err(Self::format_latest_invocation_model_read_error)
+    }
+
+    fn format_latest_invocation_model_read_error(err: sqlite::Error) -> String {
+        format!("Failed to infer session chain model from invocations: {err}")
     }
 
     pub(super) fn latest_invocation_model_sql(provider_session_expr: &str) -> String {

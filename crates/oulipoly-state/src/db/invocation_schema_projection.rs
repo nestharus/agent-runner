@@ -35,9 +35,11 @@ impl StateDb {
         conn: &sqlite::Connection,
     ) -> Result<bool, String> {
         let columns = Self::invocations_columns(conn)?;
-        Ok(columns
-            .iter()
-            .any(|column| column == "provider_session_resolved_account"))
+        Ok(Self::columns_have_resolved_account_column(&columns))
+    }
+
+    fn columns_have_resolved_account_column(columns: &[String]) -> bool {
+        Self::has_column(columns, "provider_session_resolved_account")
     }
 
     pub(super) fn columns_have_dual_id_columns(columns: &[String]) -> bool {
@@ -50,15 +52,23 @@ impl StateDb {
         conn: &mut sqlite::Connection,
         stored: i32,
     ) -> Result<i32, String> {
-        if stored >= 5 {
+        if Self::stored_schema_is_at_least_dual_id_schema5(stored) {
             return Ok(stored);
         }
         let columns = Self::invocations_columns(conn)?;
-        if !Self::columns_have_dual_id_columns(&columns) {
+        if !Self::existing_schema_can_promote_to_dual_id_schema5(&columns) {
             return Ok(stored);
         }
         Self::promote_existing_dual_id_schema5(conn)?;
         Ok(5)
+    }
+
+    fn stored_schema_is_at_least_dual_id_schema5(stored: i32) -> bool {
+        stored >= 5
+    }
+
+    fn existing_schema_can_promote_to_dual_id_schema5(columns: &[String]) -> bool {
+        Self::columns_have_dual_id_columns(columns)
     }
 
     pub(super) fn promote_existing_dual_id_schema5(
@@ -84,10 +94,23 @@ impl StateDb {
              PRAGMA user_version = 5;
              COMMIT;",
         )
-        .map_err(|e| {
-            let _ = conn.execute_batch("ROLLBACK;");
-            format!("Failed to promote existing dual-id invocation schema to version 5: {e}")
-        })
+        .map_err(|e| Self::report_dual_id_schema5_promotion_error(conn, e))
+    }
+
+    fn report_dual_id_schema5_promotion_error(
+        conn: &mut sqlite::Connection,
+        err: sqlite::Error,
+    ) -> String {
+        Self::rollback_dual_id_schema5_promotion(conn);
+        Self::format_dual_id_schema5_promotion_error(err)
+    }
+
+    fn rollback_dual_id_schema5_promotion(conn: &mut sqlite::Connection) {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+
+    fn format_dual_id_schema5_promotion_error(err: sqlite::Error) -> String {
+        format!("Failed to promote existing dual-id invocation schema to version 5: {err}")
     }
 
     pub(super) fn provider_session_expr(

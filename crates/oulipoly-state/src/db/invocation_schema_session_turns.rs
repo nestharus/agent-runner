@@ -19,9 +19,16 @@ impl StateDb {
             &columns,
             Self::session_turns_column_repairs().as_slice(),
         )?;
+        Self::ensure_session_turns_indexes(conn)
+    }
+
+    fn ensure_session_turns_indexes(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::session_turns_index_sql())
-            .map_err(|e| format!("Failed to ensure session_turns indexes: {e}"))?;
-        Ok(())
+            .map_err(Self::format_session_turns_indexes_error)
+    }
+
+    fn format_session_turns_indexes_error(err: sqlite::Error) -> String {
+        format!("Failed to ensure session_turns indexes: {err}")
     }
 
     pub(super) fn session_turns_column_repairs() -> [ColumnRepair; 4] {
@@ -75,12 +82,27 @@ impl StateDb {
         columns: &[String],
         repair: &ColumnRepair,
     ) -> Result<(), String> {
-        if Self::has_column(columns, repair.column_name) {
+        if !Self::column_repair_is_needed(columns, repair) {
             return Ok(());
         }
+        Self::execute_column_repair(conn, repair)
+    }
+
+    fn column_repair_is_needed(columns: &[String], repair: &ColumnRepair) -> bool {
+        !Self::has_column(columns, repair.column_name)
+    }
+
+    fn execute_column_repair(
+        conn: &sqlite::Connection,
+        repair: &ColumnRepair,
+    ) -> Result<(), String> {
         conn.execute(repair.sql, [])
-            .map_err(|e| format!("{}: {e}", repair.error_context))?;
+            .map_err(|e| Self::format_column_repair_error(repair, e))?;
         Ok(())
+    }
+
+    fn format_column_repair_error(repair: &ColumnRepair, err: sqlite::Error) -> String {
+        format!("{}: {err}", repair.error_context)
     }
 
     pub(super) fn execute_drop_column_repairs(
@@ -99,12 +121,27 @@ impl StateDb {
         columns: &[String],
         repair: &DropColumnRepair,
     ) -> Result<(), String> {
-        if !Self::has_column(columns, repair.column_name) {
+        if !Self::drop_column_repair_is_needed(columns, repair) {
             return Ok(());
         }
+        Self::execute_drop_column_repair(conn, repair)
+    }
+
+    fn drop_column_repair_is_needed(columns: &[String], repair: &DropColumnRepair) -> bool {
+        Self::has_column(columns, repair.column_name)
+    }
+
+    fn execute_drop_column_repair(
+        conn: &sqlite::Connection,
+        repair: &DropColumnRepair,
+    ) -> Result<(), String> {
         conn.execute(repair.sql, [])
-            .map_err(|e| format!("{}: {e}", repair.error_context))?;
+            .map_err(|e| Self::format_drop_column_repair_error(repair, e))?;
         Ok(())
+    }
+
+    fn format_drop_column_repair_error(repair: &DropColumnRepair, err: sqlite::Error) -> String {
+        format!("{}: {err}", repair.error_context)
     }
 
     pub(super) fn invocations_index_sql() -> &'static str {

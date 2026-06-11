@@ -51,8 +51,12 @@ impl StateDb {
                 sqlite::params![chain_id],
                 |row| row.get(0),
             )
-            .map_err(|e| format!("Failed to read chain preview: {e}"))?;
+            .map_err(Self::format_chain_preview_read_error)?;
         Self::strict_rfc3339_message(&raw_last, "chain preview timestamp")
+    }
+
+    fn format_chain_preview_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read chain preview: {err}")
     }
 
     pub(super) fn preview_turn_count(
@@ -97,19 +101,31 @@ impl StateDb {
                  ORDER BY timestamp DESC, id DESC
                  LIMIT 3",
             )
-            .map_err(|e| format!("Failed to prepare recent turns preview: {e}"))?;
+            .map_err(Self::format_recent_turns_preview_prepare_error)?;
         let rows = stmt
             .query_map(
                 sqlite::params![active_provider, active_session_id],
                 Self::recent_turn_row_mapper,
             )
-            .map_err(|e| format!("Failed to query recent turns preview: {e}"))?;
+            .map_err(Self::format_recent_turns_preview_query_error)?;
 
         let mut recent_turns = Vec::new();
         for row in rows {
-            recent_turns.push(row.map_err(|e| format!("Failed to read recent turn: {e}"))?);
+            recent_turns.push(row.map_err(Self::format_recent_turn_read_error)?);
         }
         Ok(recent_turns)
+    }
+
+    fn format_recent_turns_preview_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare recent turns preview: {err}")
+    }
+
+    fn format_recent_turns_preview_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query recent turns preview: {err}")
+    }
+
+    fn format_recent_turn_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read recent turn: {err}")
     }
 
     pub(super) fn recent_turn_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<RecentTurnRow> {

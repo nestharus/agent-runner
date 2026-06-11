@@ -10,7 +10,7 @@
 //! Invocation finalize orchestration and lifecycle-log classification.
 
 use super::*;
-use crate::result_envelope::ResultEnvelopeInput;
+use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput};
 
 impl StateDb {
     pub fn finalize_invocation(
@@ -75,17 +75,45 @@ impl StateDb {
     ) {
         if let Ok(invocation) = result {
             let failure_identity =
-                (!success).then(|| self.result_artifact_failure_identity(invocation));
-            let input = ResultEnvelopeInput {
-                id: &invocation.invocation_uuid,
+                self.finalize_result_artifact_failure_identity(success, invocation);
+            let input = Self::map_finalize_result_envelope_input(
+                invocation,
                 success,
                 exit_code,
                 error_category,
                 terminal_reason,
                 finished_at,
-                failure_identity: failure_identity.as_ref(),
-            };
+                failure_identity.as_ref(),
+            );
             self.warn_result_artifact_failure(input);
+        }
+    }
+
+    fn finalize_result_artifact_failure_identity(
+        &self,
+        success: bool,
+        invocation: &FinalizeInvocationRow,
+    ) -> Option<ResultEnvelopeFailureIdentity> {
+        (!success).then(|| self.result_artifact_failure_identity(invocation))
+    }
+
+    fn map_finalize_result_envelope_input<'a>(
+        invocation: &'a FinalizeInvocationRow,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&'a str>,
+        terminal_reason: Option<&'a str>,
+        finished_at: &'a str,
+        failure_identity: Option<&'a ResultEnvelopeFailureIdentity>,
+    ) -> ResultEnvelopeInput<'a> {
+        ResultEnvelopeInput {
+            id: &invocation.invocation_uuid,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            finished_at,
+            failure_identity,
         }
     }
 

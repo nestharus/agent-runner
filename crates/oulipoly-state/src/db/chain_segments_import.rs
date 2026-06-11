@@ -1,16 +1,33 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - orchestration
 //! - predicate
 //!
-//! Role set: { accessor, orchestration, predicate }
+//! Role set: { accessor, formatter, orchestration, predicate }
 //!
 //! Imported chain minting and active segment closing helpers.
 
 use super::*;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
+
+const CLOSE_MATCHING_ACTIVE_SEGMENT_RETURNING_SQL: &str = "UPDATE session_chain_segments
+             SET ended_at = ?2,
+                 last_turn_id = (
+                    SELECT st.turn_id
+                    FROM session_turns st
+                    WHERE st.provider_name = session_chain_segments.provider_name
+                      AND st.session_id = session_chain_segments.session_id
+                    ORDER BY st.timestamp DESC, st.id DESC
+                    LIMIT 1
+                 )
+             WHERE chain_id = ?1
+               AND ended_at IS NULL
+               AND (?3 IS NULL OR provider_name = ?3)
+               AND (?4 IS NULL OR session_id = ?4)
+             RETURNING id";
 
 impl StateDb {
     pub fn mint_imported_chain_if_absent(
@@ -28,11 +45,11 @@ impl StateDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin imported chain mint: {e}"))?;
+            .map_err(Self::format_imported_chain_mint_begin_error)?;
         Self::insert_imported_chain(&tx, &chain_id, &ts, model_name)?;
         Self::insert_imported_segment(&tx, &chain_id, provider_name, session_id, &ts)?;
         tx.commit()
-            .map_err(|e| format!("Failed to commit imported chain mint: {e}"))?;
+            .map_err(Self::format_imported_chain_mint_commit_error)?;
         Ok(())
     }
 
@@ -50,7 +67,7 @@ impl StateDb {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| format!("Failed to check existing session chain segment: {e}"))?;
+            .map_err(Self::format_session_chain_segment_exists_error)?;
         Ok(exists.is_some())
     }
 
@@ -66,7 +83,7 @@ impl StateDb {
              ON CONFLICT DO NOTHING",
             sqlite::params![chain_id, started_at, model_name],
         )
-        .map_err(|e| format!("Failed to mint imported session chain: {e}"))?;
+        .map_err(Self::format_imported_chain_mint_error)?;
         Ok(())
     }
 
@@ -84,7 +101,7 @@ impl StateDb {
              ON CONFLICT DO NOTHING",
             sqlite::params![chain_id, provider_name, session_id, started_at],
         )
-        .map_err(|e| format!("Failed to mint imported session chain segment: {e}"))?;
+        .map_err(Self::format_imported_segment_mint_error)?;
         Ok(())
     }
 
@@ -127,26 +144,45 @@ impl StateDb {
         session_id: Option<&str>,
         ended_at: &DateTime<Utc>,
     ) -> Result<Option<i64>, DbError> {
+        let ended_at = Self::segment_end_timestamp(ended_at);
         conn.query_row(
-            "UPDATE session_chain_segments
-             SET ended_at = ?2,
-                 last_turn_id = (
-                    SELECT st.turn_id
-                    FROM session_turns st
-                    WHERE st.provider_name = session_chain_segments.provider_name
-                      AND st.session_id = session_chain_segments.session_id
-                    ORDER BY st.timestamp DESC, st.id DESC
-                    LIMIT 1
-                 )
-             WHERE chain_id = ?1
-               AND ended_at IS NULL
-               AND (?3 IS NULL OR provider_name = ?3)
-               AND (?4 IS NULL OR session_id = ?4)
-             RETURNING id",
-            sqlite::params![chain_id, ended_at.to_rfc3339(), provider_name, session_id],
-            |row| row.get(0),
+            CLOSE_MATCHING_ACTIVE_SEGMENT_RETURNING_SQL,
+            sqlite::params![chain_id, ended_at, provider_name, session_id],
+            Self::map_returned_chain_segment_id,
         )
         .optional()
-        .map_err(|e| format!("Failed to close active session chain segment: {e}"))
+        .map_err(Self::format_close_active_segment_error)
+    }
+
+    fn segment_end_timestamp(ended_at: &DateTime<Utc>) -> String {
+        ended_at.to_rfc3339()
+    }
+
+    fn map_returned_chain_segment_id(row: &sqlite::Row<'_>) -> sqlite::Result<i64> {
+        row.get(0)
+    }
+
+    fn format_close_active_segment_error(e: sqlite::Error) -> DbError {
+        format!("Failed to close active session chain segment: {e}")
+    }
+
+    fn format_imported_chain_mint_begin_error(e: sqlite::Error) -> DbError {
+        format!("Failed to begin imported chain mint: {e}")
+    }
+
+    fn format_imported_chain_mint_commit_error(e: sqlite::Error) -> DbError {
+        format!("Failed to commit imported chain mint: {e}")
+    }
+
+    fn format_session_chain_segment_exists_error(e: sqlite::Error) -> DbError {
+        format!("Failed to check existing session chain segment: {e}")
+    }
+
+    fn format_imported_chain_mint_error(e: sqlite::Error) -> DbError {
+        format!("Failed to mint imported session chain: {e}")
+    }
+
+    fn format_imported_segment_mint_error(e: sqlite::Error) -> DbError {
+        format!("Failed to mint imported session chain segment: {e}")
     }
 }

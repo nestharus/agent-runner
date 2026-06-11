@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
+//! - formatter
 //! - orchestration
 //! - mapper
 //! - predicate
 //!
-//! Role set: { orchestration, mapper, predicate }
+//! Role set: { formatter, orchestration, mapper, predicate }
 //!
 //! Provider quota window replacement and burn-rate delta classification.
 
@@ -37,8 +38,12 @@ impl StateDb {
                 projection.topology_peak_live_window_count
             ],
         )
-        .map_err(|e| format!("Failed to upsert quota: {e}"))?;
+        .map_err(Self::format_quota_upsert_error)?;
         Ok(())
+    }
+
+    fn format_quota_upsert_error(e: sqlite::Error) -> String {
+        format!("Failed to upsert quota: {e}")
     }
 
     pub(super) fn replace_quota_window_rows(
@@ -66,8 +71,12 @@ impl StateDb {
             "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
             sqlite::params![provider_name],
         )
-        .map_err(|e| format!("Failed to clear windows: {e}"))?;
+        .map_err(Self::format_clear_windows_error)?;
         Ok(())
+    }
+
+    fn format_clear_windows_error(e: sqlite::Error) -> String {
+        format!("Failed to clear windows: {e}")
     }
 
     pub(super) fn insert_quota_window_rows(
@@ -178,7 +187,11 @@ impl StateDb {
                 delta.last_delta_calls.map(|value| value as i64),
             ],
         )
-        .map_err(|e| format!("Failed to insert window: {e}"))?;
+        .map_err(Self::format_insert_window_error)?;
         Ok(())
+    }
+
+    fn format_insert_window_error(e: sqlite::Error) -> String {
+        format!("Failed to insert window: {e}")
     }
 }

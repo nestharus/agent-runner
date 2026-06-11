@@ -477,14 +477,33 @@ fn assert_helper_mutations_are_migration_represented(
     migration_sql: &str,
     helper: &str,
 ) {
+    let statements = helper_mutating_sql_statements(db_source, helper);
+    assert_helper_statements_are_migration_represented(migration_sql, helper, statements);
+}
+
+// Declared role: parser
+fn helper_mutating_sql_statements(db_source: &str, helper: &str) -> Vec<String> {
     let body = extract_function_body(db_source, helper);
-    for statement in mutating_sql_statements(&body) {
-        let normalized = normalize_sql(&statement);
+    mutating_sql_statements(&body)
+}
+
+// Declared role: validator
+fn assert_helper_statements_are_migration_represented(
+    migration_sql: &str,
+    helper: &str,
+    statements: Vec<String>,
+) {
+    for statement in statements {
         assert!(
-            migration_sql.contains(&normalized),
+            helper_statement_is_migration_represented(migration_sql, &statement),
             "{helper} contains schema-mutating SQL not represented in compiled migrations: {statement}"
         );
     }
+}
+
+// Declared role: formatter
+fn helper_statement_is_migration_represented(migration_sql: &str, statement: &str) -> bool {
+    migration_sql.contains(&normalize_sql(statement))
 }
 
 // Declared role: accessor
@@ -543,17 +562,20 @@ fn schema_rows(conn: &Connection) -> Vec<SchemaRow> {
              ORDER BY type, name",
         )
         .unwrap();
-    stmt.query_map([], |row| {
-        Ok(SchemaRow {
-            object_type: row.get(0)?,
-            name: row.get(1)?,
-            table_name: row.get(2)?,
-            sql: row.get(3)?,
-        })
+    stmt.query_map([], schema_row)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+// Declared role: mapper
+fn schema_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SchemaRow> {
+    Ok(SchemaRow {
+        object_type: row.get(0)?,
+        name: row.get(1)?,
+        table_name: row.get(2)?,
+        sql: row.get(3)?,
     })
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap()
 }
 
 // Declared role: mapper
@@ -695,11 +717,25 @@ fn mutating_sql_statements(rust_body: &str) -> Vec<String> {
 
 // Declared role: parser
 fn sql_statements_from_literal(literal: String) -> Vec<String> {
-    strip_sql_comments(&literal)
-        .split(';')
-        .map(str::trim)
-        .map(str::to_string)
-        .collect()
+    let uncommented = strip_sql_comments(&literal);
+    let statements = split_sql_statements(&uncommented);
+    let statements = trim_sql_statements(statements);
+    owned_sql_statements(statements)
+}
+
+// Declared role: parser
+fn split_sql_statements(literal: &str) -> Vec<&str> {
+    literal.split(';').collect()
+}
+
+// Declared role: formatter
+fn trim_sql_statements(statements: Vec<&str>) -> Vec<&str> {
+    statements.into_iter().map(str::trim).collect()
+}
+
+// Declared role: mapper
+fn owned_sql_statements(statements: Vec<&str>) -> Vec<String> {
+    statements.into_iter().map(str::to_string).collect()
 }
 
 // Declared role: parser

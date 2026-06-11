@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, mapper, orchestration }
+//! Role set: { accessor, formatter, mapper, orchestration }
 //!
 //! Provider quota refresh aggregate orchestration and empty-refresh writes.
 
@@ -30,7 +31,7 @@ impl StateDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin tx: {e}"))?;
+            .map_err(Self::format_refresh_begin_error)?;
 
         if windows.is_empty() {
             return Self::record_empty_quota_refresh(tx, provider_name, &now, &prior_windows);
@@ -48,9 +49,16 @@ impl StateDb {
             &prior_windows_by_id,
             turns_between_refreshes,
         )?;
-        tx.commit()
-            .map_err(|e| format!("Failed to commit refresh: {e}"))?;
+        tx.commit().map_err(Self::format_refresh_commit_error)?;
         Ok(())
+    }
+
+    fn format_refresh_begin_error(e: sqlite::Error) -> String {
+        format!("Failed to begin tx: {e}")
+    }
+
+    fn format_refresh_commit_error(e: sqlite::Error) -> String {
+        format!("Failed to commit refresh: {e}")
     }
 
     pub(super) fn record_empty_quota_refresh(
@@ -60,8 +68,7 @@ impl StateDb {
         prior_windows: &[QuotaWindow],
     ) -> Result<(), String> {
         Self::write_empty_quota_refresh(&tx, provider_name, now, prior_windows)?;
-        tx.commit()
-            .map_err(|e| format!("Failed to commit refresh: {e}"))
+        tx.commit().map_err(Self::format_refresh_commit_error)
     }
 
     pub(super) fn write_empty_quota_refresh(
@@ -91,7 +98,7 @@ impl StateDb {
                 last_empty_refresh_at = ?2",
             sqlite::params![provider_name, now],
         )
-        .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+        .map_err(Self::format_empty_quota_refresh_error)?;
         Ok(())
     }
 
@@ -108,8 +115,12 @@ impl StateDb {
                 last_empty_refresh_at = ?2",
             sqlite::params![provider_name, now],
         )
-        .map_err(|e| format!("Failed to record empty quota refresh: {e}"))?;
+        .map_err(Self::format_empty_quota_refresh_error)?;
         Ok(())
+    }
+
+    fn format_empty_quota_refresh_error(e: sqlite::Error) -> String {
+        format!("Failed to record empty quota refresh: {e}")
     }
 
     pub(super) fn turns_between_quota_refreshes(

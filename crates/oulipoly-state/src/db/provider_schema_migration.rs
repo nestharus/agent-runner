@@ -46,7 +46,7 @@ impl StateDb {
 
     pub(super) fn initialize_providers_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::providers_schema_sql())
-            .map_err(|e| format!("Failed to initialize providers schema: {e}"))
+            .map_err(Self::format_initialize_providers_schema_error)
     }
 
     pub(super) fn migrate_legacy_providers_schema(
@@ -54,24 +54,24 @@ impl StateDb {
     ) -> Result<(), String> {
         let tx = conn
             .transaction()
-            .map_err(|e| format!("Failed to begin providers migration: {e}"))?;
+            .map_err(Self::format_begin_providers_migration_error)?;
         Self::rename_legacy_providers_table(&tx)?;
         Self::create_migrated_providers_table(&tx)?;
         Self::rebuild_providers_aggregate(&tx)?;
         Self::rebuild_provider_error_metadata(&tx)?;
         Self::drop_legacy_providers_table(&tx)?;
         tx.commit()
-            .map_err(|e| format!("Failed to commit providers migration: {e}"))
+            .map_err(Self::format_commit_providers_migration_error)
     }
 
     pub(super) fn rename_legacy_providers_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch("ALTER TABLE providers RENAME TO providers_legacy_index_keyed;")
-            .map_err(|e| format!("Failed to rename legacy providers table: {e}"))
+            .map_err(Self::format_rename_legacy_providers_table_error)
     }
 
     pub(super) fn create_migrated_providers_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::providers_schema_sql())
-            .map_err(|e| format!("Failed to create migrated providers table: {e}"))
+            .map_err(Self::format_create_migrated_providers_table_error)
     }
 
     pub(super) fn rebuild_providers_aggregate(conn: &sqlite::Connection) -> Result<(), String> {
@@ -95,7 +95,7 @@ impl StateDb {
               AND success IS NOT NULL
             GROUP BY model_name, provider_name;",
         )
-        .map_err(|e| format!("Failed to rebuild providers aggregate: {e}"))
+        .map_err(Self::format_rebuild_providers_aggregate_error)
     }
 
     pub(super) fn rebuild_provider_error_metadata(conn: &sqlite::Connection) -> Result<(), String> {
@@ -127,12 +127,44 @@ impl StateDb {
                            AND i.success = 0
                     );",
         )
-        .map_err(|e| format!("Failed to rebuild provider error metadata: {e}"))
+        .map_err(Self::format_rebuild_provider_error_metadata_error)
     }
 
     pub(super) fn drop_legacy_providers_table(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch("DROP TABLE providers_legacy_index_keyed;")
-            .map_err(|e| format!("Failed to drop legacy providers table: {e}"))
+            .map_err(Self::format_drop_legacy_providers_table_error)
+    }
+
+    fn format_initialize_providers_schema_error(e: sqlite::Error) -> String {
+        format!("Failed to initialize providers schema: {e}")
+    }
+
+    fn format_begin_providers_migration_error(e: sqlite::Error) -> String {
+        format!("Failed to begin providers migration: {e}")
+    }
+
+    fn format_commit_providers_migration_error(e: sqlite::Error) -> String {
+        format!("Failed to commit providers migration: {e}")
+    }
+
+    fn format_rename_legacy_providers_table_error(e: sqlite::Error) -> String {
+        format!("Failed to rename legacy providers table: {e}")
+    }
+
+    fn format_create_migrated_providers_table_error(e: sqlite::Error) -> String {
+        format!("Failed to create migrated providers table: {e}")
+    }
+
+    fn format_rebuild_providers_aggregate_error(e: sqlite::Error) -> String {
+        format!("Failed to rebuild providers aggregate: {e}")
+    }
+
+    fn format_rebuild_provider_error_metadata_error(e: sqlite::Error) -> String {
+        format!("Failed to rebuild provider error metadata: {e}")
+    }
+
+    fn format_drop_legacy_providers_table_error(e: sqlite::Error) -> String {
+        format!("Failed to drop legacy providers table: {e}")
     }
 
     pub(super) fn unexpected_providers_schema_error(description: &str) -> String {

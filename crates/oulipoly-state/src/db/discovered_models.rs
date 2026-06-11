@@ -2,10 +2,11 @@
 //!
 //! - accessor
 //! - filter
+//! - formatter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, filter, mapper, orchestration }
+//! Role set: { accessor, filter, formatter, mapper, orchestration }
 //!
 //! Discovered model persistence methods for `StateDb`.
 
@@ -29,7 +30,7 @@ impl StateDb {
                     &model.cli_version,
                 ],
             )
-            .map_err(|e| format!("Failed to upsert discovered model: {e}"))?;
+            .map_err(Self::format_discovered_model_upsert_error)?;
         Ok(())
     }
 
@@ -66,19 +67,19 @@ impl StateDb {
         let mut stmt = self
             .conn
             .prepare(sql)
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            .map_err(Self::format_discovered_model_query_prepare_error)?;
 
         let rows = if let Some(provider) = bind_provider {
             stmt.query_map(sqlite::params![provider], Self::map_discovered_model_row)
-                .map_err(|e| format!("Failed to query discovered models: {e}"))?
+                .map_err(Self::format_discovered_models_query_error)?
         } else {
             stmt.query_map([], Self::map_discovered_model_row)
-                .map_err(|e| format!("Failed to query discovered models: {e}"))?
+                .map_err(Self::format_discovered_models_query_error)?
         };
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| format!("Failed to read model row: {e}"))?);
+            result.push(row.map_err(Self::format_discovered_model_row_read_error)?);
         }
         Ok(result)
     }
@@ -92,11 +93,10 @@ impl StateDb {
         let changed = self
             .conn
             .execute(
-                "DELETE FROM discovered_models
-                 WHERE provider = ?1 AND cli_version != ?2",
+                Self::stale_discovered_models_delete_sql(),
                 sqlite::params![provider, current_cli_version],
             )
-            .map_err(|e| format!("Failed to delete stale models: {e}"))?;
+            .map_err(Self::format_stale_discovered_models_delete_error)?;
         Ok(changed as u64)
     }
 
@@ -108,5 +108,30 @@ impl StateDb {
             discovered_at: row.get(2)?,
             cli_version: row.get(3)?,
         })
+    }
+
+    fn stale_discovered_models_delete_sql() -> &'static str {
+        "DELETE FROM discovered_models
+                 WHERE provider = ?1 AND cli_version != ?2"
+    }
+
+    fn format_discovered_model_upsert_error(e: sqlite::Error) -> String {
+        format!("Failed to upsert discovered model: {e}")
+    }
+
+    fn format_discovered_model_query_prepare_error(e: sqlite::Error) -> String {
+        format!("Failed to prepare query: {e}")
+    }
+
+    fn format_discovered_models_query_error(e: sqlite::Error) -> String {
+        format!("Failed to query discovered models: {e}")
+    }
+
+    fn format_discovered_model_row_read_error(e: sqlite::Error) -> String {
+        format!("Failed to read model row: {e}")
+    }
+
+    fn format_stale_discovered_models_delete_error(e: sqlite::Error) -> String {
+        format!("Failed to delete stale models: {e}")
     }
 }

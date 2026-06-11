@@ -21,8 +21,12 @@ impl StateDb {
                     calls_since_refresh = calls_since_refresh + 1",
                 sqlite::params![provider_name],
             )
-            .map_err(|e| format!("Failed to increment calls_since_refresh: {e}"))?;
+            .map_err(Self::format_increment_calls_since_refresh_error)?;
         Ok(())
+    }
+
+    fn format_increment_calls_since_refresh_error(e: sqlite::Error) -> String {
+        format!("Failed to increment calls_since_refresh: {e}")
     }
 
     pub fn mark_exhausted(&self, provider_name: &str) -> Result<(), String> {
@@ -42,8 +46,12 @@ impl StateDb {
                     exhausted_at = excluded.exhausted_at",
                 sqlite::params![provider_name, &now],
             )
-            .map_err(|e| format!("Failed to mark provider exhausted: {e}"))?;
+            .map_err(Self::format_mark_provider_exhausted_error)?;
         Ok(())
+    }
+
+    fn format_mark_provider_exhausted_error(e: sqlite::Error) -> String {
+        format!("Failed to mark provider exhausted: {e}")
     }
 
     pub fn record_provider_unavailable(
@@ -63,8 +71,12 @@ impl StateDb {
                     failure_class = excluded.failure_class",
                 params![provider_name, next_at, failure_class],
             )
-            .map_err(|e| format!("Failed to record provider unavailable: {e}"))?;
+            .map_err(Self::format_record_provider_unavailable_error)?;
         Ok(())
+    }
+
+    fn format_record_provider_unavailable_error(e: sqlite::Error) -> String {
+        format!("Failed to record provider unavailable: {e}")
     }
 
     pub fn clear_provider_unavailable(&self, provider_name: &str) -> Result<(), String> {
@@ -76,8 +88,12 @@ impl StateDb {
                  WHERE provider_name = ?1",
                 params![provider_name],
             )
-            .map_err(|e| format!("Failed to clear provider unavailable: {e}"))?;
+            .map_err(Self::format_clear_provider_unavailable_error)?;
         Ok(())
+    }
+
+    fn format_clear_provider_unavailable_error(e: sqlite::Error) -> String {
+        format!("Failed to clear provider unavailable: {e}")
     }
 
     pub fn touch_provider_refresh(
@@ -94,8 +110,12 @@ impl StateDb {
                     last_refresh_at = excluded.last_refresh_at",
                 params![provider_name, ts],
             )
-            .map_err(|e| format!("Failed to touch provider refresh: {e}"))?;
+            .map_err(Self::format_touch_provider_refresh_error)?;
         Ok(())
+    }
+
+    fn format_touch_provider_refresh_error(e: sqlite::Error) -> String {
+        format!("Failed to touch provider refresh: {e}")
     }
 
     pub fn clear_exhausted(&self, provider_name: &str) -> Result<(), String> {
@@ -104,8 +124,12 @@ impl StateDb {
                 "UPDATE provider_quotas SET exhausted_at = NULL WHERE provider_name = ?1",
                 sqlite::params![provider_name],
             )
-            .map_err(|e| format!("Failed to clear provider exhausted flag: {e}"))?;
+            .map_err(Self::format_clear_provider_exhausted_error)?;
         Ok(())
+    }
+
+    fn format_clear_provider_exhausted_error(e: sqlite::Error) -> String {
+        format!("Failed to clear provider exhausted flag: {e}")
     }
 
     pub fn record_topology_probe(&self, provider_name: &str) -> Result<(), String> {
@@ -118,7 +142,11 @@ impl StateDb {
                     last_topology_probe_at = excluded.last_topology_probe_at",
                 sqlite::params![provider_name, &now],
             )
-            .map_err(|e| format!("Failed to record topology probe: {e}"))?;
+            .map_err(Self::format_record_topology_probe_error)?;
         Ok(())
+    }
+
+    fn format_record_topology_probe_error(e: sqlite::Error) -> String {
+        format!("Failed to record topology probe: {e}")
     }
 }

@@ -85,12 +85,20 @@ fn doomed_dir_link_regex() -> Regex {
 
 fn doomed_dir_link_pattern() -> String {
     let boundary = r"(^|[^[:alnum:]_./~-])";
-    let dirs = DOOMED_DIRS
-        .iter()
-        .map(|dir| regex::escape(dir))
-        .collect::<Vec<_>>()
-        .join("|");
+    let dirs = join_doomed_dir_parts(escaped_doomed_dir_parts());
     let path = r"/[A-Za-z0-9._~@%+=:,;/-]*\.[A-Za-z0-9][A-Za-z0-9._~@%+=:,;/-]*";
+    format_doomed_dir_link_pattern(boundary, &dirs, path)
+}
+
+fn escaped_doomed_dir_parts() -> Vec<String> {
+    DOOMED_DIRS.iter().map(|dir| regex::escape(dir)).collect()
+}
+
+fn join_doomed_dir_parts(dirs: Vec<String>) -> String {
+    dirs.join("|")
+}
+
+fn format_doomed_dir_link_pattern(boundary: &str, dirs: &str, path: &str) -> String {
     format!("{boundary}({dirs}){path}")
 }
 
@@ -162,11 +170,31 @@ fn tracked_regular_files() -> Vec<String> {
 }
 
 fn collect_existing_regular_files(root: &Path, stdout: &str) -> Vec<String> {
+    let existing_regular_paths = existing_regular_stage_paths(root, stdout);
+    owned_tracked_files(existing_regular_paths)
+}
+
+fn existing_regular_stage_paths<'a>(root: &Path, stdout: &'a str) -> Vec<&'a str> {
     regular_stage_paths(stdout)
         .into_iter()
-        .filter(|tracked_file| root.join(tracked_file).exists())
-        .map(str::to_owned)
+        .filter(|tracked_file| tracked_file_exists(root, tracked_file))
         .collect()
+}
+
+fn tracked_file_exists(root: &Path, tracked_file: &str) -> bool {
+    path_exists(&tracked_file_path(root, tracked_file))
+}
+
+fn tracked_file_path(root: &Path, tracked_file: &str) -> PathBuf {
+    root.join(tracked_file)
+}
+
+fn path_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+fn owned_tracked_files(tracked_files: Vec<&str>) -> Vec<String> {
+    tracked_files.into_iter().map(str::to_owned).collect()
 }
 
 fn regular_stage_paths(stdout: &str) -> Vec<&str> {
@@ -195,7 +223,15 @@ fn should_scan_for_doomed_dir_links(tracked_file: &str) -> bool {
 }
 
 fn line_doomed_dir_links<'a>(regex: &'a Regex, line: &'a str) -> impl Iterator<Item = &'a str> {
-    regex.find_iter(line).map(|found| found.as_str())
+    doomed_dir_link_matches(regex, line).map(doomed_dir_match_str)
+}
+
+fn doomed_dir_link_matches<'a>(regex: &'a Regex, line: &'a str) -> regex::Matches<'a, 'a> {
+    regex.find_iter(line)
+}
+
+fn doomed_dir_match_str(found: regex::Match<'_>) -> &str {
+    found.as_str()
 }
 
 fn file_doomed_dir_link_violations(root: &Path, regex: &Regex, tracked_file: &str) -> Vec<String> {
