@@ -13,6 +13,49 @@
 use super::*;
 
 impl StateDb {
+    pub(super) fn invocations_schema_sql() -> &'static str {
+        concat!(
+            "CREATE TABLE IF NOT EXISTS invocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invocation_uuid TEXT NOT NULL UNIQUE,
+            model_name TEXT NOT NULL,
+            provider_name TEXT,
+            provider_index INTEGER NOT NULL,
+            parent_invocation_id INTEGER REFERENCES invocations(id),
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
+            success INTEGER,
+            exit_code INTEGER,
+            error_category TEXT,
+            terminal_reason TEXT,
+            session_id TEXT,
+            session_capture_method TEXT,
+            provider_session_id TEXT,
+            resume_input_id TEXT,
+            provider_session_capture_method TEXT,
+            provider_session_resolved_account TEXT,
+            resume_acceptance_status TEXT,
+            resume_acceptance_evidence TEXT,
+            created_at TEXT NOT NULL,
+            finished_at TEXT,
+            row_version INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_invocations_uuid
+            ON invocations (invocation_uuid);
+        CREATE INDEX IF NOT EXISTS idx_invocations_parent
+            ON invocations (parent_invocation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
+            ON invocations (provider_name, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
+            ON invocations (provider_name, session_id)
+            WHERE session_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_invocations_provider_provider_session
+            ON invocations (provider_name, provider_index, provider_session_id)
+            WHERE provider_session_id IS NOT NULL;",
+            invocation_returned_artifacts_schema_sql!()
+        )
+    }
+
     pub(super) fn table_column_names(
         conn: &sqlite::Connection,
         table_name: &str,

@@ -84,6 +84,66 @@ fn path_is_unreadable(path: &Path) -> bool {
 }
 
 impl StateDb {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
+    }
+
+    pub fn open_with_sink(
+        path: &Path,
+        sink: Box<dyn LifecycleEventSink + Send>,
+    ) -> Result<Self, String> {
+        Self::ensure_state_parent_dir(path)?;
+        let mut conn =
+            sqlite::Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
+
+        let ran_open_migrations = Self::run_open_migrations(path, &mut conn)?;
+        Self::apply_current_schema_repairs(&mut conn, ran_open_migrations)?;
+        let db = StateDb {
+            conn,
+            db_path: path.to_path_buf(),
+            lifecycle_sink: Mutex::new(sink),
+        };
+        db.backfill_session_chains()
+            .map_err(|e| format!("{e}; run `agents migrate-db` first"))?;
+
+        Ok(db)
+    }
+
+    fn apply_current_schema_repairs(
+        conn: &mut sqlite::Connection,
+        ran_open_migrations: bool,
+    ) -> Result<(), String> {
+        Self::validate_providers_schema(conn)?;
+        Self::ensure_invocations_schema(conn)?;
+        Self::ensure_providers_schema(conn)?;
+        Self::ensure_provider_quotas_schema(conn)?;
+        Self::ensure_provider_quotas_topology_schema(conn)?;
+        Self::ensure_provider_quota_windows_schema(conn)?;
+        Self::ensure_session_turns_schema(conn)?;
+        if ran_open_migrations {
+            Self::apply_returned_artifacts_schema(conn)?;
+        }
+        Ok(())
+    }
+
+    pub fn with_write_txn<R, F>(&mut self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&mut Transaction<'_>) -> Result<R, String>,
+    {
+        let mut tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin state DB transaction: {e}"))?;
+        match f(&mut tx) {
+            Ok(value) => {
+                tx.commit()
+                    .map_err(|e| format!("Failed to commit state DB transaction: {e}"))?;
+                Ok(value)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
         Self::validate_read_only_paths(path)?;
         let conn = Self::open_read_only_connection(path)?;

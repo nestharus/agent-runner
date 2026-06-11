@@ -20,6 +20,25 @@
 use super::*;
 use crate::StateDbError;
 
+/// Oulipoly-owned compact-summary evidence projected from provider transcripts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTurnEventRow {
+    pub session_id: String,
+    pub turn_uuid: String,
+    pub is_compaction_boundary: bool,
+    pub summary_metadata_json: Option<String>,
+}
+
+/// Test-visible owned turn/event row read from the state boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedTurnEvent {
+    pub session_id: String,
+    pub turn_uuid: String,
+    pub is_compaction_boundary: bool,
+    pub summary_metadata_json: Option<String>,
+    pub ingested_at: String,
+}
+
 struct OwnedTurnEventInsertValues<'a> {
     session_id: &'a str,
     turn_uuid: &'a str,

@@ -4,10 +4,12 @@
 #[test]
 fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
     let db_source = include_str!("../src/db.rs");
-    let state_db_impl = db_source
+    let opening_source = include_str!("../src/db/opening.rs");
+    let state_db_impl = opening_source
         .split_once("impl StateDb {")
         .map(|(_, body)| body)
-        .expect("db.rs should contain the StateDb impl");
+        .expect("db/opening.rs should contain the StateDb impl");
+    let public_boundary_source = format!("{db_source}\n{opening_source}");
 
     for forbidden in [
         "pub fn connection_mut",
@@ -20,7 +22,7 @@ fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
         "-> Connection",
     ] {
         assert!(
-            !db_source.contains(forbidden),
+            !public_boundary_source.contains(forbidden),
             "StateDb must expose writes through with_write_txn only; found forbidden signature fragment {forbidden}"
         );
     }
@@ -41,12 +43,12 @@ fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
         .unwrap();
 
     assert!(
-        db_source.contains("pub fn with_write_txn"),
+        opening_source.contains("pub fn with_write_txn"),
         "StateDb must expose the closure-scoped write transaction API"
     );
     assert!(
-        db_source.contains("FnOnce(&mut rusqlite::Transaction<'_>)")
-            || db_source.contains("FnOnce(&mut Transaction<'_>)"),
+        opening_source.contains("FnOnce(&mut rusqlite::Transaction<'_>)")
+            || opening_source.contains("FnOnce(&mut Transaction<'_>)"),
         "with_write_txn must scope writes to a non-escaping rusqlite transaction"
     );
 }

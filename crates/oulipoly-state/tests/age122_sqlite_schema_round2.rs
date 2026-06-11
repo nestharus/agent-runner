@@ -25,13 +25,13 @@ const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS 
 
 #[test]
 fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface() {
-    let db_rs = include_str!("../src/db.rs");
+    let invocation_schema_rs = include_str!("../src/db/invocation_schema.rs");
     let schema_rs = include_str!("../src/schema.rs");
     let lib_rs = include_str!("../src/lib.rs");
     let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
 
     assert!(
-        db_rs.contains(EXPECTED_INVOCATIONS_SCHEMA_SNIPPET),
+        invocation_schema_rs.contains(EXPECTED_INVOCATIONS_SCHEMA_SNIPPET),
         "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
     );
     assert!(

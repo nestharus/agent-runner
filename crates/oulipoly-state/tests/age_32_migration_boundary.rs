@@ -437,6 +437,10 @@ fn legacy_repair_source() -> String {
     [
         include_str!("../src/db.rs"),
         include_str!("../src/db/chain_backfill.rs"),
+        include_str!("../src/db/invocation_schema.rs"),
+        include_str!("../src/db/opening.rs"),
+        include_str!("../src/db/provider_quotas.rs"),
+        include_str!("../src/db/provider_schema.rs"),
     ]
     .join("\n")
 }

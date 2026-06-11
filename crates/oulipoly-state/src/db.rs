@@ -77,6 +77,7 @@ mod invocation_window;
 mod lifecycle_log_adapter;
 mod model_parameters;
 mod opening;
+mod owned_turn_event;
 mod provider_quota_reads;
 mod provider_quota_status;
 mod provider_quota_test_support;
@@ -88,6 +89,7 @@ mod providers;
 mod resume;
 mod returned_artifacts;
 mod session_capture;
+mod session_markers;
 mod session_turns;
 mod sqlite_adapter;
 mod timestamps;
@@ -101,6 +103,7 @@ pub use self::discovery_types::{
     ModelParameter, ParamType,
 };
 pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
+pub use self::owned_turn_event::{OwnedTurnEvent, OwnedTurnEventRow};
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,
     QuotaAggregateProjection, QuotaWindowDelta,
@@ -111,6 +114,7 @@ pub use self::providers::ProviderRecord;
 pub use self::resume::{
     ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview, WrongIdKindInput,
 };
+pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]
 pub use self::session_turns::SessionTurnRecord;
 pub use self::session_turns::{SessionTurnCounts, SessionTurnIngest};
@@ -148,54 +152,7 @@ pub enum ReadOnlyOpenError {
     Operational { message: String },
 }
 
-/// Oulipoly-owned compact-summary evidence projected from provider transcripts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedTurnEventRow {
-    pub session_id: String,
-    pub turn_uuid: String,
-    pub is_compaction_boundary: bool,
-    pub summary_metadata_json: Option<String>,
-}
-
-/// Test-visible owned turn/event row read from the state boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedTurnEvent {
-    pub session_id: String,
-    pub turn_uuid: String,
-    pub is_compaction_boundary: bool,
-    pub summary_metadata_json: Option<String>,
-    pub ingested_at: String,
-}
-
-mod owned_turn_event;
-
 pub type DbError = String;
-
-#[derive(Debug, Clone)]
-pub struct SessionMarkerPayload {
-    pub agent_runner_invocation_id: String,
-    pub provider_session_id: Option<String>,
-    pub provider_name: Option<String>,
-    pub agent_runner_chain_id: Option<String>,
-    pub resume_input_id: Option<String>,
-    pub legacy_id: String,
-    pub legacy_session_id: Option<String>,
-}
-
-impl SessionMarkerPayload {
-    pub fn stderr_line(&self) -> String {
-        let payload = serde_json::json!({
-            "id": self.legacy_id,
-            "session_id": self.legacy_session_id,
-            "agent_runner_invocation_id": self.agent_runner_invocation_id,
-            "provider_session_id": self.provider_session_id,
-            "provider_name": self.provider_name,
-            "agent_runner_chain_id": self.agent_runner_chain_id,
-            "resume_input_id": self.resume_input_id,
-        });
-        format!("OULIPOLY_SESSION={payload}\n")
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderSessionProjection {
@@ -288,111 +245,6 @@ struct LifecycleInvocationRow {
     session_id: Option<String>,
     provider_session_id: Option<String>,
     resume_input_id: Option<String>,
-}
-
-impl StateDb {
-    pub fn open(path: &Path) -> Result<Self, String> {
-        Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
-    }
-
-    pub fn open_with_sink(
-        path: &Path,
-        sink: Box<dyn LifecycleEventSink + Send>,
-    ) -> Result<Self, String> {
-        Self::ensure_state_parent_dir(path)?;
-        let mut conn =
-            sqlite::Connection::open(path).map_err(|e| format!("Failed to open state DB: {e}"))?;
-
-        let ran_open_migrations = Self::run_open_migrations(path, &mut conn)?;
-        Self::apply_current_schema_repairs(&mut conn, ran_open_migrations)?;
-        let db = StateDb {
-            conn,
-            db_path: path.to_path_buf(),
-            lifecycle_sink: Mutex::new(sink),
-        };
-        db.backfill_session_chains()
-            .map_err(|e| format!("{e}; run `agents migrate-db` first"))?;
-
-        Ok(db)
-    }
-
-    fn apply_current_schema_repairs(
-        conn: &mut sqlite::Connection,
-        ran_open_migrations: bool,
-    ) -> Result<(), String> {
-        Self::validate_providers_schema(conn)?;
-        Self::ensure_invocations_schema(conn)?;
-        Self::ensure_providers_schema(conn)?;
-        Self::ensure_provider_quotas_schema(conn)?;
-        Self::ensure_provider_quotas_topology_schema(conn)?;
-        Self::ensure_provider_quota_windows_schema(conn)?;
-        Self::ensure_session_turns_schema(conn)?;
-        if ran_open_migrations {
-            Self::apply_returned_artifacts_schema(conn)?;
-        }
-        Ok(())
-    }
-
-    pub fn with_write_txn<R, F>(&mut self, f: F) -> Result<R, String>
-    where
-        F: FnOnce(&mut Transaction<'_>) -> Result<R, String>,
-    {
-        let mut tx = self
-            .conn
-            .transaction()
-            .map_err(|e| format!("Failed to begin state DB transaction: {e}"))?;
-        match f(&mut tx) {
-            Ok(value) => {
-                tx.commit()
-                    .map_err(|e| format!("Failed to commit state DB transaction: {e}"))?;
-                Ok(value)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn invocations_schema_sql() -> &'static str {
-        concat!(
-            "CREATE TABLE IF NOT EXISTS invocations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            invocation_uuid TEXT NOT NULL UNIQUE,
-            model_name TEXT NOT NULL,
-            provider_name TEXT,
-            provider_index INTEGER NOT NULL,
-            parent_invocation_id INTEGER REFERENCES invocations(id),
-            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'legacy')),
-            success INTEGER,
-            exit_code INTEGER,
-            error_category TEXT,
-            terminal_reason TEXT,
-            session_id TEXT,
-            session_capture_method TEXT,
-            provider_session_id TEXT,
-            resume_input_id TEXT,
-            provider_session_capture_method TEXT,
-            provider_session_resolved_account TEXT,
-            resume_acceptance_status TEXT,
-            resume_acceptance_evidence TEXT,
-            created_at TEXT NOT NULL,
-            finished_at TEXT,
-            row_version INTEGER NOT NULL DEFAULT 0
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_invocations_uuid
-            ON invocations (invocation_uuid);
-        CREATE INDEX IF NOT EXISTS idx_invocations_parent
-            ON invocations (parent_invocation_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
-            ON invocations (provider_name, created_at);
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
-            ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_provider_session
-            ON invocations (provider_name, provider_index, provider_session_id)
-            WHERE provider_session_id IS NOT NULL;",
-            invocation_returned_artifacts_schema_sql!()
-        )
-    }
 }
 
 #[allow(dead_code)]
