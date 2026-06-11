@@ -79,6 +79,7 @@ mod provider_quotas;
 mod provider_schema;
 mod providers;
 mod sqlite_adapter;
+mod timestamps;
 
 pub use self::discovery_types::{
     AccountRecord, AuthMethod, AuthStatus, CliMapping, CliProviderRecord, DiscoveredModel,
@@ -901,35 +902,6 @@ impl StateDb {
         }
     }
 
-    fn strict_rfc3339_at(raw: &str, column_index: usize) -> sqlite::Result<DateTime<Utc>> {
-        DateTime::parse_from_rfc3339(raw)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| {
-                sqlite::Error::FromSqlConversionFailure(
-                    column_index,
-                    sqlite::Type::Text,
-                    Box::new(e),
-                )
-            })
-    }
-
-    fn strict_rfc3339_message(raw: &str, field_name: &str) -> Result<DateTime<Utc>, String> {
-        DateTime::parse_from_rfc3339(raw)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| format!("Bad {field_name} {raw}: {e}"))
-    }
-
-    fn optional_forgiving_rfc3339(raw: Option<String>) -> Option<DateTime<Utc>> {
-        raw.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc))
-    }
-
-    fn fallback_now_rfc3339(raw: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(raw)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now())
-    }
-
     fn invocations_schema_sql() -> &'static str {
         concat!(
             "CREATE TABLE IF NOT EXISTS invocations (
@@ -1154,10 +1126,6 @@ impl StateDb {
         self.warn_invocation_artifact_for_start_result(start, &started_at, &sql_result);
         lc_log_adapter::emit_start(&self.lifecycle_sink, timer, context, &sql_result);
         Self::translate_start_invocation_result(sql_result)
-    }
-
-    fn current_rfc3339_timestamp() -> String {
-        Utc::now().to_rfc3339()
     }
 
     fn execute_start_invocation_sql(
