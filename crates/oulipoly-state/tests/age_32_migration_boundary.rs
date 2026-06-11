@@ -28,7 +28,7 @@ use fixtures::v3_full_state_db::{
 use fixtures::v3_setup_only_db::build_versionless_setup_only_db;
 use fixtures::versionless_unrecognized::build_versionless_unrecognized_db;
 use fixtures::{schema_fingerprint, table_names, user_version};
-use oulipoly_state::migrations;
+use oulipoly_state::migrations::{self, Migration};
 use oulipoly_state::schema::{
     self, CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility,
 };
@@ -107,26 +107,8 @@ fn ti_03_current_version_open_is_noop_for_rows_and_duplicates() {
     let second = fixtures::representative_snapshot(db.connection());
 
     assert_eq!(second, first);
-    assert_eq!(
-        db.connection()
-            .query_row(
-                "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1",
-                [fixtures::CHAIN_ID],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        db.connection()
-            .query_row(
-                "SELECT COUNT(*) FROM providers WHERE provider_name = ?1",
-                [fixtures::PROVIDER_NAME],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        1
-    );
+    assert_eq!(duplicate_segment_count(db.connection()), 1);
+    assert_eq!(duplicate_provider_count(db.connection()), 1);
 }
 
 #[test]
@@ -134,7 +116,7 @@ fn ti_06_probe_and_classifier_report_migratable_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     build_v3_full_state_db(&db_path);
-    let before = std::fs::read(&db_path).unwrap();
+    let before = db_bytes(&db_path);
 
     let conn =
         Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -158,7 +140,7 @@ fn ti_06_probe_and_classifier_report_migratable_without_mutation() {
     assert!(!report.compatible);
     drop(conn);
 
-    let after = std::fs::read(&db_path).unwrap();
+    let after = db_bytes(&db_path);
     assert_eq!(after, before, "read-only probe/classifier mutated DB bytes");
 }
 
@@ -250,16 +232,12 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
     let plan = migrations::plan(4, CURRENT_SCHEMA_VERSION).unwrap();
 
     assert_eq!(
-        plan.iter()
-            .map(|migration| migration.target_version)
-            .collect::<Vec<_>>(),
+        plan_target_versions(&plan),
         vec![5, 6, 7, 8, CURRENT_SCHEMA_VERSION],
         "schema-4 DBs must take the AGE-54 schema-5, AGE-58 schema-6, AGE-123 schema-7, PP-002 schema-8, and AGE-163 schema-9 migrations"
     );
     assert_eq!(
-        plan.iter()
-            .map(|migration| migration.id)
-            .collect::<Vec<_>>(),
+        plan_ids(&plan),
         vec![
             "0005_invocation_dual_session_ids",
             "0006_age_58_dual_write_row_versions",
@@ -387,7 +365,56 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
     let db_source = legacy_repair_source();
     assert_legacy_repair_source_uses_runtime_helper_bodies(&db_source);
     let helper_names = find_ensure_schema_helpers(&db_source);
-    let allowed: BTreeSet<&str> = [
+    assert_schema_helpers_are_allow_listed(&helper_names, &allowed_schema_helpers());
+
+    let migration_sql = normalized_migration_sql_corpus();
+    assert_schema_mutations_are_migration_represented(
+        &db_source,
+        &migration_sql,
+        &schema_mutation_helpers(),
+    );
+}
+
+// Declared role: accessor
+fn duplicate_segment_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1",
+        [fixtures::CHAIN_ID],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+}
+
+// Declared role: accessor
+fn duplicate_provider_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM providers WHERE provider_name = ?1",
+        [fixtures::PROVIDER_NAME],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap()
+}
+
+// Declared role: accessor
+fn db_bytes(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).unwrap()
+}
+
+// Declared role: mapper
+fn plan_target_versions(plan: &[&Migration]) -> Vec<i32> {
+    plan.iter()
+        .map(|migration| migration.target_version)
+        .collect()
+}
+
+// Declared role: mapper
+fn plan_ids(plan: &[&Migration]) -> Vec<&'static str> {
+    plan.iter().map(|migration| migration.id).collect()
+}
+
+// Declared role: mapper
+fn allowed_schema_helpers() -> BTreeSet<&'static str> {
+    [
         "ensure_invocations_schema",
         "ensure_providers_schema",
         "ensure_session_turns_schema",
@@ -396,22 +423,32 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
         "ensure_provider_quota_windows_schema",
     ]
     .into_iter()
-    .collect();
+    .collect()
+}
 
-    for helper in &helper_names {
+// Declared role: validator
+fn assert_schema_helpers_are_allow_listed(helper_names: &[String], allowed: &BTreeSet<&str>) {
+    for helper in helper_names {
         assert!(
             allowed.contains(helper.as_str()),
             "new ad hoc schema repair helper {helper} must be represented as an ordered migration"
         );
     }
+}
 
+// Declared role: formatter
+fn normalized_migration_sql_corpus() -> String {
     let mut migration_sql = String::new();
     for migration in migrations::manifest() {
         migration_sql.push_str(&normalize_sql(migration.sql));
         migration_sql.push('\n');
     }
+    migration_sql
+}
 
-    for helper in [
+// Declared role: accessor
+fn schema_mutation_helpers() -> [&'static str; 8] {
+    [
         "ensure_invocations_schema",
         "ensure_providers_schema",
         "validate_providers_schema",
@@ -420,15 +457,33 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
         "ensure_provider_quotas_topology_schema",
         "ensure_provider_quota_windows_schema",
         "backfill_session_chains",
-    ] {
-        let body = extract_function_body(&db_source, helper);
-        for statement in mutating_sql_statements(&body) {
-            let normalized = normalize_sql(&statement);
-            assert!(
-                migration_sql.contains(&normalized),
-                "{helper} contains schema-mutating SQL not represented in compiled migrations: {statement}"
-            );
-        }
+    ]
+}
+
+// Declared role: validator
+fn assert_schema_mutations_are_migration_represented(
+    db_source: &str,
+    migration_sql: &str,
+    helpers: &[&str],
+) {
+    for helper in helpers {
+        assert_helper_mutations_are_migration_represented(db_source, migration_sql, helper);
+    }
+}
+
+// Declared role: validator
+fn assert_helper_mutations_are_migration_represented(
+    db_source: &str,
+    migration_sql: &str,
+    helper: &str,
+) {
+    let body = extract_function_body(db_source, helper);
+    for statement in mutating_sql_statements(&body) {
+        let normalized = normalize_sql(&statement);
+        assert!(
+            migration_sql.contains(&normalized),
+            "{helper} contains schema-mutating SQL not represented in compiled migrations: {statement}"
+        );
     }
 }
 

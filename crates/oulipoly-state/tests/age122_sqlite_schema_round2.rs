@@ -36,35 +36,26 @@ const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS 
 
 #[test]
 fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface() {
-    let invocation_schema_rs = concat!(
-        include_str!("../src/db/invocation_schema_table.rs"),
-        include_str!("../src/db/invocation_schema_repair.rs"),
-        include_str!("../src/db/invocation_schema_projection.rs"),
-        include_str!("../src/db/invocation_schema_session_turns.rs"),
-        include_str!("../src/db/invocation_schema_legacy_migration.rs"),
-    );
-    let schema_rs = include_str!("../src/schema.rs");
-    let lib_rs = include_str!("../src/lib.rs");
-    let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
-
     assert!(
-        invocation_schema_rs.contains(EXPECTED_INVOCATIONS_SCHEMA_SNIPPET),
+        invocation_schema_source().contains(EXPECTED_INVOCATIONS_SCHEMA_SNIPPET),
         "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
     );
     assert!(
-        schema_rs.contains("pub const CURRENT_SCHEMA_VERSION: i32 = 9;"),
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 9;"),
         "AGE-129 must not bump the StateDb schema version beyond the AGE-163 v9 baseline"
     );
     assert!(
-        !lib_rs.contains("pub mod lifecycle_log"),
+        !lib_source().contains("pub mod lifecycle_log"),
         "AGE-129 may re-export the lifecycle sink trait/no-op, but must not expose lifecycle_log as a public module"
     );
     assert!(
-        lib_rs.contains("mod lifecycle_log;") || lib_rs.contains("pub(crate) mod lifecycle_log;"),
+        lib_source().contains("mod lifecycle_log;")
+            || lib_source().contains("pub(crate) mod lifecycle_log;"),
         "AGE-129 must add only a private lifecycle_log module declaration"
     );
     assert!(
-        lib_rs.contains("LifecycleEventSink") && lib_rs.contains("NoopLifecycleEventSink"),
+        lib_source().contains("LifecycleEventSink")
+            && lib_source().contains("NoopLifecycleEventSink"),
         "AGE-129 must publicly re-export only LifecycleEventSink and NoopLifecycleEventSink"
     );
     for private_helper in [
@@ -77,18 +68,13 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
         "emit_and_forward",
     ] {
         assert!(
-            !lib_rs.contains(private_helper),
+            !lib_source().contains(private_helper),
             "AGE-129 builder helpers and emit_and_forward must remain crate-private implementation details"
         );
     }
 
-    let mut migrations = std::fs::read_dir(migrations_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    migrations.sort();
     assert_eq!(
-        migrations,
+        sorted_migration_names(),
         vec![
             "0004_state_db_schema_boundary.sql",
             "0005_invocation_dual_session_ids.sql",
@@ -99,4 +85,43 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
         ],
         "AGE-129 must not add lifecycle/raw-io/event migrations beyond the AGE-163 v9 baseline"
     );
+}
+
+fn invocation_schema_source() -> &'static str {
+    concat!(
+        include_str!("../src/db/invocation_schema_table.rs"),
+        include_str!("../src/db/invocation_schema_repair.rs"),
+        include_str!("../src/db/invocation_schema_projection.rs"),
+        include_str!("../src/db/invocation_schema_session_turns.rs"),
+        include_str!("../src/db/invocation_schema_legacy_migration.rs"),
+    )
+}
+
+fn schema_source() -> &'static str {
+    include_str!("../src/schema.rs")
+}
+
+fn lib_source() -> &'static str {
+    include_str!("../src/lib.rs")
+}
+
+fn sorted_migration_names() -> Vec<String> {
+    let mut migrations = migration_names();
+    migrations.sort();
+    migrations
+}
+
+fn migration_names() -> Vec<String> {
+    std::fs::read_dir(migrations_dir())
+        .unwrap()
+        .map(|entry| migration_name(entry.unwrap()))
+        .collect()
+}
+
+fn migration_name(entry: std::fs::DirEntry) -> String {
+    entry.file_name().to_string_lossy().into_owned()
+}
+
+fn migrations_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations")
 }

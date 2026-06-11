@@ -63,7 +63,17 @@ pub(in crate::db::tests) fn insert_assistant_turns_after(
     count: usize,
     id_prefix: &str,
 ) {
-    let turns: Vec<_> = (0..count)
+    let turns = assistant_turns_after(since, count, id_prefix);
+    db.ingest_session_turns_batch(provider_name, &turns)
+        .unwrap();
+}
+
+fn assistant_turns_after(
+    since: DateTime<Utc>,
+    count: usize,
+    id_prefix: &str,
+) -> Vec<SessionTurnIngest> {
+    (0..count)
         .map(|i| SessionTurnIngest {
             session_id: format!("{id_prefix}-session"),
             turn_id: format!("{id_prefix}-turn-{i}"),
@@ -74,15 +84,21 @@ pub(in crate::db::tests) fn insert_assistant_turns_after(
             is_compaction_boundary: false,
             body: None,
         })
-        .collect();
-    db.ingest_session_turns_batch(provider_name, &turns)
-        .unwrap();
+        .collect()
 }
 
 pub(in crate::db::tests) fn last_empty_refresh_at(
     db: &StateDb,
     provider_name: &str,
 ) -> Option<DateTime<Utc>> {
+    last_empty_refresh_at_raw(db, provider_name).map(|value| {
+        DateTime::parse_from_rfc3339(&value)
+            .unwrap()
+            .with_timezone(&Utc)
+    })
+}
+
+fn last_empty_refresh_at_raw(db: &StateDb, provider_name: &str) -> Option<String> {
     db.conn
         .query_row(
             "SELECT last_empty_refresh_at
@@ -92,11 +108,6 @@ pub(in crate::db::tests) fn last_empty_refresh_at(
             |row| row.get::<_, Option<String>>(0),
         )
         .unwrap()
-        .map(|value| {
-            DateTime::parse_from_rfc3339(&value)
-                .unwrap()
-                .with_timezone(&Utc)
-        })
 }
 
 pub(in crate::db::tests) fn last_topology_probe_at_raw(

@@ -3,18 +3,17 @@
 //!
 #[test]
 fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
-    let db_source = include_str!("../src/db.rs");
-    let opening_source = concat!(
-        include_str!("../src/db/opening_read_only.rs"),
-        include_str!("../src/db/opening_write.rs"),
-        include_str!("../src/db/opening_migrations.rs"),
-    );
-    let state_db_impl = opening_source
-        .split_once("impl StateDb {")
-        .map(|(_, body)| body)
-        .expect("split opening modules should contain the StateDb impl");
-    let public_boundary_source = format!("{db_source}\n{opening_source}");
+    let public_boundary_source = public_boundary_source();
+    let opening_source = opening_source();
+    let state_db_impl = state_db_impl(opening_source);
 
+    assert_no_raw_mutable_connection_escape(&public_boundary_source);
+    assert_no_forbidden_state_db_impl_escape(state_db_impl);
+    assert_read_only_connection_smoke();
+    assert_with_write_txn_surface(opening_source);
+}
+
+fn assert_no_raw_mutable_connection_escape(public_boundary_source: &str) {
     for forbidden in [
         "pub fn connection_mut",
         "pub fn into_connection",
@@ -30,14 +29,18 @@ fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
             "StateDb must expose writes through with_write_txn only; found forbidden signature fragment {forbidden}"
         );
     }
+}
 
+fn assert_no_forbidden_state_db_impl_escape(state_db_impl: &str) {
     for forbidden_method in ["fn into_connection", "fn connection_mut"] {
         assert!(
             !state_db_impl.contains(forbidden_method),
             "StateDb public surface must not define forbidden raw connection escape method {forbidden_method}"
         );
     }
+}
 
+fn assert_read_only_connection_smoke() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("state.db");
     let state = oulipoly_state::StateDb::open(&db_path).unwrap();
@@ -45,7 +48,9 @@ fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
     read_only_connection
         .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
         .unwrap();
+}
 
+fn assert_with_write_txn_surface(opening_source: &str) {
     assert!(
         opening_source.contains("pub fn with_write_txn"),
         "StateDb must expose the closure-scoped write transaction API"
@@ -55,6 +60,29 @@ fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
             || opening_source.contains("FnOnce(&mut Transaction<'_>)"),
         "with_write_txn must scope writes to a non-escaping rusqlite transaction"
     );
+}
+
+fn public_boundary_source() -> String {
+    format!("{}\n{}", db_source(), opening_source())
+}
+
+fn db_source() -> &'static str {
+    include_str!("../src/db.rs")
+}
+
+fn opening_source() -> &'static str {
+    concat!(
+        include_str!("../src/db/opening_read_only.rs"),
+        include_str!("../src/db/opening_write.rs"),
+        include_str!("../src/db/opening_migrations.rs"),
+    )
+}
+
+fn state_db_impl(opening_source: &str) -> &str {
+    opening_source
+        .split_once("impl StateDb {")
+        .map(|(_, body)| body)
+        .expect("split opening modules should contain the StateDb impl")
 }
 
 #[test]

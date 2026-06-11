@@ -15,14 +15,30 @@ pub(in crate::db::tests) const CHAIN_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccc
 pub(in crate::db::tests) fn model_store_from_toml(
     fixtures: &[(&str, &str)],
 ) -> std::collections::HashMap<String, oulipoly_config::ModelConfig> {
+    collect_model_store(parsed_model_fixtures(fixtures))
+}
+
+struct ParsedModelFixture {
+    name: String,
+    config: oulipoly_config::ModelConfig,
+}
+
+fn parsed_model_fixtures(fixtures: &[(&str, &str)]) -> Vec<ParsedModelFixture> {
     fixtures
         .iter()
-        .map(|(name, body)| {
-            (
-                (*name).to_string(),
-                oulipoly_config::ModelConfig::from_toml_with_name(name, body, None).unwrap(),
-            )
+        .map(|(name, body)| ParsedModelFixture {
+            name: (*name).to_string(),
+            config: oulipoly_config::ModelConfig::from_toml_with_name(name, body, None).unwrap(),
         })
+        .collect()
+}
+
+fn collect_model_store(
+    fixtures: Vec<ParsedModelFixture>,
+) -> std::collections::HashMap<String, oulipoly_config::ModelConfig> {
+    fixtures
+        .into_iter()
+        .map(|fixture| (fixture.name, fixture.config))
         .collect()
 }
 
@@ -211,16 +227,29 @@ pub(in crate::db::tests) fn invocation_count(db: &StateDb) -> i64 {
 }
 
 pub(in crate::db::tests) fn invocation_checksum(db: &StateDb) -> String {
-    let dual_id_cols = StateDb::invocations_have_dual_id_columns(&db.conn).unwrap();
-    let extra_cols = if dual_id_cols {
+    let dual_id_cols = invocation_checksum_has_dual_id_columns(db);
+    let extra_cols = invocation_checksum_extra_columns(dual_id_cols);
+    let sql = invocation_checksum_sql(extra_cols);
+    query_invocation_checksum(db, &sql)
+}
+
+fn invocation_checksum_has_dual_id_columns(db: &StateDb) -> bool {
+    StateDb::invocations_have_dual_id_columns(&db.conn).unwrap()
+}
+
+fn invocation_checksum_extra_columns(dual_id_cols: bool) -> &'static str {
+    if dual_id_cols {
         " || '|' || COALESCE(session_capture_method, '') \
              || '|' || COALESCE(provider_session_id, '') \
              || '|' || COALESCE(resume_input_id, '') \
              || '|' || COALESCE(provider_session_capture_method, '')"
     } else {
         ""
-    };
-    let sql = format!(
+    }
+}
+
+fn invocation_checksum_sql(extra_cols: &str) -> String {
+    format!(
         "SELECT COALESCE(group_concat(line, char(10)), '')
              FROM (
                  SELECT id || '|' || invocation_uuid || '|' || status || '|' ||
@@ -229,8 +258,11 @@ pub(in crate::db::tests) fn invocation_checksum(db: &StateDb) -> String {
                  FROM invocations
                  ORDER BY id
              )"
-    );
-    db.conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    )
+}
+
+fn query_invocation_checksum(db: &StateDb, sql: &str) -> String {
+    db.conn.query_row(sql, [], |row| row.get(0)).unwrap()
 }
 
 // risk: Schema migration and backfill; level: particular-integration; source: proposal §11.1 Schema migration and backfill / A5.

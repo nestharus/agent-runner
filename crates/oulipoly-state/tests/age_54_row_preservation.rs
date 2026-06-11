@@ -319,23 +319,8 @@ fn unknown_populated_invocations_shape_fails_closed_before_rebuild() {
     );
     assert_eq!(raw_invocation_count(&db_path), before_count);
     let after_columns = table_columns(&db_path, "invocations");
-    let mut before_columns_with_row_version = before_columns.clone();
-    before_columns_with_row_version.push("row_version".to_string());
-    let mut before_columns_with_row_version_and_identity = before_columns_with_row_version.clone();
-    before_columns_with_row_version_and_identity
-        .push("provider_session_resolved_account".to_string());
-    assert!(
-        after_columns == before_columns
-            || after_columns == before_columns_with_row_version
-            || after_columns == before_columns_with_row_version_and_identity
-    );
-    let conn = Connection::open(&db_path).unwrap();
-    let marker: String = conn
-        .query_row("SELECT unexpected_hand_edit FROM invocations", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(marker, UNKNOWN_SHAPE_MARKER);
+    assert!(acceptable_unknown_shape_columns(&before_columns).contains(&after_columns));
+    assert_eq!(unexpected_hand_edit_marker(&db_path), UNKNOWN_SHAPE_MARKER);
 }
 
 // Risk: row-count guard branch structural drift
@@ -343,36 +328,55 @@ fn unknown_populated_invocations_shape_fails_closed_before_rebuild() {
 // Level: residual source-shape verification for unreachable mismatch branch
 #[test]
 fn migrate_legacy_invocations_row_count_guards_abort_before_drop_in_source_shape() {
-    let source = include_str!("../src/db/invocation_schema_legacy_migration.rs");
-    let body = extract_function_body(source, "migrate_legacy_invocations");
+    let body = migrate_legacy_invocations_body();
+    assert_legacy_row_count_guard_body(body);
+}
 
-    let old_count = body
-        .find("legacy_invocations_count(&tx)")
-        .expect("legacy rebuild must call old invocation count before copy");
-    let old_scan_guard = body
-        .find("validate_legacy_invocation_scan_count")
-        .expect("legacy rebuild must validate old scan/count before replacement");
-    let create_new = body
-        .find("create_migrated_invocations_table(&tx)")
-        .expect("legacy rebuild must create the replacement table after scan guard");
-    let new_count = body
-        .find("migrated_invocations_count(&tx)")
-        .expect("legacy rebuild must count migrated rows before replacement");
-    let new_count_guard = body
-        .find("validate_migrated_invocation_count")
-        .expect("legacy rebuild must validate migrated row count before replacement");
-    let drop_table = body
-        .find("replace_invocations_with_migrated_table(&tx)")
-        .expect("legacy rebuild replacement point must remain explicit");
+// Declared role: mapper
+fn acceptable_unknown_shape_columns(before_columns: &[String]) -> Vec<Vec<String>> {
+    let with_row_version = columns_with_row_version(before_columns);
+    vec![
+        before_columns.to_vec(),
+        with_row_version.clone(),
+        columns_with_resolved_account(&with_row_version),
+    ]
+}
 
-    for guard in [
-        "SELECT COUNT(*) FROM invocations",
-        "scanned {scanned} rows but table count was {old_count}",
-        "CREATE TABLE invocations_new",
-        "SELECT COUNT(*) FROM invocations_new",
-        "migrated {new_count} rows from {old_count}",
-        "DROP TABLE invocations;",
-    ] {
+// Declared role: mapper
+fn columns_with_row_version(columns: &[String]) -> Vec<String> {
+    let mut updated = columns.to_vec();
+    updated.push("row_version".to_string());
+    updated
+}
+
+// Declared role: mapper
+fn columns_with_resolved_account(columns: &[String]) -> Vec<String> {
+    let mut updated = columns.to_vec();
+    updated.push("provider_session_resolved_account".to_string());
+    updated
+}
+
+// Declared role: accessor
+fn unexpected_hand_edit_marker(path: &Path) -> String {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("SELECT unexpected_hand_edit FROM invocations", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+// Declared role: parser
+fn migrate_legacy_invocations_body() -> &'static str {
+    extract_function_body(
+        include_str!("../src/db/invocation_schema_legacy_migration.rs"),
+        "migrate_legacy_invocations",
+    )
+}
+
+// Declared role: validator
+fn assert_legacy_row_count_guard_body(body: &str) {
+    let offsets = legacy_row_count_guard_offsets(body);
+    for guard in legacy_row_count_guard_fragments() {
         assert!(
             body.contains(guard),
             "legacy rebuild guard body must retain {guard:?}"
@@ -380,13 +384,77 @@ fn migrate_legacy_invocations_row_count_guards_abort_before_drop_in_source_shape
     }
 
     assert!(
-        old_count < old_scan_guard && old_scan_guard < create_new,
+        offsets.old_count < offsets.old_scan_guard && offsets.old_scan_guard < offsets.create_new,
         "old scan/count guard must run before invocations_new is created"
     );
     assert!(
-        create_new < new_count && new_count < new_count_guard && new_count_guard < drop_table,
+        offsets.create_new < offsets.new_count
+            && offsets.new_count < offsets.new_count_guard
+            && offsets.new_count_guard < offsets.drop_table,
         "migrated row-count guard must abort before DROP TABLE"
     );
+}
+
+struct LegacyRowCountGuardOffsets {
+    old_count: usize,
+    old_scan_guard: usize,
+    create_new: usize,
+    new_count: usize,
+    new_count_guard: usize,
+    drop_table: usize,
+}
+
+// Declared role: parser
+fn legacy_row_count_guard_offsets(body: &str) -> LegacyRowCountGuardOffsets {
+    LegacyRowCountGuardOffsets {
+        old_count: source_offset(
+            body,
+            "legacy_invocations_count(&tx)",
+            "legacy rebuild must call old invocation count before copy",
+        ),
+        old_scan_guard: source_offset(
+            body,
+            "validate_legacy_invocation_scan_count",
+            "legacy rebuild must validate old scan/count before replacement",
+        ),
+        create_new: source_offset(
+            body,
+            "create_migrated_invocations_table(&tx)",
+            "legacy rebuild must create the replacement table after scan guard",
+        ),
+        new_count: source_offset(
+            body,
+            "migrated_invocations_count(&tx)",
+            "legacy rebuild must count migrated rows before replacement",
+        ),
+        new_count_guard: source_offset(
+            body,
+            "validate_migrated_invocation_count",
+            "legacy rebuild must validate migrated row count before replacement",
+        ),
+        drop_table: source_offset(
+            body,
+            "replace_invocations_with_migrated_table(&tx)",
+            "legacy rebuild replacement point must remain explicit",
+        ),
+    }
+}
+
+// Declared role: parser
+fn source_offset(source: &str, needle: &str, message: &str) -> usize {
+    source.find(needle).expect(message)
+}
+
+// Declared role: accessor
+fn legacy_row_count_guard_fragments() -> [&'static str; 6] {
+    [
+        "SELECT COUNT(*) FROM invocations",
+        "scanned {scanned} rows but table count was {old_count}",
+        "CREATE TABLE invocations_new",
+        "SELECT COUNT(*) FROM invocations_new",
+        "migrated {new_count} rows from {old_count}",
+        "DROP TABLE invocations;",
+    ]
 }
 
 #[derive(Debug, PartialEq, Eq)]
