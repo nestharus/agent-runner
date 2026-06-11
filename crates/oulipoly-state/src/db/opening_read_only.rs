@@ -1,9 +1,12 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - formatter
 //! - validator
 //! - mapper
+//! - predicate
 //!
-//! Role set: { validator, mapper }
+//! Role set: { accessor, formatter, validator, mapper, predicate }
 //!
 //! Read-only state database open error classification and path validation.
 

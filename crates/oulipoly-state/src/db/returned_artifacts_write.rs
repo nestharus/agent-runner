@@ -1,10 +1,13 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - formatter
 //! - orchestration
+//! - parser
 //! - validator
 //! - mapper
 //!
-//! Role set: { orchestration, validator, mapper }
+//! Role set: { accessor, formatter, orchestration, parser, validator, mapper }
 //!
 //! Returned-artifact replacement and row insertion.
 

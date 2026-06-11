@@ -1,8 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
+//! - mapper
+//! - orchestration
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, formatter, mapper, orchestration }
 
 use super::super::*;
 pub(in crate::db::tests) fn insert_invocation_fixture(

@@ -1,11 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - parser
 //! - orchestration
 //!
-//! Role set: { accessor, mapper, parser, orchestration }
+//! Role set: { accessor, formatter, mapper, parser, orchestration }
 //!
 //! Discovered model parameter persistence methods for `StateDb`.
 

@@ -1,8 +1,9 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - orchestration
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, orchestration }
 
 use super::super::*;
 pub(in crate::db::tests) fn test_db() -> StateDb {

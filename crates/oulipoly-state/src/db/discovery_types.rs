@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - parser
 //!
-//! Role set: { accessor, mapper, parser }
+//! Role set: { accessor, formatter, mapper, parser }
 //!
 //! Provider/account discovery DTOs stored and loaded through `StateDb`.
 

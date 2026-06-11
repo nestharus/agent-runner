@@ -1,10 +1,12 @@
 //! ## Declared roles
 //!
-//! - validator
+//! - accessor
+//! - formatter
 //! - validator
 //! - mapper
+//! - predicate
 //!
-//! Role set: { validator, mapper }
+//! Role set: { accessor, formatter, validator, mapper, predicate }
 //!
 //! Provider aggregate schema validation and shape matching.
 

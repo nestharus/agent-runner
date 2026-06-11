@@ -1,8 +1,11 @@
 //! ## Declared roles
 //!
+//! - formatter
+//! - mapper
 //! - orchestration
+//! - predicate
 //!
-//! Role set: { orchestration }
+//! Role set: { formatter, mapper, orchestration, predicate }
 //!
 //! Invocation finalize orchestration and lifecycle-log classification.
 

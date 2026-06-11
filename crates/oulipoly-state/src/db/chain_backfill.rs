@@ -1,10 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - orchestration
+//! - predicate
 //!
-//! Role set: { accessor, mapper, orchestration }
+//! Role set: { accessor, formatter, mapper, orchestration, predicate }
 //!
 //! Session chain backfill from legacy session turn rows.
 

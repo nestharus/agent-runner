@@ -1,9 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - filter
 //! - mapper
+//! - parser
 //!
-//! Role set: { accessor, mapper }
+//! Role set: { accessor, filter, mapper, parser }
 //!
 //! Resume preview query and turn-preview mapping helpers.
 

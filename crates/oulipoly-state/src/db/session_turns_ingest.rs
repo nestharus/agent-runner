@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
+//! - formatter
 //! - mapper
 //! - orchestration
-//! - mapper
+//! - predicate
 //!
-//! Role set: { mapper, orchestration }
+//! Role set: { formatter, mapper, orchestration, predicate }
 //!
 //! Session-turn DTOs and ingest writes.
 

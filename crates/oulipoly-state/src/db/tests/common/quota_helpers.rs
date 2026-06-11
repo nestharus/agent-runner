@@ -1,8 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - mapper
+//! - orchestration
+//! - parser
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, mapper, orchestration, parser }
 
 use super::super::*;
 pub(in crate::db::tests) fn ts(value: &str) -> DateTime<Utc> {

@@ -1,8 +1,11 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - formatter
 //! - mapper
+//! - orchestration
 //!
-//! Role set: { mapper }
+//! Role set: { accessor, formatter, mapper, orchestration }
 //!
 //! Invocation finalize lifecycle-log context mapping.
 

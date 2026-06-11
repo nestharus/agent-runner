@@ -1,8 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
+//! - mapper
+//! - predicate
+//! - validator
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, formatter, mapper, predicate, validator }
 
 use super::super::*;
 pub(in crate::db::tests) fn age160_sqlite_failure(

@@ -1,9 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - filter
+//! - formatter
 //! - mapper
+//! - parser
 //!
-//! Role set: { accessor, mapper }
+//! Role set: { accessor, filter, formatter, mapper, parser }
 //!
 //! Resume chain and wrong-id lookup helpers.
 

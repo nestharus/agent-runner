@@ -1,10 +1,13 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - filter
+//! - formatter
 //! - mapper
+//! - parser
 //! - predicate
 //!
-//! Role set: { accessor, mapper, predicate }
+//! Role set: { accessor, filter, formatter, mapper, parser, predicate }
 //!
 //! Session-turn count and user-body query helpers.
 

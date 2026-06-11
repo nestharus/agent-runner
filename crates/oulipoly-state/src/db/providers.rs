@@ -4,8 +4,9 @@
 //! - mapper
 //! - orchestration
 //! - formatter
+//! - validator
 //!
-//! Role set: { accessor, mapper, orchestration, formatter }
+//! Role set: { accessor, mapper, orchestration, formatter, validator }
 //!
 //! Provider aggregate and round-robin cursor persistence methods for `StateDb`.
 

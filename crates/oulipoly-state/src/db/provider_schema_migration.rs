@@ -1,9 +1,11 @@
 //! ## Declared roles
 //!
+//! - formatter
+//! - mapper
 //! - validator
 //! - orchestration
 //!
-//! Role set: { validator, orchestration }
+//! Role set: { formatter, mapper, validator, orchestration }
 //!
 //! Provider aggregate validator creation and legacy migration.
 

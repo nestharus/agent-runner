@@ -1,8 +1,9 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - mapper
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, mapper }
 
 use super::super::*;
 pub(in crate::db::tests) fn sample_provider() -> CliProviderRecord {

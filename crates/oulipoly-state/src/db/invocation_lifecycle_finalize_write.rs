@@ -1,9 +1,13 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - formatter
 //! - orchestration
 //! - mapper
+//! - predicate
+//! - validator
 //!
-//! Role set: { orchestration, mapper }
+//! Role set: { accessor, formatter, orchestration, mapper, predicate, validator }
 //!
 //! Invocation finalize row and provider aggregate writes.
 

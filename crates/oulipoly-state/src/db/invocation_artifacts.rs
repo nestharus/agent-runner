@@ -1,11 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - predicate
 //! - orchestration
 //! - mapper
 //! - formatter
 //!
-//! Role set: { accessor, orchestration, mapper, formatter }
+//! Role set: { accessor, predicate, orchestration, mapper, formatter }
 //!
 //! Invocation sidecar artifact pathing, payload mapping, and atomic file writes.
 

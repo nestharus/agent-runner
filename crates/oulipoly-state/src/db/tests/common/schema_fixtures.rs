@@ -1,8 +1,10 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
+//! - orchestration
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, formatter, orchestration }
 
 use super::super::*;
 use super::*;

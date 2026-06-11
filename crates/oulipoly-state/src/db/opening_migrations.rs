@@ -1,9 +1,11 @@
 //! ## Declared roles
 //!
+//! - formatter
 //! - validator
 //! - orchestration
+//! - predicate
 //!
-//! Role set: { validator, orchestration }
+//! Role set: { formatter, validator, orchestration, predicate }
 //!
 //! State database open-time migration dispatch and returned-artifact validator repair.
 

@@ -3,8 +3,9 @@
 //! - mapper
 //! - orchestration
 //! - formatter
+//! - predicate
 //!
-//! Role set: { mapper, orchestration, formatter }
+//! Role set: { mapper, orchestration, formatter, predicate }
 //!
 //! Owned turn/event DTOs and insert persistence.
 

@@ -1,8 +1,10 @@
 //! ## Declared roles
 //!
+//! - accessor
 //! - orchestration
+//! - predicate
 //!
-//! Role set: { orchestration }
+//! Role set: { accessor, orchestration, predicate }
 //!
 //! Imported chain minting and active segment closing helpers.
 

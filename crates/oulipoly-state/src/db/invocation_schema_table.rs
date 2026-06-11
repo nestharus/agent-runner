@@ -1,9 +1,12 @@
 //! ## Declared roles
 //!
+//! - formatter
+//! - mapper
 //! - validator
 //! - accessor
+//! - predicate
 //!
-//! Role set: { validator, accessor }
+//! Role set: { formatter, mapper, validator, accessor, predicate }
 //!
 //! Invocation table DDL and table-column inspection helpers.
 

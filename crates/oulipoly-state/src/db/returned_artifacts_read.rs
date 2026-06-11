@@ -1,10 +1,13 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
+//! - parser
+//! - predicate
 //! - validator
 //!
-//! Role set: { accessor, mapper, validator }
+//! Role set: { accessor, formatter, mapper, parser, predicate, validator }
 //!
 //! Returned-artifact list query and row decoding.
 

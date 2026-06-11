@@ -1,9 +1,13 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - filter
+//! - mapper
 //! - orchestration
+//! - predicate
 //! - validator
 //!
-//! Role set: { orchestration, validator }
+//! Role set: { accessor, filter, mapper, orchestration, predicate, validator }
 //!
 //! Resume request resolution and provider/model validation.
 

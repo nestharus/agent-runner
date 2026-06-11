@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - parser
 //!
-//! Role set: { accessor, mapper, parser }
+//! Role set: { accessor, formatter, mapper, parser }
 
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};

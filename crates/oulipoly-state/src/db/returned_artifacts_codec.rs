@@ -2,9 +2,10 @@
 //!
 //! - mapper
 //! - formatter
+//! - parser
 //! - validator
 //!
-//! Role set: { mapper, formatter, validator }
+//! Role set: { mapper, formatter, parser, validator }
 //!
 //! Returned-artifact identity and version-id codec helpers.
 

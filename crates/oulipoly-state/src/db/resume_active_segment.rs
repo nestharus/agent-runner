@@ -1,8 +1,9 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, formatter }
 //!
 //! Active segment and chain model lookup helpers.
 

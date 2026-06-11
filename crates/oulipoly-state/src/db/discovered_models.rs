@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - filter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, mapper, orchestration }
+//! Role set: { accessor, filter, mapper, orchestration }
 //!
 //! Discovered model persistence methods for `StateDb`.
 

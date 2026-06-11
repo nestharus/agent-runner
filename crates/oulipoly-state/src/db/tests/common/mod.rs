@@ -1,8 +1,10 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - mapper
+//! - orchestration
 //!
-//! Role set: { accessor }
+//! Role set: { accessor, mapper, orchestration }
 
 mod age160_lifecycle_helpers;
 mod base;

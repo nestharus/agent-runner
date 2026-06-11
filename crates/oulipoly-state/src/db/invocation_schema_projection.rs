@@ -1,9 +1,13 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - formatter
 //! - validator
 //! - mapper
+//! - orchestration
+//! - predicate
 //!
-//! Role set: { validator, mapper }
+//! Role set: { accessor, formatter, validator, mapper, orchestration, predicate }
 //!
 //! Invocation dual-id projection SQL helpers.
 
