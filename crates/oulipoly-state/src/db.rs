@@ -137,75 +137,6 @@ pub enum ReadOnlyOpenError {
     Operational { message: String },
 }
 
-fn classify_read_only_open_error(path: &Path, err: sqlite::Error) -> ReadOnlyOpenError {
-    match sqlite::project_read_only_open_error(path, &err) {
-        sqlite::ReadOnlyOpenFailure::WalSidecar { message }
-        | sqlite::ReadOnlyOpenFailure::ShmSidecar { message } => {
-            read_only_wal_sidecar_error(path.to_path_buf(), message)
-        }
-        sqlite::ReadOnlyOpenFailure::PlainDb { kind, message } => {
-            read_only_plain_db_error(path, kind, message)
-        }
-        sqlite::ReadOnlyOpenFailure::Unknown { message } => {
-            ReadOnlyOpenError::Operational { message }
-        }
-    }
-}
-
-fn read_only_plain_db_error(
-    path: &Path,
-    kind: sqlite::PlainDbKind,
-    message: String,
-) -> ReadOnlyOpenError {
-    match kind {
-        sqlite::PlainDbKind::NotDatabase | sqlite::PlainDbKind::Corrupt => {
-            read_only_not_database(path.to_path_buf(), message)
-        }
-        sqlite::PlainDbKind::PermissionDenied => read_only_permission_denied(path.to_path_buf()),
-        sqlite::PlainDbKind::ReadOnly
-        | sqlite::PlainDbKind::CannotOpen
-        | sqlite::PlainDbKind::SystemIo => ReadOnlyOpenError::Operational { message },
-    }
-}
-
-fn read_only_not_database(path: PathBuf, message: String) -> ReadOnlyOpenError {
-    ReadOnlyOpenError::NotADatabase { path, message }
-}
-
-fn read_only_permission_denied(path: PathBuf) -> ReadOnlyOpenError {
-    ReadOnlyOpenError::PermissionDenied { path }
-}
-
-fn read_only_wal_sidecar_error(path: PathBuf, message: String) -> ReadOnlyOpenError {
-    ReadOnlyOpenError::WalSidecarError { path, message }
-}
-
-fn wal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-wal", path.display()))
-}
-
-fn shm_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-shm", path.display()))
-}
-
-#[cfg(unix)]
-fn path_is_unreadable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    match std::fs::metadata(path) {
-        Ok(metadata) => metadata.permissions().mode() & 0o444 == 0,
-        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
-    }
-}
-
-#[cfg(not(unix))]
-fn path_is_unreadable(path: &Path) -> bool {
-    match std::fs::File::open(path) {
-        Ok(_) => false,
-        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveChainSegmentSnapshot {
     pub chain_id: String,
@@ -2745,6 +2676,7 @@ fn migrate_legacy_invocations() {
 
 #[cfg(test)]
 mod tests {
+    use super::opening::{classify_read_only_open_error, shm_path, wal_path};
     use super::*;
     use crate::test_support::env_lock;
     use tempfile::TempDir;
