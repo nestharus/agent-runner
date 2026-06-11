@@ -339,31 +339,45 @@ fn unknown_populated_invocations_shape_fails_closed_before_rebuild() {
 }
 
 // Risk: row-count guard branch structural drift
-// Source: contract § Fix Design row-count guard rails; db.rs::migrate_legacy_invocations
+// Source: contract § Fix Design row-count guard rails; invocation_schema_legacy_migration::migrate_legacy_invocations
 // Level: residual source-shape verification for unreachable mismatch branch
 #[test]
 fn migrate_legacy_invocations_row_count_guards_abort_before_drop_in_source_shape() {
-    let source = include_str!("../src/db.rs");
+    let source = include_str!("../src/db/invocation_schema_legacy_migration.rs");
     let body = extract_function_body(source, "migrate_legacy_invocations");
 
     let old_count = body
-        .find("SELECT COUNT(*) FROM invocations")
-        .expect("legacy rebuild must count old invocations before copy");
+        .find("legacy_invocations_count(&tx)")
+        .expect("legacy rebuild must call old invocation count before copy");
     let old_scan_guard = body
-        .find("scanned {} rows but table count was {old_count}")
-        .expect("legacy rebuild must abort on old scan/count mismatch");
+        .find("validate_legacy_invocation_scan_count")
+        .expect("legacy rebuild must validate old scan/count before replacement");
     let create_new = body
-        .find("CREATE TABLE invocations_new")
+        .find("create_migrated_invocations_table(&tx)")
         .expect("legacy rebuild must create the replacement table after scan guard");
     let new_count = body
-        .find("SELECT COUNT(*) FROM invocations_new")
+        .find("migrated_invocations_count(&tx)")
         .expect("legacy rebuild must count migrated rows before replacement");
     let new_count_guard = body
-        .find("migrated {new_count} rows from {old_count}")
-        .expect("legacy rebuild must abort on migrated row-count mismatch");
+        .find("validate_migrated_invocation_count")
+        .expect("legacy rebuild must validate migrated row count before replacement");
     let drop_table = body
-        .find("DROP TABLE invocations;")
+        .find("replace_invocations_with_migrated_table(&tx)")
         .expect("legacy rebuild replacement point must remain explicit");
+
+    for guard in [
+        "SELECT COUNT(*) FROM invocations",
+        "scanned {scanned} rows but table count was {old_count}",
+        "CREATE TABLE invocations_new",
+        "SELECT COUNT(*) FROM invocations_new",
+        "migrated {new_count} rows from {old_count}",
+        "DROP TABLE invocations;",
+    ] {
+        assert!(
+            body.contains(guard),
+            "legacy rebuild guard body must retain {guard:?}"
+        );
+    }
 
     assert!(
         old_count < old_scan_guard && old_scan_guard < create_new,

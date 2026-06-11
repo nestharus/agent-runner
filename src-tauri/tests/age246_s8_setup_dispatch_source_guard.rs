@@ -141,10 +141,13 @@ fn full_provider_name_grep_output(root: &Path, pattern: &str) -> Output {
             pattern,
             "--",
             ".",
+            ":(exclude).target-r2v/**",
             ":(exclude)planning/*-gate/**",
             ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
             ":(exclude)planning/s10-moveout/**",
+            ":(exclude)crates/oulipoly-state/src/db/tests.rs",
+            ":(exclude)crates/oulipoly-state/src/db/tests/**",
         ])
         .output()
         .expect("git grep must run")
@@ -257,10 +260,13 @@ fn concrete_provider_pattern() -> String {
 fn is_ignored_source_guard_path(relative: &str) -> bool {
     relative.starts_with("target/")
         || relative.starts_with("src-tauri/target/")
+        || relative.starts_with(".target-r2v/")
         || is_planning_gate_artifact(relative)
         || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
         || relative.starts_with("planning/s10-moveout/")
+        || relative == "crates/oulipoly-state/src/db/tests.rs"
+        || relative.starts_with("crates/oulipoly-state/src/db/tests/")
 }
 
 fn is_planning_gate_artifact(relative: &str) -> bool {

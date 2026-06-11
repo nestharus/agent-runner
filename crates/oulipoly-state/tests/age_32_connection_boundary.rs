@@ -4,11 +4,15 @@
 #[test]
 fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
     let db_source = include_str!("../src/db.rs");
-    let opening_source = include_str!("../src/db/opening.rs");
+    let opening_source = concat!(
+        include_str!("../src/db/opening_read_only.rs"),
+        include_str!("../src/db/opening_write.rs"),
+        include_str!("../src/db/opening_migrations.rs"),
+    );
     let state_db_impl = opening_source
         .split_once("impl StateDb {")
         .map(|(_, body)| body)
-        .expect("db/opening.rs should contain the StateDb impl");
+        .expect("split opening modules should contain the StateDb impl");
     let public_boundary_source = format!("{db_source}\n{opening_source}");
 
     for forbidden in [

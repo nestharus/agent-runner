@@ -25,7 +25,13 @@ const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS 
 
 #[test]
 fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface() {
-    let invocation_schema_rs = include_str!("../src/db/invocation_schema.rs");
+    let invocation_schema_rs = concat!(
+        include_str!("../src/db/invocation_schema_table.rs"),
+        include_str!("../src/db/invocation_schema_repair.rs"),
+        include_str!("../src/db/invocation_schema_projection.rs"),
+        include_str!("../src/db/invocation_schema_session_turns.rs"),
+        include_str!("../src/db/invocation_schema_legacy_migration.rs"),
+    );
     let schema_rs = include_str!("../src/schema.rs");
     let lib_rs = include_str!("../src/lib.rs");
     let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

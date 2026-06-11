@@ -65,57 +65,95 @@ macro_rules! invocation_returned_artifacts_schema_sql {
 
 mod accounts;
 mod chain_backfill;
-mod chain_segments;
+mod chain_segments_compaction;
+mod chain_segments_import;
+mod chain_segments_open;
 mod cli_providers;
 mod discovered_models;
 mod discovery_types;
 mod invocation_artifacts;
-mod invocation_lifecycle;
+mod invocation_lifecycle_finalize;
+mod invocation_lifecycle_finalize_context;
+mod invocation_lifecycle_finalize_write;
+mod invocation_lifecycle_start;
 mod invocation_records;
-mod invocation_schema;
+mod invocation_schema_legacy_migration;
+mod invocation_schema_projection;
+mod invocation_schema_repair;
+mod invocation_schema_session_turns;
+mod invocation_schema_table;
 mod invocation_window;
 mod lifecycle_invocation_row;
 mod lifecycle_log_adapter;
 mod model_parameters;
-mod opening;
-mod owned_turn_event;
+mod opening_migrations;
+mod opening_read_only;
+mod opening_write;
+mod owned_turn_event_read;
+mod owned_turn_event_write;
 mod provider_quota_reads;
+mod provider_quota_refresh;
 mod provider_quota_status;
 mod provider_quota_test_support;
-mod provider_quota_writes;
+mod provider_quota_window_writes;
 mod provider_quotas;
-mod provider_schema;
+mod provider_schema_migration;
+mod provider_schema_validation;
 mod provider_session_binding;
 mod providers;
-mod resume;
-mod returned_artifacts;
+mod resume_active_segment;
+mod resume_lookup;
+mod resume_preview;
+mod resume_resolution;
+mod resume_types;
+mod returned_artifacts_codec;
+mod returned_artifacts_read;
+mod returned_artifacts_write;
 mod schema_types;
 mod session_capture;
 mod session_markers;
-mod session_turns;
+mod session_turns_ingest;
+mod session_turns_query;
 mod sqlite_adapter;
 mod timestamps;
 
 pub use self::chain_backfill::BackfillReport;
-pub use self::chain_segments::{
+pub use self::chain_segments_open::{
     ActiveChainSegmentSnapshot, ChainSegmentRotationInput, CompactSummaryEvidence,
 };
 pub use self::discovery_types::{
     AccountRecord, AuthMethod, AuthStatus, CliMapping, CliProviderRecord, DiscoveredModel,
     ModelParameter, ParamType,
 };
+use self::invocation_lifecycle_start::{
+    FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
+    active_lifecycle_session_id, lifecycle_terminal_status,
+};
 pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
+use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
-pub use self::owned_turn_event::{OwnedTurnEvent, OwnedTurnEventRow};
+pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,
     QuotaAggregateProjection, QuotaWindowDelta,
 };
 pub use self::provider_quotas::{QuotaRecord, QuotaWindow, QuotaWindowInput};
+use self::provider_schema_migration::ProviderColumn;
 pub use self::provider_session_binding::ProviderSessionBinding;
 pub use self::providers::ProviderRecord;
-pub use self::resume::{
+pub use self::resume_types::{
     ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview, WrongIdKindInput,
+};
+use self::resume_types::{
+    OPENCODE_SESSION_MIN_SUFFIX_LEN, OPENCODE_SESSION_PREFIX, ParsedTurnPreviewTimestamp,
+    RecentTurnRow, ResumeChainCandidate, WrongIdKindInvocationMatch, WrongIdKindInvocationRow,
+};
+use self::returned_artifacts_codec::{
+    InvocationIdentity, ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError,
+    ReturnedArtifactPayloadFields, ReturnedArtifactRawRow, ReturnedArtifactRowParams,
+    ReturnedArtifactValidatedInputs, ValidatedReturnedArtifactFieldValues,
+    returned_artifact_producer_uuid, returned_artifact_sql_integer, returned_artifact_version_id,
+    returned_source_kind,
 };
 use self::schema_types::{
     ColumnRepair, DropColumnRepair, InvocationDualIdProjection, InvocationsSchemaShape,
@@ -123,8 +161,8 @@ use self::schema_types::{
 };
 pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]
-pub use self::session_turns::SessionTurnRecord;
-pub use self::session_turns::{SessionTurnCounts, SessionTurnIngest};
+pub use self::session_turns_ingest::SessionTurnRecord;
+pub use self::session_turns_ingest::{SessionTurnCounts, SessionTurnIngest};
 
 use self::lifecycle_log_adapter as lc_log_adapter;
 use self::sqlite_adapter as sqlite;

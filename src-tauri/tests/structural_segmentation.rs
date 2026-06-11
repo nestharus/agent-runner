@@ -1,10 +1,8 @@
 //! ## Declared roles
 //!
-//! Roles: orchestration, formatter, mapper, accessor, parser, validator,
-//! predicate, filter.
+//! Roles: orchestration, formatter, mapper, accessor, parser, validator, predicate, filter.
 //!
-//! TEST: structural segmentation fixtures and tracked-file lint helpers: git
-//! inventory accessors/parsers, regex/link formatters, tracked-path predicates
+//! TEST: structural segmentation fixtures and tracked-file lint helpers: git inventory accessors/parsers, regex/link formatters, tracked-path predicates
 //! and filters, file-content scanners, and assertion validators for doomed-dir
 //! absence and dangling-link rejection.
 //!
@@ -160,19 +158,19 @@ fn is_regular_blob(mode: &str) -> bool {
 }
 
 fn tracked_regular_files() -> Vec<String> {
-    collect_regular_files(&git_stdout(&["ls-files", "--stage"]))
+    collect_existing_regular_files(&repo_root(), &git_stdout(&["ls-files", "--stage"]))
 }
 
-fn collect_regular_files(stdout: &str) -> Vec<String> {
-    own_tracked_files(regular_stage_paths(stdout))
+fn collect_existing_regular_files(root: &Path, stdout: &str) -> Vec<String> {
+    regular_stage_paths(stdout)
+        .into_iter()
+        .filter(|tracked_file| root.join(tracked_file).exists())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn regular_stage_paths(stdout: &str) -> Vec<&str> {
     stdout.lines().filter_map(regular_stage_path).collect()
-}
-
-fn own_tracked_files(tracked_files: Vec<&str>) -> Vec<String> {
-    tracked_files.into_iter().map(str::to_owned).collect()
 }
 
 fn regular_stage_path(tracked_entry: &str) -> Option<&str> {

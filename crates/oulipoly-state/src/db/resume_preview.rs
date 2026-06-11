@@ -1,0 +1,151 @@
+//! ## Declared roles
+//!
+//! - accessor
+//! - mapper
+//!
+//! Role set: { accessor, mapper }
+//!
+//! Resume preview query and turn-preview mapping helpers.
+
+use super::*;
+use chrono::{DateTime, Utc};
+
+impl StateDb {
+    pub(super) fn chain_previews(&self, input: &str) -> Result<Vec<ChainPreview>, String> {
+        let chain_ids = self.candidate_chain_ids(input)?;
+        let mut out = Vec::new();
+        for chain_id in chain_ids {
+            out.push(self.build_chain_preview(chain_id)?);
+        }
+        Self::sort_chain_previews(&mut out);
+        Ok(out)
+    }
+
+    pub(super) fn build_chain_preview(&self, chain_id: String) -> Result<ChainPreview, String> {
+        let last_used_at = self.read_chain_preview_last_used_at(&chain_id)?;
+        let (active_provider, active_session_id) = self
+            .active_segment_for_chain(&chain_id)?
+            .unwrap_or_else(|| ("<none>".to_string(), "<none>".to_string()));
+        let turn_count = self.preview_turn_count(&active_provider, &active_session_id);
+        let recent_turns = self.recent_turn_previews(&active_provider, &active_session_id)?;
+        Ok(ChainPreview {
+            chain_id,
+            last_used_at,
+            active_provider,
+            active_session_id,
+            turn_count,
+            recent_turns,
+        })
+    }
+
+    pub(super) fn read_chain_preview_last_used_at(
+        &self,
+        chain_id: &str,
+    ) -> Result<DateTime<Utc>, String> {
+        let raw_last: String = self
+            .conn
+            .query_row(
+                "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                sqlite::params![chain_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read chain preview: {e}"))?;
+        Self::strict_rfc3339_message(&raw_last, "chain preview timestamp")
+    }
+
+    pub(super) fn preview_turn_count(
+        &self,
+        active_provider: &str,
+        active_session_id: &str,
+    ) -> usize {
+        let turn_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+                sqlite::params![active_provider, active_session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        turn_count.max(0) as usize
+    }
+
+    pub(super) fn recent_turn_previews(
+        &self,
+        active_provider: &str,
+        active_session_id: &str,
+    ) -> Result<Vec<TurnPreview>, String> {
+        let rows = self.query_recent_turn_rows(active_provider, active_session_id)?;
+        let parsed = Self::parse_turn_preview_timestamps(rows)?;
+        let mut recent_turns = Self::map_recent_turn_previews(parsed);
+        recent_turns.reverse();
+        Ok(recent_turns)
+    }
+
+    pub(super) fn query_recent_turn_rows(
+        &self,
+        active_provider: &str,
+        active_session_id: &str,
+    ) -> Result<Vec<RecentTurnRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT role, timestamp
+                 FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 3",
+            )
+            .map_err(|e| format!("Failed to prepare recent turns preview: {e}"))?;
+        let rows = stmt
+            .query_map(
+                sqlite::params![active_provider, active_session_id],
+                Self::recent_turn_row_mapper,
+            )
+            .map_err(|e| format!("Failed to query recent turns preview: {e}"))?;
+
+        let mut recent_turns = Vec::new();
+        for row in rows {
+            recent_turns.push(row.map_err(|e| format!("Failed to read recent turn: {e}"))?);
+        }
+        Ok(recent_turns)
+    }
+
+    pub(super) fn recent_turn_row_mapper(row: &sqlite::Row<'_>) -> sqlite::Result<RecentTurnRow> {
+        Ok(RecentTurnRow {
+            role: row.get(0)?,
+            timestamp_raw: row.get(1)?,
+        })
+    }
+
+    pub(super) fn parse_turn_preview_timestamps(
+        rows: Vec<RecentTurnRow>,
+    ) -> Result<Vec<ParsedTurnPreviewTimestamp>, String> {
+        rows.into_iter()
+            .map(|row| {
+                Ok(ParsedTurnPreviewTimestamp {
+                    role: row.role,
+                    timestamp: Self::strict_rfc3339_message(
+                        &row.timestamp_raw,
+                        "recent turn timestamp",
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn map_recent_turn_previews(
+        rows: Vec<ParsedTurnPreviewTimestamp>,
+    ) -> Vec<TurnPreview> {
+        rows.into_iter()
+            .map(|row| TurnPreview {
+                role: row.role,
+                timestamp: row.timestamp,
+                snippet: None,
+            })
+            .collect()
+    }
+
+    pub(super) fn sort_chain_previews(out: &mut [ChainPreview]) {
+        out.sort_by_key(|preview| std::cmp::Reverse(preview.last_used_at));
+    }
+}

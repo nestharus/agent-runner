@@ -1,0 +1,184 @@
+//! ## Declared roles
+//!
+//! - orchestration
+//! - mapper
+//! - predicate
+//!
+//! Role set: { orchestration, mapper, predicate }
+//!
+//! Provider quota window replacement and burn-rate delta classification.
+
+use super::*;
+
+impl StateDb {
+    pub(super) fn write_quota_aggregate(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+        now: &str,
+        projection: QuotaAggregateProjection,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO provider_quotas
+                (provider_name, used_percent, resets_at, calls_since_refresh, refreshed_at,
+                 topology_peak_live_window_count)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)
+             ON CONFLICT (provider_name) DO UPDATE SET
+                used_percent = ?2,
+                resets_at = ?3,
+                calls_since_refresh = 0,
+                refreshed_at = ?4,
+                exhausted_at = NULL,
+                topology_peak_live_window_count = MAX(topology_peak_live_window_count, ?5)",
+            sqlite::params![
+                provider_name,
+                projection.legacy_used,
+                projection.legacy_resets,
+                now,
+                projection.topology_peak_live_window_count
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert quota: {e}"))?;
+        Ok(())
+    }
+
+    pub(super) fn replace_quota_window_rows(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+        windows: &[QuotaWindowInput],
+        prior_windows_by_id: &HashMap<u32, &QuotaWindow>,
+        turns_between_refreshes: u64,
+    ) -> Result<(), String> {
+        Self::delete_quota_window_rows(conn, provider_name)?;
+        Self::insert_quota_window_rows(
+            conn,
+            provider_name,
+            windows,
+            prior_windows_by_id,
+            turns_between_refreshes,
+        )
+    }
+
+    pub(super) fn delete_quota_window_rows(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+    ) -> Result<(), String> {
+        conn.execute(
+            "DELETE FROM provider_quota_windows WHERE provider_name = ?1",
+            sqlite::params![provider_name],
+        )
+        .map_err(|e| format!("Failed to clear windows: {e}"))?;
+        Ok(())
+    }
+
+    pub(super) fn insert_quota_window_rows(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+        windows: &[QuotaWindowInput],
+        prior_windows_by_id: &HashMap<u32, &QuotaWindow>,
+        turns_between_refreshes: u64,
+    ) -> Result<(), String> {
+        for (index, window) in windows.iter().enumerate() {
+            let delta = Self::quota_window_delta(
+                window,
+                prior_windows_by_id.get(&(index as u32)).copied(),
+                turns_between_refreshes,
+            );
+            Self::insert_quota_window_row(conn, provider_name, index, window, delta)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn quota_window_delta(
+        window: &QuotaWindowInput,
+        prior_window: Option<&QuotaWindow>,
+        turns_between_refreshes: u64,
+    ) -> QuotaWindowDelta {
+        match prior_window {
+            Some(prior) => {
+                Self::classify_quota_window_delta(window, prior, turns_between_refreshes)
+            }
+            None => QuotaWindowDelta {
+                last_delta_percent: None,
+                last_delta_calls: None,
+            },
+        }
+    }
+
+    pub(super) fn classify_quota_window_delta(
+        window: &QuotaWindowInput,
+        prior_window: &QuotaWindow,
+        turns_between_refreshes: u64,
+    ) -> QuotaWindowDelta {
+        let delta_percent = (window.used_percent - prior_window.used_percent).max(0.0);
+        if Self::quota_delta_sample_is_learnable(delta_percent, window, turns_between_refreshes) {
+            QuotaWindowDelta {
+                last_delta_percent: Some(delta_percent),
+                last_delta_calls: Some(turns_between_refreshes),
+            }
+        } else {
+            QuotaWindowDelta {
+                last_delta_percent: prior_window.last_delta_percent,
+                last_delta_calls: prior_window.last_delta_calls,
+            }
+        }
+    }
+
+    pub(super) fn quota_delta_sample_is_learnable(
+        delta_percent: f64,
+        window: &QuotaWindowInput,
+        turns_between_refreshes: u64,
+    ) -> bool {
+        delta_percent > 0.0
+            && !Self::quota_delta_sample_is_small(turns_between_refreshes)
+            && !Self::quota_window_is_near_rail(window)
+            && !Self::quota_delta_rate_too_high(delta_percent, turns_between_refreshes)
+    }
+
+    pub(super) fn quota_delta_sample_is_small(turns_between_refreshes: u64) -> bool {
+        turns_between_refreshes < MIN_LEARN_SAMPLE_CALLS
+    }
+
+    pub(super) fn quota_window_is_near_rail(window: &QuotaWindowInput) -> bool {
+        window.used_percent >= NEAR_EXHAUSTED_USED_PERCENT
+    }
+
+    pub(super) fn quota_delta_rate_too_high(
+        delta_percent: f64,
+        turns_between_refreshes: u64,
+    ) -> bool {
+        Self::quota_delta_rate(delta_percent, turns_between_refreshes) > MAX_LEARNABLE_BURN_RATE
+    }
+
+    pub(super) fn quota_delta_rate(delta_percent: f64, turns_between_refreshes: u64) -> f64 {
+        if turns_between_refreshes > 0 {
+            delta_percent / (turns_between_refreshes as f64)
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    pub(super) fn insert_quota_window_row(
+        conn: &sqlite::Connection,
+        provider_name: &str,
+        index: usize,
+        window: &QuotaWindowInput,
+        delta: QuotaWindowDelta,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO provider_quota_windows
+                (provider_name, window_id, used_percent, resets_at,
+                 last_delta_percent, last_delta_calls)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            sqlite::params![
+                provider_name,
+                index as i64,
+                window.used_percent,
+                window.resets_at.to_rfc3339(),
+                delta.last_delta_percent,
+                delta.last_delta_calls.map(|value| value as i64),
+            ],
+        )
+        .map_err(|e| format!("Failed to insert window: {e}"))?;
+        Ok(())
+    }
+}

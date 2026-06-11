@@ -437,10 +437,17 @@ fn legacy_repair_source() -> String {
     [
         include_str!("../src/db.rs"),
         include_str!("../src/db/chain_backfill.rs"),
-        include_str!("../src/db/invocation_schema.rs"),
-        include_str!("../src/db/opening.rs"),
+        include_str!("../src/db/invocation_schema_table.rs"),
+        include_str!("../src/db/invocation_schema_repair.rs"),
+        include_str!("../src/db/invocation_schema_projection.rs"),
+        include_str!("../src/db/invocation_schema_session_turns.rs"),
+        include_str!("../src/db/invocation_schema_legacy_migration.rs"),
+        include_str!("../src/db/opening_read_only.rs"),
+        include_str!("../src/db/opening_write.rs"),
+        include_str!("../src/db/opening_migrations.rs"),
         include_str!("../src/db/provider_quotas.rs"),
-        include_str!("../src/db/provider_schema.rs"),
+        include_str!("../src/db/provider_schema_migration.rs"),
+        include_str!("../src/db/provider_schema_validation.rs"),
     ]
     .join("\n")
 }

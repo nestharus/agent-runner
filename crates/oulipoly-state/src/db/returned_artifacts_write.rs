@@ -1,0 +1,264 @@
+//! ## Declared roles
+//!
+//! - orchestration
+//! - validator
+//! - mapper
+//!
+//! Role set: { orchestration, validator, mapper }
+//!
+//! Returned-artifact replacement and row insertion.
+
+use super::*;
+use oulipoly_agent_messenger::ReturnedArtifactRef;
+use uuid::Uuid;
+
+impl StateDb {
+    pub fn record_returned_artifacts(
+        &self,
+        invocation_row_id: i64,
+        refs: &[ReturnedArtifactRef],
+    ) -> Result<(), DbError> {
+        Self::prepare_returned_artifacts_table(&self.conn)?;
+        let identity =
+            Self::load_invocation_identity_for_returned_artifacts(&self.conn, invocation_row_id)?;
+        Self::validate_returned_artifact_refs(&identity, refs)?;
+        Self::replace_returned_artifact_rows(&self.conn, invocation_row_id, refs)
+    }
+
+    pub(super) fn prepare_returned_artifacts_table(
+        conn: &sqlite::Connection,
+    ) -> Result<(), DbError> {
+        conn.execute_batch(invocation_returned_artifacts_schema_sql!())
+            .map_err(|e| format!("Failed to ensure returned-artifacts schema: {e}"))
+    }
+
+    pub(super) fn load_invocation_identity_for_returned_artifacts(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+    ) -> Result<InvocationIdentity, DbError> {
+        let uuid_text = Self::load_invocation_uuid_text(conn, invocation_row_id)?;
+        let uuid =
+            Self::parse_invocation_uuid_for_returned_artifacts(invocation_row_id, &uuid_text)?;
+        Ok(InvocationIdentity {
+            row_id: invocation_row_id,
+            uuid,
+        })
+    }
+
+    pub(super) fn load_invocation_uuid_text(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+    ) -> Result<String, DbError> {
+        conn.query_row(
+            "SELECT invocation_uuid FROM invocations WHERE id = ?1",
+            sqlite::params![invocation_row_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load invocation for returned artifacts: {e}"))?
+        .ok_or_else(|| format!("Invocation {invocation_row_id} not found"))
+    }
+
+    pub(super) fn parse_invocation_uuid_for_returned_artifacts(
+        invocation_row_id: i64,
+        uuid_text: &str,
+    ) -> Result<Uuid, DbError> {
+        Uuid::parse_str(uuid_text)
+            .map_err(|e| format!("Invalid invocation UUID on row {invocation_row_id}: {e}"))
+    }
+
+    pub(super) fn validate_returned_artifact_refs(
+        identity: &InvocationIdentity,
+        refs: &[ReturnedArtifactRef],
+    ) -> Result<(), DbError> {
+        for reference in refs {
+            Self::validate_returned_artifact_ref(identity.row_id, identity.uuid, reference)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn replace_returned_artifact_rows(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+        refs: &[ReturnedArtifactRef],
+    ) -> Result<(), DbError> {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin returned-artifacts tx: {e}"))?;
+        tx.execute(
+            "DELETE FROM invocation_returned_artifacts WHERE invocation_id = ?1",
+            sqlite::params![invocation_row_id],
+        )
+        .map_err(|e| format!("Failed to reset returned artifacts: {e}"))?;
+        for (ordinal, reference) in refs.iter().enumerate() {
+            Self::insert_returned_artifact_row(&tx, invocation_row_id, ordinal, reference)?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit returned-artifacts tx: {e}"))
+    }
+
+    pub(super) fn validate_returned_artifact_ref(
+        invocation_row_id: i64,
+        invocation_uuid: Uuid,
+        reference: &ReturnedArtifactRef,
+    ) -> Result<(), DbError> {
+        let derived_uuid =
+            returned_artifact_producer_uuid(&reference.store_address.workflow_run_id)
+                .map_err(|e| format!("Invalid returned-artifact workflow_run_id: {e}"))?;
+        Self::validate_returned_artifact_producer_uuid(reference, derived_uuid)?;
+        Self::validate_returned_artifact_owner(invocation_row_id, invocation_uuid, reference)?;
+        Self::validate_returned_artifact_version_id(reference, derived_uuid)
+    }
+
+    pub(super) fn validate_returned_artifact_producer_uuid(
+        reference: &ReturnedArtifactRef,
+        derived_uuid: Uuid,
+    ) -> Result<(), DbError> {
+        if derived_uuid == reference.producer_invocation_uuid {
+            Ok(())
+        } else {
+            Err(format!(
+                "Returned artifact producer UUID mismatch: workflow_run_id encodes {derived_uuid}, ref carries {}",
+                reference.producer_invocation_uuid
+            ))
+        }
+    }
+
+    pub(super) fn validate_returned_artifact_owner(
+        invocation_row_id: i64,
+        invocation_uuid: Uuid,
+        reference: &ReturnedArtifactRef,
+    ) -> Result<(), DbError> {
+        if reference.producer_invocation_uuid == invocation_uuid {
+            Ok(())
+        } else {
+            Err(format!(
+                "Returned artifact belongs to {}, but invocation row {invocation_row_id} is {invocation_uuid}",
+                reference.producer_invocation_uuid
+            ))
+        }
+    }
+
+    pub(super) fn validate_returned_artifact_version_id(
+        reference: &ReturnedArtifactRef,
+        derived_uuid: Uuid,
+    ) -> Result<(), DbError> {
+        let expected_version_id = returned_artifact_version_id(
+            derived_uuid,
+            &reference.store_address.artifact_name,
+            reference.store_address.version,
+        );
+        if reference.version_id == expected_version_id {
+            Ok(())
+        } else {
+            Err(format!(
+                "Returned artifact version_id mismatch: expected {expected_version_id}, ref carries {}",
+                reference.version_id
+            ))
+        }
+    }
+
+    pub(super) fn insert_returned_artifact_row(
+        conn: &sqlite::Connection,
+        invocation_row_id: i64,
+        ordinal: usize,
+        reference: &ReturnedArtifactRef,
+    ) -> Result<(), DbError> {
+        let validated = Self::validate_returned_artifact_inputs(reference)?;
+        let payload = Self::format_returned_artifact_payload_fields(reference)?;
+        let params = Self::bind_returned_artifact_row_params(
+            invocation_row_id,
+            ordinal,
+            reference,
+            &validated,
+            &payload,
+        );
+        Self::execute_returned_artifact_row_insert(conn, &params)
+    }
+
+    pub(super) fn validate_returned_artifact_inputs(
+        reference: &ReturnedArtifactRef,
+    ) -> Result<ReturnedArtifactValidatedInputs, DbError> {
+        Ok(ReturnedArtifactValidatedInputs {
+            version: returned_artifact_sql_integer(reference.store_address.version, "version")?,
+            content_len: returned_artifact_sql_integer(reference.content_len, "content_len")?,
+        })
+    }
+
+    pub(super) fn format_returned_artifact_payload_fields(
+        reference: &ReturnedArtifactRef,
+    ) -> Result<ReturnedArtifactPayloadFields, DbError> {
+        Ok(ReturnedArtifactPayloadFields {
+            source_json: serde_json::to_string(&reference.source)
+                .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?,
+            returned_at: reference.returned_at.to_rfc3339(),
+        })
+    }
+
+    pub(super) fn bind_returned_artifact_row_params<'a>(
+        invocation_row_id: i64,
+        ordinal: usize,
+        reference: &'a ReturnedArtifactRef,
+        validated: &'a ReturnedArtifactValidatedInputs,
+        payload: &'a ReturnedArtifactPayloadFields,
+    ) -> ReturnedArtifactRowParams<'a> {
+        ReturnedArtifactRowParams {
+            invocation_row_id,
+            ordinal: ordinal as i64,
+            version_id: &reference.version_id,
+            name: &reference.name,
+            workflow_run_id: &reference.store_address.workflow_run_id,
+            artifact_name: &reference.store_address.artifact_name,
+            version: validated.version,
+            sha256: &reference.sha256,
+            content_len: validated.content_len,
+            format_hint: &reference.format_hint,
+            verdict_line: &reference.verdict_line,
+            source_kind: returned_source_kind(&reference.source),
+            source_json: &payload.source_json,
+            returned_at: &payload.returned_at,
+        }
+    }
+
+    pub(super) fn execute_returned_artifact_row_insert(
+        conn: &sqlite::Connection,
+        params: &ReturnedArtifactRowParams<'_>,
+    ) -> Result<(), DbError> {
+        conn.execute(
+            "INSERT INTO invocation_returned_artifacts (
+                invocation_id,
+                ordinal,
+                version_id,
+                name,
+                workflow_run_id,
+                artifact_name,
+                version,
+                sha256,
+                content_len,
+                format_hint,
+                verdict_line,
+                source_kind,
+                source_json,
+                returned_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            sqlite::params![
+                params.invocation_row_id,
+                params.ordinal,
+                params.version_id,
+                params.name,
+                params.workflow_run_id,
+                params.artifact_name,
+                params.version,
+                params.sha256,
+                params.content_len,
+                params.format_hint,
+                params.verdict_line,
+                params.source_kind,
+                params.source_json,
+                params.returned_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to record returned artifact: {e}"))?;
+        Ok(())
+    }
+}
