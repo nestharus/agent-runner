@@ -434,7 +434,11 @@ fn ti_40_legacy_repair_helpers_are_allow_listed_and_migration_represented() {
 
 // Declared role: accessor
 fn legacy_repair_source() -> String {
-    include_str!("../src/db.rs").to_string()
+    [
+        include_str!("../src/db.rs"),
+        include_str!("../src/db/chain_backfill.rs"),
+    ]
+    .join("\n")
 }
 
 // Declared role: validator
