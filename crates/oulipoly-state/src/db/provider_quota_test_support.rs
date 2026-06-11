@@ -1,9 +1,10 @@
 //! ## Declared roles
 //!
+//! - accessor
 //! - orchestration
 //! - formatter
 //!
-//! Role set: { orchestration, formatter }
+//! Role set: { accessor, orchestration, formatter }
 //!
 //! Test-support writes for seeding provider quota edge cases.
 
@@ -25,13 +26,19 @@ impl StateDb {
         provider_name: &str,
         refreshed_at: &DateTime<Utc>,
     ) -> Result<(), String> {
+        let refreshed_at = Self::quota_test_timestamp(refreshed_at);
         self.conn
             .execute(
                 "UPDATE provider_quotas SET refreshed_at = ?1 WHERE provider_name = ?2",
-                sqlite::params![refreshed_at.to_rfc3339(), provider_name],
+                sqlite::params![refreshed_at, provider_name],
             )
             .map_err(Self::format_set_refreshed_at_error)?;
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn quota_test_timestamp(timestamp: &DateTime<Utc>) -> String {
+        timestamp.to_rfc3339()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -79,6 +86,7 @@ impl StateDb {
         provider_name: &str,
         refreshed_at: &DateTime<Utc>,
     ) -> Result<(), String> {
+        let refreshed_at = Self::quota_test_timestamp(refreshed_at);
         self.conn
             .execute(
                 "INSERT INTO provider_quotas
@@ -89,7 +97,7 @@ impl StateDb {
                     resets_at = NULL,
                     calls_since_refresh = 0,
                     refreshed_at = ?2",
-                sqlite::params![provider_name, refreshed_at.to_rfc3339()],
+                sqlite::params![provider_name, refreshed_at],
             )
             .map_err(Self::format_insert_quota_row_error)?;
         self.conn

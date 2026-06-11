@@ -120,40 +120,10 @@ fn has_session_user_text_turn_requires_exact_user_body_match() {
     let db = test_db();
     let expected = "[OULIPOLY NOTIFICATIONS]\nhandle: h-exact\n";
 
-    db.ingest_session_turns_batch(
-        "fixture-provider",
-        &[
-            SessionTurnIngest {
-                session_id: "session-a".to_string(),
-                turn_id: "user-exact".to_string(),
-                timestamp: ts("2026-04-17T08:00:00Z"),
-                role: "user".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-                body: Some(serde_json::json!([{ "type": "text", "text": expected }]).to_string()),
-            },
-            SessionTurnIngest {
-                session_id: "session-a".to_string(),
-                turn_id: "assistant-same-text".to_string(),
-                timestamp: ts("2026-04-17T08:00:01Z"),
-                role: "assistant".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-                body: Some(
-                    serde_json::json!([{ "type": "text", "text": "assistant text" }]).to_string(),
-                ),
-            },
-        ],
-    )
-    .unwrap();
+    db.ingest_session_turns_batch("fixture-provider", &exact_user_text_turns(expected))
+        .unwrap();
 
-    let extra_text_body = serde_json::json!([
-        { "type": "text", "text": expected },
-        { "type": "text", "text": "extra" }
-    ])
-    .to_string();
+    let extra_text_body = extra_text_body(expected);
 
     assert!(
         db.has_session_user_text_turn("fixture-provider", "session-a", expected)
@@ -170,11 +140,60 @@ fn has_session_user_text_turn_requires_exact_user_body_match() {
     );
     assert!(StateDb::session_turn_body_has_exact_text(
         &extra_text_body,
-        &format!("{expected}extra")
+        &expected_plus_extra(expected)
     ));
     assert!(
         !db.has_session_user_text_turn("other-provider", "session-a", expected)
             .unwrap(),
         "provider identity must match"
     );
+}
+
+fn exact_user_text_turns(expected: &str) -> Vec<SessionTurnIngest> {
+    vec![
+        user_exact_text_turn(expected),
+        assistant_same_text_turn("assistant text"),
+    ]
+}
+
+fn user_exact_text_turn(expected: &str) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: "session-a".to_string(),
+        turn_id: "user-exact".to_string(),
+        timestamp: ts("2026-04-17T08:00:00Z"),
+        role: "user".to_string(),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: false,
+        body: Some(text_body(expected)),
+    }
+}
+
+fn assistant_same_text_turn(text: &str) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: "session-a".to_string(),
+        turn_id: "assistant-same-text".to_string(),
+        timestamp: ts("2026-04-17T08:00:01Z"),
+        role: "assistant".to_string(),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: false,
+        body: Some(text_body(text)),
+    }
+}
+
+fn text_body(text: &str) -> String {
+    serde_json::json!([{ "type": "text", "text": text }]).to_string()
+}
+
+fn extra_text_body(expected: &str) -> String {
+    serde_json::json!([
+        { "type": "text", "text": expected },
+        { "type": "text", "text": "extra" }
+    ])
+    .to_string()
+}
+
+fn expected_plus_extra(expected: &str) -> String {
+    format!("{expected}extra")
 }

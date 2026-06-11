@@ -99,8 +99,11 @@ pub(in crate::db::tests) fn seed_current_drift_required_tables(conn: &sqlite::Co
 
 pub(in crate::db::tests) fn db_without_table(table: &str) -> StateDb {
     let db = test_db();
-    db.conn
-        .execute_batch(&format!("DROP TABLE {table};"))
-        .unwrap();
+    let drop_sql = drop_table_sql(table);
+    db.conn.execute_batch(&drop_sql).unwrap();
     db
+}
+
+fn drop_table_sql(table: &str) -> String {
+    format!("DROP TABLE {table};")
 }

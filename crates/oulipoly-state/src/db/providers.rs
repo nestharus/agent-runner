@@ -201,14 +201,20 @@ impl StateDb {
         provider_name: &str,
         last_invoked_at: &DateTime<Utc>,
     ) -> Result<usize, String> {
+        let last_invoked_at = Self::last_invoked_at_test_timestamp(last_invoked_at);
         self.conn
             .execute(
                 "UPDATE providers
                  SET last_invoked_at = ?1
                  WHERE model_name = ?2 AND provider_name = ?3",
-                sqlite::params![last_invoked_at.to_rfc3339(), model_name, provider_name],
+                sqlite::params![last_invoked_at, model_name, provider_name],
             )
             .map_err(Self::format_set_last_invoked_at_error)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn last_invoked_at_test_timestamp(timestamp: &DateTime<Utc>) -> String {
+        timestamp.to_rfc3339()
     }
 
     #[cfg(any(test, feature = "test-support"))]
