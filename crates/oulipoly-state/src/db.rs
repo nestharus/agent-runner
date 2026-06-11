@@ -100,6 +100,7 @@ pub use self::discovery_types::{
     AccountRecord, AuthMethod, AuthStatus, CliMapping, CliProviderRecord, DiscoveredModel,
     ModelParameter, ParamType,
 };
+pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,
     QuotaAggregateProjection, QuotaWindowDelta,
@@ -203,86 +204,6 @@ pub struct SessionTurnCounts {
     pub total: u64,
     pub assistant: u64,
     pub sidechain: u64,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct InvocationRecord {
-    pub id: i64,
-    pub invocation_uuid: String,
-    pub model_name: String,
-    pub provider_name: Option<String>,
-    pub provider_index: usize,
-    pub parent_invocation_id: Option<i64>,
-    pub status: InvocationStatus,
-    pub success: Option<bool>,
-    pub exit_code: Option<i32>,
-    pub error_category: Option<String>,
-    pub terminal_reason: Option<String>,
-    pub session_id: Option<String>,
-    pub session_capture_method: Option<String>,
-    pub provider_session_id: Option<String>,
-    pub resume_input_id: Option<String>,
-    pub provider_session_capture_method: Option<String>,
-    pub provider_session_resolved_account: Option<String>,
-    pub resume_acceptance_status: Option<String>,
-    pub resume_acceptance_evidence: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InvocationStart {
-    pub invocation_uuid: String,
-    pub model_name: String,
-    pub provider_name: String,
-    pub provider_index: usize,
-    pub parent_invocation_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InvocationStatus {
-    Running,
-    Succeeded,
-    Failed,
-    Legacy,
-}
-
-impl InvocationStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            InvocationStatus::Running => "running",
-            InvocationStatus::Succeeded => "succeeded",
-            InvocationStatus::Failed => "failed",
-            InvocationStatus::Legacy => "legacy",
-        }
-    }
-
-    /// Inherent `from_str` returning `Option<Self>` per the PR-A contract
-    /// (`tmp/01-pr-a-contract.md` §"Struct contract"). The `FromStr` trait
-    /// impl below provides the `Result`-returning idiomatic Rust surface;
-    /// this inherent method is the contracted API caller-facing surface.
-    /// Clippy's `should_implement_trait` lint flags the name collision —
-    /// allowed here because both surfaces are intentional and the contract
-    /// pins this specific shape.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        s.parse().ok()
-    }
-}
-
-impl std::str::FromStr for InvocationStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(InvocationStatus::Running),
-            "succeeded" => Ok(InvocationStatus::Succeeded),
-            "failed" => Ok(InvocationStatus::Failed),
-            "legacy" => Ok(InvocationStatus::Legacy),
-            _ => Err(format!("Unknown invocation status: {s}")),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
