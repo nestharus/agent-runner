@@ -2781,13 +2781,6 @@ impl StateDb {
     fn session_turn_count_error(e: sqlite::Error) -> String {
         format!("Failed to count session turns: {e}")
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn drop_provider_quotas_for_test(&self) {
-        self.conn
-            .execute_batch("DROP TABLE provider_quotas")
-            .unwrap();
-    }
 }
 
 #[allow(dead_code)]

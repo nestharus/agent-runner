@@ -9,6 +9,13 @@
 use super::*;
 
 impl StateDb {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn drop_provider_quotas_for_test(&self) {
+        self.conn
+            .execute_batch("DROP TABLE provider_quotas")
+            .unwrap();
+    }
+
     /// Test-only: backdate a provider's `refreshed_at` so tests can seed
     /// turns whose timestamps are "after" the refresh.
     #[cfg(any(test, feature = "test-support"))]
