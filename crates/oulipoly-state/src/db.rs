@@ -74,6 +74,7 @@ mod invocation_lifecycle;
 mod invocation_records;
 mod invocation_schema;
 mod invocation_window;
+mod lifecycle_invocation_row;
 mod lifecycle_log_adapter;
 mod model_parameters;
 mod opening;
@@ -104,6 +105,7 @@ pub use self::discovery_types::{
     ModelParameter, ParamType,
 };
 pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
+use self::lifecycle_invocation_row::LifecycleInvocationRow;
 pub use self::owned_turn_event::{OwnedTurnEvent, OwnedTurnEventRow};
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,
@@ -158,14 +160,6 @@ pub enum ReadOnlyOpenError {
 }
 
 pub type DbError = String;
-
-struct LifecycleInvocationRow {
-    invocation_uuid: String,
-    provider_name: Option<String>,
-    session_id: Option<String>,
-    provider_session_id: Option<String>,
-    resume_input_id: Option<String>,
-}
 
 #[allow(dead_code)]
 fn migrate_legacy_invocations() {
