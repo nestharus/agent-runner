@@ -14,7 +14,7 @@
 //! Rationale: this module is the session-metadata adapter/resolver subsystem.
 //! Focused sibling modules own transcript registry hydration, provider-private
 //! locator scans, cwd resolution, and display/error mapping while this module
-//! preserves the historical public API.
+//! preserves the historical public API through those runner-owned interfaces.
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
@@ -28,6 +28,19 @@
 //!       - UUID parser and formatter helpers
 //!       - ambiguity, recency, mutability, and provider-selection predicates
 //!       - ResumeError and LocatorError to MetadataError mapping
+//!       - TranscriptLocatorRegistry and TranscriptLocator common-interface
+//!         handoff for provider-private transcript storage
+//!       - session-resolution inputs StateDb, ModelStore, ResolvedResume, and the
+//!         oulipoly-config session/provider/storage types (ProvidersConfig,
+//!         SessionsConfig, ModelConfig, SessionStorage, ScriptSessionStorageType)
+//!         that resume/metadata resolution reads
+//!       - external-provider session-locate surface (ProviderRegistry,
+//!         session_provider identity/locate/describe, oulipoly_provider DescribeResult)
+//!       - external session-runtime workspace-root lookup over
+//!         oulipoly_state::mailbox::MailboxDb session_runtime rows
+//!       - the session-metadata-resolution sibling resolvers (ambiguity, cwd,
+//!         errors, ids, locator, metadata_shape, mutability, registry, resume,
+//!         transcript, workspace) this facade sequences
 
 mod ambiguity;
 mod cwd;
@@ -327,13 +340,8 @@ fn load_builtin_metadata_facts(
     input: &str,
 ) -> Result<BuiltinMetadataFacts, MetadataError> {
     let mut resolved = resolve_metadata_session(state, models, input)?;
-    let provider = match effective_provider_for_resolved(&resolved, providers_cfg) {
-        Ok(provider) => provider,
-        Err(_) => {
-            resolved = rebase_builtin_resolved(state, providers_cfg, sessions_cfg, resolved)?;
-            effective_provider_for_resolved(&resolved, providers_cfg)?
-        }
-    };
+    let provider =
+        resolve_builtin_provider_with_rebase(state, providers_cfg, sessions_cfg, &mut resolved)?;
     let provider_name = resolved.active_provider.clone();
     let active_segment_id = external_active_segment_id(state, &resolved)?;
     let located_transcript = available_jsonl_path(
@@ -347,14 +355,48 @@ fn load_builtin_metadata_facts(
         &provider_name,
         &resolved.active_session_id,
     )?;
-    Ok(BuiltinMetadataFacts {
+    Ok(builtin_metadata_facts(
         resolved,
         provider,
         provider_name,
         active_segment_id,
         located_transcript,
         workspace_root,
-    })
+    ))
+}
+
+/// Resolve the effective provider for a builtin resume, rebasing the resolved
+/// resume onto an earlier resumable segment when the active provider is no
+/// longer configured.
+fn resolve_builtin_provider_with_rebase(
+    state: &StateDb,
+    providers_cfg: &ProvidersConfig,
+    sessions_cfg: &SessionsConfig,
+    resolved: &mut ResolvedResume,
+) -> Result<oulipoly_config::ProviderConfig, MetadataError> {
+    if let Ok(provider) = effective_provider_for_resolved(resolved, providers_cfg) {
+        return Ok(provider);
+    }
+    *resolved = rebase_builtin_resolved(state, providers_cfg, sessions_cfg, resolved.clone())?;
+    effective_provider_for_resolved(resolved, providers_cfg)
+}
+
+fn builtin_metadata_facts(
+    resolved: oulipoly_state::ResolvedResume,
+    provider: oulipoly_config::ProviderConfig,
+    provider_name: String,
+    active_segment_id: i64,
+    located_transcript: LocatedTranscript,
+    workspace_root: PathBuf,
+) -> BuiltinMetadataFacts {
+    BuiltinMetadataFacts {
+        resolved,
+        provider,
+        provider_name,
+        active_segment_id,
+        located_transcript,
+        workspace_root,
+    }
 }
 
 /// Rebase a resolved resume onto a resumable earlier chain segment when its
@@ -474,13 +516,29 @@ fn load_external_metadata_facts(
         &provider_name,
         &resolved.active_session_id,
     );
-    Ok(ExternalMetadataFacts {
+    Ok(external_metadata_facts(
         provider,
         provider_name,
         active_segment_id,
         located_transcript,
         workspace_root,
-    })
+    ))
+}
+
+fn external_metadata_facts(
+    provider: oulipoly_config::ProviderConfig,
+    provider_name: String,
+    active_segment_id: i64,
+    located_transcript: LocatedTranscript,
+    workspace_root: PathBuf,
+) -> ExternalMetadataFacts {
+    ExternalMetadataFacts {
+        provider,
+        provider_name,
+        active_segment_id,
+        located_transcript,
+        workspace_root,
+    }
 }
 
 fn map_external_session_metadata(
@@ -621,7 +679,6 @@ pub fn resolve_resume_workspace_root(
     providers_cfg: &ProvidersConfig,
     input: &str,
 ) -> Result<PathBuf, MetadataError> {
-    parse_session_uuid(input)?;
     let resolved = state
         .resolve_resume(models, input, None)
         .map_err(map_resume_error)?;
