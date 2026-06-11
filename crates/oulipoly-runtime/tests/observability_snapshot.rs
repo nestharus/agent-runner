@@ -187,7 +187,7 @@ fn provider_invocation_process_liveness_distinguishes_verified_live_and_dead() {
 
     let snapshot = fixture
         .service()
-        .snapshot(&fixture.root(), SnapshotLimits::default());
+        .snapshot(&fixture.root(), full_snapshot_limits());
 
     let live = node(
         &snapshot,
@@ -221,7 +221,7 @@ fn running_invocation_with_dead_pid_is_reconciled_to_stale_not_running() {
 
     let snapshot = fixture
         .service()
-        .snapshot(&fixture.root(), SnapshotLimits::default());
+        .snapshot(&fixture.root(), full_snapshot_limits());
 
     // The live-backed running invocation stays Running; the running-status
     // invocation whose process is dead is reconciled to Stale (it died without
@@ -333,7 +333,7 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
 
     let snapshot = fixture
         .service()
-        .snapshot(&fixture.root(), SnapshotLimits::default());
+        .snapshot(&fixture.root(), full_snapshot_limits());
 
     assert!(has_diagnostic(&snapshot, "stale-runtime"));
     let session = node(&snapshot, "session:session-observe");
@@ -409,7 +409,7 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
 
     let snapshot = fixture
         .service()
-        .snapshot(&fixture.root(), SnapshotLimits::default());
+        .snapshot(&fixture.root(), full_snapshot_limits());
 
     assert!(has_diagnostic(&snapshot, "stuck:claim-dead"));
     let wake = node(&snapshot, "wake:session-observe:claim-a");
@@ -432,6 +432,37 @@ fn missing_runtime_with_pending_mailbox_reports_wake_needed() {
         .snapshot(&fixture.root(), SnapshotLimits::default());
 
     assert!(has_diagnostic(&snapshot, "wake-needed:no-runtime"));
+}
+
+#[test]
+fn default_snapshot_hides_terminal_nodes_and_explicit_full_snapshot_keeps_them() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let pid = fixture.open_pid();
+    let owner = current_identity();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
+    drop(pid);
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "done-workload",
+        &agent_bash_meta("done-workload", "DONE", &owner, Some(778), Some(0)),
+        "done tail",
+    );
+
+    assert!(!SnapshotLimits::default().include_terminal);
+    let live_only = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+    let full = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+
+    assert!(find_node(&live_only, "agent-bash:done-workload").is_none());
+    assert_eq!(
+        node(&full, "agent-bash:done-workload").status,
+        MonitorStatus::Succeeded
+    );
+    assert!(full.nodes.len() > live_only.nodes.len());
 }
 
 #[test]
@@ -490,6 +521,7 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
     let snapshot = fixture.service().snapshot(
         &fixture.root(),
         SnapshotLimits {
+            include_terminal: true,
             agent_bash_scan_dirs: 4,
             log_tail_bytes: 64,
             ..SnapshotLimits::default()
@@ -565,6 +597,7 @@ fn agent_bash_mailbox_referenced_state_dir_is_included_even_outside_scan_limit()
     let snapshot = fixture.service().snapshot(
         &fixture.root(),
         SnapshotLimits {
+            include_terminal: true,
             agent_bash_scan_dirs: 1,
             log_tail_bytes: 64,
             ..SnapshotLimits::default()
@@ -585,6 +618,13 @@ fn restore_env(name: &str, value: Option<OsString>) {
         None => unsafe {
             std::env::remove_var(name);
         },
+    }
+}
+
+fn full_snapshot_limits() -> SnapshotLimits {
+    SnapshotLimits {
+        include_terminal: true,
+        ..SnapshotLimits::default()
     }
 }
 

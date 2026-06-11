@@ -13,6 +13,7 @@ mod mailbox;
 mod service;
 mod state_access;
 mod transcript_source;
+mod visibility;
 
 pub use dto::{
     CancelRef, InspectRef, LivenessStatus, MailboxState, MonitorDiagnostic,
