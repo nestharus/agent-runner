@@ -1250,9 +1250,6 @@ fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> V
         ":(exclude)planning/s10-moveout/**",
         ":(exclude)planning/wu-e/**",
         ":(exclude)planning/opencode-contract/**",
-        ":(exclude).target-r2v/**",
-        ":(exclude)crates/oulipoly-state/src/db/tests.rs",
-        ":(exclude)crates/oulipoly-state/src/db/tests/**",
     ]);
     args
 }
