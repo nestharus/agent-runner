@@ -16,6 +16,7 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::mailbox::project_mailbox;
 use crate::observability::state_access::SnapshotStores;
 use crate::observability::transcript_source::SessionTranscriptResolver;
+use crate::observability::visibility::retain_live_subtrees;
 use oulipoly_config::SessionStorage;
 use oulipoly_state::mailbox::MailboxRow;
 use serde::Serialize;
@@ -96,7 +97,6 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
             &mailbox.rows,
             limits,
         ));
-        let invocation_count = invocation.invocation_count;
         let pending_mailbox_count = mailbox.pending_count;
         let running_agent_bash_count = agent_bash.running_count;
         let root_invocation_uuid = invocation.root_invocation_uuid.clone();
@@ -114,10 +114,12 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
             root_invocation_uuid.as_deref(),
             limits,
         );
+        if !limits.include_terminal {
+            retain_live_subtrees(&mut nodes);
+        }
         let summary = summary(
             &nodes,
             &diagnostics,
-            invocation_count,
             pending_mailbox_count,
             running_agent_bash_count,
         );
@@ -294,19 +296,25 @@ fn monitor_snapshot(
 fn summary(
     nodes: &[MonitorNode],
     diagnostics: &[MonitorDiagnostic],
-    invocation_count: usize,
     pending_mailbox_count: usize,
     running_agent_bash_count: usize,
 ) -> MonitorSummary {
     MonitorSummary {
         status: summary_status(nodes, diagnostics),
         total_nodes: nodes.len(),
-        invocation_nodes: invocation_count,
+        invocation_nodes: invocation_nodes(nodes),
         running_nodes: running_nodes(nodes),
         pending_mailbox_count,
         running_agent_bash_count,
         diagnostics_count: diagnostics.len(),
     }
+}
+
+fn invocation_nodes(nodes: &[MonitorNode]) -> usize {
+    nodes
+        .iter()
+        .filter(|node| node.kind == MonitorNodeKind::Invocation)
+        .count()
 }
 
 fn running_nodes(nodes: &[MonitorNode]) -> usize {
