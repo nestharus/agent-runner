@@ -111,6 +111,9 @@ pub use self::providers::ProviderRecord;
 pub use self::resume::{
     ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview, WrongIdKindInput,
 };
+#[allow(unused_imports)]
+pub use self::session_turns::SessionTurnRecord;
+pub use self::session_turns::{SessionTurnCounts, SessionTurnIngest};
 
 use self::lifecycle_log_adapter as lc_log_adapter;
 use self::sqlite_adapter as sqlite;
@@ -145,37 +148,6 @@ pub enum ReadOnlyOpenError {
     Operational { message: String },
 }
 
-/// One turn ingested from a CLI session log. The unified store across
-/// every CLI we know how to parse — Claude Code, Codex, etc.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct SessionTurnRecord {
-    pub provider_name: String,
-    pub session_id: String,
-    pub turn_id: String,
-    pub timestamp: DateTime<Utc>,
-    /// "user" or "assistant" — only "assistant" turns count toward quota.
-    pub role: String,
-    pub parent_turn_id: Option<String>,
-    pub is_sidechain: bool,
-    pub source_file: String,
-}
-
-/// One turn batched into `ingest_session_turns_batch`. Named struct
-/// instead of a tuple so callers can't accidentally swap positional
-/// fields (the role / parent_turn_id pair is otherwise easy to mix up).
-#[derive(Debug, Clone)]
-pub struct SessionTurnIngest {
-    pub session_id: String,
-    pub turn_id: String,
-    pub timestamp: DateTime<Utc>,
-    pub role: String,
-    pub parent_turn_id: Option<String>,
-    pub is_sidechain: bool,
-    pub is_compaction_boundary: bool,
-    pub body: Option<String>,
-}
-
 /// Oulipoly-owned compact-summary evidence projected from provider transcripts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedTurnEventRow {
@@ -198,13 +170,6 @@ pub struct OwnedTurnEvent {
 mod owned_turn_event;
 
 pub type DbError = String;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionTurnCounts {
-    pub total: u64,
-    pub assistant: u64,
-    pub sidechain: u64,
-}
 
 #[derive(Debug, Clone)]
 pub struct SessionMarkerPayload {
