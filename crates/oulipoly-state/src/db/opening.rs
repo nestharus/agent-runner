@@ -15,6 +15,35 @@ use crate::schema::{
 };
 
 impl StateDb {
+    pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
+        Self::validate_read_only_paths(path)?;
+        let conn = Self::open_read_only_connection(path)?;
+        Self::probe_read_only_schema(path, &conn)?;
+
+        Ok(Self {
+            conn,
+            db_path: path.to_path_buf(),
+            lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
+        })
+    }
+
+    pub fn open_default() -> Result<Self, String> {
+        let db_path = Self::default_path()?;
+        Self::open(&db_path)
+    }
+
+    pub fn open_for_memory(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open(path.as_ref())
+    }
+
+    pub fn default_path() -> Result<PathBuf, String> {
+        Ok(crate::paths::data_dir()?.join("state.db"))
+    }
+
+    pub fn connection(&self) -> &sqlite::Connection {
+        &self.conn
+    }
+
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
