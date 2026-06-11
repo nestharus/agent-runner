@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
-//! - mutator
+//! - orchestration
+//! - formatter
 //!
-//! Role set: { mutator }
+//! Role set: { orchestration, formatter }
 //!
-//! Test-support mutations for seeding provider quota edge cases.
+//! Test-support writes for seeding provider quota edge cases.
 
 use super::*;
 

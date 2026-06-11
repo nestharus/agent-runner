@@ -1,3 +1,14 @@
+//! ## Declared roles
+//!
+//! - accessor
+//! - orchestration
+//! - mapper
+//! - formatter
+//!
+//! Role set: { accessor, orchestration, mapper, formatter }
+//!
+//! Invocation sidecar artifact pathing, payload mapping, and atomic file writes.
+
 use super::{InvocationStart, StateDb, lc_log_adapter};
 use crate::result_envelope::{ResultEnvelopeInput, result_envelope_payload};
 use std::path::{Path, PathBuf};

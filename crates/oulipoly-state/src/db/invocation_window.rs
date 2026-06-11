@@ -1,3 +1,15 @@
+//! ## Declared roles
+//!
+//! - accessor
+//! - orchestration
+//! - parser
+//! - predicate
+//! - mapper
+//!
+//! Role set: { accessor, orchestration, parser, predicate, mapper }
+//!
+//! Invocation-window session lookup, timestamp parsing, filtering, and ranking.
+
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;

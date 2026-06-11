@@ -1,3 +1,12 @@
+//! ## Declared roles
+//!
+//! - parser
+//! - formatter
+//!
+//! Role set: { parser, formatter }
+//!
+//! RFC3339 timestamp parsing and formatting helpers for persisted rows.
+
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};
 

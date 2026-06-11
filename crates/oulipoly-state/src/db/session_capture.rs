@@ -1,3 +1,15 @@
+//! ## Declared roles
+//!
+//! - accessor
+//! - orchestration
+//! - mapper
+//! - predicate
+//! - formatter
+//!
+//! Role set: { accessor, orchestration, mapper, predicate, formatter }
+//!
+//! Invocation session-capture projection, persistence, and lifecycle reporting.
+
 use super::{LifecycleInvocationRow, RusqliteOptionalExtension, StateDb, lc_log_adapter, sqlite};
 
 struct SessionCaptureProjection<'a> {

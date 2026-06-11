@@ -1,3 +1,14 @@
+//! ## Declared roles
+//!
+//! - validator
+//! - accessor
+//! - mapper
+//! - filter
+//!
+//! Role set: { validator, accessor, mapper, filter }
+//!
+//! Schema-boundary regression assertions over source snippets and migration files.
+
 const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             invocation_uuid TEXT NOT NULL UNIQUE,

@@ -1,13 +1,13 @@
 //! ## Declared roles
 //!
-//! - DTO
+//! - validator
+//! - orchestration
+//! - accessor
 //! - mapper
-//! - policy constant
-//! - schema
 //!
-//! Role set: { DTO, mapper, policy constant, schema }
+//! Role set: { validator, orchestration, accessor, mapper }
 //!
-//! Provider quota persistence types and burn-rate guard constants.
+//! Provider quota schema validation, repair orchestration, and row mapping types.
 
 use super::*;
 

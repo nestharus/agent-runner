@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
-//! - mutator
+//! - orchestration
+//! - formatter
 //!
-//! Role set: { mutator }
+//! Role set: { orchestration, formatter }
 //!
-//! Provider quota status flag and probe timestamp mutations.
+//! Provider quota status flag and probe timestamp writes.
 
 use super::*;
 

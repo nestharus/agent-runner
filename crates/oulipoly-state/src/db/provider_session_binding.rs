@@ -1,3 +1,16 @@
+//! ## Declared roles
+//!
+//! - orchestration
+//! - accessor
+//! - validator
+//! - predicate
+//! - mapper
+//! - formatter
+//!
+//! Role set: { orchestration, accessor, validator, predicate, mapper, formatter }
+//!
+//! Provider-session binding persistence and chain minting coordination.
+
 use super::{DbError, RusqliteOptionalExtension, StateDb, sqlite};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
