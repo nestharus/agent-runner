@@ -156,24 +156,83 @@ fn assert_typed_signal_disposition_marks_guard_after_finalize(
     function_name: &str,
     disposition: &str,
 ) {
+    assert_disposition_guard_evidence(disposition_guard_evidence(function_name, disposition));
+}
+
+fn disposition_guard_evidence<'a>(function_name: &'a str, disposition: &str) -> GuardEvidence<'a> {
     let body = production_block_after(disposition_source(), function_name);
-    let disposition_token = format!("TerminalSignalDisposition::{disposition}");
+    let disposition_token = disposition_token(disposition);
+    let has_disposition = body.contains(&disposition_token);
+    let finalize = body.find("finalize_invocation");
+    let mark = body.find("guard.mark_finalized()");
+    let has_guard_fallback = body.contains("finalize_invocation_from_guard");
+    guard_evidence(
+        function_name,
+        disposition_token,
+        has_disposition,
+        finalize,
+        mark,
+        has_guard_fallback,
+    )
+}
+
+fn disposition_token(disposition: &str) -> String {
+    format!("TerminalSignalDisposition::{disposition}")
+}
+
+fn assert_disposition_guard_evidence(evidence: GuardEvidence<'_>) {
     assert!(
-        body.contains(&disposition_token),
-        "{function_name} must handle {disposition_token}"
+        evidence.has_disposition,
+        "{} must handle {}",
+        evidence.function_name, evidence.disposition_token
     );
-    let finalize_idx = body
-        .find("finalize_invocation")
-        .unwrap_or_else(|| panic!("{disposition_token} must explicitly finalize invocation"));
-    let mark_idx = body
-        .find("guard.mark_finalized()")
-        .unwrap_or_else(|| panic!("{disposition_token} must mark FinalizerGuard finalized"));
+    let finalize_idx = evidence.finalize.unwrap_or_else(|| {
+        panic!(
+            "{} must explicitly finalize invocation",
+            evidence.disposition_token
+        )
+    });
+    let mark_idx = evidence.mark.unwrap_or_else(|| {
+        panic!(
+            "{} must mark FinalizerGuard finalized",
+            evidence.disposition_token
+        )
+    });
     assert!(
         finalize_idx < mark_idx,
-        "{disposition_token} must mark the guard only after explicit finalization"
+        "{} must mark the guard only after explicit finalization",
+        evidence.disposition_token
     );
     assert!(
-        !body.contains("finalize_invocation_from_guard"),
-        "{disposition_token} must not route typed-signal handling through FinalizerGuard::drop"
+        !evidence.has_guard_fallback,
+        "{} must not route typed-signal handling through FinalizerGuard::drop",
+        evidence.disposition_token
     );
+}
+
+struct GuardEvidence<'a> {
+    function_name: &'a str,
+    disposition_token: String,
+    has_disposition: bool,
+    finalize: Option<usize>,
+    mark: Option<usize>,
+    has_guard_fallback: bool,
+}
+
+fn guard_evidence<'a>(
+    function_name: &'a str,
+    disposition_token: String,
+    has_disposition: bool,
+    finalize: Option<usize>,
+    mark: Option<usize>,
+    has_guard_fallback: bool,
+) -> GuardEvidence<'a> {
+    GuardEvidence {
+        function_name,
+        disposition_token,
+        has_disposition,
+        finalize,
+        mark,
+        has_guard_fallback,
+    }
 }
