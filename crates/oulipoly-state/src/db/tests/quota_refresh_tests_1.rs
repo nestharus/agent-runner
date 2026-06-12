@@ -6,6 +6,21 @@
 //! - predicate
 //!
 //! Role set: { validator, accessor, mapper, predicate }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/quota_refresh_tests_1.rs
+//!     role: intrinsic-surface
+//!     Domain: quota-refresh-tests-1-persistence
+//!     Owns:
+//!       - StateDb quota-refresh-tests-1 persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: calls_since_refresh, exhausted_at, last_empty_refresh_at, mark_current_schema_version, quota_input, quota_window_rows, test_db
+//! ```
 
 use super::common::*;
 use super::*;

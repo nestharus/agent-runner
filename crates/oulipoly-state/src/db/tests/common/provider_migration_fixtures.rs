@@ -6,6 +6,21 @@
 //! - orchestration
 //!
 //! Role set: { accessor, formatter, mapper, orchestration }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/common/provider_migration_fixtures.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-migration-fixtures-persistence
+//!     Owns:
+//!       - StateDb provider-migration-fixtures persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, StateDb, TempDir, Uuid, params, sqlite
+//! ```
 
 use super::super::*;
 use super::*;

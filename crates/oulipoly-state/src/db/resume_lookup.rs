@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, filter, formatter, mapper, parser }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/resume_lookup.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-lookup-persistence
+//!     Owns:
+//!       - StateDb resume-lookup persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: ChainPreview, Connection, DateTime, DbError, ResumeChainCandidate, StateDb, Utc, Uuid, WrongIdKindInvocationMatch, WrongIdKindInvocationRow, params, sqlite
+//! ```
+//!
 //! Resume chain and wrong-id lookup helpers.
 
 use super::*;

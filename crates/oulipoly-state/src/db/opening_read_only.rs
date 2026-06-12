@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, formatter, validator, mapper, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/opening_read_only.rs
+//!     role: intrinsic-surface
+//!     Domain: opening-read-only-persistence
+//!     Owns:
+//!       - StateDb opening-read-only persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, Path, PathBuf, ReadOnlyOpenError, StateDb, sqlite
+//! ```
+//!
 //! Read-only state database open error classification and path validation.
 
 use super::*;

@@ -7,6 +7,21 @@
 //!
 //! Role set: { formatter, orchestration, mapper, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quota_window_writes.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-quota-window-writes-persistence
+//!     Owns:
+//!       - StateDb provider-quota-window-writes persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, HashMap, MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT, QuotaAggregateProjection, QuotaWindow, QuotaWindowDelta, QuotaWindowInput, StateDb, params, sqlite
+//! ```
+//!
 //! Provider quota window replacement and burn-rate delta classification.
 
 use super::*;

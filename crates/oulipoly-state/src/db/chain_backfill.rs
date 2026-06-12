@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, formatter, mapper, orchestration, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/chain_backfill.rs
+//!     role: intrinsic-surface
+//!     Domain: chain-backfill-persistence
+//!     Owns:
+//!       - StateDb chain-backfill persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, DbError, StateDb, Uuid, params, sqlite
+//! ```
+//!
 //! Session chain backfill from legacy session turn rows.
 
 use super::*;

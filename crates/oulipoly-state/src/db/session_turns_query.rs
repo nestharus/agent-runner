@@ -9,6 +9,21 @@
 //!
 //! Role set: { accessor, filter, formatter, mapper, parser, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/session_turns_query.rs
+//!     role: intrinsic-surface
+//!     Domain: session-turns-query-persistence
+//!     Owns:
+//!       - StateDb session-turns-query persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: DateTime, SessionTurnCounts, StateDb, Utc, params, sqlite
+//! ```
+//!
 //! Session-turn count and user-body query helpers.
 
 use super::*;

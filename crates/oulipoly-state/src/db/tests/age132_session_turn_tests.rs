@@ -3,6 +3,21 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/age132_session_turn_tests.rs
+//!     role: intrinsic-surface
+//!     Domain: age132-session-turn-tests-persistence
+//!     Owns:
+//!       - StateDb age132-session-turn-tests persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: SESSION_A, session_turn_count, session_turn_detail_row, session_turn_source_file, test_db, ts
+//! ```
 
 use super::common::*;
 use super::*;

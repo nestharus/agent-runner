@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, formatter, mapper, orchestration, validator }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quotas.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-quotas-persistence
+//!     Owns:
+//!       - StateDb provider-quotas persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: ColumnRepair, Connection, DateTime, DropColumnRepair, StateDb, Utc, sqlite
+//! ```
+//!
 //! Provider quota schema validation, repair orchestration, and row mapping types.
 
 use super::*;

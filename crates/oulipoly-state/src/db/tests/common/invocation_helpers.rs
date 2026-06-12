@@ -7,6 +7,21 @@
 //! - validator
 //!
 //! Role set: { accessor, formatter, mapper, orchestration, validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/common/invocation_helpers.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-helpers-persistence
+//!     Owns:
+//!       - StateDb invocation-helpers persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, InvocationStart, StateDb, Uuid, params, sqlite
+//! ```
 
 use super::super::*;
 pub(in crate::db::tests) fn insert_invocation_fixture(

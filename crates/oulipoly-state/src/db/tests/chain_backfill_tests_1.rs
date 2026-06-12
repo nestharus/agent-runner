@@ -3,6 +3,21 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/chain_backfill_tests_1.rs
+//!     role: intrinsic-surface
+//!     Domain: chain-backfill-tests-1-persistence
+//!     Owns:
+//!       - StateDb chain-backfill-tests-1 persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: CHAIN_A, SESSION_A, SESSION_B, active_imported_segment_count, active_segment_count_for_chain, chain_count, invocation_checksum, invocation_dual_id_row, invocation_migration_backfill_row, legacy_v4_invocation_dual_id_fixture, pre_chain_db_with_turns, resolver_model_store, seed_chain_row, segment_count, test_db, ts
+//! ```
 
 use super::common::*;
 use super::*;

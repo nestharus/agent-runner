@@ -7,6 +7,21 @@
 //!
 //! Role set: { accessor, formatter, orchestration, validator }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/opening_write.rs
+//!     role: intrinsic-surface
+//!     Domain: opening-write-persistence
+//!     Owns:
+//!       - StateDb opening-write persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, LifecycleEventSink, Mutex, NoopLifecycleEventSink, Path, PathBuf, ReadOnlyOpenError, StateDb, Transaction, sqlite
+//! ```
+//!
 //! State database write/open entry points and current validator repairs.
 
 use super::*;

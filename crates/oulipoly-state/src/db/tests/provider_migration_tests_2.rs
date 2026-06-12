@@ -3,6 +3,21 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/provider_migration_tests_2.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-migration-tests-2-persistence
+//!     Owns:
+//!       - StateDb provider-migration-tests-2 persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: ProviderAggregateSnapshot, invocation_count, legacy_invocations_snapshot, legacy_invocations_with_malformed_providers_db, mark_current_schema_version, provider_aggregate_snapshot, provider_last_error_fixture_db, provider_last_error_tie_fixture_db, provider_rebuild_fixture_db
+//! ```
 
 use super::common::*;
 use super::*;

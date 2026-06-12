@@ -9,6 +9,21 @@
 //!
 //! Role set: { accessor, formatter, validator, orchestration, mapper, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_schema_legacy_migration.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-schema-legacy-migration-persistence
+//!     Owns:
+//!       - StateDb invocation-schema-legacy-migration persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, HashMap, InvocationStatus, LegacyInvocationInsert, LegacyInvocationRow, StateDb, Transaction, Uuid, params, sqlite
+//! ```
+//!
 //! Legacy invocation table rebuild migration helpers.
 
 use super::*;

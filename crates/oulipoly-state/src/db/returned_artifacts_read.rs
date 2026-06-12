@@ -9,6 +9,21 @@
 //!
 //! Role set: { accessor, formatter, mapper, parser, predicate, validator }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/returned_artifacts_read.rs
+//!     role: intrinsic-surface
+//!     Domain: returned-artifacts-read-persistence
+//!     Owns:
+//!       - StateDb returned-artifacts-read persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, DateTime, DbError, ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError, ReturnedArtifactRawRow, StateDb, Utc, Uuid, ValidatedReturnedArtifactFieldValues, params, returned_artifact_producer_uuid, sqlite
+//! ```
+//!
 //! Returned-artifact list query and row decoding.
 
 use super::*;

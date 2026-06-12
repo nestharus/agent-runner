@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, formatter, mapper, parser, orchestration }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/model_parameters.rs
+//!     role: intrinsic-surface
+//!     Domain: model-parameters-persistence
+//!     Owns:
+//!       - StateDb model-parameters persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: CliMapping, ModelParameter, ParamType, StateDb, params, sqlite
+//! ```
+//!
 //! Discovered model parameter persistence methods for `StateDb`.
 
 use super::*;

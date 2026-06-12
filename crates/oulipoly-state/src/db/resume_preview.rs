@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, filter, formatter, mapper, parser }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/resume_preview.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-preview-persistence
+//!     Owns:
+//!       - StateDb resume-preview persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: ChainPreview, DateTime, ParsedTurnPreviewTimestamp, RecentTurnRow, StateDb, TurnPreview, Utc, params, sqlite
+//! ```
+//!
 //! Resume preview query and turn-preview mapping helpers.
 
 use super::*;

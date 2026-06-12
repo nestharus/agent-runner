@@ -10,6 +10,21 @@
 //!
 //! Role set: { accessor, formatter, orchestration, mapper, parser, predicate, validator }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_lifecycle_finalize_write.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-lifecycle-finalize-write-persistence
+//!     Owns:
+//!       - StateDb invocation-lifecycle-finalize-write persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, FinalizeInvocationRow, FinalizeInvocationRowColumns, InvocationStatus, StateDb, params, sqlite
+//! ```
+//!
 //! Invocation finalize row and provider aggregate writes.
 
 use super::*;

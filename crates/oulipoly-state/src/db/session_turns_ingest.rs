@@ -7,6 +7,21 @@
 //!
 //! Role set: { formatter, mapper, orchestration, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/session_turns_ingest.rs
+//!     role: intrinsic-surface
+//!     Domain: session-turns-ingest-persistence
+//!     Owns:
+//!       - StateDb session-turns-ingest persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, DateTime, StateDb, Utc, params, sqlite
+//! ```
+//!
 //! Session-turn DTOs and ingest writes.
 
 use super::*;

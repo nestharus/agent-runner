@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, filter, formatter, mapper, orchestration }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quota_refresh.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-quota-refresh-persistence
+//!     Owns:
+//!       - StateDb provider-quota-refresh persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, DateTime, HashMap, QuotaAggregateProjection, QuotaRecord, QuotaWindow, QuotaWindowInput, StateDb, Transaction, Utc, params, sqlite
+//! ```
+//!
 //! Provider quota refresh aggregate orchestration and empty-refresh writes.
 
 use super::*;

@@ -6,6 +6,21 @@
 //! - predicate
 //!
 //! Role set: { validator, mapper, formatter, predicate }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/age132_preview_tests.rs
+//!     role: intrinsic-surface
+//!     Domain: age132-preview-tests-persistence
+//!     Owns:
+//!       - StateDb age132-preview-tests persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: CHAIN_A, CHAIN_B, SESSION_A, seed_test_chain, test_db, ts
+//! ```
 
 use super::common::*;
 use super::*;

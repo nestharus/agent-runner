@@ -7,6 +7,21 @@
 //!
 //! Role set: { accessor, formatter, orchestration, mapper }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_lifecycle_start.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-lifecycle-start-persistence
+//!     Owns:
+//!       - StateDb invocation-lifecycle-start persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: InvocationStart, InvocationStatus, StateDb, lc_log_adapter, params, sqlite
+//! ```
+//!
 //! Invocation start persistence and lifecycle-log context.
 
 use super::*;

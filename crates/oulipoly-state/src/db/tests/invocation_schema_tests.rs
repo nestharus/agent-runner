@@ -3,6 +3,21 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/invocation_schema_tests.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-schema-tests-persistence
+//!     Owns:
+//!       - StateDb invocation-schema-tests persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: FROM, invocation_column_notnull, invocation_columns, invocation_table_sql, invocation_terminal_reason_for_model, legacy_invocations_db, mark_current_schema_version, test_db
+//! ```
 
 use super::common::*;
 use super::*;

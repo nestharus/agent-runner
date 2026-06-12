@@ -8,6 +8,21 @@
 //!
 //! Role set: { accessor, formatter, mapper, orchestration, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/chain_segments_import.rs
+//!     role: intrinsic-surface
+//!     Domain: chain-segments-import-persistence
+//!     Owns:
+//!       - StateDb chain-segments-import persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: Connection, DateTime, DbError, StateDb, Utc, Uuid, params, sqlite
+//! ```
+//!
 //! Imported chain minting and active segment closing helpers.
 
 use super::*;

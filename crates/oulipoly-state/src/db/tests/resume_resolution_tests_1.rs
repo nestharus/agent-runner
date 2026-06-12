@@ -3,6 +3,21 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/resume_resolution_tests_1.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-resolution-tests-1-persistence
+//!     Owns:
+//!       - StateDb resume-resolution-tests-1 persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: CHAIN_A, CHAIN_B, CHAIN_C, SESSION_A, SESSION_B, resolver_model_store, seed_chain_row, seed_invocation_for_session, seed_segment_row, seed_test_chain, test_db
+//! ```
 
 use super::common::*;
 use super::*;

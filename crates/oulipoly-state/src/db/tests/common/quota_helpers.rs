@@ -8,6 +8,21 @@
 //! - validator
 //!
 //! Role set: { accessor, formatter, mapper, orchestration, parser, validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/common/quota_helpers.rs
+//!     role: intrinsic-surface
+//!     Domain: quota-helpers-persistence
+//!     Owns:
+//!       - StateDb quota-helpers persistence surface: the StateDb methods, owned
+//!         tables/rows, and SQL this concern extends, split out of the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: DateTime, QuotaWindow, QuotaWindowInput, SessionTurnIngest, StateDb, Utc, params, sqlite
+//! ```
 
 use super::super::*;
 pub(in crate::db::tests) fn ts(value: &str) -> DateTime<Utc> {
