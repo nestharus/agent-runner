@@ -1,12 +1,13 @@
 //! ## Declared roles
 //!
+//! - orchestration
+//! - validator
+//! - mapper
 //! - accessor
 //! - formatter
-//! - orchestration
 //! - parser
-//! - validator
 //!
-//! Role set: { accessor, formatter, orchestration, parser, validator }
+//! Role set: { orchestration, validator, mapper, accessor, formatter, parser }
 
 use super::common::*;
 use super::*;

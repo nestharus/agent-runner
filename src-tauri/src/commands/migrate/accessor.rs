@@ -1,4 +1,10 @@
-//! Declared role: accessor
+//! ## Declared roles
+//!
+//! - orchestration
+//! - validator
+//! - accessor
+//!
+//! Role set: { orchestration, validator, accessor }
 
 use oulipoly_state::StateDb;
 use std::path::{Path, PathBuf};

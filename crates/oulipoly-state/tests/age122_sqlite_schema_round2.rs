@@ -1,12 +1,13 @@
 //! ## Declared roles
 //!
+//! - orchestration
+//! - filter
 //! - validator
+//! - mapper
 //! - accessor
 //! - formatter
-//! - mapper
-//! - filter
 //!
-//! Role set: { validator, accessor, formatter, mapper, filter }
+//! Role set: { orchestration, filter, validator, mapper, accessor, formatter }
 //!
 //! Schema-boundary regression assertions over source snippets and migration files.
 //!

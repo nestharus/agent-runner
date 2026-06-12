@@ -1,8 +1,10 @@
 //! ## Declared roles
 //!
 //! - validator
+//! - mapper
+//! - formatter
 //!
-//! Role set: { validator }
+//! Role set: { validator, mapper, formatter }
 
 use super::common::*;
 use super::*;

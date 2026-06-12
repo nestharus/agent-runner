@@ -1,11 +1,12 @@
 //! ## Declared roles
 //!
+//! - validator
+//! - predicate
 //! - mapper
 //! - formatter
 //! - parser
-//! - validator
 //!
-//! Role set: { mapper, formatter, parser, validator }
+//! Role set: { validator, predicate, mapper, formatter, parser }
 //!
 //! Returned-artifact identity and version-id codec helpers.
 
