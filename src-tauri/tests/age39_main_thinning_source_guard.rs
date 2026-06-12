@@ -131,14 +131,53 @@ fn diagnostics_source() -> &'static str {
 }
 
 fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start_idx = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing {start}"));
+    source_slice_from_parse_result(source, start, end, source_slice_bounds(source, start, end))
+}
+
+fn source_slice_bounds(
+    source: &str,
+    start: &str,
+    end: &str,
+) -> Result<(usize, usize), SourceSliceError> {
+    let start_idx = source.find(start).ok_or(SourceSliceError::Start)?;
     let end_idx = source[start_idx..]
         .find(end)
         .map(|idx| start_idx + idx)
-        .unwrap_or_else(|| panic!("missing {end} after {start}"));
-    &source[start_idx..end_idx]
+        .ok_or(SourceSliceError::End)?;
+    Ok((start_idx, end_idx))
+}
+
+fn source_slice_from_parse_result<'a>(
+    source: &'a str,
+    start: &str,
+    end: &str,
+    result: Result<(usize, usize), SourceSliceError>,
+) -> &'a str {
+    source_slice_from_bounds(source, validated_source_slice_bounds(start, end, result))
+}
+
+fn validated_source_slice_bounds(
+    start: &str,
+    end: &str,
+    result: Result<(usize, usize), SourceSliceError>,
+) -> (usize, usize) {
+    result.unwrap_or_else(|error| panic!("{}", source_slice_error_message(error, start, end)))
+}
+
+fn source_slice_from_bounds(source: &str, bounds: (usize, usize)) -> &str {
+    &source[bounds.0..bounds.1]
+}
+
+enum SourceSliceError {
+    Start,
+    End,
+}
+
+fn source_slice_error_message(error: SourceSliceError, start: &str, end: &str) -> String {
+    match error {
+        SourceSliceError::Start => format!("missing {start}"),
+        SourceSliceError::End => format!("missing {end} after {start}"),
+    }
 }
 
 fn compact(source: &str) -> String {
@@ -206,9 +245,16 @@ fn diagnostics_slice() -> &'static str {
 
 fn entrypoint_slice() -> &'static str {
     let source = main_source();
-    let start_idx = source
+    source_from_index(source, entrypoint_start_index(source))
+}
+
+fn entrypoint_start_index(source: &str) -> usize {
+    source
         .find("fn main() -> ExitCode")
-        .expect("missing main entrypoint");
+        .expect("missing main entrypoint")
+}
+
+fn source_from_index(source: &str, start_idx: usize) -> &str {
     &source[start_idx..]
 }
 

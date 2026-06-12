@@ -536,28 +536,69 @@ pub fn assert_single_terminal_signal(stderr: &str, expected_kind: &str, expect_s
 }
 
 pub fn assert_terminal_signal_shape(line: &str, expected_kind: &str, expect_session: bool) {
+    assert_terminal_signal_facts(terminal_signal_facts(line), expected_kind, expect_session);
+}
+
+fn terminal_signal_facts(line: &str) -> TerminalSignalFacts {
     let value = parse_terminal_signal_line(line);
     let object = value
         .as_object()
         .expect("terminal signal marker body object");
-    let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    assert_eq!(
+    let keys = object.keys().cloned().collect();
+    TerminalSignalFacts {
+        evidence_is_object: value["evidence"].is_object(),
+        invocation_id_is_uuid: uuid_value_is_valid(&value["invocation_id"]),
         keys,
-        BTreeSet::from(["evidence", "invocation_id", "kind", "session_id"]),
+        kind: value["kind"].clone(),
+        raw: value.clone(),
+        session_id_is_uuid: uuid_value_is_valid(&value["session_id"]),
+        session_is_null: value["session_id"].is_null(),
+    }
+}
+
+fn uuid_value_is_valid(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|raw| uuid::Uuid::parse_str(raw).is_ok())
+}
+
+fn assert_terminal_signal_facts(
+    facts: TerminalSignalFacts,
+    expected_kind: &str,
+    expect_session: bool,
+) {
+    assert_eq!(
+        facts.keys,
+        terminal_signal_expected_keys(),
         "AGE-153 marker schema from /home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/contracts/age-153-terminal-signal-wiring.md"
     );
-    assert_eq!(value["kind"], expected_kind);
-    assert!(value["evidence"].is_object(), "{value}");
-    let invocation_id = value["invocation_id"]
-        .as_str()
-        .expect("invocation_id string");
-    uuid::Uuid::parse_str(invocation_id).expect("invocation_id uuid");
+    assert_eq!(facts.kind, expected_kind);
+    assert!(facts.evidence_is_object, "{}", facts.raw);
+    assert!(facts.invocation_id_is_uuid, "invocation_id uuid");
     if expect_session {
-        let session_id = value["session_id"].as_str().expect("session_id string");
-        uuid::Uuid::parse_str(session_id).expect("session_id uuid");
+        assert!(facts.session_id_is_uuid, "session_id uuid");
     } else {
-        assert!(value["session_id"].is_null(), "{value}");
+        assert!(facts.session_is_null, "{}", facts.raw);
     }
+}
+
+fn terminal_signal_expected_keys() -> BTreeSet<String> {
+    BTreeSet::from([
+        "evidence".to_string(),
+        "invocation_id".to_string(),
+        "kind".to_string(),
+        "session_id".to_string(),
+    ])
+}
+
+struct TerminalSignalFacts {
+    evidence_is_object: bool,
+    invocation_id_is_uuid: bool,
+    keys: BTreeSet<String>,
+    kind: Value,
+    raw: Value,
+    session_id_is_uuid: bool,
+    session_is_null: bool,
 }
 
 pub fn assert_no_terminal_marker_on_stdout(output: &Output) {
@@ -693,9 +734,11 @@ pub fn main_rs_source() -> String {
 }
 
 pub fn balancing_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut combined = String::new();
-    for rel in [
+    combined_source(read_manifest_sources(balancing_source_files()))
+}
+
+fn balancing_source_files() -> &'static [&'static str] {
+    &[
         "src/run/mod.rs",
         "src/run/balancing/mod.rs",
         "src/run/balancing/orchestration.rs",
@@ -726,20 +769,15 @@ pub fn balancing_source() -> String {
         "src/run/balancing/predicate.rs",
         "src/run/balancing/state_update.rs",
         "src/run/balancing/validator.rs",
-    ] {
-        let path = root.join(rel);
-        let extra = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
-        combined.push('\n');
-        combined.push_str(&extra);
-    }
-    combined
+    ]
 }
 
 pub fn repl_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut combined = String::new();
-    for rel in [
+    combined_source(read_manifest_sources(repl_source_files()))
+}
+
+fn repl_source_files() -> &'static [&'static str] {
+    &[
         "src/run/mod.rs",
         "src/run/repl/mod.rs",
         "src/run/repl/orchestration.rs",
@@ -748,14 +786,7 @@ pub fn repl_source() -> String {
         "src/run/repl/formatter.rs",
         "src/run/repl/mapper.rs",
         "src/run/repl/validator.rs",
-    ] {
-        let path = root.join(rel);
-        let extra = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
-        combined.push('\n');
-        combined.push_str(&extra);
-    }
-    combined
+    ]
 }
 
 pub fn terminal_outcome_adapter_source() -> String {
@@ -764,13 +795,15 @@ pub fn terminal_outcome_adapter_source() -> String {
 }
 
 pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
-    let start_idx = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing {start}"));
+    source_block_from_parse_result(source, start, source_block_bounds(source, start))
+}
+
+fn source_block_bounds(source: &str, start: &str) -> Result<(usize, usize), SourceBlockError> {
+    let start_idx = source.find(start).ok_or(SourceBlockError::Start)?;
     let open_idx = source[start_idx..]
         .find('{')
         .map(|idx| start_idx + idx)
-        .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+        .ok_or(SourceBlockError::OpeningBrace)?;
     let mut depth = 1usize;
     let mut idx = open_idx + 1;
     let bytes = source.as_bytes();
@@ -781,7 +814,7 @@ pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return &source[open_idx + 1..idx];
+                    return Ok((open_idx + 1, idx));
                 }
             }
             _ => {}
@@ -789,23 +822,80 @@ pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
         idx += 1;
     }
 
-    panic!("missing closing brace after {start}");
+    Err(SourceBlockError::ClosingBrace)
+}
+
+fn source_block_from_parse_result<'a>(
+    source: &'a str,
+    start: &str,
+    result: Result<(usize, usize), SourceBlockError>,
+) -> &'a str {
+    source_block_slice(source, validated_source_block_bounds(start, result))
+}
+
+fn validated_source_block_bounds(
+    start: &str,
+    result: Result<(usize, usize), SourceBlockError>,
+) -> (usize, usize) {
+    result.unwrap_or_else(|error| panic!("{}", source_block_error_message(error, start)))
+}
+
+fn source_block_slice(source: &str, bounds: (usize, usize)) -> &str {
+    &source[bounds.0..bounds.1]
+}
+
+enum SourceBlockError {
+    Start,
+    OpeningBrace,
+    ClosingBrace,
+}
+
+fn source_block_error_message(error: SourceBlockError, start: &str) -> String {
+    match error {
+        SourceBlockError::Start => format!("missing {start}"),
+        SourceBlockError::OpeningBrace => format!("missing opening brace after {start}"),
+        SourceBlockError::ClosingBrace => format!("missing closing brace after {start}"),
+    }
 }
 
 fn signal_consumer_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut combined = main_rs_source();
-    combined.push('\n');
-    combined.push_str(&repl_source());
-    for rel in [
+    combined_source(signal_consumer_source_parts())
+}
+
+fn signal_consumer_source_parts() -> Vec<String> {
+    let mut sources = vec![main_rs_source(), repl_source()];
+    sources.extend(read_manifest_sources(signal_consumer_source_files()));
+    sources
+}
+
+fn signal_consumer_source_files() -> &'static [&'static str] {
+    &[
         "src/invocation/result_envelope.rs",
         "src/invocation/finalize.rs",
-    ] {
-        let path = root.join(rel);
-        let extra = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+    ]
+}
+
+fn read_manifest_sources(rels: &[&str]) -> Vec<String> {
+    rels.iter().map(|rel| read_manifest_source(rel)).collect()
+}
+
+fn read_manifest_source(rel: &str) -> String {
+    read_source_path(&manifest_source_path(rel))
+}
+
+fn manifest_source_path(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+fn read_source_path(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
+}
+
+fn combined_source(sources: Vec<String>) -> String {
+    let mut combined = String::new();
+    for source in sources {
         combined.push('\n');
-        combined.push_str(&extra);
+        combined.push_str(&source);
     }
     combined
 }

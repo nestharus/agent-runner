@@ -1,8 +1,15 @@
 use oulipoly_config::ModelConfig;
 
 pub(in crate::run::balancing) fn diagnostic_exhaustion_category(input: &str) -> Option<String> {
+    exhaustion_category_for_diagnostic(diagnostic_input_is_exhaustion(input))
+}
+
+fn diagnostic_input_is_exhaustion(input: &str) -> bool {
     super::super::super::predicate::diagnostic_input_is_exhaustion(input)
-        .then(crate::quota_zero_turn::quota_exhausted_category)
+}
+
+fn exhaustion_category_for_diagnostic(is_exhaustion: bool) -> Option<String> {
+    is_exhaustion.then(crate::quota_zero_turn::quota_exhausted_category)
 }
 
 pub(in crate::run::balancing) fn quota_retry_budget(model: &ModelConfig) -> usize {

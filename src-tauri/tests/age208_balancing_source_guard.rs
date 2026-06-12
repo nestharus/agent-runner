@@ -99,13 +99,15 @@ fn finalization_source() -> &'static str {
 }
 
 fn production_block_after<'a>(source: &'a str, start: &str) -> &'a str {
-    let start_idx = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing {start}"));
+    production_block_from_parse_result(source, start, production_block_bounds(source, start))
+}
+
+fn production_block_bounds(source: &str, start: &str) -> Result<(usize, usize), BlockError> {
+    let start_idx = source.find(start).ok_or(BlockError::Start)?;
     let open_idx = source[start_idx..]
         .find('{')
         .map(|idx| start_idx + idx)
-        .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+        .ok_or(BlockError::OpeningBrace)?;
     let mut depth = 1usize;
     let mut idx = open_idx + 1;
     let bytes = source.as_bytes();
@@ -116,7 +118,7 @@ fn production_block_after<'a>(source: &'a str, start: &str) -> &'a str {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return &source[open_idx + 1..idx];
+                    return Ok((open_idx + 1, idx));
                 }
             }
             _ => {}
@@ -124,7 +126,40 @@ fn production_block_after<'a>(source: &'a str, start: &str) -> &'a str {
         idx += 1;
     }
 
-    panic!("missing closing brace after {start}");
+    Err(BlockError::ClosingBrace)
+}
+
+fn production_block_from_parse_result<'a>(
+    source: &'a str,
+    start: &str,
+    result: Result<(usize, usize), BlockError>,
+) -> &'a str {
+    production_block_slice(source, validated_block_bounds(start, result))
+}
+
+fn validated_block_bounds(
+    start: &str,
+    result: Result<(usize, usize), BlockError>,
+) -> (usize, usize) {
+    result.unwrap_or_else(|error| panic!("{}", block_error_message(error, start)))
+}
+
+fn production_block_slice(source: &str, bounds: (usize, usize)) -> &str {
+    &source[bounds.0..bounds.1]
+}
+
+enum BlockError {
+    Start,
+    OpeningBrace,
+    ClosingBrace,
+}
+
+fn block_error_message(error: BlockError, start: &str) -> String {
+    match error {
+        BlockError::Start => format!("missing {start}"),
+        BlockError::OpeningBrace => format!("missing opening brace after {start}"),
+        BlockError::ClosingBrace => format!("missing closing brace after {start}"),
+    }
 }
 
 #[test]
@@ -160,13 +195,17 @@ fn assert_typed_signal_disposition_marks_guard_after_finalize(
 }
 
 fn disposition_guard_evidence<'a>(function_name: &'a str, disposition: &str) -> GuardEvidence<'a> {
+    guard_evidence_from_facts(disposition_guard_facts(function_name, disposition))
+}
+
+fn disposition_guard_facts<'a>(function_name: &'a str, disposition: &str) -> GuardFacts<'a> {
     let body = production_block_after(disposition_source(), function_name);
     let disposition_token = disposition_token(disposition);
-    let has_disposition = body.contains(&disposition_token);
-    let finalize = body.find("finalize_invocation");
-    let mark = body.find("guard.mark_finalized()");
-    let has_guard_fallback = body.contains("finalize_invocation_from_guard");
-    guard_evidence(
+    let has_disposition = has_disposition_token(body, &disposition_token);
+    let finalize = finalize_position(body);
+    let mark = guard_mark_position(body);
+    let has_guard_fallback = has_guard_fallback(body);
+    guard_facts(
         function_name,
         disposition_token,
         has_disposition,
@@ -176,8 +215,35 @@ fn disposition_guard_evidence<'a>(function_name: &'a str, disposition: &str) -> 
     )
 }
 
+fn has_disposition_token(body: &str, disposition_token: &str) -> bool {
+    body.contains(disposition_token)
+}
+
+fn finalize_position(body: &str) -> Option<usize> {
+    body.find("finalize_invocation")
+}
+
+fn guard_mark_position(body: &str) -> Option<usize> {
+    body.find("guard.mark_finalized()")
+}
+
+fn has_guard_fallback(body: &str) -> bool {
+    body.contains("finalize_invocation_from_guard")
+}
+
 fn disposition_token(disposition: &str) -> String {
     format!("TerminalSignalDisposition::{disposition}")
+}
+
+fn guard_evidence_from_facts(facts: GuardFacts<'_>) -> GuardEvidence<'_> {
+    guard_evidence(
+        facts.function_name,
+        facts.disposition_token,
+        facts.has_disposition,
+        facts.finalize,
+        facts.mark,
+        facts.has_guard_fallback,
+    )
 }
 
 fn assert_disposition_guard_evidence(evidence: GuardEvidence<'_>) {
@@ -217,6 +283,33 @@ struct GuardEvidence<'a> {
     finalize: Option<usize>,
     mark: Option<usize>,
     has_guard_fallback: bool,
+}
+
+struct GuardFacts<'a> {
+    function_name: &'a str,
+    disposition_token: String,
+    has_disposition: bool,
+    finalize: Option<usize>,
+    mark: Option<usize>,
+    has_guard_fallback: bool,
+}
+
+fn guard_facts<'a>(
+    function_name: &'a str,
+    disposition_token: String,
+    has_disposition: bool,
+    finalize: Option<usize>,
+    mark: Option<usize>,
+    has_guard_fallback: bool,
+) -> GuardFacts<'a> {
+    GuardFacts {
+        function_name,
+        disposition_token,
+        has_disposition,
+        finalize,
+        mark,
+        has_guard_fallback,
+    }
 }
 
 fn guard_evidence<'a>(

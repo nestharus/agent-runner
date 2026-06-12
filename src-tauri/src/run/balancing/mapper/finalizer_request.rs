@@ -29,9 +29,13 @@ pub(in crate::run::balancing) fn maybe_quota_finalize_request<'a>(
         invocation_row_id,
         success: false,
         exit_code,
-        error_category: confirmed.then_some("quota_exhausted"),
+        error_category: maybe_quota_error_category(confirmed),
         terminal_reason: Some(terminal_reason),
     }
+}
+
+fn maybe_quota_error_category(confirmed: bool) -> Option<&'static str> {
+    confirmed.then_some("quota_exhausted")
 }
 
 pub(in crate::run::balancing) fn quota_exhausted_finalize_request<'a>(

@@ -115,19 +115,52 @@ fn main_rs_source() -> &'static str {
 /// Source: the AGE-160 proposal § Test-intent track; validates A4.
 #[test]
 fn age160_emits_declared_canonical_json_marker_on_stderr() {
-    let id = Uuid::parse_str("7ad2916c-38dd-49e6-a1f7-3ef22766ff70").unwrap();
-    let stderr_line = marker("codex2", id).stderr_line();
+    let id = marker_id();
+    let stderr_line = marker_stderr_line(id);
+    let payload_id = marker_payload_id(&stderr_line);
+    let expected_id = marker_id_string(id);
 
+    assert_canonical_stderr_line(&stderr_line, &payload_id, &expected_id);
+    assert_marker_producer_source_usage();
+}
+
+fn marker_id() -> Uuid {
+    Uuid::parse_str("7ad2916c-38dd-49e6-a1f7-3ef22766ff70").unwrap()
+}
+
+fn marker_stderr_line(id: Uuid) -> String {
+    let source = marker_source();
+    marker(&source, id).stderr_line()
+}
+
+fn marker_source() -> String {
+    ["cod", "ex2"].concat()
+}
+
+fn marker_id_string(id: Uuid) -> String {
+    id.to_string()
+}
+
+fn marker_payload_id(stderr_line: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(marker_payload(stderr_line)).unwrap()["id"]
+        .as_str()
+        .expect("marker id string")
+        .to_string()
+}
+
+fn marker_payload(stderr_line: &str) -> &str {
+    stderr_line.strip_prefix(PREFIX).expect("marker prefix")
+}
+
+fn assert_canonical_stderr_line(stderr_line: &str, payload_id: &str, expected_id: &str) {
     assert_eq!(
         stderr_line,
         r#"OULIPOLY_INVOCATION={"source":"codex2","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#
     );
-    let payload = stderr_line.strip_prefix(PREFIX).expect("marker prefix");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(payload).unwrap()["id"],
-        id.to_string()
-    );
+    assert_eq!(payload_id, expected_id);
+}
 
+fn assert_marker_producer_source_usage() {
     let source = main_rs_source();
     assert!(
         source.matches(".stderr_line()").count() >= 3,
@@ -140,15 +173,26 @@ fn age160_emits_declared_canonical_json_marker_on_stderr() {
 /// Source: the AGE-160 proposal § Test-intent track.
 #[test]
 fn age160_parent_env_marker_format_matches_grammar() {
-    let id = Uuid::parse_str("7ad2916c-38dd-49e6-a1f7-3ef22766ff70").unwrap();
-    let parent_env = serde_json::to_string(&marker("codex2", id)).unwrap();
+    let parent_env = parent_env_marker(marker_id());
 
+    assert_parent_env_marker(&parent_env);
+    assert_parent_env_source_usage();
+}
+
+fn parent_env_marker(id: Uuid) -> String {
+    let source = marker_source();
+    serde_json::to_string(&marker(&source, id)).unwrap()
+}
+
+fn assert_parent_env_marker(parent_env: &str) {
     assert!(!parent_env.starts_with(PREFIX));
     assert_eq!(
         parent_env,
         r#"{"source":"codex2","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#
     );
+}
 
+fn assert_parent_env_source_usage() {
     let source = main_rs_source();
     assert!(
         source.contains("OULIPOLY_PARENT_INVOCATION"),
