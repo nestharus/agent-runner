@@ -544,7 +544,7 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
         "{stderr}"
     );
     assert!(stderr.contains("[diagnostics: network_error]"), "{stderr}");
-    assert!(!stderr.contains("retrying another provider"), "{stderr}");
+    assert!(!stderr.contains("rotating to another provider"), "{stderr}");
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 0);
     assert_eq!(fixture.exhausted_provider_count(), 0);

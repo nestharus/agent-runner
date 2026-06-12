@@ -112,9 +112,7 @@ pub(super) fn emit_returned_artifacts_error(error: impl Display) {
 }
 
 pub(super) fn emit_routing_retry(provider_name: &str) {
-    eprintln!(
-        "[routing] provider {provider_name} returned quota_exhausted; retrying another provider"
-    );
+    eprintln!("[routing] provider {provider_name} unavailable; rotating to another provider");
 }
 
 pub(super) fn emit_stderr(stderr: &str) {

@@ -28,6 +28,14 @@ impl TerminalSignalRecognizer for Recognizer {
             return terminal_signal(evidence, kind, signal_evidence);
         }
 
+        if let Some(signal_evidence) = stderr_storage_contention_evidence(evidence.stderr) {
+            return terminal_signal(
+                evidence,
+                TerminalSignalKind::ProviderStorageContention,
+                signal_evidence,
+            );
+        }
+
         if let Some(kind) = post_quota_terminal_signal_kind(&evidence.terminal_status) {
             let signal_evidence = terminal_status_evidence(&evidence.terminal_status)
                 .unwrap_or_else(|| "unknown".to_string());
@@ -43,6 +51,18 @@ fn opencode_json_error_signal(
 ) -> Option<(TerminalSignalKind, String)> {
     json_error_signal_from_stream(evidence.stdout)
         .or_else(|| json_error_signal_from_stream(evidence.stderr))
+}
+
+/// Detect an OpenCode session-store contention crash reported as plain stderr
+/// text (e.g. `Failed query: insert into "project" ...`) rather than a
+/// structured JSON error event. Scans stderr only — assistant content is on
+/// stdout — to keep ordinary output from being misclassified.
+fn stderr_storage_contention_evidence(stderr: &[u8]) -> Option<String> {
+    let text = stream_text(stderr);
+    let line = non_empty_stream_lines(text.as_ref())
+        .into_iter()
+        .find(|line| message_reports_storage_contention(&line.to_lowercase()))?;
+    Some(bounded_excerpt(line, TERMINAL_SIGNAL_EVIDENCE_MAX_LEN))
 }
 
 fn json_error_signal_from_stream(bytes: &[u8]) -> Option<(TerminalSignalKind, String)> {
@@ -122,7 +142,21 @@ fn terminal_signal_kind_from_json_error(
     if error_reports_persistent_quota(lower_message) {
         return Some(TerminalSignalKind::QuotaExhaustedInband);
     }
+    if message_reports_storage_contention(lower_message) {
+        return Some(TerminalSignalKind::ProviderStorageContention);
+    }
     Some(TerminalSignalKind::Unknown)
+}
+
+/// OpenCode persists every session/project to a per-account SQLite store; under
+/// concurrent load that store contends and the statement fails. These are
+/// retryable on a less-loaded account, not terminal. Inputs are pre-lowercased.
+fn message_reports_storage_contention(message: &str) -> bool {
+    message.contains("failed to execute statement")
+        || message.contains("failed query")
+        || message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("sqlite_busy")
 }
 
 fn error_status_code(error: &Value) -> Option<i64> {
@@ -237,19 +271,31 @@ mod tests {
     }
 
     #[test]
-    fn terminal_structured_error_exit_zero_maps_to_failure_signal_with_incident_evidence() {
+    fn terminal_sqlite_statement_error_maps_to_storage_contention_with_incident_evidence() {
         let signal = Recognizer.recognize(&evidence_with_status(
             INCIDENT_SQLITE_ERROR_EVENT,
             b"",
             TerminalStatusEvidence::Exited { code: 0 },
         ));
 
-        assert_eq!(signal.kind, TerminalSignalKind::Unknown);
+        assert_eq!(signal.kind, TerminalSignalKind::ProviderStorageContention);
         assert!(
             signal.evidence.contains("Failed to execute statement"),
             "signal evidence should retain the incident message: {}",
             signal.evidence
         );
+    }
+
+    #[test]
+    fn terminal_plain_stderr_failed_query_maps_to_storage_contention() {
+        let signal = Recognizer.recognize(&evidence_with_status(
+            b"",
+            br#"Failed query: insert into "project" ("id", "worktree") values (?, ?)
+Error: Unexpected error, check log file at /home/u/.opencode3/opencode/log/x.log"#,
+            TerminalStatusEvidence::Exited { code: 1 },
+        ));
+
+        assert_eq!(signal.kind, TerminalSignalKind::ProviderStorageContention);
     }
 
     #[test]

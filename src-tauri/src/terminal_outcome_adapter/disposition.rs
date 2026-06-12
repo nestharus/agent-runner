@@ -173,6 +173,9 @@ fn terminal_signal_disposition(signal: &TerminalSignal) -> TerminalSignalDisposi
     match signal.kind {
         TerminalSignalKind::CleanExit => TerminalSignalDisposition::InteractiveClean,
         TerminalSignalKind::QuotaExhaustedInband => TerminalSignalDisposition::QuotaExhaustedRetry,
+        TerminalSignalKind::ProviderStorageContention => {
+            TerminalSignalDisposition::QuotaExhaustedRetry
+        }
         TerminalSignalKind::MaybeQuotaExhausted => TerminalSignalDisposition::MaybeQuotaVerify,
         TerminalSignalKind::ProlongedSilence => TerminalSignalDisposition::ProlongedSilenceFail,
         TerminalSignalKind::NonzeroExit

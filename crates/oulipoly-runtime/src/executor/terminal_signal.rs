@@ -188,6 +188,7 @@ mod tests {
             TerminalSignalKind::QuotaExhaustedInband => "quota_exhausted_inband",
             TerminalSignalKind::MaybeQuotaExhausted => "maybe_quota_exhausted",
             TerminalSignalKind::RateLimited => "rate_limited",
+            TerminalSignalKind::ProviderStorageContention => "provider_storage_contention",
             TerminalSignalKind::ProlongedSilence => "prolonged_silence",
             TerminalSignalKind::Unknown => "unknown",
         }

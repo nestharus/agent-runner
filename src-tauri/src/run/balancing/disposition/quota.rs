@@ -48,7 +48,7 @@ pub(in crate::run::balancing) fn handle_quota_exhausted_retry(
         Err(err) => formatter::emit_finalize_invocation_warning(err),
     }
     bump_quota_tick(input.env, input.provider_name);
-    // [routing] provider {provider_name} returned quota_exhausted; retrying another provider
+    // [routing] provider {provider_name} unavailable; rotating to another provider
     if retry_available(input.attempts, input.max_attempts) {
         formatter::emit_routing_retry(input.provider_name);
     }
