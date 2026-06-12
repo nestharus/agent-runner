@@ -58,102 +58,210 @@ impl Age153Fixture {
 
     pub fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        write_executable_script(&path, &script_body(body));
         path
     }
 
-    pub fn write_model(&self, model_name: &str, providers: &[&str]) {
-        let mut body = String::new();
-        for provider in providers {
-            body.push_str(&format!(
-                r#"[[providers]]
+    fn write_model_toml(&self, model_name: &str, body: &str) {
+        fs::write(self.model_toml_path(model_name), body).unwrap();
+    }
+
+    fn model_toml_path(&self, model_name: &str) -> PathBuf {
+        self.models_dir.join(model_toml_filename(model_name))
+    }
+
+    fn write_providers_toml(&self, body: &str) {
+        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+    }
+
+    fn write_provider_command_scripts<'a>(
+        &self,
+        providers: &'a [(&'a str, &'a str)],
+    ) -> Vec<(&'a str, PathBuf)> {
+        providers
+            .iter()
+            .map(|(provider, command_body)| {
+                let command =
+                    self.write_script(&provider_script_name(provider, "command"), command_body);
+                (*provider, command)
+            })
+            .collect()
+    }
+
+    fn write_resume_provider_scripts<'a>(
+        &self,
+        providers: &'a [(&'a str, String)],
+    ) -> Vec<ResumeProviderPaths<'a>> {
+        providers
+            .iter()
+            .map(|(provider, command_body)| ResumeProviderPaths {
+                provider,
+                command: self.write_script(&provider_script_name(provider, "resume"), command_body),
+                projects_dir: self.provider_projects_dir(provider),
+            })
+            .collect()
+    }
+
+    fn write_project_session_jsonl(&self, provider: &str, session_id: &str, body: &str) {
+        let source_dir = self.provider_projects_dir(provider).join("source-project");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join(session_jsonl_filename(session_id)), body).unwrap();
+    }
+
+    fn stage_active_provider_session_jsonl(&self, provider: &str) {
+        self.write_project_session_jsonl(provider, SESSION_ID, &active_provider_jsonl());
+    }
+}
+
+fn write_executable_script(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    mark_executable(path);
+}
+
+fn mark_executable(path: &Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+fn script_body(body: &str) -> String {
+    format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n")
+}
+
+fn model_providers_toml(providers: &[&str]) -> String {
+    providers
+        .iter()
+        .map(|provider| model_provider_toml(provider))
+        .collect()
+}
+
+fn model_provider_toml(provider: &str) -> String {
+    format!(
+        r#"[[providers]]
 name = "{provider}"
 args = []
 interactive_args = ["interactive"]
 
 "#
-            ));
-        }
-        fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
-    }
+    )
+}
 
-    pub fn write_providers_with_bodies(&self, providers: &[(&str, &str)]) {
-        let mut body = String::new();
-        for (provider, command_body) in providers {
-            let command = self.write_script(&format!("{provider}-command.sh"), command_body);
-            body.push_str(&format!(
-                r#"[{provider}]
+fn provider_script_name(provider: &str, suffix: &str) -> String {
+    format!("{provider}-{suffix}.sh")
+}
+
+fn model_toml_filename(model_name: &str) -> String {
+    format!("{model_name}.toml")
+}
+
+fn session_jsonl_filename(session_id: &str) -> String {
+    format!("{session_id}.jsonl")
+}
+
+fn providers_toml(providers: &[(&str, PathBuf)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, command)| provider_command_toml(provider, command))
+        .collect()
+}
+
+fn providers_toml_from_paths(providers: &[(&str, &Path)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, command)| provider_command_toml(provider, command))
+        .collect()
+}
+
+fn provider_command_toml(provider: &str, command: &Path) -> String {
+    format!(
+        r#"[{provider}]
 command = {}
 args = []
 interactive_args = ["interactive"]
 prompt_mode = "arg"
 
 "#,
-                toml_string(&command.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
-    }
+        toml_string(&command.display().to_string())
+    )
+}
 
-    pub fn write_providers_with_command_paths(&self, providers: &[(&str, &Path)]) {
-        let mut body = String::new();
-        for (provider, command) in providers {
-            body.push_str(&format!(
-                r#"[{provider}]
-command = {}
-args = []
-interactive_args = ["interactive"]
-prompt_mode = "arg"
+fn resume_model_toml(providers: &[(&str, String)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, _)| resume_model_provider_toml(provider))
+        .collect()
+}
 
-"#,
-                toml_string(&command.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
-    }
-
-    pub fn write_resume_pool(&self, model_name: &str, providers: &[(&str, String)]) {
-        let mut model = String::new();
-        let mut providers_toml = String::new();
-        for (provider, command_body) in providers {
-            model.push_str(&format!(
-                r#"[[providers]]
+fn resume_model_provider_toml(provider: &str) -> String {
+    format!(
+        r#"[[providers]]
 name = "{provider}"
 args = ["exec-{provider}"]
 
 "#
-            ));
-            let command = self.write_script(&format!("{provider}-resume.sh"), command_body);
-            let projects_dir = self.provider_projects_dir(provider);
-            providers_toml.push_str(&format!(
-                r#"[{provider}]
+    )
+}
+
+struct ResumeProviderPaths<'a> {
+    provider: &'a str,
+    command: PathBuf,
+    projects_dir: PathBuf,
+}
+
+fn resume_providers_toml(providers: &[ResumeProviderPaths<'_>]) -> String {
+    providers.iter().map(resume_provider_toml).collect()
+}
+
+fn resume_provider_toml(provider: &ResumeProviderPaths<'_>) -> String {
+    format!(
+        r#"[{}]
 command = {}
 args = []
-interactive_args = ["launch-{provider}"]
+interactive_args = ["launch-{}"]
 prompt_mode = "arg"
 
-[{provider}.resume]
+[{}.resume]
 kind = "flag"
 flag = "--resume"
 
-[{provider}.session_storage]
+[{}.session_storage]
 kind = "claude_code"
 projects_dir = {}
 
 "#,
-                toml_string(&command.display().to_string()),
-                toml_string(&projects_dir.display().to_string())
-            ));
-        }
-        fs::write(self.models_dir.join(format!("{model_name}.toml")), model).unwrap();
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        provider.provider,
+        toml_string(&provider.command.display().to_string()),
+        provider.provider,
+        provider.provider,
+        provider.provider,
+        toml_string(&provider.projects_dir.display().to_string())
+    )
+}
+
+fn active_provider_jsonl() -> String {
+    format!(
+        r#"{{"sessionId":"{SESSION_ID}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
+    )
+}
+
+impl Age153Fixture {
+    pub fn write_model(&self, model_name: &str, providers: &[&str]) {
+        self.write_model_toml(model_name, &model_providers_toml(providers));
+    }
+
+    pub fn write_providers_with_bodies(&self, providers: &[(&str, &str)]) {
+        let commands = self.write_provider_command_scripts(providers);
+        self.write_providers_toml(&providers_toml(&commands));
+    }
+
+    pub fn write_providers_with_command_paths(&self, providers: &[(&str, &Path)]) {
+        self.write_providers_toml(&providers_toml_from_paths(providers));
+    }
+
+    pub fn write_resume_pool(&self, model_name: &str, providers: &[(&str, String)]) {
+        let provider_paths = self.write_resume_provider_scripts(providers);
+        self.write_model_toml(model_name, &resume_model_toml(providers));
+        self.write_providers_toml(&resume_providers_toml(&provider_paths));
     }
 
     pub fn provider_projects_dir(&self, provider: &str) -> PathBuf {
@@ -161,15 +269,7 @@ projects_dir = {}
     }
 
     pub fn stage_active_claude_jsonl(&self, provider: &str) {
-        let source_dir = self.provider_projects_dir(provider).join("source-project");
-        fs::create_dir_all(&source_dir).unwrap();
-        fs::write(
-            source_dir.join(format!("{SESSION_ID}.jsonl")),
-            format!(
-                r#"{{"sessionId":"{SESSION_ID}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
-            ),
-        )
-        .unwrap();
+        self.stage_active_provider_session_jsonl(provider);
     }
 
     pub fn seed_active_chain(&self, provider: &str, model: &str) {
@@ -469,20 +569,54 @@ pub fn assert_no_terminal_marker_on_stdout(output: &Output) {
 }
 
 pub fn assert_result_envelope_shape(stdout: &str) -> Value {
-    let lines: Vec<_> = stdout
-        .lines()
-        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
-        .collect();
+    let line = single_result_envelope_line(stdout);
+    let value = parse_result_envelope_line(line);
+    assert_result_envelope_value_shape(&value);
+    value
+}
+
+fn single_result_envelope_line(stdout: &str) -> &str {
+    let lines = result_envelope_lines(stdout);
     assert_eq!(
         lines.len(),
         1,
         "stdout must contain one result envelope:\n{stdout}"
     );
-    let raw = lines[0].strip_prefix("OULIPOLY_RESULT=").unwrap();
-    let value: Value = serde_json::from_str(raw).unwrap();
+    lines[0]
+}
+
+fn result_envelope_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
+        .collect()
+}
+
+fn parse_result_envelope_line(line: &str) -> Value {
+    serde_json::from_str(result_envelope_payload(line)).unwrap()
+}
+
+fn result_envelope_payload(line: &str) -> &str {
+    line.strip_prefix("OULIPOLY_RESULT=").unwrap()
+}
+
+fn assert_result_envelope_value_shape(value: &Value) {
     let object = value.as_object().expect("result envelope object");
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    let base_keys = BTreeSet::from([
+    let base_keys = result_envelope_base_keys();
+    if value["success"] == true {
+        assert_eq!(keys, base_keys);
+    } else {
+        assert_eq!(keys, failure_result_envelope_keys(base_keys));
+        assert_eq!(
+            value["agent_runner_invocation_id"], value["id"],
+            "failure result identity must repeat the runner invocation id"
+        );
+    }
+}
+
+fn result_envelope_base_keys() -> BTreeSet<&'static str> {
+    BTreeSet::from([
         "error_category",
         "exit_code",
         "finished_at",
@@ -490,41 +624,50 @@ pub fn assert_result_envelope_shape(stdout: &str) -> Value {
         "status",
         "success",
         "terminal_reason",
+    ])
+}
+
+fn failure_result_envelope_keys(mut base_keys: BTreeSet<&'static str>) -> BTreeSet<&'static str> {
+    base_keys.extend([
+        "agent_runner_invocation_id",
+        "provider_name",
+        "provider_session_id",
+        "agent_runner_chain_id",
     ]);
-    if value["success"] == true {
-        assert_eq!(keys, base_keys);
-    } else {
-        let mut expected = base_keys;
-        expected.extend([
-            "agent_runner_invocation_id",
-            "provider_name",
-            "provider_session_id",
-            "agent_runner_chain_id",
-        ]);
-        assert_eq!(keys, expected);
-        assert_eq!(
-            value["agent_runner_invocation_id"], value["id"],
-            "failure result identity must repeat the runner invocation id"
-        );
-    }
-    value
+    base_keys
 }
 
 pub fn normalized_result_stdout(stdout: &str) -> String {
-    stdout
-        .lines()
-        .map(|line| {
-            let Some(raw) = line.strip_prefix("OULIPOLY_RESULT=") else {
-                return line.to_string();
-            };
-            let mut value: Value = serde_json::from_str(raw).unwrap();
-            value["id"] = Value::String("<uuid>".to_string());
-            value["finished_at"] = Value::String("<ts>".to_string());
-            format!("OULIPOLY_RESULT={}", serde_json::to_string(&value).unwrap())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
+    normalized_stdout_lines(stdout).join("\n") + "\n"
+}
+
+fn normalized_stdout_lines(stdout: &str) -> Vec<String> {
+    stdout.lines().map(normalized_stdout_line).collect()
+}
+
+fn normalized_stdout_line(line: &str) -> String {
+    let Some(raw) = result_envelope_payload_opt(line) else {
+        return line.to_string();
+    };
+    format_normalized_result_line(normalized_result_value(parse_result_value(raw)))
+}
+
+fn result_envelope_payload_opt(line: &str) -> Option<&str> {
+    line.strip_prefix("OULIPOLY_RESULT=")
+}
+
+fn parse_result_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap()
+}
+
+fn normalized_result_value(mut value: Value) -> Value {
+    value["id"] = Value::String("<uuid>".to_string());
+    value["finished_at"] = Value::String("<ts>".to_string());
+    value
+}
+
+fn format_normalized_result_line(value: Value) -> String {
+    format!("OULIPOLY_RESULT={}", serde_json::to_string(&value).unwrap())
 }
 
 pub fn assert_normalized_result_stdout_matches_golden(stdout: &str, golden: &str) {
@@ -679,9 +822,24 @@ pub fn assert_signal_consumer_source_wired(function_name: &str, expected_fragmen
 }
 
 pub fn parse_valid_invocations(stderr: &str) -> Vec<CompositeInvocationId> {
-    stderr
-        .lines()
-        .filter_map(|line| line.strip_prefix("OULIPOLY_INVOCATION="))
-        .filter_map(|raw| CompositeInvocationId::parse_env_value(raw).ok())
+    parse_invocation_payloads(invocation_payloads(stderr))
+}
+
+fn invocation_payloads(stderr: &str) -> Vec<&str> {
+    stderr.lines().filter_map(invocation_payload).collect()
+}
+
+fn invocation_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("OULIPOLY_INVOCATION=")
+}
+
+fn parse_invocation_payloads(payloads: Vec<&str>) -> Vec<CompositeInvocationId> {
+    payloads
+        .into_iter()
+        .filter_map(parse_invocation_payload)
         .collect()
+}
+
+fn parse_invocation_payload(raw: &str) -> Option<CompositeInvocationId> {
+    CompositeInvocationId::parse_env_value(raw).ok()
 }
