@@ -959,8 +959,23 @@ fn repl_source_files() -> &'static [&'static str] {
 }
 
 pub fn terminal_outcome_adapter_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal_outcome_adapter.rs");
-    fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut combined = String::new();
+    for rel in [
+        "src/terminal_outcome_adapter.rs",
+        "src/terminal_outcome_adapter/category.rs",
+        "src/terminal_outcome_adapter/disposition.rs",
+        "src/terminal_outcome_adapter/fixture_override.rs",
+        "src/terminal_outcome_adapter/marker.rs",
+        "src/terminal_outcome_adapter/outcome.rs",
+    ] {
+        let path = root.join(rel);
+        let extra = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+        combined.push('\n');
+        combined.push_str(&extra);
+    }
+    combined
 }
 
 pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
