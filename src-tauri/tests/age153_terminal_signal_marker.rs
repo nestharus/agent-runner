@@ -96,7 +96,19 @@ fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
 }
 
 fn disposition_source() -> &'static str {
-    include_str!("../src/run/balancing/disposition.rs")
+    concat!(
+        include_str!("../src/run/balancing/disposition.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition/control.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition/failure.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition/input.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition/maybe_quota.rs"),
+        "\n",
+        include_str!("../src/run/balancing/disposition/quota.rs"),
+    )
 }
 
 fn finalization_source() -> &'static str {
