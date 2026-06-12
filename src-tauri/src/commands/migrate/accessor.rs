@@ -14,9 +14,12 @@ pub(super) fn default_state_db_path() -> Result<PathBuf, String> {
 }
 
 pub(super) fn state_db_parent_dir(db_path: &Path) -> Result<&Path, String> {
-    db_path
-        .parent()
+    db_path_parent(db_path)
         .ok_or_else(|| super::formatter::format_state_db_path_no_parent_error(db_path))
+}
+
+fn db_path_parent(db_path: &Path) -> Option<&Path> {
+    db_path.parent()
 }
 
 pub(super) fn open_default_state_db() -> Result<StateDb, String> {

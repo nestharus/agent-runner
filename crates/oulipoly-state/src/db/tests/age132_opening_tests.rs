@@ -92,10 +92,16 @@ fn sqlite_sidecar_file(dir: &Path, db_path: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn find_sqlite_sidecar_file(dir: &Path, db_path: &Path) -> Option<PathBuf> {
+    sqlite_sidecar_candidate_paths(dir)
+        .into_iter()
+        .find(|path| sqlite_sidecar_candidate(path, db_path))
+}
+
+fn sqlite_sidecar_candidate_paths(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
         .unwrap()
         .map(sidecar_entry_path)
-        .find(|path| sqlite_sidecar_candidate(path, db_path))
+        .collect()
 }
 
 #[cfg(unix)]

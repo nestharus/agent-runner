@@ -101,16 +101,30 @@ fn resolved_account_from_session_storage(
     provider_session_id: &str,
 ) -> Option<String> {
     match session_storage {
-        SessionStorage::ClaudeCode { projects_dir } => Some(projects_dir.display().to_string()),
-        SessionStorage::Codex { sessions_dir } => Some(sessions_dir.display().to_string()),
-        SessionStorage::Script { .. } => resolve_workspace_root_for_provider_session(
-            Some(session_storage),
-            provider_name,
-            provider_session_id,
-        )
-        .ok()
-        .map(|path| path.display().to_string()),
+        SessionStorage::ClaudeCode { projects_dir } => Some(display_path(projects_dir)),
+        SessionStorage::Codex { sessions_dir } => Some(display_path(sessions_dir)),
+        SessionStorage::Script { .. } => {
+            script_storage_resolved_account(session_storage, provider_name, provider_session_id)
+        }
     }
+}
+
+fn script_storage_resolved_account(
+    session_storage: &SessionStorage,
+    provider_name: &str,
+    provider_session_id: &str,
+) -> Option<String> {
+    resolve_workspace_root_for_provider_session(
+        Some(session_storage),
+        provider_name,
+        provider_session_id,
+    )
+    .ok()
+    .map(|path| display_path(&path))
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 pub(crate) struct ResumeExecutionEnvironment {

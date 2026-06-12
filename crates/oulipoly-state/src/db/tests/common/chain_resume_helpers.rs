@@ -181,13 +181,7 @@ pub(in crate::db::tests) fn seed_invocation_for_session(
     created_at: &str,
 ) {
     let id = db
-        .start_invocation(&InvocationStart {
-            invocation_uuid: Uuid::new_v4().to_string(),
-            model_name: model_name.to_string(),
-            provider_name: provider_name.to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
+        .start_invocation(&session_seed_invocation_start(model_name, provider_name))
         .unwrap();
     db.update_session_capture(id, Some(session_id), "fixture")
         .unwrap();
@@ -197,6 +191,16 @@ pub(in crate::db::tests) fn seed_invocation_for_session(
             sqlite::params![created_at, id],
         )
         .unwrap();
+}
+
+fn session_seed_invocation_start(model_name: &str, provider_name: &str) -> InvocationStart {
+    InvocationStart {
+        invocation_uuid: Uuid::new_v4().to_string(),
+        model_name: model_name.to_string(),
+        provider_name: provider_name.to_string(),
+        provider_index: 0,
+        parent_invocation_id: None,
+    }
 }
 
 pub(in crate::db::tests) fn pre_chain_db_with_turns(

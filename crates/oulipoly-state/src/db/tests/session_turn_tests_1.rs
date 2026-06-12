@@ -180,10 +180,17 @@ struct ExactTextProbe {
 }
 
 fn exact_text_probe(expected: &str) -> ExactTextProbe {
+    exact_text_probe_fields(&exact_text_probe_db(expected), expected)
+}
+
+fn exact_text_probe_db(expected: &str) -> StateDb {
     let db = test_db();
     db.ingest_session_turns_batch("fixture-provider", &exact_user_text_turns(expected))
         .unwrap();
+    db
+}
 
+fn exact_text_probe_fields(db: &StateDb, expected: &str) -> ExactTextProbe {
     let extra_text_body = extra_text_body(expected);
 
     ExactTextProbe {
