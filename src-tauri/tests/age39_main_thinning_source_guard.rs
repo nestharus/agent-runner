@@ -267,9 +267,15 @@ fn entrypoint_slice() -> &'static str {
 }
 
 fn entrypoint_start_index(source: &str) -> usize {
-    source
-        .find("fn main() -> ExitCode")
-        .expect("missing main entrypoint")
+    expect_entrypoint_start_index(entrypoint_start_position(source))
+}
+
+fn entrypoint_start_position(source: &str) -> Option<usize> {
+    source.find("fn main() -> ExitCode")
+}
+
+fn expect_entrypoint_start_index(position: Option<usize>) -> usize {
+    position.expect("missing main entrypoint")
 }
 
 fn source_from_index(source: &str, start_idx: usize) -> &str {
