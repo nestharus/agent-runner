@@ -262,64 +262,7 @@ fn provider_invocation_exit_code(success: bool) -> i32 {
     if success { 0 } else { 1 }
 }
 
-pub(in crate::db::tests) fn with_models_config(model_name: &str, body: &str, test: impl FnOnce()) {
-    let _guard = env_lock().lock().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    write_model_config_fixture(dir.path(), model_name, body);
-
-    let old = current_xdg_config_home();
-    isolate_xdg_config_home(dir.path());
-    let result = run_models_config_test(test);
-    restore_xdg_config_home(old);
-    resume_models_config_panic(result);
-}
-
-fn write_model_config_fixture(dir: &std::path::Path, model_name: &str, body: &str) {
-    let models_dir = models_fixture_dir(dir);
-    std::fs::create_dir_all(&models_dir).unwrap();
-    std::fs::write(model_fixture_path(&models_dir, model_name), body).unwrap();
-}
-
-fn models_fixture_dir(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join("oulipoly-agent-runner").join("models")
-}
-
-fn model_fixture_path(models_dir: &std::path::Path, model_name: &str) -> std::path::PathBuf {
-    models_dir.join(model_fixture_filename(model_name))
-}
-
-fn model_fixture_filename(model_name: &str) -> String {
-    format!("{model_name}.toml")
-}
-
-fn current_xdg_config_home() -> Option<std::ffi::OsString> {
-    std::env::var_os("XDG_CONFIG_HOME")
-}
-
-fn isolate_xdg_config_home(dir: &std::path::Path) {
-    // Tests need to isolate config-driven provider-name resolution.
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", dir);
-    }
-}
-
-fn run_models_config_test(test: impl FnOnce()) -> std::thread::Result<()> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(test))
-}
-
-fn restore_xdg_config_home(old: Option<std::ffi::OsString>) {
-    match old {
-        Some(value) => unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", value);
-        },
-        None => unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        },
-    }
-}
-
-fn resume_models_config_panic(result: std::thread::Result<()>) {
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
-    }
-}
+// PP-002: the XDG_CONFIG_HOME-mutating `with_models_config` fixture (and its
+// helpers) were removed. Legacy-migration tests now push a `LegacyProviderNames`
+// lookup directly into `StateDb::open_with_legacy_provider_names`, so no test
+// drives provider-name resolution through ambient global process state.

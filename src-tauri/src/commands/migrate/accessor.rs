@@ -14,7 +14,13 @@ pub(super) fn state_db_parent_dir(db_path: &Path) -> Result<&Path, String> {
 }
 
 pub(super) fn open_default_state_db() -> Result<StateDb, String> {
-    StateDb::open_default()
+    // PP-001: push the app-resolved legacy provider-name lookup into the open so
+    // a pre-UUID invocation migration maps provider names without StateDb itself
+    // discovering the app config layout.
+    StateDb::open_with_legacy_provider_names(
+        &StateDb::default_path()?,
+        &crate::migration_providers::legacy_invocation_provider_names(),
+    )
 }
 
 pub(super) fn open_state_db(path: &Path) -> Result<StateDb, String> {

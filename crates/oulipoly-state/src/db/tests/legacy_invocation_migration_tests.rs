@@ -8,41 +8,44 @@ use super::common::*;
 use super::*;
 #[test]
 fn migration_backfills_resolved_and_legacy_rows() {
-    with_models_config(
-        "mapped-model",
-        r#"
-[[providers]]
-name = "fixture-provider"
-"#,
-        || {
-            let dir = legacy_invocations_db(&[
-                ("mapped-model", 0, 1, 0, None, "2026-04-17T08:00:00Z"),
-                (
-                    "missing-model",
-                    0,
-                    0,
-                    7,
-                    Some("rate_limit"),
-                    "2026-04-17T08:05:00Z",
-                ),
-            ]);
-            let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-
-            let rows = migrated_invocation_rows(&db.conn);
-
-            assert_eq!(rows[0].0, "mapped-model");
-            assert_eq!(rows[0].1.as_deref(), Some("fixture-provider"));
-            assert_eq!(rows[0].2, "succeeded");
-            assert_eq!(rows[0].4, "2026-04-17T08:00:00Z");
-            assert!(Uuid::parse_str(&rows[0].3).is_ok());
-
-            assert_eq!(rows[1].0, "missing-model");
-            assert_eq!(rows[1].1, None);
-            assert_eq!(rows[1].2, "legacy");
-            assert_eq!(rows[1].4, "2026-04-17T08:05:00Z");
-            assert!(Uuid::parse_str(&rows[1].3).is_ok());
-        },
+    // PP-001: the caller pushes the resolved `(model, provider_index) ->
+    // provider_name` lookup; StateDb no longer discovers the app config layout.
+    let mut provider_names = LegacyProviderNames::new();
+    provider_names.insert(
+        ("mapped-model".to_string(), 0),
+        "fixture-provider".to_string(),
     );
+
+    let dir = legacy_invocations_db(&[
+        ("mapped-model", 0, 1, 0, None, "2026-04-17T08:00:00Z"),
+        (
+            "missing-model",
+            0,
+            0,
+            7,
+            Some("rate_limit"),
+            "2026-04-17T08:05:00Z",
+        ),
+    ]);
+    let db =
+        StateDb::open_with_legacy_provider_names(&dir.path().join("state.db"), &provider_names)
+            .unwrap();
+
+    let rows = migrated_invocation_rows(&db.conn);
+
+    assert_eq!(rows[0].0, "mapped-model");
+    assert_eq!(rows[0].1.as_deref(), Some("fixture-provider"));
+    assert_eq!(rows[0].2, "succeeded");
+    assert_eq!(rows[0].4, "2026-04-17T08:00:00Z");
+    assert!(Uuid::parse_str(&rows[0].3).is_ok());
+
+    // A model absent from the pushed lookup falls through to status='legacy'
+    // with provider_name=NULL.
+    assert_eq!(rows[1].0, "missing-model");
+    assert_eq!(rows[1].1, None);
+    assert_eq!(rows[1].2, "legacy");
+    assert_eq!(rows[1].4, "2026-04-17T08:05:00Z");
+    assert!(Uuid::parse_str(&rows[1].3).is_ok());
 }
 
 #[test]
@@ -83,8 +86,11 @@ fn migration_rolls_back_when_rebuild_fails() {
 }
 
 #[test]
-fn migration_succeeds_with_corrupt_models_config_and_marks_rows_legacy() {
-    let _guard = env_lock().lock().unwrap();
+fn migration_with_empty_provider_lookup_marks_rows_legacy() {
+    // When the caller cannot resolve any provider names (e.g. the app's models
+    // config is missing or corrupt, so it pushes an empty lookup), the DB open
+    // must still succeed and every legacy row degrades to status='legacy' with
+    // provider_name=NULL (per V10 — observable degradation, not silent).
     let dir = legacy_invocations_db(&[
         ("any-model", 0, 1, 0, None, "2026-04-17T08:00:00Z"),
         (
@@ -98,52 +104,19 @@ fn migration_succeeds_with_corrupt_models_config_and_marks_rows_legacy() {
     ]);
     let path = dir.path().join("state.db");
 
-    // Plant a corrupt models/ directory at XDG_CONFIG_HOME so the
-    // load_models() call inside migration fails.
-    let config_root = dir.path().join("oulipoly-agent-runner");
-    let models_dir = config_root.join("models");
-    std::fs::create_dir_all(&models_dir).unwrap();
-    std::fs::write(
-        models_dir.join("broken.toml"),
-        "this = is = not = valid = toml",
-    )
-    .unwrap();
+    let db = StateDb::open_with_legacy_provider_names(&path, &LegacyProviderNames::new())
+        .expect("DB open must not fail on an empty provider lookup");
 
-    let old = std::env::var_os("XDG_CONFIG_HOME");
-    unsafe {
-        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    let conn = sqlite::Connection::open(&path).unwrap();
+    let rows = migrated_invocation_rows(&conn);
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert!(r.1.is_none(), "provider_name must be NULL on empty lookup");
+        assert_eq!(r.2, "legacy", "status must be legacy on empty lookup");
+        assert!(Uuid::parse_str(&r.3).is_ok());
+        assert!(!r.4.is_empty(), "finished_at must be backfilled");
     }
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // The DB open must succeed despite the corrupt config.
-        let db = StateDb::open(&path).expect("DB open must not fail on corrupt models config");
-
-        // Verify both legacy rows migrated cleanly with provider_name=NULL
-        // and status='legacy' since the lookup couldn't resolve anything.
-        let conn = sqlite::Connection::open(&path).unwrap();
-        let rows = migrated_invocation_rows(&conn);
-        assert_eq!(rows.len(), 2);
-        for r in &rows {
-            assert!(
-                r.1.is_none(),
-                "provider_name must be NULL on corrupt config"
-            );
-            assert_eq!(r.2, "legacy", "status must be legacy on corrupt config");
-            assert!(Uuid::parse_str(&r.3).is_ok());
-            assert!(!r.4.is_empty(), "finished_at must be backfilled");
-        }
-        drop(db);
-    }));
-    match old {
-        Some(value) => unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", value);
-        },
-        None => unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        },
-    }
-    if let Err(payload) = result {
-        std::panic::resume_unwind(payload);
-    }
+    drop(db);
 }
 
 type MigratedInvocationRow = (String, Option<String>, String, String, String);

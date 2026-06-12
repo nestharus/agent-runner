@@ -845,7 +845,7 @@ fn function_end_offset(source: &str, start: usize) -> Option<usize> {
 
 // Declared role: accessor
 fn function_end_marker() -> &'static str {
-    "\n    /// Resolve `(model_name, provider_index) -> provider_name`"
+    "\npub type LegacyProviderNames"
 }
 
 // Declared role: validator

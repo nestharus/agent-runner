@@ -29,6 +29,7 @@ pub type StateDbError = String;
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
+pub use db::LegacyProviderNames;
 pub use db::ProviderRecord;
 pub use db::ReadOnlyOpenError;
 pub use db::SessionTurnCounts;
@@ -94,16 +95,6 @@ pub mod age_32_connection_boundary_doctest {
     /// escaped.execute_batch("CREATE TABLE bypass (id INTEGER)").unwrap();
     /// ```
     pub struct StateDbRawConnectionEscapeMustNotCompile;
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, OnceLock};
-
-    pub(crate) fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 }
 
 #[cfg(test)]

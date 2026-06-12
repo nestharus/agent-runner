@@ -17,14 +17,19 @@ use super::*;
 // Legacy repair allow-list only. Durable schema changes belong in
 // crates/oulipoly-state/migrations/ and schema.rs owns the version.
 impl StateDb {
-    pub(super) fn ensure_invocations_schema(conn: &sqlite::Connection) -> Result<(), String> {
+    pub(super) fn ensure_invocations_schema(
+        conn: &sqlite::Connection,
+        provider_names: &LegacyProviderNames,
+    ) -> Result<(), String> {
         let columns = Self::invocations_columns(conn)?;
         match Self::classify_invocations_schema(&columns) {
             InvocationsSchemaShape::Empty => Self::initialize_invocations_schema(conn),
             InvocationsSchemaShape::Current => {
                 Self::repair_current_invocations_schema(conn, &columns)
             }
-            InvocationsSchemaShape::LegacyPreUuid => Self::migrate_legacy_invocations(conn),
+            InvocationsSchemaShape::LegacyPreUuid => {
+                Self::migrate_legacy_invocations(conn, provider_names)
+            }
             InvocationsSchemaShape::UnrecognizedPreUuid(columns) => {
                 Err(Self::unrecognized_invocations_shape_error(&columns))
             }

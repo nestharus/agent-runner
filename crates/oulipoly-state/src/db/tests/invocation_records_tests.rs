@@ -95,44 +95,36 @@ fn invocation_status_round_trips_through_strings() {
 
 #[test]
 fn get_invocation_by_uuid_returns_matching_and_missing_rows() {
-    with_models_config(
-        "legacy-model",
-        r#"
-[[providers]]
-name = "fixture-provider"
-"#,
-        || {
-            let db = test_db();
-            let start = InvocationStart {
-                invocation_uuid: Uuid::new_v4().to_string(),
-                model_name: "legacy-model".to_string(),
-                provider_name: "fixture-provider".to_string(),
-                provider_index: 0,
-                parent_invocation_id: None,
-            };
-            db.start_invocation(&start).unwrap();
-            let running = db
-                .get_invocation_by_uuid(&start.invocation_uuid)
-                .unwrap()
-                .unwrap();
-            assert_eq!(running.invocation_uuid, start.invocation_uuid);
+    let db = test_db();
+    let start = InvocationStart {
+        invocation_uuid: Uuid::new_v4().to_string(),
+        model_name: "legacy-model".to_string(),
+        provider_name: "fixture-provider".to_string(),
+        provider_index: 0,
+        parent_invocation_id: None,
+    };
+    db.start_invocation(&start).unwrap();
+    let running = db
+        .get_invocation_by_uuid(&start.invocation_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.invocation_uuid, start.invocation_uuid);
 
-            let dir =
-                legacy_invocations_db(&[("missing-model", 0, 0, 7, None, "2026-04-17T08:05:00Z")]);
-            let migrated = StateDb::open(&dir.path().join("state.db")).unwrap();
-            let legacy_uuid = legacy_invocation_uuid(&migrated);
-            let legacy = migrated
-                .get_invocation_by_uuid(&legacy_uuid)
-                .unwrap()
-                .unwrap();
-            assert_eq!(legacy.status, InvocationStatus::Legacy);
-            assert!(
-                migrated
-                    .get_invocation_by_uuid("00000000-0000-0000-0000-000000000000")
-                    .unwrap()
-                    .is_none()
-            );
-        },
+    // A legacy row for a model absent from the pushed provider lookup migrates
+    // to status='legacy' (empty lookup here — no config discovery).
+    let dir = legacy_invocations_db(&[("missing-model", 0, 0, 7, None, "2026-04-17T08:05:00Z")]);
+    let migrated = StateDb::open(&dir.path().join("state.db")).unwrap();
+    let legacy_uuid = legacy_invocation_uuid(&migrated);
+    let legacy = migrated
+        .get_invocation_by_uuid(&legacy_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy.status, InvocationStatus::Legacy);
+    assert!(
+        migrated
+            .get_invocation_by_uuid("00000000-0000-0000-0000-000000000000")
+            .unwrap()
+            .is_none()
     );
 }
 

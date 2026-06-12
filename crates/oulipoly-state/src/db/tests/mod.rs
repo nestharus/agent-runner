@@ -15,7 +15,7 @@
 //!       - StateDb split test module declarations under `crates/oulipoly-state/src/db/tests/*.rs`
 //!       - common test helper module aggregation
 //!       - opening/read-only helper imports shared by split test modules
-//!       - fixture support imports `env_lock`, `TempDir`, and `Uuid`
+//!       - fixture support imports `TempDir` and `Uuid`
 //!       - age132_opening_tests, age132_preview_tests, age132_resume_tests_1, age132_resume_tests_2, age132_session_turn_tests
 //!       - age160_lifecycle_tests, age160_marker_tests, age160_read_only_tests, artifact_tests
 //!       - chain_backfill_tests_1, chain_backfill_tests_2, common, invocation_lifecycle_tests_1, invocation_lifecycle_tests_2
@@ -29,7 +29,6 @@
 
 use super::opening_read_only::{classify_read_only_open_error, shm_path, wal_path};
 use super::*;
-use crate::test_support::env_lock;
 use tempfile::TempDir;
 use uuid::Uuid;
 

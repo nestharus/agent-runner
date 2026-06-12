@@ -14,8 +14,10 @@
 use super::*;
 
 impl StateDb {
-    pub(super) fn migrate_legacy_invocations(conn: &sqlite::Connection) -> Result<(), String> {
-        let provider_names = Self::provider_name_lookup()?;
+    pub(super) fn migrate_legacy_invocations(
+        conn: &sqlite::Connection,
+        provider_names: &LegacyProviderNames,
+    ) -> Result<(), String> {
         let tx = Self::begin_invocation_migration(conn)?;
         Self::validate_providers_schema(&tx)?;
         // Guardrail order: SELECT COUNT(*) FROM invocations
@@ -25,7 +27,7 @@ impl StateDb {
         Self::validate_legacy_invocation_scan_count(old_rows.len(), old_count)?;
         // Guardrail order: CREATE TABLE invocations_new
         Self::create_migrated_invocations_table(&tx)?;
-        Self::insert_migrated_invocation_rows(&tx, old_rows, &provider_names)?;
+        Self::insert_migrated_invocation_rows(&tx, old_rows, provider_names)?;
         // Guardrail order: SELECT COUNT(*) FROM invocations_new
         let new_count = Self::migrated_invocations_count(&tx)?;
         // Guardrail order: migrated {new_count} rows from {old_count}
@@ -367,52 +369,13 @@ impl StateDb {
     fn format_invocations_table_replace_error(err: sqlite::Error) -> String {
         format!("Failed to replace invocations table: {err}")
     }
-
-    /// Resolve `(model_name, provider_index) -> provider_name` from the
-    /// installed models config, used by the legacy-row migration. A corrupt
-    /// or missing models directory must not block DB open: log on stderr and
-    /// return an empty lookup so unmappable rows fall through to
-    /// `status='legacy'` with `provider_name=NULL` (per V10 — degradation
-    /// is observable via the legacy status, not silent).
-    pub(super) fn provider_name_lookup()
-    -> Result<std::collections::HashMap<(String, usize), String>, String> {
-        let models = Self::load_models_for_invocation_migration()?;
-        Ok(Self::build_provider_name_lookup(models))
-    }
-
-    pub(super) fn load_models_for_invocation_migration() -> Result<ModelStore, String> {
-        let models_dir = Self::migration_models_dir();
-        match load_models(&models_dir, None) {
-            Ok(models) => Ok(models),
-            Err(e) => {
-                Self::warn_model_config_load_failed(&e.to_string());
-                Ok(HashMap::new())
-            }
-        }
-    }
-
-    pub(super) fn migration_models_dir() -> PathBuf {
-        dirs::config_dir()
-            .map(|dir| dir.join("oulipoly-agent-runner").join("models"))
-            .unwrap_or_else(|| PathBuf::from("models"))
-    }
-
-    pub(super) fn warn_model_config_load_failed(error: &str) {
-        eprintln!(
-            "Warning: failed to load models config during invocation migration ({error}); \
-             pre-existing invocation rows will migrate as status='legacy'."
-        );
-    }
-
-    pub(super) fn build_provider_name_lookup(
-        models: ModelStore,
-    ) -> std::collections::HashMap<(String, usize), String> {
-        let mut lookup = std::collections::HashMap::new();
-        for (model_name, model) in models {
-            for (provider_index, provider) in model.providers.iter().enumerate() {
-                lookup.insert((model_name.clone(), provider_index), provider.name.clone());
-            }
-        }
-        lookup
-    }
 }
+
+/// Pushed `(model_name, provider_index) -> provider_name` lookup the caller
+/// supplies to the legacy-row migration. StateDb no longer discovers or parses
+/// the app's models config layout during DB open (PP-001 dependency inversion):
+/// the config/runtime owner resolves provider names and pushes this map in via
+/// [`StateDb::open_with_legacy_provider_names`]. An empty map means unmappable
+/// rows fall through to `status='legacy'` with `provider_name=NULL` (per V10 —
+/// degradation is observable via the legacy status, not silent).
+pub type LegacyProviderNames = std::collections::HashMap<(String, usize), String>;

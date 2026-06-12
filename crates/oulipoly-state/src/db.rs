@@ -155,6 +155,7 @@ use self::invocation_lifecycle_start::{
     active_lifecycle_session_id, lifecycle_terminal_status,
 };
 pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
+pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
@@ -201,7 +202,6 @@ use crate::schema::CURRENT_SCHEMA_VERSION;
 use chrono::{DateTime, Utc};
 #[cfg(test)]
 use oulipoly_agent_messenger::ReturnedArtifactRef;
-use oulipoly_config::load_models;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

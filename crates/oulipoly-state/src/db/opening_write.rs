@@ -21,11 +21,35 @@ impl StateDb {
         path: &Path,
         sink: Box<dyn LifecycleEventSink + Send>,
     ) -> Result<Self, String> {
+        Self::open_with_sink_and_legacy_provider_names(path, sink, &LegacyProviderNames::new())
+    }
+
+    /// Open with a caller-pushed legacy provider-name lookup (PP-001 inversion).
+    /// Used by the app's migrate path, which owns the models-config layout and
+    /// resolves `(model_name, provider_index) -> provider_name` before pushing
+    /// it in. The plain `open`/`open_with_sink` paths default to an empty map so
+    /// StateDb never discovers the app config layout itself.
+    pub fn open_with_legacy_provider_names(
+        path: &Path,
+        provider_names: &LegacyProviderNames,
+    ) -> Result<Self, String> {
+        Self::open_with_sink_and_legacy_provider_names(
+            path,
+            Box::new(NoopLifecycleEventSink),
+            provider_names,
+        )
+    }
+
+    fn open_with_sink_and_legacy_provider_names(
+        path: &Path,
+        sink: Box<dyn LifecycleEventSink + Send>,
+        provider_names: &LegacyProviderNames,
+    ) -> Result<Self, String> {
         Self::ensure_state_parent_dir(path)?;
         let mut conn = Self::open_state_connection(path)?;
 
         let ran_open_migrations = Self::run_open_migrations(path, &mut conn)?;
-        Self::apply_current_schema_repairs(&mut conn, ran_open_migrations)?;
+        Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
         let db = StateDb {
             conn,
             db_path: path.to_path_buf(),
@@ -57,9 +81,10 @@ impl StateDb {
     pub(super) fn apply_current_schema_repairs(
         conn: &mut sqlite::Connection,
         ran_open_migrations: bool,
+        provider_names: &LegacyProviderNames,
     ) -> Result<(), String> {
         Self::validate_providers_schema(conn)?;
-        Self::ensure_invocations_schema(conn)?;
+        Self::ensure_invocations_schema(conn, provider_names)?;
         Self::ensure_providers_schema(conn)?;
         Self::ensure_provider_quotas_schema(conn)?;
         Self::ensure_provider_quotas_topology_schema(conn)?;
