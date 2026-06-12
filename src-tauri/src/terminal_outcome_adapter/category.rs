@@ -57,6 +57,7 @@ fn category_for_signal_kind(kind: TerminalSignalKind) -> Option<TerminalOutcomeC
         | TerminalSignalKind::SpawnError
         | TerminalSignalKind::MaybeQuotaExhausted
         | TerminalSignalKind::RateLimited
+        | TerminalSignalKind::ProviderStorageContention
         | TerminalSignalKind::Unknown => None,
     }
 }

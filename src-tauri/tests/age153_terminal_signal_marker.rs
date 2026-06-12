@@ -36,7 +36,7 @@ fn terminal_signal_marker_is_stderr_key_json_with_four_fields_and_once() {
     assert_ordered(
         &stderr,
         "OULIPOLY_TERMINAL_SIGNAL=",
-        "[routing] provider claude-age153-a returned quota_exhausted; retrying another provider",
+        "unavailable; rotating to another provider",
     );
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 1);
@@ -62,7 +62,7 @@ fn assert_marker_emission_is_adjacent_to_typed_signal_finalization() {
         .find(".finalize_invocation(")
         .expect("typed terminal signal block must include lifecycle finalization");
     let retry_idx = after_signal
-        .find("[routing] provider {provider_name} returned quota_exhausted; retrying another provider")
+        .find("[routing] provider {provider_name} unavailable; rotating to another provider")
         .expect("quota retry diagnostic must remain in the typed quota retry path");
     assert!(
         finalize_idx < retry_idx,

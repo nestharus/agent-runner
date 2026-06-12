@@ -22,6 +22,7 @@ pub(in crate::run::balancing) fn terminal_signal_branch(
     };
     match signal.kind {
         TerminalSignalKind::QuotaExhaustedInband => TerminalSignalBranch::QuotaExhaustedRetry,
+        TerminalSignalKind::ProviderStorageContention => TerminalSignalBranch::QuotaExhaustedRetry,
         TerminalSignalKind::MaybeQuotaExhausted => TerminalSignalBranch::MaybeQuotaVerify,
         TerminalSignalKind::ProlongedSilence => TerminalSignalBranch::ProlongedSilenceFail,
         TerminalSignalKind::NonzeroExit

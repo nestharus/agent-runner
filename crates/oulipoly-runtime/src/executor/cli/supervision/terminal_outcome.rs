@@ -98,14 +98,17 @@ mod tests {
         );
 
         assert_eq!(output.exit_code, -1);
-        assert_eq!(output.terminal_signal.kind, TerminalSignalKind::Unknown);
+        assert_eq!(
+            output.terminal_signal.kind,
+            TerminalSignalKind::ProviderStorageContention
+        );
         let reason = output
             .terminal_reason
             .as_deref()
             .expect("terminal structured errors must surface a terminal_reason");
         assert!(
-            reason.contains("Failed to execute statement"),
-            "terminal_reason should retain the incident message: {reason}"
+            reason.contains("provider_storage_contention"),
+            "terminal_reason should surface the storage-contention reason: {reason}"
         );
     }
 
