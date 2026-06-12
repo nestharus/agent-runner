@@ -1,11 +1,13 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - orchestration
 //! - parser
+//! - predicate
 //!
-//! Role set: { accessor, mapper, orchestration, parser }
+//! Role set: { accessor, formatter, mapper, orchestration, parser, predicate }
 //!
 //! Compaction boundary and chain segment list helpers.
 

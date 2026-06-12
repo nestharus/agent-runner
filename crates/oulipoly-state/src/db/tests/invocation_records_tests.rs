@@ -118,14 +118,7 @@ name = "fixture-provider"
             let dir =
                 legacy_invocations_db(&[("missing-model", 0, 0, 7, None, "2026-04-17T08:05:00Z")]);
             let migrated = StateDb::open(&dir.path().join("state.db")).unwrap();
-            let legacy_uuid: String = migrated
-                .conn
-                .query_row(
-                    "SELECT invocation_uuid FROM invocations LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
+            let legacy_uuid = legacy_invocation_uuid(&migrated);
             let legacy = migrated
                 .get_invocation_by_uuid(&legacy_uuid)
                 .unwrap()
@@ -179,10 +172,7 @@ fn list_invocation_children_orders_by_created_at_then_row_id() {
     );
 
     let children = db.list_invocation_children(root_id).unwrap();
-    let ordered: Vec<&str> = children
-        .iter()
-        .map(|record| record.invocation_uuid.as_str())
-        .collect();
+    let ordered = invocation_record_uuids(&children);
 
     assert_eq!(
         ordered,
@@ -223,10 +213,7 @@ fn list_invocation_children_returns_only_direct_children() {
     );
 
     let children = db.list_invocation_children(root_id).unwrap();
-    let uuids: Vec<&str> = children
-        .iter()
-        .map(|record| record.invocation_uuid.as_str())
-        .collect();
+    let uuids = invocation_record_uuids(&children);
 
     assert_eq!(
         uuids,
@@ -235,4 +222,11 @@ fn list_invocation_children_returns_only_direct_children() {
             "80000000-0000-0000-0000-000000000000",
         ]
     );
+}
+
+fn invocation_record_uuids(records: &[InvocationRecord]) -> Vec<&str> {
+    records
+        .iter()
+        .map(|record| record.invocation_uuid.as_str())
+        .collect()
 }

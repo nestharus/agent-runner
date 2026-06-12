@@ -61,6 +61,17 @@ pub(super) struct SessionTurnBindValues<'a> {
     pub(super) body: Option<&'a str>,
 }
 
+pub(super) struct SessionTurnInsertRow<'a> {
+    pub(super) provider_name: &'a str,
+    pub(super) session_id: &'a str,
+    pub(super) turn_id: &'a str,
+    pub(super) timestamp: String,
+    pub(super) role: &'a str,
+    pub(super) source_file: &'a str,
+    pub(super) ingested_at: String,
+    pub(super) body: Option<&'a str>,
+}
+
 impl StateDb {
     // --- Session log ingestion ---
 
@@ -75,27 +86,60 @@ impl StateDb {
         role: &str,
         source_file: &str,
     ) -> Result<bool, String> {
-        let now = Self::current_rfc3339_timestamp();
-        let ts = Self::format_session_turn_timestamp(timestamp);
-        let changed = self
-            .conn
+        let row = Self::session_turn_insert_row(
+            provider_name,
+            session_id,
+            turn_id,
+            timestamp,
+            role,
+            source_file,
+        );
+        let changed = self.insert_session_turn_row(&row)?;
+        Ok(Self::session_turn_insert_changed(changed))
+    }
+
+    fn session_turn_insert_row<'a>(
+        provider_name: &'a str,
+        session_id: &'a str,
+        turn_id: &'a str,
+        timestamp: &DateTime<Utc>,
+        role: &'a str,
+        source_file: &'a str,
+    ) -> SessionTurnInsertRow<'a> {
+        SessionTurnInsertRow {
+            provider_name,
+            session_id,
+            turn_id,
+            timestamp: Self::format_session_turn_timestamp(timestamp),
+            role,
+            source_file,
+            ingested_at: Self::current_rfc3339_timestamp(),
+            body: None,
+        }
+    }
+
+    fn insert_session_turn_row(&self, row: &SessionTurnInsertRow<'_>) -> Result<usize, String> {
+        self.conn
             .execute(
                 "INSERT OR IGNORE INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, is_compaction_boundary, source_file, ingested_at, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8)",
                 sqlite::params![
-                    provider_name,
-                    session_id,
-                    turn_id,
-                    &ts,
-                    role,
-                    source_file,
-                    &now,
-                    Option::<&str>::None,
+                    row.provider_name,
+                    row.session_id,
+                    row.turn_id,
+                    &row.timestamp,
+                    row.role,
+                    row.source_file,
+                    &row.ingested_at,
+                    row.body,
                 ],
             )
-            .map_err(Self::format_session_turn_ingest_error)?;
-        Ok(changed > 0)
+            .map_err(Self::format_session_turn_ingest_error)
+    }
+
+    fn session_turn_insert_changed(changed: usize) -> bool {
+        changed > 0
     }
 
     fn format_session_turn_ingest_error(err: sqlite::Error) -> String {

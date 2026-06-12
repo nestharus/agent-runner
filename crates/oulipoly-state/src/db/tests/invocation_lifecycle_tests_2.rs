@@ -131,14 +131,7 @@ fn finalize_invocation_skips_provider_aggregate_for_null_provider_name() {
     db.finalize_invocation(ids[1], false, 1, Some("rate_limit"), Some("429"))
         .unwrap();
 
-    let provider_rows: i64 = db
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM providers WHERE model_name = 'legacy-model'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let provider_rows = provider_rows_for_model(&db, "legacy-model");
     assert_eq!(provider_rows, 0);
 }
 

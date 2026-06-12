@@ -4,6 +4,7 @@
 //!
 //! Role set: { validator }
 
+use super::common::*;
 use super::*;
 #[test]
 fn state_db_open_sets_busy_timeout() {
@@ -11,10 +12,7 @@ fn state_db_open_sets_busy_timeout() {
     let path = dir.path().join("state.db");
 
     let db = StateDb::open(&path).unwrap();
-    let busy_timeout = db
-        .connection()
-        .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
-        .unwrap();
+    let busy_timeout = busy_timeout_ms(&db);
 
     assert!(
         busy_timeout >= 5000,

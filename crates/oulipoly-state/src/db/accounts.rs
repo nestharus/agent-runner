@@ -5,8 +5,10 @@
 //! - formatter
 //! - mapper
 //! - orchestration
+//! - parser
+//! - predicate
 //!
-//! Role set: { accessor, filter, formatter, mapper, orchestration }
+//! Role set: { accessor, filter, formatter, mapper, orchestration, parser, predicate }
 //!
 //! Provider account persistence methods for `StateDb`.
 

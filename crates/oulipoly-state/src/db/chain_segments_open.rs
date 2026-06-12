@@ -4,8 +4,9 @@
 //! - mapper
 //! - orchestration
 //! - accessor
+//! - validator
 //!
-//! Role set: { formatter, mapper, orchestration, accessor }
+//! Role set: { formatter, mapper, orchestration, accessor, validator }
 //!
 //! Session-chain segment open, rotate, and active snapshot operations.
 

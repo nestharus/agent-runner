@@ -6,10 +6,32 @@
 //! - orchestration
 //! - predicate
 //! - validator
+//! - parser
 //!
-//! Role set: { accessor, filter, mapper, orchestration, predicate, validator }
+//! Role set: { accessor, filter, mapper, orchestration, predicate, validator, parser }
 //!
 //! Resume request resolution and provider/model validation.
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/resume_resolution.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-session-id-grammar
+//!     Owns:
+//!       - StateDb resume input acceptance for UUIDs and OpenCode provider session IDs
+//!       - OpenCode `ses_` provider-session prefix strip and suffix validation
+//!       - provider-session-id-to-chain resolution query path
+//!   - component: crates/oulipoly-state/src/db/resume_resolution.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-model-provider-resolution
+//!     Owns:
+//!       - ModelStore and ModelConfig lookup for resume continuation
+//!       - active-provider compatibility checks against model provider entries
+//!       - provider/model mismatch suggestion construction and sorting
+//!       - ResolvedResume assembly across chain, provider, session, and model fields
+//! ```
 
 use super::*;
 use oulipoly_config::ModelConfig;

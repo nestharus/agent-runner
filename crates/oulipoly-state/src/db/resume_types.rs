@@ -5,6 +5,26 @@
 //! Role set: { mapper }
 //!
 //! Resume public mappers and private query row mappers.
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/resume_types.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-session-id-grammar
+//!     Owns:
+//!       - OpenCode provider session ID prefix `ses_`
+//!       - OpenCode provider session ID minimum alphanumeric suffix length accepted by StateDb resume input validation
+//!       - StateDb opaque provider-session resume identity DTO boundary
+//!   - component: crates/oulipoly-state/src/db/resume_types.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-dto-boundary
+//!     Owns:
+//!       - ModelStore alias over std::collections::HashMap and ModelConfig
+//!       - ResolvedResume, ResumeError, ChainPreview, TurnPreview, and row DTO fields
+//!       - chrono DateTime/Utc timestamp fields carried by resume previews
+//! ```
 
 use chrono::{DateTime, Utc};
 use oulipoly_config::ModelConfig;

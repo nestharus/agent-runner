@@ -17,6 +17,11 @@
 //!       - oulipoly_state::schema_probe inspect_schema API
 //!       - oulipoly_state::StateDb open and connection APIs
 //!       - crates/oulipoly-state/src/db.rs legacy ensure_schema helper names and schema-mutating SQL source shape
+//!       - rusqlite::Connection fixture inspection surface
+//!       - std::collections::{BTreeMap, BTreeSet} expected-table and fingerprint comparison surface
+//!       - std::ops::Range migration matrix selection surface
+//!       - std::sync::{Mutex, OnceLock} migration-failure test synchronization surface
+//!       - tempfile::tempdir database fixture directory surface
 
 mod fixtures;
 
@@ -503,7 +508,20 @@ fn assert_helper_statements_are_migration_represented(
 
 // Declared role: formatter
 fn helper_statement_is_migration_represented(migration_sql: &str, statement: &str) -> bool {
-    migration_sql.contains(&normalize_sql(statement))
+    migration_sql_contains_normalized_statement(
+        migration_sql,
+        &normalized_helper_statement(statement),
+    )
+}
+
+// Declared role: formatter
+fn normalized_helper_statement(statement: &str) -> String {
+    normalize_sql(statement)
+}
+
+// Declared role: predicate
+fn migration_sql_contains_normalized_statement(migration_sql: &str, statement: &str) -> bool {
+    migration_sql.contains(statement)
 }
 
 // Declared role: accessor

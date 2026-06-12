@@ -30,15 +30,7 @@ fn agent_session_chain_records_initial_reason_even_if_ingestion_minted_first() {
 
     db.mint_chain_for_invocation_session(id).unwrap();
 
-    let reason: String = db
-        .conn
-        .query_row(
-            "SELECT transition_reason FROM session_chain_segments
-                 WHERE provider_name = 'provider-a' AND session_id = ?1",
-            sqlite::params![SESSION_A],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let reason = chain_segment_transition_reason(&db, "provider-a", SESSION_A);
     assert_eq!(reason, "initial");
 }
 
@@ -54,14 +46,6 @@ fn imported_session_stays_imported_when_no_agent_mint_fires() {
     )
     .unwrap();
 
-    let reason: String = db
-        .conn
-        .query_row(
-            "SELECT transition_reason FROM session_chain_segments
-                 WHERE provider_name = 'provider-a' AND session_id = ?1",
-            sqlite::params![SESSION_A],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let reason = chain_segment_transition_reason(&db, "provider-a", SESSION_A);
     assert_eq!(reason, "imported");
 }

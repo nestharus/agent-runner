@@ -9,14 +9,7 @@ use super::*;
 #[test]
 fn session_turns_schema_creation_includes_sidechain_columns() {
     let db = test_db();
-    let sql: String = db
-        .conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_turns'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let sql = session_turn_table_sql(&db);
 
     assert!(sql.contains("parent_turn_id TEXT"));
     assert!(sql.contains("is_sidechain INTEGER NOT NULL DEFAULT 0"));
@@ -28,26 +21,10 @@ fn session_turns_schema_migration_adds_parent_and_sidechain_columns() {
     let dir = legacy_session_turns_db();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
 
-    let columns: Vec<(String, String, i64, Option<String>)> = db
-        .conn
-        .prepare("PRAGMA table_info(session_turns)")
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
-        })
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let columns = session_turn_columns(&db);
 
-    assert!(columns.iter().any(|column| {
-        column.0 == "parent_turn_id" && column.1 == "TEXT" && column.2 == 0 && column.3.is_none()
-    }));
-    assert!(columns.iter().any(|column| {
-        column.0 == "is_sidechain"
-            && column.1 == "INTEGER"
-            && column.2 == 1
-            && column.3.as_deref() == Some("0")
-    }));
+    assert!(has_parent_turn_column(&columns));
+    assert!(has_sidechain_column(&columns));
 }
 
 #[test]
@@ -67,50 +44,21 @@ fn session_turns_schema_migration_adds_nullable_body_to_legacy_db() {
 
     let db = StateDb::open(&path).unwrap();
 
-    let session_columns: Vec<(String, String, i64)> = db
-        .conn
-        .prepare("PRAGMA table_info(session_turns)")
-        .unwrap()
-        .query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let session_columns = session_turn_columns(&db);
     assert!(
-        session_columns
-            .iter()
-            .any(|(name, data_type, notnull)| name == "body"
-                && data_type == "TEXT"
-                && *notnull == 0),
+        has_nullable_body_column(&session_columns),
         "legacy migration must add nullable body TEXT; columns={session_columns:?}"
     );
-    let body: Option<String> = db
-        .conn
-        .query_row(
-            "SELECT body FROM session_turns WHERE turn_id = 'legacy-turn'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let body = session_turn_body(&db, "legacy-turn");
     assert_eq!(body, None);
 
-    let quota_columns: Vec<String> = db
-        .conn
-        .prepare("PRAGMA table_info(provider_quotas)")
-        .unwrap()
-        .query_map([], |row| row.get(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let quota_columns = provider_quota_column_names(&db);
     assert!(
-        quota_columns
-            .iter()
-            .any(|column| column == "topology_peak_live_window_count"),
+        has_column(&quota_columns, "topology_peak_live_window_count"),
         "body migration must coexist with WU-13 quota topology migration; columns={quota_columns:?}"
     );
     assert!(
-        quota_columns
-            .iter()
-            .any(|column| column == "last_topology_probe_at"),
+        has_column(&quota_columns, "last_topology_probe_at"),
         "body migration must coexist with WU-13 quota topology migration; columns={quota_columns:?}"
     );
 }
@@ -118,18 +66,7 @@ fn session_turns_schema_migration_adds_nullable_body_to_legacy_db() {
 #[test]
 fn session_turns_schema_creation_includes_resume_lookup_index() {
     let db = test_db();
-    let indexes: Vec<String> = db
-        .conn
-        .prepare(
-            "SELECT name FROM sqlite_master
-                 WHERE type = 'index' AND tbl_name = 'session_turns'
-                 ORDER BY name",
-        )
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let indexes = session_turn_index_names(&db);
 
     assert!(
         indexes.contains(&"idx_session_turns_session_lookup".to_string()),
@@ -141,21 +78,83 @@ fn session_turns_schema_creation_includes_resume_lookup_index() {
 fn session_turns_schema_migration_adds_resume_lookup_index() {
     let dir = legacy_session_turns_db();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-    let indexes: Vec<String> = db
-        .conn
+    let indexes = session_turn_index_names(&db);
+
+    assert!(
+        indexes.contains(&"idx_session_turns_session_lookup".to_string()),
+        "resume lookup index must be added on existing DB open: {indexes:?}"
+    );
+}
+
+type SessionTurnColumn = (String, String, i64, Option<String>);
+
+fn session_turn_columns(db: &StateDb) -> Vec<SessionTurnColumn> {
+    db.conn
+        .prepare("PRAGMA table_info(session_turns)")
+        .unwrap()
+        .query_map([], session_turn_column_row)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn session_turn_column_row(row: &sqlite::Row<'_>) -> sqlite::Result<SessionTurnColumn> {
+    Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+}
+
+fn has_parent_turn_column(columns: &[SessionTurnColumn]) -> bool {
+    columns.iter().any(|column| {
+        column.0 == "parent_turn_id" && column.1 == "TEXT" && column.2 == 0 && column.3.is_none()
+    })
+}
+
+fn has_sidechain_column(columns: &[SessionTurnColumn]) -> bool {
+    columns.iter().any(|column| {
+        column.0 == "is_sidechain"
+            && column.1 == "INTEGER"
+            && column.2 == 1
+            && column.3.as_deref() == Some("0")
+    })
+}
+
+fn has_nullable_body_column(columns: &[SessionTurnColumn]) -> bool {
+    columns
+        .iter()
+        .any(|(name, data_type, notnull, _)| name == "body" && data_type == "TEXT" && *notnull == 0)
+}
+
+fn provider_quota_column_names(db: &StateDb) -> Vec<String> {
+    db.conn
+        .prepare("PRAGMA table_info(provider_quotas)")
+        .unwrap()
+        .query_map([], provider_quota_column_name_row)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn provider_quota_column_name_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get(1)
+}
+
+fn has_column(columns: &[String], expected: &str) -> bool {
+    columns.iter().any(|column| column == expected)
+}
+
+fn session_turn_index_names(db: &StateDb) -> Vec<String> {
+    db.conn
         .prepare(
             "SELECT name FROM sqlite_master
                  WHERE type = 'index' AND tbl_name = 'session_turns'
                  ORDER BY name",
         )
         .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([], session_turn_index_name_row)
         .unwrap()
         .map(Result::unwrap)
-        .collect();
+        .collect()
+}
 
-    assert!(
-        indexes.contains(&"idx_session_turns_session_lookup".to_string()),
-        "resume lookup index must be added on existing DB open: {indexes:?}"
-    );
+fn session_turn_index_name_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get(0)
 }

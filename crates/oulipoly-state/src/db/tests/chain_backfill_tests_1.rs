@@ -36,14 +36,7 @@ fn backfill_creates_one_chain_per_provider_session_pair() {
 
     assert_eq!(chain_count(&db), 2);
     assert_eq!(segment_count(&db), 2);
-    let imported: i64 = db
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM session_chain_segments WHERE transition_reason = 'imported' AND ended_at IS NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+    let imported = active_imported_segment_count(&db);
     assert_eq!(imported, 2);
 }
 
@@ -82,37 +75,7 @@ fn migration_backfill_null_null_preserves_running_rows() {
     );
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
 
-    type MigrationBackfillRow = (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<String>,
-    );
-
-    let row: MigrationBackfillRow = db
-        .conn
-        .query_row(
-            "SELECT session_id, provider_session_id, resume_input_id,
-                        provider_session_capture_method, terminal_reason, status, error_category
-                 FROM invocations
-                 WHERE invocation_uuid = ?1",
-            sqlite::params![invocation_uuid],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
-        )
-        .unwrap();
+    let row = invocation_migration_backfill_row(&db, invocation_uuid);
 
     assert_eq!(row.0, None);
     assert_eq!(row.1, None);
@@ -152,17 +115,7 @@ fn migration_backfill_resumed_chain_id_safe() {
     }
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
 
-    let row: (String, Option<String>, Option<String>, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT session_id, provider_session_id, resume_input_id,
-                        provider_session_capture_method
-                 FROM invocations
-                 WHERE invocation_uuid = ?1",
-            sqlite::params![invocation_uuid],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
+    let row = invocation_dual_id_row(&db, invocation_uuid);
     let models = resolver_model_store();
     let resolved = db.resolve_resume(&models, CHAIN_A, None).unwrap();
 
@@ -186,17 +139,7 @@ fn migration_backfill_non_resumed_with_session_id() {
     );
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
 
-    let row: (String, Option<String>, Option<String>, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT session_id, provider_session_id, resume_input_id,
-                        provider_session_capture_method
-                 FROM invocations
-                 WHERE invocation_uuid = ?1",
-            sqlite::params![invocation_uuid],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
+    let row = invocation_dual_id_row(&db, invocation_uuid);
 
     assert_eq!(row.0, SESSION_A);
     assert_eq!(row.1.as_deref(), Some(SESSION_A));
@@ -230,13 +173,6 @@ fn mint_chain_no_op_on_resume_of_existing_chain() {
 
     assert_eq!(first_id, second_id);
     assert_eq!(segment_count(&db), 1);
-    let active: i64 = db
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
-            sqlite::params![CHAIN_A],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let active = active_segment_count_for_chain(&db, CHAIN_A);
     assert_eq!(active, 1);
 }

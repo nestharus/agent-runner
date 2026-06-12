@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - orchestration
 //! - validator
 //!
-//! Role set: { accessor, orchestration, validator }
+//! Role set: { accessor, formatter, orchestration, validator }
 //!
 //! State database write/open entry points and current validator repairs.
 

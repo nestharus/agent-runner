@@ -1,12 +1,14 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - filter
+//! - formatter
 //! - orchestration
 //! - parser
 //! - predicate
 //! - mapper
 //!
-//! Role set: { accessor, orchestration, parser, predicate, mapper }
+//! Role set: { accessor, filter, formatter, orchestration, parser, predicate, mapper }
 //!
 //! Invocation-window session lookup, timestamp parsing, filtering, and ranking.
 

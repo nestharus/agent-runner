@@ -14,6 +14,9 @@
 //!       - fixtures count_rows, schema_fingerprint, user_version helpers
 //!       - oulipoly_state::StateDb open and connection APIs
 //!       - oulipoly_state::CURRENT_SCHEMA_VERSION
+//!       - rusqlite::{Connection, params} row-inspection support surface
+//!       - std::path::Path fixture database path support surface
+//!       - tempfile::tempdir database fixture directory surface
 
 mod fixtures;
 
@@ -461,7 +464,17 @@ fn legacy_row_count_guard_offsets(body: &str) -> LegacyRowCountGuardOffsets {
 
 // Declared role: parser
 fn source_offset(source: &str, needle: &str, message: &str) -> usize {
-    source.find(needle).expect(message)
+    require_source_offset(find_source_offset(source, needle), message)
+}
+
+// Declared role: parser
+fn find_source_offset(source: &str, needle: &str) -> Option<usize> {
+    source.find(needle)
+}
+
+// Declared role: validator
+fn require_source_offset(offset: Option<usize>, message: &str) -> usize {
+    offset.expect(message)
 }
 
 // Declared role: accessor

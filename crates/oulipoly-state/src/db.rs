@@ -15,8 +15,9 @@
 //! SQLite open/migration/schema behavior, marker parsing/formatting (re-exported from
 //! `invocation_marker.rs`), sidecar identity classification (delegated to `db/sqlite_adapter.rs`),
 //! lifecycle log sink integration (delegated to `db/lifecycle_log_adapter.rs`), and resume/quota
-//! orchestration. Intrinsic-surface declarations cover the schema-version and chrono couplings;
-//! see `the AGE-160 proposal § Intrinsic-surface declarations` for the canonical declaration.
+//! orchestration. Intrinsic-surface declarations cover the schema-version, timestamp, facade
+//! support, and concern-module aggregation couplings; see `the AGE-160 proposal § Intrinsic-surface
+//! declarations` for the canonical declaration.
 //!
 //! AGE-160 intrinsic schema-version carrier: `crate::schema` owns the schema-version constants and
 //! compatibility classifier consumed by this StateDb open/migration boundary.
@@ -37,6 +38,30 @@
 //!     Owns:
 //!       - provider_quotas.exhausted_at
 //!       - count_session_turns
+//!   - component: crates/oulipoly-state/src/db.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-concern-module-aggregator
+//!     Owns:
+//!       - StateDb concern-module declarations under `crates/oulipoly-state/src/db/*.rs`
+//!       - StateDb facade imports and public re-exports from concern modules
+//!       - StateDb schema macro and table-shape type aggregation
+//!       - StateDb facade external support imports: lifecycle_log_adapter, sqlite_adapter, and params
+//!       - LifecycleEventSink and NoopLifecycleEventSink integration for StateDb lifecycle logging
+//!       - chrono DateTime/Utc timestamp surface used by facade-level StateDb APIs
+//!       - oulipoly_config::load_models legacy migration lookup interface
+//!       - std HashMap/Path/PathBuf/Mutex facade support types and uuid::Uuid identifiers
+//!       - test-only CompositeInvocationId, CURRENT_SCHEMA_VERSION, and ReturnedArtifactRef support imports
+//!       - accounts, chain_backfill, chain_segments_compaction, chain_segments_import, chain_segments_open
+//!       - cli_providers, discovered_models, discovery_types, invocation_artifacts
+//!       - invocation_lifecycle_finalize, invocation_lifecycle_finalize_context, invocation_lifecycle_finalize_write, invocation_lifecycle_start
+//!       - invocation_records, invocation_schema_legacy_migration, invocation_schema_projection, invocation_schema_repair, invocation_schema_session_turns, invocation_schema_table
+//!       - invocation_window, lifecycle_invocation_row, lifecycle_log_adapter, model_parameters
+//!       - opening_migrations, opening_read_only, opening_write, owned_turn_event_read, owned_turn_event_write
+//!       - provider_quota_reads, provider_quota_refresh, provider_quota_status, provider_quota_test_support, provider_quota_window_writes, provider_quotas
+//!       - provider_schema_migration, provider_schema_validation, provider_session_binding, providers
+//!       - resume_active_segment, resume_lookup, resume_preview, resume_resolution, resume_types
+//!       - returned_artifacts_codec, returned_artifacts_read, returned_artifacts_write
+//!       - schema_types, session_capture, session_markers, session_turns_ingest, session_turns_query, sqlite_adapter, timestamps
 //! ```
 
 macro_rules! invocation_returned_artifacts_schema_sql {

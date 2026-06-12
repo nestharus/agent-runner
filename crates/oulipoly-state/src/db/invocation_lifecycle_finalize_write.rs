@@ -4,10 +4,11 @@
 //! - formatter
 //! - orchestration
 //! - mapper
+//! - parser
 //! - predicate
 //! - validator
 //!
-//! Role set: { accessor, formatter, orchestration, mapper, predicate, validator }
+//! Role set: { accessor, formatter, orchestration, mapper, parser, predicate, validator }
 //!
 //! Invocation finalize row and provider aggregate writes.
 

@@ -141,8 +141,18 @@ pub(in crate::db::tests) fn legacy_session_turns_db() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let conn = sqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE session_turns (
+    create_legacy_session_turns_table(&conn);
+    mark_current_schema_version(&conn);
+    dir
+}
+
+fn create_legacy_session_turns_table(conn: &sqlite::Connection) {
+    conn.execute_batch(legacy_session_turns_schema_sql())
+        .unwrap();
+}
+
+fn legacy_session_turns_schema_sql() -> &'static str {
+    "CREATE TABLE session_turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 provider_name TEXT NOT NULL,
                 session_id TEXT NOT NULL,
@@ -152,11 +162,7 @@ pub(in crate::db::tests) fn legacy_session_turns_db() -> TempDir {
                 source_file TEXT NOT NULL,
                 ingested_at TEXT NOT NULL,
                 UNIQUE (provider_name, session_id, turn_id)
-            );",
-    )
-    .unwrap();
-    mark_current_schema_version(&conn);
-    dir
+            );"
 }
 
 pub(in crate::db::tests) fn invocation_table_sql(db: &StateDb) -> String {
@@ -171,6 +177,117 @@ pub(in crate::db::tests) fn invocation_table_sql(db: &StateDb) -> String {
 
 pub(in crate::db::tests) fn invocation_columns(db: &StateDb) -> Vec<String> {
     require_sqlite_rows(read_invocation_columns(db))
+}
+
+pub(in crate::db::tests) fn invocation_column_notnull(db: &StateDb, column_name: &str) -> i64 {
+    db.conn
+        .query_row(
+            "SELECT [notnull] FROM pragma_table_info('invocations') WHERE name = ?1",
+            sqlite::params![column_name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn session_turn_table_sql(db: &StateDb) -> String {
+    db.conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_turns'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) type SessionTurnDetailRow = (Option<String>, i64, i64, Option<String>);
+
+pub(in crate::db::tests) fn session_turn_source_file(db: &StateDb, turn_id: &str) -> String {
+    db.conn
+        .query_row(
+            "SELECT source_file FROM session_turns WHERE turn_id = ?1",
+            sqlite::params![turn_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn session_turn_detail_row(
+    db: &StateDb,
+    turn_id: &str,
+) -> SessionTurnDetailRow {
+    db.conn
+        .query_row(
+            "SELECT parent_turn_id, is_sidechain, is_compaction_boundary, body
+                 FROM session_turns WHERE turn_id = ?1",
+            sqlite::params![turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn session_turn_count(db: &StateDb) -> i64 {
+    db.conn
+        .query_row("SELECT COUNT(*) FROM session_turns", [], |row| row.get(0))
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn session_turn_body(db: &StateDb, turn_id: &str) -> Option<String> {
+    db.conn
+        .query_row(
+            "SELECT body FROM session_turns WHERE turn_id = ?1",
+            sqlite::params![turn_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn sqlite_user_version(conn: &sqlite::Connection) -> i32 {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn preserved_row_value(conn: &sqlite::Connection, id: i64) -> String {
+    conn.query_row(
+        "SELECT value FROM preserved_rows WHERE id = ?1",
+        sqlite::params![id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+pub(in crate::db::tests) fn sqlite_schema_object_count(
+    conn: &sqlite::Connection,
+    object_type: &str,
+    name: &str,
+) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+        sqlite::params![object_type, name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+pub(in crate::db::tests) fn sqlite_master_object_type(
+    conn: &sqlite::Connection,
+    name: &str,
+) -> String {
+    conn.query_row(
+        "SELECT type FROM sqlite_master WHERE name = ?1",
+        sqlite::params![name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+pub(in crate::db::tests) fn provider_rows_for_model(db: &StateDb, model_name: &str) -> i64 {
+    db.conn
+        .query_row(
+            "SELECT COUNT(*) FROM providers WHERE model_name = ?1",
+            sqlite::params![model_name],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn read_invocation_columns(db: &StateDb) -> sqlite::Result<Vec<String>> {

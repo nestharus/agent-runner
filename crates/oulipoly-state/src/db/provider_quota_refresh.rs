@@ -1,11 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - filter
 //! - formatter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, formatter, mapper, orchestration }
+//! Role set: { accessor, filter, formatter, mapper, orchestration }
 //!
 //! Provider quota refresh aggregate orchestration and empty-refresh writes.
 

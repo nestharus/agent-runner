@@ -10,6 +10,19 @@
 //! Role set: { accessor, formatter, orchestration, parser, validator, mapper }
 //!
 //! Returned-artifact replacement and row insertion.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-state/src/db/returned_artifacts_write.rs
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly_agent_messenger::ReturnedArtifactRef returned-artifact-ref contract
+//!       - ReturnedArtifactRef.store_address workflow_run_id/artifact_name/version field contract
+//!       - StateDb invocation_returned_artifacts persistence row and SQLite mutation contract
+//!       - Returned-artifact UUID identity, source JSON encoding, and returned_at timestamp persistence contract
+//! ```
 
 use super::*;
 use oulipoly_agent_messenger::ReturnedArtifactRef;

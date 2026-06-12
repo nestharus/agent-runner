@@ -156,14 +156,7 @@ fn bind_invocation_provider_session_start_conflicting_rebind_rejects_without_mut
         "{err}"
     );
     assert_eq!(segment_count(&db), before_segments);
-    let stored: Option<String> = db
-        .conn
-        .query_row(
-            "SELECT provider_session_id FROM invocations WHERE id = ?1",
-            sqlite::params![id],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let stored = invocation_provider_session_id(&db, id);
     assert_eq!(stored.as_deref(), Some(provider_session_id.as_str()));
 }
 
@@ -185,14 +178,7 @@ fn bind_invocation_provider_session_start_matching_resume_input_does_not_mint_du
     .unwrap();
 
     assert_eq!(segment_count(&db), 0);
-    let row: (Option<String>, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT provider_session_id, resume_input_id FROM invocations WHERE id = ?1",
-            sqlite::params![id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
+    let row = invocation_provider_and_resume_input_ids(&db, id);
     assert_eq!(row.0.as_deref(), Some(provider_session_id.as_str()));
     assert_eq!(row.1.as_deref(), Some(provider_session_id.as_str()));
 }
@@ -217,15 +203,7 @@ fn bind_then_record_legacy_then_rebind_preserves_legacy_resume_session_id() {
     db.bind_invocation_provider_session_start(id, &binding)
         .unwrap();
 
-    let row: (Option<String>, Option<String>, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT session_id, provider_session_id, resume_input_id
-                 FROM invocations WHERE id = ?1",
-            sqlite::params![id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let row = invocation_session_provider_resume_ids(&db, id);
     assert_eq!(row.0.as_deref(), Some(legacy_resume_input.as_str()));
     assert_eq!(row.1.as_deref(), Some(provider_session_id.as_str()));
     assert_eq!(row.2.as_deref(), Some(legacy_resume_input.as_str()));

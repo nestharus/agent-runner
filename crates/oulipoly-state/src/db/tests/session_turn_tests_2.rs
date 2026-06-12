@@ -11,50 +11,8 @@ fn has_session_user_turn_containing_matches_user_body_substring() {
     let db = test_db();
     let nonce = "11111111-2222-4333-8444-555555555555";
 
-    db.ingest_session_turns_batch(
-        "fixture-provider",
-        &[
-            SessionTurnIngest {
-                session_id: "session-a".to_string(),
-                turn_id: "user-quoted-delivery".to_string(),
-                timestamp: ts("2026-04-17T08:00:00Z"),
-                role: "user".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-                body: Some(
-                    serde_json::json!([
-                        {
-                            "type": "text",
-                            "text": format!(
-                                "\"[OULIPOLY NOTIFICATIONS]\n[OULIPOLY-DELIVERY {nonce}]\nbody\""
-                            )
-                        }
-                    ])
-                    .to_string(),
-                ),
-            },
-            SessionTurnIngest {
-                session_id: "session-a".to_string(),
-                turn_id: "assistant-same-nonce".to_string(),
-                timestamp: ts("2026-04-17T08:00:01Z"),
-                role: "assistant".to_string(),
-                parent_turn_id: None,
-                is_sidechain: false,
-                is_compaction_boundary: false,
-                body: Some(
-                    serde_json::json!([
-                        {
-                            "type": "text",
-                            "text": format!("assistant [OULIPOLY-DELIVERY {nonce}]")
-                        }
-                    ])
-                    .to_string(),
-                ),
-            },
-        ],
-    )
-    .unwrap();
+    db.ingest_session_turns_batch("fixture-provider", &delivery_fixture_turns(nonce))
+        .unwrap();
 
     assert!(
         db.has_session_user_turn_containing("fixture-provider", "session-a", nonce)
@@ -81,4 +39,54 @@ fn has_session_user_turn_containing_matches_user_body_substring() {
             .unwrap(),
         "session identity must match"
     );
+}
+
+fn delivery_fixture_turns(nonce: &str) -> [SessionTurnIngest; 2] {
+    [user_delivery_turn(nonce), assistant_delivery_turn(nonce)]
+}
+
+fn user_delivery_turn(nonce: &str) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: "session-a".to_string(),
+        turn_id: "user-quoted-delivery".to_string(),
+        timestamp: ts("2026-04-17T08:00:00Z"),
+        role: "user".to_string(),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: false,
+        body: Some(quoted_delivery_body(nonce)),
+    }
+}
+
+fn assistant_delivery_turn(nonce: &str) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: "session-a".to_string(),
+        turn_id: "assistant-same-nonce".to_string(),
+        timestamp: ts("2026-04-17T08:00:01Z"),
+        role: "assistant".to_string(),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: false,
+        body: Some(assistant_delivery_body(nonce)),
+    }
+}
+
+fn quoted_delivery_body(nonce: &str) -> String {
+    delivery_body_json(&quoted_delivery_text(nonce))
+}
+
+fn quoted_delivery_text(nonce: &str) -> String {
+    format!("\"[OULIPOLY NOTIFICATIONS]\n[OULIPOLY-DELIVERY {nonce}]\nbody\"")
+}
+
+fn assistant_delivery_body(nonce: &str) -> String {
+    delivery_body_json(&assistant_delivery_text(nonce))
+}
+
+fn assistant_delivery_text(nonce: &str) -> String {
+    format!("assistant [OULIPOLY-DELIVERY {nonce}]")
+}
+
+fn delivery_body_json(text: &str) -> String {
+    serde_json::json!([{ "type": "text", "text": text }]).to_string()
 }

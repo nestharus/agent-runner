@@ -7,7 +7,7 @@
 use super::*;
 #[test]
 fn age160_composite_invocation_id_declared_grammar_canonical_json_round_trip() {
-    let known_uuid = Uuid::parse_str("7ad2916c-38dd-49e6-a1f7-3ef22766ff70").unwrap();
+    let known_uuid = known_marker_uuid();
     let composite = CompositeInvocationId {
         source: "provider-b2".to_string(),
         id: known_uuid.to_string(),
@@ -28,7 +28,7 @@ fn age160_composite_invocation_id_declared_grammar_canonical_json_round_trip() {
     assert_eq!(parsed.source, "provider-b2");
     assert_eq!(parsed.id.to_string(), known_uuid.to_string());
 
-    let parent_env = serde_json::to_string(&composite).unwrap();
+    let parent_env = parent_env_payload(&composite);
     assert!(!parent_env.starts_with("OULIPOLY_INVOCATION="));
     assert_eq!(
         CompositeInvocationId::parse_env_value(&parent_env)
@@ -43,10 +43,7 @@ fn age160_composite_invocation_id_declared_grammar_canonical_json_round_trip() {
 fn age160_composite_invocation_id_declared_grammar_legacy_shell_mangled_compatibility() {
     let known_uuid = "7ad2916c-38dd-49e6-a1f7-3ef22766ff70";
 
-    for payload in [
-        format!("{{source:\"provider-b2\",id:\"{known_uuid}\",extra:\"ignored\"}}"),
-        format!("{{source:'provider-b2',id:'{known_uuid}',extra:'ignored'}}"),
-    ] {
+    for payload in legacy_marker_payloads(known_uuid) {
         assert!(
             !payload.starts_with("OULIPOLY_INVOCATION="),
             "legacy compatibility payloads are raw payloads, not marker lines"
@@ -59,4 +56,27 @@ fn age160_composite_invocation_id_declared_grammar_legacy_shell_mangled_compatib
     assert!(
         CompositeInvocationId::parse_env_value("{source:'provider-b2',id:'not-a-uuid'}").is_err()
     );
+}
+
+fn known_marker_uuid() -> Uuid {
+    Uuid::parse_str("7ad2916c-38dd-49e6-a1f7-3ef22766ff70").unwrap()
+}
+
+fn parent_env_payload(composite: &CompositeInvocationId) -> String {
+    serde_json::to_string(composite).unwrap()
+}
+
+fn legacy_marker_payloads(known_uuid: &str) -> [String; 2] {
+    [
+        double_quoted_legacy_marker_payload(known_uuid),
+        single_quoted_legacy_marker_payload(known_uuid),
+    ]
+}
+
+fn double_quoted_legacy_marker_payload(known_uuid: &str) -> String {
+    format!("{{source:\"provider-b2\",id:\"{known_uuid}\",extra:\"ignored\"}}")
+}
+
+fn single_quoted_legacy_marker_payload(known_uuid: &str) -> String {
+    format!("{{source:'provider-b2',id:'{known_uuid}',extra:'ignored'}}")
 }

@@ -136,13 +136,21 @@ pub(super) fn returned_artifact_version_id(
 pub(super) fn returned_artifact_encoded_name(artifact_name: &str) -> String {
     let mut encoded_name = String::new();
     for byte in artifact_name.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+        if returned_artifact_byte_is_unreserved(byte) {
             encoded_name.push(byte as char);
         } else {
-            encoded_name.push_str(&format!("%{byte:02X}"));
+            encoded_name.push_str(&format_returned_artifact_percent_byte(byte));
         }
     }
     encoded_name
+}
+
+pub(super) fn returned_artifact_byte_is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+pub(super) fn format_returned_artifact_percent_byte(byte: u8) -> String {
+    format!("%{byte:02X}")
 }
 
 pub(super) fn format_returned_artifact_version_id(

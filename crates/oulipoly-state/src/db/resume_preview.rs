@@ -2,10 +2,11 @@
 //!
 //! - accessor
 //! - filter
+//! - formatter
 //! - mapper
 //! - parser
 //!
-//! Role set: { accessor, filter, mapper, parser }
+//! Role set: { accessor, filter, formatter, mapper, parser }
 //!
 //! Resume preview query and turn-preview mapping helpers.
 

@@ -148,28 +148,12 @@ fn update_session_capture_dual_id_semantics_for_non_resumed_and_resumed_rows() {
     db.update_session_capture(resumed, Some("attempted-resume-id"), "resumed")
         .unwrap();
 
-    let non_resumed_row: (Option<String>, Option<String>, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT provider_session_id, resume_input_id, provider_session_capture_method
-                 FROM invocations WHERE id = ?1",
-            sqlite::params![non_resumed],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let non_resumed_row = invocation_capture_projection(&db, non_resumed);
     assert_eq!(non_resumed_row.0.as_deref(), Some("new-provider-session"));
     assert_eq!(non_resumed_row.1, None);
     assert_eq!(non_resumed_row.2.as_deref(), Some("stdout"));
 
-    let resumed_row: (Option<String>, Option<String>, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT provider_session_id, resume_input_id, provider_session_capture_method
-                 FROM invocations WHERE id = ?1",
-            sqlite::params![resumed],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let resumed_row = invocation_capture_projection(&db, resumed);
     assert_eq!(resumed_row.0.as_deref(), Some("active-provider-session"));
     assert_eq!(resumed_row.1.as_deref(), Some("attempted-resume-id"));
     assert_eq!(resumed_row.2, None);
@@ -191,22 +175,8 @@ fn record_legacy_resume_input_session_id_updates_only_resumed_row() {
     db.record_legacy_resume_input_session_id(non_resumed, "must-not-apply")
         .unwrap();
 
-    let resumed_session: Option<String> = db
-        .conn
-        .query_row(
-            "SELECT session_id FROM invocations WHERE id = ?1",
-            sqlite::params![resumed],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let non_resumed_session: Option<String> = db
-        .conn
-        .query_row(
-            "SELECT session_id FROM invocations WHERE id = ?1",
-            sqlite::params![non_resumed],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let resumed_session = invocation_session_id(&db, resumed);
+    let non_resumed_session = invocation_session_id(&db, non_resumed);
 
     assert_eq!(resumed_session.as_deref(), Some("attempted-resume"));
     assert_eq!(non_resumed_session.as_deref(), Some("provider-session"));

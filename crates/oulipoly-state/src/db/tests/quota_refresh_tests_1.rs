@@ -63,24 +63,13 @@ fn provider_quotas_topology_columns_created_and_backfilled() {
 
     let db = StateDb::open(&path).unwrap();
 
-    let columns: Vec<String> = db
-        .conn
-        .prepare("PRAGMA table_info(provider_quotas)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let columns = provider_quota_column_names(&db);
     assert!(
-        columns
-            .iter()
-            .any(|column| column == "topology_peak_live_window_count"),
+        has_provider_quota_column(&columns, "topology_peak_live_window_count"),
         "provider_quotas topology peak column missing after migration: {columns:?}"
     );
     assert!(
-        columns
-            .iter()
-            .any(|column| column == "last_topology_probe_at"),
+        has_provider_quota_column(&columns, "last_topology_probe_at"),
         "provider_quotas probe timestamp column missing after migration: {columns:?}"
     );
 
@@ -91,6 +80,24 @@ fn provider_quotas_topology_columns_created_and_backfilled() {
     let empty_quota = db.get_quota("empty").unwrap().unwrap();
     assert_eq!(empty_quota.topology_peak_live_window_count, 0);
     assert!(empty_quota.last_topology_probe_at.is_none());
+}
+
+fn provider_quota_column_names(db: &StateDb) -> Vec<String> {
+    db.conn
+        .prepare("PRAGMA table_info(provider_quotas)")
+        .unwrap()
+        .query_map([], provider_quota_column_name_row)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn provider_quota_column_name_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get(1)
+}
+
+fn has_provider_quota_column(columns: &[String], expected: &str) -> bool {
+    columns.iter().any(|column| column == expected)
 }
 
 #[test]

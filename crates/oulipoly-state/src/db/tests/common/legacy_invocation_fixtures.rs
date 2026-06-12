@@ -1,10 +1,11 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - orchestration
 //!
-//! Role set: { accessor, mapper, orchestration }
+//! Role set: { accessor, formatter, mapper, orchestration }
 
 use super::super::*;
 use super::*;
@@ -14,11 +15,26 @@ pub(in crate::db::tests) type LegacyInvocationFixtureRow<'a> =
 pub(in crate::db::tests) fn legacy_invocations_db(
     rows: &[LegacyInvocationFixtureRow<'_>],
 ) -> TempDir {
+    let (dir, conn) = temp_state_connection();
+    create_legacy_invocations_table(&conn);
+    insert_legacy_invocation_rows(&conn, rows);
+    mark_current_schema_version(&conn);
+    dir
+}
+
+fn temp_state_connection() -> (TempDir, sqlite::Connection) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let conn = sqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE invocations (
+    (dir, conn)
+}
+
+fn create_legacy_invocations_table(conn: &sqlite::Connection) {
+    conn.execute_batch(legacy_invocations_schema_sql()).unwrap();
+}
+
+fn legacy_invocations_schema_sql() -> &'static str {
+    "CREATE TABLE invocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model_name TEXT NOT NULL,
                 provider_index INTEGER NOT NULL,
@@ -26,26 +42,59 @@ pub(in crate::db::tests) fn legacy_invocations_db(
                 exit_code INTEGER NOT NULL,
                 error_category TEXT,
                 created_at TEXT NOT NULL
-            );",
+            );"
+}
+
+fn insert_legacy_invocation_rows(
+    conn: &sqlite::Connection,
+    rows: &[LegacyInvocationFixtureRow<'_>],
+) {
+    for row in rows.iter().map(legacy_invocation_insert_from_row) {
+        insert_legacy_invocation_row(conn, &row);
+    }
+}
+
+struct LegacyInvocationInsert<'a> {
+    model_name: &'a str,
+    provider_index: i64,
+    success: i64,
+    exit_code: i64,
+    error_category: Option<&'a str>,
+    created_at: &'a str,
+}
+
+fn legacy_invocation_insert_from_row<'a>(
+    row: &'a LegacyInvocationFixtureRow<'a>,
+) -> LegacyInvocationInsert<'a> {
+    let (model_name, provider_index, success, exit_code, error_category, created_at) = *row;
+    LegacyInvocationInsert {
+        model_name,
+        provider_index,
+        success,
+        exit_code,
+        error_category,
+        created_at,
+    }
+}
+
+fn insert_legacy_invocation_row(conn: &sqlite::Connection, row: &LegacyInvocationInsert<'_>) {
+    conn.execute(
+        legacy_invocation_insert_sql(),
+        sqlite::params![
+            row.model_name,
+            row.provider_index,
+            row.success,
+            row.exit_code,
+            row.error_category,
+            row.created_at
+        ],
     )
     .unwrap();
-    for (model_name, provider_index, success, exit_code, error_category, created_at) in rows {
-        conn.execute(
-                "INSERT INTO invocations (model_name, provider_index, success, exit_code, error_category, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                sqlite::params![
-                    model_name,
-                    provider_index,
-                    success,
-                    exit_code,
-                    error_category,
-                    created_at
-                ],
-            )
-            .unwrap();
-    }
-    mark_current_schema_version(&conn);
-    dir
+}
+
+fn legacy_invocation_insert_sql() -> &'static str {
+    "INSERT INTO invocations (model_name, provider_index, success, exit_code, error_category, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
 }
 
 pub(in crate::db::tests) struct ProviderMigrationInvocationFixture<'a> {
@@ -74,13 +123,26 @@ pub(in crate::db::tests) struct ProviderAggregateSnapshot {
 pub(in crate::db::tests) fn legacy_providers_db(
     rows: &[ProviderMigrationInvocationFixture<'_>],
 ) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("state.db");
-    let conn = sqlite::Connection::open(&path).unwrap();
+    let (dir, conn) = temp_state_connection();
+    create_current_invocations_table(&conn);
+    create_legacy_providers_table(&conn);
+    seed_stale_provider_aggregate(&conn);
+    insert_provider_migration_invocations(&conn, rows);
+    mark_current_schema_version(&conn);
+    dir
+}
+
+fn create_current_invocations_table(conn: &sqlite::Connection) {
     conn.execute_batch(StateDb::invocations_schema_sql())
         .unwrap();
-    conn.execute_batch(
-        "CREATE TABLE providers (
+}
+
+fn create_legacy_providers_table(conn: &sqlite::Connection) {
+    conn.execute_batch(legacy_providers_schema_sql()).unwrap();
+}
+
+fn legacy_providers_schema_sql() -> &'static str {
+    "CREATE TABLE providers (
                 model_name TEXT NOT NULL,
                 provider_index INTEGER NOT NULL,
                 invocation_count INTEGER NOT NULL DEFAULT 0,
@@ -89,38 +151,58 @@ pub(in crate::db::tests) fn legacy_providers_db(
                 last_error_at TEXT,
                 last_invoked_at TEXT,
                 PRIMARY KEY (model_name, provider_index)
-            );
-            INSERT INTO providers (
+            );"
+}
+
+fn seed_stale_provider_aggregate(conn: &sqlite::Connection) {
+    conn.execute_batch(stale_provider_aggregate_sql()).unwrap();
+}
+
+fn stale_provider_aggregate_sql() -> &'static str {
+    "INSERT INTO providers (
                 model_name, provider_index, invocation_count, error_count,
                 last_error, last_error_at, last_invoked_at
             ) VALUES (
                 'routing-model', 0, 99, 88,
                 'stale-index-aggregate', '2026-04-01T00:00:00+00:00',
                 '2026-04-01T00:00:00+00:00'
-            );",
+            );"
+}
+
+fn insert_provider_migration_invocations(
+    conn: &sqlite::Connection,
+    rows: &[ProviderMigrationInvocationFixture<'_>],
+) {
+    for row in rows {
+        insert_provider_migration_invocation(conn, row);
+    }
+}
+
+fn insert_provider_migration_invocation(
+    conn: &sqlite::Connection,
+    row: &ProviderMigrationInvocationFixture<'_>,
+) {
+    conn.execute(
+        provider_migration_invocation_insert_sql(),
+        sqlite::params![
+            Uuid::new_v4().to_string(),
+            row.model_name,
+            row.provider_name,
+            row.provider_index,
+            row.status,
+            row.success,
+            row.exit_code,
+            row.error_category,
+            row.created_at,
+            row.finished_at,
+        ],
     )
     .unwrap();
-    for row in rows {
-        conn.execute(
-            "INSERT INTO invocations (
-                    invocation_uuid, model_name, provider_name, provider_index,
-                    status, success, exit_code, error_category, created_at, finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            sqlite::params![
-                Uuid::new_v4().to_string(),
-                row.model_name,
-                row.provider_name,
-                row.provider_index,
-                row.status,
-                row.success,
-                row.exit_code,
-                row.error_category,
-                row.created_at,
-                row.finished_at,
-            ],
-        )
-        .unwrap();
-    }
-    mark_current_schema_version(&conn);
-    dir
+}
+
+fn provider_migration_invocation_insert_sql() -> &'static str {
+    "INSERT INTO invocations (
+            invocation_uuid, model_name, provider_name, provider_index,
+            status, success, exit_code, error_category, created_at, finished_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
 }

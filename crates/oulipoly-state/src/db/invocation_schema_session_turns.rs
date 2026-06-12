@@ -1,11 +1,12 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - validator
 //! - orchestration
 //! - predicate
 //!
-//! Role set: { accessor, validator, orchestration, predicate }
+//! Role set: { accessor, formatter, validator, orchestration, predicate }
 //!
 //! Session-turn validator repair helpers.
 

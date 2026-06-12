@@ -180,17 +180,14 @@ fn age132_timestamp_policies_preserve_strict_forgiving_and_fallback_callers() {
     let before = Utc::now();
     db.mint_chain_for_invocation_session(id).unwrap();
     let after = Utc::now();
-    let raw_started: String = db
-            .conn
-            .query_row(
-                "SELECT started_at FROM session_chain_segments WHERE provider_name = 'provider-a' AND session_id = ?1",
-                sqlite::params![SESSION_A],
-                |row| row.get(0),
-            )
-            .unwrap();
-    let started_at = DateTime::parse_from_rfc3339(&raw_started)
-        .unwrap()
-        .with_timezone(&Utc);
+    let raw_started = chain_segment_started_at_raw(&db, "provider-a", SESSION_A);
+    let started_at = parse_test_timestamp_utc(&raw_started);
     assert!(started_at >= before - chrono::Duration::seconds(1));
     assert!(started_at <= after + chrono::Duration::seconds(1));
+}
+
+fn parse_test_timestamp_utc(raw: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(raw)
+        .unwrap()
+        .with_timezone(&Utc)
 }

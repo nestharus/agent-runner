@@ -1,10 +1,13 @@
 //! ## Declared roles
 //!
+//! - accessor
+//! - formatter
 //! - validator
 //! - orchestration
 //! - mapper
+//! - predicate
 //!
-//! Role set: { validator, orchestration, mapper }
+//! Role set: { accessor, formatter, validator, orchestration, mapper, predicate }
 //!
 //! Legacy invocation table rebuild migration helpers.
 

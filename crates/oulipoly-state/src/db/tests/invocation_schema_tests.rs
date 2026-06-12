@@ -23,14 +23,7 @@ fn schema_creation() {
     assert!(sql.contains("resume_acceptance_status TEXT"));
     assert!(sql.contains("resume_acceptance_evidence TEXT"));
 
-    let indexes: Vec<String> = db
-            .conn
-            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'invocations' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+    let indexes = invocation_index_names(&db);
     assert_eq!(
         indexes,
         vec![
@@ -50,18 +43,11 @@ fn t_schema_fresh_invocations_schema_includes_nullable_terminal_reason() {
     let columns = invocation_columns(&db);
 
     assert!(
-        columns.iter().any(|column| column == "terminal_reason"),
+        has_column(&columns, "terminal_reason"),
         "fresh invocations schema must expose terminal_reason: {columns:?}"
     );
 
-    let nullable: i64 = db
-        .conn
-        .query_row(
-            "SELECT [notnull] FROM pragma_table_info('invocations') WHERE name = 'terminal_reason'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let nullable = invocation_column_notnull(&db, "terminal_reason");
     assert_eq!(nullable, 0, "terminal_reason must be nullable");
 }
 
@@ -106,7 +92,7 @@ fn t_schema_incremental_adds_terminal_reason_without_losing_rows() {
     let db = StateDb::open(&path).unwrap();
     let columns = invocation_columns(&db);
     assert!(
-        columns.iter().any(|column| column == "terminal_reason"),
+        has_column(&columns, "terminal_reason"),
         "incremental migration must add terminal_reason: {columns:?}"
     );
 
@@ -134,18 +120,11 @@ fn t_schema_legacy_rebuild_adds_terminal_reason_and_migrates_null() {
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
     let columns = invocation_columns(&db);
     assert!(
-        columns.iter().any(|column| column == "terminal_reason"),
+        has_column(&columns, "terminal_reason"),
         "legacy rebuild must add terminal_reason: {columns:?}"
     );
 
-    let terminal_reason: Option<String> = db
-        .conn
-        .query_row(
-            "SELECT terminal_reason FROM invocations WHERE model_name = 'mapped-model'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let terminal_reason = invocation_terminal_reason_for_model(&db, "mapped-model");
     assert_eq!(terminal_reason, None);
 }
 
@@ -173,4 +152,22 @@ fn update_resume_acceptance_persists_status_and_evidence() {
         row.resume_acceptance_evidence.as_deref(),
         Some("matched session id")
     );
+}
+
+fn invocation_index_names(db: &StateDb) -> Vec<String> {
+    db.conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'invocations' ORDER BY name")
+        .unwrap()
+        .query_map([], invocation_index_name_row)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn invocation_index_name_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get(0)
+}
+
+fn has_column(columns: &[String], expected: &str) -> bool {
+    columns.iter().any(|column| column == expected)
 }

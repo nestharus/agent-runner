@@ -2,8 +2,9 @@
 //!
 //! - accessor
 //! - formatter
+//! - mapper
 //!
-//! Role set: { accessor, formatter }
+//! Role set: { accessor, formatter, mapper }
 //!
 //! Active segment and chain model lookup helpers.
 

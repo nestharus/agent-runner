@@ -77,9 +77,19 @@ fn unreadable_sidecar_message(sidecar: &Path) -> String {
 
 #[cfg(unix)]
 pub(super) fn path_is_unreadable(path: &Path) -> bool {
+    classify_unix_path_unreadable(read_path_metadata(path))
+}
+
+#[cfg(unix)]
+fn read_path_metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    std::fs::metadata(path)
+}
+
+#[cfg(unix)]
+fn classify_unix_path_unreadable(result: std::io::Result<std::fs::Metadata>) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    match std::fs::metadata(path) {
+    match result {
         Ok(metadata) => metadata.permissions().mode() & 0o444 == 0,
         Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
     }
@@ -87,7 +97,17 @@ pub(super) fn path_is_unreadable(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 pub(super) fn path_is_unreadable(path: &Path) -> bool {
-    match std::fs::File::open(path) {
+    classify_file_open_unreadable(open_file_for_read_probe(path))
+}
+
+#[cfg(not(unix))]
+fn open_file_for_read_probe(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(not(unix))]
+fn classify_file_open_unreadable(result: std::io::Result<std::fs::File>) -> bool {
+    match result {
         Ok(_) => false,
         Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
     }

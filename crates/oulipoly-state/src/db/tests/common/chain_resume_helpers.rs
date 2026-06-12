@@ -5,9 +5,10 @@
 //! - mapper
 //! - orchestration
 //! - parser
+//! - predicate
 //! - validator
 //!
-//! Role set: { accessor, formatter, mapper, orchestration, parser, validator }
+//! Role set: { accessor, formatter, mapper, orchestration, parser, predicate, validator }
 
 use super::super::*;
 use super::*;
@@ -248,6 +249,73 @@ pub(in crate::db::tests) fn segment_count(db: &StateDb) -> i64 {
         .unwrap()
 }
 
+pub(in crate::db::tests) fn active_segment_count_for_chain(db: &StateDb, chain_id: &str) -> i64 {
+    db.conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_chain_segments WHERE chain_id = ?1 AND ended_at IS NULL",
+            sqlite::params![chain_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn active_imported_segment_count(db: &StateDb) -> i64 {
+    db.conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_chain_segments WHERE transition_reason = 'imported' AND ended_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn session_chain_model_name(db: &StateDb) -> String {
+    db.conn
+        .query_row("SELECT model_name FROM session_chains", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn chain_segment_transition_reason(
+    db: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+) -> String {
+    db.conn
+        .query_row(
+            "SELECT transition_reason FROM session_chain_segments
+                 WHERE provider_name = ?1 AND session_id = ?2",
+            sqlite::params![provider_name, session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn chain_segment_started_at_raw(
+    db: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+) -> String {
+    db.conn
+        .query_row(
+            "SELECT started_at FROM session_chain_segments WHERE provider_name = ?1 AND session_id = ?2",
+            sqlite::params![provider_name, session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+pub(in crate::db::tests) fn chain_last_used_at_raw(db: &StateDb, chain_id: &str) -> String {
+    db.conn
+        .query_row(
+            "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+            sqlite::params![chain_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 pub(in crate::db::tests) fn invocation_count(db: &StateDb) -> i64 {
     db.conn
         .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
@@ -304,32 +372,92 @@ pub(in crate::db::tests) fn legacy_v4_invocation_dual_id_fixture(
     error_category: Option<&str>,
 ) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
+    let conn = open_legacy_v4_state_db(&dir);
+    seed_legacy_v4_dual_id_schema(&conn);
+    let row = legacy_v4_dual_id_insert(
+        invocation_uuid,
+        session_id,
+        session_capture_method,
+        status,
+        terminal_reason,
+        error_category,
+    );
+    insert_legacy_v4_dual_id_row(&conn, &row);
+    mark_legacy_v4_schema_version(&conn);
+    drop(conn);
+    dir
+}
+
+fn open_legacy_v4_state_db(dir: &TempDir) -> sqlite::Connection {
     let db_path = dir.path().join("state.db");
-    let conn = sqlite::Connection::open(&db_path).unwrap();
-    seed_current_drift_required_tables(&conn);
+    sqlite::Connection::open(&db_path).unwrap()
+}
+
+fn seed_legacy_v4_dual_id_schema(conn: &sqlite::Connection) {
+    seed_current_drift_required_tables(conn);
+    drop_legacy_v4_resolved_account_column(conn);
+}
+
+fn drop_legacy_v4_resolved_account_column(conn: &sqlite::Connection) {
+    conn.execute(legacy_v4_drop_resolved_account_column_sql(), [])
+        .unwrap();
+}
+
+fn legacy_v4_drop_resolved_account_column_sql() -> &'static str {
+    "ALTER TABLE invocations DROP COLUMN provider_session_resolved_account"
+}
+
+struct LegacyV4DualIdInsert<'a> {
+    invocation_uuid: &'a str,
+    session_id: Option<&'a str>,
+    session_capture_method: Option<&'a str>,
+    status: &'a str,
+    terminal_reason: Option<&'a str>,
+    error_category: Option<&'a str>,
+}
+
+fn legacy_v4_dual_id_insert<'a>(
+    invocation_uuid: &'a str,
+    session_id: Option<&'a str>,
+    session_capture_method: Option<&'a str>,
+    status: &'a str,
+    terminal_reason: Option<&'a str>,
+    error_category: Option<&'a str>,
+) -> LegacyV4DualIdInsert<'a> {
+    LegacyV4DualIdInsert {
+        invocation_uuid,
+        session_id,
+        session_capture_method,
+        status,
+        terminal_reason,
+        error_category,
+    }
+}
+
+fn insert_legacy_v4_dual_id_row(conn: &sqlite::Connection, row: &LegacyV4DualIdInsert<'_>) {
     conn.execute(
-        "ALTER TABLE invocations DROP COLUMN provider_session_resolved_account",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO invocations
-                (invocation_uuid, model_name, provider_name, provider_index, status, success,
-                 exit_code, error_category, terminal_reason, session_id, session_capture_method,
-                 created_at, finished_at)
-             VALUES (?1, 'provider-a-opus', 'provider-a', 0, ?2, NULL, NULL, ?3, ?4, ?5, ?6,
-                     '2026-04-17T08:00:00Z', NULL)",
+        legacy_v4_dual_id_insert_sql(),
         sqlite::params![
-            invocation_uuid,
-            status,
-            error_category,
-            terminal_reason,
-            session_id,
-            session_capture_method
+            row.invocation_uuid,
+            row.status,
+            row.error_category,
+            row.terminal_reason,
+            row.session_id,
+            row.session_capture_method
         ],
     )
     .unwrap();
+}
+
+fn legacy_v4_dual_id_insert_sql() -> &'static str {
+    "INSERT INTO invocations
+            (invocation_uuid, model_name, provider_name, provider_index, status, success,
+             exit_code, error_category, terminal_reason, session_id, session_capture_method,
+             created_at, finished_at)
+         VALUES (?1, 'provider-a-opus', 'provider-a', 0, ?2, NULL, NULL, ?3, ?4, ?5, ?6,
+                 '2026-04-17T08:00:00Z', NULL)"
+}
+
+fn mark_legacy_v4_schema_version(conn: &sqlite::Connection) {
     conn.pragma_update(None, "user_version", 4).unwrap();
-    drop(conn);
-    dir
 }

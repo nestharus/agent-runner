@@ -145,11 +145,6 @@ fn age132_backfill_infers_model_from_latest_matching_invocation() {
             segments_inserted: 1
         }
     );
-    let model_name: String = db
-        .conn
-        .query_row("SELECT model_name FROM session_chains", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let model_name = session_chain_model_name(&db);
     assert_eq!(model_name, "provider-a-opus");
 }

@@ -1,6 +1,19 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 //!
+//! ## Intrinsic-surface declarations
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age_32_connection_boundary.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-connection-boundary-test-domain
+//!     Owns:
+//!       - StateDb public API source scanning and forbidden raw connection signature assertions
+//!       - db.rs and db/*.rs include_str aggregation for boundary checks
+//!       - oulipoly_state::StateDb read-only connection smoke test surface
+//!       - rusqlite::Connection read-only smoke test support surface
+//!       - tempfile::tempdir database fixture directory surface
+//!       - session_replace source include_str write-transaction boundary check
+
 #[test]
 fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
     let public_boundary_source = public_boundary_source();
@@ -141,8 +154,10 @@ fn db_module_sources() -> &'static str {
 
 #[test]
 fn ti_39_session_replace_uses_state_db_write_transaction_not_raw_connection_writes() {
-    let source = include_str!("../../../crates/oulipoly-runtime/src/session_replace/mod.rs");
+    assert_session_replace_uses_state_db_write_transaction(session_replace_source());
+}
 
+fn assert_session_replace_uses_state_db_write_transaction(source: &str) {
     assert!(
         source.contains("with_write_txn"),
         "session_replace replacement writes must route through StateDb::with_write_txn"
@@ -156,4 +171,8 @@ fn ti_39_session_replace_uses_state_db_write_transaction_not_raw_connection_writ
         !source.contains("replace_db_turns(&mut conn"),
         "replace_db_turns must receive the transaction from with_write_txn, not a raw Connection"
     );
+}
+
+fn session_replace_source() -> &'static str {
+    include_str!("../../../crates/oulipoly-runtime/src/session_replace/mod.rs")
 }

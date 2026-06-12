@@ -1,8 +1,10 @@
 //! ## Declared roles
 //!
+//! - formatter
+//! - predicate
 //! - validator
 //!
-//! Role set: { validator }
+//! Role set: { formatter, predicate, validator }
 
 use super::common::*;
 use super::*;
@@ -36,16 +38,9 @@ fn quota_tight_routing_column_dropped_after_migration() {
 
     let db = StateDb::open(&path).unwrap();
 
-    let columns: Vec<String> = db
-        .conn
-        .prepare("PRAGMA table_info(invocations)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let columns = table_column_names(&db.conn, "invocations");
     assert!(
-        !columns.iter().any(|column| column == "quota_tight_routing"),
+        !has_column_named(&columns, "quota_tight_routing"),
         "quota_tight_routing should be removed by migration: {columns:?}"
     );
 }
@@ -59,13 +54,11 @@ fn providers_migration_rebuilds_aggregate_from_invocations_by_provider_name() {
 
     let columns = table_columns_with_pk(&db.conn, "providers");
     assert!(
-        columns
-            .iter()
-            .any(|(name, pk)| name == "provider_name" && *pk == 2),
+        has_column_with_pk(&columns, "provider_name", 2),
         "providers must be keyed by provider_name after migration: {columns:?}"
     );
     assert!(
-        !columns.iter().any(|(name, _)| name == "provider_index"),
+        !has_table_column(&columns, "provider_index"),
         "providers.provider_index must be removed after migration: {columns:?}"
     );
 
@@ -104,29 +97,21 @@ fn quota_schema_remains_name_keyed_after_provider_migration() {
 
     let quota_columns = table_columns_with_pk(&db.conn, "provider_quotas");
     assert!(
-        quota_columns
-            .iter()
-            .any(|(name, pk)| name == "provider_name" && *pk == 1),
+        has_column_with_pk(&quota_columns, "provider_name", 1),
         "provider_quotas must remain keyed only by provider_name: {quota_columns:?}"
     );
     assert!(
-        !quota_columns
-            .iter()
-            .any(|(name, _)| name == "model_name" || name == "provider_index"),
+        !has_aggregate_identity_column(&quota_columns),
         "provider_quotas must not gain aggregate identity columns: {quota_columns:?}"
     );
 
     let window_columns = table_columns_with_pk(&db.conn, "provider_quota_windows");
     assert!(
-        window_columns
-            .iter()
-            .any(|(name, pk)| name == "provider_name" && *pk == 1),
+        has_column_with_pk(&window_columns, "provider_name", 1),
         "provider_quota_windows must remain provider-name keyed: {window_columns:?}"
     );
     assert!(
-        !window_columns
-            .iter()
-            .any(|(name, _)| name == "model_name" || name == "provider_index"),
+        !has_aggregate_identity_column(&window_columns),
         "provider_quota_windows must not gain aggregate identity columns: {window_columns:?}"
     );
 }
@@ -144,9 +129,8 @@ fn providers_migration_rejects_unexpected_shape_without_mutating_source_tables()
         Ok(_) => panic!("unexpected providers shape should fail StateDb::open"),
         Err(err) => err,
     };
-    let err_lower = err.to_ascii_lowercase();
     assert!(
-        err_lower.contains("providers") && err_lower.contains("unexpected"),
+        unexpected_providers_shape_error(&err),
         "unexpected-shape error should name providers and unexpected shape; got {err}"
     );
 
@@ -159,15 +143,54 @@ fn providers_migration_rejects_unexpected_shape_without_mutating_source_tables()
     let recovered = StateDb::open(&path).unwrap();
     let columns = table_columns_with_pk(&recovered.conn, "providers");
     assert!(
-        columns
-            .iter()
-            .any(|(name, pk)| name == "provider_name" && *pk == 2),
+        has_column_with_pk(&columns, "provider_name", 2),
         "operator cleanup should let missing-table branch create post-fix providers: {columns:?}"
     );
     assert!(
-        !columns.iter().any(|(name, _)| name == "provider_index"),
+        !has_table_column(&columns, "provider_index"),
         "operator cleanup must not recreate provider_index: {columns:?}"
     );
+}
+
+fn table_column_names(conn: &sqlite::Connection, table: &str) -> Vec<String> {
+    table_columns_with_pk(conn, table)
+        .into_iter()
+        .map(table_column_name)
+        .collect()
+}
+
+fn table_column_name((name, _pk): (String, i64)) -> String {
+    name
+}
+
+fn has_column_named(columns: &[String], expected: &str) -> bool {
+    columns.iter().any(|column| column == expected)
+}
+
+fn has_column_with_pk(columns: &[(String, i64)], expected: &str, expected_pk: i64) -> bool {
+    columns
+        .iter()
+        .any(|(name, pk)| name == expected && *pk == expected_pk)
+}
+
+fn has_table_column(columns: &[(String, i64)], expected: &str) -> bool {
+    columns.iter().any(|(name, _)| name == expected)
+}
+
+fn has_aggregate_identity_column(columns: &[(String, i64)]) -> bool {
+    has_table_column(columns, "model_name") || has_table_column(columns, "provider_index")
+}
+
+fn unexpected_providers_shape_error(err: &str) -> bool {
+    has_unexpected_providers_shape_tokens(&normalized_error_text(err))
+}
+
+fn normalized_error_text(err: &str) -> String {
+    err.to_ascii_lowercase()
+}
+
+fn has_unexpected_providers_shape_tokens(err_lower: &str) -> bool {
+    err_lower.contains("providers") && err_lower.contains("unexpected")
 }
 
 #[test]
@@ -224,12 +247,7 @@ fn providers_migration_rejects_non_table_object_named_providers() {
     );
 
     let conn = sqlite::Connection::open(&path).unwrap();
-    let mut stmt = conn
-        .prepare("SELECT type FROM sqlite_master WHERE name = 'providers'")
-        .unwrap();
-    let observed_type: String = stmt
-        .query_row([], |row| row.get(0))
-        .expect("providers object should still exist after rejected open");
+    let observed_type = sqlite_master_object_type(&conn, "providers");
     assert_eq!(
         observed_type, "view",
         "rejected open must not mutate the providers object"

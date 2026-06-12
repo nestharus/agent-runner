@@ -3,6 +3,29 @@
 //! - orchestration
 //!
 //! Role set: { orchestration }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: state-db-test-module-aggregator
+//!     Owns:
+//!       - StateDb split test module declarations under `crates/oulipoly-state/src/db/tests/*.rs`
+//!       - common test helper module aggregation
+//!       - opening/read-only helper imports shared by split test modules
+//!       - fixture support imports `env_lock`, `TempDir`, and `Uuid`
+//!       - age132_opening_tests, age132_preview_tests, age132_resume_tests_1, age132_resume_tests_2, age132_session_turn_tests
+//!       - age160_lifecycle_tests, age160_marker_tests, age160_read_only_tests, artifact_tests
+//!       - chain_backfill_tests_1, chain_backfill_tests_2, common, invocation_lifecycle_tests_1, invocation_lifecycle_tests_2
+//!       - invocation_records_tests, invocation_schema_tests, legacy_invocation_migration_tests, migration_failure_tests, migration_returning_clause_tests
+//!       - opening_core_tests, provider_aggregate_tests, provider_migration_tests_1, provider_migration_tests_2
+//!       - quota_exhaustion_tests, quota_refresh_tests_1, quota_refresh_tests_2, quota_refresh_tests_3
+//!       - resume_resolution_tests_1, resume_resolution_tests_2, resume_window_tests
+//!       - session_capture_tests, session_turn_schema_tests, session_turn_tests_1, session_turn_tests_2
+//!       - setup_counter_tests, setup_crud_tests_1, setup_crud_tests_2
+//! ```
 
 use super::opening_read_only::{classify_read_only_open_error, shm_path, wal_path};
 use super::*;

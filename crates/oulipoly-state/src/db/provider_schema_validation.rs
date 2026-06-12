@@ -73,16 +73,23 @@ impl StateDb {
     }
 
     pub(super) fn providers_has_foreign_keys(conn: &sqlite::Connection) -> Result<bool, String> {
+        Self::provider_foreign_key_row_exists(conn).map(Self::provider_foreign_key_marker_exists)
+    }
+
+    fn provider_foreign_key_row_exists(conn: &sqlite::Connection) -> Result<Option<()>, String> {
         let mut stmt = conn
             .prepare("PRAGMA foreign_key_list(providers)")
             .map_err(Self::format_inspect_providers_foreign_keys_error)?;
         let mut rows = stmt
             .query([])
             .map_err(Self::format_inspect_providers_foreign_keys_error)?;
-        Ok(rows
-            .next()
-            .map_err(Self::format_read_providers_foreign_keys_error)?
-            .is_some())
+        rows.next()
+            .map_err(Self::format_read_providers_foreign_keys_error)
+            .map(|row| row.map(|_| ()))
+    }
+
+    fn provider_foreign_key_marker_exists(row: Option<()>) -> bool {
+        row.is_some()
     }
 
     fn format_inspect_providers_foreign_keys_error(e: sqlite::Error) -> String {

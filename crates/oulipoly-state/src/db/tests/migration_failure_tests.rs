@@ -4,6 +4,7 @@
 //!
 //! Role set: { validator }
 
+use super::common::*;
 use super::*;
 #[test]
 fn ti_04_ti_12_ti_24_ordered_migration_failure_rolls_back_and_reports_rebuild() {
@@ -53,22 +54,10 @@ fn ti_04_ti_12_ti_24_ordered_migration_failure_rolls_back_and_reports_rebuild() 
         "expected StepFailed"
     );
 
-    let version: i32 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .unwrap();
+    let version = sqlite_user_version(&conn);
     assert_eq!(version, 3);
-    let preserved: String = conn
-        .query_row("SELECT value FROM preserved_rows WHERE id = 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let preserved = preserved_row_value(&conn, 1);
     assert_eq!(preserved, "before");
-    let marker_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'age32_failure_marker'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+    let marker_exists = sqlite_schema_object_count(&conn, "table", "age32_failure_marker");
     assert_eq!(marker_exists, 0, "failed migration left partial schema");
 }

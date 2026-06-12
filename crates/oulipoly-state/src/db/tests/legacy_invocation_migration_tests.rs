@@ -28,25 +28,7 @@ name = "fixture-provider"
             ]);
             let db = StateDb::open(&dir.path().join("state.db")).unwrap();
 
-            let rows: Vec<(String, Option<String>, String, String, String)> = db
-                .conn
-                .prepare(
-                    "SELECT model_name, provider_name, status, invocation_uuid, finished_at
-                         FROM invocations ORDER BY created_at",
-                )
-                .unwrap()
-                .query_map([], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .unwrap()
-                .map(Result::unwrap)
-                .collect();
+            let rows = migrated_invocation_rows(&db.conn);
 
             assert_eq!(rows[0].0, "mapped-model");
             assert_eq!(rows[0].1.as_deref(), Some("fixture-provider"));
@@ -83,13 +65,7 @@ fn migration_rolls_back_when_rebuild_fails() {
     assert!(!err.is_empty());
 
     let conn = sqlite::Connection::open(&path).unwrap();
-    let columns: Vec<String> = conn
-        .prepare("PRAGMA table_info(invocations)")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let columns = invocation_column_names(&conn);
     assert_eq!(
         columns,
         vec![
@@ -102,9 +78,7 @@ fn migration_rolls_back_when_rebuild_fails() {
             "created_at",
         ]
     );
-    let row_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
-        .unwrap();
+    let row_count = invocation_row_count(&conn);
     assert_eq!(row_count, 1);
 }
 
@@ -146,25 +120,7 @@ fn migration_succeeds_with_corrupt_models_config_and_marks_rows_legacy() {
         // Verify both legacy rows migrated cleanly with provider_name=NULL
         // and status='legacy' since the lookup couldn't resolve anything.
         let conn = sqlite::Connection::open(&path).unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT model_name, provider_name, status, invocation_uuid, finished_at
-                     FROM invocations ORDER BY created_at",
-            )
-            .unwrap();
-        let rows: Vec<(String, Option<String>, String, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
+        let rows = migrated_invocation_rows(&conn);
         assert_eq!(rows.len(), 2);
         for r in &rows {
             assert!(
@@ -188,4 +144,41 @@ fn migration_succeeds_with_corrupt_models_config_and_marks_rows_legacy() {
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+}
+
+type MigratedInvocationRow = (String, Option<String>, String, String, String);
+
+fn migrated_invocation_rows(conn: &sqlite::Connection) -> Vec<MigratedInvocationRow> {
+    conn.prepare(
+        "SELECT model_name, provider_name, status, invocation_uuid, finished_at
+             FROM invocations ORDER BY created_at",
+    )
+    .unwrap()
+    .query_map([], migrated_invocation_row)
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+fn migrated_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<MigratedInvocationRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn invocation_column_names(conn: &sqlite::Connection) -> Vec<String> {
+    conn.prepare("PRAGMA table_info(invocations)")
+        .unwrap()
+        .query_map([], invocation_column_name_row)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn invocation_column_name_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+    row.get(1)
 }

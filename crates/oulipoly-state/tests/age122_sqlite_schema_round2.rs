@@ -2,12 +2,28 @@
 //!
 //! - validator
 //! - accessor
+//! - formatter
 //! - mapper
 //! - filter
 //!
-//! Role set: { validator, accessor, mapper, filter }
+//! Role set: { validator, accessor, formatter, mapper, filter }
 //!
 //! Schema-boundary regression assertions over source snippets and migration files.
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/tests/age122_sqlite_schema_round2.rs
+//!     role: intrinsic-surface
+//!     Domain: sqlite-schema-boundary-source-scan-test-domain
+//!     Owns:
+//!       - include_str source snippets for db invocation schema, schema.rs, and lib.rs
+//!       - migration directory read and migration filename sorting surface
+//!       - std::fs::{read_dir, DirEntry, ReadDir} migration-file enumeration support surface
+//!       - std::ffi::OsString migration filename formatting support surface
+//!       - std::path::{Path, PathBuf} migration-directory support surface
+//! ```
 
 const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

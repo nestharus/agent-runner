@@ -22,17 +22,8 @@ fn chain_last_used_at_updates_after_successful_invocation() {
     db.update_chain_last_used(CHAIN_A).unwrap();
     let after = Utc::now();
 
-    let last_used_raw: String = db
-        .conn
-        .query_row(
-            "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
-            sqlite::params![CHAIN_A],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let last_used = DateTime::parse_from_rfc3339(&last_used_raw)
-        .unwrap()
-        .with_timezone(&Utc);
+    let last_used_raw = chain_last_used_at_raw(&db, CHAIN_A);
+    let last_used = ts(&last_used_raw);
     assert!(last_used >= before - chrono::Duration::seconds(1));
     assert!(last_used <= after + chrono::Duration::seconds(1));
 }

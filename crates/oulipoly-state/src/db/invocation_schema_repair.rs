@@ -1,5 +1,6 @@
 //! ## Declared roles
 //!
+//! - accessor
 //! - filter
 //! - formatter
 //! - mapper
@@ -7,7 +8,7 @@
 //! - orchestration
 //! - predicate
 //!
-//! Role set: { filter, formatter, mapper, validator, orchestration, predicate }
+//! Role set: { accessor, filter, formatter, mapper, validator, orchestration, predicate }
 //!
 //! Invocation schema shape classification and repair.
 

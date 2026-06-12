@@ -44,15 +44,22 @@ impl StateDb {
         provider_name: &str,
         session_id: &str,
     ) -> Result<SessionTurnCounts, String> {
-        let counts = self
-            .conn
+        self.query_session_turn_count_tuple(provider_name, session_id)
+            .map(Self::map_session_turn_counts)
+    }
+
+    fn query_session_turn_count_tuple(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<(i64, i64, i64), String> {
+        self.conn
             .query_row(
                 SESSION_TURN_COUNTS_SQL,
                 sqlite::params![provider_name, session_id],
                 Self::map_session_turn_count_tuple,
             )
-            .map_err(Self::format_trace_session_turn_count_error)?;
-        Ok(Self::map_session_turn_counts(counts))
+            .map_err(Self::format_trace_session_turn_count_error)
     }
 
     fn map_session_turn_count_tuple(row: &sqlite::Row<'_>) -> sqlite::Result<(i64, i64, i64)> {
@@ -280,15 +287,33 @@ impl StateDb {
     pub(super) fn canonical_text_from_chunks<'a>(
         chunks: impl Iterator<Item = &'a serde_json::Value>,
     ) -> Option<String> {
+        Self::format_canonical_text(Self::session_turn_text_values(chunks))
+    }
+
+    pub(super) fn session_turn_text_values<'a>(
+        chunks: impl Iterator<Item = &'a serde_json::Value>,
+    ) -> impl Iterator<Item = &'a str> {
+        chunks.filter_map(Self::session_turn_chunk_text)
+    }
+
+    pub(super) fn session_turn_chunk_text(chunk: &serde_json::Value) -> Option<&str> {
+        chunk.get("text").and_then(serde_json::Value::as_str)
+    }
+
+    pub(super) fn format_canonical_text<'a>(
+        texts: impl Iterator<Item = &'a str>,
+    ) -> Option<String> {
         let mut canonical_text = String::new();
-        let mut has_text = false;
-        for chunk in chunks {
-            if let Some(candidate) = chunk.get("text").and_then(serde_json::Value::as_str) {
-                canonical_text.push_str(candidate);
-                has_text = true;
-            }
+        let mut text_count = 0;
+        for text in texts {
+            canonical_text.push_str(text);
+            text_count += 1;
         }
-        has_text.then_some(canonical_text)
+        Self::canonical_text_has_chunks(text_count).then_some(canonical_text)
+    }
+
+    pub(super) fn canonical_text_has_chunks(text_count: usize) -> bool {
+        text_count > 0
     }
 
     pub(super) fn canonical_text_equals(candidate: Option<&str>, text: &str) -> bool {

@@ -28,9 +28,7 @@ fn record_topology_probe_sets_timestamp_without_changing_windows() {
     let after = Utc::now();
     let probe_at_raw =
         last_topology_probe_at_raw(&db, provider).expect("probe timestamp should be set");
-    let probe_at = DateTime::parse_from_rfc3339(&probe_at_raw)
-        .unwrap()
-        .with_timezone(&Utc);
+    let probe_at = ts(&probe_at_raw);
     assert!(
         probe_at >= before - chrono::Duration::seconds(1)
             && probe_at <= after + chrono::Duration::seconds(1),

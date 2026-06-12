@@ -32,14 +32,7 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
         )
         .unwrap()
     );
-    let source_file: String = db
-        .conn
-        .query_row(
-            "SELECT source_file FROM session_turns WHERE turn_id = 'single-turn'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let source_file = session_turn_source_file(&db, "single-turn");
     assert_eq!(source_file, "/tmp/session.jsonl");
 
     let turns = vec![
@@ -72,15 +65,7 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
         db.ingest_session_turns_batch("provider-a", &turns).unwrap(),
         0
     );
-    let row: (Option<String>, i64, i64, Option<String>) = db
-        .conn
-        .query_row(
-            "SELECT parent_turn_id, is_sidechain, is_compaction_boundary, body
-                 FROM session_turns WHERE turn_id = 'turn-2'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
+    let row = session_turn_detail_row(&db, "turn-2");
     assert_eq!(
         row,
         (Some("turn-1".to_string()), 1, 1, Some("world".to_string()))
@@ -128,9 +113,6 @@ fn age132_session_turn_ingest_batch_and_single_paths_preserve_mapping_and_atomic
             .unwrap_err()
             .contains("bad turn")
     );
-    let persisted: i64 = failing
-        .conn
-        .query_row("SELECT COUNT(*) FROM session_turns", [], |row| row.get(0))
-        .unwrap();
+    let persisted = session_turn_count(&failing);
     assert_eq!(persisted, 0);
 }

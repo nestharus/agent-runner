@@ -1,12 +1,13 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - formatter
 //! - mapper
 //! - orchestration
 //! - parser
 //! - validator
 //!
-//! Role set: { accessor, mapper, orchestration, parser, validator }
+//! Role set: { accessor, formatter, mapper, orchestration, parser, validator }
 
 use super::super::*;
 pub(in crate::db::tests) fn ts(value: &str) -> DateTime<Utc> {
@@ -200,6 +201,16 @@ pub(in crate::db::tests) fn calls_since_refresh(db: &StateDb, provider_name: &st
             |row| row.get::<_, i64>(0),
         )
         .unwrap() as u64
+}
+
+pub(in crate::db::tests) fn provider_quota_row_count(db: &StateDb, provider_name: &str) -> i64 {
+    db.conn
+        .query_row(
+            "SELECT COUNT(*) FROM provider_quotas WHERE provider_name = ?1",
+            sqlite::params![provider_name],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 pub(in crate::db::tests) fn exhausted_at_raw(db: &StateDb, provider_name: &str) -> Option<String> {

@@ -41,14 +41,7 @@ fn mark_exhausted_creates_row_when_missing() {
     db.mark_exhausted(provider).unwrap();
     let after = Utc::now();
 
-    let row_count: i64 = db
-        .conn
-        .query_row(
-            "SELECT COUNT(*) FROM provider_quotas WHERE provider_name = ?1",
-            sqlite::params![provider],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let row_count = provider_quota_row_count(&db, provider);
     assert_eq!(row_count, 1, "mark_exhausted must upsert the quota row");
 
     let exhausted = exhausted_at(&db, provider).expect("exhausted_at set");
@@ -79,9 +72,7 @@ fn clear_exhausted_nulls_the_flag() {
 fn record_provider_unavailable_writes_and_round_trips_next_available_at() {
     let db = test_db();
     let provider = "wu-a1-record";
-    let ts = chrono::DateTime::parse_from_rfc3339("2026-05-21T01:23:45Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let ts = ts("2026-05-21T01:23:45Z");
 
     db.record_provider_unavailable(provider, Some(ts), "RollingWindow5h")
         .unwrap();
@@ -95,12 +86,8 @@ fn record_provider_unavailable_writes_and_round_trips_next_available_at() {
 fn record_provider_unavailable_idempotent_under_repeat_calls() {
     let db = test_db();
     let provider = "wu-a1-repeat";
-    let ts1 = chrono::DateTime::parse_from_rfc3339("2026-05-21T01:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
-    let ts2 = chrono::DateTime::parse_from_rfc3339("2026-05-21T02:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let ts1 = ts("2026-05-21T01:00:00Z");
+    let ts2 = ts("2026-05-21T02:00:00Z");
 
     db.record_provider_unavailable(provider, Some(ts1), "RollingWindow5h")
         .unwrap();
@@ -116,9 +103,7 @@ fn record_provider_unavailable_idempotent_under_repeat_calls() {
 fn touch_provider_refresh_updates_last_refresh_at_only() {
     let db = test_db();
     let provider = "wu-a1-touch";
-    let now = chrono::DateTime::parse_from_rfc3339("2026-05-21T03:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let now = ts("2026-05-21T03:00:00Z");
 
     db.touch_provider_refresh(provider, now).unwrap();
 
@@ -164,9 +149,7 @@ fn advance_round_robin_index_persists_across_db_reopen() {
 fn clear_provider_unavailable_nulls_next_available_at_and_failure_class() {
     let db = test_db();
     let provider = "wu-a1-clear";
-    let ts = chrono::DateTime::parse_from_rfc3339("2026-05-21T04:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let ts = ts("2026-05-21T04:00:00Z");
 
     db.record_provider_unavailable(provider, Some(ts), "UpstreamApiDown")
         .unwrap();

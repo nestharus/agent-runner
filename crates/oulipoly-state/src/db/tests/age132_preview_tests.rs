@@ -25,18 +25,7 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
         "provider-a-opus",
         "2026-04-17T09:00:00Z",
     );
-    let turns: Vec<_> = (0..4)
-        .map(|i| SessionTurnIngest {
-            session_id: SESSION_A.to_string(),
-            turn_id: format!("turn-{i}"),
-            timestamp: ts(&format!("2026-04-17T08:00:0{i}Z")),
-            role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
-            parent_turn_id: None,
-            is_sidechain: false,
-            is_compaction_boundary: false,
-            body: Some(format!("body-{i}")),
-        })
-        .collect();
+    let turns = preview_fixture_turns();
     db.ingest_session_turns_batch("provider-a2", &turns)
         .unwrap();
 
@@ -63,51 +52,7 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
 
     let boundary_db = test_db();
     boundary_db
-        .ingest_session_turns_batch(
-            "provider-a",
-            &[
-                SessionTurnIngest {
-                    session_id: SESSION_A.to_string(),
-                    turn_id: "old-boundary".to_string(),
-                    timestamp: ts("2026-04-17T08:00:00Z"),
-                    role: "assistant".to_string(),
-                    parent_turn_id: None,
-                    is_sidechain: false,
-                    is_compaction_boundary: true,
-                    body: None,
-                },
-                SessionTurnIngest {
-                    session_id: SESSION_A.to_string(),
-                    turn_id: "tie-first".to_string(),
-                    timestamp: ts("2026-04-17T08:01:00Z"),
-                    role: "assistant".to_string(),
-                    parent_turn_id: None,
-                    is_sidechain: false,
-                    is_compaction_boundary: true,
-                    body: None,
-                },
-                SessionTurnIngest {
-                    session_id: SESSION_A.to_string(),
-                    turn_id: "tie-second".to_string(),
-                    timestamp: ts("2026-04-17T08:01:00Z"),
-                    role: "assistant".to_string(),
-                    parent_turn_id: None,
-                    is_sidechain: false,
-                    is_compaction_boundary: true,
-                    body: None,
-                },
-                SessionTurnIngest {
-                    session_id: SESSION_A.to_string(),
-                    turn_id: "not-yet-boundary".to_string(),
-                    timestamp: ts("2026-04-17T08:02:00Z"),
-                    role: "assistant".to_string(),
-                    parent_turn_id: None,
-                    is_sidechain: false,
-                    is_compaction_boundary: false,
-                    body: None,
-                },
-            ],
-        )
+        .ingest_session_turns_batch("provider-a", &boundary_fixture_turns())
         .unwrap();
     let latest = boundary_db
         .latest_compaction_boundary("provider-a", SESSION_A)
@@ -142,4 +87,68 @@ fn age132_resume_previews_and_compaction_boundaries_preserve_ordering_contracts(
             .unwrap(),
         None
     );
+}
+
+fn preview_fixture_turns() -> Vec<SessionTurnIngest> {
+    (0..4).map(preview_fixture_turn).collect()
+}
+
+fn preview_fixture_turn(index: usize) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: SESSION_A.to_string(),
+        turn_id: preview_fixture_turn_id(index),
+        timestamp: ts(&preview_fixture_timestamp(index)),
+        role: preview_fixture_role(index),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: false,
+        body: Some(preview_fixture_body(index)),
+    }
+}
+
+fn preview_fixture_turn_id(index: usize) -> String {
+    format!("turn-{index}")
+}
+
+fn preview_fixture_timestamp(index: usize) -> String {
+    format!("2026-04-17T08:00:0{index}Z")
+}
+
+fn preview_fixture_role(index: usize) -> String {
+    if preview_fixture_turn_is_user(index) {
+        "user"
+    } else {
+        "assistant"
+    }
+    .to_string()
+}
+
+fn preview_fixture_turn_is_user(index: usize) -> bool {
+    index.is_multiple_of(2)
+}
+
+fn preview_fixture_body(index: usize) -> String {
+    format!("body-{index}")
+}
+
+fn boundary_fixture_turns() -> Vec<SessionTurnIngest> {
+    vec![
+        boundary_fixture_turn("old-boundary", "2026-04-17T08:00:00Z", true),
+        boundary_fixture_turn("tie-first", "2026-04-17T08:01:00Z", true),
+        boundary_fixture_turn("tie-second", "2026-04-17T08:01:00Z", true),
+        boundary_fixture_turn("not-yet-boundary", "2026-04-17T08:02:00Z", false),
+    ]
+}
+
+fn boundary_fixture_turn(turn_id: &str, timestamp: &str, is_boundary: bool) -> SessionTurnIngest {
+    SessionTurnIngest {
+        session_id: SESSION_A.to_string(),
+        turn_id: turn_id.to_string(),
+        timestamp: ts(timestamp),
+        role: "assistant".to_string(),
+        parent_turn_id: None,
+        is_sidechain: false,
+        is_compaction_boundary: is_boundary,
+        body: None,
+    }
 }

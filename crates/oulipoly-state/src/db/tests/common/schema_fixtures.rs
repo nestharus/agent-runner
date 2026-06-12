@@ -15,8 +15,12 @@ pub(in crate::db::tests) fn mark_current_schema_version(conn: &sqlite::Connectio
 }
 
 pub(in crate::db::tests) fn seed_current_drift_required_tables(conn: &sqlite::Connection) {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS invocations (
+    conn.execute_batch(current_drift_required_tables_sql())
+        .unwrap();
+}
+
+fn current_drift_required_tables_sql() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS invocations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 invocation_uuid TEXT NOT NULL UNIQUE,
                 model_name TEXT NOT NULL,
@@ -92,9 +96,7 @@ pub(in crate::db::tests) fn seed_current_drift_required_tables(conn: &sqlite::Co
                 transition_reason TEXT NOT NULL CHECK (transition_reason IN
                     ('initial', 'manual', 'quota_threshold', 'exhausted', 'imported')),
                 UNIQUE(chain_id, provider_name, session_id)
-            );",
-    )
-    .unwrap();
+            );"
 }
 
 pub(in crate::db::tests) fn db_without_table(table: &str) -> StateDb {
