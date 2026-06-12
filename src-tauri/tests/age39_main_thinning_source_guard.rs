@@ -199,11 +199,29 @@ fn assert_not_contains(haystack: &str, needle: &str, context: &str) {
 }
 
 fn assert_order(haystack: &str, first: &str, second: &str, context: &str) {
-    let first_idx = haystack
-        .find(first)
+    assert_order_positions(
+        order_positions(haystack, first, second),
+        first,
+        second,
+        context,
+    );
+}
+
+fn order_positions(haystack: &str, first: &str, second: &str) -> (Option<usize>, Option<usize>) {
+    (haystack.find(first), haystack.find(second))
+}
+
+fn assert_order_positions(
+    positions: (Option<usize>, Option<usize>),
+    first: &str,
+    second: &str,
+    context: &str,
+) {
+    let first_idx = positions
+        .0
         .unwrap_or_else(|| panic!("{context}: missing first marker `{first}`"));
-    let second_idx = haystack
-        .find(second)
+    let second_idx = positions
+        .1
         .unwrap_or_else(|| panic!("{context}: missing second marker `{second}`"));
     assert!(
         first_idx < second_idx,
@@ -555,18 +573,28 @@ fn age_39_returned_artifacts_are_persisted_before_lifecycle_finalization() {
         assert_contains(&body, "record_returned_artifacts(", name);
         assert_contains(&body, "invocation_lifecycle_service", name);
         assert_contains(&body, ".finalize_invocation(", name);
-
-        let artifacts = body
-            .find("record_returned_artifacts(")
-            .unwrap_or_else(|| panic!("{name}: missing returned-artifact persistence"));
-        let finalization = body
-            .rfind(".finalize_invocation(")
-            .unwrap_or_else(|| panic!("{name}: missing lifecycle finalization"));
-        assert!(
-            artifacts < finalization,
-            "{name}: returned artifacts must be persisted before normal finalization"
-        );
+        assert_artifacts_before_finalization(name, artifact_finalization_positions(&body));
     }
+}
+
+fn artifact_finalization_positions(body: &str) -> (Option<usize>, Option<usize>) {
+    (
+        body.find("record_returned_artifacts("),
+        body.rfind(".finalize_invocation("),
+    )
+}
+
+fn assert_artifacts_before_finalization(name: &str, positions: (Option<usize>, Option<usize>)) {
+    let artifacts = positions
+        .0
+        .unwrap_or_else(|| panic!("{name}: missing returned-artifact persistence"));
+    let finalization = positions
+        .1
+        .unwrap_or_else(|| panic!("{name}: missing lifecycle finalization"));
+    assert!(
+        artifacts < finalization,
+        "{name}: returned artifacts must be persisted before normal finalization"
+    );
 }
 
 #[test]

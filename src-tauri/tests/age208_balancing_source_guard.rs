@@ -165,11 +165,22 @@ fn block_error_message(error: BlockError, start: &str) -> String {
 #[test]
 fn age153_typed_signal_precedence_runs_before_legacy_diagnostics_in_balancing_path() {
     let balanced = production_block_after(finalization_source(), "fn finalize_completed_attempt(");
-    let signal_idx = balanced
-        .find("apply_terminal_signal_outcome")
+    assert_typed_signal_precedes_diagnostics(typed_signal_precedence_positions(balanced));
+}
+
+fn typed_signal_precedence_positions(body: &str) -> (Option<usize>, Option<usize>) {
+    (
+        body.find("apply_terminal_signal_outcome"),
+        body.find("balanced_result_error_category"),
+    )
+}
+
+fn assert_typed_signal_precedes_diagnostics(positions: (Option<usize>, Option<usize>)) {
+    let signal_idx = positions
+        .0
         .expect("finalize_completed_attempt must consume typed signal");
-    let diagnostics_idx = balanced
-        .find("balanced_result_error_category")
+    let diagnostics_idx = positions
+        .1
         .expect("finalize_completed_attempt diagnostics fallback");
     assert!(
         signal_idx < diagnostics_idx,

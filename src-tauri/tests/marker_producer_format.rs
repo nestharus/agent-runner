@@ -142,10 +142,24 @@ fn marker_id_string(id: Uuid) -> String {
 }
 
 fn marker_payload_id(stderr_line: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(marker_payload(stderr_line)).unwrap()["id"]
-        .as_str()
-        .expect("marker id string")
-        .to_string()
+    let payload = parse_marker_payload_value(marker_payload(stderr_line));
+    marker_id_owned(marker_payload_id_str(marker_payload_id_value(&payload)))
+}
+
+fn parse_marker_payload_value(payload: &str) -> serde_json::Value {
+    serde_json::from_str(payload).unwrap()
+}
+
+fn marker_payload_id_value(payload: &serde_json::Value) -> &serde_json::Value {
+    &payload["id"]
+}
+
+fn marker_payload_id_str(value: &serde_json::Value) -> &str {
+    value.as_str().expect("marker id string")
+}
+
+fn marker_id_owned(id: &str) -> String {
+    id.to_string()
 }
 
 fn marker_payload(stderr_line: &str) -> &str {
@@ -162,8 +176,16 @@ fn assert_canonical_stderr_line(stderr_line: &str, payload_id: &str, expected_id
 
 fn assert_marker_producer_source_usage() {
     let source = main_rs_source();
+    assert_marker_producer_count(stderr_line_producer_count(source));
+}
+
+fn stderr_line_producer_count(source: &str) -> usize {
+    source.matches(".stderr_line()").count()
+}
+
+fn assert_marker_producer_count(count: usize) {
     assert!(
-        source.matches(".stderr_line()").count() >= 3,
+        count >= 3,
         "run/repl/resume/balanced producer paths must keep emitting through CompositeInvocationId::stderr_line"
     );
 }
@@ -194,14 +216,25 @@ fn assert_parent_env_marker(parent_env: &str) {
 
 fn assert_parent_env_source_usage() {
     let source = main_rs_source();
+    assert_parent_env_source_contains_parent(source);
+    assert_parent_env_json_producer_count(parent_env_json_producer_count(source));
+}
+
+fn assert_parent_env_source_contains_parent(source: &str) {
     assert!(
         source.contains("OULIPOLY_PARENT_INVOCATION"),
         "Tauri parent-env propagation must continue to own OULIPOLY_PARENT_INVOCATION"
     );
+}
+
+fn parent_env_json_producer_count(source: &str) -> usize {
+    source.matches("serde_json::to_string(invocation)").count()
+        + source.matches("serde_json::to_string(&invocation)").count()
+}
+
+fn assert_parent_env_json_producer_count(count: usize) {
     assert!(
-        source.matches("serde_json::to_string(invocation)").count()
-            + source.matches("serde_json::to_string(&invocation)").count()
-            >= 3,
+        count >= 3,
         "run/repl/resume/balanced parent env propagation must use raw compact JSON without the stderr prefix"
     );
 }

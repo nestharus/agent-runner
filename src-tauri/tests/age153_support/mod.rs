@@ -23,22 +23,19 @@ pub struct Age153Fixture {
     pub models_dir: PathBuf,
 }
 
+struct FixturePaths {
+    config_home: PathBuf,
+    data_home: PathBuf,
+    app_config_dir: PathBuf,
+    models_dir: PathBuf,
+}
+
 impl Age153Fixture {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let config_home = dir.path().join("config");
-        let data_home = dir.path().join("data");
-        let app_config_dir = config_home.join("oulipoly-agent-runner");
-        let models_dir = app_config_dir.join("models");
-        fs::create_dir_all(&models_dir).unwrap();
-
-        Self {
-            dir,
-            config_home,
-            data_home,
-            app_config_dir,
-            models_dir,
-        }
+        let paths = fixture_paths(dir.path());
+        create_fixture_dirs(&paths);
+        fixture_from_paths(dir, paths)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -57,9 +54,13 @@ impl Age153Fixture {
     }
 
     pub fn write_script(&self, name: &str, body: &str) -> PathBuf {
-        let path = self.dir.path().join(name);
+        let path = self.script_path(name);
         write_executable_script(&path, &script_body(body));
         path
+    }
+
+    fn script_path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
     }
 
     fn write_model_toml(&self, model_name: &str, body: &str) {
@@ -81,9 +82,7 @@ impl Age153Fixture {
         providers
             .iter()
             .map(|(provider, command_body)| {
-                let command =
-                    self.write_script(&provider_script_name(provider, "command"), command_body);
-                (*provider, command)
+                self.provider_command_script_entry(provider, command_body)
             })
             .collect()
     }
@@ -94,23 +93,118 @@ impl Age153Fixture {
     ) -> Vec<ResumeProviderPaths<'a>> {
         providers
             .iter()
-            .map(|(provider, command_body)| ResumeProviderPaths {
-                provider,
-                command: self.write_script(&provider_script_name(provider, "resume"), command_body),
-                projects_dir: self.provider_projects_dir(provider),
+            .map(|(provider, command_body)| {
+                self.resume_provider_paths_entry(provider, command_body)
             })
             .collect()
     }
 
     fn write_project_session_jsonl(&self, provider: &str, session_id: &str, body: &str) {
-        let source_dir = self.provider_projects_dir(provider).join("source-project");
-        fs::create_dir_all(&source_dir).unwrap();
-        fs::write(source_dir.join(session_jsonl_filename(session_id)), body).unwrap();
+        let path = self.project_session_jsonl_path(provider, session_id);
+        write_project_session_jsonl_at(&path, body);
+    }
+
+    fn provider_command_script_entry<'a>(
+        &self,
+        provider: &'a str,
+        command_body: &str,
+    ) -> (&'a str, PathBuf) {
+        provider_command_script_entry(
+            provider,
+            self.write_provider_command_script(provider, command_body),
+        )
+    }
+
+    fn write_provider_command_script(&self, provider: &str, command_body: &str) -> PathBuf {
+        self.write_script(&provider_script_name(provider, "command"), command_body)
+    }
+
+    fn resume_provider_paths_entry<'a>(
+        &self,
+        provider: &'a str,
+        command_body: &str,
+    ) -> ResumeProviderPaths<'a> {
+        resume_provider_paths(
+            provider,
+            self.write_resume_provider_script(provider, command_body),
+            self.provider_projects_dir(provider),
+        )
+    }
+
+    fn write_resume_provider_script(&self, provider: &str, command_body: &str) -> PathBuf {
+        self.write_script(&provider_script_name(provider, "resume"), command_body)
+    }
+
+    fn project_session_jsonl_path(&self, provider: &str, session_id: &str) -> PathBuf {
+        self.provider_projects_dir(provider)
+            .join("source-project")
+            .join(session_jsonl_filename(session_id))
     }
 
     fn stage_active_provider_session_jsonl(&self, provider: &str) {
         self.write_project_session_jsonl(provider, SESSION_ID, &active_provider_jsonl());
     }
+}
+
+fn fixture_paths(dir: &Path) -> FixturePaths {
+    let config_home = dir.join("config");
+    let data_home = dir.join("data");
+    let app_config_dir = config_home.join("oulipoly-agent-runner");
+    let models_dir = app_config_dir.join("models");
+
+    FixturePaths {
+        config_home,
+        data_home,
+        app_config_dir,
+        models_dir,
+    }
+}
+
+fn create_fixture_dirs(paths: &FixturePaths) {
+    fs::create_dir_all(&paths.models_dir).unwrap();
+}
+
+fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Age153Fixture {
+    Age153Fixture {
+        dir,
+        config_home: paths.config_home,
+        data_home: paths.data_home,
+        app_config_dir: paths.app_config_dir,
+        models_dir: paths.models_dir,
+    }
+}
+
+fn provider_command_script_entry(provider: &str, command: PathBuf) -> (&str, PathBuf) {
+    (provider, command)
+}
+
+fn resume_provider_paths<'a>(
+    provider: &'a str,
+    command: PathBuf,
+    projects_dir: PathBuf,
+) -> ResumeProviderPaths<'a> {
+    ResumeProviderPaths {
+        provider,
+        command,
+        projects_dir,
+    }
+}
+
+fn write_project_session_jsonl_at(path: &Path, body: &str) {
+    create_project_session_dir(project_session_dir(path));
+    write_project_session_file(path, body);
+}
+
+fn project_session_dir(path: &Path) -> &Path {
+    path.parent().expect("session jsonl parent")
+}
+
+fn create_project_session_dir(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+}
+
+fn write_project_session_file(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
 }
 
 fn write_executable_script(path: &Path, body: &str) {
@@ -769,11 +863,33 @@ pub fn assert_normalized_result_stdout_matches_golden(stdout: &str, golden: &str
 }
 
 pub fn assert_ordered(haystack: &str, first: &str, second: &str) {
-    let first_index = haystack
-        .find(first)
+    assert_ordered_positions(
+        ordered_marker_positions(haystack, first, second),
+        haystack,
+        first,
+        second,
+    );
+}
+
+fn ordered_marker_positions(
+    haystack: &str,
+    first: &str,
+    second: &str,
+) -> (Option<usize>, Option<usize>) {
+    (haystack.find(first), haystack.find(second))
+}
+
+fn assert_ordered_positions(
+    positions: (Option<usize>, Option<usize>),
+    haystack: &str,
+    first: &str,
+    second: &str,
+) {
+    let first_index = positions
+        .0
         .unwrap_or_else(|| panic!("missing first marker {first:?} in:\n{haystack}"));
-    let second_index = haystack
-        .find(second)
+    let second_index = positions
+        .1
         .unwrap_or_else(|| panic!("missing second marker {second:?} in:\n{haystack}"));
     assert!(
         first_index < second_index,
