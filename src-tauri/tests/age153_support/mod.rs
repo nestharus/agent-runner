@@ -3,7 +3,7 @@
 
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -23,22 +23,19 @@ pub struct Age153Fixture {
     pub models_dir: PathBuf,
 }
 
+struct FixturePaths {
+    config_home: PathBuf,
+    data_home: PathBuf,
+    app_config_dir: PathBuf,
+    models_dir: PathBuf,
+}
+
 impl Age153Fixture {
     pub fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let config_home = dir.path().join("config");
-        let data_home = dir.path().join("data");
-        let app_config_dir = config_home.join("oulipoly-agent-runner");
-        let models_dir = app_config_dir.join("models");
-        fs::create_dir_all(&models_dir).unwrap();
-
-        Self {
-            dir,
-            config_home,
-            data_home,
-            app_config_dir,
-            models_dir,
-        }
+        let paths = fixture_paths(dir.path());
+        create_fixture_dirs(&paths);
+        fixture_from_paths(dir, paths)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -57,103 +54,308 @@ impl Age153Fixture {
     }
 
     pub fn write_script(&self, name: &str, body: &str) -> PathBuf {
-        let path = self.dir.path().join(name);
-        fs::write(
-            &path,
-            format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&path, perms).unwrap();
+        let path = self.script_path(name);
+        write_executable_script(&path, &script_body(body));
         path
     }
 
-    pub fn write_model(&self, model_name: &str, providers: &[&str]) {
-        let mut body = String::new();
-        for provider in providers {
-            body.push_str(&format!(
-                r#"[[providers]]
+    fn script_path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+
+    fn write_model_toml(&self, model_name: &str, body: &str) {
+        fs::write(self.model_toml_path(model_name), body).unwrap();
+    }
+
+    fn model_toml_path(&self, model_name: &str) -> PathBuf {
+        self.models_dir.join(model_toml_filename(model_name))
+    }
+
+    fn write_providers_toml(&self, body: &str) {
+        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
+    }
+
+    fn write_provider_command_scripts<'a>(
+        &self,
+        providers: &'a [(&'a str, &'a str)],
+    ) -> Vec<(&'a str, PathBuf)> {
+        providers
+            .iter()
+            .map(|(provider, command_body)| {
+                self.provider_command_script_entry(provider, command_body)
+            })
+            .collect()
+    }
+
+    fn write_resume_provider_scripts<'a>(
+        &self,
+        providers: &'a [(&'a str, String)],
+    ) -> Vec<ResumeProviderPaths<'a>> {
+        providers
+            .iter()
+            .map(|(provider, command_body)| {
+                self.resume_provider_paths_entry(provider, command_body)
+            })
+            .collect()
+    }
+
+    fn write_project_session_jsonl(&self, provider: &str, session_id: &str, body: &str) {
+        let path = self.project_session_jsonl_path(provider, session_id);
+        write_project_session_jsonl_at(&path, body);
+    }
+
+    fn provider_command_script_entry<'a>(
+        &self,
+        provider: &'a str,
+        command_body: &str,
+    ) -> (&'a str, PathBuf) {
+        provider_command_script_entry(
+            provider,
+            self.write_provider_command_script(provider, command_body),
+        )
+    }
+
+    fn write_provider_command_script(&self, provider: &str, command_body: &str) -> PathBuf {
+        self.write_script(&provider_script_name(provider, "command"), command_body)
+    }
+
+    fn resume_provider_paths_entry<'a>(
+        &self,
+        provider: &'a str,
+        command_body: &str,
+    ) -> ResumeProviderPaths<'a> {
+        resume_provider_paths(
+            provider,
+            self.write_resume_provider_script(provider, command_body),
+            self.provider_projects_dir(provider),
+        )
+    }
+
+    fn write_resume_provider_script(&self, provider: &str, command_body: &str) -> PathBuf {
+        self.write_script(&provider_script_name(provider, "resume"), command_body)
+    }
+
+    fn project_session_jsonl_path(&self, provider: &str, session_id: &str) -> PathBuf {
+        self.provider_projects_dir(provider)
+            .join("source-project")
+            .join(session_jsonl_filename(session_id))
+    }
+
+    fn stage_active_provider_session_jsonl(&self, provider: &str) {
+        self.write_project_session_jsonl(provider, SESSION_ID, &active_provider_jsonl());
+    }
+}
+
+fn fixture_paths(dir: &Path) -> FixturePaths {
+    let config_home = dir.join("config");
+    let data_home = dir.join("data");
+    let app_config_dir = config_home.join("oulipoly-agent-runner");
+    let models_dir = app_config_dir.join("models");
+
+    FixturePaths {
+        config_home,
+        data_home,
+        app_config_dir,
+        models_dir,
+    }
+}
+
+fn create_fixture_dirs(paths: &FixturePaths) {
+    fs::create_dir_all(&paths.models_dir).unwrap();
+}
+
+fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Age153Fixture {
+    Age153Fixture {
+        dir,
+        config_home: paths.config_home,
+        data_home: paths.data_home,
+        app_config_dir: paths.app_config_dir,
+        models_dir: paths.models_dir,
+    }
+}
+
+fn provider_command_script_entry(provider: &str, command: PathBuf) -> (&str, PathBuf) {
+    (provider, command)
+}
+
+fn resume_provider_paths<'a>(
+    provider: &'a str,
+    command: PathBuf,
+    projects_dir: PathBuf,
+) -> ResumeProviderPaths<'a> {
+    ResumeProviderPaths {
+        provider,
+        command,
+        projects_dir,
+    }
+}
+
+fn write_project_session_jsonl_at(path: &Path, body: &str) {
+    create_project_session_dir(project_session_dir(path));
+    write_project_session_file(path, body);
+}
+
+fn project_session_dir(path: &Path) -> &Path {
+    path.parent().expect("session jsonl parent")
+}
+
+fn create_project_session_dir(path: &Path) {
+    fs::create_dir_all(path).unwrap();
+}
+
+fn write_project_session_file(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+}
+
+fn write_executable_script(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    mark_executable(path);
+}
+
+fn mark_executable(path: &Path) {
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+fn script_body(body: &str) -> String {
+    format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n")
+}
+
+fn model_providers_toml(providers: &[&str]) -> String {
+    providers
+        .iter()
+        .map(|provider| model_provider_toml(provider))
+        .collect()
+}
+
+fn model_provider_toml(provider: &str) -> String {
+    format!(
+        r#"[[providers]]
 name = "{provider}"
 args = []
 interactive_args = ["interactive"]
 
 "#
-            ));
-        }
-        fs::write(self.models_dir.join(format!("{model_name}.toml")), body).unwrap();
-    }
+    )
+}
 
-    pub fn write_providers_with_bodies(&self, providers: &[(&str, &str)]) {
-        let mut body = String::new();
-        for (provider, command_body) in providers {
-            let command = self.write_script(&format!("{provider}-command.sh"), command_body);
-            body.push_str(&format!(
-                r#"[{provider}]
+fn provider_script_name(provider: &str, suffix: &str) -> String {
+    format!("{provider}-{suffix}.sh")
+}
+
+fn model_toml_filename(model_name: &str) -> String {
+    format!("{model_name}.toml")
+}
+
+fn session_jsonl_filename(session_id: &str) -> String {
+    format!("{session_id}.jsonl")
+}
+
+fn providers_toml(providers: &[(&str, PathBuf)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, command)| provider_command_toml(provider, command))
+        .collect()
+}
+
+fn providers_toml_from_paths(providers: &[(&str, &Path)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, command)| provider_command_toml(provider, command))
+        .collect()
+}
+
+fn provider_command_toml(provider: &str, command: &Path) -> String {
+    format!(
+        r#"[{provider}]
 command = {}
 args = []
 interactive_args = ["interactive"]
 prompt_mode = "arg"
 
 "#,
-                toml_string(&command.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
-    }
+        toml_string(&command.display().to_string())
+    )
+}
 
-    pub fn write_providers_with_command_paths(&self, providers: &[(&str, &Path)]) {
-        let mut body = String::new();
-        for (provider, command) in providers {
-            body.push_str(&format!(
-                r#"[{provider}]
-command = {}
-args = []
-interactive_args = ["interactive"]
-prompt_mode = "arg"
+fn resume_model_toml(providers: &[(&str, String)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, _)| resume_model_provider_toml(provider))
+        .collect()
+}
 
-"#,
-                toml_string(&command.display().to_string())
-            ));
-        }
-        fs::write(self.app_config_dir.join("providers.toml"), body).unwrap();
-    }
-
-    pub fn write_resume_pool(&self, model_name: &str, providers: &[(&str, String)]) {
-        let mut model = String::new();
-        let mut providers_toml = String::new();
-        for (provider, command_body) in providers {
-            model.push_str(&format!(
-                r#"[[providers]]
+fn resume_model_provider_toml(provider: &str) -> String {
+    format!(
+        r#"[[providers]]
 name = "{provider}"
 args = ["exec-{provider}"]
 
 "#
-            ));
-            let command = self.write_script(&format!("{provider}-resume.sh"), command_body);
-            let projects_dir = self.provider_projects_dir(provider);
-            providers_toml.push_str(&format!(
-                r#"[{provider}]
+    )
+}
+
+struct ResumeProviderPaths<'a> {
+    provider: &'a str,
+    command: PathBuf,
+    projects_dir: PathBuf,
+}
+
+fn resume_providers_toml(providers: &[ResumeProviderPaths<'_>]) -> String {
+    providers.iter().map(resume_provider_toml).collect()
+}
+
+fn resume_provider_toml(provider: &ResumeProviderPaths<'_>) -> String {
+    format!(
+        r#"[{}]
 command = {}
 args = []
-interactive_args = ["launch-{provider}"]
+interactive_args = ["launch-{}"]
 prompt_mode = "arg"
 
-[{provider}.resume]
+[{}.resume]
 kind = "flag"
 flag = "--resume"
 
-[{provider}.session_storage]
+[{}.session_storage]
 kind = "claude_code"
 projects_dir = {}
 
 "#,
-                toml_string(&command.display().to_string()),
-                toml_string(&projects_dir.display().to_string())
-            ));
-        }
-        fs::write(self.models_dir.join(format!("{model_name}.toml")), model).unwrap();
-        fs::write(self.app_config_dir.join("providers.toml"), providers_toml).unwrap();
+        provider.provider,
+        toml_string(&provider.command.display().to_string()),
+        provider.provider,
+        provider.provider,
+        provider.provider,
+        toml_string(&provider.projects_dir.display().to_string())
+    )
+}
+
+fn active_provider_jsonl() -> String {
+    format!(
+        r#"{{"sessionId":"{SESSION_ID}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
+    )
+}
+
+impl Age153Fixture {
+    pub fn write_model(&self, model_name: &str, providers: &[&str]) {
+        self.write_model_toml(model_name, &model_providers_toml(providers));
+    }
+
+    pub fn write_providers_with_bodies(&self, providers: &[(&str, &str)]) {
+        let commands = self.write_provider_command_scripts(providers);
+        self.write_providers_toml(&providers_toml(&commands));
+    }
+
+    pub fn write_providers_with_command_paths(&self, providers: &[(&str, &Path)]) {
+        self.write_providers_toml(&providers_toml_from_paths(providers));
+    }
+
+    pub fn write_resume_pool(&self, model_name: &str, providers: &[(&str, String)]) {
+        let provider_paths = self.write_resume_provider_scripts(providers);
+        self.write_model_toml(model_name, &resume_model_toml(providers));
+        self.write_providers_toml(&resume_providers_toml(&provider_paths));
     }
 
     pub fn provider_projects_dir(&self, provider: &str) -> PathBuf {
@@ -161,15 +363,7 @@ projects_dir = {}
     }
 
     pub fn stage_active_claude_jsonl(&self, provider: &str) {
-        let source_dir = self.provider_projects_dir(provider).join("source-project");
-        fs::create_dir_all(&source_dir).unwrap();
-        fs::write(
-            source_dir.join(format!("{SESSION_ID}.jsonl")),
-            format!(
-                r#"{{"sessionId":"{SESSION_ID}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
-            ),
-        )
-        .unwrap();
+        self.stage_active_provider_session_jsonl(provider);
     }
 
     pub fn seed_active_chain(&self, provider: &str, model: &str) {
@@ -436,28 +630,122 @@ pub fn assert_single_terminal_signal(stderr: &str, expected_kind: &str, expect_s
 }
 
 pub fn assert_terminal_signal_shape(line: &str, expected_kind: &str, expect_session: bool) {
+    assert_terminal_signal_facts(terminal_signal_facts(line), expected_kind, expect_session);
+}
+
+fn terminal_signal_facts(line: &str) -> TerminalSignalFacts {
     let value = parse_terminal_signal_line(line);
-    let object = value
-        .as_object()
-        .expect("terminal signal marker body object");
-    let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    assert_eq!(
+    let object = expect_terminal_signal_object(terminal_signal_object(&value));
+    terminal_signal_facts_from_parts(
+        terminal_signal_evidence_is_object(&value),
+        terminal_signal_invocation_id_is_uuid(&value),
+        terminal_signal_keys(object),
+        terminal_signal_kind(&value),
+        terminal_signal_raw(&value),
+        terminal_signal_session_id_is_uuid(&value),
+        terminal_signal_session_is_null(&value),
+    )
+}
+
+fn terminal_signal_object(value: &Value) -> Option<&Map<String, Value>> {
+    value.as_object()
+}
+
+fn expect_terminal_signal_object(object: Option<&Map<String, Value>>) -> &Map<String, Value> {
+    object.expect("terminal signal marker body object")
+}
+
+fn terminal_signal_keys(object: &Map<String, Value>) -> BTreeSet<String> {
+    object.keys().cloned().collect()
+}
+
+fn terminal_signal_evidence_is_object(value: &Value) -> bool {
+    value["evidence"].is_object()
+}
+
+fn terminal_signal_invocation_id_is_uuid(value: &Value) -> bool {
+    uuid_value_is_valid(&value["invocation_id"])
+}
+
+fn terminal_signal_kind(value: &Value) -> Value {
+    value["kind"].clone()
+}
+
+fn terminal_signal_raw(value: &Value) -> Value {
+    value.clone()
+}
+
+fn terminal_signal_session_id_is_uuid(value: &Value) -> bool {
+    uuid_value_is_valid(&value["session_id"])
+}
+
+fn terminal_signal_session_is_null(value: &Value) -> bool {
+    value["session_id"].is_null()
+}
+
+fn terminal_signal_facts_from_parts(
+    evidence_is_object: bool,
+    invocation_id_is_uuid: bool,
+    keys: BTreeSet<String>,
+    kind: Value,
+    raw: Value,
+    session_id_is_uuid: bool,
+    session_is_null: bool,
+) -> TerminalSignalFacts {
+    TerminalSignalFacts {
+        evidence_is_object,
+        invocation_id_is_uuid,
         keys,
-        BTreeSet::from(["evidence", "invocation_id", "kind", "session_id"]),
+        kind,
+        raw,
+        session_id_is_uuid,
+        session_is_null,
+    }
+}
+
+fn uuid_value_is_valid(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|raw| uuid::Uuid::parse_str(raw).is_ok())
+}
+
+fn assert_terminal_signal_facts(
+    facts: TerminalSignalFacts,
+    expected_kind: &str,
+    expect_session: bool,
+) {
+    assert_eq!(
+        facts.keys,
+        terminal_signal_expected_keys(),
         "AGE-153 marker schema from /home/nes/projects/agent-runner/planning/age-153-terminal-signal-wiring/contracts/age-153-terminal-signal-wiring.md"
     );
-    assert_eq!(value["kind"], expected_kind);
-    assert!(value["evidence"].is_object(), "{value}");
-    let invocation_id = value["invocation_id"]
-        .as_str()
-        .expect("invocation_id string");
-    uuid::Uuid::parse_str(invocation_id).expect("invocation_id uuid");
+    assert_eq!(facts.kind, expected_kind);
+    assert!(facts.evidence_is_object, "{}", facts.raw);
+    assert!(facts.invocation_id_is_uuid, "invocation_id uuid");
     if expect_session {
-        let session_id = value["session_id"].as_str().expect("session_id string");
-        uuid::Uuid::parse_str(session_id).expect("session_id uuid");
+        assert!(facts.session_id_is_uuid, "session_id uuid");
     } else {
-        assert!(value["session_id"].is_null(), "{value}");
+        assert!(facts.session_is_null, "{}", facts.raw);
     }
+}
+
+fn terminal_signal_expected_keys() -> BTreeSet<String> {
+    BTreeSet::from([
+        "evidence".to_string(),
+        "invocation_id".to_string(),
+        "kind".to_string(),
+        "session_id".to_string(),
+    ])
+}
+
+struct TerminalSignalFacts {
+    evidence_is_object: bool,
+    invocation_id_is_uuid: bool,
+    keys: BTreeSet<String>,
+    kind: Value,
+    raw: Value,
+    session_id_is_uuid: bool,
+    session_is_null: bool,
 }
 
 pub fn assert_no_terminal_marker_on_stdout(output: &Output) {
@@ -469,20 +757,54 @@ pub fn assert_no_terminal_marker_on_stdout(output: &Output) {
 }
 
 pub fn assert_result_envelope_shape(stdout: &str) -> Value {
-    let lines: Vec<_> = stdout
-        .lines()
-        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
-        .collect();
+    let line = single_result_envelope_line(stdout);
+    let value = parse_result_envelope_line(line);
+    assert_result_envelope_value_shape(&value);
+    value
+}
+
+fn single_result_envelope_line(stdout: &str) -> &str {
+    let lines = result_envelope_lines(stdout);
     assert_eq!(
         lines.len(),
         1,
         "stdout must contain one result envelope:\n{stdout}"
     );
-    let raw = lines[0].strip_prefix("OULIPOLY_RESULT=").unwrap();
-    let value: Value = serde_json::from_str(raw).unwrap();
+    lines[0]
+}
+
+fn result_envelope_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("OULIPOLY_RESULT="))
+        .collect()
+}
+
+fn parse_result_envelope_line(line: &str) -> Value {
+    serde_json::from_str(result_envelope_payload(line)).unwrap()
+}
+
+fn result_envelope_payload(line: &str) -> &str {
+    line.strip_prefix("OULIPOLY_RESULT=").unwrap()
+}
+
+fn assert_result_envelope_value_shape(value: &Value) {
     let object = value.as_object().expect("result envelope object");
     let keys: BTreeSet<_> = object.keys().map(String::as_str).collect();
-    let base_keys = BTreeSet::from([
+    let base_keys = result_envelope_base_keys();
+    if value["success"] == true {
+        assert_eq!(keys, base_keys);
+    } else {
+        assert_eq!(keys, failure_result_envelope_keys(base_keys));
+        assert_eq!(
+            value["agent_runner_invocation_id"], value["id"],
+            "failure result identity must repeat the runner invocation id"
+        );
+    }
+}
+
+fn result_envelope_base_keys() -> BTreeSet<&'static str> {
+    BTreeSet::from([
         "error_category",
         "exit_code",
         "finished_at",
@@ -490,41 +812,50 @@ pub fn assert_result_envelope_shape(stdout: &str) -> Value {
         "status",
         "success",
         "terminal_reason",
+    ])
+}
+
+fn failure_result_envelope_keys(mut base_keys: BTreeSet<&'static str>) -> BTreeSet<&'static str> {
+    base_keys.extend([
+        "agent_runner_invocation_id",
+        "provider_name",
+        "provider_session_id",
+        "agent_runner_chain_id",
     ]);
-    if value["success"] == true {
-        assert_eq!(keys, base_keys);
-    } else {
-        let mut expected = base_keys;
-        expected.extend([
-            "agent_runner_invocation_id",
-            "provider_name",
-            "provider_session_id",
-            "agent_runner_chain_id",
-        ]);
-        assert_eq!(keys, expected);
-        assert_eq!(
-            value["agent_runner_invocation_id"], value["id"],
-            "failure result identity must repeat the runner invocation id"
-        );
-    }
-    value
+    base_keys
 }
 
 pub fn normalized_result_stdout(stdout: &str) -> String {
-    stdout
-        .lines()
-        .map(|line| {
-            let Some(raw) = line.strip_prefix("OULIPOLY_RESULT=") else {
-                return line.to_string();
-            };
-            let mut value: Value = serde_json::from_str(raw).unwrap();
-            value["id"] = Value::String("<uuid>".to_string());
-            value["finished_at"] = Value::String("<ts>".to_string());
-            format!("OULIPOLY_RESULT={}", serde_json::to_string(&value).unwrap())
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n"
+    normalized_stdout_lines(stdout).join("\n") + "\n"
+}
+
+fn normalized_stdout_lines(stdout: &str) -> Vec<String> {
+    stdout.lines().map(normalized_stdout_line).collect()
+}
+
+fn normalized_stdout_line(line: &str) -> String {
+    let Some(raw) = result_envelope_payload_opt(line) else {
+        return line.to_string();
+    };
+    format_normalized_result_line(normalized_result_value(parse_result_value(raw)))
+}
+
+fn result_envelope_payload_opt(line: &str) -> Option<&str> {
+    line.strip_prefix("OULIPOLY_RESULT=")
+}
+
+fn parse_result_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap()
+}
+
+fn normalized_result_value(mut value: Value) -> Value {
+    value["id"] = Value::String("<uuid>".to_string());
+    value["finished_at"] = Value::String("<ts>".to_string());
+    value
+}
+
+fn format_normalized_result_line(value: Value) -> String {
+    format!("OULIPOLY_RESULT={}", serde_json::to_string(&value).unwrap())
 }
 
 pub fn assert_normalized_result_stdout_matches_golden(stdout: &str, golden: &str) {
@@ -532,11 +863,33 @@ pub fn assert_normalized_result_stdout_matches_golden(stdout: &str, golden: &str
 }
 
 pub fn assert_ordered(haystack: &str, first: &str, second: &str) {
-    let first_index = haystack
-        .find(first)
+    assert_ordered_positions(
+        ordered_marker_positions(haystack, first, second),
+        haystack,
+        first,
+        second,
+    );
+}
+
+fn ordered_marker_positions(
+    haystack: &str,
+    first: &str,
+    second: &str,
+) -> (Option<usize>, Option<usize>) {
+    (haystack.find(first), haystack.find(second))
+}
+
+fn assert_ordered_positions(
+    positions: (Option<usize>, Option<usize>),
+    haystack: &str,
+    first: &str,
+    second: &str,
+) {
+    let first_index = positions
+        .0
         .unwrap_or_else(|| panic!("missing first marker {first:?} in:\n{haystack}"));
-    let second_index = haystack
-        .find(second)
+    let second_index = positions
+        .1
         .unwrap_or_else(|| panic!("missing second marker {second:?} in:\n{haystack}"));
     assert!(
         first_index < second_index,
@@ -550,14 +903,33 @@ pub fn main_rs_source() -> String {
 }
 
 pub fn balancing_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut combined = String::new();
-    for rel in [
+    combined_source(read_manifest_sources(balancing_source_files()))
+}
+
+fn balancing_source_files() -> &'static [&'static str] {
+    &[
         "src/run/mod.rs",
         "src/run/balancing/mod.rs",
         "src/run/balancing/orchestration.rs",
         "src/run/balancing/accessor.rs",
         "src/run/balancing/mapper.rs",
+        "src/run/balancing/mapper/attempt.rs",
+        "src/run/balancing/mapper/attempt/completed.rs",
+        "src/run/balancing/mapper/attempt/disposition.rs",
+        "src/run/balancing/mapper/attempt/quota.rs",
+        "src/run/balancing/mapper/attempt/shared.rs",
+        "src/run/balancing/mapper/attempt/spawn.rs",
+        "src/run/balancing/mapper/context.rs",
+        "src/run/balancing/mapper/context/config.rs",
+        "src/run/balancing/mapper/context/invocation.rs",
+        "src/run/balancing/mapper/context/quota.rs",
+        "src/run/balancing/mapper/context/routing.rs",
+        "src/run/balancing/mapper/context/session.rs",
+        "src/run/balancing/mapper/executor_request.rs",
+        "src/run/balancing/mapper/failure.rs",
+        "src/run/balancing/mapper/finalizer_request.rs",
+        "src/run/balancing/mapper/session_ingest.rs",
+        "src/run/balancing/mapper/terminal.rs",
         "src/run/balancing/parser.rs",
         "src/run/balancing/disposition.rs",
         "src/run/balancing/finalization.rs",
@@ -566,20 +938,15 @@ pub fn balancing_source() -> String {
         "src/run/balancing/predicate.rs",
         "src/run/balancing/state_update.rs",
         "src/run/balancing/validator.rs",
-    ] {
-        let path = root.join(rel);
-        let extra = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
-        combined.push('\n');
-        combined.push_str(&extra);
-    }
-    combined
+    ]
 }
 
 pub fn repl_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut combined = String::new();
-    for rel in [
+    combined_source(read_manifest_sources(repl_source_files()))
+}
+
+fn repl_source_files() -> &'static [&'static str] {
+    &[
         "src/run/mod.rs",
         "src/run/repl/mod.rs",
         "src/run/repl/orchestration.rs",
@@ -588,6 +955,19 @@ pub fn repl_source() -> String {
         "src/run/repl/formatter.rs",
         "src/run/repl/mapper.rs",
         "src/run/repl/validator.rs",
+    ]
+}
+
+pub fn terminal_outcome_adapter_source() -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut combined = String::new();
+    for rel in [
+        "src/terminal_outcome_adapter.rs",
+        "src/terminal_outcome_adapter/category.rs",
+        "src/terminal_outcome_adapter/disposition.rs",
+        "src/terminal_outcome_adapter/fixture_override.rs",
+        "src/terminal_outcome_adapter/marker.rs",
+        "src/terminal_outcome_adapter/outcome.rs",
     ] {
         let path = root.join(rel);
         let extra = fs::read_to_string(&path)
@@ -598,19 +978,16 @@ pub fn repl_source() -> String {
     combined
 }
 
-pub fn terminal_outcome_adapter_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/terminal_outcome_adapter.rs");
-    fs::read_to_string(&path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
+pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
+    source_block_from_parse_result(source, start, source_block_bounds(source, start))
 }
 
-pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
-    let start_idx = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing {start}"));
+fn source_block_bounds(source: &str, start: &str) -> Result<(usize, usize), SourceBlockError> {
+    let start_idx = source.find(start).ok_or(SourceBlockError::Start)?;
     let open_idx = source[start_idx..]
         .find('{')
         .map(|idx| start_idx + idx)
-        .unwrap_or_else(|| panic!("missing opening brace after {start}"));
+        .ok_or(SourceBlockError::OpeningBrace)?;
     let mut depth = 1usize;
     let mut idx = open_idx + 1;
     let bytes = source.as_bytes();
@@ -621,7 +998,7 @@ pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    return &source[open_idx + 1..idx];
+                    return Ok((open_idx + 1, idx));
                 }
             }
             _ => {}
@@ -629,23 +1006,80 @@ pub fn source_block_after<'a>(source: &'a str, start: &str) -> &'a str {
         idx += 1;
     }
 
-    panic!("missing closing brace after {start}");
+    Err(SourceBlockError::ClosingBrace)
+}
+
+fn source_block_from_parse_result<'a>(
+    source: &'a str,
+    start: &str,
+    result: Result<(usize, usize), SourceBlockError>,
+) -> &'a str {
+    source_block_slice(source, validated_source_block_bounds(start, result))
+}
+
+fn validated_source_block_bounds(
+    start: &str,
+    result: Result<(usize, usize), SourceBlockError>,
+) -> (usize, usize) {
+    result.unwrap_or_else(|error| panic!("{}", source_block_error_message(error, start)))
+}
+
+fn source_block_slice(source: &str, bounds: (usize, usize)) -> &str {
+    &source[bounds.0..bounds.1]
+}
+
+enum SourceBlockError {
+    Start,
+    OpeningBrace,
+    ClosingBrace,
+}
+
+fn source_block_error_message(error: SourceBlockError, start: &str) -> String {
+    match error {
+        SourceBlockError::Start => format!("missing {start}"),
+        SourceBlockError::OpeningBrace => format!("missing opening brace after {start}"),
+        SourceBlockError::ClosingBrace => format!("missing closing brace after {start}"),
+    }
 }
 
 fn signal_consumer_source() -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut combined = main_rs_source();
-    combined.push('\n');
-    combined.push_str(&repl_source());
-    for rel in [
+    combined_source(signal_consumer_source_parts())
+}
+
+fn signal_consumer_source_parts() -> Vec<String> {
+    let mut sources = vec![main_rs_source(), repl_source()];
+    sources.extend(read_manifest_sources(signal_consumer_source_files()));
+    sources
+}
+
+fn signal_consumer_source_files() -> &'static [&'static str] {
+    &[
         "src/invocation/result_envelope.rs",
         "src/invocation/finalize.rs",
-    ] {
-        let path = root.join(rel);
-        let extra = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"));
+    ]
+}
+
+fn read_manifest_sources(rels: &[&str]) -> Vec<String> {
+    rels.iter().map(|rel| read_manifest_source(rel)).collect()
+}
+
+fn read_manifest_source(rel: &str) -> String {
+    read_source_path(&manifest_source_path(rel))
+}
+
+fn manifest_source_path(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+fn read_source_path(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("failed to read {path:?}: {err}"))
+}
+
+fn combined_source(sources: Vec<String>) -> String {
+    let mut combined = String::new();
+    for source in sources {
         combined.push('\n');
-        combined.push_str(&extra);
+        combined.push_str(&source);
     }
     combined
 }
@@ -662,9 +1096,24 @@ pub fn assert_signal_consumer_source_wired(function_name: &str, expected_fragmen
 }
 
 pub fn parse_valid_invocations(stderr: &str) -> Vec<CompositeInvocationId> {
-    stderr
-        .lines()
-        .filter_map(|line| line.strip_prefix("OULIPOLY_INVOCATION="))
-        .filter_map(|raw| CompositeInvocationId::parse_env_value(raw).ok())
+    parse_invocation_payloads(invocation_payloads(stderr))
+}
+
+fn invocation_payloads(stderr: &str) -> Vec<&str> {
+    stderr.lines().filter_map(invocation_payload).collect()
+}
+
+fn invocation_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("OULIPOLY_INVOCATION=")
+}
+
+fn parse_invocation_payloads(payloads: Vec<&str>) -> Vec<CompositeInvocationId> {
+    payloads
+        .into_iter()
+        .filter_map(parse_invocation_payload)
         .collect()
+}
+
+fn parse_invocation_payload(raw: &str) -> Option<CompositeInvocationId> {
+    CompositeInvocationId::parse_env_value(raw).ok()
 }

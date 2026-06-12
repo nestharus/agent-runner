@@ -17,6 +17,10 @@ pub enum FailureClass {
     WeeklyOrLonger,
     UpstreamApiDown,
     TransientStderrNoise,
+    /// The provider's backing session store contended under concurrent load.
+    /// A short rotate-away cooldown sheds load from the contended account while
+    /// it recovers, so concurrent siblings prefer a less-loaded account.
+    ProviderStorageContention,
 }
 
 impl FailureClass {
@@ -26,6 +30,7 @@ impl FailureClass {
             FailureClass::WeeklyOrLonger => "WeeklyOrLonger",
             FailureClass::UpstreamApiDown => "UpstreamApiDown",
             FailureClass::TransientStderrNoise => "TransientStderrNoise",
+            FailureClass::ProviderStorageContention => "ProviderStorageContention",
         }
     }
 
@@ -33,6 +38,9 @@ impl FailureClass {
         match kind {
             TerminalSignalKind::QuotaExhaustedInband => Some(FailureClass::RollingWindow5h),
             TerminalSignalKind::RateLimited => Some(FailureClass::TransientStderrNoise),
+            TerminalSignalKind::ProviderStorageContention => {
+                Some(FailureClass::ProviderStorageContention)
+            }
             TerminalSignalKind::ProlongedSilence | TerminalSignalKind::SpawnError => {
                 Some(FailureClass::UpstreamApiDown)
             }
@@ -51,6 +59,7 @@ impl FailureClass {
             FailureClass::RollingWindow5h => Some(Duration::hours(5)),
             FailureClass::WeeklyOrLonger => Some(Duration::days(7)),
             FailureClass::UpstreamApiDown => Some(Duration::minutes(5)),
+            FailureClass::ProviderStorageContention => Some(Duration::minutes(2)),
             FailureClass::TransientStderrNoise => None,
         }
     }

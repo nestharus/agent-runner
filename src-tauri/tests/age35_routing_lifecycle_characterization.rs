@@ -571,7 +571,7 @@ fn age_81_one_shot_retries_first_quota_exhausted_provider_then_succeeds() {
     assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("age81-a") && stderr.contains("retrying another provider"),
+        stderr.contains("age81-a") && stderr.contains("rotating to another provider"),
         "{stderr}"
     );
     let db = fixture.open_db();
@@ -623,7 +623,7 @@ fn age_81_one_shot_retries_n_minus_one_quota_exhausted_providers_then_succeeds()
     assert!(stdout.contains("OULIPOLY_RESULT="), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
-        stderr.matches("retrying another provider").count(),
+        stderr.matches("rotating to another provider").count(),
         2,
         "{stderr}"
     );
@@ -701,7 +701,7 @@ fn age_81_one_shot_non_quota_failure_does_not_retry() {
     assert!(stdout.starts_with("OULIPOLY_RESULT="), "{stdout}");
     assert!(!stdout.contains("age81-b executed"), "{stdout}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!stderr.contains("retrying another provider"), "{stderr}");
+    assert!(!stderr.contains("rotating to another provider"), "{stderr}");
     assert!(!stderr.contains("age81-b executed"), "{stderr}");
     let db = fixture.open_db();
     // AGE-163 WU-A.4: non-quota failures may still mutate routing state

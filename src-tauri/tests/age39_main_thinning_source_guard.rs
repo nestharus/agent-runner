@@ -20,6 +20,40 @@ fn one_shot_helper_region_source() -> &'static str {
         "\n",
         include_str!("../src/run/balancing/mapper.rs"),
         "\n",
+        include_str!("../src/run/balancing/mapper/attempt.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/attempt/completed.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/attempt/disposition.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/attempt/quota.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/attempt/shared.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/attempt/spawn.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/context.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/context/config.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/context/invocation.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/context/quota.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/context/routing.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/context/session.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/executor_request.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/failure.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/finalizer_request.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/session_ingest.rs"),
+        "\n",
+        include_str!("../src/run/balancing/mapper/terminal.rs"),
+        "\n",
         include_str!("../src/run/balancing/parser.rs"),
         "\n",
         include_str!("../src/run/balancing/predicate.rs"),
@@ -97,14 +131,53 @@ fn diagnostics_source() -> &'static str {
 }
 
 fn source_slice<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start_idx = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing {start}"));
+    source_slice_from_parse_result(source, start, end, source_slice_bounds(source, start, end))
+}
+
+fn source_slice_bounds(
+    source: &str,
+    start: &str,
+    end: &str,
+) -> Result<(usize, usize), SourceSliceError> {
+    let start_idx = source.find(start).ok_or(SourceSliceError::Start)?;
     let end_idx = source[start_idx..]
         .find(end)
         .map(|idx| start_idx + idx)
-        .unwrap_or_else(|| panic!("missing {end} after {start}"));
-    &source[start_idx..end_idx]
+        .ok_or(SourceSliceError::End)?;
+    Ok((start_idx, end_idx))
+}
+
+fn source_slice_from_parse_result<'a>(
+    source: &'a str,
+    start: &str,
+    end: &str,
+    result: Result<(usize, usize), SourceSliceError>,
+) -> &'a str {
+    source_slice_from_bounds(source, validated_source_slice_bounds(start, end, result))
+}
+
+fn validated_source_slice_bounds(
+    start: &str,
+    end: &str,
+    result: Result<(usize, usize), SourceSliceError>,
+) -> (usize, usize) {
+    result.unwrap_or_else(|error| panic!("{}", source_slice_error_message(error, start, end)))
+}
+
+fn source_slice_from_bounds(source: &str, bounds: (usize, usize)) -> &str {
+    &source[bounds.0..bounds.1]
+}
+
+enum SourceSliceError {
+    Start,
+    End,
+}
+
+fn source_slice_error_message(error: SourceSliceError, start: &str, end: &str) -> String {
+    match error {
+        SourceSliceError::Start => format!("missing {start}"),
+        SourceSliceError::End => format!("missing {end} after {start}"),
+    }
 }
 
 fn compact(source: &str) -> String {
@@ -126,11 +199,29 @@ fn assert_not_contains(haystack: &str, needle: &str, context: &str) {
 }
 
 fn assert_order(haystack: &str, first: &str, second: &str, context: &str) {
-    let first_idx = haystack
-        .find(first)
+    assert_order_positions(
+        order_positions(haystack, first, second),
+        first,
+        second,
+        context,
+    );
+}
+
+fn order_positions(haystack: &str, first: &str, second: &str) -> (Option<usize>, Option<usize>) {
+    (haystack.find(first), haystack.find(second))
+}
+
+fn assert_order_positions(
+    positions: (Option<usize>, Option<usize>),
+    first: &str,
+    second: &str,
+    context: &str,
+) {
+    let first_idx = positions
+        .0
         .unwrap_or_else(|| panic!("{context}: missing first marker `{first}`"));
-    let second_idx = haystack
-        .find(second)
+    let second_idx = positions
+        .1
         .unwrap_or_else(|| panic!("{context}: missing second marker `{second}`"));
     assert!(
         first_idx < second_idx,
@@ -172,9 +263,22 @@ fn diagnostics_slice() -> &'static str {
 
 fn entrypoint_slice() -> &'static str {
     let source = main_source();
-    let start_idx = source
-        .find("fn main() -> ExitCode")
-        .expect("missing main entrypoint");
+    source_from_index(source, entrypoint_start_index(source))
+}
+
+fn entrypoint_start_index(source: &str) -> usize {
+    expect_entrypoint_start_index(entrypoint_start_position(source))
+}
+
+fn entrypoint_start_position(source: &str) -> Option<usize> {
+    source.find("fn main() -> ExitCode")
+}
+
+fn expect_entrypoint_start_index(position: Option<usize>) -> usize {
+    position.expect("missing main entrypoint")
+}
+
+fn source_from_index(source: &str, start_idx: usize) -> &str {
     &source[start_idx..]
 }
 
@@ -475,18 +579,28 @@ fn age_39_returned_artifacts_are_persisted_before_lifecycle_finalization() {
         assert_contains(&body, "record_returned_artifacts(", name);
         assert_contains(&body, "invocation_lifecycle_service", name);
         assert_contains(&body, ".finalize_invocation(", name);
-
-        let artifacts = body
-            .find("record_returned_artifacts(")
-            .unwrap_or_else(|| panic!("{name}: missing returned-artifact persistence"));
-        let finalization = body
-            .rfind(".finalize_invocation(")
-            .unwrap_or_else(|| panic!("{name}: missing lifecycle finalization"));
-        assert!(
-            artifacts < finalization,
-            "{name}: returned artifacts must be persisted before normal finalization"
-        );
+        assert_artifacts_before_finalization(name, artifact_finalization_positions(&body));
     }
+}
+
+fn artifact_finalization_positions(body: &str) -> (Option<usize>, Option<usize>) {
+    (
+        body.find("record_returned_artifacts("),
+        body.rfind(".finalize_invocation("),
+    )
+}
+
+fn assert_artifacts_before_finalization(name: &str, positions: (Option<usize>, Option<usize>)) {
+    let artifacts = positions
+        .0
+        .unwrap_or_else(|| panic!("{name}: missing returned-artifact persistence"));
+    let finalization = positions
+        .1
+        .unwrap_or_else(|| panic!("{name}: missing lifecycle finalization"));
+    assert!(
+        artifacts < finalization,
+        "{name}: returned artifacts must be persisted before normal finalization"
+    );
 }
 
 #[test]

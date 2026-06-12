@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `parser`, `validator`, `formatter`, `orchestration`
+//! `accessor`, `parser`, `validator`, `formatter`, `mapper`, `orchestration`
 
 #[cfg(test)]
 mod tests {
@@ -8,9 +8,53 @@ mod tests {
         concat!(
             include_str!("disposition.rs"),
             "\n",
+            include_str!("disposition/control.rs"),
+            "\n",
+            include_str!("disposition/failure.rs"),
+            "\n",
+            include_str!("disposition/input.rs"),
+            "\n",
+            include_str!("disposition/maybe_quota.rs"),
+            "\n",
+            include_str!("disposition/quota.rs"),
+            "\n",
             include_str!("formatter.rs"),
             "\n",
             include_str!("mapper.rs"),
+            "\n",
+            include_str!("mapper/attempt.rs"),
+            "\n",
+            include_str!("mapper/attempt/completed.rs"),
+            "\n",
+            include_str!("mapper/attempt/disposition.rs"),
+            "\n",
+            include_str!("mapper/attempt/quota.rs"),
+            "\n",
+            include_str!("mapper/attempt/shared.rs"),
+            "\n",
+            include_str!("mapper/attempt/spawn.rs"),
+            "\n",
+            include_str!("mapper/context.rs"),
+            "\n",
+            include_str!("mapper/context/config.rs"),
+            "\n",
+            include_str!("mapper/context/invocation.rs"),
+            "\n",
+            include_str!("mapper/context/quota.rs"),
+            "\n",
+            include_str!("mapper/context/routing.rs"),
+            "\n",
+            include_str!("mapper/context/session.rs"),
+            "\n",
+            include_str!("mapper/executor_request.rs"),
+            "\n",
+            include_str!("mapper/failure.rs"),
+            "\n",
+            include_str!("mapper/finalizer_request.rs"),
+            "\n",
+            include_str!("mapper/session_ingest.rs"),
+            "\n",
+            include_str!("mapper/terminal.rs"),
             "\n",
             include_str!("predicate.rs"),
             "\n",
@@ -27,6 +71,40 @@ mod tests {
             include_str!("formatter.rs"),
             "\n",
             include_str!("mapper.rs"),
+            "\n",
+            include_str!("mapper/attempt.rs"),
+            "\n",
+            include_str!("mapper/attempt/completed.rs"),
+            "\n",
+            include_str!("mapper/attempt/disposition.rs"),
+            "\n",
+            include_str!("mapper/attempt/quota.rs"),
+            "\n",
+            include_str!("mapper/attempt/shared.rs"),
+            "\n",
+            include_str!("mapper/attempt/spawn.rs"),
+            "\n",
+            include_str!("mapper/context.rs"),
+            "\n",
+            include_str!("mapper/context/config.rs"),
+            "\n",
+            include_str!("mapper/context/invocation.rs"),
+            "\n",
+            include_str!("mapper/context/quota.rs"),
+            "\n",
+            include_str!("mapper/context/routing.rs"),
+            "\n",
+            include_str!("mapper/context/session.rs"),
+            "\n",
+            include_str!("mapper/executor_request.rs"),
+            "\n",
+            include_str!("mapper/failure.rs"),
+            "\n",
+            include_str!("mapper/finalizer_request.rs"),
+            "\n",
+            include_str!("mapper/session_ingest.rs"),
+            "\n",
+            include_str!("mapper/terminal.rs"),
             "\n",
             include_str!("predicate.rs"),
             "\n",
@@ -86,10 +164,18 @@ mod tests {
         start: &str,
         result: Result<(usize, usize), BlockError>,
     ) -> &'a str {
-        match result {
-            Ok((body_start, body_end)) => &source[body_start..body_end],
-            Err(error) => panic!("{}", block_error_message(error, start)),
-        }
+        production_block_slice(source, validated_block_bounds(start, result))
+    }
+
+    fn validated_block_bounds(
+        start: &str,
+        result: Result<(usize, usize), BlockError>,
+    ) -> (usize, usize) {
+        result.unwrap_or_else(|error| panic!("{}", block_error_message(error, start)))
+    }
+
+    fn production_block_slice(source: &str, bounds: (usize, usize)) -> &str {
+        &source[bounds.0..bounds.1]
     }
 
     enum BlockError {
@@ -143,14 +229,34 @@ mod tests {
     }
 
     fn disposition_guard_evidence(function_name: &str, disposition: &str) -> GuardEvidence {
+        guard_evidence(disposition_guard_facts(function_name, disposition))
+    }
+
+    fn disposition_guard_facts(function_name: &str, disposition: &str) -> GuardFacts {
         let body = production_block_after(disposition_source(), function_name);
         let disposition_token = disposition_token(disposition);
-        guard_evidence(
-            body.contains(&disposition_token),
-            body.find("finalize_invocation"),
-            body.find("guard.mark_finalized()"),
-            body.contains("finalize_invocation_from_guard"),
+        guard_facts(
+            has_disposition_token(body, &disposition_token),
+            finalize_position(body),
+            guard_mark_position(body),
+            has_guard_fallback(body),
         )
+    }
+
+    fn has_disposition_token(body: &str, disposition_token: &str) -> bool {
+        body.contains(disposition_token)
+    }
+
+    fn finalize_position(body: &str) -> Option<usize> {
+        body.find("finalize_invocation")
+    }
+
+    fn guard_mark_position(body: &str) -> Option<usize> {
+        body.find("guard.mark_finalized()")
+    }
+
+    fn has_guard_fallback(body: &str) -> bool {
+        body.contains("finalize_invocation_from_guard")
     }
 
     fn disposition_token(disposition: &str) -> String {
@@ -198,17 +304,33 @@ mod tests {
         has_guard_fallback: bool,
     }
 
-    fn guard_evidence(
+    struct GuardFacts {
         has_disposition: bool,
         finalize: Option<usize>,
         mark: Option<usize>,
         has_guard_fallback: bool,
-    ) -> GuardEvidence {
-        GuardEvidence {
+    }
+
+    fn guard_facts(
+        has_disposition: bool,
+        finalize: Option<usize>,
+        mark: Option<usize>,
+        has_guard_fallback: bool,
+    ) -> GuardFacts {
+        GuardFacts {
             has_disposition,
             finalize,
             mark,
             has_guard_fallback,
+        }
+    }
+
+    fn guard_evidence(facts: GuardFacts) -> GuardEvidence {
+        GuardEvidence {
+            has_disposition: facts.has_disposition,
+            finalize: facts.finalize,
+            mark: facts.mark,
+            has_guard_fallback: facts.has_guard_fallback,
         }
     }
 }
