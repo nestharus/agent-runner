@@ -3,7 +3,7 @@
 
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -541,18 +541,71 @@ pub fn assert_terminal_signal_shape(line: &str, expected_kind: &str, expect_sess
 
 fn terminal_signal_facts(line: &str) -> TerminalSignalFacts {
     let value = parse_terminal_signal_line(line);
-    let object = value
-        .as_object()
-        .expect("terminal signal marker body object");
-    let keys = object.keys().cloned().collect();
+    let object = expect_terminal_signal_object(terminal_signal_object(&value));
+    terminal_signal_facts_from_parts(
+        terminal_signal_evidence_is_object(&value),
+        terminal_signal_invocation_id_is_uuid(&value),
+        terminal_signal_keys(object),
+        terminal_signal_kind(&value),
+        terminal_signal_raw(&value),
+        terminal_signal_session_id_is_uuid(&value),
+        terminal_signal_session_is_null(&value),
+    )
+}
+
+fn terminal_signal_object(value: &Value) -> Option<&Map<String, Value>> {
+    value.as_object()
+}
+
+fn expect_terminal_signal_object(object: Option<&Map<String, Value>>) -> &Map<String, Value> {
+    object.expect("terminal signal marker body object")
+}
+
+fn terminal_signal_keys(object: &Map<String, Value>) -> BTreeSet<String> {
+    object.keys().cloned().collect()
+}
+
+fn terminal_signal_evidence_is_object(value: &Value) -> bool {
+    value["evidence"].is_object()
+}
+
+fn terminal_signal_invocation_id_is_uuid(value: &Value) -> bool {
+    uuid_value_is_valid(&value["invocation_id"])
+}
+
+fn terminal_signal_kind(value: &Value) -> Value {
+    value["kind"].clone()
+}
+
+fn terminal_signal_raw(value: &Value) -> Value {
+    value.clone()
+}
+
+fn terminal_signal_session_id_is_uuid(value: &Value) -> bool {
+    uuid_value_is_valid(&value["session_id"])
+}
+
+fn terminal_signal_session_is_null(value: &Value) -> bool {
+    value["session_id"].is_null()
+}
+
+fn terminal_signal_facts_from_parts(
+    evidence_is_object: bool,
+    invocation_id_is_uuid: bool,
+    keys: BTreeSet<String>,
+    kind: Value,
+    raw: Value,
+    session_id_is_uuid: bool,
+    session_is_null: bool,
+) -> TerminalSignalFacts {
     TerminalSignalFacts {
-        evidence_is_object: value["evidence"].is_object(),
-        invocation_id_is_uuid: uuid_value_is_valid(&value["invocation_id"]),
+        evidence_is_object,
+        invocation_id_is_uuid,
         keys,
-        kind: value["kind"].clone(),
-        raw: value.clone(),
-        session_id_is_uuid: uuid_value_is_valid(&value["session_id"]),
-        session_is_null: value["session_id"].is_null(),
+        kind,
+        raw,
+        session_id_is_uuid,
+        session_is_null,
     }
 }
 
