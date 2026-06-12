@@ -1,8 +1,9 @@
 //! ## Declared roles
 //!
 //! - validator
+//! - parser
 //!
-//! Role set: { validator }
+//! Role set: { validator, parser }
 
 use super::common::*;
 use super::*;

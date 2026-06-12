@@ -9,6 +9,19 @@
 //!
 //! Role set: { orchestration, accessor, validator, predicate, mapper, formatter }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_session_binding.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-session-binding-persistence
+//!     Owns:
+//!       - StateDb provider-session binding upsert/lookup persistence
+//!       - sqlite (rusqlite re-export) and RusqliteOptionalExtension optional-row access
+//!       - DbError construction for binding persistence failures
+//! ```
+//!
 //! Provider-session binding persistence and chain minting coordination.
 
 use super::{DbError, RusqliteOptionalExtension, StateDb, sqlite};

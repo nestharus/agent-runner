@@ -8,6 +8,19 @@
 //!
 //! Role set: { accessor, orchestration, mapper, predicate, formatter }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/session_capture.rs
+//!     role: intrinsic-surface
+//!     Domain: session-capture-persistence
+//!     Owns:
+//!       - StateDb session-capture write/read methods over the invocations table
+//!       - sqlite (rusqlite re-export) and RusqliteOptionalExtension row access used by session capture
+//!       - LifecycleInvocationRow projection and lc_log_adapter lifecycle emission for capture events
+//! ```
+//!
 //! Invocation session-capture projection, persistence, and lifecycle reporting.
 
 use super::{LifecycleInvocationRow, RusqliteOptionalExtension, StateDb, lc_log_adapter, sqlite};

@@ -3,6 +3,17 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/migration_failure_tests.rs
+//!     role: intrinsic-surface
+//!     Domain: migration-failure-test-surface
+//!     Owns:
+//!       - crate::migrations Migration and MigrationError contract exercised by failure-path assertions
+//! ```
 
 use super::common::*;
 use super::*;

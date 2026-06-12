@@ -3,6 +3,18 @@
 //! - validator
 //!
 //! Role set: { validator }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/age160_read_only_tests.rs
+//!     role: intrinsic-surface
+//!     Domain: read-only-open-adapter-test-surface
+//!     Owns:
+//!       - crate::db::sqlite_adapter read-only open surface (Connection, OpenFlags, Statement, Transaction, Row, params, OptionalExtension)
+//!       - ReadOnlyOpenFailure, SqliteFailureProjection, and SidecarProbe outcomes asserted by read-only open tests
+//! ```
 
 use super::common::*;
 use super::*;

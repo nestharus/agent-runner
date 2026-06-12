@@ -4,8 +4,9 @@
 //! - formatter
 //! - mapper
 //! - parser
+//! - orchestration
 //!
-//! Role set: { accessor, formatter, mapper, parser }
+//! Role set: { accessor, formatter, mapper, parser, orchestration }
 
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};

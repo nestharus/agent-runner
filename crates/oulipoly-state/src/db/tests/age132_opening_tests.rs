@@ -3,8 +3,10 @@
 //! - accessor
 //! - filter
 //! - validator
+//! - mapper
+//! - predicate
 //!
-//! Role set: { accessor, filter, validator }
+//! Role set: { accessor, filter, validator, mapper, predicate }
 
 use super::*;
 #[test]

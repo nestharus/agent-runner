@@ -7,6 +7,18 @@
 //!
 //! Role set: { formatter, validator, orchestration, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/opening_migrations.rs
+//!     role: intrinsic-surface
+//!     Domain: schema-version-gated-open-migration
+//!     Owns:
+//!       - CURRENT_SCHEMA_VERSION and MINIMUM_SUPPORTED_SCHEMA_VERSION schema-version bounds
+//!       - SchemaCompatibility decision consumed to gate open-time migration
+//! ```
+//!
 //! State database open-time migration dispatch and returned-artifact validator repair.
 
 use super::*;

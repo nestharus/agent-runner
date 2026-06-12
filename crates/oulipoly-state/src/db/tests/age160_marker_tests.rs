@@ -1,8 +1,11 @@
 //! ## Declared roles
 //!
 //! - validator
+//! - parser
+//! - formatter
+//! - mapper
 //!
-//! Role set: { validator }
+//! Role set: { validator, parser, formatter, mapper }
 
 use super::*;
 #[test]

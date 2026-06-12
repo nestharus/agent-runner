@@ -8,6 +8,18 @@
 //!
 //! Role set: { accessor, formatter, mapper, parser, validator }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quota_reads.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-quota-read-mapping
+//!     Owns:
+//!       - QuotaRecord and QuotaWindow public DTOs returned by quota reads
+//!       - RawQuotaRecordRow and RawQuotaWindowRow row projections mapped into the public quota DTOs
+//! ```
+//!
 //! Provider quota read APIs and row-to-DTO mapping helpers.
 
 use super::provider_quotas::{QuotaRecord, QuotaWindow, RawQuotaRecordRow, RawQuotaWindowRow};

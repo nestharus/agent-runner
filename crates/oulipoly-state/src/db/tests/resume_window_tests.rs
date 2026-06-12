@@ -2,8 +2,9 @@
 //!
 //! - mapper
 //! - validator
+//! - orchestration
 //!
-//! Role set: { mapper, validator }
+//! Role set: { mapper, validator, orchestration }
 
 use super::common::*;
 use super::*;

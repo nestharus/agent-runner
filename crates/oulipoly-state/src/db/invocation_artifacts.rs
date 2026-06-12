@@ -8,6 +8,19 @@
 //!
 //! Role set: { accessor, predicate, orchestration, mapper, formatter }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_artifacts.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-artifact-persistence
+//!     Owns:
+//!       - StateDb invocation-artifact path construction and JSON payload read/write
+//!       - InvocationStart inputs consumed when persisting artifacts
+//!       - lc_log_adapter lifecycle emission for artifact operations
+//! ```
+//!
 //! Invocation sidecar artifact pathing, payload mapping, and atomic file writes.
 
 use super::{InvocationStart, StateDb, lc_log_adapter};
