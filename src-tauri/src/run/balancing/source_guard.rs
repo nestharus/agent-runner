@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `parser`, `validator`, `formatter`, `orchestration`
+//! `accessor`, `parser`, `validator`, `formatter`, `mapper`, `orchestration`
 
 #[cfg(test)]
 mod tests {
