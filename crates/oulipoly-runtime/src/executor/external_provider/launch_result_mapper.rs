@@ -1,17 +1,19 @@
 //! ## Declared roles
 //!
-//! Roles: mapper, accessor, predicate.
+//! Roles: mapper, accessor, predicate, filter, validator.
 //!
 //! - mapper: `map_launch_result_with_terminal_classification`,
-//!   `launch_session_capture`, `launch_provider_session_id`, and
-//!   `submitted_user_turn_from_marker_value` translate provider launch results
-//!   into runtime execution, terminal, session-capture, and submitted-turn
-//!   surfaces.
-//! - accessor: `marker_string`, `nonempty_marker_string`, and
-//!   `raw_provider_session_id` read optional marker/session fields from launch
-//!   JSON values.
-//! - predicate: `provider_session_id_is_present` and `nonempty_marker_string`
-//!   reject empty marker/session identifiers before runtime capture.
+//!   `launch_session_capture`, and `launch_provider_session_id` translate
+//!   provider launch results into runtime execution, terminal, session-capture,
+//!   submitted-turn, and assistant-productivity surfaces.
+//! - accessor: `marker_string` and `raw_provider_session_id` read optional
+//!   marker/session fields from launch JSON values.
+//! - predicate: `provider_session_id_is_present` reports whether a session
+//!   identifier is present before runtime capture.
+//! - filter: `nonempty_marker_string` and `accepted_provider_session_id` select
+//!   non-empty/accepted marker and session values, dropping empties.
+//! - validator: `submitted_user_turn_from_marker_value` validates the
+//!   submitted-user-turn marker payload before constructing the runtime DTO.
 //!
 //! ## Adapter declarations
 //!
@@ -34,10 +36,12 @@
 //!       - terminal classification override and fallback mapping
 //!       - launch session object to runtime session-capture mapping
 //!       - submitted-user-turn marker extraction semantics
+//!       - assistant-response productivity evidence projection
 //!       - returned-artifact and child-invocation empty defaults for launch results
 //! ```
 
 use super::terminal_cancel_mapper::map_terminal_cancel_outcome;
+use crate::executor::assistant_response::launch_result_produced_assistant_response;
 use crate::executor::{
     ExecutionResult, SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn,
 };
@@ -65,6 +69,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         terminal_reason: terminal.terminal_reason,
         terminal_signal: terminal.terminal_signal,
     });
+    let produced_assistant_response = launch_result_produced_assistant_response(&result);
     ExecutionResult {
         stdout,
         stderr,
@@ -74,6 +79,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         resume_acceptance: None,
         terminal_reason: terminal.terminal_reason,
         terminal_signal: Some(terminal.terminal_signal),
+        produced_assistant_response,
         submitted_user_turn: submitted_user_turn(&result),
         captured_child_invocations: Vec::new(),
         returned_artifacts: Vec::new(),

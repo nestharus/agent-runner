@@ -31,8 +31,9 @@ use crate::captured_child::emit_captured_child_marker_lines;
 use crate::error_emit::effective_model_for_execution;
 use crate::invocation::finalize::FinalizerGuard;
 use crate::quota_zero_turn::{
-    apply_zero_turn_classification_to_result, zero_turn_classification_for_action,
-    zero_turn_classify_after_completion, zero_turn_late_bind_baseline, zero_turn_record_baseline,
+    apply_zero_turn_classification_to_result, host_observed_completion_from_result,
+    zero_turn_classification_for_action, zero_turn_classify_after_completion,
+    zero_turn_late_bind_baseline, zero_turn_record_baseline,
 };
 use crate::terminal_outcome_adapter::{
     TerminalSignalContext, apply_age153_terminal_signal_fixture_override,
@@ -437,6 +438,7 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
         &input.env.state,
         &input.env.sessions_cfg,
         input.zero_turn_baseline,
+        host_observed_completion_from_result(input.result),
     );
     apply_zero_turn_classification_to_result(
         input.result,

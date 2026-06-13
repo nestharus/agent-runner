@@ -379,6 +379,37 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
 }
 
 #[test]
+fn external_provider_wake_confirms_delivery_from_host_observed_assistant_response() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake confirmed by assistant response",
+        &[
+            ("S11_EMIT_ASSISTANT_RESPONSE_MARKER", "1"),
+            ("S11_SKIP_SCAN_WAKE_TURN", "1"),
+        ],
+    );
+    assert_success(&output);
+
+    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+    wait_until(
+        "assistant-response evidence delivered pending mailbox",
+        || {
+            let db = fixture.mailbox();
+            let rows = db.list_mailbox(SESSION, true).unwrap();
+            rows.len() == 1
+                && rows[0].delivered_at.is_some()
+                && rows[0].delivery_attempts == 1
+                && rows[0].delivery_error.is_none()
+                && db.wake_claim(SESSION).unwrap().is_none()
+        },
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn external_provider_wake_confirms_delivery_from_submitted_turn_marker() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -687,6 +718,17 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
         "value": value,
     }
 
+def produced_assistant_response_marker_event(request, seq):
+    return {
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.produced_assistant_response",
+        "value": True,
+    }
+
 def exit_event(request, seq, session_id):
     event = {
         "contract": CONTRACT,
@@ -761,13 +803,16 @@ def launch(request):
         target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-resumed.txt"
         target.write_text(prompt, encoding="utf-8")
         emit(stdout_event(request, 1, "resumed\n"))
+        seq = 2
+        if os.environ.get("S11_EMIT_ASSISTANT_RESPONSE_MARKER") == "1":
+            emit(produced_assistant_response_marker_event(request, seq))
+            seq += 1
         if os.environ.get("S11_SKIP_SCAN_WAKE_TURN") == "1":
             (pathlib.Path(os.environ["S11_WORK_DIR"]) / "skip-scan-wake-turn.txt").write_text("skip\n", encoding="utf-8")
         if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
-            emit(submitted_turn_marker_event(request, 2, known, prompt))
-            emit(exit_event(request, 3, known))
-        else:
-            emit(exit_event(request, 2, known))
+            emit(submitted_turn_marker_event(request, seq, known, prompt))
+            seq += 1
+        emit(exit_event(request, seq, known))
         return
     if os.environ.get("S11_NO_NOTIFY") != "1":
         spawn_notify_workload()

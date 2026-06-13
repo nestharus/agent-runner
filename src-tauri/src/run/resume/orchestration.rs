@@ -29,8 +29,8 @@ use crate::invocation::finalize::FinalizerGuard;
 use crate::migration_providers::load_resume_execution_environment;
 use crate::quota_zero_turn::{
     apply_zero_turn_classification_to_result, filter_quota_exhausted_migration_candidates,
-    zero_turn_classification_for_action, zero_turn_classify_after_completion,
-    zero_turn_record_baseline,
+    host_observed_completion_from_result, zero_turn_classification_for_action,
+    zero_turn_classify_after_completion, zero_turn_record_baseline,
 };
 use crate::resume_cli::{
     format_resume_error, render_resume_model_pool_mismatch, renderable_resume_execution_target,
@@ -632,8 +632,12 @@ fn apply_resume_attempt_classification(
     result: &mut executor::ExecutionResult,
 ) -> Result<crate::zero_turn_orchestration::ZeroTurnAction, String> {
     apply_age153_terminal_signal_fixture_override(result);
-    let zero_turn_classification =
-        zero_turn_classify_after_completion(&env.state, &env.sessions_cfg, zero_turn_baseline);
+    let zero_turn_classification = zero_turn_classify_after_completion(
+        &env.state,
+        &env.sessions_cfg,
+        zero_turn_baseline,
+        host_observed_completion_from_result(result),
+    );
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
     Ok(next_action(
         zero_turn_confirmation,

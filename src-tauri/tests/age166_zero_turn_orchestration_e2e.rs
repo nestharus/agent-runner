@@ -195,6 +195,7 @@ fn execution_result_with_signal(
             evidence: "typed evidence".to_string(),
             observed_at: SystemTime::UNIX_EPOCH,
         }),
+        produced_assistant_response: false,
         submitted_user_turn: None,
         captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
         returned_artifacts: Vec::new(),

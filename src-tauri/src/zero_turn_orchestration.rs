@@ -2,7 +2,7 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `accessor`, `formatter`, `mapper`, `predicate`
+//! `orchestration`, `accessor`, `formatter`, `mapper`, `predicate`, `validator`
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -15,6 +15,7 @@
 //!       - ZeroTurnConfirmationState
 //!       - provider_session confirmation key
 //!       - completion scan baseline bookkeeping
+//!       - host-observed completion evidence
 //!       - baseline/delta classification
 //!       - same-provider verification planning
 //!       - confirmed quota decision
@@ -67,6 +68,25 @@ pub struct ZeroTurnEvidence {
     pub current_assistant_turns: u64,
     pub new_assistant_turns: u64,
     pub evidence: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostObservedCompletion {
+    pub clean_terminal_signal: bool,
+    pub produced_assistant_response: bool,
+}
+
+impl HostObservedCompletion {
+    pub fn new(clean_terminal_signal: bool, produced_assistant_response: bool) -> Self {
+        Self {
+            clean_terminal_signal,
+            produced_assistant_response,
+        }
+    }
+
+    fn confirms_productive_turn(self) -> bool {
+        self.clean_terminal_signal && self.produced_assistant_response
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,38 +153,86 @@ fn build_maybe_quota_exhausted_evidence(
     }
 }
 
+struct ValidatedTurnDelta<'a> {
+    provider_session_id: &'a str,
+    baseline_assistant_turns: u64,
+    current_assistant_turns: u64,
+    new_assistant_turns: u64,
+}
+
+/// Resolve the turn-count preconditions (session id, baseline, non-regressing
+/// delta) for a scanned completion, or report the `Unclassified*` outcome that
+/// the precondition failure implies.
+fn validate_turn_delta(
+    baseline: &ZeroTurnBaseline,
+    end_count: SessionTurnCounts,
+) -> Result<ValidatedTurnDelta<'_>, ZeroTurnClassification> {
+    let Some(provider_session_id) = baseline.provider_session_id.as_deref() else {
+        return Err(ZeroTurnClassification::UnclassifiedNoSessionId);
+    };
+    if baseline.scan_failed {
+        return Err(ZeroTurnClassification::UnclassifiedScanFailed);
+    }
+    let Some(baseline_assistant_turns) = baseline.baseline_assistant_turns else {
+        return Err(ZeroTurnClassification::UnclassifiedScanFailed);
+    };
+    let current_assistant_turns = end_count.assistant;
+    let Some(new_assistant_turns) = current_assistant_turns.checked_sub(baseline_assistant_turns)
+    else {
+        return Err(ZeroTurnClassification::UnclassifiedScanFailed);
+    };
+    Ok(ValidatedTurnDelta {
+        provider_session_id,
+        baseline_assistant_turns,
+        current_assistant_turns,
+        new_assistant_turns,
+    })
+}
+
+/// Map a validated turn-count delta onto its domain classification: no new
+/// assistant turns is the speculative `MaybeQuotaExhausted`, otherwise `Productive`.
+fn classify_validated_turn_delta(
+    baseline: &ZeroTurnBaseline,
+    delta: ValidatedTurnDelta<'_>,
+) -> ZeroTurnClassification {
+    if no_new_turns_produced(delta.new_assistant_turns) {
+        return ZeroTurnClassification::MaybeQuotaExhausted {
+            evidence: build_maybe_quota_exhausted_evidence(
+                baseline,
+                delta.provider_session_id,
+                delta.baseline_assistant_turns,
+                delta.current_assistant_turns,
+                delta.new_assistant_turns,
+            ),
+        };
+    }
+    ZeroTurnClassification::Productive
+}
+
 pub fn classify_completion_delta(
     baseline: &ZeroTurnBaseline,
     end_count: SessionTurnCounts,
 ) -> ZeroTurnClassification {
-    let Some(provider_session_id) = baseline.provider_session_id.as_ref() else {
-        return ZeroTurnClassification::UnclassifiedNoSessionId;
-    };
-    if baseline.scan_failed {
-        return ZeroTurnClassification::UnclassifiedScanFailed;
+    match validate_turn_delta(baseline, end_count) {
+        Ok(delta) => classify_validated_turn_delta(baseline, delta),
+        Err(classification) => classification,
     }
-    let Some(baseline_assistant_turns) = baseline.baseline_assistant_turns else {
-        return ZeroTurnClassification::UnclassifiedScanFailed;
-    };
+}
 
-    let current_assistant_turns = end_count.assistant;
-    let Some(new_assistant_turns) = current_assistant_turns.checked_sub(baseline_assistant_turns)
-    else {
-        return ZeroTurnClassification::UnclassifiedScanFailed;
-    };
-    if no_new_turns_produced(new_assistant_turns) {
-        return ZeroTurnClassification::MaybeQuotaExhausted {
-            evidence: build_maybe_quota_exhausted_evidence(
-                baseline,
-                provider_session_id,
-                baseline_assistant_turns,
-                current_assistant_turns,
-                new_assistant_turns,
-            ),
-        };
+/// Classify completion productivity, treating clean host-observed assistant
+/// output as authoritative `Productive` and otherwise deferring to the
+/// session-store delta. The delta path is ground truth — a real assistant-turn
+/// delta overrides a speculative non-clean signal (e.g. `MaybeQuotaExhausted`),
+/// so it is never narrowed here.
+pub fn classify_completion(
+    baseline: &ZeroTurnBaseline,
+    end_count: SessionTurnCounts,
+    host_observed: HostObservedCompletion,
+) -> ZeroTurnClassification {
+    if host_observed.confirms_productive_turn() {
+        return ZeroTurnClassification::Productive;
     }
-
-    ZeroTurnClassification::Productive
+    classify_completion_delta(baseline, end_count)
 }
 
 fn confirmation_key_from_evidence(evidence: ZeroTurnEvidence) -> ZeroTurnConfirmationKey {
@@ -191,13 +259,7 @@ pub fn next_action(
             ZeroTurnAction::Continue
         }
         ZeroTurnClassification::MaybeQuotaExhausted { evidence } => {
-            let key = confirmation_key_from_evidence(evidence);
-            if is_same_provider_confirmed(state, &key) {
-                ZeroTurnAction::ConfirmedExhaustion
-            } else {
-                state.record_maybe(key);
-                ZeroTurnAction::VerifySameProvider
-            }
+            next_action_for_maybe_quota(state, evidence)
         }
         ZeroTurnClassification::UnclassifiedNoSessionId
         | ZeroTurnClassification::UnclassifiedScanFailed => {
@@ -207,12 +269,24 @@ pub fn next_action(
     }
 }
 
+fn next_action_for_maybe_quota(
+    state: &mut ZeroTurnConfirmationState,
+    evidence: ZeroTurnEvidence,
+) -> ZeroTurnAction {
+    let key = confirmation_key_from_evidence(evidence);
+    if is_same_provider_confirmed(state, &key) {
+        return ZeroTurnAction::ConfirmedExhaustion;
+    }
+    state.record_maybe(key);
+    ZeroTurnAction::VerifySameProvider
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification, ZeroTurnConfirmationKey,
-        ZeroTurnConfirmationState, ZeroTurnEvidence, classify_completion_delta, next_action,
-        record_baseline,
+        HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
+        ZeroTurnConfirmationKey, ZeroTurnConfirmationState, ZeroTurnEvidence, classify_completion,
+        classify_completion_delta, next_action, record_baseline,
     };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_state::SessionTurnCounts;
@@ -284,6 +358,69 @@ mod tests {
     fn classify_completion_delta_one_or_more_new_is_productive() {
         let classification =
             classify_completion_delta(&baseline(Some("session-1"), Some(3)), counts(4));
+
+        assert_eq!(classification, ZeroTurnClassification::Productive);
+    }
+
+    #[test]
+    fn classify_completion_host_productive_overrides_zero_delta() {
+        let classification = classify_completion(
+            &baseline(Some("session-1"), Some(3)),
+            counts(3),
+            HostObservedCompletion::new(true, true),
+        );
+
+        assert_eq!(classification, ZeroTurnClassification::Productive);
+    }
+
+    #[test]
+    fn classify_completion_host_productive_overrides_scan_failure() {
+        let baseline = record_baseline("claude-a", Some("session-1"), Some(counts(3)), true);
+        let classification = classify_completion(
+            &baseline,
+            counts(0),
+            HostObservedCompletion::new(true, true),
+        );
+
+        assert_eq!(classification, ZeroTurnClassification::Productive);
+    }
+
+    #[test]
+    fn classify_completion_not_productive_zero_delta_stays_maybe_quota() {
+        let classification = classify_completion(
+            &baseline(Some("session-1"), Some(3)),
+            counts(3),
+            HostObservedCompletion::new(true, false),
+        );
+
+        assert!(matches!(
+            classification,
+            ZeroTurnClassification::MaybeQuotaExhausted { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_completion_non_clean_signal_is_not_productive() {
+        let classification = classify_completion(
+            &baseline(Some("session-1"), Some(3)),
+            counts(3),
+            HostObservedCompletion::new(false, true),
+        );
+
+        assert_ne!(classification, ZeroTurnClassification::Productive);
+    }
+
+    #[test]
+    fn classify_completion_scan_delta_overrides_speculative_non_clean_signal() {
+        // A real assistant-turn delta (+1) is ground truth that the turn
+        // produced output, so it stays Productive even when the host-observed
+        // signal was non-clean (e.g. a speculative MaybeQuotaExhausted). The
+        // delta path must not be narrowed by host-observed evidence.
+        let classification = classify_completion(
+            &baseline(Some("session-1"), Some(3)),
+            counts(4),
+            HostObservedCompletion::new(false, false),
+        );
 
         assert_eq!(classification, ZeroTurnClassification::Productive);
     }

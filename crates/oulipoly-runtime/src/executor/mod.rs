@@ -13,6 +13,7 @@
 //!       - executor-facade-wrapper-contract
 //! ```
 
+mod assistant_response;
 pub mod cli;
 mod external_provider;
 mod provider_specific;
@@ -64,6 +65,10 @@ pub struct ExecutionResult {
     pub resume_acceptance: Option<ResumeAcceptanceResult>,
     pub terminal_reason: Option<String>,
     pub terminal_signal: Option<TerminalSignal>,
+    /// Host-observed evidence that this execution emitted a real assistant
+    /// response. Terminal cleanliness is checked by callers before treating it
+    /// as productive completion.
+    pub produced_assistant_response: bool,
     pub submitted_user_turn: Option<SubmittedUserTurn>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,

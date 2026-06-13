@@ -7,7 +7,7 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `predicate`, `accessor`
+//! `orchestration`, `mapper`, `predicate`, `accessor`, `formatter`
 //!
 //! - `orchestration`: `zero_turn_record_baseline` / `zero_turn_classify_after_completion`
 //!   sequence the session scan + turn-count read + core classification.
@@ -17,14 +17,35 @@
 //!   `zero_turn_classification_is_non_productive`, `is_confirmed_zero_turn_exhaustion`.
 //! - `accessor`: `provider_has_no_session_source` / `has_session_source` /
 //!   `baseline_turn_count_from_scan` read session-source + turn-count state.
+//! - `formatter`: `maybe_quota_exhausted_reason` builds the terminal-reason string.
+//!
+//! ## Adapter declarations
+//!
+//! This component is a coupling adapter: it bridges the pure zero-turn
+//! classification core to the main-side execution context (session scan,
+//! turn-count state, execution-result/terminal-signal mutation). Every external
+//! reference is subordinate to one of the declared `Translates:` contracts. The
+//! authoritative carrier is the Step 6a contract; this block mirrors it.
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/quota_zero_turn/completion_classification.rs
+//!     role: adapter
+//!     Translates:
+//!       - zero-turn-classification-core-contract
+//!       - executor-result-productivity-contract
+//!       - state-db-session-turn-count-contract
+//!       - sessions-config-contract
+//!       - provider-session-scan-contract
+//! ```
 
 use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_state::StateDb;
 
 use crate::zero_turn_orchestration::{
-    ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification, ZeroTurnEvidence,
-    classify_completion_delta, record_baseline,
+    HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
+    ZeroTurnEvidence, classify_completion, classify_completion_delta, record_baseline,
 };
 
 fn zero_turn_zero_counts() -> oulipoly_state::SessionTurnCounts {
@@ -74,8 +95,13 @@ fn baseline_turn_count_from_scan(
 fn classify_from_turn_count_result<E>(
     baseline: &ZeroTurnBaseline,
     count_result: Result<oulipoly_state::SessionTurnCounts, E>,
+    host_observed: HostObservedCompletion,
 ) -> ZeroTurnClassification {
-    classify_turn_counts_or_scan_failed(baseline, turn_counts_or_scan_failed(count_result))
+    classify_turn_counts_or_scan_failed(
+        baseline,
+        turn_counts_or_scan_failed(count_result),
+        host_observed,
+    )
 }
 
 fn turn_counts_or_scan_failed<E>(
@@ -87,10 +113,12 @@ fn turn_counts_or_scan_failed<E>(
 fn classify_turn_counts_or_scan_failed(
     baseline: &ZeroTurnBaseline,
     counts: Option<oulipoly_state::SessionTurnCounts>,
+    host_observed: HostObservedCompletion,
 ) -> ZeroTurnClassification {
-    counts.map_or(ZeroTurnClassification::UnclassifiedScanFailed, |counts| {
-        classify_completion_delta(baseline, counts)
-    })
+    counts.map_or_else(
+        || classify_completion(baseline, zero_turn_zero_counts(), host_observed),
+        |counts| classify_completion(baseline, counts, host_observed),
+    )
 }
 
 pub(crate) fn zero_turn_record_baseline(
@@ -116,12 +144,13 @@ pub(crate) fn zero_turn_classify_after_completion(
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
     baseline: &ZeroTurnBaseline,
+    host_observed: HostObservedCompletion,
 ) -> ZeroTurnClassification {
     let Some(session_id) = baseline.provider_session_id.as_deref() else {
-        return classify_completion_delta(baseline, zero_turn_zero_counts());
+        return classify_completion(baseline, zero_turn_zero_counts(), host_observed);
     };
     if baseline.scan_failed {
-        return classify_completion_delta(baseline, zero_turn_zero_counts());
+        return classify_completion(baseline, zero_turn_zero_counts(), host_observed);
     }
     let report =
         oulipoly_runtime::sessions::scan_provider(&baseline.provider_name, sessions_cfg, state);
@@ -131,7 +160,36 @@ pub(crate) fn zero_turn_classify_after_completion(
     classify_from_turn_count_result(
         baseline,
         state.count_session_turns(&baseline.provider_name, session_id),
+        host_observed,
     )
+}
+
+pub(crate) fn host_observed_completion_from_result(
+    result: &executor::ExecutionResult,
+) -> HostObservedCompletion {
+    HostObservedCompletion::new(
+        terminal_signal_is_clean_exit(result.exit_code, &result.terminal_signal),
+        result.produced_assistant_response,
+    )
+}
+
+pub(crate) fn host_observed_completion_from_interactive_result(
+    result: &executor::cli::InteractiveExecutionResult,
+) -> HostObservedCompletion {
+    HostObservedCompletion::new(
+        terminal_signal_is_clean_exit(result.exit_code, &result.terminal_signal),
+        false,
+    )
+}
+
+fn terminal_signal_is_clean_exit(
+    exit_code: i32,
+    signal: &Option<executor::TerminalSignal>,
+) -> bool {
+    exit_code == 0
+        && signal
+            .as_ref()
+            .is_some_and(|signal| signal.kind == TerminalSignalKind::CleanExit)
 }
 
 fn zero_turn_classification_is_non_productive(c: &ZeroTurnClassification) -> bool {
