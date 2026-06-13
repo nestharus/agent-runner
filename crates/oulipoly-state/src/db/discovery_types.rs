@@ -7,6 +7,20 @@
 //!
 //! Role set: { accessor, formatter, mapper, parser }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/discovery_types.rs
+//!     role: intrinsic-surface
+//!     Domain: discovery-types-persistence
+//!     Owns:
+//!       - the StateDb discovery-types surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! Provider/account discovery DTOs stored and loaded through `StateDb`.
 
 use serde::{Deserialize, Serialize};

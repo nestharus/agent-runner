@@ -5,6 +5,20 @@
 //!
 //! Role set: { parser, formatter }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/timestamps.rs
+//!     role: intrinsic-surface
+//!     Domain: timestamps-persistence
+//!     Owns:
+//!       - the StateDb timestamps surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! RFC3339 timestamp parsing and formatting helpers for persisted rows.
 
 use super::{StateDb, sqlite};

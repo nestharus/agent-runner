@@ -3,6 +3,20 @@
 //! - formatter
 //!
 //! Role set: { formatter }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/session_markers.rs
+//!     role: intrinsic-surface
+//!     Domain: session-markers-persistence
+//!     Owns:
+//!       - the StateDb session-markers surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
 
 #[derive(Debug, Clone)]
 pub struct SessionMarkerPayload {

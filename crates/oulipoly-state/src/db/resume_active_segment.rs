@@ -6,6 +6,20 @@
 //!
 //! Role set: { accessor, formatter, mapper }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/resume_active_segment.rs
+//!     role: intrinsic-surface
+//!     Domain: resume-active-segment-persistence
+//!     Owns:
+//!       - the StateDb resume-active-segment surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! Active segment and chain model lookup helpers.
 
 use super::*;

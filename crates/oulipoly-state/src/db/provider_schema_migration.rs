@@ -7,6 +7,20 @@
 //!
 //! Role set: { formatter, mapper, validator, orchestration }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_schema_migration.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-schema-migration-persistence
+//!     Owns:
+//!       - the StateDb provider-schema-migration surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! Provider aggregate validator creation and legacy migration.
 
 use super::*;

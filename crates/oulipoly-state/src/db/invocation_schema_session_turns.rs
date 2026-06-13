@@ -8,6 +8,20 @@
 //!
 //! Role set: { accessor, formatter, validator, orchestration, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_schema_session_turns.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-schema-session-turns-persistence
+//!     Owns:
+//!       - the StateDb invocation-schema-session-turns surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! Session-turn validator repair helpers.
 
 use super::*;

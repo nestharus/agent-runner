@@ -8,6 +8,20 @@
 //!
 //! Role set: { formatter, mapper, validator, accessor, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_schema_table.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-schema-table-persistence
+//!     Owns:
+//!       - the StateDb invocation-schema-table surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! Invocation table DDL and table-column inspection helpers.
 
 use super::*;

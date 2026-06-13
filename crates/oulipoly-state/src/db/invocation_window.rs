@@ -10,6 +10,20 @@
 //!
 //! Role set: { accessor, filter, formatter, orchestration, parser, predicate, mapper }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_window.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-window-persistence
+//!     Owns:
+//!       - the StateDb invocation-window surface this concern owns, split from the StateDb
+//!         facade by the WU #65 decomposition with the public API preserved
+//!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
+//!         via `use super::*`, subordinate to this domain
+//! ```
+//!
 //! Invocation-window session lookup, timestamp parsing, filtering, and ranking.
 
 use super::{StateDb, sqlite};
