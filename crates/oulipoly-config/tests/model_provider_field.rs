@@ -1,6 +1,6 @@
 use oulipoly_config::{
-    ModelConfig, ProviderImplementationFlavor, ProviderImplementationRef, ProvidersConfig,
-    render_validated_model_toml,
+    render_validated_model_toml, ModelConfig, ProviderImplementationFlavor,
+    ProviderImplementationRef, ProvidersConfig,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -133,16 +133,6 @@ fn allowed_baseline_count(path_hash: u64, term_index: usize) -> usize {
             max_count: 2,
         },
         BaselineCount {
-            path_hash: 0xc2f6e4e3b2f099a0,
-            term_index: 0,
-            max_count: 64,
-        },
-        BaselineCount {
-            path_hash: 0xc2f6e4e3b2f099a0,
-            term_index: 1,
-            max_count: 80,
-        },
-        BaselineCount {
             path_hash: 0xb8683260b149ac25,
             term_index: 0,
             max_count: 145,
@@ -186,6 +176,51 @@ fn allowed_baseline_count(path_hash: u64, term_index: usize) -> usize {
             path_hash: 0x4a64b316570053af,
             term_index: 1,
             max_count: 20,
+        },
+        BaselineCount {
+            path_hash: 0x29291bc4fb74f7cc,
+            term_index: 0,
+            max_count: 3,
+        },
+        BaselineCount {
+            path_hash: 0x29291bc4fb74f7cc,
+            term_index: 1,
+            max_count: 8,
+        },
+        BaselineCount {
+            path_hash: 0xe21cc33bc8f073ce,
+            term_index: 0,
+            max_count: 57,
+        },
+        BaselineCount {
+            path_hash: 0xe21cc33bc8f073ce,
+            term_index: 1,
+            max_count: 61,
+        },
+        BaselineCount {
+            path_hash: 0x81530b7a8a2e5a51,
+            term_index: 0,
+            max_count: 5,
+        },
+        BaselineCount {
+            path_hash: 0x81530b7a8a2e5a51,
+            term_index: 1,
+            max_count: 5,
+        },
+        BaselineCount {
+            path_hash: 0x46ed8f70af670333,
+            term_index: 0,
+            max_count: 2,
+        },
+        BaselineCount {
+            path_hash: 0x46ed8f70af670333,
+            term_index: 1,
+            max_count: 9,
+        },
+        BaselineCount {
+            path_hash: 0xc18bd0239070104,
+            term_index: 1,
+            max_count: 12,
         },
     ];
 
