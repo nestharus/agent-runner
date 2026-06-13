@@ -1,0 +1,218 @@
+//! ## Declared roles
+//!
+//! - accessor
+//! - predicate
+//! - orchestration
+//! - mapper
+//! - formatter
+//!
+//! Role set: { accessor, predicate, orchestration, mapper, formatter }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_artifacts.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-artifact-persistence
+//!     Owns:
+//!       - StateDb invocation-artifact path construction and JSON payload read/write
+//!       - InvocationStart inputs consumed when persisting artifacts
+//!       - lc_log_adapter lifecycle emission for artifact operations
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: InvocationStart, Path, PathBuf, ResultEnvelopeInput, StateDb, lc_log_adapter, result_envelope_payload
+//! ```
+//!
+//! Invocation sidecar artifact pathing, payload mapping, and atomic file writes.
+
+use super::{InvocationStart, StateDb, lc_log_adapter};
+use crate::result_envelope::{ResultEnvelopeInput, result_envelope_payload};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy)]
+enum RawArtifactKind {
+    Stdout,
+    Stderr,
+    Result,
+    EventsJsonl,
+}
+
+impl StateDb {
+    pub(super) fn invocations_dir(&self) -> Option<PathBuf> {
+        if self.is_memory_db() {
+            return None;
+        }
+        Some(self.invocations_dir_path())
+    }
+
+    fn is_memory_db(&self) -> bool {
+        self.db_path == Path::new(":memory:")
+    }
+
+    fn invocations_dir_path(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("invocations")
+    }
+
+    pub(super) fn write_invocation_artifact(
+        &self,
+        start: &InvocationStart,
+        started_at: &str,
+    ) -> Result<(), String> {
+        let Some(dir) = self.invocations_dir() else {
+            return Ok(());
+        };
+        Self::ensure_artifact_dir(&dir)?;
+        let bytes = Self::invocation_artifact_bytes(start, started_at)?;
+        let (tmp_path, final_path) =
+            Self::artifact_paths(&dir, &start.invocation_uuid, "invocation");
+        Self::write_artifact_atomically(&tmp_path, &final_path, &bytes)
+    }
+
+    fn ensure_artifact_dir(dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| Self::format_create_artifact_dir_error(dir, e))
+    }
+
+    fn invocation_artifact_bytes(
+        start: &InvocationStart,
+        started_at: &str,
+    ) -> Result<Vec<u8>, String> {
+        let payload = Self::invocation_artifact_payload(start, started_at);
+        serde_json::to_vec(&payload).map_err(Self::format_invocation_artifact_serialize_error)
+    }
+
+    fn invocation_artifact_payload(start: &InvocationStart, started_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": start.invocation_uuid,
+            "status": "running",
+            "pid": std::process::id(),
+            "started_at": started_at,
+            "model_name": start.model_name,
+            "provider_name": start.provider_name,
+        })
+    }
+
+    fn artifact_paths(dir: &Path, uuid: &str, extension: &str) -> (PathBuf, PathBuf) {
+        (
+            dir.join(format!("{uuid}.{extension}.tmp")),
+            dir.join(format!("{uuid}.{extension}")),
+        )
+    }
+
+    fn write_artifact_atomically(
+        tmp_path: &Path,
+        final_path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        std::fs::write(tmp_path, bytes)
+            .map_err(|e| Self::format_artifact_write_error(tmp_path, e))?;
+        std::fs::rename(tmp_path, final_path)
+            .map_err(|e| Self::format_artifact_rename_error(tmp_path, final_path, e))
+    }
+
+    pub(super) fn write_result_artifact(
+        &self,
+        input: ResultEnvelopeInput<'_>,
+    ) -> Result<(), String> {
+        let Some(dir) = self.invocations_dir() else {
+            return Ok(());
+        };
+        Self::ensure_artifact_dir(&dir)?;
+        let bytes = Self::result_artifact_bytes(input)?;
+        let (tmp_path, final_path) = Self::artifact_paths(&dir, input.id, "result");
+        Self::write_artifact_atomically(&tmp_path, &final_path, &bytes)
+    }
+
+    fn result_artifact_bytes(input: ResultEnvelopeInput<'_>) -> Result<Vec<u8>, String> {
+        let payload = Self::result_artifact_payload(input);
+        serde_json::to_vec(&payload).map_err(Self::format_result_artifact_serialize_error)
+    }
+
+    fn result_artifact_payload(input: ResultEnvelopeInput<'_>) -> serde_json::Value {
+        result_envelope_payload(input)
+    }
+
+    pub(super) fn raw_paths_for(
+        &self,
+        invocation_uuid: &str,
+    ) -> Option<lc_log_adapter::RawArtifactPaths> {
+        let state_dir = Self::state_dir_for(&self.db_path)?;
+        Some(Self::raw_paths_map_for(state_dir, invocation_uuid))
+    }
+
+    fn is_memory_db_path(path: &Path) -> bool {
+        path == Path::new(":memory:")
+    }
+
+    fn state_dir_for(db_path: &Path) -> Option<&Path> {
+        (!Self::is_memory_db_path(db_path))
+            .then(|| db_path.parent())
+            .flatten()
+    }
+
+    fn raw_paths_map_for(state_dir: &Path, uuid: &str) -> lc_log_adapter::RawArtifactPaths {
+        let raw_io_dir = state_dir.join("invocations").join("raw-io");
+        lc_log_adapter::RawArtifactPaths {
+            stdout_path: raw_io_dir.join(Self::format_raw_artifact_filename(
+                uuid,
+                RawArtifactKind::Stdout,
+            )),
+            stderr_path: raw_io_dir.join(Self::format_raw_artifact_filename(
+                uuid,
+                RawArtifactKind::Stderr,
+            )),
+            result_path: raw_io_dir.join(Self::format_raw_artifact_filename(
+                uuid,
+                RawArtifactKind::Result,
+            )),
+            events_jsonl_path: raw_io_dir.join(Self::format_raw_artifact_filename(
+                uuid,
+                RawArtifactKind::EventsJsonl,
+            )),
+        }
+    }
+
+    fn format_raw_artifact_filename(uuid: &str, kind: RawArtifactKind) -> String {
+        format!("{uuid}.{}", Self::raw_artifact_suffix(kind))
+    }
+
+    fn raw_artifact_suffix(kind: RawArtifactKind) -> &'static str {
+        match kind {
+            RawArtifactKind::Stdout => "stdout",
+            RawArtifactKind::Stderr => "stderr",
+            RawArtifactKind::Result => "result",
+            RawArtifactKind::EventsJsonl => "events.jsonl",
+        }
+    }
+
+    fn format_create_artifact_dir_error(dir: &Path, e: std::io::Error) -> String {
+        format!("create_dir_all({}): {e}", dir.display())
+    }
+
+    fn format_invocation_artifact_serialize_error(e: serde_json::Error) -> String {
+        format!("serialize invocation artifact: {e}")
+    }
+
+    fn format_artifact_write_error(tmp_path: &Path, e: std::io::Error) -> String {
+        format!("write({}): {e}", tmp_path.display())
+    }
+
+    fn format_artifact_rename_error(
+        tmp_path: &Path,
+        final_path: &Path,
+        e: std::io::Error,
+    ) -> String {
+        format!(
+            "rename({} -> {}): {e}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    }
+
+    fn format_result_artifact_serialize_error(e: serde_json::Error) -> String {
+        format!("serialize result artifact: {e}")
+    }
+}

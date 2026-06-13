@@ -1,0 +1,178 @@
+//! ## Declared roles
+//!
+//! - orchestration
+//! - formatter
+//!
+//! Role set: { orchestration, formatter }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quota_status.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-quota-status-persistence
+//!     Owns:
+//!       - the StateDb provider-quota-status persistence surface this concern extends, split
+//!         from the StateDb facade with the public API preserved
+//!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: StateDb, sqlite, chrono, and the provider-quota status DTOs this concern reads
+//! ```
+//!
+//! Provider quota status flag and probe timestamp writes.
+
+use super::*;
+
+impl StateDb {
+    /// Bump `calls_since_refresh` for a provider. Creates the row with 1 call
+    /// and zeroed quota if the provider isn't tracked yet.
+    pub fn increment_calls_since_refresh(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, calls_since_refresh)
+                 VALUES (?1, 1)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    calls_since_refresh = calls_since_refresh + 1",
+                sqlite::params![provider_name],
+            )
+            .map_err(Self::format_increment_calls_since_refresh_error)?;
+        Ok(())
+    }
+
+    fn format_increment_calls_since_refresh_error(e: sqlite::Error) -> String {
+        format!("Failed to increment calls_since_refresh: {e}")
+    }
+
+    pub fn mark_exhausted(&self, provider_name: &str) -> Result<(), String> {
+        let now = Self::current_provider_quota_timestamp();
+        // Upsert so first-use quota failures land the flag even when the
+        // provider has never produced a `provider_quotas` row (e.g.,
+        // misconfigured quota_script that only ever fails, or a provider
+        // whose first call returns quota_exhausted before any refresh has
+        // succeeded). Previously a plain UPDATE silently dropped the write
+        // for these cases, leaving the account eligible to be routed to
+        // again on the next call.
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, exhausted_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    exhausted_at = excluded.exhausted_at",
+                sqlite::params![provider_name, &now],
+            )
+            .map_err(Self::format_mark_provider_exhausted_error)?;
+        Ok(())
+    }
+
+    fn format_mark_provider_exhausted_error(e: sqlite::Error) -> String {
+        format!("Failed to mark provider exhausted: {e}")
+    }
+
+    pub fn record_provider_unavailable(
+        &self,
+        provider_name: &str,
+        next_available_at: Option<DateTime<Utc>>,
+        failure_class: &str,
+    ) -> Result<(), String> {
+        let next_at = Self::optional_provider_quota_timestamp(next_available_at);
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas
+                    (provider_name, next_available_at, failure_class)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    next_available_at = excluded.next_available_at,
+                    failure_class = excluded.failure_class",
+                params![provider_name, next_at, failure_class],
+            )
+            .map_err(Self::format_record_provider_unavailable_error)?;
+        Ok(())
+    }
+
+    fn format_record_provider_unavailable_error(e: sqlite::Error) -> String {
+        format!("Failed to record provider unavailable: {e}")
+    }
+
+    pub fn clear_provider_unavailable(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas
+                 SET next_available_at = NULL,
+                     failure_class = NULL
+                 WHERE provider_name = ?1",
+                params![provider_name],
+            )
+            .map_err(Self::format_clear_provider_unavailable_error)?;
+        Ok(())
+    }
+
+    fn format_clear_provider_unavailable_error(e: sqlite::Error) -> String {
+        format!("Failed to clear provider unavailable: {e}")
+    }
+
+    pub fn touch_provider_refresh(
+        &self,
+        provider_name: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let ts = Self::provider_quota_timestamp(now);
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, last_refresh_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    last_refresh_at = excluded.last_refresh_at",
+                params![provider_name, ts],
+            )
+            .map_err(Self::format_touch_provider_refresh_error)?;
+        Ok(())
+    }
+
+    fn format_touch_provider_refresh_error(e: sqlite::Error) -> String {
+        format!("Failed to touch provider refresh: {e}")
+    }
+
+    pub fn clear_exhausted(&self, provider_name: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE provider_quotas SET exhausted_at = NULL WHERE provider_name = ?1",
+                sqlite::params![provider_name],
+            )
+            .map_err(Self::format_clear_provider_exhausted_error)?;
+        Ok(())
+    }
+
+    fn format_clear_provider_exhausted_error(e: sqlite::Error) -> String {
+        format!("Failed to clear provider exhausted flag: {e}")
+    }
+
+    pub fn record_topology_probe(&self, provider_name: &str) -> Result<(), String> {
+        let now = Self::current_provider_quota_timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO provider_quotas (provider_name, last_topology_probe_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT (provider_name) DO UPDATE SET
+                    last_topology_probe_at = excluded.last_topology_probe_at",
+                sqlite::params![provider_name, &now],
+            )
+            .map_err(Self::format_record_topology_probe_error)?;
+        Ok(())
+    }
+
+    fn format_record_topology_probe_error(e: sqlite::Error) -> String {
+        format!("Failed to record topology probe: {e}")
+    }
+
+    fn current_provider_quota_timestamp() -> String {
+        Self::provider_quota_timestamp(Utc::now())
+    }
+
+    fn optional_provider_quota_timestamp(ts: Option<DateTime<Utc>>) -> Option<String> {
+        ts.map(Self::provider_quota_timestamp)
+    }
+
+    fn provider_quota_timestamp(ts: DateTime<Utc>) -> String {
+        ts.to_rfc3339()
+    }
+}

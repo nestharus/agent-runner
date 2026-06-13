@@ -9,6 +9,22 @@
 //! bounded by re-export consumer policy and doctest compile-fail validation. Intrinsic-surface
 //! declaration `oulipoly_state_root_compatibility_api` covers the documented root-public DB
 //! compatibility facade; see `the AGE-160 proposal § Intrinsic-surface declarations`.
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/lib.rs
+//!     role: intrinsic-surface
+//!     Domain: oulipoly_state_root_compatibility_api
+//!     Owns:
+//!       - the crate root-public DB compatibility facade: every `pub use db::...`
+//!         re-export (StateDb, DbError, LegacyProviderNames, ProviderRecord,
+//!         InvocationRecord/Start/Status, QuotaRecord/Window, SessionTurn*,
+//!         ReadOnlyOpenError, and the remaining db concern surface) is the
+//!         documented stable consumer API this root carrier owns and re-exports
+//!         unchanged from the decomposed `db` module tree
+//! ```
 
 mod chain_segments;
 mod db;
@@ -29,6 +45,7 @@ pub type StateDbError = String;
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
+pub use db::LegacyProviderNames;
 pub use db::ProviderRecord;
 pub use db::ReadOnlyOpenError;
 pub use db::SessionTurnCounts;
@@ -94,16 +111,6 @@ pub mod age_32_connection_boundary_doctest {
     /// escaped.execute_batch("CREATE TABLE bypass (id INTEGER)").unwrap();
     /// ```
     pub struct StateDbRawConnectionEscapeMustNotCompile;
-}
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::{Mutex, OnceLock};
-
-    pub(crate) fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 }
 
 #[cfg(test)]

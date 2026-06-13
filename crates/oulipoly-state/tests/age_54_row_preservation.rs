@@ -14,6 +14,9 @@
 //!       - fixtures count_rows, schema_fingerprint, user_version helpers
 //!       - oulipoly_state::StateDb open and connection APIs
 //!       - oulipoly_state::CURRENT_SCHEMA_VERSION
+//!       - rusqlite::{Connection, params} row-inspection support surface
+//!       - std::path::Path fixture database path support surface
+//!       - tempfile::tempdir database fixture directory surface
 
 mod fixtures;
 
@@ -59,7 +62,10 @@ fn state_db_open_preserves_invocation_row_count_for_schema4_fixture() {
     assert_eq!(after.uuids, before.uuids);
     assert_eq!(after.parent_links, before.parent_links);
     assert_eq!(after.user_version, CURRENT_SCHEMA_VERSION);
-    assert_dual_id_backfill_matrix(&db_path);
+    assert_dual_id_backfill_matrix(
+        &actual_dual_id_backfill_rows(&db_path),
+        &expected_dual_id_backfill_rows(),
+    );
 }
 
 // Risk: repeated trace/open drops further
@@ -89,8 +95,11 @@ fn state_db_open_is_idempotent_for_schema5_fixture() {
         after_schema, before_schema,
         "schema-5 fixtures should be upgraded to the current schema on first open"
     );
-    assert_provider_session_index_exists(&db_path);
-    assert_dual_id_backfill_matrix(&db_path);
+    assert_provider_session_index_exists(&invocation_index_names(&db_path));
+    assert_dual_id_backfill_matrix(
+        &actual_dual_id_backfill_rows(&db_path),
+        &expected_dual_id_backfill_rows(),
+    );
 }
 
 // Risk: duplicate owner drift
@@ -112,7 +121,7 @@ fn schema4_dual_id_column_or_index_drift_preserves_rows_or_rolls_back() {
     match result {
         Ok(db) => {
             assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
-            assert_provider_session_index_exists(&db_path);
+            assert_provider_session_index_exists(&invocation_index_names(&db_path));
         }
         Err(_) => {
             assert_eq!(after.user_version, 4);
@@ -319,60 +328,188 @@ fn unknown_populated_invocations_shape_fails_closed_before_rebuild() {
     );
     assert_eq!(raw_invocation_count(&db_path), before_count);
     let after_columns = table_columns(&db_path, "invocations");
-    let mut before_columns_with_row_version = before_columns.clone();
-    before_columns_with_row_version.push("row_version".to_string());
-    let mut before_columns_with_row_version_and_identity = before_columns_with_row_version.clone();
-    before_columns_with_row_version_and_identity
-        .push("provider_session_resolved_account".to_string());
-    assert!(
-        after_columns == before_columns
-            || after_columns == before_columns_with_row_version
-            || after_columns == before_columns_with_row_version_and_identity
-    );
-    let conn = Connection::open(&db_path).unwrap();
-    let marker: String = conn
-        .query_row("SELECT unexpected_hand_edit FROM invocations", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(marker, UNKNOWN_SHAPE_MARKER);
+    assert!(acceptable_unknown_shape_columns(&before_columns).contains(&after_columns));
+    assert_eq!(unexpected_hand_edit_marker(&db_path), UNKNOWN_SHAPE_MARKER);
 }
 
 // Risk: row-count guard branch structural drift
-// Source: contract § Fix Design row-count guard rails; db.rs::migrate_legacy_invocations
+// Source: contract § Fix Design row-count guard rails; invocation_schema_legacy_migration::migrate_legacy_invocations
 // Level: residual source-shape verification for unreachable mismatch branch
 #[test]
 fn migrate_legacy_invocations_row_count_guards_abort_before_drop_in_source_shape() {
-    let source = include_str!("../src/db.rs");
-    let body = extract_function_body(source, "migrate_legacy_invocations");
+    let body = migrate_legacy_invocations_body();
+    assert_legacy_row_count_guard_body(body);
+}
 
-    let old_count = body
-        .find("SELECT COUNT(*) FROM invocations")
-        .expect("legacy rebuild must count old invocations before copy");
-    let old_scan_guard = body
-        .find("scanned {} rows but table count was {old_count}")
-        .expect("legacy rebuild must abort on old scan/count mismatch");
-    let create_new = body
-        .find("CREATE TABLE invocations_new")
-        .expect("legacy rebuild must create the replacement table after scan guard");
-    let new_count = body
-        .find("SELECT COUNT(*) FROM invocations_new")
-        .expect("legacy rebuild must count migrated rows before replacement");
-    let new_count_guard = body
-        .find("migrated {new_count} rows from {old_count}")
-        .expect("legacy rebuild must abort on migrated row-count mismatch");
-    let drop_table = body
-        .find("DROP TABLE invocations;")
-        .expect("legacy rebuild replacement point must remain explicit");
+// Declared role: mapper
+fn acceptable_unknown_shape_columns(before_columns: &[String]) -> Vec<Vec<String>> {
+    let with_row_version = columns_with_row_version(before_columns);
+    vec![
+        before_columns.to_vec(),
+        with_row_version.clone(),
+        columns_with_resolved_account(&with_row_version),
+    ]
+}
 
+// Declared role: mapper
+fn columns_with_row_version(columns: &[String]) -> Vec<String> {
+    let mut updated = columns.to_vec();
+    updated.push("row_version".to_string());
+    updated
+}
+
+// Declared role: mapper
+fn columns_with_resolved_account(columns: &[String]) -> Vec<String> {
+    let mut updated = columns.to_vec();
+    updated.push("provider_session_resolved_account".to_string());
+    updated
+}
+
+// Declared role: accessor
+fn unexpected_hand_edit_marker(path: &Path) -> String {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("SELECT unexpected_hand_edit FROM invocations", [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+// Declared role: parser
+fn migrate_legacy_invocations_body() -> &'static str {
+    extract_function_body(legacy_migration_source(), "migrate_legacy_invocations")
+}
+
+// Declared role: accessor
+fn legacy_migration_source() -> &'static str {
+    include_str!("../src/db/invocation_schema_legacy_migration.rs")
+}
+
+// Declared role: validator
+fn assert_legacy_row_count_guard_body(body: &str) {
+    assert_legacy_row_count_guard_executable_fragments();
+    assert_legacy_row_count_guard_order(&legacy_row_count_guard_offsets(body));
+}
+
+// Declared role: validator
+fn assert_legacy_row_count_guard_executable_fragments() {
+    for guard in legacy_row_count_guard_fragments() {
+        let body = extract_function_body(legacy_migration_source(), guard.function_name);
+        assert!(
+            body.contains(guard.fragment),
+            "legacy rebuild helper {} must retain executable fragment {:?}",
+            guard.function_name,
+            guard.fragment
+        );
+    }
+}
+
+// Declared role: validator
+fn assert_legacy_row_count_guard_order(offsets: &LegacyRowCountGuardOffsets) {
     assert!(
-        old_count < old_scan_guard && old_scan_guard < create_new,
+        offsets.old_count < offsets.old_scan_guard && offsets.old_scan_guard < offsets.create_new,
         "old scan/count guard must run before invocations_new is created"
     );
     assert!(
-        create_new < new_count && new_count < new_count_guard && new_count_guard < drop_table,
+        offsets.create_new < offsets.new_count
+            && offsets.new_count < offsets.new_count_guard
+            && offsets.new_count_guard < offsets.drop_table,
         "migrated row-count guard must abort before DROP TABLE"
     );
+}
+
+struct LegacyRowCountGuardOffsets {
+    old_count: usize,
+    old_scan_guard: usize,
+    create_new: usize,
+    new_count: usize,
+    new_count_guard: usize,
+    drop_table: usize,
+}
+
+// Declared role: parser
+fn legacy_row_count_guard_offsets(body: &str) -> LegacyRowCountGuardOffsets {
+    LegacyRowCountGuardOffsets {
+        old_count: source_offset(
+            body,
+            "legacy_invocations_count(&tx)",
+            "legacy rebuild must call old invocation count before copy",
+        ),
+        old_scan_guard: source_offset(
+            body,
+            "validate_legacy_invocation_scan_count",
+            "legacy rebuild must validate old scan/count before replacement",
+        ),
+        create_new: source_offset(
+            body,
+            "create_migrated_invocations_table(&tx)",
+            "legacy rebuild must create the replacement table after scan guard",
+        ),
+        new_count: source_offset(
+            body,
+            "migrated_invocations_count(&tx)",
+            "legacy rebuild must count migrated rows before replacement",
+        ),
+        new_count_guard: source_offset(
+            body,
+            "validate_migrated_invocation_count",
+            "legacy rebuild must validate migrated row count before replacement",
+        ),
+        drop_table: source_offset(
+            body,
+            "replace_invocations_with_migrated_table(&tx)",
+            "legacy rebuild replacement point must remain explicit",
+        ),
+    }
+}
+
+// Declared role: parser
+fn source_offset(source: &str, needle: &str, message: &str) -> usize {
+    require_source_offset(find_source_offset(source, needle), message)
+}
+
+// Declared role: parser
+fn find_source_offset(source: &str, needle: &str) -> Option<usize> {
+    source.find(needle)
+}
+
+// Declared role: validator
+fn require_source_offset(offset: Option<usize>, message: &str) -> usize {
+    offset.expect(message)
+}
+
+// Declared role: accessor
+fn legacy_row_count_guard_fragments() -> [LegacyRowCountGuardFragment; 6] {
+    [
+        LegacyRowCountGuardFragment {
+            function_name: "legacy_invocations_count",
+            fragment: "SELECT COUNT(*) FROM invocations",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "format_legacy_invocation_scan_count_error",
+            fragment: "scanned {scanned} rows but table count was {old_count}",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "create_migrated_invocations_table",
+            fragment: "CREATE TABLE invocations_new",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "migrated_invocations_count",
+            fragment: "SELECT COUNT(*) FROM invocations_new",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "format_migrated_invocation_count_mismatch_error",
+            fragment: "migrated {new_count} rows from {old_count}",
+        },
+        LegacyRowCountGuardFragment {
+            function_name: "replace_invocations_with_migrated_table",
+            fragment: "DROP TABLE invocations;",
+        },
+    ]
+}
+
+struct LegacyRowCountGuardFragment {
+    function_name: &'static str,
+    fragment: &'static str,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -426,24 +563,45 @@ fn has_invocation_uuid_column(columns: &[String]) -> bool {
 
 // Declared role: accessor
 fn select_invocation_uuids(path: &Path) -> Vec<String> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_invocation_uuid_rows(read_invocation_uuid_rows(path))
+}
+
+// Declared role: accessor
+fn read_invocation_uuid_rows(path: &Path) -> rusqlite::Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT invocation_uuid FROM invocations ORDER BY id")?;
+    stmt.query_map([], invocation_uuid_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_invocation_uuid_rows(result: rusqlite::Result<Vec<String>>) -> Vec<String> {
+    result.unwrap()
+}
+
+// Declared role: mapper
+fn invocation_uuid_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get(0)
 }
 
 // Declared role: accessor
 fn parent_links(path: &Path) -> Vec<(String, Option<String>)> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare(parent_links_sql())
-        .unwrap()
-        .query_map([], parent_link_row)
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_parent_link_rows(read_parent_link_rows(path))
+}
+
+// Declared role: accessor
+fn read_parent_link_rows(path: &Path) -> rusqlite::Result<Vec<(String, Option<String>)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(parent_links_sql())?;
+    stmt.query_map([], parent_link_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_parent_link_rows(
+    result: rusqlite::Result<Vec<(String, Option<String>)>>,
+) -> Vec<(String, Option<String>)> {
+    result.unwrap()
 }
 
 // Declared role: accessor
@@ -467,12 +625,24 @@ fn table_columns(path: &Path, table: &str) -> Vec<String> {
 
 // Declared role: accessor
 fn query_table_columns(conn: &Connection, sql: &str) -> Vec<String> {
-    conn.prepare(sql)
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(1))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_table_column_rows(read_table_column_rows(conn, sql))
+}
+
+// Declared role: accessor
+fn read_table_column_rows(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(sql)?;
+    stmt.query_map([], table_column_name_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_table_column_rows(result: rusqlite::Result<Vec<String>>) -> Vec<String> {
+    result.unwrap()
+}
+
+// Declared role: mapper
+fn table_column_name_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get::<_, String>(1)
 }
 
 // Declared role: formatter
@@ -481,20 +651,31 @@ fn table_info_sql(table: &str) -> String {
 }
 
 // Declared role: validator
-fn assert_provider_session_index_exists(path: &Path) {
-    let indexes = invocation_index_names(path);
-    assert_contains_provider_session_index(&indexes);
+fn assert_provider_session_index_exists(indexes: &[String]) {
+    assert_contains_provider_session_index(indexes);
 }
 
 // Declared role: accessor
 fn invocation_index_names(path: &Path) -> Vec<String> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare(invocation_index_names_sql())
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap()
+    require_invocation_index_rows(read_invocation_index_rows(path))
+}
+
+// Declared role: accessor
+fn read_invocation_index_rows(path: &Path) -> rusqlite::Result<Vec<String>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(invocation_index_names_sql())?;
+    stmt.query_map([], invocation_index_name_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_invocation_index_rows(result: rusqlite::Result<Vec<String>>) -> Vec<String> {
+    result.unwrap()
+}
+
+// Declared role: mapper
+fn invocation_index_name_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+    row.get::<_, String>(0)
 }
 
 // Declared role: accessor
@@ -513,11 +694,8 @@ fn assert_contains_provider_session_index(indexes: &[String]) {
 }
 
 // Declared role: validator
-fn assert_dual_id_backfill_matrix(path: &Path) {
-    assert_eq!(
-        actual_dual_id_backfill_rows(path),
-        expected_dual_id_backfill_rows()
-    );
+fn assert_dual_id_backfill_matrix(actual: &[DualIdBackfillRow], expected: &[DualIdBackfillRow]) {
+    assert_eq!(actual, expected);
 }
 
 type DualIdBackfillRow = (
@@ -530,17 +708,26 @@ type DualIdBackfillRow = (
 
 // Declared role: accessor
 fn actual_dual_id_backfill_rows(path: &Path) -> Vec<DualIdBackfillRow> {
-    let conn = Connection::open(path).unwrap();
-    conn.prepare(
+    require_dual_id_backfill_rows(read_dual_id_backfill_rows(path))
+}
+
+// Declared role: accessor
+fn read_dual_id_backfill_rows(path: &Path) -> rusqlite::Result<Vec<DualIdBackfillRow>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare(
         "SELECT invocation_uuid, session_id, provider_session_id, resume_input_id,
                     provider_session_capture_method
              FROM invocations ORDER BY id",
-    )
-    .unwrap()
-    .query_map([], dual_id_backfill_row)
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap()
+    )?;
+    stmt.query_map([], dual_id_backfill_row)
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+}
+
+// Declared role: validator
+fn require_dual_id_backfill_rows(
+    result: rusqlite::Result<Vec<DualIdBackfillRow>>,
+) -> Vec<DualIdBackfillRow> {
+    result.unwrap()
 }
 
 // Declared role: mapper
@@ -631,19 +818,44 @@ fn function_source_span(source: &str, name: &str) -> std::ops::Range<usize> {
 
 // Declared role: parser
 fn function_start(source: &str, name: &str) -> usize {
-    let signature = format!("fn {name}");
-    source.find(&signature).unwrap_or_else(|| {
-        panic!("missing function {name}");
-    })
+    let signature = function_signature_needle(name);
+    require_function_start(name, source.find(&signature))
+}
+
+// Declared role: formatter
+fn function_signature_needle(name: &str) -> String {
+    format!("fn {name}")
+}
+
+// Declared role: validator
+fn require_function_start(name: &str, start: Option<usize>) -> usize {
+    start.unwrap_or_else(|| panic!("missing function {name}"))
 }
 
 // Declared role: parser
 fn function_end(source: &str, start: usize, name: &str) -> usize {
-    let end_marker = "\n    /// Resolve `(model_name, provider_index) -> provider_name`";
-    source[start..]
-        .find(end_marker)
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing end marker after function {name}"))
+    let offset = require_function_end_offset(name, function_end_offset(source, start));
+    map_function_end(start, offset)
+}
+
+// Declared role: parser
+fn function_end_offset(source: &str, start: usize) -> Option<usize> {
+    source[start..].find(function_end_marker())
+}
+
+// Declared role: accessor
+fn function_end_marker() -> &'static str {
+    "\npub type LegacyProviderNames"
+}
+
+// Declared role: validator
+fn require_function_end_offset(name: &str, offset: Option<usize>) -> usize {
+    offset.unwrap_or_else(|| panic!("missing end marker after function {name}"))
+}
+
+// Declared role: mapper
+fn map_function_end(start: usize, offset: usize) -> usize {
+    start + offset
 }
 
 // Declared role: orchestration
