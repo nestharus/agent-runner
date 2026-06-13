@@ -15,6 +15,8 @@
 //!     Domain: migrate-db-open-seam
 //!     Owns:
 //!       - the migrate-db StateDb open seam this accessor owns: StateDb::default_path, StateDb::open, and StateDb::open_with_legacy_provider_names (the PP-001 pushed-lookup entrypoint)
+//!       - the parent-dir resolution + error formatting this seam owns: std::path::Path/PathBuf parent access and super::formatter::format_state_db_path_no_parent_error
+//!       - the PP-001 app-side legacy provider-name lookup pushed into the open seam: crate::migration_providers::legacy_invocation_provider_names
 //!       - Intrinsic carrier subordinate to this domain: oulipoly_state::StateDb
 //! ```
 
