@@ -9,21 +9,28 @@
 use super::common::*;
 use super::*;
 #[test]
-fn composite_invocation_id_formats_and_round_trips() {
+fn composite_invocation_id_formats_to_marker_line() {
     let composite = CompositeInvocationId {
         source: "fixture-provider".to_string(),
         id: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
     };
-    let line = composite.stderr_line();
     assert_eq!(
-        line,
+        composite.stderr_line(),
         r#"OULIPOLY_INVOCATION={"source":"fixture-provider","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#
     );
+}
 
-    let parsed =
-        CompositeInvocationId::parse_env_value(line.strip_prefix("OULIPOLY_INVOCATION=").unwrap())
-            .unwrap();
-    assert_eq!(parsed, composite);
+#[test]
+fn composite_invocation_id_parses_marker_payload() {
+    let composite = CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "7ad2916c-38dd-49e6-a1f7-3ef22766ff70".to_string(),
+    };
+    let payload = r#"{"source":"fixture-provider","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#;
+    assert_eq!(
+        CompositeInvocationId::parse_env_value(payload).unwrap(),
+        composite
+    );
 }
 
 #[test]
@@ -74,20 +81,28 @@ fn composite_invocation_id_rejects_malformed_env_values() {
 }
 
 #[test]
-fn invocation_status_round_trips_through_strings() {
-    for status in [
-        InvocationStatus::Running,
-        InvocationStatus::Succeeded,
-        InvocationStatus::Failed,
-        InvocationStatus::Legacy,
+fn invocation_status_formats_each_variant_to_str() {
+    for (status, text) in [
+        (InvocationStatus::Running, "running"),
+        (InvocationStatus::Succeeded, "succeeded"),
+        (InvocationStatus::Failed, "failed"),
+        (InvocationStatus::Legacy, "legacy"),
     ] {
-        // Inherent contracted API: Option<Self>.
-        assert_eq!(InvocationStatus::from_str(status.as_str()), Some(status));
-        // FromStr trait surface: Result<Self, _>. Both must work.
-        assert_eq!(
-            status.as_str().parse::<InvocationStatus>().ok(),
-            Some(status)
-        );
+        assert_eq!(status.as_str(), text);
+    }
+}
+
+#[test]
+fn invocation_status_parses_each_string_to_variant() {
+    for (text, status) in [
+        ("running", InvocationStatus::Running),
+        ("succeeded", InvocationStatus::Succeeded),
+        ("failed", InvocationStatus::Failed),
+        ("legacy", InvocationStatus::Legacy),
+    ] {
+        // Inherent contracted API: Option<Self>; FromStr trait surface: Result<Self, _>.
+        assert_eq!(InvocationStatus::from_str(text), Some(status));
+        assert_eq!(text.parse::<InvocationStatus>().ok(), Some(status));
     }
     assert_eq!(InvocationStatus::from_str("unknown"), None);
     assert!("unknown".parse::<InvocationStatus>().is_err());

@@ -9,11 +9,10 @@
 
 use super::*;
 #[test]
-fn age160_composite_invocation_id_declared_grammar_canonical_json_round_trip() {
-    let known_uuid = known_marker_uuid();
+fn age160_composite_invocation_id_formats_canonical_marker() {
     let composite = CompositeInvocationId {
         source: "provider-b2".to_string(),
-        id: known_uuid.to_string(),
+        id: known_marker_uuid().to_string(),
     };
 
     let stderr_line = composite.stderr_line();
@@ -26,12 +25,21 @@ fn age160_composite_invocation_id_declared_grammar_canonical_json_round_trip() {
         payload,
         r#"{"source":"provider-b2","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#
     );
+}
+
+#[test]
+fn age160_composite_invocation_id_parses_canonical_payload() {
+    let known_uuid = known_marker_uuid();
+    let payload = r#"{"source":"provider-b2","id":"7ad2916c-38dd-49e6-a1f7-3ef22766ff70"}"#;
 
     let parsed = CompositeInvocationId::parse_env_value(payload).unwrap();
     assert_eq!(parsed.source, "provider-b2");
     assert_eq!(parsed.id.to_string(), known_uuid.to_string());
 
-    let parent_env = parent_env_payload(&composite);
+    let parent_env = parent_env_payload(&CompositeInvocationId {
+        source: "provider-b2".to_string(),
+        id: known_uuid.to_string(),
+    });
     assert!(!parent_env.starts_with("OULIPOLY_INVOCATION="));
     assert_eq!(
         CompositeInvocationId::parse_env_value(&parent_env)

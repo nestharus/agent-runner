@@ -209,8 +209,16 @@ pub(in crate::db::tests) fn pre_chain_db_with_turns(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let conn = sqlite::Connection::open(&path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE session_turns (
+    conn.execute_batch(pre_chain_schema_sql()).unwrap();
+    for row in rows {
+        insert_pre_chain_session_turn(&conn, row);
+    }
+    mark_current_schema_version(&conn);
+    dir
+}
+
+fn pre_chain_schema_sql() -> &'static str {
+    "CREATE TABLE session_turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 provider_name TEXT NOT NULL,
                 session_id TEXT NOT NULL,
@@ -238,20 +246,18 @@ pub(in crate::db::tests) fn pre_chain_db_with_turns(
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT
-            );",
-    )
-    .unwrap();
-    for (provider, session, turn, timestamp, role) in rows {
-        conn.execute(
-            "INSERT INTO session_turns
+            );"
+}
+
+fn insert_pre_chain_session_turn(conn: &sqlite::Connection, row: &(&str, &str, &str, &str, &str)) {
+    let (provider, session, turn, timestamp, role) = row;
+    conn.execute(
+        "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, '', ?4)",
-            sqlite::params![provider, session, turn, timestamp, role],
-        )
-        .unwrap();
-    }
-    mark_current_schema_version(&conn);
-    dir
+        sqlite::params![provider, session, turn, timestamp, role],
+    )
+    .unwrap();
 }
 
 pub(in crate::db::tests) fn chain_count(db: &StateDb) -> i64 {

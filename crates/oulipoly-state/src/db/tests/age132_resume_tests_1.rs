@@ -22,37 +22,13 @@
 use super::common::*;
 use super::*;
 #[test]
-fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
-    let db = test_db();
-    let invocation_uuid = "44444444-4444-4444-8444-444444444444";
-    let id = db
-        .start_invocation(&InvocationStart {
-            invocation_uuid: invocation_uuid.to_string(),
-            model_name: "provider-a-opus".to_string(),
-            provider_name: "provider-a".to_string(),
-            provider_index: 7,
-            parent_invocation_id: None,
-        })
-        .unwrap();
-    db.update_session_capture(id, Some(SESSION_A), "verified")
-        .unwrap();
-    db.update_resume_acceptance(id, "accepted", Some("matched"))
-        .unwrap();
-    db.conn
-        .execute(
-            "UPDATE invocations
-                 SET status = 'succeeded',
-                     success = 1,
-                     exit_code = 0,
-                     terminal_reason = 'exit_zero',
-                     created_at = '2026-04-17T08:00:00Z',
-                     finished_at = '2026-04-17T08:00:02Z'
-                 WHERE id = ?1",
-            sqlite::params![id],
-        )
-        .unwrap();
+fn age132_invocation_projection_maps_full_row() {
+    let (db, invocation_uuid, id) = age132_full_projection_fixture();
 
-    let record = db.get_invocation_by_uuid(invocation_uuid).unwrap().unwrap();
+    let record = db
+        .get_invocation_by_uuid(&invocation_uuid)
+        .unwrap()
+        .unwrap();
     assert_eq!(record.id, id);
     assert_eq!(record.invocation_uuid, invocation_uuid);
     assert_eq!(record.model_name, "provider-a-opus");
@@ -85,6 +61,11 @@ fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
     assert_eq!(children[0].invocation_uuid, child_uuid);
     assert_eq!(children[0].parent_invocation_id, Some(id));
     assert_eq!(children[0].created_at, ts("2026-04-17T08:00:01Z"));
+}
+
+#[test]
+fn age132_invocation_projection_rejects_bad_values() {
+    let (db, invocation_uuid, id) = age132_full_projection_fixture();
 
     db.conn
         .pragma_update(None, "ignore_check_constraints", true)
@@ -95,7 +76,7 @@ fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
             sqlite::params![id],
         )
         .unwrap();
-    let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
+    let err = db.get_invocation_by_uuid(&invocation_uuid).unwrap_err();
     assert!(err.contains("Unknown invocation status: paused"), "{err}");
     db.conn
             .execute(
@@ -103,8 +84,40 @@ fn age132_invocation_projection_maps_full_row_and_rejects_bad_values() {
                 sqlite::params![id],
             )
             .unwrap();
-    let err = db.get_invocation_by_uuid(invocation_uuid).unwrap_err();
+    let err = db.get_invocation_by_uuid(&invocation_uuid).unwrap_err();
     assert!(err.contains("Conversion error"), "{err}");
+}
+
+fn age132_full_projection_fixture() -> (StateDb, String, i64) {
+    let db = test_db();
+    let invocation_uuid = "44444444-4444-4444-8444-444444444444".to_string();
+    let id = db
+        .start_invocation(&InvocationStart {
+            invocation_uuid: invocation_uuid.clone(),
+            model_name: "provider-a-opus".to_string(),
+            provider_name: "provider-a".to_string(),
+            provider_index: 7,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    db.update_session_capture(id, Some(SESSION_A), "verified")
+        .unwrap();
+    db.update_resume_acceptance(id, "accepted", Some("matched"))
+        .unwrap();
+    db.conn
+        .execute(
+            "UPDATE invocations
+                 SET status = 'succeeded',
+                     success = 1,
+                     exit_code = 0,
+                     terminal_reason = 'exit_zero',
+                     created_at = '2026-04-17T08:00:00Z',
+                     finished_at = '2026-04-17T08:00:02Z'
+                 WHERE id = ?1",
+            sqlite::params![id],
+        )
+        .unwrap();
+    (db, invocation_uuid, id)
 }
 
 #[test]
