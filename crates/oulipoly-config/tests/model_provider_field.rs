@@ -1,6 +1,6 @@
 use oulipoly_config::{
-    render_validated_model_toml, ModelConfig, ProviderImplementationFlavor,
-    ProviderImplementationRef, ProvidersConfig,
+    ModelConfig, ProviderImplementationFlavor, ProviderImplementationRef, ProvidersConfig,
+    render_validated_model_toml,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -133,21 +133,6 @@ fn allowed_baseline_count(path_hash: u64, term_index: usize) -> usize {
             max_count: 2,
         },
         BaselineCount {
-            path_hash: 0xb8683260b149ac25,
-            term_index: 0,
-            max_count: 145,
-        },
-        BaselineCount {
-            path_hash: 0xb8683260b149ac25,
-            term_index: 1,
-            max_count: 60,
-        },
-        BaselineCount {
-            path_hash: 0xb8683260b149ac25,
-            term_index: 2,
-            max_count: 5,
-        },
-        BaselineCount {
             path_hash: 0xfc744273be412950,
             term_index: 0,
             max_count: 16,
@@ -221,6 +206,46 @@ fn allowed_baseline_count(path_hash: u64, term_index: usize) -> usize {
             path_hash: 0xc18bd0239070104,
             term_index: 1,
             max_count: 12,
+        },
+        BaselineCount {
+            path_hash: 0x38b8d376b637c9c0,
+            term_index: 0,
+            max_count: 15,
+        },
+        BaselineCount {
+            path_hash: 0x38b8d376b637c9c0,
+            term_index: 1,
+            max_count: 16,
+        },
+        BaselineCount {
+            path_hash: 0x1c2bad87a1cd5b9e,
+            term_index: 0,
+            max_count: 1,
+        },
+        BaselineCount {
+            path_hash: 0xae50a55b605342df,
+            term_index: 0,
+            max_count: 3,
+        },
+        BaselineCount {
+            path_hash: 0xae50a55b605342df,
+            term_index: 1,
+            max_count: 3,
+        },
+        BaselineCount {
+            path_hash: 0xdea0a5bcf7c8658f,
+            term_index: 0,
+            max_count: 126,
+        },
+        BaselineCount {
+            path_hash: 0xdea0a5bcf7c8658f,
+            term_index: 1,
+            max_count: 41,
+        },
+        BaselineCount {
+            path_hash: 0xdea0a5bcf7c8658f,
+            term_index: 2,
+            max_count: 5,
         },
     ];
 
