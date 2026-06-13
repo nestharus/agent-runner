@@ -54,7 +54,7 @@
 //!       - accounts, chain_backfill, chain_segments_compaction, chain_segments_import, chain_segments_open
 //!       - cli_providers, discovered_models, discovery_types, invocation_artifacts
 //!       - invocation_lifecycle_finalize, invocation_lifecycle_finalize_context, invocation_lifecycle_finalize_write, invocation_lifecycle_start
-//!       - invocation_records, invocation_schema_legacy_migration, invocation_schema_projection, invocation_schema_repair, invocation_schema_session_turns, invocation_schema_table
+//!       - invocation_live_load, invocation_records, invocation_schema_legacy_migration, invocation_schema_projection, invocation_schema_repair, invocation_schema_session_turns, invocation_schema_table
 //!       - invocation_window, lifecycle_invocation_row, lifecycle_log_adapter, model_parameters
 //!       - opening_migrations, opening_read_only, opening_write, owned_turn_event_read, owned_turn_event_write
 //!       - provider_quota_reads, provider_quota_refresh, provider_quota_status, provider_quota_test_support, provider_quota_window_writes, provider_quotas
@@ -101,6 +101,7 @@ mod invocation_lifecycle_finalize;
 mod invocation_lifecycle_finalize_context;
 mod invocation_lifecycle_finalize_write;
 mod invocation_lifecycle_start;
+mod invocation_live_load;
 mod invocation_records;
 mod invocation_schema_legacy_migration;
 mod invocation_schema_projection;

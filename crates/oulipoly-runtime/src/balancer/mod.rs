@@ -19,6 +19,20 @@
 //!
 //! ## Intrinsic-surface declarations
 //! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/balancer/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: balancer-routing-hub
+//!     Owns:
+//!       - the balancer routing hub: this file owns coordination of the balancer
+//!         submodule tree it declares and re-exports as the intrinsic internal
+//!         surface of the routing concern — burn_rate, context, density,
+//!         eligibility, forensics, invocation_fallback, live_load, migration,
+//!         projection, refresh_inputs, snapshot, topology, working_set
+//!       - the RoutingError routing-failure type this hub defines and the
+//!         select_provider/score_routing_candidates selection orchestration
+//!       - intrinsic routing-input carriers subordinate to this domain, consumed by
+//!         the selection orchestration: oulipoly_config::ModelConfig,
+//!         oulipoly_state::StateDb, oulipoly_core::TransitionReason, chrono::Utc, std::fmt
 //!   - component: crates/oulipoly-runtime/src/balancer/context.rs::balance_context_surface
 //!     role: intrinsic-surface
 //!     Domain: contextual-balancer-dependencies
@@ -72,6 +86,7 @@ mod density;
 mod eligibility;
 pub mod forensics;
 mod invocation_fallback;
+mod live_load;
 mod migration;
 mod projection;
 mod refresh_inputs;
@@ -118,6 +133,7 @@ use density::{
 };
 use eligibility::eligible_provider_indices;
 use invocation_fallback::score_by_invocation_count;
+use live_load::restrict_to_least_loaded;
 use refresh_inputs::refresh_routing_inputs;
 use snapshot::{QuotaSnapshot, load_quota_snapshot};
 use topology::repair_routing_topology;
@@ -207,6 +223,16 @@ fn score_routing_candidates(
     snapshot: &QuotaSnapshot,
     candidates: &[usize],
 ) -> usize {
+    let least_loaded = restrict_to_least_loaded(model, state, candidates);
+    score_least_loaded_candidates(model, state, snapshot, least_loaded.as_slice())
+}
+
+fn score_least_loaded_candidates(
+    model: &ModelConfig,
+    state: &StateDb,
+    snapshot: &QuotaSnapshot,
+    candidates: &[usize],
+) -> usize {
     if candidates_have_windows(snapshot, candidates) {
         score_by_density(
             model,
@@ -228,7 +254,7 @@ fn candidates_have_windows(snapshot: &QuotaSnapshot, candidates: &[usize]) -> bo
 
 #[cfg(test)]
 #[rustfmt::skip]
-pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 15] {
+pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 16] {
     macro_rules! source {
         ($path:literal, $file:literal) => { ($path, production_balancer_source($path, include_str!($file))) };
     }
@@ -243,6 +269,7 @@ pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 15
         source!("crates/oulipoly-runtime/src/balancer/density.rs", "density.rs"),
         source!("crates/oulipoly-runtime/src/balancer/density/trace.rs", "density/trace.rs"),
         source!("crates/oulipoly-runtime/src/balancer/invocation_fallback.rs", "invocation_fallback.rs"),
+        source!("crates/oulipoly-runtime/src/balancer/live_load.rs", "live_load.rs"),
         source!("crates/oulipoly-runtime/src/balancer/eligibility.rs", "eligibility.rs"),
         source!("crates/oulipoly-runtime/src/balancer/context.rs", "context.rs"),
         source!("crates/oulipoly-runtime/src/balancer/snapshot.rs", "snapshot.rs"),
