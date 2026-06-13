@@ -5,6 +5,18 @@
 //! - accessor
 //!
 //! Role set: { orchestration, validator, accessor }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/commands/migrate/accessor.rs
+//!     role: intrinsic-surface
+//!     Domain: migrate-db-open-seam
+//!     Owns:
+//!       - the migrate-db StateDb open seam this accessor owns: StateDb::default_path, StateDb::open, and StateDb::open_with_legacy_provider_names (the PP-001 pushed-lookup entrypoint)
+//!       - Intrinsic carrier subordinate to this domain: oulipoly_state::StateDb
+//! ```
 
 use oulipoly_state::StateDb;
 use std::path::{Path, PathBuf};

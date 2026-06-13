@@ -7,6 +7,18 @@
 //!
 //! Role set: { accessor, formatter, mapper, orchestration }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/cli_providers.rs
+//!     role: intrinsic-surface
+//!     Domain: cli-providers-persistence
+//!     Owns:
+//!       - StateDb cli_providers discovery persistence: the cli_providers table and its columns (cli_name, display_name, installed, version, config_dir, last_synced) this concern writes and reads
+//!       - Intrinsic StateDb/rusqlite carriers and the CliProviderRecord row DTO referenced via `use super::*`, subordinate to this domain: StateDb, sqlite, params, CliProviderRecord
+//! ```
+//!
 //! CLI provider discovery persistence methods for `StateDb`.
 
 use super::*;

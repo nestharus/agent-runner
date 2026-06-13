@@ -9,6 +9,22 @@
 //! bounded by re-export consumer policy and doctest compile-fail validation. Intrinsic-surface
 //! declaration `oulipoly_state_root_compatibility_api` covers the documented root-public DB
 //! compatibility facade; see `the AGE-160 proposal § Intrinsic-surface declarations`.
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/lib.rs
+//!     role: intrinsic-surface
+//!     Domain: oulipoly_state_root_compatibility_api
+//!     Owns:
+//!       - the crate root-public DB compatibility facade: every `pub use db::...`
+//!         re-export (StateDb, DbError, LegacyProviderNames, ProviderRecord,
+//!         InvocationRecord/Start/Status, QuotaRecord/Window, SessionTurn*,
+//!         ReadOnlyOpenError, and the remaining db concern surface) is the
+//!         documented stable consumer API this root carrier owns and re-exports
+//!         unchanged from the decomposed `db` module tree
+//! ```
 
 mod chain_segments;
 mod db;
