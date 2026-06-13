@@ -19,6 +19,8 @@
 //!         from the StateDb facade with the public API preserved
 //!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
 //!         via `use super::*`, subordinate to this domain: StateDb, StateDbError, Connection, Transaction, OwnedTurnEventRow, params, rusqlite, Utc
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: StateDbError
 //! ```
 //!
 //! Owned turn/event DTOs and insert persistence.

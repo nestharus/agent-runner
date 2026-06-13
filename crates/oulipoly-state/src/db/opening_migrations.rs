@@ -17,6 +17,8 @@
 //!     Owns:
 //!       - CURRENT_SCHEMA_VERSION and MINIMUM_SUPPORTED_SCHEMA_VERSION schema-version bounds
 //!       - SchemaCompatibility decision consumed to gate open-time migration
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION, SchemaCompatibility, migrations
 //! ```
 //!
 //! State database open-time migration dispatch and returned-artifact validator repair.

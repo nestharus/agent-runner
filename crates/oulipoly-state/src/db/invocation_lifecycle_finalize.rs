@@ -20,6 +20,8 @@
 //!         facade by the WU #65 decomposition with the public API preserved
 //!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
 //!         via `use super::*`, subordinate to this domain: FinalizeInvocationRow, FinalizeLifecycleInput, OperationResult, StateDb, lc_log_adapter, lifecycle_terminal_status, sqlite
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: ResultEnvelopeFailureIdentity, ResultEnvelopeInput
 //! ```
 //!
 //! Invocation finalize orchestration and lifecycle-log classification.

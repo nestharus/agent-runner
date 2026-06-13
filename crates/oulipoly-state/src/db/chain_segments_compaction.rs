@@ -22,6 +22,8 @@
 //!         facade by the WU #65 decomposition with the public API preserved
 //!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
 //!         via `use super::*`, subordinate to this domain: DateTime, DbError, StateDb, Utc, params, sqlite
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, Utc
 //! ```
 //!
 //! Compaction boundary and chain segment list helpers.

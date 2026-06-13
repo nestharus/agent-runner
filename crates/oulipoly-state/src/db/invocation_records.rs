@@ -20,6 +20,8 @@
 //!         from the StateDb facade with the public API preserved
 //!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
 //!         via `use super::*`, subordinate to this domain: StateDb, sqlite, chrono DateTime/Utc, and the InvocationRecord/Status DTOs this concern maps
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, StateDb, Utc, sqlite
 //! ```
 
 use super::{StateDb, sqlite};

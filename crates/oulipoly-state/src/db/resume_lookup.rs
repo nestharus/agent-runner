@@ -21,6 +21,8 @@
 //!         facade by the WU #65 decomposition with the public API preserved
 //!       - Intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
 //!         via `use super::*`, subordinate to this domain: ChainPreview, Connection, DateTime, DbError, ResumeChainCandidate, StateDb, Utc, Uuid, WrongIdKindInvocationMatch, WrongIdKindInvocationRow, params, sqlite
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, Utc, Uuid
 //! ```
 //!
 //! Resume chain and wrong-id lookup helpers.

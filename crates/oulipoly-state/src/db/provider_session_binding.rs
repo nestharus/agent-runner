@@ -20,6 +20,8 @@
 //!       - StateDb provider-session binding upsert/lookup persistence
 //!       - sqlite (rusqlite re-export) and RusqliteOptionalExtension optional-row access
 //!       - DbError construction for binding persistence failures
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, DbError, RusqliteOptionalExtension, StateDb, Utc, Uuid, sqlite
 //! ```
 //!
 //! Provider-session binding persistence and chain minting coordination.

@@ -18,6 +18,8 @@
 //!     Owns:
 //!       - QuotaRecord and QuotaWindow public DTOs returned by quota reads
 //!       - RawQuotaRecordRow and RawQuotaWindowRow row projections mapped into the public quota DTOs
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: QuotaRecord, QuotaWindow, RawQuotaRecordRow, RawQuotaWindowRow
 //! ```
 //!
 //! Provider quota read APIs and row-to-DTO mapping helpers.

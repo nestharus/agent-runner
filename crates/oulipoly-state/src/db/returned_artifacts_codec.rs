@@ -18,6 +18,8 @@
 //!     Owns:
 //!       - the returned-artifact identity/version-id codec this concern owns
 //!       - Intrinsic carriers referenced via `use super::*`, subordinate to this domain: ReturnedArtifactSource, Uuid
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, Utc, Uuid
 //! ```
 //!
 //! Returned-artifact identity and version-id codec helpers.

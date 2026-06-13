@@ -19,6 +19,8 @@
 //!       - StateDb invocation-artifact path construction and JSON payload read/write
 //!       - InvocationStart inputs consumed when persisting artifacts
 //!       - lc_log_adapter lifecycle emission for artifact operations
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: InvocationStart, Path, PathBuf, ResultEnvelopeInput, StateDb, lc_log_adapter, result_envelope_payload
 //! ```
 //!
 //! Invocation sidecar artifact pathing, payload mapping, and atomic file writes.

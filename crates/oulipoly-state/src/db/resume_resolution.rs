@@ -31,6 +31,8 @@
 //!       - active-provider compatibility checks against model provider entries
 //!       - provider/model mismatch suggestion construction and sorting
 //!       - ResolvedResume assembly across chain, provider, session, and model fields
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: ModelConfig, Uuid
 //! ```
 
 use super::*;

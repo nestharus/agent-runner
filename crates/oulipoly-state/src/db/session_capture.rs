@@ -19,6 +19,8 @@
 //!       - StateDb session-capture write/read methods over the invocations table
 //!       - sqlite (rusqlite re-export) and RusqliteOptionalExtension row access used by session capture
 //!       - LifecycleInvocationRow projection and lc_log_adapter lifecycle emission for capture events
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: LifecycleInvocationRow, RusqliteOptionalExtension, StateDb, lc_log_adapter, sqlite
 //! ```
 //!
 //! Invocation session-capture projection, persistence, and lifecycle reporting.

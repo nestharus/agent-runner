@@ -22,6 +22,8 @@
 //!         facade by the WU #65 decomposition with the public API preserved
 //!       - all StateDb/rusqlite carriers and concern-owned DTOs/macros referenced
 //!         via `use super::*`, subordinate to this domain
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, HashMap, StateDb, Utc, sqlite
 //! ```
 //!
 //! Invocation-window session lookup, timestamp parsing, filtering, and ranking.

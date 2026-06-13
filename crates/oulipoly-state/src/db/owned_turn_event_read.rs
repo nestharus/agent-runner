@@ -18,6 +18,8 @@
 //!         from the StateDb facade with the public API preserved
 //!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
 //!         via `use super::*`, subordinate to this domain: StateDb, StateDbError, Connection, OwnedTurnEvent, CompactSummaryEvidence, params, rusqlite
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: StateDbError
 //! ```
 //!
 //! Owned turn/event reads and compact-summary evidence mapping.

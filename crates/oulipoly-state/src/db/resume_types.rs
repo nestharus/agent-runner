@@ -24,6 +24,8 @@
 //!       - ModelStore alias over std::collections::HashMap and ModelConfig
 //!       - ResolvedResume, ResumeError, ChainPreview, TurnPreview, and row DTO fields
 //!       - chrono DateTime/Utc timestamp fields carried by resume previews
+//!       - external contract symbols referenced by this concern via its `use`
+//!         declarations, intrinsic and subordinate to this persistence domain: DateTime, ModelConfig, Utc
 //! ```
 
 use chrono::{DateTime, Utc};
