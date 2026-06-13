@@ -111,8 +111,8 @@ fn settings_migration_packaging_is_read_only_and_separate_from_central_config_mi
 // risk: Migration mutating or interpreting central config; level: source guard; source: contract "S5 must not retire central config"
 #[test]
 fn s5_does_not_retire_central_provider_or_model_config_parsing() {
-    let model_source = read("../crates/oulipoly-config/src/model.rs");
-    let providers_source = read("../crates/oulipoly-config/src/providers.rs");
+    let model_source = read_config_module("model");
+    let providers_source = read_config_module("providers");
     let tauri_source = [
         read("src/commands/models/reload.rs"),
         read("src/commands/models/formatter.rs"),
@@ -495,6 +495,41 @@ fn function_body<'a>(source: &'a str, marker: &str) -> &'a str {
 fn read(relative: &str) -> String {
     fs::read_to_string(manifest_path(relative))
         .unwrap_or_else(|error| panic!("failed to read {relative}: {error}"))
+}
+
+/// Read a central-config module's full source: the facade file `<name>.rs` (if
+/// it still exists) plus every `.rs` under the `<name>/` module directory. The
+/// AGE-204/#41/#73 splits moved the central provider/model parsing surface out
+/// of the monolithic `<name>.rs` into `<name>/` submodules, so the source guard
+/// must look at the whole module, not just the (now thin) facade.
+fn read_config_module(name: &str) -> String {
+    let mut combined = String::new();
+    let facade = manifest_path(&format!("../crates/oulipoly-config/src/{name}.rs"));
+    if let Ok(contents) = fs::read_to_string(&facade) {
+        combined.push_str(&contents);
+        combined.push('\n');
+    }
+    let dir = manifest_path(&format!("../crates/oulipoly-config/src/{name}"));
+    collect_rs_sources(&dir, &mut combined);
+    combined
+}
+
+fn collect_rs_sources(dir: &Path, out: &mut String) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_rs_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            if let Ok(contents) = fs::read_to_string(&path) {
+                out.push_str(&contents);
+                out.push('\n');
+            }
+        }
+    }
 }
 
 fn manifest_path(relative: &str) -> PathBuf {

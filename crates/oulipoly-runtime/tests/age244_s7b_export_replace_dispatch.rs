@@ -33,7 +33,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-const BASE_REF: &str = "f61a445acfdeb1e9df07c86ac6722e5bc3c99e69";
+// Post-decomposition baseline. The oulipoly-config model.rs (#41) and
+// providers.rs (#73) module-directory splits relocated test-fixture provider
+// tokens (e.g. providers.rs -> providers/tests.rs), which re-paths every grep
+// hit relative to the old pre-split baseline and so registered as "new". This
+// ref is the providers/ split merge; the guard still catches any genuinely new
+// concrete provider-name reference introduced after it. Bump on intentional
+// structural relocations.
+const BASE_REF: &str = "9c2bbd965902d119e3e1a592f6988907e27818ea";
 const MODEL: &str = "model-alpha";
 const UNRELATED_MODEL: &str = "model-unrelated";
 const PROVIDER_NAME: &str = "provider-alpha-account";
