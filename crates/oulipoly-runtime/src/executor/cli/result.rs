@@ -23,6 +23,7 @@
 //!       - temp-file-cleanup-lifecycle-contract
 //! ```
 
+use super::super::assistant_response::legacy_stdout_produced_assistant_response;
 use super::super::{
     CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ReturnedArtifactRef,
     SessionCaptureResult, TerminalSignal,
@@ -45,6 +46,7 @@ pub(super) fn execution_result_from_raw(
     resume_acceptance: Option<ResumeAcceptanceResult>,
     session_capture_override: Option<SessionCaptureResult>,
 ) -> ExecutionResult {
+    let produced_assistant_response = legacy_stdout_produced_assistant_response(&result.stdout);
     ExecutionResult {
         stdout: result.stdout,
         stderr: result.stderr,
@@ -54,6 +56,7 @@ pub(super) fn execution_result_from_raw(
         resume_acceptance,
         terminal_reason: result.terminal_reason,
         terminal_signal: result.terminal_signal,
+        produced_assistant_response,
         submitted_user_turn: None,
         captured_child_invocations: result.captured_child_invocations,
         returned_artifacts: result.returned_artifacts,
