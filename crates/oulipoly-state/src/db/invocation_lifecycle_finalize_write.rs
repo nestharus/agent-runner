@@ -309,7 +309,11 @@ impl StateDb {
     }
 
     pub(super) fn provider_error_snippet(value: &str) -> String {
-        value.chars().take(500).collect()
+        Self::collect_snippet(value.chars().take(500))
+    }
+
+    fn collect_snippet(chars: impl Iterator<Item = char>) -> String {
+        chars.collect()
     }
 
     pub(super) fn warn_result_artifact_failure(&self, input: ResultEnvelopeInput<'_>) {

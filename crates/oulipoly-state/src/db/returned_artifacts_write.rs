@@ -291,10 +291,20 @@ impl StateDb {
         reference: &ReturnedArtifactRef,
     ) -> Result<ReturnedArtifactPayloadFields, DbError> {
         Ok(ReturnedArtifactPayloadFields {
-            source_json: serde_json::to_string(&reference.source)
-                .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))?,
-            returned_at: reference.returned_at.to_rfc3339(),
+            source_json: Self::encode_returned_artifact_source(&reference.source)?,
+            returned_at: Self::format_returned_at(reference.returned_at),
         })
+    }
+
+    fn encode_returned_artifact_source(
+        source: &oulipoly_agent_messenger::ReturnedArtifactSource,
+    ) -> Result<String, DbError> {
+        serde_json::to_string(source)
+            .map_err(|e| format!("Failed to encode returned-artifact source: {e}").into())
+    }
+
+    fn format_returned_at(returned_at: DateTime<Utc>) -> String {
+        returned_at.to_rfc3339()
     }
 
     pub(super) fn bind_returned_artifact_row_params<'a>(

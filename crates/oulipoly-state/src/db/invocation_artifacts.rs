@@ -39,15 +39,22 @@ enum RawArtifactKind {
 
 impl StateDb {
     pub(super) fn invocations_dir(&self) -> Option<PathBuf> {
-        if self.db_path == Path::new(":memory:") {
+        if self.is_memory_db() {
             return None;
         }
-        let parent = self
-            .db_path
+        Some(self.invocations_dir_path())
+    }
+
+    fn is_memory_db(&self) -> bool {
+        self.db_path == Path::new(":memory:")
+    }
+
+    fn invocations_dir_path(&self) -> PathBuf {
+        self.db_path
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Some(parent.join("invocations"))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("invocations")
     }
 
     pub(super) fn write_invocation_artifact(
@@ -169,13 +176,16 @@ impl StateDb {
     }
 
     fn format_raw_artifact_filename(uuid: &str, kind: RawArtifactKind) -> String {
-        let suffix = match kind {
+        format!("{uuid}.{}", Self::raw_artifact_suffix(kind))
+    }
+
+    fn raw_artifact_suffix(kind: RawArtifactKind) -> &'static str {
+        match kind {
             RawArtifactKind::Stdout => "stdout",
             RawArtifactKind::Stderr => "stderr",
             RawArtifactKind::Result => "result",
             RawArtifactKind::EventsJsonl => "events.jsonl",
-        };
-        format!("{uuid}.{suffix}")
+        }
     }
 
     fn format_create_artifact_dir_error(dir: &Path, e: std::io::Error) -> String {

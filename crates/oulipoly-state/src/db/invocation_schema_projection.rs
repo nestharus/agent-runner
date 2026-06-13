@@ -145,11 +145,17 @@ impl StateDb {
     ) -> String {
         let prefix = alias.unwrap_or_default();
         match projection {
-            ProviderSessionProjection::DualId => {
-                format!("COALESCE({prefix}provider_session_id, {prefix}session_id)")
-            }
-            ProviderSessionProjection::LegacySessionId => format!("{prefix}session_id"),
+            ProviderSessionProjection::DualId => Self::dual_id_session_expr(prefix),
+            ProviderSessionProjection::LegacySessionId => Self::legacy_session_id_expr(prefix),
         }
+    }
+
+    fn dual_id_session_expr(prefix: &str) -> String {
+        format!("COALESCE({prefix}provider_session_id, {prefix}session_id)")
+    }
+
+    fn legacy_session_id_expr(prefix: &str) -> String {
+        format!("{prefix}session_id")
     }
 
     pub(super) fn invocation_record_select_sql(
