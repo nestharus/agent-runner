@@ -8,6 +8,18 @@
 //!
 //! Role set: { accessor, mapper, orchestration, formatter, validator }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/providers.rs
+//!     role: intrinsic-surface
+//!     Domain: providers-persistence
+//!     Owns:
+//!       - StateDb providers persistence: the providers table/rows and provider-aggregate SQL this concern owns
+//!       - Intrinsic StateDb/rusqlite carriers and DTOs referenced via `use super::*`, subordinate to this domain: StateDb, sqlite, params, DbError, DateTime, Utc
+//! ```
+//!
 //! Provider aggregate and round-robin cursor persistence methods for `StateDb`.
 
 use super::*;

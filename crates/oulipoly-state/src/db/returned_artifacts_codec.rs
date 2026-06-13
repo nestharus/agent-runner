@@ -8,6 +8,18 @@
 //!
 //! Role set: { validator, predicate, mapper, formatter, parser }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/returned_artifacts_codec.rs
+//!     role: intrinsic-surface
+//!     Domain: returned-artifacts-codec
+//!     Owns:
+//!       - the returned-artifact identity/version-id codec this concern owns
+//!       - Intrinsic carriers referenced via `use super::*`, subordinate to this domain: ReturnedArtifactSource, Uuid
+//! ```
+//!
 //! Returned-artifact identity and version-id codec helpers.
 
 use super::*;

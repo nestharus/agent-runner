@@ -4,8 +4,11 @@
 //! - formatter
 //! - accessor
 //! - validator
+//! - mapper
+//! - parser
+//! - predicate
 //!
-//! Role set: { orchestration, formatter, accessor, validator }
+//! Role set: { orchestration, formatter, accessor, validator, mapper, parser, predicate }
 //!
 //! VI-005 end-to-end validation for the PP-001 inversion: `agents migrate-db`
 //! resolves legacy invocation provider names through the installed models config
