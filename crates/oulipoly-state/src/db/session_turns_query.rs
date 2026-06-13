@@ -4,10 +4,11 @@
 //! - filter
 //! - formatter
 //! - mapper
+//! - orchestration
 //! - parser
 //! - predicate
 //!
-//! Role set: { accessor, filter, formatter, mapper, parser, predicate }
+//! Role set: { accessor, filter, formatter, mapper, orchestration, parser, predicate }
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -24,6 +25,11 @@
 //!         via `use super::*`, subordinate to this domain: DateTime, SessionTurnCounts, StateDb, Utc, params, sqlite
 //!       - external contract symbols referenced by this concern via its `use`
 //!         declarations, intrinsic and subordinate to this persistence domain: DateTime, Utc
+//!       - intrinsic JSON and iterator carriers this concern uses to parse and
+//!         canonicalize stored session-turn bodies and to gate empty chunk
+//!         streams, subordinate to this domain: serde_json (serde_json::Value,
+//!         serde_json::from_str, serde_json::Value::Array, serde_json::Value::as_str)
+//!         and std::iter::Peekable
 //! ```
 //!
 //! Session-turn count and user-body query helpers.
@@ -109,7 +115,7 @@ impl StateDb {
         since: Option<&DateTime<Utc>>,
     ) -> Result<u64, String> {
         let count = self.query_assistant_turn_count(provider_name, since)?;
-        Ok(count.max(0) as u64)
+        Ok(Self::nonnegative_turn_count(count))
     }
 
     pub(super) fn query_assistant_turn_count(
@@ -317,25 +323,24 @@ impl StateDb {
         chunk.get("text").and_then(serde_json::Value::as_str)
     }
 
+    /// Produce the canonical text for a turn's text chunks, or `None` when there
+    /// are no text chunks. `None` is distinct from `Some(String::new())`: the
+    /// latter means text chunks were present but each carried empty text.
     pub(super) fn format_canonical_text<'a>(
         texts: impl Iterator<Item = &'a str>,
     ) -> Option<String> {
-        let (canonical_text, text_count) = Self::accumulate_canonical_text(texts);
-        Self::canonical_text_has_chunks(text_count).then_some(canonical_text)
+        let mut texts = texts.peekable();
+        Self::has_text_chunk(&mut texts).then(|| Self::fold_canonical_text(texts))
     }
 
-    fn accumulate_canonical_text<'a>(texts: impl Iterator<Item = &'a str>) -> (String, usize) {
-        let mut canonical_text = String::new();
-        let mut text_count = 0;
-        for text in texts {
-            canonical_text.push_str(text);
-            text_count += 1;
-        }
-        (canonical_text, text_count)
+    fn has_text_chunk<'a>(
+        texts: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    ) -> bool {
+        texts.peek().is_some()
     }
 
-    pub(super) fn canonical_text_has_chunks(text_count: usize) -> bool {
-        text_count > 0
+    fn fold_canonical_text<'a>(texts: impl Iterator<Item = &'a str>) -> String {
+        texts.collect()
     }
 
     pub(super) fn canonical_text_equals(candidate: Option<&str>, text: &str) -> bool {
