@@ -8,6 +8,20 @@
 //!
 //! Role set: { accessor, formatter, validator, mapper, predicate }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_schema_validation.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-schema-validation-persistence
+//!     Owns:
+//!       - the StateDb provider-schema-validation persistence surface this concern extends, split
+//!         from the StateDb facade with the public API preserved
+//!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: StateDb, sqlite, and the providers schema-shape symbols this concern validates
+//! ```
+//!
 //! Provider aggregate schema validation and shape matching.
 
 use super::*;

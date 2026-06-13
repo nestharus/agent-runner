@@ -7,6 +7,20 @@
 //!
 //! Role set: { accessor, formatter, mapper, orchestration }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_lifecycle_finalize_context.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-lifecycle-finalize-context-persistence
+//!     Owns:
+//!       - the StateDb invocation-lifecycle-finalize-context persistence surface this concern extends, split
+//!         from the StateDb facade with the public API preserved
+//!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: StateDb, LifecycleInvocationRow, FinalizeLifecycleInput, lc_log_adapter (FinalizeContext, RawArtifactPaths), active_lifecycle_session_id
+//! ```
+//!
 //! Invocation finalize lifecycle-log context mapping.
 
 use super::*;

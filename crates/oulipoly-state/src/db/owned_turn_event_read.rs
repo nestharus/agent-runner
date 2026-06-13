@@ -6,6 +6,20 @@
 //!
 //! Role set: { accessor, mapper, formatter }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/owned_turn_event_read.rs
+//!     role: intrinsic-surface
+//!     Domain: owned-turn-event-read-persistence
+//!     Owns:
+//!       - the StateDb owned-turn-event-read persistence surface this concern extends, split
+//!         from the StateDb facade with the public API preserved
+//!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: StateDb, StateDbError, Connection, OwnedTurnEvent, CompactSummaryEvidence, params, rusqlite
+//! ```
+//!
 //! Owned turn/event reads and compact-summary evidence mapping.
 
 use super::*;

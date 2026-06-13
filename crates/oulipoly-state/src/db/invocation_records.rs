@@ -7,6 +7,20 @@
 //! - orchestration
 //!
 //! Role set: { accessor, formatter, mapper, parser, orchestration }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/invocation_records.rs
+//!     role: intrinsic-surface
+//!     Domain: invocation-records-persistence
+//!     Owns:
+//!       - the StateDb invocation-records persistence surface this concern extends, split
+//!         from the StateDb facade with the public API preserved
+//!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: StateDb, sqlite, chrono DateTime/Utc, and the InvocationRecord/Status DTOs this concern maps
+//! ```
 
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};

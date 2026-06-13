@@ -22,6 +22,26 @@
 //!         via `use super::*`, subordinate to this domain: Connection, HashMap, MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT, QuotaAggregateProjection, QuotaWindow, QuotaWindowDelta, QuotaWindowInput, StateDb, params, sqlite
 //! ```
 //!
+//! ## Common-interface declarations
+//!
+//! ```yaml
+//! common_interface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quota_window_writes.rs
+//!     role: common-interface
+//!     Contract: provider-quota-window-positional-identity
+//!     Declares:
+//!       - The `&[QuotaWindowInput]` slice IS the StateDb-owned stable per-provider
+//!         window-identity contract: a window's `window_id` is its position in the
+//!         slice. The runtime quota producer (`QuotaScriptWindow`, validated by
+//!         `parse_output`) emits windows in stable per-provider `window_id`/positional
+//!         order before lowering to `QuotaWindowInput`, so `insert_quota_window_rows`
+//!         and `prior_windows_by_id` match cross-refresh rows through this declared
+//!         common interface (slice position), not incidental generated-output ordering.
+//!       - This positional window identity is the pre-existing agreed producer↔StateDb
+//!         contract; the WU #65 decomposition preserves it byte-for-byte and does not
+//!         change quota-window matching semantics.
+//! ```
+//!
 //! Provider quota window replacement and burn-rate delta classification.
 
 use super::*;

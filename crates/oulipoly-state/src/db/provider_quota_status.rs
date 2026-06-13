@@ -5,6 +5,20 @@
 //!
 //! Role set: { orchestration, formatter }
 //!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/provider_quota_status.rs
+//!     role: intrinsic-surface
+//!     Domain: provider-quota-status-persistence
+//!     Owns:
+//!       - the StateDb provider-quota-status persistence surface this concern extends, split
+//!         from the StateDb facade with the public API preserved
+//!       - intrinsic StateDb/rusqlite carriers and concern-owned DTOs referenced
+//!         via `use super::*`, subordinate to this domain: StateDb, sqlite, chrono, and the provider-quota status DTOs this concern reads
+//! ```
+//!
 //! Provider quota status flag and probe timestamp writes.
 
 use super::*;
