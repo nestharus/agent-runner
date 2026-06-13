@@ -1,12 +1,13 @@
 //! ## Declared roles
 //!
-//! - accessor
+//! - orchestration
 //! - filter
-//! - formatter
 //! - mapper
+//! - accessor
+//! - formatter
 //! - parser
 //!
-//! Role set: { accessor, filter, formatter, mapper, parser }
+//! Role set: { orchestration, filter, mapper, accessor, formatter, parser }
 //!
 //! ## Intrinsic-surface declarations
 //!

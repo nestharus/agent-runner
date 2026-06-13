@@ -310,7 +310,7 @@ impl StateDb {
     pub(super) fn session_turn_text_values<'a>(
         chunks: impl Iterator<Item = &'a serde_json::Value>,
     ) -> impl Iterator<Item = &'a str> {
-        chunks.filter_map(Self::session_turn_chunk_text)
+        chunks.flat_map(Self::session_turn_chunk_text)
     }
 
     pub(super) fn session_turn_chunk_text(chunk: &serde_json::Value) -> Option<&str> {
@@ -320,13 +320,18 @@ impl StateDb {
     pub(super) fn format_canonical_text<'a>(
         texts: impl Iterator<Item = &'a str>,
     ) -> Option<String> {
+        let (canonical_text, text_count) = Self::accumulate_canonical_text(texts);
+        Self::canonical_text_has_chunks(text_count).then_some(canonical_text)
+    }
+
+    fn accumulate_canonical_text<'a>(texts: impl Iterator<Item = &'a str>) -> (String, usize) {
         let mut canonical_text = String::new();
         let mut text_count = 0;
         for text in texts {
             canonical_text.push_str(text);
             text_count += 1;
         }
-        Self::canonical_text_has_chunks(text_count).then_some(canonical_text)
+        (canonical_text, text_count)
     }
 
     pub(super) fn canonical_text_has_chunks(text_count: usize) -> bool {

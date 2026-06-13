@@ -1,12 +1,13 @@
 //! ## Declared roles
 //!
-//! - accessor
+//! - orchestration
 //! - filter
-//! - formatter
 //! - mapper
+//! - accessor
+//! - formatter
 //! - parser
 //!
-//! Role set: { accessor, filter, formatter, mapper, parser }
+//! Role set: { orchestration, filter, mapper, accessor, formatter, parser }
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -180,16 +181,18 @@ impl StateDb {
         rows: Vec<RecentTurnRow>,
     ) -> Result<Vec<ParsedTurnPreviewTimestamp>, String> {
         rows.into_iter()
-            .map(|row| {
-                Ok(ParsedTurnPreviewTimestamp {
-                    role: row.role,
-                    timestamp: Self::strict_rfc3339_message(
-                        &row.timestamp_raw,
-                        "recent turn timestamp",
-                    )?,
-                })
-            })
+            .map(Self::parse_turn_preview_timestamp)
             .collect()
+    }
+
+    fn parse_turn_preview_timestamp(
+        row: RecentTurnRow,
+    ) -> Result<ParsedTurnPreviewTimestamp, String> {
+        let timestamp = Self::strict_rfc3339_message(&row.timestamp_raw, "recent turn timestamp")?;
+        Ok(ParsedTurnPreviewTimestamp {
+            role: row.role,
+            timestamp,
+        })
     }
 
     pub(super) fn map_recent_turn_previews(

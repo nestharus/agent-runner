@@ -1,13 +1,14 @@
 //! ## Declared roles
 //!
+//! - orchestration
+//! - validator
+//! - predicate
+//! - mapper
 //! - accessor
 //! - formatter
-//! - mapper
 //! - parser
-//! - predicate
-//! - validator
 //!
-//! Role set: { accessor, formatter, mapper, parser, predicate, validator }
+//! Role set: { orchestration, validator, predicate, mapper, accessor, formatter, parser }
 //!
 //! ## Intrinsic-surface declarations
 //!
