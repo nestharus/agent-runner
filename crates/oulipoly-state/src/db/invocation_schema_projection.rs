@@ -131,12 +131,18 @@ impl StateDb {
         conn: &sqlite::Connection,
         alias: Option<&str>,
     ) -> Result<String, String> {
-        let projection = if Self::invocations_have_dual_id_columns(conn)? {
+        let projection = Self::select_provider_session_projection(conn)?;
+        Ok(Self::format_provider_session_expr(projection, alias))
+    }
+
+    fn select_provider_session_projection(
+        conn: &sqlite::Connection,
+    ) -> Result<ProviderSessionProjection, String> {
+        Ok(if Self::invocations_have_dual_id_columns(conn)? {
             ProviderSessionProjection::DualId
         } else {
             ProviderSessionProjection::LegacySessionId
-        };
-        Ok(Self::format_provider_session_expr(projection, alias))
+        })
     }
 
     pub(super) fn format_provider_session_expr(
@@ -171,14 +177,26 @@ impl StateDb {
     pub(super) fn invocation_dual_id_projection(
         conn: &sqlite::Connection,
     ) -> Result<InvocationDualIdProjection, String> {
-        if Self::invocations_have_dual_id_columns(conn)? {
-            if Self::invocations_have_resolved_account_column(conn)? {
-                Ok(InvocationDualIdProjection::Current)
+        let has_dual_id = Self::invocations_have_dual_id_columns(conn)?;
+        let has_resolved_account = Self::invocations_have_resolved_account_column(conn)?;
+        Ok(Self::map_invocation_dual_id_projection(
+            has_dual_id,
+            has_resolved_account,
+        ))
+    }
+
+    fn map_invocation_dual_id_projection(
+        has_dual_id: bool,
+        has_resolved_account: bool,
+    ) -> InvocationDualIdProjection {
+        if has_dual_id {
+            if has_resolved_account {
+                InvocationDualIdProjection::Current
             } else {
-                Ok(InvocationDualIdProjection::CurrentWithoutResolvedAccount)
+                InvocationDualIdProjection::CurrentWithoutResolvedAccount
             }
         } else {
-            Ok(InvocationDualIdProjection::Legacy)
+            InvocationDualIdProjection::Legacy
         }
     }
 
