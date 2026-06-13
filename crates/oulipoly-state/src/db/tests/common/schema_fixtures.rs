@@ -5,6 +5,21 @@
 //! - orchestration
 //!
 //! Role set: { accessor, formatter, orchestration }
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-state/src/db/tests/common/schema_fixtures.rs
+//!     role: intrinsic-surface
+//!     Domain: schema-fixtures-test-fixture
+//!     Owns:
+//!       - the db test fixture surface this module owns: StateDb-owned temp databases,
+//!       -   schema/rows, and concern DTOs it seeds and inspects via `use super::*`
+//!       - all StateDb/rusqlite carriers referenced via `use super::*`, subordinate to
+//!       -   this fixture domain: StateDb, sqlite, params, Connection, Transaction, Row,
+//!       -   Statement, Uuid, and the concern-owned DTOs each test exercises
+//! ```
 
 use super::super::*;
 use super::*;

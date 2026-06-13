@@ -44,13 +44,17 @@ struct MigrateDbFixture {
 }
 
 fn migrate_db_fixture() -> MigrateDbFixture {
+    let fixture = migrate_db_fixture_layout();
+    create_fixture_dirs(&fixture);
+    fixture
+}
+
+fn migrate_db_fixture_layout() -> MigrateDbFixture {
     let dir = tempfile::tempdir().unwrap();
     let config_home = dir.path().join("config");
     let data_home = dir.path().join("data");
     let models_dir = config_home.join("oulipoly-agent-runner").join("models");
     let db_path = data_home.join("oulipoly-agent-runner").join("state.db");
-    std::fs::create_dir_all(&models_dir).unwrap();
-    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     MigrateDbFixture {
         _dir: dir,
         config_home,
@@ -60,12 +64,21 @@ fn migrate_db_fixture() -> MigrateDbFixture {
     }
 }
 
+fn create_fixture_dirs(fixture: &MigrateDbFixture) {
+    std::fs::create_dir_all(&fixture.models_dir).unwrap();
+    std::fs::create_dir_all(fixture.db_path.parent().unwrap()).unwrap();
+}
+
 fn write_model_toml(models_dir: &Path, model_name: &str, provider_name: &str) {
     std::fs::write(
         models_dir.join(format!("{model_name}.toml")),
-        format!("[[providers]]\nname = \"{provider_name}\"\nargs = []\n"),
+        model_toml(provider_name),
     )
     .unwrap();
+}
+
+fn model_toml(provider_name: &str) -> String {
+    format!("[[providers]]\nname = \"{provider_name}\"\nargs = []\n")
 }
 
 fn write_corrupt_model_toml(models_dir: &Path) {
@@ -121,9 +134,23 @@ fn migrated_invocation_row(db_path: &Path) -> (String, Option<String>, String) {
         .query_row(
             "SELECT model_name, provider_name, status FROM invocations",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            migrated_invocation_row_tuple,
         )
         .unwrap()
+}
+
+fn migrated_invocation_row_tuple(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, Option<String>, String)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+}
+
+fn stderr_text(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+fn stderr_mentions_models_config_failure(stderr: &str) -> bool {
+    stderr.contains("failed to load models config")
 }
 
 #[test]
@@ -158,9 +185,9 @@ fn migrate_db_with_corrupt_models_config_degrades_legacy_non_fatally() {
         Some(0),
         "corrupt models config must not abort migrate-db: {output:?}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr_text(&output);
     assert!(
-        stderr.contains("failed to load models config"),
+        stderr_mentions_models_config_failure(&stderr),
         "corrupt config must emit an observable degradation warning: {stderr}"
     );
     let (model, provider, status) = migrated_invocation_row(&fixture.db_path);

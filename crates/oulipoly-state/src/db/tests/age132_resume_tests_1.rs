@@ -1,8 +1,9 @@
 //! ## Declared roles
 //!
+//! - orchestration
 //! - validator
 //!
-//! Role set: { validator }
+//! Role set: { orchestration, validator }
 //!
 //! ## Intrinsic-surface declarations
 //!
