@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `filter`, `formatter`, `mapper`, `predicate`
+//! `accessor`, `filter`, `formatter`, `mapper`, `predicate`, `orchestration`
 
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeRow, WakeSweepCandidate};
@@ -26,10 +26,7 @@ pub(super) fn wake_sweep_candidate_disposition(
         return abandoned_transient_disposition(db, state, candidate);
     }
     if wake_sweep_candidate_is_resumable(db, state, candidate)? {
-        if wake_sweep_candidate_reached_cap(candidate) {
-            emit_wake_sweep_candidate_cap_reached(&candidate.session_id, candidate);
-        }
-        return Ok(resumable_wake_sweep_disposition(candidate));
+        return Ok(resumable_disposition_with_cap_emit(candidate));
     }
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
@@ -47,12 +44,45 @@ fn abandoned_transient_disposition(
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<WakeSweepDisposition, String> {
-    if wake_sweep_candidate_is_resumable(db, state, candidate)? {
+    // Preserve only sessions with durable WORK — at least one produced assistant
+    // turn. A bare resume target (a registered chain segment with zero turns) is
+    // an empty registration, not work, so a dead-owner session with no produced
+    // turns is reaped rather than left pending forever.
+    if wake_sweep_candidate_has_produced_turns(db, state, candidate)? {
         trace_abandoned_transient_wake_skip(&candidate.session_id);
         return Ok(WakeSweepDisposition::Skip);
     }
     trace_abandoned_transient_wake_reap(&candidate.session_id);
     Ok(WakeSweepDisposition::Abandoned)
+}
+
+fn wake_sweep_candidate_has_produced_turns(
+    db: &MailboxDb,
+    state: Option<&StateDb>,
+    candidate: &WakeSweepCandidate,
+) -> Result<bool, String> {
+    let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
+        return Ok(false);
+    };
+    let evidence = wake_sweep_runtime_resume_evidence_values(state, &runtime)?;
+    Ok(runtime_has_produced_turns(evidence))
+}
+
+fn runtime_has_produced_turns(evidence: Option<(bool, u64)>) -> bool {
+    evidence
+        .map(|(_, turn_count)| turn_count > 0)
+        .unwrap_or(false)
+}
+
+fn resumable_disposition_with_cap_emit(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
+    emit_cap_reached_if_capped(candidate);
+    resumable_wake_sweep_disposition(candidate)
+}
+
+fn emit_cap_reached_if_capped(candidate: &WakeSweepCandidate) {
+    if wake_sweep_candidate_reached_cap(candidate) {
+        emit_wake_sweep_candidate_cap_reached(&candidate.session_id, candidate);
+    }
 }
 
 fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
@@ -67,8 +97,16 @@ fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweep
 
 fn wake_sweep_candidate_has_deliverable_pending(session_id: &str) -> bool {
     crate::mailbox_delivery::deliverable_pending_count(session_id)
-        .map(|count| count > 0)
+        .map(count_is_positive)
         .unwrap_or(false)
+}
+
+fn count_is_positive(count: usize) -> bool {
+    count > 0
+}
+
+fn option_is_present<T>(value: Option<T>) -> bool {
+    value.is_some()
 }
 
 fn wake_sweep_candidate_is_resumable(
@@ -126,14 +164,28 @@ fn wake_sweep_runtime_resume_evidence_values(
     let Some(provider_name) = runtime.provider_name.as_deref() else {
         return Ok(None);
     };
-    let has_chain = state
-        .chain_id_for_segment(provider_name, &runtime.session_id)
-        .map_err(|err| err.to_string())?
-        .is_some();
-    let turn_count = state
-        .count_session_turns(provider_name, &runtime.session_id)
-        .map(|counts| counts.total)?;
+    let has_chain = segment_has_chain(state, provider_name, &runtime.session_id)?;
+    let turn_count = session_total_turn_count(state, provider_name, &runtime.session_id)?;
     Ok(Some((has_chain, turn_count)))
+}
+
+fn segment_has_chain(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    state
+        .chain_id_for_segment(provider_name, session_id)
+        .map(option_is_present)
+        .map_err(|err| err.to_string())
+}
+
+fn session_total_turn_count(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+) -> Result<u64, String> {
+    Ok(state.count_session_turns(provider_name, session_id)?.total)
 }
 
 fn resume_evidence_values_present(evidence: Option<(bool, u64)>) -> bool {
@@ -152,12 +204,11 @@ fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxR
 }
 
 fn pending_rows_have_live_owner(rows: &[MailboxRow]) -> Result<bool, String> {
-    for row in rows {
-        if mailbox_row_has_live_owner_identity(row)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(pending_rows_liveness(rows)?.contains(&true))
+}
+
+fn pending_rows_liveness(rows: &[MailboxRow]) -> Result<Vec<bool>, String> {
+    rows.iter().map(mailbox_row_has_live_owner_identity).collect()
 }
 
 fn wake_sweep_candidate_is_abandoned_transient(
@@ -179,7 +230,7 @@ fn wake_sweep_candidate_is_unclaimed_abandoned_transient(
 }
 
 fn wake_sweep_candidate_has_wake_claim(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    db.wake_claim(session_id).map(|claim| claim.is_some())
+    db.wake_claim(session_id).map(option_is_present)
 }
 
 fn pending_rows_are_abandoned_transient(rows: &[MailboxRow]) -> Result<bool, String> {
@@ -201,7 +252,16 @@ fn mailbox_row_has_live_owner_identity(row: &MailboxRow) -> Result<bool, String>
     let Some(recorded) = mailbox_row_owner_identity(row) else {
         return Ok(false);
     };
-    read_live_process_identity(recorded.os_pid).map(|live| live.as_ref() == Some(&recorded))
+    recorded_identity_is_live(&recorded)
+}
+
+fn recorded_identity_is_live(recorded: &ProcessIdentity) -> Result<bool, String> {
+    read_live_process_identity(recorded.os_pid)
+        .map(|live| live_identity_matches(live.as_ref(), recorded))
+}
+
+fn live_identity_matches(live: Option<&ProcessIdentity>, recorded: &ProcessIdentity) -> bool {
+    live == Some(recorded)
 }
 
 fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {

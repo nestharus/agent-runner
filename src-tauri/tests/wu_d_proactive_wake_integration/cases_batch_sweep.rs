@@ -4,9 +4,9 @@
 //!
 //! TEST: proactive wake integration orchestration cases (batch delivery and wake-sweep regressions).
 
-use crate::SESSION;
 use crate::fake_cli::provider_script;
 use crate::fixtures::Fixture;
+use crate::{MODEL, PROVIDER, SESSION};
 use crate::liveness::{
     assert_dead_owner_debris_reaped, delivered_rows_without_pending_or_claim,
     delivered_single_row_without_error_or_claim, settle_wake_sweep, wait_for_file, wait_until,
@@ -100,6 +100,27 @@ pub(crate) fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
     settle_wake_sweep();
 
     assert_prompt_file_missing(&fixture, "non-resumable-transient-resumed.txt");
+    assert_dead_owner_debris_reaped(&fixture, SESSION);
+    assert_no_wake_claim(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn wake_sweep_reaps_dead_owner_session_with_chain_but_no_turns() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "chain-no-turns-resumed.txt"));
+    // A registered chain segment with ZERO produced turns is an empty resume
+    // target, not durable work. With a dead owner, it must be reaped (not
+    // preserved as if resumable) and never auto-woken.
+    fixture.seed_active_chain_for("33333333-3333-4333-8333-333333333333", PROVIDER, SESSION, MODEL);
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-chain-no-turns");
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+    settle_wake_sweep();
+
+    assert_prompt_file_missing(&fixture, "chain-no-turns-resumed.txt");
     assert_dead_owner_debris_reaped(&fixture, SESSION);
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
