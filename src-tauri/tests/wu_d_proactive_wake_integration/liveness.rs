@@ -218,6 +218,13 @@ fn single_mailbox_row_is_delivered(rows: &[MailboxRow]) -> bool {
     rows.len() == 1 && mailbox_row_has_delivery(&rows[0])
 }
 
+pub(crate) fn assert_dead_owner_debris_reaped(fixture: &Fixture, session_id: &str) {
+    assert!(
+        dead_session_debris_is_reaped(fixture, session_id),
+        "expected non-resumable dead-owner session {session_id} to be reaped with {WAKE_SWEEP_ABANDONED_ERROR}"
+    );
+}
+
 fn dead_session_debris_is_reaped(fixture: &Fixture, session_id: &str) -> bool {
     dead_session_rows_are_reaped(&mailbox_rows(fixture, session_id))
         && wake_claim_is_absent(&wake_claim(fixture, session_id))

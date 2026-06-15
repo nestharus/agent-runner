@@ -104,6 +104,11 @@ fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
 }
 
 #[test]
+fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
+    cases_batch_sweep::wake_sweep_reaps_non_resumable_abandoned_transient_session();
+}
+
+#[test]
 fn wake_sweep_delivers_resumable_session_missing_models_dir() {
     cases_batch_sweep::wake_sweep_delivers_resumable_session_missing_models_dir();
 }
