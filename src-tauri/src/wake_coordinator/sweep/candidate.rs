@@ -23,8 +23,7 @@ pub(super) fn wake_sweep_candidate_disposition(
         return Ok(WakeSweepDisposition::Skip);
     }
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
-        trace_abandoned_transient_wake_skip(&candidate.session_id);
-        return Ok(WakeSweepDisposition::Skip);
+        return abandoned_transient_disposition(db, state, candidate);
     }
     if wake_sweep_candidate_is_resumable(db, state, candidate)? {
         if wake_sweep_candidate_reached_cap(candidate) {
@@ -35,6 +34,24 @@ pub(super) fn wake_sweep_candidate_disposition(
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
+    Ok(WakeSweepDisposition::Abandoned)
+}
+
+/// Disposition for an unclaimed session whose pending rows all have a dead owner
+/// PID lineage. Such a session is never auto-woken (anti-resurrection, #44/#55).
+/// When it also has no durable resume evidence, its pending rows are
+/// undeliverable debris and are reaped so they do not accumulate; a resumable
+/// session is left pending so a later deliberate resume can still consume it.
+fn abandoned_transient_disposition(
+    db: &MailboxDb,
+    state: Option<&StateDb>,
+    candidate: &WakeSweepCandidate,
+) -> Result<WakeSweepDisposition, String> {
+    if wake_sweep_candidate_is_resumable(db, state, candidate)? {
+        trace_abandoned_transient_wake_skip(&candidate.session_id);
+        return Ok(WakeSweepDisposition::Skip);
+    }
+    trace_abandoned_transient_wake_reap(&candidate.session_id);
     Ok(WakeSweepDisposition::Abandoned)
 }
 
@@ -211,5 +228,12 @@ fn trace_abandoned_transient_wake_skip(session_id: &str) {
     tracing::warn!(
         session_id,
         "Skipping auto wake for abandoned transient session with dead owner lineage"
+    );
+}
+
+fn trace_abandoned_transient_wake_reap(session_id: &str) {
+    tracing::warn!(
+        session_id,
+        "Reaping abandoned transient session with dead owner lineage and no resume evidence"
     );
 }

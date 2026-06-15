@@ -8,8 +8,8 @@ use crate::SESSION;
 use crate::fake_cli::provider_script;
 use crate::fixtures::Fixture;
 use crate::liveness::{
-    delivered_rows_without_pending_or_claim, delivered_single_row_without_error_or_claim,
-    settle_wake_sweep, wait_for_file, wait_until,
+    assert_dead_owner_debris_reaped, delivered_rows_without_pending_or_claim,
+    delivered_single_row_without_error_or_claim, settle_wake_sweep, wait_for_file, wait_until,
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
@@ -81,6 +81,26 @@ pub(crate) fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
 
     assert_prompt_file_missing(&fixture, "abandoned-transient-resumed.txt");
     assert_pending_handle_without_error(&fixture, SESSION, "h-abandoned-transient");
+    assert_no_wake_claim(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script("", "", "non-resumable-transient-resumed.txt"));
+    // Idle headless runtime with a dead-owner pending row, but NO session turn /
+    // chain -> no durable resume evidence. The session is never auto-woken
+    // (anti-resurrection) and, being non-resumable, its undeliverable row is reaped.
+    fixture.seed_idle_runtime();
+    fixture.seed_mailbox(SESSION, "h-non-resumable-transient");
+
+    let output = fixture.run_mailbox_list(SESSION);
+    assert_success(&output);
+    settle_wake_sweep();
+
+    assert_prompt_file_missing(&fixture, "non-resumable-transient-resumed.txt");
+    assert_dead_owner_debris_reaped(&fixture, SESSION);
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
