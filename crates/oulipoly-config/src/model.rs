@@ -1,9 +1,14 @@
 //! ## Declared roles
 //!
 //! - accessor
+//! - parser
+//! - validator
+//! - mapper
+//! - formatter
+//! - predicate
 //! - orchestration
 //!
-//! Role set: { accessor, orchestration }
+//! Role set: { accessor, parser, validator, mapper, formatter, predicate, orchestration }
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -13,7 +18,7 @@
 //!     role: intrinsic-surface
 //!     Domain: model-config-facade
 //!     Owns:
-//!       - public model module facade and frozen re-export surface
+//!       - public model module facade and frozen parser/validator/mapper/formatter/predicate re-export surface
 //!       - submodule declaration hub for model configuration concerns
 //!       - crate-internal test support aliases for moved model loader helpers
 //! ```
@@ -45,7 +50,7 @@ pub use self::tool_restrictions::{
 };
 
 #[cfg(test)]
-use self::codex_overlap::{codex_arg_overlap, split_codex_arg_parts, CodexArgPart};
+use self::codex_overlap::{CodexArgPart, codex_arg_overlap, split_codex_arg_parts};
 
 #[cfg(test)]
 use self::loader::{

@@ -322,7 +322,7 @@ state_dir = {}
 }
 
 #[test]
-fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
+fn legacy_opencode_resume_confirms_delivery_after_host_observed_assistant_response() {
     let _guard = integration_test_guard();
     let fixture = prepared_fixture();
     fixture.seed_mailbox_notification();
@@ -359,18 +359,7 @@ fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
             .state()
             .has_session_user_text_turn(PROVIDER, SESSION, &prompt)
             .unwrap(),
-        "fixture should quote-wrap the delivered user body so exact-text confirmation stays red"
-    );
-    assert!(
-        fixture
-            .state()
-            .has_session_user_turn_containing(
-                PROVIDER,
-                SESSION,
-                &delivery_nonce_from_prompt(&prompt)
-            )
-            .unwrap(),
-        "session_turns should contain the delivery nonce in the quote-wrapped user body"
+        "host-observed assistant output confirms delivery without exact-text transcript evidence"
     );
     assert_eq!(fixture.unconfirmed_invocation_count(), 0);
     assert!(fixture.mailbox().list_pending(SESSION).unwrap().is_empty());
@@ -378,13 +367,13 @@ fn legacy_opencode_resume_confirms_delivery_after_targeted_turn_ingest() {
 }
 
 #[test]
-fn legacy_opencode_resume_leaves_mailbox_pending_when_ingested_turn_omits_delivery_nonce() {
+fn legacy_opencode_resume_confirms_delivery_when_ingested_turn_omits_delivery_nonce() {
     let _guard = integration_test_guard();
     let fixture = prepared_fixture();
     fixture.seed_mailbox_notification();
 
     let output = fixture.run_resume_with_env(&[("WAKE_CONFIRM_STRIP_DELIVERY_NONCE", "1")]);
-    assert_exit_code(&output, 1);
+    assert_success(&output);
     let prompt = wait_for_file(&fixture.notification_prompt_path());
     assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
     wait_until(
@@ -396,15 +385,15 @@ fn legacy_opencode_resume_leaves_mailbox_pending_when_ingested_turn_omits_delive
         },
     );
     wait_until(
-        "nonce-less export leaves mailbox pending unconfirmed",
+        "nonce-less export still marks mailbox delivered from host-observed assistant output",
         || {
             let db = fixture.mailbox();
             let rows = db.list_mailbox(SESSION, true).unwrap();
             rows.len() == 1
-                && rows[0].delivered_at.is_none()
+                && rows[0].delivered_at.is_some()
                 && rows[0].delivery_attempts == 1
-                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
-                && rows[0].delivered_by_invocation_uuid.is_none()
+                && rows[0].delivery_error.is_none()
+                && rows[0].delivered_by_invocation_uuid.is_some()
         },
     );
     assert!(
@@ -416,41 +405,44 @@ fn legacy_opencode_resume_leaves_mailbox_pending_when_ingested_turn_omits_delive
                 &delivery_nonce_from_prompt(&prompt)
             )
             .unwrap(),
-        "stored resume turn without the delivery nonce must not confirm delivery"
+        "the stale transcript export still omits the delivery nonce"
     );
-    assert_eq!(fixture.unconfirmed_invocation_count(), 1);
-    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
+    assert_eq!(fixture.unconfirmed_invocation_count(), 0);
+    assert!(fixture.mailbox().list_pending(SESSION).unwrap().is_empty());
     fixture.assert_xdg_isolated();
 }
 
 #[test]
-fn legacy_opencode_resume_leaves_mailbox_pending_when_export_omits_notification_turn() {
+fn legacy_opencode_resume_confirms_delivery_when_export_omits_notification_turn() {
     let _guard = integration_test_guard();
     let fixture = prepared_fixture();
     fixture.seed_mailbox_notification();
 
     let output = fixture.run_resume_with_env(&[("WAKE_CONFIRM_OMIT_RESUME_USER_TURN", "1")]);
-    assert_exit_code(&output, 1);
+    assert_success(&output);
     let prompt = wait_for_file(&fixture.notification_prompt_path());
     assert!(prompt.contains("[OULIPOLY-DELIVERY "), "{prompt}");
-    wait_until("omitted export leaves mailbox pending unconfirmed", || {
-        let db = fixture.mailbox();
-        let rows = db.list_mailbox(SESSION, true).unwrap();
-        rows.len() == 1
-            && rows[0].delivered_at.is_none()
-            && rows[0].delivery_attempts == 1
-            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
-            && rows[0].delivered_by_invocation_uuid.is_none()
-    });
+    wait_until(
+        "omitted export still marks mailbox delivered from host-observed assistant output",
+        || {
+            let db = fixture.mailbox();
+            let rows = db.list_mailbox(SESSION, true).unwrap();
+            rows.len() == 1
+                && rows[0].delivered_at.is_some()
+                && rows[0].delivery_attempts == 1
+                && rows[0].delivery_error.is_none()
+                && rows[0].delivered_by_invocation_uuid.is_some()
+        },
+    );
     assert!(
         !fixture
             .state()
             .has_session_user_text_turn(PROVIDER, SESSION, &prompt)
             .unwrap(),
-        "omitted export must not create exact user-turn confirmation evidence"
+        "the stale transcript export still omits exact user-turn confirmation evidence"
     );
-    assert_eq!(fixture.unconfirmed_invocation_count(), 1);
-    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
+    assert_eq!(fixture.unconfirmed_invocation_count(), 0);
+    assert!(fixture.mailbox().list_pending(SESSION).unwrap().is_empty());
     fixture.assert_xdg_isolated();
 }
 
