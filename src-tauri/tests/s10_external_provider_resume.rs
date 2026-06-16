@@ -430,6 +430,11 @@ fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd
         "resume must pass the provider session captured by the first external launch"
     );
     assert_eq!(
+        resume_launch["params"]["session"]["start_mode"].as_str(),
+        Some("resume"),
+        "resume must tell external providers to resume the known session"
+    );
+    assert_eq!(
         resume_launch["params"]["model"]["inputs"]["prompt"].as_str(),
         Some("resume prompt")
     );

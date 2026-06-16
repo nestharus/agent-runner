@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "launch.schema.json",
   "title": "Oulipoly Provider Launch Contract",
+  "$comment": "intrinsic_surface_declarations:\n  - component: contract/v1/launch.schema.json\n    role: intrinsic-surface\n    Domain: oulipoly-provider-launch-contract\n    Owns:\n      - LaunchParams schema\n      - LaunchSession schema\n      - launch request, event, and result schemas\n      - common.schema.json references used by provider launch contract envelopes",
   "type": "object",
   "$defs": {
     "LaunchParams": {
@@ -14,10 +15,23 @@
         "working_directory": { "type": "string", "minLength": 1 },
         "env": { "$ref": "common.schema.json#/$defs/StringMap" },
         "stdin": { "$ref": "common.schema.json#/$defs/BytePayload" },
-        "session": { "type": "object", "additionalProperties": true }
+        "session": { "$ref": "#/$defs/LaunchSession" }
       },
       "required": ["settings_id", "mode", "model", "argv", "working_directory"],
       "additionalProperties": false
+    },
+    "LaunchSession": {
+      "type": "object",
+      "description": "Host-supplied launch session intent. known_provider_session_id identifies the provider session id; start_mode=create means start a new provider session using that id, while start_mode=resume means continue an existing provider session with that id. Omit both fields when no known provider session id is supplied.",
+      "properties": {
+        "known_provider_session_id": { "type": "string", "minLength": 1 },
+        "start_mode": { "enum": ["create", "resume"] }
+      },
+      "dependentRequired": {
+        "known_provider_session_id": ["start_mode"],
+        "start_mode": ["known_provider_session_id"]
+      },
+      "additionalProperties": true
     },
     "LaunchRequest": {
       "allOf": [

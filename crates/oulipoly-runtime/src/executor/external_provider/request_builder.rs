@@ -1,4 +1,19 @@
-//! Role: mapper.
+//! ## Declared roles
+//!
+//! `mapper`, `accessor`, `predicate`, `formatter`, `parser`, `validator`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/executor/external_provider/request_builder.rs
+//!     role: adapter
+//!     Translates:
+//!       - external-provider-dispatch-context-carrier
+//!       - oulipoly-provider-policy-evaluate-contract
+//!       - oulipoly-provider-launch-contract
+//!       - child-process-launch-environment-contract
+//! ```
 
 use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::{resolve_input_flags, shell_split};
@@ -391,12 +406,25 @@ fn launch_session(context: &ExternalProviderDispatchContext) -> Option<JsonObjec
             "known_provider_session_id".to_string(),
             Value::String(session_id.clone()),
         );
+        let start_mode = required_known_provider_session_start_mode(context);
+        session.insert(
+            "start_mode".to_string(),
+            Value::String(start_mode.as_str().to_string()),
+        );
     }
     if session.is_empty() {
         None
     } else {
         Some(session)
     }
+}
+
+fn required_known_provider_session_start_mode(
+    context: &ExternalProviderDispatchContext,
+) -> crate::services::ProviderSessionStartMode {
+    context
+        .start_known_provider_session_mode
+        .expect("known provider session id requires a start mode")
 }
 
 fn mode(context: &ExternalProviderDispatchContext) -> String {

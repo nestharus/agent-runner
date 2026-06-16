@@ -1,14 +1,21 @@
-//! Role: carrier.
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `formatter`, `parser`, `predicate`
 //!
 //! ```yaml
 //! intrinsic_surface_declarations:
-//!   - surface_id: age217_s6a_dispatch_context
-//!     component: crates/oulipoly-runtime/src/executor/external_provider/context.rs
-//!     role: carrier
-//!     carrier: ExternalProviderDispatchContext
-//!     invariant: carrier == actual, with settings_id derived from the selected provider account
+//!   - component: crates/oulipoly-runtime/src/executor/external_provider/context.rs
+//!     role: intrinsic-surface
+//!     Domain: external-provider-dispatch-context-carrier
+//!     Owns:
+//!       - ExternalProviderDispatchContext carrier fields
+//!       - ExternalProviderDispatchInput carrier fields
+//!       - AccountSelection carrier fields
+//!       - settings_id derivation invariant
+//!       - provider session start intent fields
 //! ```
 
+use crate::services::ProviderSessionStartMode;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::Path;
@@ -26,6 +33,7 @@ pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) models_dir: Option<PathBuf>,
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
+    pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
     pub(crate) settings_id: String,
 }
 
@@ -41,6 +49,7 @@ pub(crate) struct ExternalProviderDispatchInput {
     pub(crate) models_dir: Option<PathBuf>,
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
+    pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
 }
 
 impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
@@ -57,6 +66,7 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             models_dir: input.models_dir,
             parent_invocation_env: input.parent_invocation_env,
             start_known_provider_session_id: input.start_known_provider_session_id,
+            start_known_provider_session_mode: input.start_known_provider_session_mode,
             settings_id,
         }
     }

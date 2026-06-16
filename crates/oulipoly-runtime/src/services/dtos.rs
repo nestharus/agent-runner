@@ -1,5 +1,6 @@
 //! ## Declared roles
-//! accessor
+//!
+//! `accessor`, `formatter`
 //!
 //! Service DTO contract carrier. This module owns request and output shapes only;
 //! production adapters and helper orchestration live in sibling modules.
@@ -258,6 +259,33 @@ pub enum ExecutorServiceRequest {
         parent_invocation_env: Option<String>,
         start_known_provider_session_id: String,
     },
+    EffectiveWithCreateKnownProviderSessionId {
+        model: ModelConfig,
+        provider: ProviderConfig,
+        provider_index: usize,
+        prompt_mode: PromptMode,
+        prompt: String,
+        working_dir: Option<PathBuf>,
+        models_dir: Option<PathBuf>,
+        extra_inputs: HashMap<String, Vec<String>>,
+        parent_invocation_env: Option<String>,
+        start_known_provider_session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSessionStartMode {
+    Create,
+    Resume,
+}
+
+impl ProviderSessionStartMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Resume => "resume",
+        }
+    }
 }
 
 pub struct ExecutorServiceOutput {

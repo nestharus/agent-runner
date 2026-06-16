@@ -94,7 +94,8 @@ struct RecordingExecutorService {
 fn capture_request_provider(request: &ExecutorServiceRequest) -> Option<ProviderConfig> {
     match request {
         ExecutorServiceRequest::Effective { provider, .. }
-        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { provider, .. } => {
+        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { provider, .. }
+        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId { provider, .. } => {
             Some(provider.clone())
         }
         ExecutorServiceRequest::Facade { .. } => None,
@@ -320,7 +321,7 @@ printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$requested""#,
     let service: &dyn ExecutorServicePort = &recording_service;
     let ExecutorServiceOutput { result } = service
         .execute(
-            ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
                 model,
                 provider: provider.clone(),
                 provider_index: 2,
