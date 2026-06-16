@@ -466,6 +466,13 @@ impl ExecutorServicePort for StubExecutorService {
                 working_dir,
                 parent_invocation_env,
                 ..
+            }
+            | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
+                provider,
+                extra_inputs,
+                working_dir,
+                parent_invocation_env,
+                ..
             } => {
                 self.calls.lock().unwrap().push(format!(
                     "effective:{}:{}:{}:{}",
@@ -509,6 +516,9 @@ impl ExecutorServicePort for PolicyRecordingExecutorService {
         let provider = match request {
             ExecutorServiceRequest::Effective { provider, .. }
             | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+                provider, ..
+            }
+            | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
                 provider, ..
             } => provider,
             ExecutorServiceRequest::Facade { .. } => {

@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: accessor, mapper, orchestration.
+//! `accessor`, `mapper`, `orchestration`, `predicate`, `validator`, `formatter`
 //!
 //! ## Adapter declarations
 //!
@@ -11,6 +11,9 @@
 //!     Translates:
 //!       - executor-service-contract
 //!       - executor-facade-wrapper-contract
+//!       - provider-registry-dispatch-contract
+//!       - external-provider-dispatch-contract
+//!       - legacy-cli-execution-contract
 //! ```
 
 mod assistant_response;
@@ -231,6 +234,18 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
+        }
+        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            models_dir,
+            extra_inputs,
+            parent_invocation_env,
+            start_known_provider_session_id,
         } => cli::execute_effective_with_start_known_provider_session_id(
             cli::EffectiveExecuteRequest {
                 model: &model,
@@ -283,6 +298,7 @@ fn external_provider_context_from_request(
                 models_dir,
                 parent_invocation_env,
                 start_known_provider_session_id: None,
+                start_known_provider_session_mode: None,
             }
             .into()
         }
@@ -307,6 +323,7 @@ fn external_provider_context_from_request(
             models_dir,
             parent_invocation_env,
             start_known_provider_session_id: None,
+            start_known_provider_session_mode: None,
         }
         .into(),
         ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
@@ -331,6 +348,36 @@ fn external_provider_context_from_request(
             models_dir,
             parent_invocation_env,
             start_known_provider_session_id: Some(start_known_provider_session_id),
+            start_known_provider_session_mode: Some(
+                crate::services::ProviderSessionStartMode::Resume,
+            ),
+        }
+        .into(),
+        ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            working_dir,
+            models_dir,
+            extra_inputs,
+            parent_invocation_env,
+            start_known_provider_session_id,
+        } => ExternalProviderDispatchInput {
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            prompt,
+            extra_inputs,
+            working_dir,
+            models_dir,
+            parent_invocation_env,
+            start_known_provider_session_id: Some(start_known_provider_session_id),
+            start_known_provider_session_mode: Some(
+                crate::services::ProviderSessionStartMode::Create,
+            ),
         }
         .into(),
     })
@@ -340,7 +387,8 @@ fn request_model_has_external_provider(request: &ExecutorServiceRequest) -> bool
     match request {
         ExecutorServiceRequest::Facade { model, .. }
         | ExecutorServiceRequest::Effective { model, .. }
-        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { model, .. } => {
+        | ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId { model, .. }
+        | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId { model, .. } => {
             model.provider.is_some()
         }
     }

@@ -1,13 +1,29 @@
 //! ## Declared roles
 //!
 //! `orchestration`, `mapper`, `formatter`, `predicate`, `accessor`, `validator`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/balancing/orchestration.rs
+//!     role: adapter
+//!     Translates:
+//!       - balancing-run-loop-contract
+//!       - routing-service-selection-contract
+//!       - invocation-lifecycle-contract
+//!       - executor-dispatch-contract
+//!       - terminal-zero-turn-disposition-contract
+//! ```
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use oulipoly_runtime::executor;
-use oulipoly_runtime::services::{InvocationLifecycleServicePort, RoutingServicePort};
+use oulipoly_runtime::services::{
+    InvocationLifecycleServicePort, ProviderSessionStartMode, RoutingServicePort,
+};
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::repositories::StateDbOpener;
 
@@ -273,8 +289,14 @@ struct BalancedInvocationAttempt<'state> {
     invocation_row_id: i64,
     guard: FinalizerGuard<'state>,
     start_known_provider_session_id: Option<String>,
+    start_known_provider_session_mode: Option<ProviderSessionStartMode>,
     zero_turn_baseline: ZeroTurnBaseline,
     invocation_env: String,
+}
+
+struct StartKnownProviderSession {
+    id: Option<String>,
+    mode: Option<ProviderSessionStartMode>,
 }
 
 fn start_balanced_attempt<'state>(
@@ -298,18 +320,18 @@ fn start_balanced_attempt<'state>(
         &invocation,
     )?;
     let guard = FinalizerGuard::new(&env.state, invocation_row_id);
-    let start_known_provider_session_id =
-        start_known_provider_session_id_for_attempt(provider, pending_verification)?;
+    let start_known_provider_session =
+        start_known_provider_session_for_attempt(provider, pending_verification)?;
     bind_start_known_provider_session_if_present(
         &env.state,
         invocation_row_id,
-        start_known_provider_session_id.as_deref(),
+        start_known_provider_session.id.as_deref(),
     );
     let zero_turn_baseline = zero_turn_record_baseline(
         &env.state,
         &env.sessions_cfg,
         provider_name,
-        start_known_provider_session_id.as_deref(),
+        start_known_provider_session.id.as_deref(),
     );
     let invocation_env = formatter::invocation_env(&invocation)
         .map_err(formatter::invocation_env_serialization_error)?;
@@ -318,7 +340,8 @@ fn start_balanced_attempt<'state>(
         invocation,
         invocation_row_id,
         guard,
-        start_known_provider_session_id,
+        start_known_provider_session_id: start_known_provider_session.id,
+        start_known_provider_session_mode: start_known_provider_session.mode,
         zero_turn_baseline,
         invocation_env,
     })
@@ -351,13 +374,24 @@ fn start_balanced_invocation_row(
         .map_err(|err| err.to_string())
 }
 
-fn start_known_provider_session_id_for_attempt(
+fn start_known_provider_session_for_attempt(
     provider: &ProviderConfig,
     pending_verification: Option<(usize, Option<String>)>,
-) -> Result<Option<String>, String> {
+) -> Result<StartKnownProviderSession, String> {
     match pending_verification {
-        Some((_, session_id)) => Ok(session_id),
-        None => executor::cli::start_known_provider_session_id(provider),
+        Some((_, session_id)) => Ok(StartKnownProviderSession {
+            mode: session_id
+                .as_ref()
+                .map(|_| ProviderSessionStartMode::Resume),
+            id: session_id,
+        }),
+        None => {
+            let id = executor::cli::start_known_provider_session_id(provider)?;
+            Ok(StartKnownProviderSession {
+                mode: id.as_ref().map(|_| ProviderSessionStartMode::Create),
+                id,
+            })
+        }
     }
 }
 
@@ -380,6 +414,7 @@ fn execute_balanced_attempt(
         (
             &attempt.invocation_env,
             attempt.start_known_provider_session_id.clone(),
+            attempt.start_known_provider_session_mode,
         ),
     );
     match agent_runtime_services

@@ -5,7 +5,9 @@ use oulipoly_config::{
 };
 use oulipoly_runtime::executor::RuntimeExecutorService;
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
-use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
+use oulipoly_runtime::services::{
+    ExecutorServicePort, ExecutorServiceRequest, ProviderSessionStartMode,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -101,10 +103,21 @@ fn external_launch_exit_session_populates_capture_and_resume_request() {
         2,
         "launch records: {launch_records:?}"
     );
+    assert!(
+        launch_records[0]["request"]["params"]
+            .get("session")
+            .is_none(),
+        "first launch without a known provider session id must omit session params"
+    );
     assert_eq!(
         launch_records[1]["request"]["params"]["session"]["known_provider_session_id"].as_str(),
         Some(expected_session.as_str()),
         "resume launch must receive the provider session captured from the prior external launch"
+    );
+    assert_eq!(
+        launch_records[1]["request"]["params"]["session"]["start_mode"].as_str(),
+        Some("resume"),
+        "resume launch must tell external providers to resume the known session"
     );
     let expected_path = std::env::var("PATH").expect("test process should have PATH");
     assert_eq!(
@@ -129,23 +142,81 @@ fn external_launch_exit_session_populates_capture_and_resume_request() {
     );
 }
 
+#[test]
+fn external_launch_with_forced_session_id_marks_start_mode_create() {
+    let fixture = Fixture::new();
+    let service = RuntimeExecutorService::new(Arc::new(fixture.registry()));
+    let expected_session = session_id();
+
+    let result = execute_external_with_start_mode(
+        &service,
+        expected_session.as_str(),
+        ProviderSessionStartMode::Create,
+    );
+
+    assert_eq!(String::from_utf8_lossy(&result.result.stdout), "ok\n");
+    let launch_records = fixture.records_for("launch");
+    assert_eq!(
+        launch_records.len(),
+        1,
+        "launch records: {launch_records:?}"
+    );
+    assert_eq!(
+        launch_records[0]["request"]["params"]["session"]["known_provider_session_id"].as_str(),
+        Some(expected_session.as_str())
+    );
+    assert_eq!(
+        launch_records[0]["request"]["params"]["session"]["start_mode"].as_str(),
+        Some("create"),
+        "fresh forced launches must tell external providers to create the known session"
+    );
+}
+
 fn execute_external(
     service: &RuntimeExecutorService,
     known_session: Option<&str>,
 ) -> oulipoly_runtime::services::ExecutorServiceOutput {
     service
-        .execute(external_execute_request(known_session))
+        .execute(external_execute_request(
+            known_session.map(|id| (id, ProviderSessionStartMode::Resume)),
+        ))
         .expect("external execution")
 }
 
-fn external_execute_request(known_session: Option<&str>) -> ExecutorServiceRequest {
+fn execute_external_with_start_mode(
+    service: &RuntimeExecutorService,
+    known_session: &str,
+    start_mode: ProviderSessionStartMode,
+) -> oulipoly_runtime::services::ExecutorServiceOutput {
+    service
+        .execute(external_execute_request(Some((known_session, start_mode))))
+        .expect("external execution")
+}
+
+fn external_execute_request(
+    known_session: Option<(&str, ProviderSessionStartMode)>,
+) -> ExecutorServiceRequest {
     let model = external_model(Path::new("unused-by-registry-lookup"));
     let provider = ProviderConfig::new(
         provider_name(),
         vec!["--model".to_string(), "sonnet".to_string()],
     );
     match known_session {
-        Some(start_known_provider_session_id) => {
+        Some((start_known_provider_session_id, ProviderSessionStartMode::Create)) => {
+            ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
+                model,
+                provider,
+                provider_index: 0,
+                prompt_mode: PromptMode::Arg,
+                prompt: "resume prompt".to_string(),
+                working_dir: None,
+                models_dir: None,
+                extra_inputs: HashMap::new(),
+                parent_invocation_env: None,
+                start_known_provider_session_id: start_known_provider_session_id.to_string(),
+            }
+        }
+        Some((start_known_provider_session_id, ProviderSessionStartMode::Resume)) => {
             ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
                 model,
                 provider,
