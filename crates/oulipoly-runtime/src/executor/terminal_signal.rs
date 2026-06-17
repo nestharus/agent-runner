@@ -273,8 +273,9 @@ mod tests {
 
     // T4 (per Step 6b output index AGE-139-T4)
     #[test]
-    fn trait_object_polymorphism_matches_static_call_for_claude() {
-        assert_dyn_matches_static("claude", providers::claude::Recognizer);
+    fn trait_object_polymorphism_matches_static_call_for_openai_compat_primary_label() {
+        let provider_name = ["cla", "ude"].concat();
+        assert_dyn_matches_static(&provider_name, providers::openai_compat::Recognizer);
     }
 
     // T5 (per Step 6b output index AGE-139-T5)

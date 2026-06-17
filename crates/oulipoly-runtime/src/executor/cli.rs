@@ -35,13 +35,12 @@
 //! - [`ipc`] (c6) — return-channel + child-marker IPC. Preserves env names,
 //!   stderr marker prefix, and JSONL semantics bit-for-bit.
 //! - [`launch`] (c3) — provider launch + command construction.
-//! - [`policy`] (c4) — provider policy emission for Claude/Codex.
+//! - [`policy`] (c4) — provider policy emission for configured tool families.
 //! - [`provider_lookup`] — configured provider lookup and provider-index
 //!   error formatting.
 //! - [`provider_identity`] (c4) — `shell_split`, `provider_name`,
 //!   `provider_executable_name`, and the ACR-205 intrinsic-surface
-//!   declaration for the bounded `claude | codex | openai_compat`
-//!   provider set.
+//!   declaration for the bounded recognizer set and policy-kind predicate.
 //! - [`request`] — public effective execution request carrier.
 //! - [`result`] — maps supervised output and return-channel artifacts onto
 //!   executor result DTOs, plus prompt/session temp-file cleanup.
@@ -156,7 +155,7 @@ mod tests {
         SupervisorConfig {
             prompt_mode: PromptMode::Arg,
             prompt_payload: None,
-            recognizer: provider_identity::ProviderRecognizer::Claude,
+            recognizer: provider_identity::ProviderRecognizer::OpenAiCompat,
         }
     }
 

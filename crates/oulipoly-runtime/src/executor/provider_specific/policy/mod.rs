@@ -4,8 +4,8 @@
 //!
 //! Functionless module inventory; no A1 function-role claim.
 
-mod claude;
 mod codex;
+mod host_policy;
 
-pub(in crate::executor) use claude::append_claude_provider_policy;
 pub(in crate::executor) use codex::append_codex_provider_policy;
+pub(in crate::executor) use host_policy::append_host_provider_policy;

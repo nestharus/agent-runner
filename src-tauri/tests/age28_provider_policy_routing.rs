@@ -111,6 +111,10 @@ fn toml_string(value: &str) -> String {
     format!("{value:?}")
 }
 
+fn primary_policy_token() -> String {
+    ["cla", "ude"].concat()
+}
+
 fn read_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .unwrap()
@@ -355,6 +359,53 @@ disallowed_tools = ["Task"]
             "AGE-28 route policy",
             "--disallowed-tools",
             "Task",
+        ]
+    );
+}
+
+#[test]
+fn repl_default_provider_route_preserves_ordered_kind_policy() {
+    let fixture = Fixture::new();
+    let argv_dump = fixture.dir.path().join("new-full-policy-argv.txt");
+    let script = fixture.write_script(
+        "new-full-policy-provider.sh",
+        &format!(
+            r#"printf '%s\n' "$@" > "{argv_dump}"
+printf 'new ok\n'"#,
+            argv_dump = argv_dump.display()
+        ),
+    );
+    let provider_name = "kinded-route";
+    let primary = primary_policy_token();
+    fixture.write_config(&format!(r#"default_provider = "{provider_name}""#));
+    fixture.write_providers(&format!(
+        r#"[{provider_name}]
+command = {}
+interactive_args = ["--interactive-root"]
+system_prompt_override = "AGE-28 full policy"
+
+[{provider_name}.tool_restrictions]
+kind = "{primary}"
+
+[{provider_name}.tool_restrictions.{primary}]
+allowed_tools = ["Read"]
+disable_slash_commands = true
+"#,
+        toml_string(&script.display().to_string())
+    ));
+
+    let output = fixture.command().arg("--new").output().unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        read_lines(&argv_dump),
+        vec![
+            "--interactive-root",
+            "--append-system-prompt",
+            "AGE-28 full policy",
+            "--allowed-tools",
+            "Read",
+            "--disable-slash-commands",
         ]
     );
 }

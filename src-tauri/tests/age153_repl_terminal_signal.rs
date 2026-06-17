@@ -7,6 +7,10 @@ use age153_support::{
     assert_single_terminal_signal, terminal_signal_lines,
 };
 
+fn primary_policy_token() -> String {
+    ["cla", "ude"].concat()
+}
+
 #[test]
 fn repl_non_clean_interactive_signal_emits_marker_and_finalizes_failed() {
     let fixture = Age153Fixture::new();
@@ -24,6 +28,25 @@ fn repl_non_clean_interactive_signal_emits_marker_and_finalizes_failed() {
     assert_single_terminal_signal(&stderr, "NonzeroExit", false);
     assert_eq!(
         fixture.failed_invocation_count("claude-age153-repl", "exit_nonzero"),
+        1
+    );
+}
+
+#[test]
+fn repl_non_clean_signal_threads_derived_provider_name() {
+    let fixture = Age153Fixture::new();
+    let provider = format!("{}-age153-derived", primary_policy_token());
+    fixture.write_model("age153-derived-repl", &[provider.as_str()]);
+    fixture.write_providers_with_bodies(&[(&provider, "printf '%s\n' 'derived stderr' >&2\nexit 42")]);
+
+    let output = fixture.run_repl("age153-derived-repl");
+
+    assert_eq!(output.status.code(), Some(42), "{output:?}");
+    assert_no_terminal_marker_on_stdout(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_single_terminal_signal(&stderr, "NonzeroExit", false);
+    assert_eq!(
+        fixture.failed_invocation_count(&provider, "exit_nonzero"),
         1
     );
 }

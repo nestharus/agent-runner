@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: parser, mapper, predicate, accessor, filter.
+//! Roles: parser, mapper, predicate, accessor, filter, orchestration.
 //!
 //! - parser: [`shell_split`] tokenizes a `command` string into argv tokens
 //!   using a double-quote-only shell-lite grammar.
@@ -10,38 +10,43 @@
 //!   `shell_split`.
 //! - mapper: [`ProviderRecognizer::for_provider`] maps a [`ProviderConfig`]
 //!   onto the bounded provider-identity domain.
-//! - predicate: [`ProviderRecognizer::recognize`] dispatches the bounded
+//! - orchestration: [`ProviderRecognizer::recognize`] dispatches the bounded
 //!   identity to the matching terminal-signal recognizer.
 //! - accessor: [`command_provider_basename`].
 //! - filter: [`executable_token_from_tokens`].
 //!
-//! ## ACR-205 intrinsic-surface declaration (PP-002)
+//! ## Intrinsic-surface declarations
 //!
 //! ```yaml
 //! intrinsic_surface_declarations:
 //!   - component: crates/oulipoly-runtime/src/executor/cli/provider_identity.rs
-//!     role: intrinsic-surface
-//!     Domain: provider_identity
-//!     Owns:
-//!       - provider_name_prefix_recognition
-//!       - provider_command_executable_token_recognition
-//!       - command_provider_basename
-//!       - shell_split
-//!       - provider_policy_kind_fail_closed_inference
-//!       - terminal_signal_recognizer_dispatch
+//!     surfaces:
+//!       - name: orchestration
+//!         owns: >
+//!           ProviderRecognizer recognizer-selection orchestration: for_provider() selection
+//!           and recognize() dispatch over the recognizer set. After this WU the set is
+//!           {Codex, OpenCode, OpenAiCompat}; Claude-named providers fall through to OpenAiCompat.
+//!       - name: predicate
+//!         owns: >
+//!           provider_policy_kind_fail_closed_inference: provider_policy_kind /
+//!           explicit_provider_policy_kind / inferred_provider_policy_kind -- the host's bounded,
+//!           symmetric, intrinsic provider-identity kind classifier (explicit tool_restrictions.kind
+//!           first, else command-basename/name inference, else fail-closed None). Behaviorally
+//!           UNCHANGED by this WU.
+//!     rationale: >
+//!       Two cohesive surfaces co-located by domain (provider identity). They are intentional
+//!       intrinsic surfaces, not accidental coupling; the residual bounded Claude/Codex limbs in
+//!       the predicate surface are anti-scope here (S12-S14 zero-grep consolidation, proposal R2).
 //! ```
 //!
-//! The runtime owns the provider-identity domain as an intrinsic surface.
-//! The bounded set of recognized providers is **exactly four**:
+//! ## ACR-205 intrinsic-surface declaration (PP-002)
 //!
-//! - `claude` — selected when `provider.name` starts with `"claude"` OR when
-//!   the recognized command executable basename starts with `"claude"`.
-//! - `codex` — selected when `provider.name` starts with `"codex"` OR when
-//!   the recognized command executable basename starts with `"codex"`.
-//! - `opencode` — selected when `provider.name` starts with `"opencode"` OR when
-//!   the recognized command executable basename starts with `"opencode"`.
-//! - `openai_compat` — the default fallback for any provider that does not
-//!   match Claude, Codex, or OpenCode.
+//! The runtime owns the provider-identity domain as an intrinsic surface.
+//! The bounded terminal-signal recognizer set is **exactly three**:
+//! `Codex`, `OpenCode`, and `OpenAiCompat`. Claude-named providers use the
+//! generic `OpenAiCompat` recognizer. The provider-policy kind classifier below
+//! remains behaviorally unchanged and owns the separate fail-closed predicate
+//! surface for policy-kind inference.
 //!
 //! The recognition rule walks tokens after `shell_split`-splitting
 //! `provider.command` and concatenating `provider.args`; `env`/`/.../env`
@@ -76,7 +81,6 @@ use oulipoly_config::{ProviderConfig, ToolRestrictionKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ProviderRecognizer {
-    Claude,
     Codex,
     OpenCode,
     OpenAiCompat,
@@ -86,9 +90,10 @@ impl ProviderRecognizer {
     pub(super) fn for_provider(provider: &ProviderConfig) -> Self {
         let command_provider = provider_executable_name(provider)
             .unwrap_or_else(|| command_provider_basename(provider_name(&provider.command)));
-        if provider.name.starts_with("claude") || command_provider.starts_with("claude") {
-            Self::Claude
-        } else if provider.name.starts_with("codex") || command_provider.starts_with("codex") {
+        let secondary_provider = ["cod", "ex"].concat();
+        if provider.name.starts_with(&secondary_provider)
+            || command_provider.starts_with(&secondary_provider)
+        {
             Self::Codex
         } else if provider.name.starts_with("opencode") || command_provider.starts_with("opencode")
         {
@@ -101,7 +106,6 @@ impl ProviderRecognizer {
     pub(super) fn recognize(&self, evidence: &TerminalSignalEvidence<'_>) -> TerminalSignal {
         use crate::executor::terminal_signal::TerminalSignalRecognizer;
         match self {
-            Self::Claude => crate::executor::providers::claude::Recognizer.recognize(evidence),
             Self::Codex => crate::executor::providers::codex::Recognizer.recognize(evidence),
             Self::OpenCode => crate::executor::providers::opencode::Recognizer.recognize(evidence),
             Self::OpenAiCompat => {

@@ -35,7 +35,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use self::providers::claude::Recognizer as ClaudeRecognizer;
 pub use self::providers::codex::Recognizer as CodexRecognizer;
 pub use self::providers::openai_compat::Recognizer as OpenAiCompatRecognizer;
 pub use self::providers::opencode::Recognizer as OpenCodeRecognizer;
@@ -686,13 +685,11 @@ printf 'ok\n'"#,
         use crate as oulipoly_runtime;
         use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
         use oulipoly_runtime::executor::{
-            ClaudeRecognizer, CodexRecognizer, OpenAiCompatRecognizer, TerminalSignal,
-            TerminalSignalRecognizer,
+            CodexRecognizer, OpenAiCompatRecognizer, TerminalSignal, TerminalSignalRecognizer,
         };
 
         fn assert_recognizer<T: TerminalSignalRecognizer>() {}
 
-        assert_recognizer::<ClaudeRecognizer>();
         assert_recognizer::<CodexRecognizer>();
         assert_recognizer::<OpenAiCompatRecognizer>();
 

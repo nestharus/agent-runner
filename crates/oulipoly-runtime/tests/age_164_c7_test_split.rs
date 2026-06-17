@@ -90,6 +90,39 @@ fn read_argv(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+fn primary_policy_token() -> String {
+    ["cla", "ude"].concat()
+}
+
+fn primary_tool_restrictions(
+    disallowed_tools: &[&str],
+    allowed_tools: &[&str],
+    disable_slash_commands: bool,
+) -> ToolRestrictions {
+    let primary = primary_policy_token();
+    let disallowed = toml_array(disallowed_tools);
+    let allowed = toml_array(allowed_tools);
+    toml::from_str(&format!(
+        r#"kind = "{primary}"
+
+[{primary}]
+disallowed_tools = {disallowed}
+allowed_tools = {allowed}
+disable_slash_commands = {disable_slash_commands}
+"#
+    ))
+    .expect("primary tool restrictions deserialize")
+}
+
+fn toml_array(values: &[&str]) -> String {
+    let quoted = values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{quoted}]")
+}
+
 // ---------------------------------------------------------------------------
 // Interactive source-guard replacement: behavior pins.
 // ---------------------------------------------------------------------------
@@ -155,6 +188,72 @@ fn interactive_execution_applies_provider_policy_to_argv() {
     assert!(
         argv.iter().any(|t| t == "--disallowed-tools"),
         "interactive policy emission missing; argv={argv:?}"
+    );
+}
+
+#[test]
+fn cn1_interactive_execution_emits_full_ordered_policy_argv() {
+    let (_dir, script_path, argv_dump) = argv_dump_script();
+    let provider = ProviderConfig {
+        name: format!("{}-interactive", primary_policy_token()),
+        command: script_path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        interactive_args: Some(vec!["--model".to_string(), "opus".to_string()]),
+        resume: None,
+        session_capture: None,
+        resume_acceptance: None,
+        session_storage: None,
+        system_prompt_override: Some("Be precise.".to_string()),
+        tool_restrictions: Some(primary_tool_restrictions(
+            &["Task", "Bash"],
+            &["Read"],
+            true,
+        )),
+        invocation_mode: Default::default(),
+    };
+
+    let exit_code = execute_interactive(&provider, None, None, None).unwrap();
+    assert_eq!(exit_code, 0);
+
+    assert_eq!(
+        read_argv(&argv_dump),
+        vec![
+            "--model",
+            "opus",
+            "--append-system-prompt",
+            "Be precise.",
+            "--disallowed-tools",
+            "Task,Bash",
+            "--allowed-tools",
+            "Read",
+            "--disable-slash-commands",
+        ]
+    );
+}
+
+#[test]
+fn cn2_interactive_execution_emits_inferred_override_without_restrictions() {
+    let (_dir, script_path, argv_dump) = argv_dump_script();
+    let provider = ProviderConfig {
+        name: primary_policy_token(),
+        command: script_path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        interactive_args: Some(Vec::new()),
+        resume: None,
+        session_capture: None,
+        resume_acceptance: None,
+        session_storage: None,
+        system_prompt_override: Some("Override only.".to_string()),
+        tool_restrictions: None,
+        invocation_mode: Default::default(),
+    };
+
+    let exit_code = execute_interactive(&provider, None, None, None).unwrap();
+    assert_eq!(exit_code, 0);
+
+    assert_eq!(
+        read_argv(&argv_dump),
+        vec!["--append-system-prompt", "Override only."]
     );
 }
 

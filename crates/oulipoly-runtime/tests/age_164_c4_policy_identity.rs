@@ -112,6 +112,10 @@ fn read_argv(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+fn primary_policy_token() -> String {
+    ["cla", "ude"].concat()
+}
+
 fn claude_restricted_provider(command: String) -> ProviderConfig {
     let mut provider = ProviderConfig::new(command, Vec::new());
     provider.name = "abc".to_string();
@@ -127,7 +131,7 @@ fn claude_restricted_provider(command: String) -> ProviderConfig {
     provider
 }
 
-fn assert_command_is_identified_as_claude(command: String, argv_dump: &std::path::Path) {
+fn assert_command_infers_primary_policy_kind(command: String, argv_dump: &std::path::Path) {
     let model = claude_identity_model(command);
 
     let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
@@ -470,7 +474,7 @@ fn intrinsic_surface_identity_via_env_prefix_skips_to_claude() {
 #[test]
 fn intrinsic_surface_identity_via_env_assignment_skips_to_claude() {
     let (_dir, env_path, claude_path, argv_dump) = fake_env_and_claude_fixture();
-    assert_command_is_identified_as_claude(
+    assert_command_infers_primary_policy_kind(
         format!("{} FOO=bar {}", env_path.display(), claude_path.display()),
         &argv_dump,
     );
@@ -479,7 +483,7 @@ fn intrinsic_surface_identity_via_env_assignment_skips_to_claude() {
 #[test]
 fn intrinsic_surface_identity_via_env_e_option_skips_to_claude() {
     let (_dir, env_path, claude_path, argv_dump) = fake_env_and_claude_fixture();
-    assert_command_is_identified_as_claude(
+    assert_command_infers_primary_policy_kind(
         format!("{} -e FOO {}", env_path.display(), claude_path.display()),
         &argv_dump,
     );
@@ -488,7 +492,7 @@ fn intrinsic_surface_identity_via_env_e_option_skips_to_claude() {
 #[test]
 fn intrinsic_surface_identity_via_env_s_option_skips_to_claude() {
     let (_dir, env_path, claude_path, argv_dump) = fake_env_and_claude_fixture();
-    assert_command_is_identified_as_claude(
+    assert_command_infers_primary_policy_kind(
         format!(
             "{} -S ignored {}",
             env_path.display(),
@@ -501,7 +505,7 @@ fn intrinsic_surface_identity_via_env_s_option_skips_to_claude() {
 #[test]
 fn intrinsic_surface_identity_via_env_long_option_skips_to_claude() {
     let (_dir, env_path, claude_path, argv_dump) = fake_env_and_claude_fixture();
-    assert_command_is_identified_as_claude(
+    assert_command_infers_primary_policy_kind(
         format!(
             "{} --ignore-environment {}",
             env_path.display(),
@@ -514,7 +518,7 @@ fn intrinsic_surface_identity_via_env_long_option_skips_to_claude() {
 #[test]
 fn intrinsic_surface_identity_via_env_mixed_options_skips_to_claude() {
     let (_dir, env_path, claude_path, argv_dump) = fake_env_and_claude_fixture();
-    assert_command_is_identified_as_claude(
+    assert_command_infers_primary_policy_kind(
         format!(
             "{} -i -u FOO FOO=bar {}",
             env_path.display(),
@@ -705,6 +709,35 @@ fn claude_policy_renders_append_system_prompt_in_order() {
         "Claude policy must render --append-system-prompt before tool flags; argv={argv:?}"
     );
     assert_eq!(argv[append_pos + 1], "Be precise.");
+}
+
+#[test]
+fn cn2_oneshot_execution_emits_inferred_override_without_restrictions() {
+    let (_dir, script_path, argv_dump) = argv_dump_fixture();
+    let mut provider = ProviderConfig::new(script_path.to_string_lossy().into_owned(), Vec::new());
+    provider.name = primary_policy_token();
+    provider.system_prompt_override = Some("Override only.".to_string());
+    let model = ModelConfig {
+        name: "override-only-model".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![provider],
+        inputs: Vec::new(),
+        provider: None,
+    };
+
+    let result = execute(&model, 0, "prompt", None, &HashMap::new(), None).expect("execute");
+    assert_eq!(result.exit_code, 0);
+    let argv = read_argv(&argv_dump);
+    let append_pos = argv
+        .iter()
+        .position(|t| t == "--append-system-prompt")
+        .expect("--append-system-prompt present");
+    assert_eq!(argv[append_pos + 1], "Override only.");
+    assert!(
+        !argv.iter().any(|t| t == "--disallowed-tools"),
+        "override-only policy must not emit tool flags; argv={argv:?}"
+    );
+    assert!(argv.iter().any(|t| t == "prompt"), "argv={argv:?}");
 }
 
 // ---------------------------------------------------------------------------

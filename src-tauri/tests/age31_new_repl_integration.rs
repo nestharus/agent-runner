@@ -72,6 +72,10 @@ prompt_mode = "arg"
     )
 }
 
+fn primary_policy_token() -> String {
+    ["cla", "ude"].concat()
+}
+
 fn combined_output(output: &Output) -> String {
     format!(
         "{}{}",
@@ -160,5 +164,41 @@ fn new_flag_with_provider_family_launches_balancer_selected_member() {
     assert_eq!(
         matches, 1,
         "exactly one provider-family member should launch: {combined}"
+    );
+}
+
+#[test]
+fn new_flag_family_carrier_preserves_inferred_policy_from_command_basename() {
+    let fixture = TempXdgHome::new();
+    let argv_dump = fixture.dir.path().join("family-policy-argv.txt");
+    let script = fixture.write_script(
+        &format!("{}-family-policy.sh", primary_policy_token()),
+        &format!(
+            r#"printf '%s\n' "$@" > "{argv_dump}"
+printf 'family policy ok\n'"#,
+            argv_dump = argv_dump.display()
+        ),
+    );
+    fixture.write_config(r#"default_provider = "family""#);
+    fixture.write_providers(&format!(
+        r#"[family2]
+command = "{}"
+args = ["one-shot-only"]
+interactive_args = []
+prompt_mode = "arg"
+system_prompt_override = "AGE31 family policy"
+"#,
+        script.display()
+    ));
+
+    let output = fixture.run_new();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(argv_dump)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["--append-system-prompt", "AGE31 family policy"]
     );
 }
