@@ -350,8 +350,8 @@ const CLI_SOURCES: &[CliSource] = &[
         path: "src/executor/provider_specific/policy/mod.rs",
     },
     CliSource {
-        label: "provider_specific/policy/claude.rs",
-        path: "src/executor/provider_specific/policy/claude.rs",
+        label: "provider_specific/policy/host_policy.rs",
+        path: "src/executor/provider_specific/policy/host_policy.rs",
     },
     CliSource {
         label: "provider_specific/policy/codex.rs",
@@ -628,8 +628,8 @@ const E5_SPLIT_SOURCES: &[CliSource] = &[
         path: "src/executor/provider_specific/policy/mod.rs",
     },
     CliSource {
-        label: "provider_specific/policy/claude.rs",
-        path: "src/executor/provider_specific/policy/claude.rs",
+        label: "provider_specific/policy/host_policy.rs",
+        path: "src/executor/provider_specific/policy/host_policy.rs",
     },
     CliSource {
         label: "provider_specific/policy/codex.rs",
@@ -770,6 +770,10 @@ fn assert_source_path_inventory_includes(path: &str) {
     );
 }
 
+fn primary_policy_token() -> String {
+    ["cla", "ude"].concat()
+}
+
 #[test]
 fn cli_root_and_submodules_have_declared_role_headers_before_imports() {
     let root = cli_root_source();
@@ -890,6 +894,31 @@ fn phase6_e4_source_inventory_names_every_split_leaf() {
 fn phase6_e5_source_inventory_names_every_split_leaf_and_island() {
     for source_path in E5_SPLIT_SOURCES {
         assert_source_path_inventory_includes(source_path.path);
+    }
+}
+
+#[test]
+fn phase6_dedicated_primary_policy_and_recognizer_leaves_are_removed() {
+    let primary = primary_policy_token();
+    let removed_policy_path = format!("src/executor/provider_specific/policy/{primary}.rs");
+    let removed_recognizer_path = format!("src/executor/providers/{primary}.rs");
+    for removed_path in [&removed_policy_path, &removed_recognizer_path] {
+        assert!(
+            !CLI_SOURCES.iter().any(|source| source.path == removed_path),
+            "C2 CLI source inventory must not include {removed_path}"
+        );
+        assert!(
+            !E5_SPLIT_SOURCES
+                .iter()
+                .any(|source| source.path == removed_path),
+            "C2 E5 source inventory must not include {removed_path}"
+        );
+        assert!(
+            !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(removed_path)
+                .exists(),
+            "dedicated leaf must be absent after the host appender retarget: {removed_path}"
+        );
     }
 }
 

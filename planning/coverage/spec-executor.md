@@ -41,6 +41,7 @@
 - `crates/oulipoly-runtime/src/executor/cli/policy/predicates.rs`
 - `crates/oulipoly-runtime/src/executor/cli/policy/validation.rs`
 - `crates/oulipoly-runtime/src/executor/cli/provider_execution.rs`
+- `crates/oulipoly-runtime/src/executor/cli/provider_identity.rs`
 - `crates/oulipoly-runtime/src/executor/cli/provider_lookup.rs`
 - `crates/oulipoly-runtime/src/executor/cli/request.rs`
 - `crates/oulipoly-runtime/src/executor/cli/result.rs`
@@ -77,12 +78,11 @@
 - `crates/oulipoly-runtime/src/executor/cli/supervision/termination.rs`
 - `crates/oulipoly-runtime/src/executor/provider_specific/mod.rs`
 - `crates/oulipoly-runtime/src/executor/provider_specific/policy/mod.rs`
-- `crates/oulipoly-runtime/src/executor/provider_specific/policy/claude.rs`
+- `crates/oulipoly-runtime/src/executor/provider_specific/policy/host_policy.rs`
 - `crates/oulipoly-runtime/src/executor/provider_specific/policy/codex.rs`
 - `crates/oulipoly-runtime/src/executor/provider_specific/resume_acceptance.rs`
 - `crates/oulipoly-runtime/src/executor/provider_specific/session_capture/mod.rs`
 - `crates/oulipoly-runtime/src/executor/provider_specific/session_capture/telemetry_scrub.rs`
-- `crates/oulipoly-runtime/src/executor/providers/claude.rs`
 - `crates/oulipoly-runtime/src/executor/providers/codex.rs`
 - `crates/oulipoly-runtime/src/executor/providers/mod.rs`
 - `crates/oulipoly-runtime/src/executor/providers/openai_compat.rs`

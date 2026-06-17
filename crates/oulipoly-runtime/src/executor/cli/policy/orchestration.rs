@@ -18,9 +18,7 @@ use super::messages::provider_policy_kind_error;
 use super::predicates::provider_policy_is_needed;
 use super::validation::validate_provider_tool_restrictions;
 use crate::executor::cli::provider_identity::provider_policy_kind;
-use crate::executor::provider_specific::policy::{
-    append_claude_provider_policy, append_codex_provider_policy,
-};
+use crate::executor::provider_specific::policy::*;
 use oulipoly_config::{ProviderConfig, ToolRestrictionKind};
 
 pub(in crate::executor::cli) fn apply_provider_policy(
@@ -38,7 +36,7 @@ pub(in crate::executor::cli) fn apply_provider_policy(
 
     match kind {
         Some(ToolRestrictionKind::Claude) => {
-            append_claude_provider_policy(provider, restrictions, base_args)
+            append_host_provider_policy(provider, restrictions, base_args)
         }
         Some(ToolRestrictionKind::Codex) => {
             append_codex_provider_policy(provider, restrictions, base_args, prompt)?
