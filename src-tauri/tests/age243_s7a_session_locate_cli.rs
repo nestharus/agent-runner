@@ -110,6 +110,100 @@ fn locate_cli_no_ref_output_stderr_and_exit_code_preserved_with_unrelated_regist
     );
 }
 
+#[test]
+fn provider_ref_locate_uses_external_record_even_when_local_locator_exists() {
+    let prepared = external_provider_locate_fixture("locate_success");
+    let local_path = prepared.fixture.root().join("local-transcript.jsonl");
+    fs::write(&local_path, "{\"local\":true}\n").unwrap();
+    prepared
+        .fixture
+        .write_sessions_with_locator_path(PROVIDER_A_ACCOUNT, &local_path);
+
+    let output = prepared
+        .fixture
+        .run_locate(&prepared.session_id, &["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = parse_stdout_json(&output);
+    assert_eq!(stdout["session_id"], prepared.session_id);
+    assert_eq!(
+        stdout["jsonl_path"],
+        prepared.transcript_path.display().to_string()
+    );
+    assert_ne!(stdout["jsonl_path"], local_path.display().to_string());
+    let records = provider_records(&prepared.record_path);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["subcommand"] == "session.locate_transcript")
+            .count(),
+        1
+    );
+    assert_external_locate_request_shape(&records);
+
+    let failure = external_provider_locate_fixture("provider_error");
+    let failure_local_path = failure
+        .fixture
+        .root()
+        .join("local-fallback-transcript.jsonl");
+    fs::write(&failure_local_path, "{\"local\":true}\n").unwrap();
+    failure
+        .fixture
+        .write_sessions_with_locator_path(PROVIDER_A_ACCOUNT, &failure_local_path);
+
+    let failure_output = failure.fixture.run_locate(&failure.session_id, &["--json"]);
+
+    assert_ne!(failure_output.status.code(), Some(0), "{failure_output:?}");
+    assert!(
+        failure_output.stdout.is_empty(),
+        "provider error must not be replaced by local fallback metadata: {failure_output:?}"
+    );
+    let failure_stderr = String::from_utf8_lossy(&failure_output.stderr);
+    assert!(
+        failure_stderr.contains("provider_locate_failed"),
+        "stderr should return the provider error: {failure_stderr}"
+    );
+    let failure_records = provider_records(&failure.record_path);
+    assert_eq!(
+        failure_records
+            .iter()
+            .filter(|record| record["subcommand"] == "session.locate_transcript")
+            .count(),
+        1
+    );
+    assert_external_locate_request_shape(&failure_records);
+}
+
+#[test]
+fn no_ref_locate_uses_local_locator_and_ignores_unrelated_registry() {
+    let prepared = component_no_storage_fixture(true);
+    let baseline = prepared
+        .fixture
+        .run_locate(&prepared.session_id, &["--json"]);
+    let record_path = prepared.fixture.root().join("provider-a-records.jsonl");
+    let provider_path = write_cli_provider_a_script(
+        prepared.fixture.root(),
+        "locate_success",
+        &record_path,
+        &prepared.jsonl_path,
+    );
+    prepared
+        .fixture
+        .write_external_model(PROVIDER_A_MODEL, PROVIDER_A_ACCOUNT, &provider_path);
+    prepared
+        .fixture
+        .write_provider(PROVIDER_A_ACCOUNT, StorageKind::None, false, None);
+
+    let output = prepared
+        .fixture
+        .run_locate(&prepared.session_id, &["--json"]);
+
+    assert_eq!(output.status.code(), baseline.status.code());
+    assert_eq!(output.stdout, baseline.stdout);
+    assert_eq!(output.stderr, baseline.stderr);
+    assert!(provider_records(&record_path).is_empty());
+}
+
 struct ExternalLocateFixture {
     fixture: LocateFixture,
     session_id: String,

@@ -684,6 +684,148 @@ fn no_ref_replace_uses_dispatch_service_with_populated_registry_and_preserves_ho
 }
 
 #[test]
+fn provider_ref_export_returns_external_bytes_without_sqlite_authority() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("export_success");
+    let before = fixture.sqlite_snapshot();
+    let expected = fs::read(&fixture.input_path).expect("expected bytes");
+    let service = ProductionSessionExportService::with_registry_handle(fixture.registry_handle());
+
+    let output = service
+        .export_session(SessionExportServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            external_provider: Some(provider_identity()),
+        })
+        .expect("service output");
+
+    assert_eq!(output.result.expect("export bytes"), expected);
+    assert_eq!(fixture.sqlite_snapshot(), before);
+    assert_provider_call_counts(&fixture, 1, 1, 0);
+    let records = fixture.request_records_for("session.export");
+    assert_export_request_shape(&records);
+    assert!(
+        !records[0]["request"].to_string().contains("state.db"),
+        "export request must not expose host SQLite paths"
+    );
+}
+
+#[test]
+fn no_ref_export_matches_direct_bytes_with_unrelated_registry() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    let metadata = resolve_export_session_metadata(SESSION_ID).expect("metadata");
+    let direct =
+        canonical_jsonl_bytes(&read_canonical_transcript(&metadata).expect("direct records"))
+            .expect("direct bytes");
+    let service =
+        ProductionSessionExportService::with_registry_handle(fixture.unrelated_registry_handle());
+
+    let output = service
+        .export_session(SessionExportServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            external_provider: None,
+        })
+        .expect("service output");
+
+    assert_eq!(output.result.expect("export bytes"), direct);
+    assert_provider_call_counts(&fixture, 0, 0, 0);
+}
+
+#[test]
+fn provider_ref_replace_invokes_transform_but_requires_local_preimage_before_dispatch() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let success = DispatchFixture::new();
+    success.write_model_file(true);
+    success.set_mode("replace_success");
+    let preimage = direct_export_hash();
+    let before_journal = success.journal_snapshot();
+    let service = ProductionSessionReplaceService::with_registry_handle(success.registry_handle());
+
+    let receipt = service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            source: ReplaceSource::File(success.input_path.clone()),
+            preimage_sha256: Some(preimage.clone()),
+            external_provider: Some(provider_identity()),
+        })
+        .expect("service output")
+        .result
+        .expect("replace receipt");
+
+    assert!(receipt.state_updated);
+    assert_eq!(success.journal_snapshot(), before_journal);
+    assert_eq!(
+        success.sqlite_snapshot().session_turns,
+        expected_replacement_turn_rows(&success)
+    );
+    assert_provider_call_counts(&success, 1, 0, 1);
+    assert_replace_request_shape(
+        &success.request_records_for("session.replace"),
+        &fs::read(&success.input_path).expect("input bytes"),
+        &preimage,
+    );
+    assert_provider_requests_do_not_expose_sqlite_mutation_authority(&success);
+
+    let missing = DispatchFixture::new();
+    missing.write_model_file(true);
+    missing.set_mode("replace_success");
+    let before_sqlite = missing.sqlite_snapshot();
+    let before_journal = missing.journal_snapshot();
+    fs::remove_file(&missing.transcript_path).expect("remove local transcript");
+    assert!(!missing.transcript_path.exists());
+    let service = ProductionSessionReplaceService::with_registry_handle(missing.registry_handle());
+
+    let err = service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            source: ReplaceSource::File(missing.input_path.clone()),
+            preimage_sha256: None,
+            external_provider: Some(provider_identity()),
+        })
+        .expect("service output")
+        .result
+        .expect_err("missing local transcript must fail before dispatch");
+
+    assert!(!format!("{err:?}").is_empty());
+    assert!(missing.records().is_empty());
+    assert_eq!(missing.sqlite_snapshot(), before_sqlite);
+    assert_eq!(missing.journal_snapshot(), before_journal);
+    assert!(!missing.transcript_path.exists());
+}
+
+#[test]
+fn no_ref_replace_matches_direct_apply_with_unrelated_registry() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let direct_fixture = DispatchFixture::new();
+    let direct_receipt =
+        session_replace::run_import_replace(SESSION_ID, Some(&direct_fixture.input_path), None)
+            .expect("direct replace");
+    let direct = comparable_replace_state(&direct_fixture, direct_receipt);
+    drop(direct_fixture);
+
+    let dispatch_fixture = DispatchFixture::new();
+    let service = ProductionSessionReplaceService::with_registry_handle(
+        dispatch_fixture.unrelated_registry_handle(),
+    );
+    let output = service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            source: ReplaceSource::File(dispatch_fixture.input_path.clone()),
+            preimage_sha256: None,
+            external_provider: None,
+        })
+        .expect("service output");
+    let dispatch =
+        comparable_replace_state(&dispatch_fixture, output.result.expect("replace receipt"));
+
+    assert_eq!(dispatch, direct);
+    assert_no_ref_replacement_session_turn_rows(&dispatch_fixture);
+    assert_provider_call_counts(&dispatch_fixture, 0, 0, 0);
+}
+
+#[test]
 fn external_export_success_validates_provider_bytes_request_shape_and_keeps_host_state_read_only() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let fixture = DispatchFixture::new();
