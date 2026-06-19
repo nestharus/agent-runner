@@ -25,13 +25,11 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
     run_wake_reclaim_sweep_or_warn("process_start");
 }
 
-#[allow(dead_code)]
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
     static DRIVER: OnceLock<()> = OnceLock::new();
     DRIVER.get_or_init(spawn_wake_reclaim_maintenance_driver);
 }
 
-#[allow(dead_code)]
 fn spawn_wake_reclaim_maintenance_driver() {
     let result = std::thread::Builder::new()
         .name("oulipoly-wake-reclaim-sweep".to_string())
@@ -45,7 +43,6 @@ fn warn_wake_reclaim_driver_start_failed(err: std::io::Error) {
     tracing::warn!("Failed to start wake reclaim sweep driver: {err}");
 }
 
-#[allow(dead_code)]
 fn wake_reclaim_maintenance_loop() {
     run_wake_reclaim_sweep_or_warn("maintenance_start");
     loop {

@@ -17,6 +17,5 @@ pub(super) const WAKE_RECLAIM_SWEEP_LIMIT: usize = 8;
 pub(super) const WAKE_RECLAIM_SWEEP_SCAN_LIMIT: usize = WAKE_RECLAIM_SWEEP_LIMIT * 32;
 pub(super) const WAKE_RECLAIM_REAP_SESSION_LIMIT: usize = 32;
 pub(super) const WAKE_RECLAIM_REAP_ROWS_PER_SESSION: usize = 20;
-#[allow(dead_code)]
 pub(super) const WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS: u64 = 60;
 pub(super) const CONSUMED_NOTIFICATION_MARKER: &str = "[OULIPOLY NOTIFICATIONS]";
