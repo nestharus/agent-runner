@@ -928,6 +928,41 @@ fn s7c_production_migration_service_runs_journal_recovery_before_provider_reques
     );
 }
 
+#[test]
+fn s7c_provider_ref_manual_rotation_service_applies_external_plan_without_builtin_stderr() {
+    let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+    let before = fixture.snapshot();
+    let service = ProductionMigrationService::with_registry_handle(fixture.registry.clone());
+    let mut stderr = Vec::new();
+
+    let output = service
+        .migrate(fixture.request_manual(&mut stderr, TARGET_PROVIDER))
+        .expect("external service migration");
+
+    let MigrationServiceOutput::Migrated { segment } = output else {
+        panic!("expected migrated output");
+    };
+    assert_eq!(segment.target_provider, TARGET_PROVIDER);
+    assert_eq!(segment.target_session_id, TARGET_SESSION);
+    assert_eq!(
+        fixture.snapshot().chains,
+        before.chains,
+        "external host apply must preserve session_chains.last_used_at"
+    );
+    fixture.assert_provider_plan_boundary_was_applied();
+    assert_eq!(
+        fixture.active_segment(),
+        (TARGET_PROVIDER.to_string(), TARGET_SESSION.to_string())
+    );
+    assert!(fixture.artifact_path.exists());
+    assert!(
+        String::from_utf8_lossy(&stderr).is_empty(),
+        "external success must not emit built-in migration stderr"
+    );
+    fixture.assert_call_count(2);
+    fixture.assert_last_request("rotation.materialize");
+}
+
 struct RuntimeFixture {
     _dir: tempfile::TempDir,
     state: StateDb,

@@ -303,6 +303,43 @@ fn active_session_nodes_point_inspect_at_live_transcript_when_resolvable() {
 }
 
 #[test]
+fn active_session_nodes_do_not_attach_transcript_inspect_ref_without_local_transcript() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+    let pid = fixture.open_pid();
+    let identity = current_identity();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &identity);
+    drop(pid);
+
+    let service = ProductionObservabilitySnapshotService::for_session(None);
+    let snapshot = service.snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert_eq!(node(&snapshot, "session:session-observe").inspect_ref, None);
+    let invocation = node(&snapshot, &format!("invocation:{ROOT_UUID}"));
+    assert!(matches!(
+        invocation.inspect_ref,
+        Some(InspectRef::InvocationStatus { .. })
+    ));
+    assert!(!matches!(
+        invocation.inspect_ref,
+        Some(InspectRef::SessionTranscript { .. })
+    ));
+    let process = node(
+        &snapshot,
+        &format!("process:{ROOT_UUID}:{}", identity.os_pid),
+    );
+    assert!(!matches!(
+        process.inspect_ref,
+        Some(InspectRef::SessionTranscript { .. })
+    ));
+}
+
+#[test]
 fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
     let fixture = Fixture::new();
     let state = fixture.open_state();
