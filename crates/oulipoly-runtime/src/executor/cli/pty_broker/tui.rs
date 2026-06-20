@@ -130,6 +130,9 @@ struct RoutedInput {
     commands: Vec<MonitorCommand>,
     /// The operator toggled focus into the monitor (expand + focus bottom).
     focus_bottom: bool,
+    /// Net wheel scroll for the top pane's scrollback: positive moves toward older
+    /// output, negative toward the live tail. Applied by the relay loop.
+    top_scroll_lines: i32,
     redraw: bool,
 }
 
@@ -259,6 +262,11 @@ impl InputRouter {
         Self { focus: Focus::Top }
     }
 
+    /// Keyboard-only routing helper. Production input always flows through
+    /// `route_mouse_aware_input` (which calls `route_next_input` per chunk) since the
+    /// broker always captures the mouse; this convenience wrapper is used by the keyboard
+    /// routing tests.
+    #[cfg(test)]
     fn route_input(&mut self, bytes: &[u8]) -> RoutedInput {
         let mut routed = RoutedInput::default();
         let mut i = 0;
@@ -661,6 +669,71 @@ fn mouse_wheel_command(event: MouseEvent) -> Option<MonitorCommand> {
     }
 }
 
+/// Minimum mouse-reporting mode the broker drives on the real terminal while the
+/// monitor is expanded, so wheel events reach the bottom pane even when the child
+/// application never requested mouse input. `PressRelease` reports buttons and the
+/// wheel without the noise of motion events.
+const BROKER_WHEEL_CAPTURE_MODE: vt100::MouseProtocolMode = vt100::MouseProtocolMode::PressRelease;
+
+fn mouse_mode_rank(mode: vt100::MouseProtocolMode) -> u8 {
+    match mode {
+        vt100::MouseProtocolMode::None => 0,
+        vt100::MouseProtocolMode::Press => 1,
+        vt100::MouseProtocolMode::PressRelease => 2,
+        vt100::MouseProtocolMode::ButtonMotion => 3,
+        vt100::MouseProtocolMode::AnyMotion => 4,
+    }
+}
+
+fn stronger_mouse_mode(
+    a: vt100::MouseProtocolMode,
+    b: vt100::MouseProtocolMode,
+) -> vt100::MouseProtocolMode {
+    if mouse_mode_rank(a) >= mouse_mode_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// The mouse request the broker drives on the *real* terminal — distinct from the
+/// child's own request. The broker always captures wheel/click events (SGR encoding for
+/// robustness, preferring a stronger child mode if the child set one) so the operator
+/// can wheel through the top-pane scrollback and the monitor regardless of whether the
+/// child enabled mouse mode. Without this the terminal's alternate-scroll mode turns the
+/// wheel into ↑/↓ keystrokes that leak to the child as history navigation. Top-pane
+/// events are still only forwarded to a child that requested mouse input (see
+/// `route_top_mouse_event`); otherwise the wheel scrolls the broker's scrollback.
+///
+/// Tradeoff: claiming the mouse disables native click-drag text selection in the top
+/// pane for the duration of the observed session (Shift+drag bypasses it in most
+/// terminals).
+fn effective_mouse_request(child: MouseRequest) -> MouseRequest {
+    MouseRequest {
+        mode: stronger_mouse_mode(child.mode, BROKER_WHEEL_CAPTURE_MODE),
+        encoding: vt100::MouseProtocolEncoding::Sgr,
+    }
+}
+
+/// Net top-pane scrollback movement for a wheel event: positive toward older output.
+fn wheel_scroll_lines(event: MouseEvent) -> i32 {
+    if !mouse_button_is_wheel(event.button) {
+        return 0;
+    }
+    match event.button & 0b11 {
+        0 => TOP_SCROLL_STEP,  // wheel up -> older output
+        1 => -TOP_SCROLL_STEP, // wheel down -> toward the live tail
+        _ => 0,
+    }
+}
+
+/// Apply a signed scroll delta to the current top-pane scrollback offset, flooring at
+/// the live tail (0). The upper bound is enforced by `Screen::set_scrollback`, which
+/// clamps to the retained history.
+fn apply_top_scroll(current: usize, delta: i32) -> usize {
+    (current as i64 + i64::from(delta)).max(0) as usize
+}
+
 fn pane_areas(area: Rect, pane: &MonitorPane) -> PaneAreas {
     let bottom_rows = pane.bottom_rows(area.height);
     let [top, bottom] =
@@ -713,6 +786,12 @@ const EXPANDED_REFRESH: Duration = Duration::from_millis(500);
 const EXPANDED_MIN_ROWS: u16 = 8;
 /// Rows always reserved for the interactive top pane.
 const TOP_PANE_MIN_ROWS: u16 = 5;
+/// Scrollback rows retained for the interactive top pane so the operator can wheel
+/// back through the child's output (the child runs in the broker's alt-screen, which
+/// has no native scrollback of its own).
+const TOP_PANE_SCROLLBACK_ROWS: usize = 10_000;
+/// Rows moved per wheel notch when scrolling the top-pane scrollback.
+const TOP_SCROLL_STEP: i32 = 3;
 
 /// Bottom-pane monitor state: collapse/expand, the latest read-only snapshot, and
 /// the current selection. Holds no terminal or IO handles.
@@ -1246,13 +1325,36 @@ fn render_frame(
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
     render_vt_screen(frame.buffer_mut(), top, screen);
+    render_scrollback_indicator(frame.buffer_mut(), top, screen.scrollback());
     render_monitor(frame.buffer_mut(), bottom, pane, focus);
-    if focus == Focus::Top && !screen.hide_cursor() {
+    // Suppress the child cursor while scrolled back — it belongs to the live tail, not
+    // the history the operator is reading.
+    if focus == Focus::Top && !screen.hide_cursor() && screen.scrollback() == 0 {
         let (crow, ccol) = screen.cursor_position();
         if crow < top.height && ccol < top.width {
             frame.set_cursor_position(Position::new(top.x + ccol, top.y + crow));
         }
     }
+}
+
+/// Badge in the top-right of the interactive pane while the operator is scrolled back,
+/// so a frozen (non-live) view is unmistakable.
+fn render_scrollback_indicator(buf: &mut Buffer, area: Rect, scrollback: usize) {
+    if scrollback == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let label = format!(" SCROLLBACK -{scrollback} (type to resume) ");
+    let width = (label.chars().count() as u16).min(area.width);
+    let x = area.x + area.width - width;
+    buf.set_string(
+        x,
+        area.y,
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Indexed(214))
+            .add_modifier(Modifier::BOLD),
+    );
 }
 
 /// Render the monitor: a status row always, plus the node list when expanded.
@@ -1614,7 +1716,9 @@ pub(super) fn relay_until_exit_observed(
 
     let mut pane = MonitorPane::new();
     let initial = child_pane_winsize(real_fd, &pane);
-    let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, 0);
+    let mut parser =
+        vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
+    let mut top_scrollback: usize = 0;
     let mut router = InputRouter::new();
     let mut line_state = InputLineState::default();
     let mut applied: Option<(libc::winsize, u16)> = None;
@@ -1645,7 +1749,20 @@ pub(super) fn relay_until_exit_observed(
                 &mut line_state,
                 &mut buffer,
             )?;
+            let scroll_lines = routed.top_scroll_lines;
+            // Sending keystrokes to the child snaps the view back to the live tail, like
+            // a terminal jumps to the prompt when you start typing.
+            let typed_to_child = !routed.forward.is_empty();
             dirty |= apply_routed_to_pane(&mut pane, routed, monitor, root);
+            if typed_to_child {
+                if top_scrollback != 0 {
+                    top_scrollback = 0;
+                    dirty = true;
+                }
+            } else if scroll_lines != 0 {
+                top_scrollback = apply_top_scroll(top_scrollback, scroll_lines);
+                dirty = true;
+            }
         }
         if ready.pty_output {
             dirty |= pump_pty_output(master_fd, &mut parser, &mut buffer)?;
@@ -1665,7 +1782,13 @@ pub(super) fn relay_until_exit_observed(
             let _ = service_control(control, &mut control_io);
             dirty = true;
         }
-        alt.sync_mouse(mouse_request_from_screen(parser.screen()))?;
+        alt.sync_mouse(effective_mouse_request(mouse_request_from_screen(
+            parser.screen(),
+        )))?;
+        // Re-assert the scrollback view each frame (clamped to retained history) so it
+        // survives child output and resizes; reading it back keeps our offset honest.
+        parser.screen_mut().set_scrollback(top_scrollback);
+        top_scrollback = parser.screen().scrollback();
         if dirty {
             draw(&mut terminal, &parser, router.focus, &pane)?;
         }
@@ -1791,13 +1914,14 @@ fn route_real_input(
     bytes: &[u8],
     router: &mut InputRouter,
     pane: &MonitorPane,
-    mouse_request: MouseRequest,
+    child_mouse: MouseRequest,
     winsize: &libc::winsize,
 ) -> RoutedInput {
-    if !mouse_request.is_enabled() {
-        return router.route_input(bytes);
-    }
-    route_mouse_aware_input(bytes, router, pane, mouse_request, winsize)
+    // The broker always captures the wheel on the real terminal (see
+    // `effective_mouse_request`), so always parse mouse events: top-pane wheel scrolls
+    // the scrollback, bottom-pane wheel scrolls the monitor, and non-wheel mouse is
+    // forwarded only to a child that requested mouse input.
+    route_mouse_aware_input(bytes, router, pane, child_mouse, winsize)
 }
 
 fn route_mouse_aware_input(
@@ -1834,9 +1958,19 @@ fn route_mouse_event(
     }
 }
 
-fn route_top_mouse_event(event: MouseEvent, mouse_request: MouseRequest, routed: &mut RoutedInput) {
-    if let Some(bytes) = encode_mouse_event(event, mouse_request.encoding) {
-        routed.forward.extend(bytes);
+fn route_top_mouse_event(event: MouseEvent, child_mouse: MouseRequest, routed: &mut RoutedInput) {
+    // A child that requested mouse owns its own events (including the wheel, e.g. a
+    // full-screen TUI agent): forward them in the child's encoding.
+    if child_mouse.is_enabled() {
+        if let Some(bytes) = encode_mouse_event(event, child_mouse.encoding) {
+            routed.forward.extend(bytes);
+        }
+        return;
+    }
+    // Child has no mouse mode: the wheel scrolls the broker's top-pane scrollback; other
+    // mouse events are swallowed rather than injected as input the child never asked for.
+    if mouse_button_is_wheel(event.button) {
+        routed.top_scroll_lines += wheel_scroll_lines(event);
     }
 }
 
@@ -2364,6 +2498,110 @@ mod tests {
             &winsize,
         );
         assert_eq!(routed.forward, b"abc".to_vec());
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_monitor_when_expanded_even_if_child_mouse_disabled() {
+        let mut router = InputRouter::new();
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Wheel-down (button 65) over the bottom monitor pane while the child has no
+        // mouse mode: the broker captures it and scrolls the selection.
+        let routed = route_real_input(
+            b"\x1b[<65;4;8M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert!(routed.forward.is_empty());
+        assert_eq!(routed.commands, vec![MonitorCommand::SelectNext]);
+    }
+
+    #[test]
+    fn top_pane_wheel_scrolls_scrollback_when_child_mouse_disabled() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Wheel-up over the top pane with no child mouse mode: scroll the top-pane
+        // scrollback toward older output, without forwarding anything to the child or
+        // emitting a monitor command.
+        let up = route_real_input(
+            b"\x1b[<64;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert!(up.forward.is_empty());
+        assert!(up.commands.is_empty());
+        assert_eq!(up.top_scroll_lines, TOP_SCROLL_STEP);
+        // Wheel-down moves back toward the live tail.
+        let down = route_real_input(
+            b"\x1b[<65;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert_eq!(down.top_scroll_lines, -TOP_SCROLL_STEP);
+    }
+
+    #[test]
+    fn broker_always_captures_wheel_regardless_of_child_mouse() {
+        // Child mouse off -> broker still captures with at least PressRelease + SGR so the
+        // terminal's alternate-scroll mode never turns the wheel into history keystrokes.
+        let effective = effective_mouse_request(MouseRequest::disabled());
+        assert!(effective.is_enabled());
+        assert_eq!(effective.mode, vt100::MouseProtocolMode::PressRelease);
+        assert_eq!(effective.encoding, vt100::MouseProtocolEncoding::Sgr);
+        // A stronger child mode is preserved (so a child's own drag/motion still works).
+        let child = MouseRequest {
+            mode: vt100::MouseProtocolMode::AnyMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+        assert_eq!(
+            effective_mouse_request(child).mode,
+            vt100::MouseProtocolMode::AnyMotion
+        );
+    }
+
+    #[test]
+    fn top_pane_wheel_forwards_to_child_that_requested_mouse() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let child = MouseRequest {
+            mode: vt100::MouseProtocolMode::ButtonMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+        // A child in mouse mode owns the wheel: forward it, never steal it for scrollback.
+        let routed = route_real_input(b"\x1b[<64;4;3M", &mut router, &pane, child, &winsize);
+        assert_eq!(routed.forward, b"\x1b[<64;4;3M".to_vec());
+        assert_eq!(routed.top_scroll_lines, 0);
+    }
+
+    #[test]
+    fn apply_top_scroll_floors_at_live_tail() {
+        assert_eq!(apply_top_scroll(0, -TOP_SCROLL_STEP), 0);
+        assert_eq!(apply_top_scroll(2, TOP_SCROLL_STEP), 2 + TOP_SCROLL_STEP as usize);
+        assert_eq!(apply_top_scroll(1, -5), 0);
     }
 
     #[test]
