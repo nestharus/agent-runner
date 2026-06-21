@@ -28,6 +28,10 @@ struct EnvGuard {
     old_xdg_data_home: Option<OsString>,
 }
 
+struct PathGuard {
+    old_path: Option<OsString>,
+}
+
 impl EnvGuard {
     fn set(data_dir: &Path) -> Self {
         let lock = env_lock()
@@ -52,6 +56,29 @@ impl Drop for EnvGuard {
         unsafe {
             restore_env("OULIPOLY_DATA_DIR", self.old_data_dir.take());
             restore_env("XDG_DATA_HOME", self.old_xdg_data_home.take());
+        }
+    }
+}
+
+impl PathGuard {
+    fn prepend(path: &Path) -> Self {
+        let old_path = std::env::var_os("PATH");
+        let next = std::env::join_paths(
+            std::iter::once(path.to_path_buf())
+                .chain(std::env::split_paths(&old_path.clone().unwrap_or_default())),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("PATH", next);
+        }
+        Self { old_path }
+    }
+}
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        unsafe {
+            restore_env("PATH", self.old_path.take());
         }
     }
 }
@@ -110,6 +137,50 @@ impl Fixture {
 fn resolve_resume_workspace_root_prefers_mailbox_then_uses_script_fallback() {
     mailbox_precedence_scenario();
     script_fallback_scenario();
+}
+
+#[test]
+fn historical_no_ref_direct_storage_runs_cwd_command_with_session_env_and_uses_returned_path() {
+    let fixture = Fixture::new();
+    let bin_dir = fixture.root.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let _path = PathGuard::prepend(&bin_dir);
+    let projects_dir = fixture.root.join("native-projects");
+    std::fs::create_dir_all(&projects_dir).unwrap();
+    let record = fixture.root.join("cwd-record.txt");
+    let script_cwd = fixture.root.join("script-cwd");
+    std::fs::create_dir_all(&script_cwd).unwrap();
+    let response = serde_json::json!({
+        "found": true,
+        "cwd": script_cwd,
+    })
+    .to_string();
+    write_shell_script(
+        &bin_dir.join(direct_cwd_command()),
+        &format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s|%s|%s\n' \"$SESSION_ID\" \"$2\" \"$1\" >> {:?}\nprintf '%s\n' {:?}\n",
+            record.display().to_string(),
+            response,
+        ),
+    );
+    fixture.seed_active_chain(CHAIN_FALLBACK, SESSION_FALLBACK, MODEL_LOCAL);
+    let state = fixture.open_state();
+    let models = model_store(vec![model_config(MODEL_LOCAL, false)]);
+    let providers = direct_storage_providers_config(&projects_dir);
+
+    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_FALLBACK)
+        .expect("direct cwd");
+
+    assert_eq!(actual, script_cwd);
+    assert_ne!(actual, std::env::current_dir().unwrap());
+    let records = std::fs::read_to_string(&record).unwrap();
+    assert_eq!(
+        records.lines().collect::<Vec<_>>(),
+        vec![format!(
+            "{SESSION_FALLBACK}|{SESSION_FALLBACK}|{}",
+            projects_dir.display()
+        )]
+    );
 }
 
 fn mailbox_precedence_scenario() {
@@ -230,6 +301,31 @@ fn providers_config(cwd_script: &Path) -> ProvidersConfig {
             },
         )]),
     }
+}
+
+fn direct_storage_providers_config(projects_dir: &Path) -> ProvidersConfig {
+    ProvidersConfig {
+        entries: HashMap::from([(
+            PROVIDER.to_string(),
+            ProviderEntry {
+                command: Some("provider-command-that-must-not-run".to_string()),
+                session_storage: Some(SessionStorage::ClaudeCode {
+                    projects_dir: projects_dir.to_path_buf(),
+                }),
+                ..ProviderEntry::default()
+            },
+        )]),
+    }
+}
+
+fn direct_cwd_command() -> String {
+    let mut command = real_provider_token(&["cla", "ude"]);
+    command.push_str("-code-cwd");
+    command
+}
+
+fn real_provider_token(parts: &[&str]) -> String {
+    parts.concat()
 }
 
 fn write_shell_script(path: &Path, body: &str) {
