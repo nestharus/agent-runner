@@ -4032,3 +4032,21 @@ and is reversible (a human/manager can re-run full apply-gate-set on the draft P
   include a CodeRabbit gate. CodeRabbit's own automatic review of the opened draft PR plus the
   human manager are the review surface. Reversible: the manager (or a follow-up) can run the
   CodeRabbit loop on the open PR at any time.
+
+### D7 — Phase 8 acceptance + WU close
+
+- Phase 8 gate aggregate = MEDIUM but wu_introduced_failures=0 and WU-delta-0 (598 tracked /
+  0 untracked). JUDGE DISPOSITION: ACCEPTED for Phase 9 on the brief's ZERO-REGRESSION basis
+  (no NEW build/test/clippy/tsc failure attributable to this WU), mirroring the NES-297
+  precedent. The MEDIUM is composed entirely of non-WU reds: the brief-allowlisted pre-existing
+  guards (age244_s7b / age245_s7c), one pre-existing clippy lint in the UNTOUCHED file
+  age216_provider_settings_source_guard.rs, and a node_modules-absent tsc with zero
+  frontend/package diff. Evidence: planning risk/phase-8-gate-report.md +
+  risk/phase-8-join-manifest.json. Reversible: draft PR only; the manager merges.
+- Phase 8.X closure capture inline (ticket_system=none, unmeasured): see closure-judge.md.
+- Phase 9: draft PR #183 opened on base main (head 83f81387, isDraft=true). auto_merge=false
+  so the orchestrator stops at the draft PR; the human manager merges. Linear cross-link and
+  NES ticket creation are deferred to the manager out-of-band (Linear unavailable this run).
+- WU CLOSED: SUCCESS. Design + proof + coverage delivered; anti-scope honored (no production
+  deletion, no behavior change, live DB never mutated). Evidence index: planning peer
+  research/, proposals/, risk/, contracts/, alignment/, design/, dry-run/, audit-history.md.
