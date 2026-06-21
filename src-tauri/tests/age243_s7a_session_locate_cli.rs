@@ -204,11 +204,100 @@ fn no_ref_locate_uses_local_locator_and_ignores_unrelated_registry() {
     assert!(provider_records(&record_path).is_empty());
 }
 
+#[test]
+fn historical_ref_locate_uses_external_path_and_rejects_local_success_on_error() {
+    let prepared = historical_ref_locate_fixture("locate_success");
+
+    let output = prepared
+        .fixture
+        .run_locate(&prepared.session_id, &["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = parse_stdout_json(&output);
+    assert_eq!(stdout["session_id"], prepared.session_id);
+    assert_eq!(stdout["chain_id"], prepared.chain_id);
+    assert_eq!(stdout["provider_name"], prepared.provider_name);
+    assert_eq!(
+        stdout["jsonl_path"],
+        prepared.transcript_path.display().to_string()
+    );
+    assert_ne!(
+        stdout["jsonl_path"],
+        prepared.local_path.display().to_string()
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .contains(&prepared.local_path.display().to_string())
+    );
+    assert_historical_locate_request_shape(
+        &provider_records(&prepared.record_path),
+        &prepared.model_name,
+        &prepared.provider_name,
+    );
+
+    let failure = historical_ref_locate_fixture("provider_error");
+    let failure_output = failure.fixture.run_locate(&failure.session_id, &["--json"]);
+
+    assert_ne!(failure_output.status.code(), Some(0), "{failure_output:?}");
+    assert!(failure_output.stdout.is_empty(), "{failure_output:?}");
+    assert_historical_locate_request_shape(
+        &provider_records(&failure.record_path),
+        &failure.model_name,
+        &failure.provider_name,
+    );
+}
+
+#[test]
+fn historical_no_ref_locate_uses_local_storage_and_ignores_unrelated_external_model() {
+    let prepared = historical_no_ref_locate_fixture();
+    let record_path = prepared.fixture.root().join("provider-a-records.jsonl");
+    let provider_path = write_cli_provider_a_script(
+        prepared.fixture.root(),
+        "locate_success",
+        &record_path,
+        &prepared.transcript_path,
+    );
+    prepared
+        .fixture
+        .write_external_model(PROVIDER_A_MODEL, PROVIDER_A_ACCOUNT, &provider_path);
+    prepared
+        .fixture
+        .write_provider(PROVIDER_A_ACCOUNT, StorageKind::None, false, None);
+
+    let output = prepared
+        .fixture
+        .run_locate(&prepared.session_id, &["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = parse_stdout_json(&output);
+    assert_eq!(stdout["session_id"], prepared.session_id);
+    assert_eq!(stdout["chain_id"], prepared.chain_id);
+    assert_eq!(stdout["provider_name"], prepared.provider_name);
+    assert_eq!(stdout["storage_type"], native_storage_kind());
+    assert_eq!(
+        stdout["jsonl_path"],
+        prepared.transcript_path.display().to_string()
+    );
+    assert!(provider_records(&record_path).is_empty());
+}
+
 struct ExternalLocateFixture {
     fixture: LocateFixture,
     session_id: String,
     chain_id: String,
     transcript_path: PathBuf,
+    record_path: PathBuf,
+}
+
+struct HistoricalLocateFixture {
+    fixture: LocateFixture,
+    session_id: String,
+    chain_id: String,
+    provider_name: String,
+    model_name: String,
+    transcript_path: PathBuf,
+    local_path: PathBuf,
     record_path: PathBuf,
 }
 
@@ -235,6 +324,127 @@ fn external_provider_locate_fixture(mode: &str) -> ExternalLocateFixture {
         transcript_path,
         record_path,
     }
+}
+
+fn historical_ref_locate_fixture(mode: &str) -> HistoricalLocateFixture {
+    let fixture = LocateFixture::new();
+    let provider_name = real_provider_token(&["cla", "ude"]);
+    let model_name = format!("{}-opus", provider_name);
+    let (projects_dir, local_path) = stage_local_storage_transcript(&fixture, SESSION_A);
+    let transcript_path = fixture.root().join("provider-owned-transcript.jsonl");
+    fs::write(&transcript_path, "{}\n").unwrap();
+    let record_path = fixture.root().join("provider-records.jsonl");
+    let provider_path =
+        write_cli_provider_a_script(fixture.root(), mode, &record_path, &transcript_path);
+    fixture.write_external_model(&model_name, &provider_name, &provider_path);
+    fixture.write_provider(
+        &provider_name,
+        StorageKind::ClaudeCode {
+            projects_dir: &projects_dir,
+        },
+        true,
+        None,
+    );
+    fixture.write_sessions_with_locator_path(&provider_name, &local_path);
+    fixture.seed_active_chain(
+        CHAIN_A,
+        &provider_name,
+        SESSION_A,
+        &model_name,
+        "2026-01-15T00:00:00Z",
+    );
+    HistoricalLocateFixture {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name,
+        model_name,
+        transcript_path,
+        local_path,
+        record_path,
+    }
+}
+
+fn historical_no_ref_locate_fixture() -> HistoricalLocateFixture {
+    let fixture = LocateFixture::new();
+    let provider_name = real_provider_token(&["cla", "ude"]);
+    let model_name = format!("{}-opus", provider_name);
+    let (projects_dir, transcript_path) = stage_local_storage_transcript(&fixture, SESSION_A);
+    fixture.write_model(&model_name, &[&provider_name]);
+    fixture.write_provider(
+        &provider_name,
+        StorageKind::ClaudeCode {
+            projects_dir: &projects_dir,
+        },
+        true,
+        None,
+    );
+    fixture.seed_active_chain(
+        CHAIN_A,
+        &provider_name,
+        SESSION_A,
+        &model_name,
+        "2026-01-15T00:00:00Z",
+    );
+    HistoricalLocateFixture {
+        fixture,
+        session_id: SESSION_A.to_string(),
+        chain_id: CHAIN_A.to_string(),
+        provider_name,
+        model_name,
+        transcript_path: transcript_path.clone(),
+        local_path: transcript_path,
+        record_path: PathBuf::new(),
+    }
+}
+
+fn stage_local_storage_transcript(fixture: &LocateFixture, session_id: &str) -> (PathBuf, PathBuf) {
+    let projects_dir = fixture.root().join("native-projects");
+    let workspace_root = fixture.root().join("workspace");
+    fs::create_dir_all(&workspace_root).unwrap();
+    let project_dir = projects_dir.join(project_dir_name(&workspace_root));
+    fs::create_dir_all(&project_dir).unwrap();
+    let transcript_path = project_dir.join(format!("{session_id}.jsonl"));
+    fs::write(
+        &transcript_path,
+        format!(
+            "{{\"sessionId\":\"{session_id}\",\"type\":\"assistant\",\"uuid\":\"local-turn\",\"timestamp\":\"2026-04-17T08:00:00Z\",\"message\":\"local\"}}\n"
+        ),
+    )
+    .unwrap();
+    (projects_dir, transcript_path)
+}
+
+fn project_dir_name(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    format!("-{}", raw.trim_start_matches('/').replace('/', "-"))
+}
+
+fn real_provider_token(parts: &[&str]) -> String {
+    parts.concat()
+}
+
+fn native_storage_kind() -> String {
+    format!("{}_code", real_provider_token(&["cla", "ude"]))
+}
+
+fn assert_historical_locate_request_shape(
+    records: &[Value],
+    model_name: &str,
+    provider_name: &str,
+) {
+    let locate_records = records
+        .iter()
+        .filter(|record| record["subcommand"] == "session.locate_transcript")
+        .collect::<Vec<_>>();
+    assert_eq!(locate_records.len(), 1, "{records:?}");
+    let request = &locate_records[0]["request"];
+    assert_eq!(request["provider_instance_id"], PROVIDER_A_INSTANCE);
+    assert_eq!(request["params"]["settings_id"], PROVIDER_A_SETTINGS);
+    assert_eq!(request["params"]["model_name"], model_name);
+    assert_eq!(request["params"]["provider_name"], provider_name);
+    assert_eq!(request["params"]["session_id"], SESSION_A);
+    assert_eq!(request["params"]["lookup_mode"], "require_existing");
 }
 
 fn assert_external_locate_request_shape(records: &[Value]) {
