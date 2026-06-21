@@ -1831,16 +1831,14 @@ pub(super) fn relay_until_exit_observed(
                 )?;
             }
             if let Some(click) = right_click {
-                dirty |= handle_top_right_click(
-                    &mut selection,
-                    click,
-                    parser.screen(),
-                    top_scrollback,
-                    &mut alt,
-                    &mut clipboard,
+                let mut io = MouseActionIo {
+                    alt: &mut alt,
+                    clipboard: &mut clipboard,
                     master_fd,
-                    &mut line_state,
-                )?;
+                    line_state: &mut line_state,
+                };
+                dirty |=
+                    handle_top_right_click(&mut selection, click, parser.screen(), top_scrollback, &mut io)?;
             }
         }
         if ready.pty_output {
@@ -2167,7 +2165,7 @@ fn extract_selection_text(screen: &vt100::Screen, span: SelectionSpan) -> String
         for col in first..=last {
             let contents = screen.cell(row, col).map(vt100::Cell::contents);
             match contents {
-                Some(text) if !text.is_empty() => line.push_str(&text),
+                Some(text) if !text.is_empty() => line.push_str(text),
                 _ => line.push(' '),
             }
         }
@@ -2276,6 +2274,14 @@ fn visible_selection_span(
     })
 }
 
+/// Mutable IO handles the relay loop lends to top-pane mouse-action helpers.
+struct MouseActionIo<'a> {
+    alt: &'a mut AltScreenGuard,
+    clipboard: &'a mut String,
+    master_fd: RawFd,
+    line_state: &'a mut InputLineState,
+}
+
 /// Handle a top-pane right-click: if it lands on the current selection, copy that
 /// selection and deselect; otherwise paste the broker clipboard into the child. Returns
 /// whether a redraw is needed. `click` is 1-based, pane-local.
@@ -2284,30 +2290,26 @@ fn handle_top_right_click(
     click: (u16, u16),
     screen: &vt100::Screen,
     top_scrollback: usize,
-    alt: &mut AltScreenGuard,
-    clipboard: &mut String,
-    master_fd: RawFd,
-    line_state: &mut InputLineState,
+    io: &mut MouseActionIo<'_>,
 ) -> Result<bool, String> {
     let height = screen.size().0;
     let cell = (click.0.saturating_sub(1), click.1.saturating_sub(1));
     let visible = selection
         .as_ref()
         .and_then(|sel| visible_selection_span(sel, top_scrollback, height));
-    let on_selection =
-        visible.is_some_and(|span| cell_in_selection(span, cell.0, cell.1));
+    let on_selection = visible.is_some_and(|span| cell_in_selection(span, cell.0, cell.1));
     if on_selection {
         if let Some(span) = visible {
             let text = extract_selection_text(screen, span);
             if !text.is_empty() {
-                *clipboard = text.clone();
-                alt.copy_to_clipboard(&text)?;
+                *io.clipboard = text.clone();
+                io.alt.copy_to_clipboard(&text)?;
             }
         }
         *selection = None;
         Ok(true)
     } else {
-        inject_clipboard_paste(master_fd, line_state, clipboard)?;
+        inject_clipboard_paste(io.master_fd, io.line_state, io.clipboard)?;
         Ok(false)
     }
 }
