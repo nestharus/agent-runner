@@ -523,11 +523,11 @@ fn collect_rs_sources(dir: &Path, out: &mut String) {
     for path in paths {
         if path.is_dir() {
             collect_rs_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                out.push_str(&contents);
-                out.push('\n');
-            }
+        } else if path.extension().is_some_and(|ext| ext == "rs")
+            && let Ok(contents) = fs::read_to_string(&path)
+        {
+            out.push_str(&contents);
+            out.push('\n');
         }
     }
 }
