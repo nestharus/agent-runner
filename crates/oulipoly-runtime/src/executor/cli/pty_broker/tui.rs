@@ -68,6 +68,11 @@ const MIN_TERMINAL_COLS: u16 = 40;
 /// Reserved focus-toggle byte: Ctrl+O.
 const FOCUS_TOGGLE_BYTE: u8 = 0x0f;
 
+/// Bracketed-paste delimiters (DECSET 2004) the broker wraps an injected notification in
+/// when the child has advertised the mode, so the body is treated as pasted content and
+/// the trailing Enter submits it.
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
 const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
 const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
@@ -2562,7 +2567,8 @@ fn inject_control_payload(
     validate_control_peer(stream)?;
     let payload = read_tui_control_payload(stream)?;
     wait_until_safe_to_inject(io)?;
-    submit_control_payload(io.master_fd, &payload, io.line_state)
+    let bracketed_paste = io.parser.screen().bracketed_paste();
+    submit_control_payload(io.master_fd, &payload, io.line_state, bracketed_paste)
 }
 
 fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
@@ -2577,15 +2583,39 @@ fn submit_control_payload(
     master_fd: RawFd,
     payload: &[u8],
     line_state: &mut InputLineState,
+    bracketed_paste: bool,
 ) -> Result<(), String> {
-    write_control_payload_to_pty(master_fd, payload).map_err(format_pty_write_failed)?;
+    write_control_payload_to_pty(master_fd, payload, bracketed_paste)
+        .map_err(format_pty_write_failed)?;
     write_control_submit_to_pty(master_fd).map_err(format_pty_submit_failed)?;
     line_state.mark_submitted();
     Ok(())
 }
 
-fn write_control_payload_to_pty(master_fd: RawFd, payload: &[u8]) -> io::Result<()> {
-    write_all_fd(master_fd, payload)
+fn write_control_payload_to_pty(
+    master_fd: RawFd,
+    payload: &[u8],
+    bracketed_paste: bool,
+) -> io::Result<()> {
+    write_all_fd(master_fd, &control_payload_bytes(payload, bracketed_paste))
+}
+
+/// The bytes to inject for a control payload. When the child advertised bracketed-paste
+/// mode (DECSET 2004) the (multi-line) body is wrapped in paste markers so an Ink-style
+/// TUI (e.g. Claude Code) treats it as pasted content and the trailing `\r` as a distinct
+/// Enter keypress that submits it; without the markers the child batches the whole burst
+/// as one paste and absorbs the submit, leaving the notification unsent in the input box.
+fn control_payload_bytes(payload: &[u8], bracketed_paste: bool) -> Vec<u8> {
+    if !bracketed_paste {
+        return payload.to_vec();
+    }
+    let mut bytes = Vec::with_capacity(
+        BRACKETED_PASTE_START.len() + payload.len() + BRACKETED_PASTE_END.len(),
+    );
+    bytes.extend_from_slice(BRACKETED_PASTE_START);
+    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(BRACKETED_PASTE_END);
+    bytes
 }
 
 fn write_control_submit_to_pty(master_fd: RawFd) -> io::Result<()> {
@@ -2963,6 +2993,17 @@ mod tests {
         assert_eq!(apply_top_scroll(0, -TOP_SCROLL_STEP), 0);
         assert_eq!(apply_top_scroll(2, TOP_SCROLL_STEP), 2 + TOP_SCROLL_STEP as usize);
         assert_eq!(apply_top_scroll(1, -5), 0);
+    }
+
+    #[test]
+    fn control_payload_bytes_wraps_only_for_bracketed_paste() {
+        // No mode 2004: inject the body verbatim (then a `\r` submit follows).
+        assert_eq!(control_payload_bytes(b"line1\nline2", false), b"line1\nline2".to_vec());
+        // Mode 2004 advertised: wrap as a real paste so the trailing Enter submits.
+        assert_eq!(
+            control_payload_bytes(b"line1\nline2", true),
+            b"\x1b[200~line1\nline2\x1b[201~".to_vec()
+        );
     }
 
     fn mouse(button: u16, col: u16, row: u16, released: bool) -> MouseEvent {
