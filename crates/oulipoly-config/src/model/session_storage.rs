@@ -23,7 +23,7 @@
 //! ```
 //!
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -164,14 +164,14 @@ fn shell_word(input: &str) -> String {
     quote_shell_word(input)
 }
 
-fn format_claude_code_cwd_script(projects_dir: &PathBuf) -> String {
+fn format_claude_code_cwd_script(projects_dir: &Path) -> String {
     format!(
         "claude-code-cwd {}",
         shell_word(&projects_dir.display().to_string())
     )
 }
 
-fn format_codex_cwd_script(sessions_dir: &PathBuf) -> String {
+fn format_codex_cwd_script(sessions_dir: &Path) -> String {
     format!(
         "codex-cwd {}",
         shell_word(&sessions_dir.display().to_string())
