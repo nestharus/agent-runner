@@ -2589,7 +2589,9 @@ fn write_control_payload_to_pty(master_fd: RawFd, payload: &[u8]) -> io::Result<
 }
 
 fn write_control_submit_to_pty(master_fd: RawFd) -> io::Result<()> {
-    write_all_fd(master_fd, b"\n")
+    // `\r` (the Enter byte) so raw-mode TUI children submit the injected notification;
+    // see submit_control_request_payload. `\n` would leave it unsubmitted in the editor.
+    write_all_fd(master_fd, b"\r")
 }
 
 fn format_pty_write_failed(err: io::Error) -> String {

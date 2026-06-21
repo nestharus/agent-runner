@@ -1366,7 +1366,11 @@ fn validate_control_request_peer(stream: &UnixStream) -> Result<(), String> {
 
 fn submit_control_request_payload(master_fd: RawFd, payload: &[u8]) -> Result<(), String> {
     write_all_fd(master_fd, payload).map_err(format_control_payload_write_error)?;
-    write_all_fd(master_fd, b"\n").map_err(format_control_submit_write_error)
+    // Submit with a carriage return (`\r`), the byte the Enter key sends. Raw-mode TUI
+    // children (e.g. Claude Code) submit on `\r` and treat `\n` as a literal newline, so a
+    // `\n` here would leave the payload sitting unsubmitted in the input box. Cooked-mode
+    // children still submit because the pty's `ICRNL` maps the incoming `\r` to `\n`.
+    write_all_fd(master_fd, b"\r").map_err(format_control_submit_write_error)
 }
 
 fn format_control_payload_write_error(err: io::Error) -> String {
@@ -1649,7 +1653,7 @@ mod tests {
         let mut read_end = read_end;
         let mut received = String::new();
         read_end.read_to_string(&mut received).unwrap();
-        assert_eq!(received, "[OULIPOLY NOTIFICATIONS]\n");
+        assert_eq!(received, "[OULIPOLY NOTIFICATIONS]\r");
     }
 
     #[test]
@@ -1681,7 +1685,7 @@ mod tests {
         let mut read_end = read_end;
         let mut received = String::new();
         read_end.read_to_string(&mut received).unwrap();
-        assert_eq!(received, "\nnotify\n");
+        assert_eq!(received, "\nnotify\r");
     }
 
     #[test]
