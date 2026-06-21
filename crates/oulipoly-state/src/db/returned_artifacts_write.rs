@@ -300,7 +300,7 @@ impl StateDb {
         source: &oulipoly_agent_messenger::ReturnedArtifactSource,
     ) -> Result<String, DbError> {
         serde_json::to_string(source)
-            .map_err(|e| format!("Failed to encode returned-artifact source: {e}").into())
+            .map_err(|e| format!("Failed to encode returned-artifact source: {e}"))
     }
 
     fn format_returned_at(returned_at: DateTime<Utc>) -> String {
