@@ -30,7 +30,6 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
     sweep::run_startup_wake_reclaim_sweep();
 }
 
-#[allow(dead_code)]
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
     sweep::start_wake_reclaim_maintenance_driver();
 }

@@ -44,6 +44,7 @@ use crate::observability::{
     MonitorNodeId, MonitorNodeKind, MonitorSnapshot, MonitorStatus, ObservabilityRoot,
     ObservabilitySnapshotPort, SnapshotLimits,
 };
+use base64::Engine as _;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -130,7 +131,32 @@ struct RoutedInput {
     commands: Vec<MonitorCommand>,
     /// The operator toggled focus into the monitor (expand + focus bottom).
     focus_bottom: bool,
+    /// Net wheel scroll for the top pane's scrollback: positive moves toward older
+    /// output, negative toward the live tail. Applied by the relay loop.
+    top_scroll_lines: i32,
+    /// Ordered top-pane drag-selection gestures (left button) the relay loop folds into
+    /// the live selection state. Empty when the child owns the mouse.
+    top_mouse: Vec<TopMouse>,
+    /// A right-click in the top pane, with its 1-based pane-local (row, col). The relay
+    /// loop copies+deselects if it lands on the selection, otherwise pastes.
+    right_click: Option<(u16, u16)>,
     redraw: bool,
+}
+
+/// A left-button selection gesture in the interactive top pane, with 1-based terminal
+/// coordinates localized to the top pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopMouse {
+    gesture: TopGesture,
+    row: u16,
+    col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopGesture {
+    Press,
+    Drag,
+    Release,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +285,11 @@ impl InputRouter {
         Self { focus: Focus::Top }
     }
 
+    /// Keyboard-only routing helper. Production input always flows through
+    /// `route_mouse_aware_input` (which calls `route_next_input` per chunk) since the
+    /// broker always captures the mouse; this convenience wrapper is used by the keyboard
+    /// routing tests.
+    #[cfg(test)]
     fn route_input(&mut self, bytes: &[u8]) -> RoutedInput {
         let mut routed = RoutedInput::default();
         let mut i = 0;
@@ -661,6 +692,71 @@ fn mouse_wheel_command(event: MouseEvent) -> Option<MonitorCommand> {
     }
 }
 
+/// Minimum mouse-reporting mode the broker drives on the real terminal so wheel events
+/// reach the panes and click-drag selection works even when the child never requested
+/// mouse input. `ButtonMotion` reports button press/release, the wheel, and motion *while
+/// a button is held* (needed to extend a drag selection) without the noise of free motion.
+const BROKER_WHEEL_CAPTURE_MODE: vt100::MouseProtocolMode = vt100::MouseProtocolMode::ButtonMotion;
+
+fn mouse_mode_rank(mode: vt100::MouseProtocolMode) -> u8 {
+    match mode {
+        vt100::MouseProtocolMode::None => 0,
+        vt100::MouseProtocolMode::Press => 1,
+        vt100::MouseProtocolMode::PressRelease => 2,
+        vt100::MouseProtocolMode::ButtonMotion => 3,
+        vt100::MouseProtocolMode::AnyMotion => 4,
+    }
+}
+
+fn stronger_mouse_mode(
+    a: vt100::MouseProtocolMode,
+    b: vt100::MouseProtocolMode,
+) -> vt100::MouseProtocolMode {
+    if mouse_mode_rank(a) >= mouse_mode_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
+/// The mouse request the broker drives on the *real* terminal — distinct from the
+/// child's own request. The broker always captures wheel/click events (SGR encoding for
+/// robustness, preferring a stronger child mode if the child set one) so the operator
+/// can wheel through the top-pane scrollback and the monitor regardless of whether the
+/// child enabled mouse mode. Without this the terminal's alternate-scroll mode turns the
+/// wheel into ↑/↓ keystrokes that leak to the child as history navigation. Top-pane
+/// events are still only forwarded to a child that requested mouse input (see
+/// `route_top_mouse_event`); otherwise the wheel scrolls the broker's scrollback.
+///
+/// Tradeoff: claiming the mouse disables native click-drag text selection in the top
+/// pane for the duration of the observed session (Shift+drag bypasses it in most
+/// terminals).
+fn effective_mouse_request(child: MouseRequest) -> MouseRequest {
+    MouseRequest {
+        mode: stronger_mouse_mode(child.mode, BROKER_WHEEL_CAPTURE_MODE),
+        encoding: vt100::MouseProtocolEncoding::Sgr,
+    }
+}
+
+/// Net top-pane scrollback movement for a wheel event: positive toward older output.
+fn wheel_scroll_lines(event: MouseEvent) -> i32 {
+    if !mouse_button_is_wheel(event.button) {
+        return 0;
+    }
+    match event.button & 0b11 {
+        0 => TOP_SCROLL_STEP,  // wheel up -> older output
+        1 => -TOP_SCROLL_STEP, // wheel down -> toward the live tail
+        _ => 0,
+    }
+}
+
+/// Apply a signed scroll delta to the current top-pane scrollback offset, flooring at
+/// the live tail (0). The upper bound is enforced by `Screen::set_scrollback`, which
+/// clamps to the retained history.
+fn apply_top_scroll(current: usize, delta: i32) -> usize {
+    (current as i64 + i64::from(delta)).max(0) as usize
+}
+
 fn pane_areas(area: Rect, pane: &MonitorPane) -> PaneAreas {
     let bottom_rows = pane.bottom_rows(area.height);
     let [top, bottom] =
@@ -713,6 +809,12 @@ const EXPANDED_REFRESH: Duration = Duration::from_millis(500);
 const EXPANDED_MIN_ROWS: u16 = 8;
 /// Rows always reserved for the interactive top pane.
 const TOP_PANE_MIN_ROWS: u16 = 5;
+/// Scrollback rows retained for the interactive top pane so the operator can wheel
+/// back through the child's output (the child runs in the broker's alt-screen, which
+/// has no native scrollback of its own).
+const TOP_PANE_SCROLLBACK_ROWS: usize = 10_000;
+/// Rows moved per wheel notch when scrolling the top-pane scrollback.
+const TOP_SCROLL_STEP: i32 = 3;
 
 /// Bottom-pane monitor state: collapse/expand, the latest read-only snapshot, and
 /// the current selection. Holds no terminal or IO handles.
@@ -1225,10 +1327,18 @@ fn vt_cell_render(cell: Option<&vt100::Cell>) -> (&str, Style) {
 }
 
 /// Render the virtual terminal screen grid into the top-pane buffer cells.
-fn render_vt_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
+fn render_vt_screen(
+    buf: &mut Buffer,
+    area: Rect,
+    screen: &vt100::Screen,
+    selection: Option<SelectionSpan>,
+) {
     for row in 0..area.height {
         for col in 0..area.width {
-            let (symbol, style) = vt_cell_render(screen.cell(row, col));
+            let (symbol, mut style) = vt_cell_render(screen.cell(row, col));
+            if selection.is_some_and(|span| cell_in_selection(span, row, col)) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             buf.set_string(area.x + col, area.y + row, symbol, style);
         }
     }
@@ -1240,19 +1350,47 @@ fn render_frame(
     screen: &vt100::Screen,
     focus: Focus,
     pane: &MonitorPane,
+    selection: Option<SelectionSpan>,
 ) {
     let area = frame.area();
     let bottom_rows = pane.bottom_rows(area.height);
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
-    render_vt_screen(frame.buffer_mut(), top, screen);
+    render_vt_screen(frame.buffer_mut(), top, screen, selection);
+    render_scrollback_indicator(frame.buffer_mut(), top, screen.scrollback());
     render_monitor(frame.buffer_mut(), bottom, pane, focus);
-    if focus == Focus::Top && !screen.hide_cursor() {
+    // Suppress the child cursor while scrolled back or selecting — it belongs to the live
+    // tail, not the history/selection the operator is reading.
+    if focus == Focus::Top
+        && !screen.hide_cursor()
+        && screen.scrollback() == 0
+        && selection.is_none()
+    {
         let (crow, ccol) = screen.cursor_position();
         if crow < top.height && ccol < top.width {
             frame.set_cursor_position(Position::new(top.x + ccol, top.y + crow));
         }
     }
+}
+
+/// Badge in the top-right of the interactive pane while the operator is scrolled back,
+/// so a frozen (non-live) view is unmistakable.
+fn render_scrollback_indicator(buf: &mut Buffer, area: Rect, scrollback: usize) {
+    if scrollback == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let label = format!(" SCROLLBACK -{scrollback} (type to resume) ");
+    let width = (label.chars().count() as u16).min(area.width);
+    let x = area.x + area.width - width;
+    buf.set_string(
+        x,
+        area.y,
+        label,
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Indexed(214))
+            .add_modifier(Modifier::BOLD),
+    );
 }
 
 /// Render the monitor: a status row always, plus the node list when expanded.
@@ -1559,6 +1697,20 @@ impl AltScreenGuard {
         sync_terminal_mouse(&mut self.writer, &mut self.mouse, request)
             .map_err(format_tui_mouse_sync_error)
     }
+
+    /// Copy `text` to the host's system clipboard via the OSC 52 escape, so the operator
+    /// can paste a drag selection elsewhere even though the broker has claimed the mouse.
+    fn copy_to_clipboard(&mut self, text: &str) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let sequence = format!("\x1b]52;c;{payload}\x07");
+        self.writer
+            .write_all(sequence.as_bytes())
+            .and_then(|()| self.writer.flush())
+            .map_err(|err| format!("Failed to write clipboard selection: {err}"))
+    }
 }
 
 impl Drop for AltScreenGuard {
@@ -1614,7 +1766,11 @@ pub(super) fn relay_until_exit_observed(
 
     let mut pane = MonitorPane::new();
     let initial = child_pane_winsize(real_fd, &pane);
-    let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, 0);
+    let mut parser =
+        vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
+    let mut top_scrollback: usize = 0;
+    let mut selection: Option<TopSelection> = None;
+    let mut clipboard = String::new();
     let mut router = InputRouter::new();
     let mut line_state = InputLineState::default();
     let mut applied: Option<(libc::winsize, u16)> = None;
@@ -1636,7 +1792,7 @@ pub(super) fn relay_until_exit_observed(
         }
         let ready = poll_relay_fds(real_fd, master_fd, control.map(ControlSocket::fd))?;
         if ready.real_input {
-            let routed = forward_real_input(
+            let mut routed = forward_real_input(
                 real_fd,
                 master_fd,
                 &mut router,
@@ -1645,7 +1801,45 @@ pub(super) fn relay_until_exit_observed(
                 &mut line_state,
                 &mut buffer,
             )?;
+            let scroll_lines = routed.top_scroll_lines;
+            // Sending keystrokes to the child snaps the view back to the live tail, like
+            // a terminal jumps to the prompt when you start typing.
+            let typed_to_child = !routed.forward.is_empty();
+            let right_click = routed.right_click;
+            let gestures = std::mem::take(&mut routed.top_mouse);
             dirty |= apply_routed_to_pane(&mut pane, routed, monitor, root);
+            if typed_to_child {
+                // Typing snaps to the live tail and drops the selection highlight.
+                selection = None;
+                if top_scrollback != 0 {
+                    top_scrollback = 0;
+                }
+                dirty = true;
+            } else if scroll_lines != 0 {
+                // Keep the selection — its highlight follows the content as we scroll.
+                top_scrollback = apply_top_scroll(top_scrollback, scroll_lines);
+                dirty = true;
+            }
+            if !gestures.is_empty() {
+                dirty |= apply_selection_gestures(
+                    &mut selection,
+                    &gestures,
+                    parser.screen(),
+                    &mut alt,
+                    top_scrollback,
+                    &mut clipboard,
+                )?;
+            }
+            if let Some(click) = right_click {
+                let mut io = MouseActionIo {
+                    alt: &mut alt,
+                    clipboard: &mut clipboard,
+                    master_fd,
+                    line_state: &mut line_state,
+                };
+                dirty |=
+                    handle_top_right_click(&mut selection, click, parser.screen(), top_scrollback, &mut io)?;
+            }
         }
         if ready.pty_output {
             dirty |= pump_pty_output(master_fd, &mut parser, &mut buffer)?;
@@ -1665,15 +1859,24 @@ pub(super) fn relay_until_exit_observed(
             let _ = service_control(control, &mut control_io);
             dirty = true;
         }
-        alt.sync_mouse(mouse_request_from_screen(parser.screen()))?;
+        alt.sync_mouse(effective_mouse_request(mouse_request_from_screen(
+            parser.screen(),
+        )))?;
+        // Re-assert the scrollback view each frame (clamped to retained history) so it
+        // survives child output and resizes; reading it back keeps our offset honest.
+        parser.screen_mut().set_scrollback(top_scrollback);
+        top_scrollback = parser.screen().scrollback();
         if dirty {
-            draw(&mut terminal, &parser, router.focus, &pane)?;
+            let render_selection = selection.as_ref().and_then(|sel| {
+                visible_selection_span(sel, top_scrollback, parser.screen().size().0)
+            });
+            draw(&mut terminal, &parser, router.focus, &pane, render_selection)?;
         }
         status = try_wait_child(child).map_err(format_interactive_child_poll_error)?;
     }
 
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
-    draw(&mut terminal, &parser, router.focus, &pane)?;
+    draw(&mut terminal, &parser, router.focus, &pane, None)?;
     Ok(status.expect("status checked above"))
 }
 
@@ -1791,13 +1994,14 @@ fn route_real_input(
     bytes: &[u8],
     router: &mut InputRouter,
     pane: &MonitorPane,
-    mouse_request: MouseRequest,
+    child_mouse: MouseRequest,
     winsize: &libc::winsize,
 ) -> RoutedInput {
-    if !mouse_request.is_enabled() {
-        return router.route_input(bytes);
-    }
-    route_mouse_aware_input(bytes, router, pane, mouse_request, winsize)
+    // The broker always captures the wheel on the real terminal (see
+    // `effective_mouse_request`), so always parse mouse events: top-pane wheel scrolls
+    // the scrollback, bottom-pane wheel scrolls the monitor, and non-wheel mouse is
+    // forwarded only to a child that requested mouse input.
+    route_mouse_aware_input(bytes, router, pane, child_mouse, winsize)
 }
 
 fn route_mouse_aware_input(
@@ -1834,10 +2038,298 @@ fn route_mouse_event(
     }
 }
 
-fn route_top_mouse_event(event: MouseEvent, mouse_request: MouseRequest, routed: &mut RoutedInput) {
-    if let Some(bytes) = encode_mouse_event(event, mouse_request.encoding) {
-        routed.forward.extend(bytes);
+fn route_top_mouse_event(event: MouseEvent, child_mouse: MouseRequest, routed: &mut RoutedInput) {
+    // A child that requested mouse owns its own events (including the wheel, e.g. a
+    // full-screen TUI agent): forward them in the child's encoding.
+    if child_mouse.is_enabled() {
+        if let Some(bytes) = encode_mouse_event(event, child_mouse.encoding) {
+            routed.forward.extend(bytes);
+        }
+        return;
     }
+    // Child has no mouse mode: the wheel scrolls the broker's top-pane scrollback, the
+    // left button drives drag selection, and everything else is swallowed rather than
+    // injected as input the child never asked for.
+    if mouse_button_is_wheel(event.button) {
+        routed.top_scroll_lines += wheel_scroll_lines(event);
+    } else if let Some(gesture) = top_selection_gesture(event) {
+        routed.top_mouse.push(TopMouse {
+            gesture,
+            row: event.row,
+            col: event.col,
+        });
+    } else if is_right_press(event) {
+        routed.right_click = Some((event.row, event.col));
+    }
+}
+
+fn mouse_button_is_motion(button: u16) -> bool {
+    button & 32 != 0
+}
+
+/// A right-button press (base button 2, not a release or motion) — the broker's paste
+/// trigger, mirroring the right-click-to-paste convention of many terminals.
+fn is_right_press(event: MouseEvent) -> bool {
+    event.button & 0b11 == 2 && !event.released && !mouse_button_is_motion(event.button)
+}
+
+/// Classify a non-wheel top-pane mouse event as a left-button selection gesture, or
+/// `None` for buttons/events the selection machine ignores.
+fn top_selection_gesture(event: MouseEvent) -> Option<TopGesture> {
+    let is_left = event.button & 0b11 == 0;
+    if !is_left {
+        return None;
+    }
+    if event.released {
+        Some(TopGesture::Release)
+    } else if mouse_button_is_motion(event.button) {
+        Some(TopGesture::Drag)
+    } else {
+        Some(TopGesture::Press)
+    }
+}
+
+/// Live drag selection in the interactive top pane. Coordinates are 1-based terminal
+/// coordinates localized to the pane (the renderer's space plus one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopSelection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+    active: bool,
+    dragged: bool,
+    /// The scrollback offset when the selection began, so the highlight can follow the
+    /// content (rather than the screen position) as the operator wheels through history.
+    scrollback_at: usize,
+}
+
+impl TopSelection {
+    fn begin(row: u16, col: u16, scrollback_at: usize) -> Self {
+        Self {
+            anchor: (row, col),
+            head: (row, col),
+            active: true,
+            dragged: false,
+            scrollback_at,
+        }
+    }
+}
+
+/// Normalized selection range in 0-based cell coordinates (start <= end, row-major).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectionSpan {
+    start: (u16, u16),
+    end: (u16, u16),
+}
+
+fn selection_span(selection: &TopSelection) -> SelectionSpan {
+    let anchor = (
+        selection.anchor.0.saturating_sub(1),
+        selection.anchor.1.saturating_sub(1),
+    );
+    let head = (
+        selection.head.0.saturating_sub(1),
+        selection.head.1.saturating_sub(1),
+    );
+    let (start, end) = if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    };
+    SelectionSpan { start, end }
+}
+
+fn cell_in_selection(span: SelectionSpan, row: u16, col: u16) -> bool {
+    (row, col) >= span.start && (row, col) <= span.end
+}
+
+/// Column range of a selection on a given row, clamped to the screen width.
+fn selection_row_cols(span: SelectionSpan, row: u16, cols: u16) -> (u16, u16) {
+    let last = cols.saturating_sub(1);
+    let first = if row == span.start.0 { span.start.1 } else { 0 };
+    let final_col = if row == span.end.0 { span.end.1 } else { last };
+    (first.min(last), final_col.min(last))
+}
+
+/// Extract the selected text from the (already scroll-positioned) screen, preserving
+/// inner spacing and trimming trailing whitespace per line.
+fn extract_selection_text(screen: &vt100::Screen, span: SelectionSpan) -> String {
+    let (rows, cols) = screen.size();
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    let row_end = span.end.0.min(rows - 1);
+    let mut lines: Vec<String> = Vec::new();
+    for row in span.start.0..=row_end {
+        let (first, last) = selection_row_cols(span, row, cols);
+        let mut line = String::new();
+        for col in first..=last {
+            let contents = screen.cell(row, col).map(vt100::Cell::contents);
+            match contents {
+                Some(text) if !text.is_empty() => line.push_str(text),
+                _ => line.push(' '),
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// Fold an ordered batch of left-button gestures into the live selection, copying to the
+/// system clipboard (OSC 52) when a drag completes. Returns whether a redraw is needed.
+enum ReleaseOutcome {
+    Copy(SelectionSpan),
+    Clear,
+    None,
+}
+
+fn apply_selection_gestures(
+    selection: &mut Option<TopSelection>,
+    gestures: &[TopMouse],
+    screen: &vt100::Screen,
+    alt: &mut AltScreenGuard,
+    scrollback_at: usize,
+    clipboard: &mut String,
+) -> Result<bool, String> {
+    let mut dirty = false;
+    for gesture in gestures {
+        match gesture.gesture {
+            TopGesture::Press => {
+                *selection = Some(TopSelection::begin(gesture.row, gesture.col, scrollback_at));
+                dirty = true;
+            }
+            TopGesture::Drag => {
+                if let Some(active) = selection.as_mut().filter(|sel| sel.active) {
+                    active.head = (gesture.row, gesture.col);
+                    active.dragged = true;
+                    dirty = true;
+                }
+            }
+            TopGesture::Release => {
+                // Resolve the outcome while holding the &mut, then act on it after the
+                // borrow ends (so we can clear `selection` or write to the terminal).
+                let outcome = match selection.as_mut() {
+                    Some(active) if active.active => {
+                        active.active = false;
+                        dirty = true;
+                        // A real drag (the head actually moved off the anchor) copies; a
+                        // bare click — including a one-pixel jitter that never left the
+                        // cell — just clears.
+                        if active.dragged && active.head != active.anchor {
+                            ReleaseOutcome::Copy(selection_span(active))
+                        } else {
+                            ReleaseOutcome::Clear
+                        }
+                    }
+                    _ => ReleaseOutcome::None,
+                };
+                match outcome {
+                    ReleaseOutcome::Copy(span) => {
+                        let text = extract_selection_text(screen, span);
+                        if text.is_empty() {
+                            *selection = None;
+                        } else {
+                            *clipboard = text.clone();
+                            alt.copy_to_clipboard(&text)?;
+                        }
+                    }
+                    ReleaseOutcome::Clear => *selection = None,
+                    ReleaseOutcome::None => {}
+                }
+            }
+        }
+    }
+    Ok(dirty)
+}
+
+/// Map a stored selection onto the currently-visible rows, shifting by how far the view
+/// has scrolled since the selection was made so the highlight tracks the content. Returns
+/// `None` when the selection has scrolled entirely off-screen.
+fn visible_selection_span(
+    selection: &TopSelection,
+    current_scrollback: usize,
+    height: u16,
+) -> Option<SelectionSpan> {
+    if height == 0 {
+        return None;
+    }
+    let base = selection_span(selection);
+    let delta = current_scrollback as i64 - selection.scrollback_at as i64;
+    let start_row = base.start.0 as i64 + delta;
+    let end_row = base.end.0 as i64 + delta;
+    let max_row = i64::from(height) - 1;
+    if end_row < 0 || start_row > max_row {
+        return None;
+    }
+    // A row clamped at the top starts at column 0; one clamped at the bottom runs to the
+    // line end, since those are interior rows of a selection extending off-screen.
+    let start_col = if start_row < 0 { 0 } else { base.start.1 };
+    let end_col = if end_row > max_row {
+        u16::MAX
+    } else {
+        base.end.1
+    };
+    Some(SelectionSpan {
+        start: (start_row.max(0) as u16, start_col),
+        end: (end_row.min(max_row) as u16, end_col),
+    })
+}
+
+/// Mutable IO handles the relay loop lends to top-pane mouse-action helpers.
+struct MouseActionIo<'a> {
+    alt: &'a mut AltScreenGuard,
+    clipboard: &'a mut String,
+    master_fd: RawFd,
+    line_state: &'a mut InputLineState,
+}
+
+/// Handle a top-pane right-click: if it lands on the current selection, copy that
+/// selection and deselect; otherwise paste the broker clipboard into the child. Returns
+/// whether a redraw is needed. `click` is 1-based, pane-local.
+fn handle_top_right_click(
+    selection: &mut Option<TopSelection>,
+    click: (u16, u16),
+    screen: &vt100::Screen,
+    top_scrollback: usize,
+    io: &mut MouseActionIo<'_>,
+) -> Result<bool, String> {
+    let height = screen.size().0;
+    let cell = (click.0.saturating_sub(1), click.1.saturating_sub(1));
+    let visible = selection
+        .as_ref()
+        .and_then(|sel| visible_selection_span(sel, top_scrollback, height));
+    let on_selection = visible.is_some_and(|span| cell_in_selection(span, cell.0, cell.1));
+    if on_selection {
+        if let Some(span) = visible {
+            let text = extract_selection_text(screen, span);
+            if !text.is_empty() {
+                *io.clipboard = text.clone();
+                io.alt.copy_to_clipboard(&text)?;
+            }
+        }
+        *selection = None;
+        Ok(true)
+    } else {
+        inject_clipboard_paste(io.master_fd, io.line_state, io.clipboard)?;
+        Ok(false)
+    }
+}
+
+/// Inject the broker clipboard into the child as a bracketed paste, so the child treats
+/// it as pasted data rather than typed commands (no accidental command execution).
+fn inject_clipboard_paste(
+    master_fd: RawFd,
+    line_state: &mut InputLineState,
+    text: &str,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    line_state.observe_user_input(&bytes);
+    write_child_input(master_fd, &bytes).map_err(format_user_input_write_error)
 }
 
 fn route_bottom_mouse_event(event: MouseEvent, routed: &mut RoutedInput) {
@@ -2010,10 +2502,11 @@ fn draw(
     parser: &vt100::Parser,
     focus: Focus,
     pane: &MonitorPane,
+    selection: Option<SelectionSpan>,
 ) -> Result<(), String> {
     let screen = parser.screen();
     terminal
-        .draw(|frame| render_frame(frame, screen, focus, pane))
+        .draw(|frame| render_frame(frame, screen, focus, pane, selection))
         .map(|_| ())
         .map_err(|err| format!("Failed to render TUI frame: {err}"))
 }
@@ -2367,6 +2860,258 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_monitor_when_expanded_even_if_child_mouse_disabled() {
+        let mut router = InputRouter::new();
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Wheel-down (button 65) over the bottom monitor pane while the child has no
+        // mouse mode: the broker captures it and scrolls the selection.
+        let routed = route_real_input(
+            b"\x1b[<65;4;8M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert!(routed.forward.is_empty());
+        assert_eq!(routed.commands, vec![MonitorCommand::SelectNext]);
+    }
+
+    #[test]
+    fn top_pane_wheel_scrolls_scrollback_when_child_mouse_disabled() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Wheel-up over the top pane with no child mouse mode: scroll the top-pane
+        // scrollback toward older output, without forwarding anything to the child or
+        // emitting a monitor command.
+        let up = route_real_input(
+            b"\x1b[<64;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert!(up.forward.is_empty());
+        assert!(up.commands.is_empty());
+        assert_eq!(up.top_scroll_lines, TOP_SCROLL_STEP);
+        // Wheel-down moves back toward the live tail.
+        let down = route_real_input(
+            b"\x1b[<65;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert_eq!(down.top_scroll_lines, -TOP_SCROLL_STEP);
+    }
+
+    #[test]
+    fn broker_always_captures_wheel_regardless_of_child_mouse() {
+        // Child mouse off -> broker still captures with at least PressRelease + SGR so the
+        // terminal's alternate-scroll mode never turns the wheel into history keystrokes.
+        let effective = effective_mouse_request(MouseRequest::disabled());
+        assert!(effective.is_enabled());
+        assert_eq!(effective.mode, vt100::MouseProtocolMode::ButtonMotion);
+        assert_eq!(effective.encoding, vt100::MouseProtocolEncoding::Sgr);
+        // A stronger child mode is preserved (so a child's own drag/motion still works).
+        let child = MouseRequest {
+            mode: vt100::MouseProtocolMode::AnyMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+        assert_eq!(
+            effective_mouse_request(child).mode,
+            vt100::MouseProtocolMode::AnyMotion
+        );
+    }
+
+    #[test]
+    fn top_pane_wheel_forwards_to_child_that_requested_mouse() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let child = MouseRequest {
+            mode: vt100::MouseProtocolMode::ButtonMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+        // A child in mouse mode owns the wheel: forward it, never steal it for scrollback.
+        let routed = route_real_input(b"\x1b[<64;4;3M", &mut router, &pane, child, &winsize);
+        assert_eq!(routed.forward, b"\x1b[<64;4;3M".to_vec());
+        assert_eq!(routed.top_scroll_lines, 0);
+    }
+
+    #[test]
+    fn apply_top_scroll_floors_at_live_tail() {
+        assert_eq!(apply_top_scroll(0, -TOP_SCROLL_STEP), 0);
+        assert_eq!(apply_top_scroll(2, TOP_SCROLL_STEP), 2 + TOP_SCROLL_STEP as usize);
+        assert_eq!(apply_top_scroll(1, -5), 0);
+    }
+
+    fn mouse(button: u16, col: u16, row: u16, released: bool) -> MouseEvent {
+        MouseEvent {
+            button,
+            col,
+            row,
+            released,
+        }
+    }
+
+    #[test]
+    fn top_selection_gesture_classifies_left_button() {
+        // Left press (button 0, 'M'), left drag (motion bit 32), left release ('m').
+        assert_eq!(
+            top_selection_gesture(mouse(0, 3, 2, false)),
+            Some(TopGesture::Press)
+        );
+        assert_eq!(
+            top_selection_gesture(mouse(32, 6, 4, false)),
+            Some(TopGesture::Drag)
+        );
+        assert_eq!(
+            top_selection_gesture(mouse(0, 6, 4, true)),
+            Some(TopGesture::Release)
+        );
+        // Right button (base bits != left) is ignored by the selection machine.
+        assert_eq!(top_selection_gesture(mouse(2, 6, 4, false)), None);
+    }
+
+    #[test]
+    fn top_left_drag_emits_selection_gestures_when_child_mouse_disabled() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // Left press in the top pane, then a drag: both become selection gestures, nothing
+        // is forwarded to the child or turned into scroll/monitor commands.
+        let routed = route_real_input(
+            b"\x1b[<0;3;2M\x1b[<32;7;2M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert!(routed.forward.is_empty());
+        assert_eq!(routed.top_scroll_lines, 0);
+        assert_eq!(
+            routed.top_mouse,
+            vec![
+                TopMouse {
+                    gesture: TopGesture::Press,
+                    row: 2,
+                    col: 3
+                },
+                TopMouse {
+                    gesture: TopGesture::Drag,
+                    row: 2,
+                    col: 7
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_span_normalizes_to_zero_based_reading_order() {
+        // Anchor below/right of head -> span is reordered and converted to 0-based cells.
+        let sel = TopSelection {
+            anchor: (3, 5),
+            head: (2, 2),
+            active: false,
+            dragged: true,
+            scrollback_at: 0,
+        };
+        let span = selection_span(&sel);
+        assert_eq!(span.start, (1, 1));
+        assert_eq!(span.end, (2, 4));
+        assert!(cell_in_selection(span, 1, 1));
+        assert!(cell_in_selection(span, 1, 9)); // mid first row extends to line end
+        assert!(cell_in_selection(span, 2, 4));
+        assert!(!cell_in_selection(span, 2, 5)); // past the end column on the last row
+        assert!(!cell_in_selection(span, 0, 9)); // before the first row
+    }
+
+    #[test]
+    fn is_right_press_only_for_right_button_down() {
+        assert!(is_right_press(mouse(2, 5, 3, false)));
+        assert!(!is_right_press(mouse(2, 5, 3, true))); // release, not press
+        assert!(!is_right_press(mouse(0, 5, 3, false))); // left button
+        assert!(!is_right_press(mouse(34, 5, 3, false))); // right + motion (drag)
+    }
+
+    #[test]
+    fn right_click_records_pane_local_position_when_child_mouse_disabled() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let routed = route_real_input(
+            b"\x1b[<2;5;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert_eq!(routed.right_click, Some((3, 5)));
+        assert!(routed.forward.is_empty());
+        assert!(routed.top_mouse.is_empty());
+    }
+
+    #[test]
+    fn visible_selection_span_follows_scroll_and_drops_offscreen() {
+        let sel = TopSelection {
+            anchor: (3, 2), // 1-based -> base rows 1..=4 (0-based)
+            head: (5, 6),
+            active: false,
+            dragged: true,
+            scrollback_at: 0,
+        };
+        // No scroll: visible at the base rows.
+        let here = visible_selection_span(&sel, 0, 10).expect("visible");
+        assert_eq!(here.start.0, 2);
+        assert_eq!(here.end.0, 4);
+        // Scrolled up by 3: the highlight moves down with the content.
+        let scrolled = visible_selection_span(&sel, 3, 10).expect("shifted");
+        assert_eq!(scrolled.start.0, 5);
+        assert_eq!(scrolled.end.0, 7);
+        // Scrolled far enough that the whole selection is below the viewport.
+        assert!(visible_selection_span(&sel, 20, 10).is_none());
+    }
+
+    #[test]
+    fn extract_selection_text_reads_screen_range_and_trims() {
+        let mut parser = vt100::Parser::new(4, 20, 0);
+        parser.process(b"hello\r\nworld wide");
+        let span = SelectionSpan {
+            start: (0, 0),
+            end: (1, 4),
+        };
+        assert_eq!(extract_selection_text(parser.screen(), span), "hello\nworld");
+    }
+
+    #[test]
     fn mouse_encoder_targets_child_requested_encoding() {
         let event = MouseEvent {
             button: 64,
@@ -2406,7 +3151,7 @@ mod tests {
         let screen = screen_owner.screen();
         let pane = MonitorPane::new();
         terminal
-            .draw(|frame| render_frame(frame, screen, Focus::Top, &pane))
+            .draw(|frame| render_frame(frame, screen, Focus::Top, &pane, None))
             .unwrap();
 
         let buf = terminal.backend().buffer();
@@ -2805,7 +3550,7 @@ mod tests {
         let pane = pane_with(snapshot, true, 0);
         let parser = vt100::Parser::new(5, 80, 0);
         terminal
-            .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane))
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
             .unwrap();
         let row = row_text(terminal.backend().buffer(), 5, 80);
         assert!(row.contains("OBS"), "status row: {row:?}");
@@ -2868,7 +3613,7 @@ mod tests {
         ];
         let parser = vt100::Parser::new(5, 60, 0);
         terminal
-            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane))
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
         let text = screen_text(terminal.backend().buffer(), 16, 60);
         assert!(text.contains("inspect"), "{text}");
@@ -2898,7 +3643,7 @@ mod tests {
         let pane = pane_with(snapshot, false, 1);
         let parser = vt100::Parser::new(5, 80, 0);
         terminal
-            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane))
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
         let text = screen_text(terminal.backend().buffer(), 12, 80);
         assert!(text.contains("provider turn"), "{text}");

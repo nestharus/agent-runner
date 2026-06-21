@@ -45,6 +45,12 @@ pub(crate) fn run_repl(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
+    // Long-lived interactive/REPL processes host the periodic wake-reclaim
+    // maintenance sweep so abandoned mailbox debris is reaped continuously.
+    // The per-invocation startup sweep is skipped for resume and is bounded, so
+    // without a persistent driver the dead-owner backlog accumulates unbounded.
+    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
+
     if let Some(session_id) = resume {
         crate::run::resume::validate_resume_input(session_id)?;
     }
