@@ -73,6 +73,12 @@ const FOCUS_TOGGLE_BYTE: u8 = 0x0f;
 /// the trailing Enter submits it.
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+/// Pause between writing an injected notification's body and the Enter that submits it.
+/// An Ink-style child (Claude Code) commits a bracketed paste to its input buffer on a
+/// later async render tick; a `\r` written back-to-back races ahead of that commit and is
+/// dropped, leaving the notification unsent until the operator presses Enter themselves.
+/// Waiting lets the paste commit land first so the Enter actually submits.
+const CONTROL_SUBMIT_DELAY: Duration = Duration::from_millis(400);
 const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
 const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
 const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
@@ -2604,6 +2610,9 @@ fn submit_control_payload(
 ) -> Result<(), String> {
     write_control_payload_to_pty(master_fd, payload, bracketed_paste)
         .map_err(format_pty_write_failed)?;
+    // Let the child commit the (pasted) body to its input buffer before the Enter, so the
+    // submit doesn't race ahead of the async paste commit and get dropped.
+    std::thread::sleep(CONTROL_SUBMIT_DELAY);
     write_control_submit_to_pty(master_fd).map_err(format_pty_submit_failed)?;
     line_state.mark_submitted();
     Ok(())
