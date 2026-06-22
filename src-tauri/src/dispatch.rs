@@ -230,6 +230,17 @@ fn dispatch_subcommand(
         Subcommands::Mailbox { command } => dispatch_mailbox_subcommand(command),
         Subcommands::ResumeList { uuid } => crate::commands::resume_list::run_resume_list(&uuid),
         Subcommands::MigrateDb => commands::migrate::run_migrate_db(),
+        Subcommands::MigrateSessionOwnership {
+            dry_run,
+            scratch_dir,
+            state_db,
+            models_dir,
+        } => commands::migrate::run_migrate_session_ownership(
+            dry_run,
+            &scratch_dir,
+            state_db.as_deref(),
+            models_dir.as_deref(),
+        ),
         Subcommands::Migrate { rebuild } => commands::migrate::run_migrate(rebuild),
         Subcommands::MigrateConfig { models_dir } => {
             commands::config_migration::run_migrate_config(models_dir.as_deref())

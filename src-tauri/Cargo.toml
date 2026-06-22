@@ -24,6 +24,7 @@ oulipoly-runtime = { path = "../crates/oulipoly-runtime" }
 oulipoly-setup = { path = "../crates/oulipoly-setup" }
 oulipoly-state = { path = "../crates/oulipoly-state" }
 regex.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
