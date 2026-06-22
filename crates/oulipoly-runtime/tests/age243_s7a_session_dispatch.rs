@@ -248,6 +248,8 @@ fn locate_request<'a>(
         session_id,
         lookup_mode: mode,
         effective_cwd: None,
+        purpose: None::<&'a str>,
+        tail_bytes_hint: None::<usize>,
     }
 }
 
@@ -945,6 +947,14 @@ fn assert_request_shape(records: &[Value], subcommand: &str, session_id: Option<
     if let Some(session_id) = session_id {
         assert_eq!(request["params"]["session_id"], session_id);
     }
+    assert!(
+        request["params"].get("purpose").is_none(),
+        "non-inspect session provider requests must omit purpose: {request}"
+    );
+    assert!(
+        request["params"].get("tail_bytes_hint").is_none(),
+        "non-inspect session provider requests must omit tail_bytes_hint: {request}"
+    );
 }
 
 fn sqlite_snapshot(conn: &Connection) -> SqliteSnapshot {

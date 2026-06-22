@@ -10,6 +10,7 @@ mod invocation;
 mod limits;
 mod liveness;
 mod mailbox;
+mod provider_inspect_transcript_source;
 mod service;
 mod state_access;
 mod transcript_source;

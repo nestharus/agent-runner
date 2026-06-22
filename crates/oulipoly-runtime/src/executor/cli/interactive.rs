@@ -37,10 +37,12 @@ use super::spawn_identity::{
     record_child_identity,
 };
 use super::terminal_signal;
-use oulipoly_config::ProviderConfig;
+use crate::provider_registry::ProviderRegistry;
+use oulipoly_config::{ModelConfig, ProviderConfig};
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
 
 pub fn execute_interactive(
     provider: &ProviderConfig,
@@ -81,6 +83,43 @@ pub fn execute_interactive_with_result_and_model_identity(
     resume: Option<ResumePayload<'_>>,
     model_name: Option<&str>,
 ) -> Result<InteractiveExecutionResult, String> {
+    execute_interactive_with_result_and_monitor_context(
+        provider,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        model_name,
+        None,
+    )
+}
+
+pub fn execute_interactive_with_result_and_model_config(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+    model: &ModelConfig,
+    provider_registry: Arc<ProviderRegistry>,
+) -> Result<InteractiveExecutionResult, String> {
+    let registry = model.provider.is_some().then_some(provider_registry);
+    execute_interactive_with_result_and_monitor_context(
+        provider,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        Some(&model.name),
+        registry,
+    )
+}
+
+fn execute_interactive_with_result_and_monitor_context(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+    model_name: Option<&str>,
+    provider_registry: Option<Arc<ProviderRegistry>>,
+) -> Result<InteractiveExecutionResult, String> {
     let resume_session_id = resume.as_ref().map(|resume| resume.session_id);
     let provider_args = interactive_provider_args(provider, resume)?;
     let spawn_identity = interactive_spawn_identity_context(
@@ -94,8 +133,14 @@ pub fn execute_interactive_with_result_and_model_identity(
     if pty_broker::controlling_terminal_available() {
         let cmd =
             interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
+        let provider_inspect = provider_registry.map(pty_broker::ProviderInspectMonitorContext::new);
         let status = if pty_broker::observed_tui_enabled() {
-            pty_broker::execute_interactive_child_observed(cmd, provider, spawn_identity.as_ref())?
+            pty_broker::execute_interactive_child_observed(
+                cmd,
+                provider,
+                spawn_identity.as_ref(),
+                provider_inspect.as_ref(),
+            )?
         } else {
             pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?
         };

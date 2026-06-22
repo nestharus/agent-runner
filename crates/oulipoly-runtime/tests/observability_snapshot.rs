@@ -3,22 +3,23 @@
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use oulipoly_config::{
-    provider_implementation_ref::ProviderImplementationRef, ModelConfig, PromptMode,
-    ProviderConfig, SessionStorage,
+    ModelConfig, PromptMode, ProviderConfig, SessionStorage,
+    provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_runtime::observability::{
     InspectRef, LivenessStatus, MonitorNodeKind, MonitorStatus, ObservabilityRoot,
     ObservabilitySnapshotPort, ProductionObservabilitySnapshotService, SnapshotLimits,
 };
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
-use oulipoly_runtime::session_metadata::TranscriptLookupMode;
-use oulipoly_runtime::session_provider::{SessionProviderIdentity, SessionProviderLocateRequest};
+use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
     WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
+#[cfg(unix)]
+use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -249,6 +250,8 @@ fn running_invocation_with_dead_pid_is_reconciled_to_stale_not_running() {
 #[test]
 fn active_session_nodes_point_inspect_at_live_transcript_when_resolvable() {
     let fixture = Fixture::new();
+    #[cfg(unix)]
+    let unrelated_record_path = prepare_unrelated_registry_records(&fixture);
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
@@ -264,8 +267,9 @@ fn active_session_nodes_point_inspect_at_live_transcript_when_resolvable() {
     let projects_dir = fixture.data_dir.join("transcript-projects");
     let project_dir = projects_dir.join("-home-nes-proj");
     std::fs::create_dir_all(&project_dir).unwrap();
+    let transcript_path = project_dir.join(format!("{SESSION_ID}.jsonl"));
     std::fs::write(
-        project_dir.join(format!("{SESSION_ID}.jsonl")),
+        &transcript_path,
         "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
     )
     .unwrap();
@@ -277,40 +281,23 @@ fn active_session_nodes_point_inspect_at_live_transcript_when_resolvable() {
     let snapshot = service.snapshot(&fixture.root(), SnapshotLimits::default());
 
     let session = node(&snapshot, "session:session-observe");
-    assert!(
-        matches!(
-            session.inspect_ref,
-            Some(InspectRef::SessionTranscript { .. })
-        ),
-        "session node should stream the live transcript, got {:?}",
-        session.inspect_ref
-    );
+    assert_session_transcript_path(session, &transcript_path);
     let root_inv = node(&snapshot, &format!("invocation:{ROOT_UUID}"));
-    assert!(
-        matches!(
-            root_inv.inspect_ref,
-            Some(InspectRef::SessionTranscript { .. })
-        ),
-        "root invocation node should stream the live transcript, got {:?}",
-        root_inv.inspect_ref
-    );
+    assert_session_transcript_path(root_inv, &transcript_path);
     let process = node(
         &snapshot,
         &format!("process:{ROOT_UUID}:{}", current_identity().os_pid),
     );
-    assert!(
-        matches!(
-            process.inspect_ref,
-            Some(InspectRef::SessionTranscript { .. })
-        ),
-        "root process node should stream the live transcript, got {:?}",
-        process.inspect_ref
-    );
+    assert_session_transcript_path(process, &transcript_path);
+    #[cfg(unix)]
+    assert_record_file_empty(&unrelated_record_path);
 }
 
 #[test]
 fn active_session_nodes_do_not_attach_transcript_inspect_ref_without_local_transcript() {
     let fixture = Fixture::new();
+    #[cfg(unix)]
+    let unrelated_record_path = prepare_unrelated_registry_records(&fixture);
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     state
@@ -343,91 +330,148 @@ fn active_session_nodes_do_not_attach_transcript_inspect_ref_without_local_trans
         process.inspect_ref,
         Some(InspectRef::SessionTranscript { .. })
     ));
+    #[cfg(unix)]
+    assert_record_file_empty(&unrelated_record_path);
 }
 
 #[cfg(unix)]
 #[test]
-fn inspect_refs_are_local_only_and_do_not_consult_external_locate() {
-    assert_observability_service_has_no_external_registry_seam();
+fn provider_inspect_source_attaches_external_transcript_and_request_metadata() {
+    assert_observability_service_has_provider_inspect_source_wiring();
 
-    {
-        let present = Fixture::new();
-        let identity = seed_running_root(&present);
-        let local = write_local_transcript_tree(&present, SESSION_ID);
-        let service =
-            ProductionObservabilitySnapshotService::for_session(Some(SessionStorage::ClaudeCode {
-                projects_dir: local.projects_dir,
-            }));
+    let fixture = Fixture::new();
+    let identity = seed_running_root(&fixture);
+    let record_path = fixture.data_dir.join("provider-records.jsonl");
+    let external_path = fixture.data_dir.join("external-inspect-session.jsonl");
+    std::fs::write(&external_path, "{\"type\":\"assistant\"}\n").unwrap();
+    let provider_path = write_external_locate_provider(&fixture, &record_path, &external_path);
+    let registry = external_registry(&provider_path);
+    let effective_cwd = fixture.data_dir.join("provider-work");
+    std::fs::create_dir_all(&effective_cwd).unwrap();
+    let limits = SnapshotLimits::default();
+    let service = ProductionObservabilitySnapshotService::for_provider_inspect(
+        registry,
+        external_identity(),
+        SESSION_ID.to_string(),
+        Some(effective_cwd.clone()),
+    );
 
-        let snapshot = service.snapshot(&present.root(), SnapshotLimits::default());
+    let snapshot = service.snapshot(&fixture.root(), limits);
 
-        assert_session_transcript_path(
-            node(&snapshot, "session:session-observe"),
-            &local.transcript_path,
-        );
-        assert_session_transcript_path(
-            node(&snapshot, &format!("invocation:{ROOT_UUID}")),
-            &local.transcript_path,
-        );
-        assert_session_transcript_path(
-            node(
-                &snapshot,
-                &format!("process:{ROOT_UUID}:{}", identity.os_pid),
-            ),
-            &local.transcript_path,
-        );
-    }
+    let expected_path = external_path.canonicalize().unwrap();
+    assert_session_transcript_ref(
+        node(&snapshot, "session:session-observe"),
+        &expected_path,
+        limits.transcript_tail_bytes,
+        Some("canonical-transcript-v1"),
+        Some("provider-a"),
+    );
+    assert_session_transcript_ref(
+        node(&snapshot, &format!("invocation:{ROOT_UUID}")),
+        &expected_path,
+        limits.transcript_tail_bytes,
+        Some("canonical-transcript-v1"),
+        Some("provider-a"),
+    );
+    assert_session_transcript_ref(
+        node(
+            &snapshot,
+            &format!("process:{ROOT_UUID}:{}", identity.os_pid),
+        ),
+        &expected_path,
+        limits.transcript_tail_bytes,
+        Some("canonical-transcript-v1"),
+        Some("provider-a"),
+    );
+    assert_eq!(
+        recorded_subcommand_count(&record_path, "session.locate_transcript"),
+        1
+    );
+    assert_provider_inspect_request(&record_path, &effective_cwd, limits.transcript_tail_bytes);
+}
 
-    {
-        let missing = Fixture::new();
-        let identity = seed_running_root(&missing);
-        let record_path = missing.data_dir.join("provider-records.jsonl");
-        let external_path = missing.data_dir.join("external-only-session.jsonl");
-        std::fs::write(&external_path, "{\"type\":\"assistant\"}\n").unwrap();
-        let provider_path = write_external_locate_provider(&missing, &record_path, &external_path);
-        let registry = external_registry(&provider_path);
-        let external =
-            oulipoly_runtime::session_provider::locate_transcript(SessionProviderLocateRequest {
-                registry: &registry,
-                identity: external_identity(),
-                session_id: SESSION_ID,
-                lookup_mode: TranscriptLookupMode::RequireExisting,
-                effective_cwd: None,
-            })
-            .expect("external locate proof");
-        assert_eq!(external.path, external_path.canonicalize().unwrap());
-        assert_eq!(
-            recorded_subcommand_count(&record_path, "session.locate_transcript"),
-            1
-        );
+#[cfg(unix)]
+#[test]
+fn provider_inspect_failure_does_not_attach_local_transcript() {
+    let fixture = Fixture::new();
+    let identity = seed_running_root(&fixture);
+    let local = write_local_transcript_tree(&fixture, SESSION_ID);
+    let local_probe =
+        ProductionObservabilitySnapshotService::for_session(Some(SessionStorage::ClaudeCode {
+            projects_dir: local.projects_dir.clone(),
+        }));
+    let local_snapshot = local_probe.snapshot(&fixture.root(), SnapshotLimits::default());
+    assert_session_transcript_path(
+        node(&local_snapshot, "session:session-observe"),
+        &local.transcript_path,
+    );
+    let record_path = fixture.data_dir.join("provider-failure-records.jsonl");
+    let external_path = fixture.data_dir.join("external-failure-session.jsonl");
+    let provider_path = write_external_locate_provider_with_behavior(
+        &fixture,
+        &record_path,
+        &external_path,
+        ExternalLocateProviderBehavior::Failing,
+    );
+    let registry = external_registry(&provider_path);
+    let service = ProductionObservabilitySnapshotService::for_provider_inspect(
+        registry,
+        external_identity(),
+        SESSION_ID.to_string(),
+        Some(fixture.data_dir.join("provider-work")),
+    );
 
-        let projects_dir = missing.data_dir.join("empty-projects");
-        std::fs::create_dir_all(&projects_dir).unwrap();
-        let service =
-            ProductionObservabilitySnapshotService::for_session(Some(SessionStorage::ClaudeCode {
-                projects_dir,
-            }));
+    let snapshot = service.snapshot(&fixture.root(), SnapshotLimits::default());
 
-        let snapshot = service.snapshot(&missing.root(), SnapshotLimits::default());
+    assert_no_session_transcript_ref(node(&snapshot, "session:session-observe"));
+    assert_no_session_transcript_ref(node(&snapshot, &format!("invocation:{ROOT_UUID}")));
+    assert_no_session_transcript_ref(node(
+        &snapshot,
+        &format!("process:{ROOT_UUID}:{}", identity.os_pid),
+    ));
+    assert_no_attached_transcript_path(&snapshot, &local.transcript_path);
+    assert_eq!(
+        recorded_subcommand_count(&record_path, "session.locate_transcript"),
+        1
+    );
+}
 
-        assert_eq!(node(&snapshot, "session:session-observe").inspect_ref, None);
-        assert!(!matches!(
-            node(&snapshot, &format!("invocation:{ROOT_UUID}")).inspect_ref,
-            Some(InspectRef::SessionTranscript { .. })
-        ));
-        assert!(!matches!(
-            node(
-                &snapshot,
-                &format!("process:{ROOT_UUID}:{}", identity.os_pid),
-            )
-            .inspect_ref,
-            Some(InspectRef::SessionTranscript { .. })
-        ));
-        assert_eq!(
-            recorded_subcommand_count(&record_path, "session.locate_transcript"),
-            1
-        );
-    }
+#[cfg(unix)]
+#[test]
+fn provider_inspect_missing_format_id_attaches_no_transcript_ref() {
+    let fixture = Fixture::new();
+    let identity = seed_running_root(&fixture);
+    let record_path = fixture.data_dir.join("provider-no-format-records.jsonl");
+    let external_path = fixture.data_dir.join("external-no-format-session.jsonl");
+    std::fs::write(&external_path, "{\"type\":\"assistant\"}\n").unwrap();
+    let provider_path = write_external_locate_provider_with_behavior(
+        &fixture,
+        &record_path,
+        &external_path,
+        ExternalLocateProviderBehavior::LocatedWithoutFormatId,
+    );
+    let registry = external_registry(&provider_path);
+    let service = ProductionObservabilitySnapshotService::for_provider_inspect(
+        registry,
+        external_identity(),
+        SESSION_ID.to_string(),
+        Some(fixture.data_dir.join("provider-work")),
+    );
+
+    let snapshot = service.snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert_no_session_transcript_ref(node(&snapshot, "session:session-observe"));
+    assert_no_session_transcript_ref(node(&snapshot, &format!("invocation:{ROOT_UUID}")));
+    assert_no_session_transcript_ref(node(
+        &snapshot,
+        &format!("process:{ROOT_UUID}:{}", identity.os_pid),
+    ));
+    assert_no_attached_transcript_path(&snapshot, &external_path);
+    assert_no_attached_transcript_path(&snapshot, &external_path.canonicalize().unwrap());
+    assert_eq!(
+        recorded_subcommand_count(&record_path, "session.locate_transcript"),
+        1
+    );
 }
 
 #[test]
@@ -806,19 +850,28 @@ fn project_dir_name(path: &Path) -> String {
     format!("-{}", raw.trim_start_matches('/').replace('/', "-"))
 }
 
-fn assert_observability_service_has_no_external_registry_seam() {
+fn assert_observability_service_has_provider_inspect_source_wiring() {
     let source = std::fs::read_to_string(observability_service_source()).unwrap();
     assert!(
         source.contains("pub fn for_session(session_storage: Option<SessionStorage>) -> Self"),
-        "snapshot construction should expose only local session storage today"
+        "snapshot construction must keep the local session-storage constructor"
+    );
+    let forbidden_fallback = ["local", "fallback", "storage"].join("_");
+    assert!(
+        !source.contains(&forbidden_fallback),
+        "provider-inspect source must not carry local fallback storage"
+    );
+    assert_clean_provider_inspect_constructor(&source);
+    assert!(
+        source.contains("ProviderRegistry"),
+        "provider-inspect source must be registry-backed"
     );
     assert!(
-        !source.contains("ProviderRegistry"),
-        "snapshot construction must not accept or load an external provider registry today"
+        source.contains("SessionProviderIdentity"),
+        "provider-inspect source must carry the provider identity envelope"
     );
-    assert!(
-        !source.contains("session_provider::locate_transcript"),
-        "snapshot construction must not call the external locate adapter today"
+    assert_provider_inspect_resolver_uses_provider_locate_only(
+        &provider_inspect_transcript_source(),
     );
 }
 
@@ -826,17 +879,215 @@ fn observability_service_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability/service.rs")
 }
 
+fn observability_transcript_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability/transcript_source.rs")
+}
+
+fn assert_clean_provider_inspect_constructor(source: &str) {
+    let signature = source_function_signature(source, "pub fn for_provider_inspect(");
+    let signature = compact_whitespace(signature);
+    let accepted = [
+        "pub fn for_provider_inspect( registry: ProviderRegistry, identity: SessionProviderIdentity, active_session_id: String, effective_cwd: Option<PathBuf>, ) -> Self",
+        "pub fn for_provider_inspect( registry: ProviderRegistry, identity: SessionProviderIdentity, active_session_id: String, effective_cwd: Option<PathBuf> ) -> Self",
+    ];
+    assert!(
+        accepted.contains(&signature.as_str()),
+        "provider-inspect constructor must keep the clean C2 shape, got `{signature}`"
+    );
+}
+
+fn assert_provider_inspect_resolver_uses_provider_locate_only(source: &str) {
+    assert!(
+        source.contains("session_provider::locate_transcript"),
+        "provider-inspect source must use session_provider::locate_transcript"
+    );
+    for forbidden in [
+        "SessionTranscriptResolver",
+        "resolve_jsonl_path_for_provider_with_mode",
+        "resolve_jsonl_path_for_provider(",
+        "locate_transcript_path(",
+        "SessionStorage",
+        "SessionsConfig",
+        "std::fs::read",
+        "read_to_string(",
+        "File::open",
+        "BufReader",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "provider-inspect source must not consult local transcript resolver/reader `{forbidden}`"
+        );
+    }
+}
+
+fn provider_inspect_transcript_source() -> String {
+    for path in provider_inspect_dedicated_source_paths() {
+        if path.exists() {
+            let source = std::fs::read_to_string(path).unwrap();
+            return production_source(&source).to_string();
+        }
+    }
+
+    provider_inspect_source_from_transcript_module().unwrap_or_else(|| {
+        panic!(
+            "provider-inspect transcript source must be scoped to a dedicated source path or ProviderInspectTranscriptResolver impl"
+        )
+    })
+}
+
+fn provider_inspect_dedicated_source_paths() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        root.join("src/observability/provider_inspect_transcript_source.rs"),
+        root.join("src/observability/transcript_source/provider_inspect.rs"),
+        root.join("src/observability/transcript_source_provider_inspect.rs"),
+    ]
+}
+
+fn provider_inspect_source_from_transcript_module() -> Option<String> {
+    let source = std::fs::read_to_string(observability_transcript_source()).unwrap();
+    let source = production_source(&source);
+    let resolver = extract_source_item(source, "struct ProviderInspectTranscriptResolver")?;
+    let implementation = extract_source_item(source, "impl ProviderInspectTranscriptResolver")?;
+    Some(format!("{resolver}\n{implementation}"))
+}
+
+fn source_function_signature<'a>(source: &'a str, marker: &str) -> &'a str {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing source marker `{marker}`"));
+    let suffix = &source[start..];
+    let end = suffix
+        .find('{')
+        .or_else(|| suffix.find(';'))
+        .unwrap_or_else(|| panic!("missing function signature end for `{marker}`"));
+    &suffix[..end]
+}
+
+fn compact_whitespace(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn production_source(source: &str) -> &str {
+    source.split("\n#[cfg(test)]").next().unwrap_or(source)
+}
+
+fn extract_source_item<'a>(source: &'a str, marker: &str) -> Option<&'a str> {
+    let start = source.find(marker)?;
+    let suffix = &source[start..];
+    let brace = suffix.find('{');
+    let semicolon = suffix.find(';');
+    match (semicolon, brace) {
+        (Some(semicolon), Some(brace)) if semicolon < brace => {
+            return Some(&source[start..start + semicolon + 1]);
+        }
+        (Some(semicolon), None) => {
+            return Some(&source[start..start + semicolon + 1]);
+        }
+        _ => {}
+    }
+    let brace = start + brace?;
+    let end = matching_brace_end(source, brace)?;
+    Some(&source[start..end])
+}
+
+fn matching_brace_end(source: &str, open_brace: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, byte) in source.as_bytes()[open_brace..].iter().enumerate() {
+        match *byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open_brace + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn assert_session_transcript_path(
     node: &oulipoly_runtime::observability::MonitorNode,
     expected_path: &Path,
 ) {
+    assert_session_transcript_ref(
+        node,
+        expected_path,
+        SnapshotLimits::default().transcript_tail_bytes,
+        None,
+        None,
+    );
+}
+
+fn assert_session_transcript_ref(
+    node: &oulipoly_runtime::observability::MonitorNode,
+    expected_path: &Path,
+    expected_tail_bytes: usize,
+    expected_format_id: Option<&str>,
+    expected_source_id: Option<&str>,
+) {
     match &node.inspect_ref {
-        Some(InspectRef::SessionTranscript { path, .. }) => {
+        Some(InspectRef::SessionTranscript {
+            path,
+            max_tail_bytes,
+            format_id,
+            source_id,
+        }) => {
             let expected = expected_path.to_string_lossy().into_owned();
             assert_eq!(path, &expected);
+            assert_eq!(*max_tail_bytes, expected_tail_bytes);
+            assert_eq!(format_id.as_deref(), expected_format_id);
+            assert_eq!(source_id.as_deref(), expected_source_id);
         }
-        other => panic!("expected local session transcript inspect ref, got {other:?}"),
+        other => panic!("expected session transcript inspect ref, got {other:?}"),
     }
+}
+
+fn assert_no_session_transcript_ref(node: &oulipoly_runtime::observability::MonitorNode) {
+    assert!(
+        !matches!(
+            &node.inspect_ref,
+            Some(InspectRef::SessionTranscript { .. })
+        ),
+        "expected no session transcript inspect ref, got {:?}",
+        node.inspect_ref
+    );
+}
+
+fn assert_no_attached_transcript_path(
+    snapshot: &oulipoly_runtime::observability::MonitorSnapshot,
+    forbidden_path: &Path,
+) {
+    let forbidden = forbidden_path.to_string_lossy();
+    assert!(
+        !snapshot.nodes.iter().any(|node| matches!(
+            &node.inspect_ref,
+            Some(InspectRef::SessionTranscript { path, .. }) if path == forbidden.as_ref()
+        )),
+        "snapshot must not attach forbidden transcript path {}",
+        forbidden_path.display()
+    );
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ExternalLocateProviderBehavior {
+    Located,
+    LocatedWithoutFormatId,
+    Failing,
+}
+
+#[cfg(unix)]
+fn prepare_unrelated_registry_records(fixture: &Fixture) -> PathBuf {
+    let record_path = fixture.data_dir.join("unrelated-provider-records.jsonl");
+    let external_path = fixture.data_dir.join("unrelated-session.jsonl");
+    std::fs::write(&external_path, "{\"type\":\"assistant\"}\n").unwrap();
+    let provider_path = write_external_locate_provider(fixture, &record_path, &external_path);
+    let _registry = external_registry(&provider_path);
+    assert_record_file_empty(&record_path);
+    record_path
 }
 
 #[cfg(unix)]
@@ -845,12 +1096,28 @@ fn write_external_locate_provider(
     record_path: &Path,
     transcript_path: &Path,
 ) -> PathBuf {
+    write_external_locate_provider_with_behavior(
+        fixture,
+        record_path,
+        transcript_path,
+        ExternalLocateProviderBehavior::Located,
+    )
+}
+
+#[cfg(unix)]
+fn write_external_locate_provider_with_behavior(
+    fixture: &Fixture,
+    record_path: &Path,
+    transcript_path: &Path,
+    behavior: ExternalLocateProviderBehavior,
+) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let provider_path = fixture.data_dir.join("external-locate-provider.py");
+    std::fs::write(record_path, "").unwrap();
     std::fs::write(
         &provider_path,
-        external_locate_provider_body(record_path, transcript_path),
+        external_locate_provider_body(record_path, transcript_path, behavior),
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&provider_path).unwrap().permissions();
@@ -860,7 +1127,17 @@ fn write_external_locate_provider(
 }
 
 #[cfg(unix)]
-fn external_locate_provider_body(record_path: &Path, transcript_path: &Path) -> String {
+fn external_locate_provider_body(
+    record_path: &Path,
+    transcript_path: &Path,
+    behavior: ExternalLocateProviderBehavior,
+) -> String {
+    let locate_ok = !matches!(behavior, ExternalLocateProviderBehavior::Failing);
+    let format_id = match behavior {
+        ExternalLocateProviderBehavior::Located => r#""canonical-transcript-v1""#,
+        ExternalLocateProviderBehavior::LocatedWithoutFormatId
+        | ExternalLocateProviderBehavior::Failing => "None",
+    };
     format!(
         r#"#!/usr/bin/env python3
 import json
@@ -868,10 +1145,12 @@ import pathlib
 import sys
 
 CONTRACT = "oulipoly.provider/v1"
+LOCATE_OK = {locate_ok}
+FORMAT_ID = {format_id}
 subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
 request = json.loads(sys.stdin.read() or "{{}}")
 with pathlib.Path({record_path}).open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps({{"subcommand": subcommand}}, sort_keys=True) + "\n")
+    handle.write(json.dumps({{"subcommand": subcommand, "request": request}}, sort_keys=True) + "\n")
 
 def envelope(result):
     return {{
@@ -903,13 +1182,28 @@ if subcommand == "describe":
         "settings_schema_id": "provider-a-test-settings",
     }})
 elif subcommand == "session.locate_transcript":
-    response = envelope({{
-        "located": True,
-        "path": {transcript_path},
-        "format_id": "jsonl",
-        "source_id": "provider-a",
-        "require_existing_observed": True,
-    }})
+    if LOCATE_OK:
+        result = {{
+            "located": True,
+            "path": {transcript_path},
+            "source_id": "provider-a",
+            "require_existing_observed": True,
+        }}
+        if FORMAT_ID is not None:
+            result["format_id"] = FORMAT_ID
+        response = envelope(result)
+    else:
+        response = {{
+            "contract": request.get("contract", CONTRACT),
+            "request_id": request.get("request_id", "request-observe"),
+            "ok": False,
+            "error": {{
+                "category": "failed",
+                "code": "inspect_locate_failed",
+                "message": "inspect_locate_failed",
+                "retryable": False,
+            }},
+        }}
 else:
     response = {{
         "contract": request.get("contract", CONTRACT),
@@ -926,6 +1220,8 @@ print(json.dumps(response))
 "#,
         record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
         transcript_path = serde_json::to_string(&transcript_path.display().to_string()).unwrap(),
+        locate_ok = if locate_ok { "True" } else { "False" },
+        format_id = format_id,
     )
 }
 
@@ -975,6 +1271,73 @@ fn recorded_subcommand_count(record_path: &Path, subcommand: &str) -> usize {
 fn recorded_subcommand(line: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
     value.get("subcommand")?.as_str().map(str::to_string)
+}
+
+#[cfg(unix)]
+fn assert_record_file_empty(record_path: &Path) {
+    let contents = std::fs::read_to_string(record_path).unwrap();
+    assert!(
+        contents.trim().is_empty(),
+        "provider registry should be unrelated, got records: {contents}"
+    );
+}
+
+#[cfg(unix)]
+fn recorded_request_for(record_path: &Path, subcommand: &str) -> Value {
+    let records = recorded_requests_for(record_path, subcommand);
+    assert_eq!(
+        records.len(),
+        1,
+        "expected exactly one {subcommand} request record, got {records:?}"
+    );
+    records.into_iter().next().unwrap()
+}
+
+#[cfg(unix)]
+fn recorded_requests_for(record_path: &Path, subcommand: &str) -> Vec<Value> {
+    std::fs::read_to_string(record_path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| recorded_request(line, subcommand))
+        .collect()
+}
+
+#[cfg(unix)]
+fn recorded_request(line: &str, subcommand: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("subcommand")?.as_str()? == subcommand {
+        value.get("request").cloned()
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn assert_provider_inspect_request(record_path: &Path, effective_cwd: &Path, tail_bytes: usize) {
+    let request = recorded_request_for(record_path, "session.locate_transcript");
+    assert_eq!(request["provider_instance_id"], "provider-a-instance");
+    assert_eq!(
+        request["host"]["working_directory"],
+        Value::String(path_string(effective_cwd))
+    );
+    assert!(
+        !request.to_string().contains("state.db"),
+        "inspect request must not expose host SQLite paths: {request}"
+    );
+
+    let params = &request["params"];
+    assert_eq!(params["settings_id"], "provider-a-settings");
+    assert_eq!(params["model_name"], "model-a");
+    assert_eq!(params["provider_name"], "provider-a");
+    assert_eq!(params["session_id"], SESSION_ID);
+    assert_eq!(params["lookup_mode"], "require_existing");
+    assert_eq!(params["purpose"], "inspect");
+    assert_eq!(params["tail_bytes_hint"], Value::from(tail_bytes as u64));
+}
+
+#[cfg(unix)]
+fn path_string(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn seed_invocation(db: &StateDb, uuid: &str, parent: Option<i64>) -> i64 {

@@ -10,12 +10,42 @@
 
 use crate::session_metadata::{TranscriptLookupMode, resolve_jsonl_path_for_provider_with_mode};
 use oulipoly_config::{SessionStorage, SessionsConfig};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 /// Number of `resolve` calls to skip between re-attempts while the transcript
 /// file does not yet exist. Bounds the expensive locator scan to at most one
 /// attempt per this many snapshot refreshes until the file appears.
 const MISS_RETRY_PERIOD: u64 = 40;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSessionTranscript {
+    pub(crate) path: String,
+    pub(crate) format_id: Option<String>,
+    pub(crate) source_id: Option<String>,
+}
+
+impl ResolvedSessionTranscript {
+    pub(crate) fn local(path: String) -> Self {
+        Self {
+            path,
+            format_id: None,
+            source_id: None,
+        }
+    }
+
+    pub(crate) fn with_metadata(
+        path: PathBuf,
+        format_id: Option<String>,
+        source_id: Option<String>,
+    ) -> Self {
+        Self {
+            path: path.to_string_lossy().into_owned(),
+            format_id,
+            source_id,
+        }
+    }
+}
 
 /// Resolves and caches the active session's transcript jsonl path from the
 /// provider's configured session storage.

@@ -1,5 +1,5 @@
 use crate::provider_registry::{ProviderRegistry, ProviderRegistryHandle};
-use crate::session_metadata::TranscriptLookupMode;
+use crate::session_metadata::{SessionStorageType, TranscriptLookupMode};
 use chrono::{DateTime, Utc};
 use oulipoly_provider::generated::Artifact;
 use oulipoly_state::StateDb;
@@ -24,6 +24,17 @@ pub struct SessionProviderLocateRequest<'a> {
     pub session_id: &'a str,
     pub lookup_mode: TranscriptLookupMode,
     pub effective_cwd: Option<&'a Path>,
+    pub purpose: Option<&'a str>,
+    pub tail_bytes_hint: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProviderLocatedTranscript {
+    pub path: std::path::PathBuf,
+    pub storage_classification: SessionStorageType,
+    pub require_existing_observed: bool,
+    pub format_id: Option<String>,
+    pub source_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

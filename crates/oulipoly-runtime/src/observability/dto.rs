@@ -89,7 +89,12 @@ pub enum LivenessStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum InspectRef {
     AgentBashLog { path: String, max_tail_bytes: usize },
-    SessionTranscript { path: String, max_tail_bytes: usize },
+    SessionTranscript {
+        path: String,
+        max_tail_bytes: usize,
+        format_id: Option<String>,
+        source_id: Option<String>,
+    },
     MailboxPayload { seq: i64 },
     WakeClaim { session_id: String },
     InvocationStatus { uuid: String },

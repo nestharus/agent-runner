@@ -266,6 +266,7 @@ enum InspectContentSource<'a> {
     SessionTranscript {
         path: &'a str,
         max_tail_bytes: usize,
+        format_id: Option<&'a str>,
     },
     LastOutput(&'a str),
     None,
@@ -1160,9 +1161,12 @@ fn inspect_content_source(node: &MonitorNode) -> InspectContentSource<'_> {
         Some(InspectRef::SessionTranscript {
             path,
             max_tail_bytes,
+            format_id,
+            ..
         }) => InspectContentSource::SessionTranscript {
             path,
             max_tail_bytes: *max_tail_bytes,
+            format_id: format_id.as_deref(),
         },
         _ => inspect_excerpt_source(node),
     }
@@ -1184,7 +1188,8 @@ fn inspect_content_lines(source: InspectContentSource<'_>) -> Vec<String> {
         InspectContentSource::SessionTranscript {
             path,
             max_tail_bytes,
-        } => inspect_transcript_content_lines(path, max_tail_bytes),
+            format_id,
+        } => inspect_transcript_content_lines(path, max_tail_bytes, format_id),
         InspectContentSource::LastOutput(excerpt) => inspect_excerpt_content_lines(excerpt),
         InspectContentSource::None => Vec::new(),
     }
@@ -1198,10 +1203,22 @@ fn inspect_log_content_lines(path: &str, max_tail_bytes: usize) -> Vec<String> {
 
 /// Project the transcript tail into readable conversation lines, falling back to
 /// the raw tail when nothing projects (e.g. a single oversized message).
-fn inspect_transcript_content_lines(path: &str, max_tail_bytes: usize) -> Vec<String> {
+fn inspect_transcript_content_lines(
+    path: &str,
+    max_tail_bytes: usize,
+    format_id: Option<&str>,
+) -> Vec<String> {
     let raw = transcript_tail_lines(path, max_tail_bytes);
-    let projected = transcript_display_lines(&raw);
+    let projected = transcript_projected_lines(format_id, &raw);
     format_transcript_inspect_lines(path, &projected, &raw)
+}
+
+fn transcript_projected_lines(format_id: Option<&str>, raw: &[String]) -> Vec<String> {
+    match format_id {
+        None => transcript_display_lines(raw),
+        Some("provider-inspect-transcript-v1" | "canonical-transcript-v1") => Vec::new(),
+        Some(_) => Vec::new(),
+    }
 }
 
 fn transcript_tail_lines(path: &str, max_tail_bytes: usize) -> Vec<String> {
@@ -3573,6 +3590,39 @@ mod tests {
             .join("\n")
     }
 
+    fn inspect_lines_for_transcript(
+        path: &str,
+        format_id: Option<&str>,
+        source_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut inspected = node(
+            "session:inspect",
+            MonitorNodeKind::Session,
+            MonitorStatus::Running,
+            "inspect session",
+        );
+        inspected.inspect_ref = Some(InspectRef::SessionTranscript {
+            path: path.to_string(),
+            max_tail_bytes: 4096,
+            format_id: format_id.map(str::to_string),
+            source_id: source_id.map(str::to_string),
+        });
+        inspect_content_lines(inspect_content_source(&inspected))
+    }
+
+    fn write_inspect_transcript_fixture(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inspect-session.jsonl");
+        std::fs::write(&path, format!("{contents}\n")).unwrap();
+        (dir, path.display().to_string())
+    }
+
+    fn native_projectable_line(sentinel: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{sentinel}"}}]}}}}"#
+        )
+    }
+
     #[test]
     fn collapsed_reserves_one_row_expanded_reserves_a_bounded_share() {
         let collapsed = MonitorPane::new();
@@ -3661,6 +3711,66 @@ mod tests {
         let text = screen_text(terminal.backend().buffer(), 16, 60);
         assert!(text.contains("inspect"), "{text}");
         assert!(text.contains("running 12 tests"), "{text}");
+    }
+
+    #[test]
+    fn provider_format_session_transcripts_render_raw_tail_without_native_projection() {
+        for format_id in ["provider-inspect-transcript-v1", "canonical-transcript-v1"] {
+            let sentinel = format!("ProviderRawSentinel-{format_id}");
+            let raw_line = native_projectable_line(&sentinel);
+            let (_dir, path) = write_inspect_transcript_fixture(&raw_line);
+
+            let lines = inspect_lines_for_transcript(&path, Some(format_id), Some("source-a"));
+            let rendered = lines.join("\n");
+
+            assert!(
+                rendered.contains(&raw_line),
+                "provider-owned format must preserve raw/canonical bytes for {format_id}: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&format!("agent: {sentinel}")),
+                "provider-owned format must not run native projection for {format_id}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_session_transcript_without_format_keeps_native_projection() {
+        let sentinel = "LocalProjectionSentinel";
+        let raw_line = native_projectable_line(sentinel);
+        let (_dir, path) = write_inspect_transcript_fixture(&raw_line);
+
+        let lines = inspect_lines_for_transcript(&path, None, None);
+        let rendered = lines.join("\n");
+
+        assert!(
+            rendered.contains(&format!("agent: {sentinel}")),
+            "local/native transcript should render projected conversation lines: {rendered}"
+        );
+        assert!(
+            !lines.iter().any(|line| line == &raw_line),
+            "local/native projection should select projected lines instead of raw JSON: {rendered}"
+        );
+    }
+
+    #[test]
+    fn unknown_provider_format_renders_raw_tail_without_native_projection() {
+        let sentinel = "UnknownFormatSentinel";
+        let raw_line = native_projectable_line(sentinel);
+        let (_dir, path) = write_inspect_transcript_fixture(&raw_line);
+
+        let lines =
+            inspect_lines_for_transcript(&path, Some("unmapped-transcript-v1"), Some("source-a"));
+        let rendered = lines.join("\n");
+
+        assert!(
+            rendered.contains(&raw_line),
+            "unsupported provider-owned format should render the bounded raw tail: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("agent: {sentinel}")),
+            "unsupported provider-owned format must not fail open to native projection: {rendered}"
+        );
     }
 
     #[test]
