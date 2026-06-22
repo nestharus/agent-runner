@@ -14,14 +14,20 @@ use crate::observability::dto::{
 use crate::observability::invocation::{invocation_node_id, project_invocations, session_node_id};
 use crate::observability::limits::SnapshotLimits;
 use crate::observability::mailbox::project_mailbox;
+use crate::observability::provider_inspect_transcript_source::ProviderInspectTranscriptResolver;
 use crate::observability::state_access::SnapshotStores;
-use crate::observability::transcript_source::SessionTranscriptResolver;
+use crate::observability::transcript_source::{
+    ResolvedSessionTranscript, SessionTranscriptResolver,
+};
 use crate::observability::visibility::retain_live_subtrees;
+use crate::provider_registry::ProviderRegistry;
+use crate::session_provider::SessionProviderIdentity;
 use oulipoly_config::SessionStorage;
 use oulipoly_state::mailbox::MailboxRow;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -39,7 +45,12 @@ pub trait ObservabilitySnapshotPort {
 pub struct ProductionObservabilitySnapshotService {
     agent_bash_root: Option<PathBuf>,
     agent_bash_cache: AgentBashMetaCache,
-    transcript: SessionTranscriptResolver,
+    transcript: TranscriptSource,
+}
+
+enum TranscriptSource {
+    Local(SessionTranscriptResolver),
+    ProviderInspect(ProviderInspectTranscriptResolver),
 }
 
 impl ProductionObservabilitySnapshotService {
@@ -56,7 +67,7 @@ impl ProductionObservabilitySnapshotService {
         Self {
             agent_bash_root,
             agent_bash_cache: AgentBashMetaCache::default(),
-            transcript: SessionTranscriptResolver::new(session_storage),
+            transcript: TranscriptSource::Local(SessionTranscriptResolver::new(session_storage)),
         }
     }
 
@@ -64,6 +75,38 @@ impl ProductionObservabilitySnapshotService {
     /// the interactive monitor.
     pub fn for_session(session_storage: Option<SessionStorage>) -> Self {
         Self::with_session_storage(default_agent_bash_root(), session_storage)
+    }
+
+    pub fn for_provider_inspect(
+        registry: ProviderRegistry,
+        identity: SessionProviderIdentity,
+        active_session_id: String,
+        effective_cwd: Option<PathBuf>,
+    ) -> Self {
+        Self::for_provider_inspect_registry(
+            Arc::new(registry),
+            identity,
+            active_session_id,
+            effective_cwd,
+        )
+    }
+
+    pub(crate) fn for_provider_inspect_registry(
+        registry: Arc<ProviderRegistry>,
+        identity: SessionProviderIdentity,
+        active_session_id: String,
+        effective_cwd: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            agent_bash_root: default_agent_bash_root(),
+            agent_bash_cache: AgentBashMetaCache::default(),
+            transcript: TranscriptSource::ProviderInspect(ProviderInspectTranscriptResolver::new(
+                registry,
+                identity,
+                active_session_id,
+                effective_cwd,
+            )),
+        }
     }
 }
 
@@ -168,9 +211,9 @@ impl ProductionObservabilitySnapshotService {
         root_invocation_uuid: Option<&str>,
         limits: SnapshotLimits,
     ) {
-        let Some(path) = self
+        let Some(transcript) = self
             .transcript
-            .resolve(root.provider_name.as_deref(), active_session_id)
+            .resolve(root.provider_name.as_deref(), active_session_id, limits)
         else {
             return;
         };
@@ -178,9 +221,25 @@ impl ProductionObservabilitySnapshotService {
             nodes,
             active_session_id,
             root_invocation_uuid,
-            path,
+            transcript,
             limits.transcript_tail_bytes,
         );
+    }
+}
+
+impl TranscriptSource {
+    fn resolve(
+        &self,
+        provider_name: Option<&str>,
+        session_id: Option<&str>,
+        limits: SnapshotLimits,
+    ) -> Option<ResolvedSessionTranscript> {
+        match self {
+            Self::Local(resolver) => resolver
+                .resolve(provider_name, session_id)
+                .map(ResolvedSessionTranscript::local),
+            Self::ProviderInspect(resolver) => resolver.resolve(limits),
+        }
     }
 }
 
@@ -188,7 +247,7 @@ fn attach_transcript_inspect_ref(
     nodes: &mut [MonitorNode],
     active_session_id: Option<&str>,
     root_invocation_uuid: Option<&str>,
-    path: String,
+    transcript: ResolvedSessionTranscript,
     max_tail_bytes: usize,
 ) {
     let session_node = active_session_id.map(session_node_id);
@@ -199,7 +258,7 @@ fn attach_transcript_inspect_ref(
         root_invocation_node.as_deref(),
     );
     for index in target_indices {
-        nodes[index].inspect_ref = Some(session_transcript_inspect_ref(&path, max_tail_bytes));
+        nodes[index].inspect_ref = Some(session_transcript_inspect_ref(&transcript, max_tail_bytes));
     }
 }
 
@@ -218,10 +277,15 @@ fn transcript_inspect_target_indices(
         .collect()
 }
 
-fn session_transcript_inspect_ref(path: &str, max_tail_bytes: usize) -> InspectRef {
+fn session_transcript_inspect_ref(
+    transcript: &ResolvedSessionTranscript,
+    max_tail_bytes: usize,
+) -> InspectRef {
     InspectRef::SessionTranscript {
-        path: path.to_string(),
+        path: transcript.path.clone(),
         max_tail_bytes,
+        format_id: transcript.format_id.clone(),
+        source_id: transcript.source_id.clone(),
     }
 }
 

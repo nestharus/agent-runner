@@ -4103,3 +4103,53 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
   mirroring the project's D7 zero-regression judge-disposition precedent. The WU introduces zero new
   build/test/clippy/token failures (8/8 S11-M2 tests green; clippy no WU delta; fmt clean; WU-delta-0
   token guard). Reversible: draft PR only; CodeRabbit + the human manager are the review surface.
+
+## S11-M3 / D1 — Proceed without Linear (manager Option B)
+- Phase: Phase 0 bootstrap
+- Decision: LINEAR_API_KEY is unavailable to spooled jobs. Per manager-max authorization,
+  the orchestrator proceeds without the ticket system (Option B): all substantive pipeline
+  work runs, the draft PR opens on base `main`, and every linear-operator dispatch is
+  skipped. wu_brief_path (planning/s11-m3-tui-inspect-seam/brief.md) is the source of truth.
+  The manager creates + links the NES ticket out-of-band after Phase 9.
+- Justifying evidence: manager authorization in the orchestration prompt; brief.md; the
+  authoritative WU4 design proposal §"deliverable 2 (TUI-inspect external seam)" + decision #5.
+- Linear gap: no ticket read/create/comment/estimate dispatch in this run. Phase 0
+  ticket-read, Phase 3 update-estimate, Phase 9 cross-link, and Final close-comment ticket
+  steps are intentionally skipped and recorded as ticket_system=none.
+
+## S11-M3 / D2 — Proceed exhaustive without baseline estimate
+- Phase: Phase 2.5 disposition
+- Decision: estimate_source=missing (no inherited M3 estimate; WU4 carried refined 13 for the
+  whole external-migration design, not M3 alone). The Phase 2.5 inherited-estimate cold-start
+  check normally emits a NEEDS_INPUT (prototype-first / proceed-without-baseline / terminate).
+  The manager (manager-max) has given an explicit standing directive to do all substantive work
+  and open the draft PR autonomously and not halt except for genuine blockers. That directive is
+  the user-owned disposition: PROCEED WITHOUT A BASELINE ESTIMATE in exhaustive mode. No halt.
+- Decision: WU-level risk verdict HIGH is ACCEPTED. It reflects the safety-critical provider-ref
+  no-local-fallback rule and the breadth of touched files (monitor construction, snapshot DTO,
+  resolver source-selection, provider RPC envelope, TUI projection), not unworkability. The seam
+  is fixed by the authoritative WU4 design deliverable 2 + decision #5; the brief directs
+  implementation. Defer-to-prototype did not fire (1 of >=2 signals).
+- Justifying evidence: planning/s11-m3-tui-inspect-seam/risk/s11-m3-risk-profile.md;
+  research/s11-m3-duplicates.md; research/s11-m3-cross-language-trace.md; manager directive.
+
+## S11-M3 / D3 — Reverted cargo fmt --all scope pollution
+- Phase: Phase 6 (post Step 6b)
+- Decision: a Step 6b test-writer ran `cargo fmt --all`, reformatting 11 unrelated product/test
+  files (import reordering only). Reverted all 11 to HEAD so the M3 PR diff stays scoped to the
+  inspect seam test changes. No semantic change reverted. M3 will not carry unrelated rustfmt churn;
+  workspace fmt-conformance of those files is a pre-existing main condition, not M3's scope (the
+  brief's acceptance gates do not include cargo fmt --check).
+
+## S11-M3 / D4 — Phase 6 zero-regression judge disposition (observed_relay env failure)
+- Phase: Phase 6 gate
+- Decision: the Phase 6 independent gate returned HIGH solely because
+  executor::cli::pty_broker::tui::tests::observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor
+  fails with EAGAIN "Failed to initialize TUI terminal: Resource temporarily unavailable (os error 11)".
+  Attribution (risk/s11-m3-regression-attribution.md) proved it fails IDENTICALLY on clean main @
+  17fdd2e4 (3/3) and the M3 worktree (3/3); M3 does not touch the terminal-init path or the test body
+  (FakeMonitor). It is a pre-existing environmental sandbox failure, WU-delta 0. Per the brief
+  (pre-existing main-red treated as not-a-regression) and the project's S11-M2 D7 zero-regression
+  precedent, Phase 6 is ACCEPTED as PASS: M3 adds zero new build/test/clippy/token failures; all
+  M3-relevant suites green (observability_snapshot 13/13, dispatch 15/15, locate CLI 7/7, render 3/3),
+  build/clippy(-D warnings)/tsc green, token guard WU-delta 0, diff scope clean, contract C2-C7 upheld.

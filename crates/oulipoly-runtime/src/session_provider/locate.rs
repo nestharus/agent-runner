@@ -1,14 +1,14 @@
-use super::types::SessionProviderError;
-use crate::session_metadata::{LocatedTranscript, SessionStorageType, TranscriptLookupMode};
+use super::types::{SessionProviderError, SessionProviderLocatedTranscript};
+use crate::session_metadata::{SessionStorageType, TranscriptLookupMode};
 use oulipoly_config::{ScriptSessionStorageType, SessionStorage};
 use oulipoly_provider::generated::SessionLocateTranscriptResult;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-pub(super) fn map_locate_result(
+pub(super) fn map_locate_result_with_raw_metadata(
     result: SessionLocateTranscriptResult,
     mode: TranscriptLookupMode,
-) -> Result<LocatedTranscript, SessionProviderError> {
+) -> Result<SessionProviderLocatedTranscript, SessionProviderError> {
     let facts = validate_locate_result(result, mode)?;
     Ok(located_transcript_from_facts(facts, mode))
 }
@@ -16,6 +16,7 @@ pub(super) fn map_locate_result(
 struct ValidLocateFacts {
     path: PathBuf,
     format_id: Option<String>,
+    source_id: Option<String>,
 }
 
 fn validate_locate_result(
@@ -28,6 +29,7 @@ fn validate_locate_result(
     Ok(ValidLocateFacts {
         path,
         format_id: result.format_id,
+        source_id: result.source_id,
     })
 }
 
@@ -45,11 +47,14 @@ fn require_located(located: bool) -> Result<(), SessionProviderError> {
 fn located_transcript_from_facts(
     facts: ValidLocateFacts,
     mode: TranscriptLookupMode,
-) -> LocatedTranscript {
-    LocatedTranscript {
+) -> SessionProviderLocatedTranscript {
+    let storage_classification = map_format_id(facts.format_id.as_deref());
+    SessionProviderLocatedTranscript {
         path: facts.path,
-        storage_classification: map_format_id(facts.format_id.as_deref()),
+        storage_classification,
         require_existing_observed: matches!(mode, TranscriptLookupMode::RequireExisting),
+        format_id: facts.format_id,
+        source_id: facts.source_id,
     }
 }
 

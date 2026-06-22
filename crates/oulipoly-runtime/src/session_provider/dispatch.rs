@@ -7,7 +7,7 @@ use super::turns;
 use super::types::{
     SessionProviderCaptureRequest, SessionProviderCaptureResult, SessionProviderError,
     SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLocateRequest,
-    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
+    SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
 };
 use crate::session_metadata::LocatedTranscript;
 use oulipoly_provider::client::ProviderClient;
@@ -20,6 +20,16 @@ use std::path::Path;
 pub fn locate_transcript(
     request: SessionProviderLocateRequest<'_>,
 ) -> Result<LocatedTranscript, SessionProviderError> {
+    locate_transcript_with_raw_metadata(request).map(|located| LocatedTranscript {
+        path: located.path,
+        storage_classification: located.storage_classification,
+        require_existing_observed: located.require_existing_observed,
+    })
+}
+
+pub fn locate_transcript_with_raw_metadata(
+    request: SessionProviderLocateRequest<'_>,
+) -> Result<SessionProviderLocatedTranscript, SessionProviderError> {
     let client = session_client(request.registry, &request.identity)?;
     let provider_result = invoke_session::<SessionLocateTranscriptResult>(
         &client,
@@ -28,11 +38,11 @@ pub fn locate_transcript(
             &request.identity,
             Some(request.session_id),
             request.effective_cwd,
-            locate_extra(request.lookup_mode),
+            locate_extra(request.lookup_mode, request.purpose, request.tail_bytes_hint),
             "locate",
         )?,
     )?;
-    locate::map_locate_result(provider_result, request.lookup_mode)
+    locate::map_locate_result_with_raw_metadata(provider_result, request.lookup_mode)
 }
 
 pub fn read_turns(

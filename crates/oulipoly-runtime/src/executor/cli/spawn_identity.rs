@@ -50,6 +50,14 @@ impl SpawnIdentityContext {
         self.session_id.as_deref()
     }
 
+    pub(super) fn model_name(&self) -> Option<&str> {
+        self.model_name.as_deref()
+    }
+
+    pub(super) fn effective_cwd(&self) -> Option<&str> {
+        self.effective_cwd.as_deref()
+    }
+
     pub(super) fn with_pty_control_path(&self, path: impl Into<String>) -> Self {
         let mut cloned = self.clone();
         cloned.pty_control_path = Some(path.into());

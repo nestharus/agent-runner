@@ -601,6 +601,8 @@ fn locate_external_provider_transcript(
         session_id,
         lookup_mode: TranscriptLookupMode::RequireExisting,
         effective_cwd: None,
+        purpose: None,
+        tail_bytes_hint: None,
     })
     .map_err(session_provider_metadata_error)
 }

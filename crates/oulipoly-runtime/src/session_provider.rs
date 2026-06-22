@@ -17,13 +17,14 @@ mod turns;
 mod types;
 
 pub use dispatch::{
-    capture, capture_for_lifecycle, locate_transcript, read_turns, read_turns_for_lifecycle,
+    capture, capture_for_lifecycle, locate_transcript, locate_transcript_with_raw_metadata,
+    read_turns, read_turns_for_lifecycle,
 };
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
 pub use turns::{assert_turn_count_diagnostic, ingest_owned_turns};
 pub use types::{
     NoRefProofOutput, NoRefProofRequest, S7A_NEUTRAL_SETTINGS_ID, SessionProviderCaptureRequest,
     SessionProviderCaptureResult, SessionProviderError, SessionProviderIdentity,
-    SessionProviderLifecycleContext, SessionProviderLocateRequest, SessionProviderReadTurnsRequest,
-    SessionProviderReadTurnsResult, SessionProviderTurn,
+    SessionProviderLifecycleContext, SessionProviderLocateRequest, SessionProviderLocatedTranscript,
+    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult, SessionProviderTurn,
 };

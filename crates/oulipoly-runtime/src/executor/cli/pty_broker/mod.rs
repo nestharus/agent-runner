@@ -14,6 +14,8 @@
 use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
 use super::terminal_signal::{InteractiveSignalGuard, exit_code_from_status};
 use crate::observability::{ObservabilityRoot, ProductionObservabilitySnapshotService};
+use crate::provider_registry::ProviderRegistry;
+use crate::session_provider::{self, SessionProviderIdentity};
 use oulipoly_config::ProviderConfig;
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeIdleUpdate};
 use sha2::{Digest, Sha256};
@@ -25,6 +27,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod cancel;
@@ -60,6 +63,16 @@ pub struct PtyControlClientError {
 pub struct PtyControlResponse {
     pub ack: bool,
     pub message: String,
+}
+
+pub(super) struct ProviderInspectMonitorContext {
+    registry: Arc<ProviderRegistry>,
+}
+
+impl ProviderInspectMonitorContext {
+    pub(super) fn new(registry: Arc<ProviderRegistry>) -> Self {
+        Self { registry }
+    }
 }
 
 pub fn inject_control_envelope(
@@ -134,6 +147,7 @@ pub(super) fn execute_interactive_child_observed(
     mut cmd: Command,
     provider: &ProviderConfig,
     context: Option<&SpawnIdentityContext>,
+    provider_inspect: Option<&ProviderInspectMonitorContext>,
 ) -> Result<ExitStatus, String> {
     let real_tty = RealTerminal::open()?;
     let full = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
@@ -156,9 +170,8 @@ pub(super) fn execute_interactive_child_observed(
     let writer = raw_tty
         .writer_clone()
         .map_err(format_tui_writer_clone_error)?;
-    let monitor =
-        ProductionObservabilitySnapshotService::for_session(provider.session_storage.clone());
     let root = observability_root(provider, context);
+    let monitor = observability_monitor(provider, context, provider_inspect);
     let status = tui::relay_until_exit_observed(
         raw_tty.fd(),
         writer,
@@ -197,8 +210,61 @@ fn observability_root(
             .and_then(SpawnIdentityContext::session_id)
             .map(str::to_string),
         provider_name: Some(provider.name.clone()),
-        model_name: None,
+        model_name: context
+            .and_then(SpawnIdentityContext::model_name)
+            .map(str::to_string),
     }
+}
+
+fn observability_monitor(
+    provider: &ProviderConfig,
+    context: Option<&SpawnIdentityContext>,
+    provider_inspect: Option<&ProviderInspectMonitorContext>,
+) -> ProductionObservabilitySnapshotService {
+    match provider_inspect {
+        Some(inspect) => provider_inspect_monitor(provider, context, inspect)
+            .unwrap_or_else(|| ProductionObservabilitySnapshotService::for_session(None)),
+        None => ProductionObservabilitySnapshotService::for_session(provider.session_storage.clone()),
+    }
+}
+
+fn provider_inspect_monitor(
+    provider: &ProviderConfig,
+    context: Option<&SpawnIdentityContext>,
+    inspect: &ProviderInspectMonitorContext,
+) -> Option<ProductionObservabilitySnapshotService> {
+    let context = context?;
+    let model_name = context.model_name()?;
+    let session_id = context.session_id()?;
+    let identity = provider_inspect_identity(inspect.registry.as_ref(), model_name, &provider.name)?;
+    Some(
+        ProductionObservabilitySnapshotService::for_provider_inspect_registry(
+            Arc::clone(&inspect.registry),
+            identity,
+            session_id.to_string(),
+            context.effective_cwd().map(PathBuf::from),
+        ),
+    )
+}
+
+fn provider_inspect_identity(
+    registry: &ProviderRegistry,
+    model_name: &str,
+    provider_name: &str,
+) -> Option<SessionProviderIdentity> {
+    let describe = registry.describe_model_provider(model_name).ok()?;
+    Some(SessionProviderIdentity {
+        model_name: model_name.to_string(),
+        provider_name: provider_name.to_string(),
+        provider_instance_id: Some(format_provider_instance_id(&describe.provider_id)),
+        settings_id: describe
+            .settings_schema_id
+            .unwrap_or_else(|| session_provider::S7A_NEUTRAL_SETTINGS_ID.to_string()),
+    })
+}
+
+fn format_provider_instance_id(provider_id: &str) -> String {
+    format!("{provider_id}-instance")
 }
 
 /// Whether the split-pane observability TUI should host this interactive

@@ -78,7 +78,11 @@ fn session_id_string(session_id: Option<&str>) -> Option<String> {
     session_id.map(str::to_string)
 }
 
-pub(super) fn locate_extra(mode: TranscriptLookupMode) -> JsonObject {
+pub(super) fn locate_extra(
+    mode: TranscriptLookupMode,
+    purpose: Option<&str>,
+    tail_bytes_hint: Option<usize>,
+) -> JsonObject {
     let mut extra = JsonObject::new();
     extra.insert(
         "lookup_mode".to_string(),
@@ -90,6 +94,8 @@ pub(super) fn locate_extra(mode: TranscriptLookupMode) -> JsonObject {
             .to_string(),
         ),
     );
+    insert_optional_str(&mut extra, "purpose", purpose);
+    insert_optional_usize(&mut extra, "tail_bytes_hint", tail_bytes_hint);
     extra
 }
 
@@ -127,6 +133,12 @@ fn insert_path(extra: &mut JsonObject, key: &str, value: Option<&Path>) {
 fn insert_optional_str(extra: &mut JsonObject, key: &str, value: Option<&str>) {
     if let Some(value) = value {
         extra.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn insert_optional_usize(extra: &mut JsonObject, key: &str, value: Option<usize>) {
+    if let Some(value) = value {
+        extra.insert(key.to_string(), Value::from(value as u64));
     }
 }
 

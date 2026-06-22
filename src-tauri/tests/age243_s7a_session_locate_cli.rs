@@ -445,6 +445,14 @@ fn assert_historical_locate_request_shape(
     assert_eq!(request["params"]["provider_name"], provider_name);
     assert_eq!(request["params"]["session_id"], SESSION_A);
     assert_eq!(request["params"]["lookup_mode"], "require_existing");
+    assert!(
+        request["params"].get("purpose").is_none(),
+        "non-inspect locate request must omit purpose: {request}"
+    );
+    assert!(
+        request["params"].get("tail_bytes_hint").is_none(),
+        "non-inspect locate request must omit tail_bytes_hint: {request}"
+    );
 }
 
 fn assert_external_locate_request_shape(records: &[Value]) {
@@ -460,6 +468,14 @@ fn assert_external_locate_request_shape(records: &[Value]) {
     assert_eq!(request["params"]["provider_name"], PROVIDER_A_ACCOUNT);
     assert_eq!(request["params"]["session_id"], SESSION_A);
     assert_eq!(request["params"]["lookup_mode"], "require_existing");
+    assert!(
+        request["params"].get("purpose").is_none(),
+        "non-inspect locate request must omit purpose: {request}"
+    );
+    assert!(
+        request["params"].get("tail_bytes_hint").is_none(),
+        "non-inspect locate request must omit tail_bytes_hint: {request}"
+    );
     assert!(
         !request.to_string().contains("state.db"),
         "locate request must not expose host SQLite paths"
