@@ -221,6 +221,24 @@ pub(crate) enum Subcommands {
     ResumeList { uuid: String },
     /// Run chain-table backfill explicitly.
     MigrateDb,
+    /// Dry-run the copied session ownership migration.
+    MigrateSessionOwnership {
+        /// Required safety flag; this command has no live apply mode.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+
+        /// Directory where copied DBs and report are written.
+        #[arg(long = "scratch-dir")]
+        scratch_dir: PathBuf,
+
+        /// Override state DB path.
+        #[arg(long = "state-db")]
+        state_db: Option<PathBuf>,
+
+        /// Override models directory.
+        #[arg(long = "models-dir")]
+        models_dir: Option<PathBuf>,
+    },
     /// Recover from an unusable state DB by backing it up and creating a fresh one.
     Migrate {
         /// Back up state.db and sidecars, then create a fresh current schema DB.

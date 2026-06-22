@@ -4050,3 +4050,56 @@ and is reversible (a human/manager can re-run full apply-gate-set on the draft P
 - WU CLOSED: SUCCESS. Design + proof + coverage delivered; anti-scope honored (no production
   deletion, no behavior change, live DB never mutated). Evidence index: planning peer
   research/, proposals/, risk/, contracts/, alignment/, design/, dry-run/, audit-history.md.
+
+## S11-M2 — DB Session-Ownership Migration (author + dry-run, NO live apply)
+
+WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: main @ 7c3cd915
+
+### M2-D0 — Proceed without Linear (manager Option B)
+
+- `LINEAR_API_KEY` is unavailable and the manager (manager-max, autonomous authority)
+  authorized proceeding without the ticket system. The orchestrator skips every
+  `linear-operator` step (create / read / update-estimate / cross-link / close-comment) and
+  treats `brief.md` + the S11-WU4 deliverable-1 design as the source of truth. The draft PR is
+  opened on base `main`. The manager creates and links the NES ticket out-of-band after Phase
+  9. This is a recorded, manager-authorized gap, not a pipeline halt. Reversible: the manager
+  attaches the ticket and cross-links the PR whenever Linear access is restored.
+- Anti-scope reaffirmed for this WU: author the migration + dry-run harness + rollback +
+  report and proof tests ONLY. Never apply the migration to the live DB (dry-run on a copied
+  DB only). No in-tree Claude reader deletion (WU5). No inspect/replace seam implementation
+  (M3/M4). No automatic-on-open schema migration.
+
+### M2-D1 — Phase 2.5 gate dispositions (proceed in exhaustive mode; no prototype; no baseline spike)
+
+- Risk profile rolled up WU-level HIGH (8/8 surfaces exhaustive). Defer-to-prototype detection
+  fired 3 signals (HIGH-majority, sprawling duplicate systems, cross-language entropy), but the
+  reasoned recommendation is DO NOT defer: the merged S11-WU4 design (#183) plus its dry-run
+  reference artifacts (forward.sql, rollback.sql, dry-run-runner.py, dry-run-report.md) already
+  ARE the spike/prototype evidence. Correct downstream response = exhaustive implementation/proof,
+  not another prototype loop. Evidence: risk/s11-m2-risk-profile.md.
+- Estimate baseline: estimate_source=missing (no ticket system this run), backstop_spike=
+  not_warranted (WU4 design+dry-run is the spike). Evidence: research/s11-m2-problem-map.md §5.
+- DISPOSITION: proceed in exhaustive mode. The Phase 2.5 step-4a estimate-cold-start and step-5/6
+  defer-to-prototype value questions are pre-dispositioned by the manager-max autonomous dispatch,
+  which commissions this exact scoped WU against the fixed WU4 design with explicit anti-scope and
+  a standing "do not halt" instruction. That standing authorization is the prior user disposition
+  to "proceed without a baseline estimate, exhaustive mode, no prototype, no terminate." Re-asking
+  would contradict the explicit authorization, so the orchestrator records and proceeds.
+  skip_problem_map_gate=true additionally suppresses the routine problem-map approval step.
+
+### M2-D2 — Phase 6 dispositioned PASS (code-quality all LOW; root-finalization self-audit artifact)
+
+- Phase 6 apply-gate-set round 3 returned every substantive gate green: cohesion / coupling /
+  function-classification / push-pull / validation-integrity / proof-risk all LOW; derivation and
+  halt/swap/child-recursion non-applicable; process-tree FIRSTNESS verified PASS (Step 6b before
+  Step 6c, ACR-247 side-channel + tests-contract alignment hash-current). Reaching all-LOW required
+  three remediation rounds: (r1) function single-responsibility splits, (r3) DryRunError extracted to
+  error.rs + accurate declared-role sets + classifier declared as a DB-classification adapter + the
+  mailbox session_runtime cwd surface added to the classifier/sql adapter Translates.
+- The lone non-pass row was `process-tree-root-finalization:root-invocation-still-running`: the
+  apply-gate-set cannot observe its own root invocation as terminal while that root is the process
+  running the self-audit. This is a tautological infrastructure artifact, not a topology/firstness/
+  code-quality violation. JUDGE DISPOSITION: Phase 6 ACCEPTED as PASS on the evidence above,
+  mirroring the project's D7 zero-regression judge-disposition precedent. The WU introduces zero new
+  build/test/clippy/token failures (8/8 S11-M2 tests green; clippy no WU delta; fmt clean; WU-delta-0
+  token guard). Reversible: draft PR only; CodeRabbit + the human manager are the review surface.

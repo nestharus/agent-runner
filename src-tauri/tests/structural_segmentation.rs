@@ -194,6 +194,19 @@ fn should_scan_for_doomed_dir_links(tracked_file: &str) -> bool {
     tracked_file != SELF_PATH
         && !is_quoted_gate_diff_artifact(tracked_file)
         && !is_code_quality_log_artifact(tracked_file)
+        && !is_decisions_log(tracked_file)
+}
+
+/// The append-only decision log records orchestrator evidence indexes that reference
+/// per-WU planning subdirs (`risk/`, `research/`, `proposals/`) by short relative path.
+/// Those collide by name with the deleted top-level doomed dirs, producing false-positive
+/// "dangling doomed-dir link" hits. The log is prose, not a code/config link surface, so
+/// exempt it from the scan (consistent with the gate-diff and code-quality-log exemptions).
+fn is_decisions_log(tracked_file: &str) -> bool {
+    std::path::Path::new(tracked_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("DECISIONS.md")
 }
 
 fn line_doomed_dir_links<'a>(regex: &'a Regex, line: &'a str) -> impl Iterator<Item = &'a str> {
