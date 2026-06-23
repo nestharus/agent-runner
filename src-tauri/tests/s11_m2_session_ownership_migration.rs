@@ -52,6 +52,41 @@ struct TurnSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentRowSnapshot {
+    id: i64,
+    chain_id: String,
+    provider_name: String,
+    session_id: String,
+    started_at: String,
+    ended_at: Option<String>,
+    last_turn_id: Option<String>,
+    transition_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnRowSnapshot {
+    id: i64,
+    provider_name: String,
+    session_id: String,
+    turn_id: String,
+    timestamp: String,
+    role: String,
+    parent_turn_id: Option<String>,
+    is_sidechain: i64,
+    is_compaction_boundary: i64,
+    source_file: Option<String>,
+    ingested_at: String,
+    body: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FullOwnershipSnapshot {
+    chains: BTreeMap<String, ChainSnapshot>,
+    segments: Vec<SegmentRowSnapshot>,
+    turns: Vec<TurnRowSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ChainSnapshot {
     model_name: String,
     created_at: String,
@@ -515,31 +550,77 @@ fn row_12_rollback_drift_fails_closed_without_restoring_drifted_copy() {
 }
 
 #[test]
-fn row_13_segment_tuple_collision_aborts_with_unchanged_copy() {
+fn row_13_segment_tuple_collision_merges_with_greatest_id_tiebreak() {
     let fixture = Fixture::new();
     fixture.write_target_config();
     fixture.seed_base_population();
     let conn = fixture.conn();
-    seed_segment(
+    let first_id = seed_segment_with_started_at(
         &conn,
         "chain-unregistered",
         &canonical_account(),
         "session-unregistered-a",
+        FIXED_TS,
         Some(LATER_TS),
         Some("turn-collision-segment"),
         "manual",
     );
-    let live_before = snapshot(&fixture.state_path);
-
-    let output = fixture.run();
-
-    assert_failure(&output);
-    assert_failure_mentions(
-        &output,
-        &fixture.scratch_dir,
-        "UNIQUE(chain_id, provider_name, session_id)",
+    let winner_id = seed_segment_with_started_at(
+        &conn,
+        "chain-unregistered",
+        &unregistered_account_family(2),
+        "session-unregistered-a",
+        FIXED_TS,
+        None,
+        Some("turn-collision-segment-open"),
+        "exhausted",
     );
-    assert_copied_db_unchanged_if_present(&fixture.scratch_dir, &live_before);
+    assert!(
+        winner_id > first_id,
+        "fixture must exercise greatest-id tie-break"
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_family(2),
+        "session-unregistered-a",
+        "turn-collision-segment-open",
+        "assistant",
+    );
+    drop(conn);
+
+    let backup_dir = fixture.backup_dir();
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let segments = query_segments_with_id(&Connection::open(&fixture.state_path).unwrap());
+    let merged: Vec<_> = segments
+        .iter()
+        .filter(|segment| {
+            segment.chain_id == "chain-unregistered"
+                && segment.session_id == "session-unregistered-a"
+        })
+        .collect();
+    assert_eq!(
+        merged.len(),
+        1,
+        "row 13 collision group was not merged: {merged:?}"
+    );
+    let survivor = merged[0];
+    assert_eq!(
+        survivor.id, winner_id,
+        "equal-start survivor must be greatest id"
+    );
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_eq!(survivor.started_at, FIXED_TS);
+    assert_eq!(survivor.ended_at, None);
+    assert_eq!(
+        survivor.last_turn_id.as_deref(),
+        Some("turn-collision-segment-open")
+    );
+    assert_eq!(survivor.transition_reason, "exhausted");
 }
 
 #[test]
@@ -561,12 +642,499 @@ fn row_14_turn_tuple_collision_aborts_with_unchanged_copy() {
     let output = fixture.run();
 
     assert_failure(&output);
-    assert_failure_mentions(
-        &output,
-        &fixture.scratch_dir,
-        "UNIQUE(provider_name, session_id, turn_id)",
+    assert_failure_mentions(&output, &fixture.scratch_dir, "divergent");
+    assert_copied_db_unchanged_if_present(&fixture.scratch_dir, &live_before);
+}
+
+#[test]
+fn s11_m2c_t1_segment_merge_three_sequential_segments_preserves_latest_and_unrelated_rows() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    let after_segments = query_segments_with_id(&conn);
+    let after = full_snapshot(&fixture.state_path);
+    let planned_dedup_losers = planned_dedup_loser_ids(
+        &before,
+        "session-merge",
+        &["turn-merge-first", "turn-merge-middle", "turn-merge-last"],
+    );
+    assert!(
+        planned_dedup_losers.is_empty(),
+        "T1 fixture should have only unique turns: {planned_dedup_losers:?}"
+    );
+    assert_preserved_non_dedup_turns_by_id(&before, &after, &planned_dedup_losers);
+    let merged: Vec<_> = after_segments
+        .iter()
+        .filter(|segment| {
+            segment.chain_id == "chain-merge-three" && segment.session_id == "session-merge"
+        })
+        .collect();
+    assert_eq!(
+        merged.len(),
+        1,
+        "sequential segments were not merged: {merged:?}"
+    );
+    let survivor = merged[0];
+    assert_eq!(survivor.started_at, "2026-06-20T10:00:00Z");
+    assert_eq!(
+        survivor.ended_at, None,
+        "latest open segment must keep merged segment open"
+    );
+    assert_eq!(survivor.last_turn_id.as_deref(), Some("turn-merge-last"));
+    assert_eq!(survivor.transition_reason, "exhausted");
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_eq!(
+        survivor.id,
+        latest_segment_id(&before, "chain-merge-three", "session-merge")
+    );
+
+    let unrelated_before = before
+        .segments
+        .iter()
+        .find(|segment| {
+            segment.chain_id == "chain-merge-three" && segment.session_id == "session-unrelated"
+        })
+        .unwrap();
+    let unrelated_after = after_segments
+        .iter()
+        .find(|segment| {
+            segment.chain_id == "chain-merge-three" && segment.session_id == "session-unrelated"
+        })
+        .unwrap();
+    assert_eq!(unrelated_after.id, unrelated_before.id);
+    assert_eq!(unrelated_after.started_at, unrelated_before.started_at);
+    assert_eq!(unrelated_after.ended_at, unrelated_before.ended_at);
+    assert_eq!(unrelated_after.last_turn_id, unrelated_before.last_turn_id);
+    assert_eq!(
+        unrelated_after.transition_reason,
+        unrelated_before.transition_reason
+    );
+}
+
+#[test]
+fn s11_m2c_t2_turn_dedup_identical_duplicates_preserves_min_id_content_and_counts() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let expected_winner = seed_turn_dedup_collision(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    let turns = query_turns_with_id(&conn);
+    let survivors: Vec<_> = turns
+        .iter()
+        .filter(|turn| turn.session_id == "session-dedup" && turn.turn_id == "turn-dedup")
+        .collect();
+    assert_eq!(
+        survivors.len(),
+        1,
+        "duplicate turn rows were not deduped: {survivors:?}"
+    );
+    let survivor = survivors[0];
+    assert_eq!(
+        survivor.id, expected_winner.id,
+        "dedup winner must be MIN(id)"
+    );
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_same_turn_content(survivor, &expected_winner);
+    assert_eq!(last_run_count(&conn, "turn_rows_deduped_away"), 1);
+    assert_eq!(last_run_count(&conn, "segment_rows_merged_away"), 1);
+    assert_eq!(last_run_count(&conn, "segment_merge_survivors_updated"), 1);
+}
+
+#[test]
+fn s11_m2c_t3_t5_divergent_turn_collision_aborts_before_mutation() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_divergent_turn_collision(&fixture);
+    let live_before = snapshot(&fixture.state_path);
+    let hash_before = file_hash(&fixture.state_path);
+
+    let output = fixture.run();
+
+    assert_failure(&output);
+    assert_failure_mentions(&output, &fixture.scratch_dir, "divergent");
+    assert_eq!(
+        file_hash(&fixture.state_path),
+        hash_before,
+        "live DB hash changed"
+    );
+    assert_eq!(
+        snapshot(&fixture.state_path),
+        live_before,
+        "live DB rows changed"
     );
     assert_copied_db_unchanged_if_present(&fixture.scratch_dir, &live_before);
+}
+
+#[test]
+fn s11_m2c_t7_rollback_restores_merged_segments_and_deleted_turns_exactly() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    seed_turn_dedup_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_apply = full_snapshot(&fixture.state_path);
+    assert_ne!(after_apply, before);
+    let expected_segment_rows_reinserted =
+        before.segments.len() as i64 - after_apply.segments.len() as i64;
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+    let report = read_report_from_output(&rollback);
+    assert_report_context_count(
+        &report,
+        &ROLLBACK_COPY_PHASE,
+        "segment_rows_reinserted",
+        expected_segment_rows_reinserted,
+    );
+    assert_report_context_count(&report, &ROLLBACK_COPY_PHASE, "turn_rows_reinserted", 1);
+    assert_report_context_count(
+        &report,
+        &ROLLBACK_COPY_PHASE,
+        "segment_merge_survivors_restored",
+        2,
+    );
+}
+
+#[test]
+fn s11_m2c_t8_rollback_aborts_when_deleted_segment_id_is_occupied() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_apply = full_snapshot(&fixture.state_path);
+    let deleted_id = first_deleted_segment_id(&before, &after_apply);
+    occupy_segment_id(&fixture.state_path, deleted_id);
+    let drifted = full_snapshot(&fixture.state_path);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    assert_failure_mentions(&rollback, fixture.dir.path(), "drift");
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        drifted,
+        "rollback mutated after drift"
+    );
+}
+
+#[test]
+fn s11_m2c_t8_rollback_aborts_when_deleted_turn_id_is_occupied() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let before_winner = seed_turn_dedup_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    assert!(
+        before
+            .turns
+            .iter()
+            .any(|turn| turn.id != before_winner.id && turn.session_id == "session-dedup"),
+        "fixture must include a dedup loser"
+    );
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_apply = full_snapshot(&fixture.state_path);
+    let deleted_id = first_deleted_turn_id(&before, &after_apply);
+    occupy_turn_id(&fixture.state_path, deleted_id);
+    let drifted = full_snapshot(&fixture.state_path);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    assert_failure_mentions(&rollback, fixture.dir.path(), "drift");
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        drifted,
+        "rollback mutated after drift"
+    );
+}
+
+#[test]
+fn s11_m2c_t15_rollback_aborts_when_merge_survivor_row_is_missing() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    seed_turn_dedup_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let survivor_id = latest_segment_id(&before, "chain-merge-three", "session-merge");
+    delete_segment_id(&fixture.state_path, survivor_id);
+    let drifted = full_snapshot(&fixture.state_path);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    assert_failure_mentions_survivor_missing_or_absent(&rollback, fixture.dir.path());
+    assert_failure_does_not_mention(
+        &rollback,
+        fixture.dir.path(),
+        "segment merge survivor drift before rollback",
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        drifted,
+        "rollback mutated after survivor missing drift"
+    );
+}
+
+#[test]
+fn s11_m2c_t16_rollback_aborts_when_merge_survivor_chain_or_session_identity_drifts() {
+    assert_merge_survivor_identity_drift_detected("chain_id");
+    assert_merge_survivor_identity_drift_detected("session_id");
+}
+
+#[test]
+fn s11_m2c_t9_idempotent_after_collision_resolution_has_zero_counts() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    seed_turn_dedup_collision(&fixture);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_first = full_snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(full_snapshot(&fixture.state_path), after_first);
+    let report = read_report_from_output(&second);
+    for key in [
+        "chain_model_updates_to_apply",
+        "segment_provider_updates_to_apply",
+        "turn_provider_updates_to_apply",
+        "segment_rows_merged_away",
+        "turn_rows_deduped_away",
+        "segment_merge_survivors_updated",
+    ] {
+        assert_report_count(&report, key, 0);
+    }
+}
+
+#[test]
+fn s11_m2c_t11_larger_multi_account_rotation_merges_and_dedups() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_large_rotation_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    let after = full_snapshot(&fixture.state_path);
+    let planned_merged_away =
+        planned_merged_segment_count(&before, "chain-large-rotation", "session-large");
+    let planned_dedup_losers = planned_dedup_loser_ids(
+        &before,
+        "session-large",
+        &[
+            "turn-large-1",
+            "turn-large-2",
+            "turn-large-3",
+            "turn-large-unique",
+        ],
+    );
+    assert_eq!(
+        planned_merged_away, 3,
+        "fixture planned segment merge count changed"
+    );
+    assert_eq!(
+        planned_dedup_losers.len(),
+        9,
+        "fixture planned turn dedup count changed"
+    );
+    assert_eq!(
+        before.segments.len() as i64 - after.segments.len() as i64,
+        planned_merged_away,
+        "segment row delta must equal only planned merged-away rows"
+    );
+    assert_preserved_non_dedup_turns_by_id(&before, &after, &planned_dedup_losers);
+    assert_eq!(
+        after
+            .segments
+            .iter()
+            .filter(|segment| segment.chain_id == "chain-large-rotation"
+                && segment.session_id == "session-large")
+            .count(),
+        1
+    );
+    for turn_id in ["turn-large-1", "turn-large-2", "turn-large-3"] {
+        let matching: Vec<_> = after
+            .turns
+            .iter()
+            .filter(|turn| turn.session_id == "session-large" && turn.turn_id == turn_id)
+            .collect();
+        assert_eq!(matching.len(), 1, "{turn_id} was not deduped: {matching:?}");
+        assert_eq!(
+            matching[0].id,
+            min_turn_id(&before, "session-large", turn_id)
+        );
+        assert_eq!(matching[0].provider_name, canonical_account());
+    }
+    assert_eq!(last_run_count(&conn, "segment_rows_merged_away"), 3);
+    assert_eq!(last_run_count(&conn, "turn_rows_deduped_away"), 9);
+    assert_large_unrelated_rows_preserved_with_expected_remap(&before, &after);
+}
+
+#[test]
+fn s11_m2c_t12_post_apply_zero_collisions_and_report_shows_merge_dedup_counts() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_turn_dedup_collision(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    assert_eq!(
+        last_run_count(&conn, "post_apply_segment_collision_count"),
+        0
+    );
+    assert_eq!(last_run_count(&conn, "post_apply_turn_collision_count"), 0);
+    let report = read_report_from_output(&output);
+    assert_report_count(&report, "segment_rows_merged_away", 1);
+    assert_report_count(&report, "turn_rows_deduped_away", 1);
+    assert_report_truthy_or_zero(&report, "zero remaining segment collisions");
+    assert_report_truthy_or_zero(&report, "zero remaining turn collisions");
+}
+
+#[test]
+fn s11_m2c_t13_preflight_requires_session_turn_body() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    fixture
+        .conn()
+        .execute_batch("ALTER TABLE session_turns DROP COLUMN body;")
+        .unwrap();
+
+    assert_preflight_failure(&fixture, "body");
+}
+
+#[test]
+fn s11_m2c_t14_dry_run_collision_resolution_preserves_live_and_rolls_back_copy_exactly() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    seed_turn_dedup_collision(&fixture);
+    let live_before = full_snapshot(&fixture.state_path);
+    let hash_before = file_hash(&fixture.state_path);
+    let mtime_before = file_mtime(&fixture.state_path);
+
+    let output = fixture.run();
+
+    assert_success(&output);
+    assert_eq!(
+        file_hash(&fixture.state_path),
+        hash_before,
+        "live DB hash changed"
+    );
+    assert_eq!(
+        file_mtime(&fixture.state_path),
+        mtime_before,
+        "live DB mtime changed"
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        live_before,
+        "live DB rows changed"
+    );
+    let state_copy = find_artifact(&fixture.scratch_dir, "state-copy.db");
+    let rollback_copy = find_artifact(&fixture.scratch_dir, "rollback-copy.db");
+    let copy_after = full_snapshot(&state_copy);
+    let planned_dedup_losers =
+        planned_dedup_loser_ids(&live_before, "session-dedup", &["turn-dedup"]);
+    assert_eq!(
+        planned_dedup_losers.len(),
+        1,
+        "fixture planned turn dedup count changed"
+    );
+    assert_preserved_non_dedup_turns_by_id(&live_before, &copy_after, &planned_dedup_losers);
+    assert_ne!(
+        copy_after, live_before,
+        "state copy did not apply merge/dedup"
+    );
+    assert_eq!(
+        copy_after
+            .segments
+            .iter()
+            .filter(|segment| segment.chain_id == "chain-merge-three"
+                && segment.session_id == "session-merge")
+            .count(),
+        1
+    );
+    assert_eq!(
+        copy_after
+            .turns
+            .iter()
+            .filter(|turn| turn.session_id == "session-dedup" && turn.turn_id == "turn-dedup")
+            .count(),
+        1
+    );
+    assert_eq!(full_snapshot(&rollback_copy), live_before);
 }
 
 #[test]
@@ -1312,6 +1880,414 @@ fn seed_turn(conn: &Connection, provider_name: &str, session_id: &str, turn_id: 
     .unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn seed_segment_with_started_at(
+    conn: &Connection,
+    chain_id: &str,
+    provider_name: &str,
+    session_id: &str,
+    started_at: &str,
+    ended_at: Option<&str>,
+    last_turn_id: Option<&str>,
+    transition_reason: &str,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO session_chain_segments
+         (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_turn_full(
+    conn: &Connection,
+    provider_name: &str,
+    session_id: &str,
+    turn_id: &str,
+    timestamp: &str,
+    role: &str,
+    parent_turn_id: Option<&str>,
+    is_sidechain: i64,
+    is_compaction_boundary: i64,
+    source_file: &str,
+    ingested_at: &str,
+    body: Option<&str>,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO session_turns
+         (provider_name, session_id, turn_id, timestamp, role, parent_turn_id,
+          is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            provider_name,
+            session_id,
+            turn_id,
+            timestamp,
+            role,
+            parent_turn_id,
+            is_sidechain,
+            is_compaction_boundary,
+            source_file,
+            ingested_at,
+            body,
+        ],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn seed_three_segment_collision(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-merge-three", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-merge-three",
+        &unregistered_account_a(),
+        "session-merge",
+        "2026-06-20T10:00:00Z",
+        Some("2026-06-20T10:04:00Z"),
+        Some("turn-merge-first"),
+        "initial",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-merge-three",
+        &canonical_account(),
+        "session-merge",
+        "2026-06-20T10:05:00Z",
+        Some("2026-06-20T10:09:00Z"),
+        Some("turn-merge-middle"),
+        "manual",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-merge-three",
+        &unregistered_account_family(2),
+        "session-merge",
+        "2026-06-20T10:10:00Z",
+        None,
+        Some("turn-merge-last"),
+        "exhausted",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-merge-three",
+        &unregistered_account_family(3),
+        "session-unrelated",
+        "2026-06-20T11:00:00Z",
+        Some("2026-06-20T11:05:00Z"),
+        Some("turn-unrelated"),
+        "imported",
+    );
+    for (provider, session_id, turn_id) in [
+        (
+            unregistered_account_a(),
+            "session-merge",
+            "turn-merge-first",
+        ),
+        (canonical_account(), "session-merge", "turn-merge-middle"),
+        (
+            unregistered_account_family(2),
+            "session-merge",
+            "turn-merge-last",
+        ),
+        (
+            unregistered_account_family(3),
+            "session-unrelated",
+            "turn-unrelated",
+        ),
+    ] {
+        seed_turn(&conn, &provider, session_id, turn_id, "assistant");
+    }
+    seed_mailbox(&fixture.mailbox_path, "session-merge", None);
+    seed_mailbox(&fixture.mailbox_path, "session-unrelated", None);
+}
+
+fn seed_turn_dedup_collision(fixture: &Fixture) -> TurnRowSnapshot {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-turn-dedup", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-turn-dedup",
+        &unregistered_account_a(),
+        "session-dedup",
+        "2026-06-20T12:00:00Z",
+        Some("2026-06-20T12:04:00Z"),
+        Some("turn-dedup"),
+        "manual",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-turn-dedup",
+        &canonical_account(),
+        "session-dedup",
+        "2026-06-20T12:05:00Z",
+        None,
+        Some("turn-dedup"),
+        "exhausted",
+    );
+    let common_body = "identical-dedup-body";
+    let winner_id = seed_turn_full(
+        &conn,
+        &unregistered_account_a(),
+        "session-dedup",
+        "turn-dedup",
+        "2026-06-20T12:01:00Z",
+        "assistant",
+        Some("turn-parent"),
+        1,
+        0,
+        "dedup.jsonl",
+        "2026-06-20T12:02:00Z",
+        Some(common_body),
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-dedup",
+        "turn-dedup",
+        "2026-06-20T12:01:00Z",
+        "assistant",
+        Some("turn-parent"),
+        1,
+        0,
+        "dedup.jsonl",
+        "2026-06-20T12:02:00Z",
+        Some(common_body),
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-dedup", None);
+    query_turns_with_id(&conn)
+        .into_iter()
+        .find(|turn| turn.id == winner_id)
+        .unwrap()
+}
+
+fn seed_divergent_turn_collision(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-divergent-turn", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-divergent-turn",
+        &unregistered_account_a(),
+        "session-divergent",
+        "2026-06-20T13:00:00Z",
+        Some("2026-06-20T13:04:00Z"),
+        Some("turn-divergent"),
+        "manual",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-divergent-turn",
+        &canonical_account(),
+        "session-divergent",
+        "2026-06-20T13:05:00Z",
+        None,
+        Some("turn-divergent"),
+        "exhausted",
+    );
+    seed_turn_full(
+        &conn,
+        &unregistered_account_a(),
+        "session-divergent",
+        "turn-divergent",
+        "2026-06-20T13:01:00Z",
+        "assistant",
+        Some("parent-left"),
+        1,
+        0,
+        "divergent.jsonl",
+        "2026-06-20T13:02:00Z",
+        Some("left-body"),
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-divergent",
+        "turn-divergent",
+        "2026-06-20T13:01:00Z",
+        "assistant",
+        Some("parent-right"),
+        0,
+        1,
+        "divergent.jsonl",
+        "2026-06-20T13:03:00Z",
+        Some("right-body"),
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-divergent", None);
+}
+
+fn seed_large_rotation_collision(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-large-rotation", &source_model_name());
+    let providers = [
+        unregistered_account_a(),
+        unregistered_account_family(2),
+        canonical_account(),
+        unregistered_account_family(3),
+    ];
+    for (index, provider) in providers.iter().enumerate() {
+        seed_segment_with_started_at(
+            &conn,
+            "chain-large-rotation",
+            provider,
+            "session-large",
+            &format!("2026-06-20T14:0{index}:00Z"),
+            if index == providers.len() - 1 {
+                None
+            } else {
+                Some("2026-06-20T14:09:00Z")
+            },
+            Some("turn-large-3"),
+            if index == providers.len() - 1 {
+                "exhausted"
+            } else {
+                "manual"
+            },
+        );
+    }
+    for turn_id in ["turn-large-1", "turn-large-2", "turn-large-3"] {
+        for provider in &providers {
+            seed_turn_full(
+                &conn,
+                provider,
+                "session-large",
+                turn_id,
+                "2026-06-20T14:01:00Z",
+                "assistant",
+                None,
+                0,
+                0,
+                "large.jsonl",
+                "2026-06-20T14:02:00Z",
+                Some(&format!("body-{turn_id}")),
+            );
+        }
+    }
+    seed_turn_full(
+        &conn,
+        &unregistered_account_family(2),
+        "session-large",
+        "turn-large-unique",
+        "2026-06-20T14:03:00Z",
+        "user",
+        Some("turn-large-3"),
+        0,
+        0,
+        "large-unique.jsonl",
+        "2026-06-20T14:04:00Z",
+        Some("body-turn-large-unique"),
+    );
+    seed_chain(&conn, "chain-large-unrelated", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-large-unrelated",
+        &unregistered_account_family(4),
+        "session-large-unrelated",
+        "2026-06-20T15:00:00Z",
+        None,
+        Some("turn-large-unrelated"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_family(4),
+        "session-large-unrelated",
+        "turn-large-unrelated",
+        "assistant",
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-large", None);
+    seed_mailbox(&fixture.mailbox_path, "session-large-unrelated", None);
+}
+
+fn occupy_segment_id(path: &Path, id: i64) {
+    let conn = Connection::open(path).unwrap();
+    seed_chain(&conn, "chain-occupied-segment", &target_model_name());
+    conn.execute(
+        "INSERT INTO session_chain_segments
+         (id, chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+         VALUES (?1, 'chain-occupied-segment', ?2, 'session-occupied-segment', ?3, NULL,
+                 'turn-occupied-segment', 'manual')",
+        params![id, accepted_account(), FIXED_TS],
+    )
+    .unwrap();
+}
+
+fn occupy_turn_id(path: &Path, id: i64) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute(
+        "INSERT INTO session_turns
+         (id, provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, body)
+         VALUES (?1, ?2, 'session-occupied-turn', 'turn-occupied-turn', ?3, 'assistant',
+                 'occupied.jsonl', ?3, 'occupied-body')",
+        params![id, accepted_account(), FIXED_TS],
+    )
+    .unwrap();
+}
+
+fn delete_segment_id(path: &Path, id: i64) {
+    let conn = Connection::open(path).unwrap();
+    let deleted = conn
+        .execute("DELETE FROM session_chain_segments WHERE id = ?1", [id])
+        .unwrap();
+    assert_eq!(deleted, 1, "fixture did not delete survivor segment {id}");
+}
+
+fn assert_merge_survivor_identity_drift_detected(column: &str) {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let survivor_id = latest_segment_id(&before, "chain-merge-three", "session-merge");
+    drift_merge_survivor_identity(&fixture.state_path, survivor_id, column);
+    let drifted = full_snapshot(&fixture.state_path);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    assert_failure_mentions(
+        &rollback,
+        fixture.dir.path(),
+        "segment merge survivor drift before rollback",
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        drifted,
+        "rollback mutated after survivor {column} drift"
+    );
+}
+
+fn drift_merge_survivor_identity(path: &Path, survivor_id: i64, column: &str) {
+    let conn = Connection::open(path).unwrap();
+    match column {
+        "chain_id" => {
+            seed_chain(&conn, "chain-survivor-drift", &target_model_name());
+            conn.execute(
+                "UPDATE session_chain_segments SET chain_id = 'chain-survivor-drift' WHERE id = ?1",
+                [survivor_id],
+            )
+            .unwrap();
+        }
+        "session_id" => {
+            conn.execute(
+                "UPDATE session_chain_segments SET session_id = 'session-survivor-drift' WHERE id = ?1",
+                [survivor_id],
+            )
+            .unwrap();
+        }
+        other => panic!("unsupported survivor identity drift column {other}"),
+    }
+}
+
 fn seed_mailbox(path: &Path, session_id: &str, cwd: Option<&str>) {
     let mut db = MailboxDb::open(path).unwrap();
     db.upsert_session_runtime(SessionRuntimeUpsert {
@@ -1411,10 +2387,15 @@ fn query_turns(conn: &Connection) -> Vec<TurnSnapshot> {
     } else {
         "NULL"
     };
+    let body_expr = if table_has_column(conn, "session_turns", "body") {
+        "body"
+    } else {
+        "NULL"
+    };
     let mut stmt = conn
         .prepare(&format!(
             "SELECT provider_name, session_id, turn_id, timestamp, role, parent_turn_id,
-                    is_sidechain, is_compaction_boundary, {source_file_expr}, ingested_at, body
+                    is_sidechain, is_compaction_boundary, {source_file_expr}, ingested_at, {body_expr}
              FROM session_turns
               ORDER BY session_id, turn_id, provider_name"
         ))
@@ -1437,6 +2418,290 @@ fn query_turns(conn: &Connection) -> Vec<TurnSnapshot> {
     .unwrap()
     .map(Result::unwrap)
     .collect()
+}
+
+fn full_snapshot(path: &Path) -> FullOwnershipSnapshot {
+    let conn = Connection::open(path).unwrap();
+    FullOwnershipSnapshot {
+        chains: query_chains(&conn),
+        segments: query_segments_with_id(&conn),
+        turns: query_turns_with_id(&conn),
+    }
+}
+
+fn query_segments_with_id(conn: &Connection) -> Vec<SegmentRowSnapshot> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, chain_id, provider_name, session_id, started_at, ended_at, last_turn_id,
+                    transition_reason
+             FROM session_chain_segments
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok(SegmentRowSnapshot {
+            id: row.get(0)?,
+            chain_id: row.get(1)?,
+            provider_name: row.get(2)?,
+            session_id: row.get(3)?,
+            started_at: row.get(4)?,
+            ended_at: row.get(5)?,
+            last_turn_id: row.get(6)?,
+            transition_reason: row.get(7)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+fn query_turns_with_id(conn: &Connection) -> Vec<TurnRowSnapshot> {
+    let source_file_expr = if table_has_column(conn, "session_turns", "source_file") {
+        "source_file"
+    } else {
+        "NULL"
+    };
+    let body_expr = if table_has_column(conn, "session_turns", "body") {
+        "body"
+    } else {
+        "NULL"
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id, provider_name, session_id, turn_id, timestamp, role, parent_turn_id,
+                    is_sidechain, is_compaction_boundary, {source_file_expr}, ingested_at, {body_expr}
+             FROM session_turns
+             ORDER BY id"
+        ))
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok(TurnRowSnapshot {
+            id: row.get(0)?,
+            provider_name: row.get(1)?,
+            session_id: row.get(2)?,
+            turn_id: row.get(3)?,
+            timestamp: row.get(4)?,
+            role: row.get(5)?,
+            parent_turn_id: row.get(6)?,
+            is_sidechain: row.get(7)?,
+            is_compaction_boundary: row.get(8)?,
+            source_file: row.get(9)?,
+            ingested_at: row.get(10)?,
+            body: row.get(11)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+fn assert_zero_collision_counts(conn: &Connection) {
+    let segment_collisions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT chain_id, provider_name, session_id
+                 FROM session_chain_segments
+                 GROUP BY chain_id, provider_name, session_id
+                 HAVING COUNT(*) > 1
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let turn_collisions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM (
+                 SELECT provider_name, session_id, turn_id
+                 FROM session_turns
+                 GROUP BY provider_name, session_id, turn_id
+                 HAVING COUNT(*) > 1
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(segment_collisions, 0, "segment collision groups remain");
+    assert_eq!(turn_collisions, 0, "turn collision groups remain");
+}
+
+fn latest_segment_id(snapshot: &FullOwnershipSnapshot, chain_id: &str, session_id: &str) -> i64 {
+    snapshot
+        .segments
+        .iter()
+        .filter(|segment| segment.chain_id == chain_id && segment.session_id == session_id)
+        .max_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+        .map(|segment| segment.id)
+        .unwrap_or_else(|| panic!("missing segment group {chain_id}/{session_id}"))
+}
+
+fn min_turn_id(snapshot: &FullOwnershipSnapshot, session_id: &str, turn_id: &str) -> i64 {
+    snapshot
+        .turns
+        .iter()
+        .filter(|turn| turn.session_id == session_id && turn.turn_id == turn_id)
+        .map(|turn| turn.id)
+        .min()
+        .unwrap_or_else(|| panic!("missing turn group {session_id}/{turn_id}"))
+}
+
+fn planned_merged_segment_count(
+    snapshot: &FullOwnershipSnapshot,
+    chain_id: &str,
+    session_id: &str,
+) -> i64 {
+    let group_count = snapshot
+        .segments
+        .iter()
+        .filter(|segment| segment.chain_id == chain_id && segment.session_id == session_id)
+        .count();
+    assert!(
+        group_count > 0,
+        "missing segment group {chain_id}/{session_id}"
+    );
+    group_count.saturating_sub(1) as i64
+}
+
+fn planned_dedup_loser_ids(
+    snapshot: &FullOwnershipSnapshot,
+    session_id: &str,
+    turn_ids: &[&str],
+) -> Vec<i64> {
+    let mut loser_ids = Vec::new();
+    for turn_id in turn_ids {
+        let mut group_ids: Vec<_> = snapshot
+            .turns
+            .iter()
+            .filter(|turn| turn.session_id == session_id && turn.turn_id == *turn_id)
+            .map(|turn| turn.id)
+            .collect();
+        assert!(
+            !group_ids.is_empty(),
+            "missing turn group {session_id}/{turn_id}"
+        );
+        group_ids.sort_unstable();
+        loser_ids.extend(group_ids.into_iter().skip(1));
+    }
+    loser_ids
+}
+
+fn assert_preserved_non_dedup_turns_by_id(
+    before: &FullOwnershipSnapshot,
+    after: &FullOwnershipSnapshot,
+    dedup_loser_ids: &[i64],
+) {
+    assert_eq!(
+        before.turns.len() as i64 - after.turns.len() as i64,
+        dedup_loser_ids.len() as i64,
+        "turn row delta must equal only planned dedup losers"
+    );
+    let after_by_id: BTreeMap<_, _> = after.turns.iter().map(|turn| (turn.id, turn)).collect();
+    for before_turn in &before.turns {
+        if dedup_loser_ids.contains(&before_turn.id) {
+            continue;
+        }
+        let after_turn = after_by_id
+            .get(&before_turn.id)
+            .unwrap_or_else(|| panic!("non-dedup turn id {} was dropped", before_turn.id));
+        assert_eq!(after_turn.id, before_turn.id);
+        assert_same_turn_content(after_turn, before_turn);
+    }
+}
+
+fn first_deleted_segment_id(before: &FullOwnershipSnapshot, after: &FullOwnershipSnapshot) -> i64 {
+    before
+        .segments
+        .iter()
+        .find(|segment| {
+            !after
+                .segments
+                .iter()
+                .any(|candidate| candidate.id == segment.id)
+        })
+        .map(|segment| segment.id)
+        .unwrap_or_else(|| panic!("no deleted segment id found"))
+}
+
+fn first_deleted_turn_id(before: &FullOwnershipSnapshot, after: &FullOwnershipSnapshot) -> i64 {
+    before
+        .turns
+        .iter()
+        .find(|turn| !after.turns.iter().any(|candidate| candidate.id == turn.id))
+        .map(|turn| turn.id)
+        .unwrap_or_else(|| panic!("no deleted turn id found"))
+}
+
+fn assert_same_turn_content(actual: &TurnRowSnapshot, expected: &TurnRowSnapshot) {
+    assert_eq!(actual.session_id, expected.session_id);
+    assert_eq!(actual.turn_id, expected.turn_id);
+    assert_eq!(actual.timestamp, expected.timestamp);
+    assert_eq!(actual.role, expected.role);
+    assert_eq!(actual.parent_turn_id, expected.parent_turn_id);
+    assert_eq!(actual.is_sidechain, expected.is_sidechain);
+    assert_eq!(
+        actual.is_compaction_boundary,
+        expected.is_compaction_boundary
+    );
+    assert_eq!(actual.source_file, expected.source_file);
+    assert_eq!(actual.ingested_at, expected.ingested_at);
+    assert_eq!(actual.body, expected.body);
+}
+
+fn assert_large_unrelated_rows_preserved_with_expected_remap(
+    before: &FullOwnershipSnapshot,
+    after: &FullOwnershipSnapshot,
+) {
+    let before_chain = before
+        .chains
+        .get("chain-large-unrelated")
+        .unwrap_or_else(|| panic!("missing unrelated chain before migration"));
+    let after_chain = after
+        .chains
+        .get("chain-large-unrelated")
+        .unwrap_or_else(|| panic!("missing unrelated chain after migration"));
+    assert_eq!(after_chain.model_name, target_model_name());
+    assert_eq!(after_chain.created_at, before_chain.created_at);
+    assert_eq!(after_chain.last_used_at, before_chain.last_used_at);
+
+    let before_segment = before
+        .segments
+        .iter()
+        .find(|segment| {
+            segment.chain_id == "chain-large-unrelated"
+                && segment.session_id == "session-large-unrelated"
+        })
+        .unwrap_or_else(|| panic!("missing unrelated segment before migration"));
+    let after_segment = after
+        .segments
+        .iter()
+        .find(|segment| segment.id == before_segment.id)
+        .unwrap_or_else(|| panic!("unrelated segment id {} was dropped", before_segment.id));
+    assert_eq!(after_segment.provider_name, canonical_account());
+    assert_eq!(after_segment.chain_id, before_segment.chain_id);
+    assert_eq!(after_segment.session_id, before_segment.session_id);
+    assert_eq!(after_segment.started_at, before_segment.started_at);
+    assert_eq!(after_segment.ended_at, before_segment.ended_at);
+    assert_eq!(after_segment.last_turn_id, before_segment.last_turn_id);
+    assert_eq!(
+        after_segment.transition_reason,
+        before_segment.transition_reason
+    );
+
+    let before_turn = before
+        .turns
+        .iter()
+        .find(|turn| turn.turn_id == "turn-large-unrelated")
+        .unwrap_or_else(|| panic!("missing unrelated turn before migration"));
+    let after_turn = after
+        .turns
+        .iter()
+        .find(|turn| turn.id == before_turn.id)
+        .unwrap_or_else(|| panic!("unrelated turn id {} was dropped", before_turn.id));
+    assert_eq!(after_turn.provider_name, canonical_account());
+    assert_same_turn_content(after_turn, before_turn);
 }
 
 fn assert_preserved_non_owned_segment_fields(
@@ -1722,6 +2987,28 @@ fn assert_report_truthy(report: &str, context: &[&str], key: &str) {
     );
 }
 
+fn assert_report_truthy_or_zero(report: &str, key: &str) {
+    let normalized_key = normalize_report_text(key);
+    let line = report
+        .lines()
+        .find(|line| normalize_report_text(line).contains(&normalized_key))
+        .unwrap_or_else(|| panic!("report missing {key}: {report}"));
+    let value = line
+        .split_once(':')
+        .or_else(|| line.split_once('='))
+        .map(|(_, value)| value)
+        .unwrap_or(line);
+    let normalized_value = normalize_report_text(value);
+    let truthy = normalized_value
+        .split_whitespace()
+        .any(|part| part == "true" || part == "yes");
+    let zero = extract_last_i64(value) == Some(0);
+    assert!(
+        truthy || zero,
+        "report field {key} was not truthy/zero: {line}\n{report}"
+    );
+}
+
 fn report_context_count(report: &str, context: &[&str], key: &str) -> Option<i64> {
     report_context_line(report, context, key).and_then(extract_last_i64)
 }
@@ -1844,6 +3131,23 @@ fn assert_failure_mentions(output: &Output, scratch_dir: &Path, needle: &str) {
     assert!(
         combined.contains(needle),
         "failure did not mention {needle}: {combined}"
+    );
+}
+
+fn assert_failure_does_not_mention(output: &Output, scratch_dir: &Path, needle: &str) {
+    let combined = combined_output(output) + &read_report_if_present(scratch_dir);
+    assert!(
+        !combined.contains(needle),
+        "failure unexpectedly mentioned {needle}: {combined}"
+    );
+}
+
+fn assert_failure_mentions_survivor_missing_or_absent(output: &Output, scratch_dir: &Path) {
+    let combined = combined_output(output) + &read_report_if_present(scratch_dir);
+    assert!(
+        combined.contains("survivor")
+            && (combined.contains("missing") || combined.contains("absent")),
+        "failure did not mention survivor missing/absent: {combined}"
     );
 }
 

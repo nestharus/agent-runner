@@ -4446,3 +4446,59 @@ are authoritatively supplied and verified by the manager. Recorded for the audit
 Both fixes restore "full-workspace-green by repairing the two architecture-guard regressions the narrow
 pipeline gate let through." Each is a <15-line localized fix to existing code with the correct pattern
 nearby. The multi-concern judgment treats this as a single regression-recovery unit; no SPLIT.
+
+## D-S11-M2c-v2-001 — Linear gap (manager Option B): proceed without a ticket
+- **Source**: S11-M2c v2 dispatch (manager-max). `LINEAR_API_KEY` is unavailable to spooled jobs.
+- **Decision**: Proceed with NO Linear/ticket-operator step. `wu_brief_path`
+  (`planning/s11-m2c-collision-resolution/brief-v2.md`) is the source of truth. Open the draft PR on
+  base `main`; the manager creates+links the NES ticket out-of-band after Phase 9. Intended title:
+  "S11-M2c: lossless collision resolution — fix 4 Phase-8 correctness findings".
+- **Evidence**: session.json `ticket_system=none`; this WU opens a FRESH draft PR (prior #191 closed).
+- **Revisit when**: a ticket key becomes available; the manager links it post-merge.
+
+## D-S11-M2c-v2-002 — Proportionate v2 pipeline for a 4-finding correctness-hardening continuation
+- **Source**: S11-M2c v2 dispatch; `skip_problem_map_gate=true`; the collision design + 30 migration
+  tests already shipped and Phase 4 PASSed in v1.
+- **Decision**: Run a proportionate continuation pipeline: Phase 0 (verify the EXISTING worktree, no
+  recreate) -> Phase 6a (orchestrator-authored contract delta F1–F4 + T15–T18) -> Phase 6b (dispatched
+  test-writer, separate invocation) -> Phase 6 alignment (dispatched) -> Phase 6c (dispatched
+  code-writer, distinct invocation) -> Phase 8 (dispatched FULL `cargo test --workspace` proof + clippy
+  + tsc + token-delta-0 + scope-clean) -> Phase 9 (dispatched pr-writer + fresh draft PR base `main`).
+- **Rationale**: The 4 findings are guard/probe hardening WITHIN the approved, unchanged design
+  (file:line precise in brief-v2). Re-running Phase 2.5 research + Phase 3 proposal + Phase 4 risk gate
+  would rebuild ceremony the manager already approved; brief-v2 IS the approved scoped-change spec. The
+  findings strictly tighten fail-closed behavior (reduce risk), add no new design surface, and preserve
+  the v1 Phase 4 PASS rationale (destructive-live-migration residual already accepted + further
+  mitigated).
+- **Invariants preserved**: the orchestrator writes no source/test code and runs no builds itself;
+  every code change + all verification is performed by dispatched `agents` sub-agents; Phase 6b/6c are
+  SEPARATE invocations with distinct UUIDs (6b never sees the fix; 6c reads tests + output index); risk
+  is evaluated against the contract delta, not the diff. The three process-tree audits fold to the v1
+  M2b-precedent consolidated shape (the orchestrator is not spawned under an `agents` parent, so there
+  is no root trace tree to audit).
+- **Revisit when**: a finding turns out to need new design surface (then re-enter Phase 3).
+
+## D-S11-M2c-v2-003 — The 4 Phase-8 correctness fixes (scope = EXACTLY these)
+- **F1 (rollback fail-closed on missing survivor)**: the `segment merge survivor drift before rollback`
+  probe inner-`JOIN`s preimage -> `session_chain_segments`, so a DELETED survivor yields no drift row
+  and rollback reinserts/commits before noticing. Fix: add a fail-closed existence (`NOT EXISTS` /
+  anti-join) probe that aborts before any rollback mutation. (`sql.rs` ~247-260.)
+- **F2 (survivor identity drift)**: the survivor drift probe must also compare `chain_id` and
+  `session_id` (merge does not change them, so expected == preimage `p.chain_id`/`p.session_id`);
+  currently only provider/started_at/ended_at/last_turn_id/transition_reason are compared, so identity
+  drift is silently overwritten by rollback. (`sql.rs` ~247-260.)
+- **F3 (forward stale segment-merge guard)**: `forward.sql` must revalidate stale segment-merge
+  survivor + loser plan rows in-transaction (mirroring the turn-dedup `INSERT OR ROLLBACK` guard),
+  aborting the whole `BEGIN IMMEDIATE` on mismatch. Today only turn-dedup content is guarded; segment
+  plan rows (`s11_wu4_segment_merge_deletes` / `s11_wu4_segment_merge_groups`) are not.
+  (`forward.sql` ~263-288 / ~370-394.)
+- **F4 (turn loser planned-old-provider guard)**: `TurnDedupDelete` must record the planned OLD
+  provider name and the forward guard must match the loser's `provider_name` against it before
+  deleting, so a loser whose provider changed to a third provider with the same content tuple is not
+  wrongly deleted. (`classifier.rs` ~51-57; `forward.sql` ~270-288.)
+- **Tests**: T15 (F1 deleted-survivor -> rollback aborts), T16 (F2 chain_id/session_id drift detected),
+  T17 (F3 stale segment plan -> forward aborts), T18 (F4 loser provider changed -> forward aborts, no
+  wrong-provider delete). The existing 30 tests stay green. Synthetic fixtures ONLY.
+- **Anti-scope (unchanged from brief.md)**: no in-tree reader deletion (WU5); no behavior change to
+  non-colliding chains; no fail-open; lossless-only dedup with abort-on-divergence; zero new lowercase
+  provider-token literals (token delta 0).

@@ -1,7 +1,7 @@
 //! Declared roles: accessor, mapper, validator, predicate
 
-use super::DryRunError;
 use super::preflight::{self, IntegrityReport};
+use super::DryRunError;
 use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -35,6 +35,8 @@ pub(crate) struct LiveApplyVerification {
     pub(crate) planned: BTreeMap<String, i64>,
     pub(crate) applied: BTreeMap<String, i64>,
     pub(crate) residual_old_owned_rows: i64,
+    pub(crate) segment_collision_count: i64,
+    pub(crate) turn_collision_count: i64,
     pub(crate) preimage_rows: i64,
 }
 
@@ -52,10 +54,15 @@ struct DriftProbeResult {
 }
 
 pub(crate) fn apply_forward(conn: &Connection) -> Result<ForwardCounts, DryRunError> {
-    conn.execute_batch(FORWARD_SQL)?;
-    Ok(ForwardCounts {
-        counts: read_key_counts(conn, "s11_wu4_last_run_counts")?,
-    })
+    match conn.execute_batch(FORWARD_SQL) {
+        Ok(()) => Ok(ForwardCounts {
+            counts: read_key_counts(conn, "s11_wu4_last_run_counts")?,
+        }),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err.into())
+        }
+    }
 }
 
 pub(crate) fn apply_forward_live(conn: &Connection) -> Result<ForwardCounts, DryRunError> {
@@ -63,8 +70,14 @@ pub(crate) fn apply_forward_live(conn: &Connection) -> Result<ForwardCounts, Dry
         Ok(()) => Ok(ForwardCounts {
             counts: read_key_counts(conn, "s11_wu4_last_run_counts")?,
         }),
-        Err(err) if is_busy_or_locked(&err) => Err(live_busy_error()),
-        Err(err) => Err(err.into()),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if is_busy_or_locked(&err) {
+                Err(live_busy_error())
+            } else {
+                Err(err.into())
+            }
+        }
     }
 }
 
@@ -113,6 +126,13 @@ pub(crate) fn verify_live_apply(
             "post-apply verification failed: residual old-owned rows: {residual_old_owned_rows}"
         )));
     }
+    let segment_collision_count = segment_collision_count(conn)?;
+    let turn_collision_count = turn_collision_count(conn)?;
+    if segment_collision_count != 0 || turn_collision_count != 0 {
+        return Err(DryRunError::new(format!(
+            "post-apply verification failed: remaining collisions: segments={segment_collision_count}, turns={turn_collision_count}"
+        )));
+    }
     let preimage_rows = preimage_row_count(conn)?;
     if preimage_rows == 0 {
         return Err(DryRunError::new(
@@ -124,6 +144,8 @@ pub(crate) fn verify_live_apply(
         planned,
         applied,
         residual_old_owned_rows,
+        segment_collision_count,
+        turn_collision_count,
         preimage_rows,
     })
 }
@@ -179,8 +201,8 @@ fn read_rollback_drift(conn: &Connection) -> Result<Vec<DriftProbeResult>, DryRu
         .collect()
 }
 
-fn rollback_drift_probes() -> [(&'static str, &'static str); 3] {
-    [
+fn rollback_drift_probes() -> Vec<(&'static str, &'static str)> {
+    vec![
         (
             "chain drift before rollback",
             "SELECT EXISTS(
@@ -203,6 +225,86 @@ fn rollback_drift_probes() -> [(&'static str, &'static str); 3] {
                 SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
                 JOIN session_turns t ON t.id = p.turn_row_id
                 WHERE p.entity_kind = 'turn' AND t.provider_name <> p.new_provider_name
+             )",
+        ),
+        (
+            "deleted segment id drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                JOIN session_chain_segments s ON s.id = p.segment_id
+                WHERE p.entity_kind = 'segment_delete'
+             )",
+        ),
+        (
+            "deleted turn id drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                JOIN session_turns t ON t.id = p.turn_row_id
+                WHERE p.entity_kind = 'turn_delete'
+             )",
+        ),
+        (
+            "segment merge survivor drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                JOIN session_chain_segments s ON s.id = p.segment_id
+                WHERE p.entity_kind = 'segment_merge_survivor'
+                  AND (
+                       NOT (s.chain_id IS p.chain_id)
+                    OR s.provider_name <> p.new_provider_name
+                    OR NOT (s.session_id IS p.session_id)
+                    OR NOT (s.started_at IS p.new_started_at)
+                    OR NOT (s.ended_at IS p.new_ended_at)
+                    OR NOT (s.last_turn_id IS p.new_last_turn_id)
+                    OR NOT (s.transition_reason IS p.new_transition_reason)
+                  )
+             )",
+        ),
+        (
+            "segment merge survivor missing before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                WHERE p.entity_kind = 'segment_merge_survivor'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_chain_segments s WHERE s.id = p.segment_id
+                  )
+             )",
+        ),
+        (
+            "segment full-row preimage drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                WHERE p.entity_kind IN ('segment_delete', 'segment_merge_survivor')
+                  AND (
+                         p.segment_id IS NULL
+                      OR p.chain_id IS NULL
+                      OR p.old_provider_name IS NULL
+                      OR p.session_id IS NULL
+                      OR p.segment_started_at IS NULL
+                      OR p.segment_transition_reason IS NULL
+                      OR (p.entity_kind = 'segment_merge_survivor'
+                          AND (p.new_provider_name IS NULL
+                               OR p.new_started_at IS NULL
+                               OR p.new_transition_reason IS NULL))
+                  )
+             )",
+        ),
+        (
+            "turn full-row preimage drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                WHERE p.entity_kind = 'turn_delete'
+                  AND (
+                         p.turn_row_id IS NULL
+                      OR p.old_provider_name IS NULL
+                      OR p.session_id IS NULL
+                      OR p.turn_id IS NULL
+                      OR p.turn_timestamp IS NULL
+                      OR p.turn_role IS NULL
+                      OR p.turn_is_sidechain IS NULL
+                      OR p.turn_is_compaction_boundary IS NULL
+                      OR p.turn_ingested_at IS NULL
+                  )
              )",
         ),
     ]
@@ -231,6 +333,18 @@ fn mismatch_count_rows(conn: &Connection) -> Result<Vec<(&'static str, i64)>, Dr
         ("chain_mismatch", read_chain_mismatch_count(conn)?),
         ("segment_mismatch", read_segment_mismatch_count(conn)?),
         ("turn_mismatch", read_turn_mismatch_count(conn)?),
+        (
+            "segment_delete_mismatch",
+            read_segment_delete_mismatch_count(conn)?,
+        ),
+        (
+            "turn_delete_mismatch",
+            read_turn_delete_mismatch_count(conn)?,
+        ),
+        (
+            "segment_merge_survivor_mismatch",
+            read_segment_merge_survivor_mismatch_count(conn)?,
+        ),
     ])
 }
 
@@ -279,6 +393,9 @@ fn planned_apply_counts(forward: &ForwardCounts) -> BTreeMap<String, i64> {
         "chain_model_updates_to_apply",
         "segment_provider_updates_to_apply",
         "turn_provider_updates_to_apply",
+        "segment_rows_merged_away",
+        "turn_rows_deduped_away",
+        "segment_merge_survivors_updated",
     ]
     .into_iter()
     .map(|key| (key.to_string(), *forward.counts.get(key).unwrap_or(&0)))
@@ -298,6 +415,18 @@ fn applied_apply_counts(conn: &Connection) -> Result<BTreeMap<String, i64>, DryR
         (
             "turn_provider_updates_to_apply".to_string(),
             applied_turn_count(conn)?,
+        ),
+        (
+            "segment_rows_merged_away".to_string(),
+            applied_segment_delete_count(conn)?,
+        ),
+        (
+            "turn_rows_deduped_away".to_string(),
+            applied_turn_delete_count(conn)?,
+        ),
+        (
+            "segment_merge_survivors_updated".to_string(),
+            applied_segment_merge_survivor_count(conn)?,
         ),
     ]))
 }
@@ -407,6 +536,34 @@ fn residual_turn_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> 
     .map_err(Into::into)
 }
 
+fn segment_collision_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT chain_id, provider_name, session_id
+             FROM session_chain_segments
+             GROUP BY chain_id, provider_name, session_id
+             HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn turn_collision_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM (
+             SELECT provider_name, session_id, turn_id
+             FROM session_turns
+             GROUP BY provider_name, session_id, turn_id
+             HAVING COUNT(*) > 1
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 fn preimage_row_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*) FROM s11_wu4_restore_session_ownership_preimage",
@@ -449,6 +606,119 @@ fn read_turn_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
         "SELECT COUNT(*) FROM s11_wu4_restore_session_ownership_preimage p
          JOIN session_turns t ON t.id = p.turn_row_id
          WHERE p.entity_kind = 'turn' AND t.provider_name <> p.old_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn applied_segment_delete_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         LEFT JOIN session_chain_segments s ON s.id = p.segment_id
+         WHERE p.entity_kind = 'segment_delete'
+           AND s.id IS NULL",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn applied_turn_delete_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         LEFT JOIN session_turns t ON t.id = p.turn_row_id
+         WHERE p.entity_kind = 'turn_delete'
+           AND t.id IS NULL",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn applied_segment_merge_survivor_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         JOIN session_chain_segments s ON s.id = p.segment_id
+         WHERE p.entity_kind = 'segment_merge_survivor'
+           AND s.provider_name = p.new_provider_name
+           AND s.started_at IS p.new_started_at
+           AND s.ended_at IS p.new_ended_at
+           AND s.last_turn_id IS p.new_last_turn_id
+           AND s.transition_reason IS p.new_transition_reason",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn read_segment_delete_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         LEFT JOIN session_chain_segments s ON s.id = p.segment_id
+         WHERE p.entity_kind = 'segment_delete'
+           AND (
+                s.id IS NULL
+             OR s.chain_id <> p.chain_id
+             OR s.provider_name <> p.old_provider_name
+             OR s.session_id <> p.session_id
+             OR s.started_at <> p.segment_started_at
+             OR NOT (s.ended_at IS p.segment_ended_at)
+             OR NOT (s.last_turn_id IS p.segment_last_turn_id)
+             OR s.transition_reason <> p.segment_transition_reason
+           )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn read_turn_delete_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         LEFT JOIN session_turns t ON t.id = p.turn_row_id
+         WHERE p.entity_kind = 'turn_delete'
+           AND (
+                t.id IS NULL
+             OR t.provider_name <> p.old_provider_name
+             OR t.session_id <> p.session_id
+             OR t.turn_id <> p.turn_id
+             OR t.timestamp <> p.turn_timestamp
+             OR t.role <> p.turn_role
+             OR NOT (t.parent_turn_id IS p.turn_parent_turn_id)
+             OR t.is_sidechain <> p.turn_is_sidechain
+             OR t.is_compaction_boundary <> p.turn_is_compaction_boundary
+             OR NOT (t.source_file IS p.turn_source_file)
+             OR t.ingested_at <> p.turn_ingested_at
+             OR NOT (t.body IS p.turn_body)
+           )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn read_segment_merge_survivor_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         LEFT JOIN session_chain_segments s ON s.id = p.segment_id
+         WHERE p.entity_kind = 'segment_merge_survivor'
+           AND (
+                s.id IS NULL
+             OR s.chain_id <> p.chain_id
+             OR s.provider_name <> p.old_provider_name
+             OR s.session_id <> p.session_id
+             OR s.started_at <> p.segment_started_at
+             OR NOT (s.ended_at IS p.segment_ended_at)
+             OR NOT (s.last_turn_id IS p.segment_last_turn_id)
+             OR s.transition_reason <> p.segment_transition_reason
+           )",
         [],
         |row| row.get(0),
     )
@@ -568,5 +838,304 @@ impl<T> OptionalRow<T> for Result<T, rusqlite::Error> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::migrate::session_ownership::{classifier, target_resolution};
+    use oulipoly_state::StateDb;
+    use rusqlite::params;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+
+    const FIXED_TS: &str = "2026-06-20T10:00:00Z";
+
+    #[test]
+    fn session_ownership_sql_stale_turn_dedup_plan_rolls_back_whole_forward_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let mut conn = Connection::open(&state_path).unwrap();
+        seed_byte_identical_turn_collision(&conn);
+
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        let loser_id = candidates.turn_dedup_deletes[0].loser_turn_row_id;
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_turns SET body = 'stale-plan-body' WHERE id = ?1",
+            [loser_id],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("stale plan must fail closed");
+
+        assert!(
+            err.to_string().contains("s11_wu4_forward_guard") || err.to_string().contains("UNIQUE"),
+            "unexpected stale-plan error: {err}"
+        );
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
+    #[test]
+    fn session_ownership_sql_stale_segment_merge_plan_rolls_back_whole_forward_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let mut conn = Connection::open(&state_path).unwrap();
+        seed_segment_merge_collision(&conn);
+
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.segment_rows_merged_away, 1);
+        assert_eq!(candidates.segment_merge_survivors_updated, 1);
+        let loser_id = candidates.segment_merge_deletes[0].segment_id;
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_chain_segments SET started_at = '2026-06-20T11:00:00Z' WHERE id = ?1",
+            [loser_id],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("stale segment plan must fail closed");
+
+        assert_forward_guard_error(&err);
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
+    #[test]
+    fn session_ownership_sql_turn_dedup_loser_provider_drift_rolls_back_whole_forward_transaction()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let mut conn = Connection::open(&state_path).unwrap();
+        seed_byte_identical_turn_collision(&conn);
+
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        let loser_id = candidates.turn_dedup_deletes[0].loser_turn_row_id;
+        let third_provider = "acct-third-neutral";
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_turns SET provider_name = ?1 WHERE id = ?2",
+            params![third_provider, loser_id],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("provider-drifted loser must fail closed");
+
+        assert_forward_guard_error(&err);
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(turn_row_exists_with_provider(
+            &conn,
+            loser_id,
+            third_provider
+        ));
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
+    fn write_target_config(models_dir: &Path) {
+        let token = moved_provider_token();
+        let target_binary = format!("agent-runner-{token}");
+        let model_name = format!("target-{token}");
+        let canonical = format!("acct-main-{token}");
+        let accepted = format!("acct-accepted-{token}");
+        fs::write(
+            models_dir.join(format!("{model_name}.toml")),
+            format!(
+                "provider = {{ binary = {target_binary:?} }}\n\n[[providers]]\nname = {canonical:?}\nargs = []\n\n[[providers]]\nname = {accepted:?}\nargs = []\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            models_dir.parent().unwrap().join("providers.toml"),
+            format!(
+                "[{canonical}]\ncommand = \"/bin/true\"\nargs = []\nprompt_mode = \"arg\"\n\n[{accepted}]\ncommand = \"/bin/true\"\nargs = []\nprompt_mode = \"arg\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn seed_byte_identical_turn_collision(conn: &Connection) {
+        let token = moved_provider_token();
+        let source_model = format!("legacy-{token}-model");
+        let canonical = format!("acct-main-{token}");
+        let unregistered = format!("acct-unreg-{token}");
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES ('chain-stale-plan', ?1, ?1, ?2)",
+            params![FIXED_TS, source_model],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+             (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+             VALUES ('chain-stale-plan', ?1, 'session-stale', ?2, ?2, 'turn-stale', 'manual')",
+            params![unregistered, FIXED_TS],
+        )
+        .unwrap();
+        for provider in [unregistered, canonical] {
+            conn.execute(
+                "INSERT INTO session_turns
+                 (provider_name, session_id, turn_id, timestamp, role, parent_turn_id,
+                  is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+                 VALUES (?1, 'session-stale', 'turn-stale', ?2, 'assistant', 'parent',
+                         1, 0, 'stale.jsonl', ?2, 'identical-body')",
+                params![provider, FIXED_TS],
+            )
+            .unwrap();
+        }
+    }
+
+    fn seed_segment_merge_collision(conn: &Connection) {
+        let token = moved_provider_token();
+        let source_model = format!("legacy-{token}-model");
+        let canonical = format!("acct-main-{token}");
+        let unregistered = format!("acct-unreg-{token}");
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES ('chain-segment-stale-plan', ?1, ?1, ?2)",
+            params![FIXED_TS, source_model],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+             (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+             VALUES ('chain-segment-stale-plan', ?1, 'session-segment-stale', ?2, ?2, 'turn-earlier', 'manual')",
+            params![unregistered, FIXED_TS],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+             (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+             VALUES ('chain-segment-stale-plan', ?1, 'session-segment-stale', '2026-06-20T10:05:00Z', NULL, 'turn-latest', 'quota_threshold')",
+            params![canonical],
+        )
+        .unwrap();
+    }
+
+    fn assert_forward_guard_error(err: &DryRunError) {
+        assert!(
+            err.to_string().contains("s11_wu4_forward_guard") || err.to_string().contains("UNIQUE"),
+            "unexpected stale-plan error: {err}"
+        );
+    }
+
+    fn turn_row_exists_with_provider(conn: &Connection, id: i64, provider_name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_turns WHERE id = ?1 AND provider_name = ?2)",
+            params![id, provider_name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn full_db_snapshot(conn: &Connection) -> BTreeMap<String, Vec<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let table_names = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        table_names
+            .into_iter()
+            .map(|table| {
+                let rows = snapshot_table(conn, &table);
+                (table, rows)
+            })
+            .collect()
+    }
+
+    fn snapshot_table(conn: &Connection, table: &str) -> Vec<String> {
+        let columns = table_columns(conn, table);
+        let mut parts = vec!["'rowid=' || quote(rowid)".to_string()];
+        parts.extend(columns.iter().map(|column| {
+            format!(
+                "{} || quote({})",
+                quote(format!("|{column}=").as_str()),
+                quote_ident(column)
+            )
+        }));
+        let sql = format!(
+            "SELECT {} FROM {} ORDER BY rowid",
+            parts.join(" || "),
+            quote_ident(table)
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+        let sql = format!("PRAGMA table_info({})", quote_ident(table));
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    fn quote_ident(value: &str) -> String {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn moved_provider_token() -> String {
+        ["cla", "ude"].concat()
     }
 }
