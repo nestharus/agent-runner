@@ -53,7 +53,7 @@
 //!       - model_provider_names
 //! ```
 
-use oulipoly_runtime::session_replace;
+use oulipoly_runtime::{session_external_provider, session_replace};
 
 use crate::cli::inputs::{TopLevelResumePromptSource, resolve_top_level_resume_prompt_source};
 use crate::resume_cli::format_resume_error;
@@ -93,6 +93,10 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     }
 
     let agent_runtime_services = wiring::AgentRuntimeServices::cli_defaults();
+
+    if let Err(err) = recover_pending_provider_owned_session_replaces(&agent_runtime_services) {
+        return Ok(handle_pending_session_replace_error(&err));
+    }
 
     if cli.usage {
         return run_usage_command(&cli, &agent_runtime_services);
@@ -138,6 +142,14 @@ fn recover_pending_session_replaces() -> Result<(), session_replace::ReplaceErro
 fn handle_pending_session_replace_error(err: &session_replace::ReplaceError) -> i32 {
     emit_pending_session_replace_error(err);
     pending_session_replace_exit_code(err)
+}
+
+fn recover_pending_provider_owned_session_replaces(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+) -> Result<(), session_replace::ReplaceError> {
+    session_external_provider::recover_pending_provider_owned_replaces(
+        agent_runtime_services.provider_registry_handle.clone(),
+    )
 }
 
 fn emit_pending_session_replace_error(err: &session_replace::ReplaceError) {

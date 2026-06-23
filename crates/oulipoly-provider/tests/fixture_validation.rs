@@ -63,6 +63,35 @@ fn launch_request_and_event_fixtures_validate_against_schema_targets() {
 }
 
 #[test]
+fn session_replace_provider_owned_and_legacy_success_fixtures_validate() {
+    let fixtures = fixtures();
+    let provider_owned = non_launch_fixture(&fixtures, "session.replace", "success_response");
+    let legacy = non_launch_fixture(&fixtures, "session.replace", "legacy_success_response");
+
+    validate_against_def("session", "SessionReplaceResponse", provider_owned);
+    validate_against_def("session", "SessionReplaceResponse", legacy);
+}
+
+#[test]
+fn session_replace_provider_owned_request_fixture_has_no_host_observed_preimage() {
+    let fixtures = fixtures();
+    let request = non_launch_fixture(&fixtures, "session.replace", "request");
+    let params = request.get("params").expect("replace params");
+
+    validate_against_def("session", "SessionReplaceRequest", request);
+    assert_eq!(
+        params.get("replace_protocol"),
+        Some(&json!("oulipoly.provider_owned_replace/v1"))
+    );
+    assert!(params.get("canonical_transcript").is_some());
+    assert!(params.get("preimage_sha256_expected").is_some());
+    assert!(
+        params.get("preimage_sha256").is_none(),
+        "provider-owned request must not include a host-observed preimage hash"
+    );
+}
+
+#[test]
 fn policy_response_schema_permits_absent_empty_argv_and_env() {
     let response = json!({
         "contract": "oulipoly.provider/v1",

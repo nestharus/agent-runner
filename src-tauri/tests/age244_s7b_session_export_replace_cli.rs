@@ -2,11 +2,14 @@
 
 mod fixtures;
 
+use base64::Engine;
 use fixtures::initiative_06_export::{ExportFixture, SESSION_A};
 use fixtures::initiative_06_import_replace::{
     CHAIN_A as REPLACE_CHAIN_A, ImportReplaceFixture, MODEL, canonical_jsonl,
 };
+use oulipoly_runtime::session_replace::ReplaceReceipt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -84,6 +87,78 @@ fn import_replace_cli_external_provider_model_reaches_session_replace_dispatch_w
     assert_eq!(request["params"]["model_name"], MODEL);
     let transcript = fs::read_to_string(&prepared.jsonl_path).unwrap();
     assert!(!transcript.contains("external-cli user"), "{transcript}");
+}
+
+#[test]
+fn import_replace_cli_provider_owned_success_uses_receipt_evidence_without_local_native_transcript()
+{
+    let prepared = external_replace_fixture("replace_provider_owned_success");
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        EXTERNAL_PROVIDER,
+        &prepared.jsonl_path,
+        "external-cli-owned",
+    );
+    let canonical_hash = sha256_hex(input.as_bytes());
+    fs::remove_file(&prepared.jsonl_path).unwrap();
+
+    let output = prepared.fixture.run_import_replace(
+        &prepared.session_id,
+        &input,
+        &["--preimage-sha256", &provider_owned_preimage_sha256()],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let receipt: ReplaceReceipt = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt.preimage_sha256, provider_owned_preimage_sha256());
+    assert_eq!(receipt.postimage_sha256, canonical_hash);
+    assert_eq!(
+        receipt.jsonl_path,
+        PathBuf::from(provider_owned_source_id())
+    );
+    assert!(!prepared.jsonl_path.exists());
+    let records = provider_records(&prepared.record_path);
+    assert_subcommand_count(&records, "describe", 1);
+    assert_subcommand_count(&records, "session.replace", 1);
+    assert_provider_owned_request_shape(request_for(&records, "session.replace"), input.as_bytes());
+    assert_provider_request_excludes_host_apply_authority(request_for(&records, "session.replace"));
+}
+
+#[test]
+fn import_replace_cli_provider_owned_protocol_failure_does_not_use_builtin_apply() {
+    let prepared = external_replace_fixture("replace_missing_operation_id");
+    let input = canonical_jsonl(
+        &prepared.session_id,
+        EXTERNAL_PROVIDER,
+        &prepared.jsonl_path,
+        "external-cli-failure",
+    );
+    let before = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        EXTERNAL_PROVIDER,
+        &prepared.session_id,
+    );
+
+    let output = prepared
+        .fixture
+        .run_import_replace(&prepared.session_id, &input, &[]);
+
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing_operation_id"), "{stderr}");
+    assert_eq!(
+        prepared.fixture.mutation_snapshot(
+            &prepared.jsonl_path,
+            EXTERNAL_PROVIDER,
+            &prepared.session_id
+        ),
+        before
+    );
+    let records = provider_records(&prepared.record_path);
+    assert_subcommand_count(&records, "session.replace", 1);
+    assert_provider_request_excludes_host_apply_authority(request_for(&records, "session.replace"));
 }
 
 #[test]
@@ -387,7 +462,54 @@ def replace_result():
     params = request.get("params", {{}})
     if MODE == "replace_provider_error":
         return error("provider_replace_failed")
-    data = base64.b64decode(params.get("data_base64", ""))
+    transcript_param = params.get("canonical_transcript", {{}})
+    data = base64.b64decode(transcript_param.get("data_base64") or params.get("data_base64", ""))
+    canonical_hash = hashlib.sha256(data).hexdigest()
+    operation_id = params.get("operation_id", "{operation_id}")
+    recovery_id = "{recovery_id}"
+    provider_preimage = "{preimage_sha256}"
+    source_id = "{source_id}"
+    provider_plan = {{
+        "schema_version": 2,
+        "operation": "session.replace",
+        "replace_protocol": "{replace_protocol}",
+        "operation_id": operation_id,
+        "recovery_id": recovery_id,
+        "session_id": params.get("session_id"),
+        "provider_name": params.get("provider_name"),
+        "canonical_format": "oulipoly.canonical_transcript/v1",
+        "input_sha256": canonical_hash,
+        "postimage_sha256": canonical_hash,
+        "preimage_sha256_observed": provider_preimage,
+        "turn_count": len([line for line in data.splitlines() if line.strip()]),
+        "db_apply": "replace_session_turns_from_canonical_v1",
+        "source_id": source_id,
+        "last_turn_id": "external-cli-owned-turn-2",
+        "last_used_at": "2026-04-17T09:00:01Z",
+    }}
+    provider_owned_result = {{
+        "changed": True,
+        "operation_id": operation_id,
+        "recovery_id": recovery_id,
+        "operation_state": "atomic_committed",
+        "preimage_sha256_observed": provider_preimage,
+        "postimage_sha256": canonical_hash,
+        "canonical_postimage": {{
+            "format_id": "oulipoly.canonical_transcript/v1",
+            "sha256": canonical_hash,
+            "turn_count": len([line for line in data.splitlines() if line.strip()]),
+            "source_id": source_id,
+            "data_base64": base64.b64encode(data).decode("ascii"),
+        }},
+        "artifacts": [],
+        "host_state_plan": provider_plan,
+    }}
+    if MODE == "replace_provider_owned_success":
+        return envelope(provider_owned_result)
+    if MODE == "replace_missing_operation_id":
+        broken = dict(provider_owned_result)
+        broken.pop("operation_id", None)
+        return envelope(broken)
     native_data = native_bytes_from_canonical(data)
     transcript = pathlib.Path({transcript_path})
     transcript.write_bytes(native_data)
@@ -428,6 +550,11 @@ print(json.dumps(response))
         transcript_path = serde_json::to_string(&transcript_path.display().to_string()).unwrap(),
         provider_name = EXTERNAL_PROVIDER,
         native_storage_kind = native_storage_kind(),
+        replace_protocol = provider_owned_replace_protocol(),
+        operation_id = provider_owned_operation_id(),
+        recovery_id = provider_owned_recovery_id(),
+        preimage_sha256 = provider_owned_preimage_sha256(),
+        source_id = provider_owned_source_id(),
     )
 }
 
@@ -475,4 +602,81 @@ fn request_for<'a>(records: &'a [Value], subcommand: &str) -> &'a Value {
         .iter()
         .find(|record| record["subcommand"] == subcommand)
         .unwrap()["request"]
+}
+
+fn assert_provider_owned_request_shape(request: &Value, canonical_bytes: &[u8]) {
+    let params = &request["params"];
+    assert_eq!(
+        params["replace_protocol"],
+        provider_owned_replace_protocol()
+    );
+    assert_eq!(params["operation_id"], provider_owned_operation_id());
+    assert!(
+        params.get("operation_mode").is_none(),
+        "initial provider-owned replace must not be a recovery request: {params}"
+    );
+    assert!(
+        params.get("recovery_action").is_none(),
+        "initial provider-owned replace must not carry recovery action: {params}"
+    );
+    assert_eq!(params["canonical_transcript"]["kind"], "bytes");
+    assert_eq!(
+        params["canonical_transcript"]["data_base64"],
+        base64::engine::general_purpose::STANDARD.encode(canonical_bytes)
+    );
+    assert_eq!(
+        params["canonical_transcript"]["sha256"],
+        sha256_hex(canonical_bytes)
+    );
+    assert_eq!(
+        params["preimage_sha256_expected"],
+        provider_owned_preimage_sha256()
+    );
+    assert!(
+        params.get("preimage_sha256").is_none(),
+        "host-observed preimage must not be sent: {params}"
+    );
+}
+
+fn assert_provider_request_excludes_host_apply_authority(request: &Value) {
+    let text = request.to_string();
+    assert!(
+        !text.contains("state.db"),
+        "request exposes SQLite path: {text}"
+    );
+    assert!(
+        !text.contains("journal") && !text.contains("transaction") && !text.contains("sql"),
+        "request exposes host mutation authority: {text}"
+    );
+}
+
+fn provider_owned_replace_protocol() -> &'static str {
+    "oulipoly.provider_owned_replace/v1"
+}
+
+fn provider_owned_operation_id() -> String {
+    "55555555-5555-4555-8555-555555555555".to_string()
+}
+
+fn provider_owned_recovery_id() -> String {
+    "66666666-6666-4666-8666-666666666666".to_string()
+}
+
+fn provider_owned_preimage_sha256() -> String {
+    "1".repeat(64)
+}
+
+fn provider_owned_source_id() -> String {
+    "provider-a-owned-canonical-source".to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }

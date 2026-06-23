@@ -115,45 +115,170 @@
     },
     "SessionExportErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
     "SessionReplaceHostStatePlan": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "schema_version": { "const": 1 },
+            "operation": { "const": "session.replace" },
+            "session_id": { "type": "string", "minLength": 1 },
+            "provider_name": { "type": "string", "minLength": 1 },
+            "canonical_format": { "const": "oulipoly.canonical_transcript/v1" },
+            "turn_count": { "type": "integer", "minimum": 0 },
+            "records_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "postimage_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "artifacts": {
+              "type": "array",
+              "items": { "$ref": "common.schema.json#/$defs/Artifact" }
+            }
+          },
+          "required": [
+            "schema_version",
+            "operation",
+            "session_id",
+            "provider_name",
+            "canonical_format",
+            "turn_count",
+            "records_sha256",
+            "postimage_sha256",
+            "artifacts"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "schema_version": { "const": 2 },
+            "operation": { "const": "session.replace" },
+            "replace_protocol": { "const": "oulipoly.provider_owned_replace/v1" },
+            "operation_id": { "type": "string", "minLength": 1 },
+            "recovery_id": { "type": "string", "minLength": 1 },
+            "session_id": { "type": "string", "minLength": 1 },
+            "provider_name": { "type": "string", "minLength": 1 },
+            "canonical_format": { "const": "oulipoly.canonical_transcript/v1" },
+            "input_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "postimage_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "preimage_sha256_observed": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+            "turn_count": { "type": "integer", "minimum": 0 },
+            "db_apply": { "const": "replace_session_turns_from_canonical_v1" },
+            "source_id": { "type": "string", "minLength": 1 },
+            "last_turn_id": { "type": ["string", "null"] },
+            "last_used_at": { "type": ["string", "null"] },
+            "chain_id": { "type": "string", "minLength": 1 },
+            "active_segment_id": { "type": "integer" }
+          },
+          "required": [
+            "schema_version",
+            "operation",
+            "replace_protocol",
+            "operation_id",
+            "recovery_id",
+            "session_id",
+            "provider_name",
+            "canonical_format",
+            "input_sha256",
+            "postimage_sha256",
+            "preimage_sha256_observed",
+            "turn_count",
+            "db_apply",
+            "source_id",
+            "last_turn_id",
+            "last_used_at"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SessionReplaceCanonicalTranscript": {
       "type": "object",
       "properties": {
-        "schema_version": { "const": 1 },
-        "operation": { "const": "session.replace" },
+        "kind": { "const": "bytes" },
+        "data_base64": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "turn_count": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["kind", "data_base64", "sha256", "turn_count"],
+      "additionalProperties": false
+    },
+    "SessionReplaceParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
         "session_id": { "type": "string", "minLength": 1 },
+        "model_name": { "type": "string", "minLength": 1 },
         "provider_name": { "type": "string", "minLength": 1 },
+        "replace_protocol": { "const": "oulipoly.provider_owned_replace/v1" },
+        "operation_id": { "type": "string", "minLength": 1 },
         "canonical_format": { "const": "oulipoly.canonical_transcript/v1" },
-        "turn_count": { "type": "integer", "minimum": 0 },
-        "records_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
-        "postimage_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
-        "artifacts": {
-          "type": "array",
-          "items": { "$ref": "common.schema.json#/$defs/Artifact" }
-        }
+        "canonical_transcript": { "$ref": "#/$defs/SessionReplaceCanonicalTranscript" },
+        "preimage_sha256_expected": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "host_apply_capability": { "const": "replace_session_turns_from_canonical_v1" },
+        "operation_mode": { "const": "recover" },
+        "recovery_action": { "enum": ["query", "commit", "rollback"] },
+        "recovery_id": { "type": "string", "minLength": 1 }
       },
       "required": [
-        "schema_version",
-        "operation",
+        "settings_id",
         "session_id",
+        "model_name",
         "provider_name",
+        "replace_protocol",
+        "operation_id",
         "canonical_format",
-        "turn_count",
-        "records_sha256",
-        "postimage_sha256",
-        "artifacts"
+        "canonical_transcript",
+        "host_apply_capability"
+      ],
+      "additionalProperties": false
+    },
+    "SessionReplaceArtifactEvidence": {
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "minLength": 1 },
+        "format_id": { "type": "string", "minLength": 1 },
+        "path": { "type": "string" },
+        "uri": { "type": "string" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "turn_count": { "type": "integer", "minimum": 0 },
+        "content_len": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["role", "format_id", "sha256"],
+      "additionalProperties": false
+    },
+    "SessionReplaceCanonicalPostimage": {
+      "type": "object",
+      "properties": {
+        "format_id": { "const": "oulipoly.canonical_transcript/v1" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "turn_count": { "type": "integer", "minimum": 0 },
+        "source_id": { "type": "string", "minLength": 1 },
+        "data_base64": { "type": "string" },
+        "artifact": { "$ref": "#/$defs/SessionReplaceArtifactEvidence" }
+      },
+      "required": ["format_id", "sha256", "turn_count", "source_id"],
+      "oneOf": [
+        { "required": ["data_base64"], "not": { "required": ["artifact"] } },
+        { "required": ["artifact"], "not": { "required": ["data_base64"] } }
       ],
       "additionalProperties": false
     },
     "SessionReplaceRequest": {
       "allOf": [
         { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
-        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionReplaceParams" } } }
       ]
     },
     "SessionReplaceResult": {
       "type": "object",
       "properties": {
         "changed": { "type": "boolean" },
+        "operation_id": { "type": "string", "minLength": 1 },
+        "recovery_id": { "type": "string", "minLength": 1 },
+        "operation_state": { "enum": ["prepared", "committed", "atomic_committed", "rolled_back", "not_found"] },
+        "preimage_sha256_observed": { "type": "string" },
         "postimage_sha256": { "type": "string" },
+        "canonical_postimage": { "$ref": "#/$defs/SessionReplaceCanonicalPostimage" },
+        "provider_preimage_artifact": { "$ref": "#/$defs/SessionReplaceArtifactEvidence" },
+        "provider_postimage_artifact": { "$ref": "#/$defs/SessionReplaceArtifactEvidence" },
         "artifacts": {
           "type": "array",
           "items": { "$ref": "common.schema.json#/$defs/Artifact" }

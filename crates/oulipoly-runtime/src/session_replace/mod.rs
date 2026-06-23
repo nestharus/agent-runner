@@ -19,13 +19,14 @@ use crate::session_metadata::{
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
 use oulipoly_state::StateDb;
-use rusqlite::{Transaction, params};
+use rusqlite::{Connection, Transaction, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -46,6 +47,37 @@ const TEST_SLEEP_AFTER_LOCK_MS: &str = "sleep-after-lock-ms";
 const TEST_BLOCK_AFTER_RENAME: &str = "block-after-transcript-rename-before-db-commit";
 const TEST_FAIL_POSTIMAGE_VERIFY: &str = "fail-postimage-verification";
 
+static RESOLVE_REPLACE_METADATA_CALLS: AtomicUsize = AtomicUsize::new(0);
+static WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static RENDER_FOR_STORAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForbiddenHelperCallCounts {
+    pub resolve_replace_metadata: usize,
+    pub write_external_provider_preimage_snapshot: usize,
+    pub canonical_records_from_provider_file: usize,
+    pub render_for_storage: usize,
+}
+
+pub fn reset_forbidden_helper_recorder() {
+    RESOLVE_REPLACE_METADATA_CALLS.store(0, Ordering::SeqCst);
+    WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
+    CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS.store(0, Ordering::SeqCst);
+    RENDER_FOR_STORAGE_CALLS.store(0, Ordering::SeqCst);
+}
+
+pub fn forbidden_helper_call_counts() -> ForbiddenHelperCallCounts {
+    ForbiddenHelperCallCounts {
+        resolve_replace_metadata: RESOLVE_REPLACE_METADATA_CALLS.load(Ordering::SeqCst),
+        write_external_provider_preimage_snapshot: WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS
+            .load(Ordering::SeqCst),
+        canonical_records_from_provider_file: CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS
+            .load(Ordering::SeqCst),
+        render_for_storage: RENDER_FOR_STORAGE_CALLS.load(Ordering::SeqCst),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplaceReceipt {
     pub session_id: String,
@@ -57,6 +89,22 @@ pub struct ReplaceReceipt {
     pub jsonl_path: PathBuf,
     pub state_updated: bool,
     pub committed_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderReplaceDbTarget {
+    pub(crate) provider_name: String,
+    pub(crate) session_id: String,
+    pub(crate) chain_id: String,
+    pub(crate) active_segment_id: i64,
+    pub(crate) source_file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ProviderReplaceDbPreimage {
+    pub(crate) session_turns: Value,
+    pub(crate) last_turn_id: Option<String>,
+    pub(crate) last_used_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +375,12 @@ struct ReplaceJournal {
     expected_turn_count: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ReplaceJournalHeader {
+    schema_version: u32,
+    operation: String,
+}
+
 pub fn run_import_replace(
     session_id: &str,
     input_path_or_stdin: Option<&Path>,
@@ -384,6 +438,8 @@ pub(crate) fn run_import_replace_bytes(
     )
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn validate_import_replace_bytes_for_session(
     session_id: &str,
     input: &[u8],
@@ -403,6 +459,8 @@ pub(crate) fn validate_import_replace_bytes_for_session(
     Ok(records.len() as u64)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn begin_external_provider_replace(
     session_id: &str,
     input: &[u8],
@@ -453,6 +511,8 @@ pub(crate) fn begin_external_provider_replace(
     })
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 impl ExternalProviderReplaceTransaction {
     pub(crate) fn canonical_bytes(&self) -> &[u8] {
         &self.input.canonical_bytes
@@ -467,6 +527,8 @@ impl ExternalProviderReplaceTransaction {
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn rollback_external_provider_replace(
     transaction: ExternalProviderReplaceTransaction,
 ) -> Result<(), ReplaceError> {
@@ -475,6 +537,8 @@ pub(crate) fn rollback_external_provider_replace(
     release_external_provider_lease(&transaction.lock, &transaction.lease)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn rollback_external_provider_replace_after_error(
     transaction: ExternalProviderReplaceTransaction,
     error: ReplaceError,
@@ -485,6 +549,8 @@ pub(crate) fn rollback_external_provider_replace_after_error(
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn commit_external_provider_replace(
     transaction: ExternalProviderReplaceTransaction,
     expected_postimage_sha256: &str,
@@ -513,6 +579,8 @@ pub(crate) fn commit_external_provider_replace(
     ))
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn verify_external_provider_commit_postimage(
     transaction: &ExternalProviderReplaceTransaction,
     expected_postimage_sha256: &str,
@@ -524,6 +592,8 @@ fn verify_external_provider_commit_postimage(
     )
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn rollback_external_provider_precommit_error(
     transaction: ExternalProviderReplaceTransaction,
     error: ReplaceError,
@@ -534,6 +604,8 @@ fn rollback_external_provider_precommit_error(
     ))
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn external_provider_postcommit_error(
     transaction: &ExternalProviderReplaceTransaction,
     error: ReplaceError,
@@ -542,6 +614,8 @@ fn external_provider_postcommit_error(
     Err(error)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn external_provider_rollback_error(
     primary_error: ReplaceError,
     rollback_error: ReplaceError,
@@ -555,18 +629,24 @@ fn external_provider_rollback_error(
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn parse_external_provider_postimage_canonical_input(
     input: &[u8],
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
     parse_and_validate_canonical_input(input)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn access_external_provider_replace_metadata(
     session_id: &str,
 ) -> Result<SessionMetadata, ReplaceError> {
     resolve_replace_metadata(session_id)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn map_external_provider_postimage_artifact_metadata(
     mut metadata: SessionMetadata,
     artifact_path: &Path,
@@ -575,6 +655,8 @@ pub(crate) fn map_external_provider_postimage_artifact_metadata(
     metadata
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn access_external_provider_artifact_canonical_hash(
     metadata: &SessionMetadata,
 ) -> Result<String, ReplaceError> {
@@ -582,6 +664,8 @@ pub(crate) fn access_external_provider_artifact_canonical_hash(
     canonical_hash_from_provider_file(metadata)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn access_external_provider_artifact_file(metadata: &SessionMetadata) -> Result<(), ReplaceError> {
     let file_metadata = fs::metadata(&metadata.jsonl_path)
         .map_err(|_| format_invalid_external_provider_artifact_error())?;
@@ -593,12 +677,16 @@ fn access_external_provider_artifact_file(metadata: &SessionMetadata) -> Result<
         .map_err(|_| format_invalid_external_provider_artifact_error())
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn format_invalid_external_provider_artifact_error() -> ReplaceError {
     ReplaceError::OperationalError {
         message: "invalid_artifact".to_string(),
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn validate_external_provider_postimage_hash(
     actual_postimage_sha256: &str,
     expected_postimage_sha256: &str,
@@ -610,6 +698,8 @@ pub(crate) fn validate_external_provider_postimage_hash(
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn access_external_provider_artifact_canonical_records(
     metadata: &SessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
@@ -617,6 +707,8 @@ pub(crate) fn access_external_provider_artifact_canonical_records(
     canonical_records_from_provider_file(metadata)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) fn validate_external_provider_postimage_semantics(
     expected: &[CanonicalRecord],
     actual: &[CanonicalRecord],
@@ -628,12 +720,16 @@ pub(crate) fn validate_external_provider_postimage_semantics(
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn format_postimage_hash_mismatch_error() -> ReplaceError {
     ReplaceError::OperationalError {
         message: "postimage_hash_mismatch".to_string(),
     }
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn format_semantic_verification_mismatch_error() -> ReplaceError {
     ReplaceError::OperationalError {
         message: "semantic_verification_mismatch".to_string(),
@@ -666,6 +762,8 @@ struct ReplacePostimagePlan {
     expected_sha256: String,
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 pub(crate) struct ExternalProviderReplaceTransaction {
     input: ReplaceInput,
     metadata: SessionMetadata,
@@ -843,6 +941,8 @@ fn acquire_import_replace_lease<'a>(
     })
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn acquire_external_provider_replace_lease(
     lock: &SessionLock,
     metadata: &SessionMetadata,
@@ -857,16 +957,21 @@ fn acquire_external_provider_replace_lease(
     .map_err(map_lock_error)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn release_external_provider_lease(lock: &SessionLock, lease: &Lease) -> Result<(), ReplaceError> {
     lock.release(&lease.session_id, &lease.token)
         .map(|_| ())
         .map_err(map_lock_error)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn write_external_provider_preimage_snapshot(
     workspace: &ReplaceJournalWorkspace,
     metadata: &SessionMetadata,
 ) -> Result<PathBuf, ReplaceError> {
+    WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
     let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ReplaceError::OperationalError {
         message: format!(
             "failed to snapshot transcript {}: {e}",
@@ -880,6 +985,8 @@ fn write_external_provider_preimage_snapshot(
     Ok(snapshot_path)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn restore_external_provider_preimage_snapshot(
     transaction: &ExternalProviderReplaceTransaction,
 ) -> Result<(), ReplaceError> {
@@ -895,6 +1002,8 @@ fn restore_external_provider_preimage_snapshot(
     atomic_write_bytes(&transaction.metadata.jsonl_path, &bytes)
 }
 
+// S11-WU5: remove with host-local provider-ref replace deletion.
+#[allow(dead_code)]
 fn update_replace_journal_postimage(
     transaction: &ExternalProviderReplaceTransaction,
     postimage_sha256: &str,
@@ -1077,6 +1186,99 @@ fn apply_replace_sqlite(
         })
 }
 
+pub(crate) fn apply_provider_owned_replace_sqlite(
+    target: &ProviderReplaceDbTarget,
+    records: &[CanonicalRecord],
+) -> Result<(), ReplaceError> {
+    let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to open state db: {e}"),
+    })?;
+    state
+        .with_write_txn(|tx| {
+            replace_db_turns_for_target(tx, target, records).map_err(|e| format!("{e:?}"))
+        })
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to update state db: {e}"),
+        })
+}
+
+pub(crate) fn restore_provider_owned_db_preimage(
+    target: &ProviderReplaceDbTarget,
+    preimage: &ProviderReplaceDbPreimage,
+) -> Result<(), ReplaceError> {
+    let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to open state db: {e}"),
+    })?;
+    state
+        .with_write_txn(|tx| {
+            restore_db_preimage_for_target(tx, target, preimage).map_err(|e| format!("{e:?}"))
+        })
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to restore state db: {e}"),
+        })
+}
+
+pub(crate) fn strict_provider_replace_db_identity(
+    provider_name: &str,
+    session_id: &str,
+    source_file: String,
+) -> Result<ProviderReplaceDbTarget, ReplaceError> {
+    let data_root = default_data_root()?;
+    let conn = Connection::open(data_root.join("state.db")).map_err(|e| {
+        ReplaceError::OperationalError {
+            message: format!("failed to open state db: {e}"),
+        }
+    })?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT chain_id, id
+             FROM session_chain_segments
+             WHERE provider_name = ?1 AND session_id = ?2 AND ended_at IS NULL
+             ORDER BY id",
+        )
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to prepare provider DB identity lookup: {e}"),
+        })?;
+    let rows = stmt
+        .query_map(params![provider_name, session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to query provider DB identity: {e}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to read provider DB identity: {e}"),
+        })?;
+    match rows.as_slice() {
+        [] => Err(ReplaceError::OperationalError {
+            message: "provider_db_identity_missing".to_string(),
+        }),
+        [(chain_id, active_segment_id)] => Ok(ProviderReplaceDbTarget {
+            provider_name: provider_name.to_string(),
+            session_id: session_id.to_string(),
+            chain_id: chain_id.clone(),
+            active_segment_id: *active_segment_id,
+            source_file,
+        }),
+        _ => Err(ReplaceError::OperationalError {
+            message: "provider_db_identity_ambiguous".to_string(),
+        }),
+    }
+}
+
+pub(crate) fn provider_replace_db_preimage(
+    target: &ProviderReplaceDbTarget,
+) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
+    let data_root = default_data_root()?;
+    let conn = Connection::open(data_root.join("state.db")).map_err(|e| {
+        ReplaceError::OperationalError {
+            message: format!("failed to open state db: {e}"),
+        }
+    })?;
+    db_preimage_from_conn(&conn, target)
+}
+
 fn cleanup_replace_journal_publication(
     workspace: &ReplaceJournalWorkspace,
     published: &PublishedReplaceJournal,
@@ -1120,6 +1322,27 @@ fn parse_and_validate_canonical_input(input: &[u8]) -> Result<Vec<CanonicalRecor
     Ok(records)
 }
 
+pub(crate) fn parse_provider_owned_canonical_input_for_session(
+    session_id: &str,
+    input: &[u8],
+) -> Result<Vec<CanonicalRecord>, ReplaceError> {
+    Uuid::try_parse(session_id).map_err(|_| ReplaceError::OperationalError {
+        message: format!("invalid_session_id: {session_id}"),
+    })?;
+    let input_text =
+        std::str::from_utf8(input).map_err(|e| ReplaceError::InvalidInputTranscript {
+            reason: format!("input is not utf-8: {e}"),
+            line: None,
+        })?;
+    let records = parse_canonical_jsonl(input_text)?;
+    if records.iter().any(|record| record.session_id != session_id) {
+        return Err(ReplaceError::OperationalError {
+            message: "canonical_session_id_mismatch".to_string(),
+        });
+    }
+    Ok(records)
+}
+
 pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
     let data_root = default_data_root()?;
     let journal_root = data_root.join("replace_journal");
@@ -1148,14 +1371,21 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
         let Ok(bytes) = fs::read(&path) else {
             continue;
         };
+        let Ok(header) = serde_json::from_slice::<ReplaceJournalHeader>(&bytes) else {
+            move_to_quarantine(&path, &quarantine_dir);
+            continue;
+        };
+        if header.schema_version == 2 && header.operation == "provider-owned-import-replace" {
+            continue;
+        }
+        if header.schema_version != 1 || header.operation != "import-replace" {
+            move_to_quarantine(&path, &quarantine_dir);
+            continue;
+        }
         let Ok(journal) = serde_json::from_slice::<ReplaceJournal>(&bytes) else {
             move_to_quarantine(&path, &quarantine_dir);
             continue;
         };
-        if journal.schema_version != 1 || journal.operation != "import-replace" {
-            move_to_quarantine(&path, &quarantine_dir);
-            continue;
-        }
         let storage_type = storage_type_from_str(&journal.storage_type);
         let metadata = SessionMetadata {
             session_id: journal.session_id.clone(),
@@ -1451,6 +1681,7 @@ fn render_for_storage(
     storage_type: &SessionStorageType,
     records: &[CanonicalRecord],
 ) -> Result<Vec<u8>, ReplaceError> {
+    RENDER_FOR_STORAGE_CALLS.fetch_add(1, Ordering::SeqCst);
     match storage_type {
         SessionStorageType::ClaudeCode => ClaudeCodeRenderer.render(records),
         SessionStorageType::CodexSession => CodexSessionRenderer.render(records),
@@ -1465,6 +1696,7 @@ fn render_for_storage(
 }
 
 fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, ReplaceError> {
+    RESOLVE_REPLACE_METADATA_CALLS.fetch_add(1, Ordering::SeqCst);
     let state =
         StateDb::open_default().map_err(|e| ReplaceError::OperationalError { message: e })?;
     let providers =
@@ -1489,9 +1721,24 @@ fn replace_db_turns(
     metadata: &SessionMetadata,
     records: &[CanonicalRecord],
 ) -> Result<(), ReplaceError> {
+    let target = ProviderReplaceDbTarget {
+        provider_name: metadata.provider_name.clone(),
+        session_id: metadata.session_id.clone(),
+        chain_id: metadata.chain_id.clone(),
+        active_segment_id: metadata.active_segment_id,
+        source_file: metadata.jsonl_path.to_string_lossy().to_string(),
+    };
+    replace_db_turns_for_target(tx, &target, records)
+}
+
+fn replace_db_turns_for_target(
+    tx: &mut Transaction<'_>,
+    target: &ProviderReplaceDbTarget,
+    records: &[CanonicalRecord],
+) -> Result<(), ReplaceError> {
     tx.execute(
         "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-        params![metadata.provider_name, metadata.session_id],
+        params![target.provider_name, target.session_id],
     )
     .map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to delete old turns: {e}"),
@@ -1500,22 +1747,19 @@ fn replace_db_turns(
     // Canonical v1 records intentionally do not carry parentage, sidechain, or
     // compaction metadata, so imported rows reset those lineage fields.
     for record in records {
-        let body =
-            serde_json::to_string(&record.content).map_err(|e| ReplaceError::OperationalError {
-                message: format!("failed to serialize replacement body: {e}"),
-            })?;
+        let body = replacement_body_json(&record.content)?;
         tx.execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role,
                  parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7, ?8)",
             params![
-                metadata.provider_name,
-                metadata.session_id,
+                target.provider_name,
+                target.session_id,
                 record.turn_id,
                 record.timestamp,
                 record.role,
-                metadata.jsonl_path.to_string_lossy(),
+                target.source_file,
                 now,
                 body,
             ],
@@ -1533,14 +1777,14 @@ fn replace_db_turns(
         "UPDATE session_chain_segments
          SET last_turn_id = ?2
          WHERE id = ?1",
-        params![metadata.active_segment_id, last.turn_id],
+        params![target.active_segment_id, last.turn_id],
     )
     .map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to refresh active segment: {e}"),
     })?;
     tx.execute(
         "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-        params![metadata.chain_id, last.timestamp],
+        params![target.chain_id, last.timestamp],
     )
     .map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to refresh chain: {e}"),
@@ -1548,9 +1792,170 @@ fn replace_db_turns(
     Ok(())
 }
 
+fn replacement_body_json(content: &[ContentChunk]) -> Result<String, ReplaceError> {
+    let mut chunks = Vec::with_capacity(content.len());
+    for chunk in content {
+        let chunk_type =
+            serde_json::to_string(&chunk.r#type).map_err(|e| ReplaceError::OperationalError {
+                message: format!("failed to serialize replacement body: {e}"),
+            })?;
+        let mut object = format!("{{\"type\":{chunk_type}");
+        if let Some(text) = &chunk.text {
+            let text = serde_json::to_string(text).map_err(|e| ReplaceError::OperationalError {
+                message: format!("failed to serialize replacement body: {e}"),
+            })?;
+            object.push_str(",\"text\":");
+            object.push_str(&text);
+        }
+        object.push('}');
+        chunks.push(object);
+    }
+    Ok(format!("[{}]", chunks.join(",")))
+}
+
+fn restore_db_preimage_for_target(
+    tx: &mut Transaction<'_>,
+    target: &ProviderReplaceDbTarget,
+    preimage: &ProviderReplaceDbPreimage,
+) -> Result<(), ReplaceError> {
+    tx.execute(
+        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+        params![target.provider_name, target.session_id],
+    )
+    .map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to delete replacement turns: {e}"),
+    })?;
+    let Some(rows) = preimage.session_turns.as_array() else {
+        return Err(ReplaceError::OperationalError {
+            message: "invalid_provider_owned_db_preimage".to_string(),
+        });
+    };
+    let now = Utc::now().to_rfc3339();
+    for row in rows {
+        let Some(values) = row.as_array() else {
+            return Err(ReplaceError::OperationalError {
+                message: "invalid_provider_owned_db_preimage".to_string(),
+            });
+        };
+        let provider_name = value_str(values, 0)?;
+        let session_id = value_str(values, 1)?;
+        let turn_id = value_str(values, 2)?;
+        let timestamp = value_str(values, 3)?;
+        let role = value_str(values, 4)?;
+        let parent_turn_id = values.get(5).and_then(Value::as_str);
+        let is_sidechain = values.get(6).and_then(Value::as_i64).unwrap_or(0);
+        let is_compaction_boundary = values.get(7).and_then(Value::as_i64).unwrap_or(0);
+        let source_file = value_str(values, 8)?;
+        let body = values.get(9).and_then(Value::as_str);
+        tx.execute(
+            "INSERT INTO session_turns
+                (provider_name, session_id, turn_id, timestamp, role,
+                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                provider_name,
+                session_id,
+                turn_id,
+                timestamp,
+                role,
+                parent_turn_id,
+                is_sidechain,
+                is_compaction_boundary,
+                source_file,
+                now,
+                body,
+            ],
+        )
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to restore preimage turn: {e}"),
+        })?;
+    }
+    tx.execute(
+        "UPDATE session_chain_segments SET last_turn_id = ?2 WHERE id = ?1",
+        params![target.active_segment_id, preimage.last_turn_id],
+    )
+    .map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to restore active segment: {e}"),
+    })?;
+    tx.execute(
+        "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
+        params![target.chain_id, preimage.last_used_at],
+    )
+    .map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to restore chain: {e}"),
+    })?;
+    Ok(())
+}
+
+fn db_preimage_from_conn(
+    conn: &Connection,
+    target: &ProviderReplaceDbTarget,
+) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
+    let mut turns = conn
+        .prepare(
+            "SELECT provider_name, session_id, turn_id, timestamp, role,
+                    parent_turn_id, is_sidechain, is_compaction_boundary, source_file, body
+             FROM session_turns
+             WHERE provider_name = ?1 AND session_id = ?2
+             ORDER BY timestamp, turn_id",
+        )
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to prepare DB preimage turn query: {e}"),
+        })?;
+    let session_turns = turns
+        .query_map(params![target.provider_name, target.session_id], |row| {
+            Ok(json!([
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                "<session-transcript>",
+                row.get::<_, Option<String>>(9)?,
+            ]))
+        })
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to query DB preimage turns: {e}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to read DB preimage turns: {e}"),
+        })?;
+    let (last_turn_id, last_used_at) = conn
+        .query_row(
+            "SELECT s.last_turn_id, c.last_used_at
+             FROM session_chain_segments s
+             JOIN session_chains c ON c.chain_id = s.chain_id
+             WHERE s.id = ?1",
+            params![target.active_segment_id],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to read DB preimage chain state: {e}"),
+        })?;
+    Ok(ProviderReplaceDbPreimage {
+        session_turns: Value::Array(session_turns),
+        last_turn_id,
+        last_used_at,
+    })
+}
+
+fn value_str(values: &[Value], index: usize) -> Result<&str, ReplaceError> {
+    values
+        .get(index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ReplaceError::OperationalError {
+            message: "invalid_provider_owned_db_preimage".to_string(),
+        })
+}
+
 fn canonical_records_from_provider_file(
     metadata: &SessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ReplaceError> {
+    CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS.fetch_add(1, Ordering::SeqCst);
     let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ReplaceError::OperationalError {
         message: format!(
             "failed to read transcript {}: {e}",

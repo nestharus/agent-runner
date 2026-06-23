@@ -241,6 +241,40 @@ fn dto_discriminants_reject_schema_invalid_values() {
     assert_deserialize_error::<dto::SchemaRequest>(&schema);
 }
 
+#[test]
+fn session_replace_provider_owned_protocol_dtos_round_trip_new_evidence_shape() {
+    let fixtures = fixtures();
+    let request = non_launch_fixture(&fixtures, "session.replace", "request");
+    let success = non_launch_fixture(&fixtures, "session.replace", "success_response");
+    let result = success.get("result").expect("replace result");
+
+    assert_json_round_trip::<dto::SessionReplaceRequest>(request);
+    assert_json_round_trip::<dto::SessionReplaceParams>(&request["params"]);
+    assert_json_round_trip::<dto::SessionReplaceCanonicalTranscript>(
+        &request["params"]["canonical_transcript"],
+    );
+    assert_json_round_trip::<dto::SessionReplaceResult>(result);
+    assert_json_round_trip::<dto::SessionReplaceCanonicalPostimage>(&result["canonical_postimage"]);
+    assert_json_round_trip::<dto::SessionReplaceArtifactEvidence>(
+        &result["provider_preimage_artifact"],
+    );
+    assert_json_round_trip::<dto::SessionReplaceArtifactEvidence>(
+        &result["provider_postimage_artifact"],
+    );
+    assert_json_round_trip::<dto::SessionReplaceResponse>(success);
+}
+
+#[test]
+fn session_replace_legacy_result_fixture_still_round_trips_after_optional_evidence_fields() {
+    let fixtures = fixtures();
+    let legacy = non_launch_fixture(&fixtures, "session.replace", "legacy_success_response");
+
+    assert_json_round_trip::<dto::SessionReplaceResult>(
+        legacy.get("result").expect("legacy replace result"),
+    );
+    assert_json_round_trip::<dto::SessionReplaceResponse>(legacy);
+}
+
 fn assert_non_launch_round_trip<Request, Result, Response, ErrorResponse>(
     fixtures: &Value,
     subcommand: &str,
