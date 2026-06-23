@@ -1224,11 +1224,11 @@ pub(crate) fn strict_provider_replace_db_identity(
     source_file: String,
 ) -> Result<ProviderReplaceDbTarget, ReplaceError> {
     let data_root = default_data_root()?;
-    let conn = Connection::open(data_root.join("state.db")).map_err(|e| {
-        ReplaceError::OperationalError {
-            message: format!("failed to open state db: {e}"),
-        }
+    let db_path = data_root.join("state.db");
+    let state = StateDb::open(&db_path).map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to open state db: {e}"),
     })?;
+    let conn = state.connection();
     let mut stmt = conn
         .prepare(
             "SELECT chain_id, id
@@ -1271,12 +1271,12 @@ pub(crate) fn provider_replace_db_preimage(
     target: &ProviderReplaceDbTarget,
 ) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
     let data_root = default_data_root()?;
-    let conn = Connection::open(data_root.join("state.db")).map_err(|e| {
-        ReplaceError::OperationalError {
-            message: format!("failed to open state db: {e}"),
-        }
+    let db_path = data_root.join("state.db");
+    let state = StateDb::open(&db_path).map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to open state db: {e}"),
     })?;
-    db_preimage_from_conn(&conn, target)
+    let conn = state.connection();
+    db_preimage_from_conn(conn, target)
 }
 
 fn cleanup_replace_journal_publication(

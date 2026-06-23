@@ -1,4 +1,4 @@
-use oulipoly_config::app::SetupBrainConfig;
+use oulipoly_config::{ProviderImplementationRef, app::SetupBrainConfig};
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
 use oulipoly_provider::error::{HostErrorKind, ProviderClientError};
 use oulipoly_provider::generated::{
@@ -25,7 +25,8 @@ impl SetupBrainHost {
         system_prompt: String,
         host_context: Value,
     ) -> Result<Self, SetupBrainError> {
-        let artifact = provider_artifact_from_ref(&config.artifact)
+        let artifact_ref: &ProviderImplementationRef = &config.artifact;
+        let artifact = provider_artifact_from_ref(artifact_ref)
             .map_err(|error| setup_brain_protocol_error_for_operation("setup.brain", error))?;
         Ok(Self {
             config,
