@@ -969,6 +969,79 @@ mod tests {
         assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
     }
 
+    #[test]
+    fn session_ownership_sql_turn_dedup_loser_ingested_at_drift_is_tolerated() {
+        let (_dir, mut conn, target) = setup_sql_turn_collision_fixture(|conn| {
+            seed_byte_identical_turn_collision(conn);
+        });
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        let loser_id = candidates.turn_dedup_deletes[0].loser_turn_row_id;
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_turns SET ingested_at = '2026-06-20T10:30:00Z' WHERE id = ?1",
+            [loser_id],
+        )
+        .unwrap();
+
+        let counts = apply_forward(&conn).expect("metadata-only loser drift should be tolerated");
+
+        assert_eq!(counts.counts["turn_rows_deduped_away"], 1);
+        assert!(!turn_row_exists(&conn, loser_id));
+    }
+
+    #[test]
+    fn session_ownership_sql_turn_dedup_loser_parent_turn_id_drift_is_tolerated() {
+        let (_dir, mut conn, target) = setup_sql_turn_collision_fixture(|conn| {
+            seed_byte_identical_turn_collision(conn);
+        });
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        let loser_id = candidates.turn_dedup_deletes[0].loser_turn_row_id;
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_turns SET parent_turn_id = 'metadata-drift-parent' WHERE id = ?1",
+            [loser_id],
+        )
+        .unwrap();
+
+        let counts = apply_forward(&conn).expect("metadata-only loser drift should be tolerated");
+
+        assert_eq!(counts.counts["turn_rows_deduped_away"], 1);
+        assert!(!turn_row_exists(&conn, loser_id));
+    }
+
+    #[test]
+    fn session_ownership_sql_stale_turn_dedup_plan_role_drift_rolls_back_whole_forward_transaction()
+    {
+        assert_intrinsic_loser_drift_rolls_back("role", "user");
+    }
+
+    #[test]
+    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction()
+    {
+        assert_intrinsic_loser_drift_rolls_back("timestamp", "2026-06-20T10:30:00Z");
+    }
+
+    #[test]
+    fn session_ownership_sql_classify_ingested_at_only_collision_produces_dedup_plan() {
+        let (_dir, conn, target) = setup_sql_turn_collision_fixture(|conn| {
+            seed_byte_identical_turn_collision(conn);
+            conn.execute(
+                "UPDATE session_turns SET ingested_at = '2026-06-20T10:30:00Z'
+                 WHERE id = (SELECT MAX(id) FROM session_turns)",
+                [],
+            )
+            .unwrap();
+        });
+
+        let candidates = classifier::classify(&conn, &target)
+            .expect("metadata-only turn collision should produce a dedup plan");
+
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        assert_eq!(candidates.turn_dedup_deletes.len(), 1);
+    }
+
     fn write_target_config(models_dir: &Path) {
         let token = moved_provider_token();
         let target_binary = format!("agent-runner-{token}");
@@ -1049,6 +1122,56 @@ mod tests {
         .unwrap();
     }
 
+    fn setup_sql_turn_collision_fixture(
+        seed: impl FnOnce(&Connection),
+    ) -> (
+        tempfile::TempDir,
+        Connection,
+        target_resolution::TargetResolution,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let conn = Connection::open(&state_path).unwrap();
+        seed(&conn);
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        (dir, conn, target)
+    }
+
+    fn assert_intrinsic_loser_drift_rolls_back(column: &str, value: &str) {
+        let (_dir, mut conn, target) = setup_sql_turn_collision_fixture(|conn| {
+            seed_byte_identical_turn_collision(conn);
+        });
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        let loser_id = candidates.turn_dedup_deletes[0].loser_turn_row_id;
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE session_turns SET {} = ?1 WHERE id = ?2",
+                quote_ident(column)
+            ),
+            params![value, loser_id],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("intrinsic loser drift must fail closed");
+
+        assert_forward_guard_error(&err);
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(turn_row_exists(&conn, loser_id));
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
     fn assert_forward_guard_error(err: &DryRunError) {
         assert!(
             err.to_string().contains("s11_wu4_forward_guard") || err.to_string().contains("UNIQUE"),
@@ -1060,6 +1183,15 @@ mod tests {
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_turns WHERE id = ?1 AND provider_name = ?2)",
             params![id, provider_name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn turn_row_exists(conn: &Connection, id: i64) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_turns WHERE id = ?1)",
+            [id],
             |row| row.get(0),
         )
         .unwrap()

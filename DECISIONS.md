@@ -4502,3 +4502,66 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
 - **Anti-scope (unchanged from brief.md)**: no in-tree reader deletion (WU5); no behavior change to
   non-colliding chains; no fail-open; lossless-only dedup with abort-on-divergence; zero new lowercase
   provider-token literals (token delta 0).
+
+## D-S11-M2c-fix-001 — Linear gap: manager-authorized Option B (proceed without Linear)
+- **WU**: `s11-m2c-fix-dedup-equality` (branch `s11-m2c-fix-dedup-equality`, base `main @ cb9ac4f6`).
+- **Decision**: Proceed without Linear. `LINEAR_API_KEY` is unavailable to spooled jobs. The manager
+  (manager-max) authorized Option B: do all pipeline work, open the draft PR on base `main`, skip every
+  `linear-operator` step, use `wu_brief_path`
+  (`/home/nes/projects/agent-runner/planning/s11-m2c-fix-dedup-equality/brief.md`) as the source of
+  truth. The manager creates + links the NES ticket out-of-band.
+- **Intended ticket title**: `S11-M2c-fix: turn dedup-equality = intrinsic content`.
+- **Consequence**: No Phase 0 ticket read/create, no Phase 3 update-estimate, no Phase 8.X Linear
+  upsert-comment, no Phase 9/Final ticket cross-link or close-comment. `auto_merge_after_phase_9=false`
+  — pipeline stops at the draft PR (base `main`); manager merges after a full `cargo test --workspace`
+  + on-copy proof.
+- **Evidence**: brief.md; orchestrator dispatch prompt manager-authorization block.
+
+## D-S11-M2c-fix-002 — Scope: turn dedup-equality = intrinsic content (do NOT split)
+- **Single concern**: redefine turn dedup-equality to intrinsic content (`role`/`timestamp`/`body`) so
+  the fail-closed guard stops aborting on benign ingestion/threading metadata (`ingested_at`,
+  `parent_turn_id`, `source_file`, `is_sidechain`, `is_compaction_boundary`), while still aborting on
+  real content divergence.
+- **Two edit sites**: (1) `classifier.rs build_turn_dedup_plan` ~732-739 — replace full-`TurnContent`
+  inequality with an explicit intrinsic-content predicate over `role`/`timestamp`/`body`; winner =
+  `min(id)` keeps its own full row. (2) `forward.sql` F4 turn-dedup loser revalidation ~269-289 —
+  compare only `body`/`role`/`timestamp` (drop `parent_turn_id`/`is_sidechain`/`is_compaction_boundary`/
+  `source_file`/`ingested_at`); keep structural id/provider/session/turn_id checks.
+- **Anti-scope (contract failure if violated)**: do NOT change segment-merge semantics, the
+  rollback/preimage structure (full deleted-row images stay), or the F3 segment stale-plan guard
+  (forward.sql ~291-318). No fail-open. No in-tree reader deletion (WU5). Synthetic fixtures only —
+  never the real `state.db`. Zero new lowercase provider-name vocabulary tokens of the kind the
+  AGE-245 S7c / AGE-246 S8 source grep guards count (token delta 0).
+
+## D-S11-M2c-fix-003 — Consolidated pipeline shape (same-lineage precedent D-S11-M2c-v2-002)
+- **Decision**: Run the manager-approved consolidated shape used by this exact lineage
+  (`s11-m2c-collision-resolution`): Phase 2.5 = one dispatched researcher producing problem-map +
+  risk-profile + hookpoints (Phase 5 folded into the problem-map's reuse-point enumeration; the two
+  call sites are the only hookpoints); Phase 3 = one dispatched proposer; Phase 4 = one dispatched
+  gpt-xhigh risk gate scored against the proposal (not the diff); Phase 6a contract orchestrator-
+  authored; Phase 6b tests-first and Phase 6c code are SEPARATE `agents` invocations with distinct
+  UUIDs (6b never sees the fix); Phase 6 tests-contracts alignment dispatched between 6b and 6c;
+  Phase 8 = one dispatched verifier running the FULL `cargo test --workspace` + clippy + fmt + tsc +
+  token-delta-0 + scope-clean; Phase 8.X closure judge; Phase 9 pr-writer + draft PR base `main`.
+- **Process-tree audits (#1/#2/#3)**: folded into the consolidated shape. This orchestrator runs as
+  Claude Code, NOT under an `agents` parent, so there is no root `agents trace --json` tree to audit;
+  the audit invariant is satisfied structurally by the orchestrator enforcing distinct 6b/6c UUIDs,
+  proposal-not-diff risk gating, and full-workspace verification. Same rationale recorded for the v1
+  M2b precedent and the v2 M2c WU in this file.
+- **File ownership (test/code separation)**: code-writer (6c) edits ONLY `classifier.rs` +
+  `forward.sql`; test-writer (6b) edits ONLY `src-tauri/tests/s11_m2_session_ownership_migration.rs`
+  + the `sql.rs` `#[cfg(test)] mod tests`. `forward.sql` is `include_str!`'d into `sql.rs` as
+  `FORWARD_SQL`, so the SQL asset edit flows in at compile time.
+- **Invariant**: the orchestrator writes no source/test code and runs no builds itself; every code
+  change and all verification is performed by dispatched `agents` sub-agents.
+
+## D-S11-M2c-fix-004 — Phase 7 CodeRabbit: enabled, auto-review on draft PR (no pre-merge fix-loop)
+- `coderabbit_review_driver.py is-enabled nestharus/agent-runner` → `enabled: true` (repo-label marker).
+- Phase 7 pre-dispatch prototype gates (inherited-prototype-tests, integration-tests/LevelComponentSet,
+  prototype-swap-record) are all explicitly non-applicable: this is a flat two-site fix with no
+  defer-to-prototype, no post-prototype derivation, no inherited prototype-test evidence. Explicit
+  swap-record N/A written at risk/s11-m2c-fix-prototype-swap-record.md.
+- Decision: do NOT drive an autonomous CodeRabbit fix-loop. It is optional; no PR exists before Phase
+  9; `auto_merge_after_phase_9=false` makes the draft PR the terminal artifact for manager review +
+  merge (after the manager re-runs the full `cargo test --workspace` + on-copy proof). CodeRabbit
+  auto-reviews the draft PR via the repo label, so the manager sees its review at merge time.
