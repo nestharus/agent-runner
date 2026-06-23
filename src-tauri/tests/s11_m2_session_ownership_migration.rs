@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{StateDb, CURRENT_SCHEMA_VERSION};
-use rusqlite::{params, Connection};
+use oulipoly_state::{CURRENT_SCHEMA_VERSION, StateDb};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -886,6 +886,46 @@ fn s11_m2c_t8_rollback_aborts_when_deleted_turn_id_is_occupied() {
         drifted,
         "rollback mutated after drift"
     );
+}
+
+#[test]
+fn s11_m2c_t15_rollback_aborts_when_merge_survivor_row_is_missing() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    seed_turn_dedup_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let survivor_id = latest_segment_id(&before, "chain-merge-three", "session-merge");
+    delete_segment_id(&fixture.state_path, survivor_id);
+    let drifted = full_snapshot(&fixture.state_path);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    assert_failure_mentions_survivor_missing_or_absent(&rollback, fixture.dir.path());
+    assert_failure_does_not_mention(
+        &rollback,
+        fixture.dir.path(),
+        "segment merge survivor drift before rollback",
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        drifted,
+        "rollback mutated after survivor missing drift"
+    );
+}
+
+#[test]
+fn s11_m2c_t16_rollback_aborts_when_merge_survivor_chain_or_session_identity_drifts() {
+    assert_merge_survivor_identity_drift_detected("chain_id");
+    assert_merge_survivor_identity_drift_detected("session_id");
 }
 
 #[test]
@@ -2187,6 +2227,67 @@ fn occupy_turn_id(path: &Path, id: i64) {
     .unwrap();
 }
 
+fn delete_segment_id(path: &Path, id: i64) {
+    let conn = Connection::open(path).unwrap();
+    let deleted = conn
+        .execute("DELETE FROM session_chain_segments WHERE id = ?1", [id])
+        .unwrap();
+    assert_eq!(deleted, 1, "fixture did not delete survivor segment {id}");
+}
+
+fn assert_merge_survivor_identity_drift_detected(column: &str) {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_three_segment_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let survivor_id = latest_segment_id(&before, "chain-merge-three", "session-merge");
+    drift_merge_survivor_identity(&fixture.state_path, survivor_id, column);
+    let drifted = full_snapshot(&fixture.state_path);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    assert_failure_mentions(
+        &rollback,
+        fixture.dir.path(),
+        "segment merge survivor drift before rollback",
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        drifted,
+        "rollback mutated after survivor {column} drift"
+    );
+}
+
+fn drift_merge_survivor_identity(path: &Path, survivor_id: i64, column: &str) {
+    let conn = Connection::open(path).unwrap();
+    match column {
+        "chain_id" => {
+            seed_chain(&conn, "chain-survivor-drift", &target_model_name());
+            conn.execute(
+                "UPDATE session_chain_segments SET chain_id = 'chain-survivor-drift' WHERE id = ?1",
+                [survivor_id],
+            )
+            .unwrap();
+        }
+        "session_id" => {
+            conn.execute(
+                "UPDATE session_chain_segments SET session_id = 'session-survivor-drift' WHERE id = ?1",
+                [survivor_id],
+            )
+            .unwrap();
+        }
+        other => panic!("unsupported survivor identity drift column {other}"),
+    }
+}
+
 fn seed_mailbox(path: &Path, session_id: &str, cwd: Option<&str>) {
     let mut db = MailboxDb::open(path).unwrap();
     db.upsert_session_runtime(SessionRuntimeUpsert {
@@ -3030,6 +3131,23 @@ fn assert_failure_mentions(output: &Output, scratch_dir: &Path, needle: &str) {
     assert!(
         combined.contains(needle),
         "failure did not mention {needle}: {combined}"
+    );
+}
+
+fn assert_failure_does_not_mention(output: &Output, scratch_dir: &Path, needle: &str) {
+    let combined = combined_output(output) + &read_report_if_present(scratch_dir);
+    assert!(
+        !combined.contains(needle),
+        "failure unexpectedly mentioned {needle}: {combined}"
+    );
+}
+
+fn assert_failure_mentions_survivor_missing_or_absent(output: &Output, scratch_dir: &Path) {
+    let combined = combined_output(output) + &read_report_if_present(scratch_dir);
+    assert!(
+        combined.contains("survivor")
+            && (combined.contains("missing") || combined.contains("absent")),
+        "failure did not mention survivor missing/absent: {combined}"
     );
 }
 

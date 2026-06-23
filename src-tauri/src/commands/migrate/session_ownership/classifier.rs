@@ -35,6 +35,13 @@ pub(crate) struct Candidates {
 #[derive(Debug, Clone)]
 pub(crate) struct SegmentMergeGroup {
     pub(crate) survivor_segment_id: i64,
+    pub(crate) expected_chain_id: String,
+    pub(crate) expected_provider_name: String,
+    pub(crate) expected_session_id: String,
+    pub(crate) expected_started_at: String,
+    pub(crate) expected_ended_at: Option<String>,
+    pub(crate) expected_last_turn_id: Option<String>,
+    pub(crate) expected_transition_reason: String,
     pub(crate) merged_started_at: String,
     pub(crate) merged_ended_at: Option<String>,
     pub(crate) merged_last_turn_id: Option<String>,
@@ -45,12 +52,20 @@ pub(crate) struct SegmentMergeGroup {
 pub(crate) struct SegmentMergeDelete {
     pub(crate) segment_id: i64,
     pub(crate) survivor_segment_id: i64,
+    pub(crate) expected_chain_id: String,
+    pub(crate) expected_provider_name: String,
+    pub(crate) expected_session_id: String,
+    pub(crate) expected_started_at: String,
+    pub(crate) expected_ended_at: Option<String>,
+    pub(crate) expected_last_turn_id: Option<String>,
+    pub(crate) expected_transition_reason: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TurnDedupDelete {
     pub(crate) loser_turn_row_id: i64,
     pub(crate) winner_turn_row_id: i64,
+    pub(crate) old_provider_name: String,
     pub(crate) new_provider_name: String,
     pub(crate) session_id: String,
     pub(crate) turn_id: String,
@@ -67,6 +82,9 @@ struct SourceSegment {
 #[derive(Debug, Clone)]
 struct SegmentRow {
     id: i64,
+    chain_id: String,
+    provider_name: String,
+    session_id: String,
     started_at: String,
     ended_at: Option<String>,
     last_turn_id: Option<String>,
@@ -89,6 +107,7 @@ struct TurnContent {
 #[derive(Debug, Clone)]
 struct TurnRow {
     id: i64,
+    old_provider_name: String,
     new_provider_name: String,
     session_id: String,
     content: TurnContent,
@@ -185,23 +204,38 @@ fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
          CREATE TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
          CREATE TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
          CREATE TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
-         CREATE TABLE s11_wu4_segment_merge_groups (
-             survivor_segment_id INTEGER PRIMARY KEY,
-             merged_started_at TEXT NOT NULL,
-             merged_ended_at TEXT,
-             merged_last_turn_id TEXT,
-             merged_transition_reason TEXT NOT NULL
-         );
-         CREATE TABLE s11_wu4_segment_merge_deletes (
-             segment_id INTEGER PRIMARY KEY,
-             survivor_segment_id INTEGER NOT NULL
-         );
-         CREATE TABLE s11_wu4_turn_dedup_deletes (
-             loser_turn_row_id INTEGER PRIMARY KEY,
-             winner_turn_row_id INTEGER NOT NULL,
-             new_provider_name TEXT NOT NULL,
-             session_id TEXT NOT NULL,
-             turn_id TEXT NOT NULL
+          CREATE TABLE s11_wu4_segment_merge_groups (
+              survivor_segment_id INTEGER PRIMARY KEY,
+              expected_chain_id TEXT NOT NULL,
+              expected_provider_name TEXT NOT NULL,
+              expected_session_id TEXT NOT NULL,
+              expected_started_at TEXT NOT NULL,
+              expected_ended_at TEXT,
+              expected_last_turn_id TEXT,
+              expected_transition_reason TEXT NOT NULL,
+              merged_started_at TEXT NOT NULL,
+              merged_ended_at TEXT,
+              merged_last_turn_id TEXT,
+              merged_transition_reason TEXT NOT NULL
+          );
+          CREATE TABLE s11_wu4_segment_merge_deletes (
+              segment_id INTEGER PRIMARY KEY,
+              survivor_segment_id INTEGER NOT NULL,
+              expected_chain_id TEXT NOT NULL,
+              expected_provider_name TEXT NOT NULL,
+              expected_session_id TEXT NOT NULL,
+              expected_started_at TEXT NOT NULL,
+              expected_ended_at TEXT,
+              expected_last_turn_id TEXT,
+              expected_transition_reason TEXT NOT NULL
+          );
+          CREATE TABLE s11_wu4_turn_dedup_deletes (
+              loser_turn_row_id INTEGER PRIMARY KEY,
+              winner_turn_row_id INTEGER NOT NULL,
+              old_provider_name TEXT NOT NULL,
+              new_provider_name TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              turn_id TEXT NOT NULL
          );",
     )
     .map_err(Into::into)
@@ -222,23 +256,38 @@ fn create_temp_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
          CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
          CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
          CREATE TEMP TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
-         CREATE TEMP TABLE s11_wu4_segment_merge_groups (
-             survivor_segment_id INTEGER PRIMARY KEY,
-             merged_started_at TEXT NOT NULL,
-             merged_ended_at TEXT,
-             merged_last_turn_id TEXT,
-             merged_transition_reason TEXT NOT NULL
-         );
-         CREATE TEMP TABLE s11_wu4_segment_merge_deletes (
-             segment_id INTEGER PRIMARY KEY,
-             survivor_segment_id INTEGER NOT NULL
-         );
-         CREATE TEMP TABLE s11_wu4_turn_dedup_deletes (
-             loser_turn_row_id INTEGER PRIMARY KEY,
-             winner_turn_row_id INTEGER NOT NULL,
-             new_provider_name TEXT NOT NULL,
-             session_id TEXT NOT NULL,
-             turn_id TEXT NOT NULL
+          CREATE TEMP TABLE s11_wu4_segment_merge_groups (
+              survivor_segment_id INTEGER PRIMARY KEY,
+              expected_chain_id TEXT NOT NULL,
+              expected_provider_name TEXT NOT NULL,
+              expected_session_id TEXT NOT NULL,
+              expected_started_at TEXT NOT NULL,
+              expected_ended_at TEXT,
+              expected_last_turn_id TEXT,
+              expected_transition_reason TEXT NOT NULL,
+              merged_started_at TEXT NOT NULL,
+              merged_ended_at TEXT,
+              merged_last_turn_id TEXT,
+              merged_transition_reason TEXT NOT NULL
+          );
+          CREATE TEMP TABLE s11_wu4_segment_merge_deletes (
+              segment_id INTEGER PRIMARY KEY,
+              survivor_segment_id INTEGER NOT NULL,
+              expected_chain_id TEXT NOT NULL,
+              expected_provider_name TEXT NOT NULL,
+              expected_session_id TEXT NOT NULL,
+              expected_started_at TEXT NOT NULL,
+              expected_ended_at TEXT,
+              expected_last_turn_id TEXT,
+              expected_transition_reason TEXT NOT NULL
+          );
+          CREATE TEMP TABLE s11_wu4_turn_dedup_deletes (
+              loser_turn_row_id INTEGER PRIMARY KEY,
+              winner_turn_row_id INTEGER NOT NULL,
+              old_provider_name TEXT NOT NULL,
+              new_provider_name TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              turn_id TEXT NOT NULL
          );",
     )
     .map_err(Into::into)
@@ -276,11 +325,20 @@ fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<()
     for group in rows.segment_merge_groups {
         conn.execute(
             "INSERT INTO s11_wu4_segment_merge_groups(
-                 survivor_segment_id, merged_started_at, merged_ended_at,
-                 merged_last_turn_id, merged_transition_reason
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 survivor_segment_id, expected_chain_id, expected_provider_name,
+                 expected_session_id, expected_started_at, expected_ended_at,
+                 expected_last_turn_id, expected_transition_reason, merged_started_at,
+                 merged_ended_at, merged_last_turn_id, merged_transition_reason
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 group.survivor_segment_id,
+                group.expected_chain_id,
+                group.expected_provider_name,
+                group.expected_session_id,
+                group.expected_started_at,
+                group.expected_ended_at,
+                group.expected_last_turn_id,
+                group.expected_transition_reason,
                 group.merged_started_at,
                 group.merged_ended_at,
                 group.merged_last_turn_id,
@@ -290,19 +348,34 @@ fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<()
     }
     for delete in rows.segment_merge_deletes {
         conn.execute(
-            "INSERT INTO s11_wu4_segment_merge_deletes(segment_id, survivor_segment_id)
-             VALUES (?1, ?2)",
-            params![delete.segment_id, delete.survivor_segment_id],
+            "INSERT INTO s11_wu4_segment_merge_deletes(
+                 segment_id, survivor_segment_id, expected_chain_id,
+                 expected_provider_name, expected_session_id, expected_started_at,
+                 expected_ended_at, expected_last_turn_id, expected_transition_reason
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                delete.segment_id,
+                delete.survivor_segment_id,
+                delete.expected_chain_id,
+                delete.expected_provider_name,
+                delete.expected_session_id,
+                delete.expected_started_at,
+                delete.expected_ended_at,
+                delete.expected_last_turn_id,
+                delete.expected_transition_reason,
+            ],
         )?;
     }
     for delete in rows.turn_dedup_deletes {
         conn.execute(
             "INSERT INTO s11_wu4_turn_dedup_deletes(
-                 loser_turn_row_id, winner_turn_row_id, new_provider_name, session_id, turn_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 loser_turn_row_id, winner_turn_row_id, old_provider_name,
+                 new_provider_name, session_id, turn_id
+              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 delete.loser_turn_row_id,
                 delete.winner_turn_row_id,
+                delete.old_provider_name,
                 delete.new_provider_name,
                 delete.session_id,
                 delete.turn_id,
@@ -578,6 +651,13 @@ fn build_segment_merge_plan(
         let latest_id = latest.id;
         merge_groups.push(SegmentMergeGroup {
             survivor_segment_id: latest_id,
+            expected_chain_id: latest.chain_id.clone(),
+            expected_provider_name: latest.provider_name.clone(),
+            expected_session_id: latest.session_id.clone(),
+            expected_started_at: latest.started_at.clone(),
+            expected_ended_at: latest.ended_at.clone(),
+            expected_last_turn_id: latest.last_turn_id.clone(),
+            expected_transition_reason: latest.transition_reason.clone(),
             merged_started_at: earliest.started_at.clone(),
             merged_ended_at: latest.ended_at.clone(),
             merged_last_turn_id: latest.last_turn_id.clone(),
@@ -588,6 +668,13 @@ fn build_segment_merge_plan(
                 merge_deletes.push(SegmentMergeDelete {
                     segment_id: row.id,
                     survivor_segment_id: latest_id,
+                    expected_chain_id: row.chain_id.clone(),
+                    expected_provider_name: row.provider_name.clone(),
+                    expected_session_id: row.session_id.clone(),
+                    expected_started_at: row.started_at.clone(),
+                    expected_ended_at: row.ended_at.clone(),
+                    expected_last_turn_id: row.last_turn_id.clone(),
+                    expected_transition_reason: row.transition_reason.clone(),
                 });
             }
         }
@@ -601,7 +688,8 @@ fn read_segment_rows(
 ) -> Result<BTreeMap<i64, SegmentRow>, DryRunError> {
     let mut rows = BTreeMap::new();
     let mut stmt = conn.prepare(
-        "SELECT id, started_at, ended_at, last_turn_id, transition_reason
+        "SELECT id, chain_id, provider_name, session_id, started_at, ended_at,
+                last_turn_id, transition_reason
          FROM session_chain_segments
          WHERE id = ?1",
     )?;
@@ -609,10 +697,13 @@ fn read_segment_rows(
         let row = stmt.query_row([segment.segment_id], |row| {
             Ok(SegmentRow {
                 id: row.get(0)?,
-                started_at: row.get(1)?,
-                ended_at: row.get(2)?,
-                last_turn_id: row.get(3)?,
-                transition_reason: row.get(4)?,
+                chain_id: row.get(1)?,
+                provider_name: row.get(2)?,
+                session_id: row.get(3)?,
+                started_at: row.get(4)?,
+                ended_at: row.get(5)?,
+                last_turn_id: row.get(6)?,
+                transition_reason: row.get(7)?,
             })
         })?;
         rows.insert(row.id, row);
@@ -654,6 +745,7 @@ fn build_turn_dedup_plan(
             deletes.push(TurnDedupDelete {
                 loser_turn_row_id: loser.id,
                 winner_turn_row_id: winner.id,
+                old_provider_name: loser.old_provider_name.clone(),
                 new_provider_name: loser.new_provider_name.clone(),
                 session_id: loser.session_id.clone(),
                 turn_id: loser.content.turn_id.clone(),
@@ -694,13 +786,13 @@ fn read_candidate_turn_rows(
     let mut rows = BTreeMap::new();
     for ((old_provider_name, session_id), new_provider_name) in owner_remaps {
         let turn_rows = owner_stmt.query_map(params![old_provider_name, session_id], |row| {
-            read_turn_row(row, new_provider_name, session_id)
+            read_turn_row(row, old_provider_name, new_provider_name, session_id)
         })?;
         for turn in turn_rows.collect::<Result<Vec<_>, _>>()? {
             if old_provider_name != new_provider_name {
                 let canonical_rows = canonical_stmt.query_map(
                     params![new_provider_name, session_id, turn.content.turn_id.as_str()],
-                    |row| read_turn_row(row, new_provider_name, session_id),
+                    |row| read_turn_row(row, new_provider_name, new_provider_name, session_id),
                 )?;
                 for canonical in canonical_rows.collect::<Result<Vec<_>, _>>()? {
                     rows.insert(canonical.id, canonical);
@@ -714,11 +806,13 @@ fn read_candidate_turn_rows(
 
 fn read_turn_row(
     row: &rusqlite::Row<'_>,
+    old_provider_name: &str,
     new_provider_name: &str,
     session_id: &str,
 ) -> Result<TurnRow, rusqlite::Error> {
     Ok(TurnRow {
         id: row.get(0)?,
+        old_provider_name: old_provider_name.to_string(),
         new_provider_name: new_provider_name.to_string(),
         session_id: session_id.to_string(),
         content: TurnContent {

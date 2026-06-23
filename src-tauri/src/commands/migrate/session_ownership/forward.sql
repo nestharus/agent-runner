@@ -268,24 +268,54 @@ SELECT 1
 WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
   AND EXISTS (
     SELECT 1
-    FROM s11_wu4_turn_dedup_deletes planned
-    LEFT JOIN session_turns loser ON loser.id = planned.loser_turn_row_id
-    LEFT JOIN session_turns winner ON winner.id = planned.winner_turn_row_id
-    WHERE loser.id IS NULL
-       OR winner.id IS NULL
-       OR loser.session_id <> planned.session_id
-       OR loser.turn_id <> planned.turn_id
-       OR winner.session_id <> planned.session_id
-       OR winner.turn_id <> planned.turn_id
+     FROM s11_wu4_turn_dedup_deletes planned
+     LEFT JOIN session_turns loser ON loser.id = planned.loser_turn_row_id
+     LEFT JOIN session_turns winner ON winner.id = planned.winner_turn_row_id
+     WHERE loser.id IS NULL
+        OR winner.id IS NULL
+        OR loser.provider_name <> planned.old_provider_name
+        OR loser.session_id <> planned.session_id
+        OR loser.turn_id <> planned.turn_id
+        OR winner.session_id <> planned.session_id
+        OR winner.turn_id <> planned.turn_id
        OR NOT (loser.timestamp IS winner.timestamp)
        OR NOT (loser.role IS winner.role)
        OR NOT (loser.parent_turn_id IS winner.parent_turn_id)
        OR NOT (loser.is_sidechain IS winner.is_sidechain)
        OR NOT (loser.is_compaction_boundary IS winner.is_compaction_boundary)
        OR NOT (loser.source_file IS winner.source_file)
-       OR NOT (loser.ingested_at IS winner.ingested_at)
-       OR NOT (loser.body IS winner.body)
+        OR NOT (loser.ingested_at IS winner.ingested_at)
+        OR NOT (loser.body IS winner.body)
 );
+
+INSERT OR ROLLBACK INTO s11_wu4_forward_guard(id)
+SELECT 1
+WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
+  AND EXISTS (
+    SELECT 1
+    FROM s11_wu4_segment_merge_deletes planned
+    LEFT JOIN session_chain_segments segment ON segment.id = planned.segment_id
+    WHERE segment.id IS NULL
+       OR NOT (segment.chain_id IS planned.expected_chain_id)
+       OR NOT (segment.provider_name IS planned.expected_provider_name)
+       OR NOT (segment.session_id IS planned.expected_session_id)
+       OR NOT (segment.started_at IS planned.expected_started_at)
+       OR NOT (segment.ended_at IS planned.expected_ended_at)
+       OR NOT (segment.last_turn_id IS planned.expected_last_turn_id)
+       OR NOT (segment.transition_reason IS planned.expected_transition_reason)
+    UNION ALL
+    SELECT 1
+    FROM s11_wu4_segment_merge_groups planned
+    LEFT JOIN session_chain_segments segment ON segment.id = planned.survivor_segment_id
+    WHERE segment.id IS NULL
+       OR NOT (segment.chain_id IS planned.expected_chain_id)
+       OR NOT (segment.provider_name IS planned.expected_provider_name)
+       OR NOT (segment.session_id IS planned.expected_session_id)
+       OR NOT (segment.started_at IS planned.expected_started_at)
+       OR NOT (segment.ended_at IS planned.expected_ended_at)
+       OR NOT (segment.last_turn_id IS planned.expected_last_turn_id)
+       OR NOT (segment.transition_reason IS planned.expected_transition_reason)
+ );
 
 DROP TABLE IF EXISTS s11_wu4_last_run_counts;
 CREATE TABLE s11_wu4_last_run_counts (

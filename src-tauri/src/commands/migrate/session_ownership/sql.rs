@@ -250,11 +250,23 @@ fn rollback_drift_probes() -> Vec<(&'static str, &'static str)> {
                 JOIN session_chain_segments s ON s.id = p.segment_id
                 WHERE p.entity_kind = 'segment_merge_survivor'
                   AND (
-                       s.provider_name <> p.new_provider_name
+                       NOT (s.chain_id IS p.chain_id)
+                    OR s.provider_name <> p.new_provider_name
+                    OR NOT (s.session_id IS p.session_id)
                     OR NOT (s.started_at IS p.new_started_at)
                     OR NOT (s.ended_at IS p.new_ended_at)
                     OR NOT (s.last_turn_id IS p.new_last_turn_id)
                     OR NOT (s.transition_reason IS p.new_transition_reason)
+                  )
+             )",
+        ),
+        (
+            "segment merge survivor missing before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                WHERE p.entity_kind = 'segment_merge_survivor'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_chain_segments s WHERE s.id = p.segment_id
                   )
              )",
         ),
@@ -879,6 +891,84 @@ mod tests {
         assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
     }
 
+    #[test]
+    fn session_ownership_sql_stale_segment_merge_plan_rolls_back_whole_forward_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let mut conn = Connection::open(&state_path).unwrap();
+        seed_segment_merge_collision(&conn);
+
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.segment_rows_merged_away, 1);
+        assert_eq!(candidates.segment_merge_survivors_updated, 1);
+        let loser_id = candidates.segment_merge_deletes[0].segment_id;
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_chain_segments SET started_at = '2026-06-20T11:00:00Z' WHERE id = ?1",
+            [loser_id],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("stale segment plan must fail closed");
+
+        assert_forward_guard_error(&err);
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
+    #[test]
+    fn session_ownership_sql_turn_dedup_loser_provider_drift_rolls_back_whole_forward_transaction()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let mut conn = Connection::open(&state_path).unwrap();
+        seed_byte_identical_turn_collision(&conn);
+
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        let loser_id = candidates.turn_dedup_deletes[0].loser_turn_row_id;
+        let third_provider = "acct-third-neutral";
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE session_turns SET provider_name = ?1 WHERE id = ?2",
+            params![third_provider, loser_id],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("provider-drifted loser must fail closed");
+
+        assert_forward_guard_error(&err);
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(turn_row_exists_with_provider(
+            &conn,
+            loser_id,
+            third_provider
+        ));
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
     fn write_target_config(models_dir: &Path) {
         let token = moved_provider_token();
         let target_binary = format!("agent-runner-{token}");
@@ -930,6 +1020,49 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn seed_segment_merge_collision(conn: &Connection) {
+        let token = moved_provider_token();
+        let source_model = format!("legacy-{token}-model");
+        let canonical = format!("acct-main-{token}");
+        let unregistered = format!("acct-unreg-{token}");
+        conn.execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES ('chain-segment-stale-plan', ?1, ?1, ?2)",
+            params![FIXED_TS, source_model],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+             (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+             VALUES ('chain-segment-stale-plan', ?1, 'session-segment-stale', ?2, ?2, 'turn-earlier', 'manual')",
+            params![unregistered, FIXED_TS],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+             (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason)
+             VALUES ('chain-segment-stale-plan', ?1, 'session-segment-stale', '2026-06-20T10:05:00Z', NULL, 'turn-latest', 'quota_threshold')",
+            params![canonical],
+        )
+        .unwrap();
+    }
+
+    fn assert_forward_guard_error(err: &DryRunError) {
+        assert!(
+            err.to_string().contains("s11_wu4_forward_guard") || err.to_string().contains("UNIQUE"),
+            "unexpected stale-plan error: {err}"
+        );
+    }
+
+    fn turn_row_exists_with_provider(conn: &Connection, id: i64, provider_name: &str) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_turns WHERE id = ?1 AND provider_name = ?2)",
+            params![id, provider_name],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     fn full_db_snapshot(conn: &Connection) -> BTreeMap<String, Vec<String>> {
