@@ -1,9 +1,9 @@
 //! Declared role: mapper, filter, accessor, validator, orchestration
 
-use super::DryRunError;
 use super::target_resolution::TargetResolution;
-use rusqlite::{Connection, params};
-use std::collections::BTreeSet;
+use super::DryRunError;
+use rusqlite::{params, Connection};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateSegment {
@@ -22,8 +22,38 @@ pub(crate) struct Candidates {
     pub(crate) eligible_segments: i64,
     pub(crate) blocked_segments: i64,
     pub(crate) issue52_unregistered_segments: i64,
+    pub(crate) segment_rows_merged_away: i64,
+    pub(crate) turn_rows_deduped_away: i64,
+    pub(crate) segment_merge_survivors_updated: i64,
     pub(crate) source_chains: Vec<String>,
     pub(crate) segments: Vec<CandidateSegment>,
+    pub(crate) segment_merge_groups: Vec<SegmentMergeGroup>,
+    pub(crate) segment_merge_deletes: Vec<SegmentMergeDelete>,
+    pub(crate) turn_dedup_deletes: Vec<TurnDedupDelete>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SegmentMergeGroup {
+    pub(crate) survivor_segment_id: i64,
+    pub(crate) merged_started_at: String,
+    pub(crate) merged_ended_at: Option<String>,
+    pub(crate) merged_last_turn_id: Option<String>,
+    pub(crate) merged_transition_reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SegmentMergeDelete {
+    pub(crate) segment_id: i64,
+    pub(crate) survivor_segment_id: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TurnDedupDelete {
+    pub(crate) loser_turn_row_id: i64,
+    pub(crate) winner_turn_row_id: i64,
+    pub(crate) new_provider_name: String,
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +62,36 @@ struct SourceSegment {
     segment_id: i64,
     old_provider_name: String,
     session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentRow {
+    id: i64,
+    started_at: String,
+    ended_at: Option<String>,
+    last_turn_id: Option<String>,
+    transition_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnContent {
+    turn_id: String,
+    timestamp: String,
+    role: String,
+    parent_turn_id: Option<String>,
+    is_sidechain: i64,
+    is_compaction_boundary: i64,
+    source_file: Option<String>,
+    ingested_at: String,
+    body: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TurnRow {
+    id: i64,
+    new_provider_name: String,
+    session_id: String,
+    content: TurnContent,
 }
 
 #[derive(Debug)]
@@ -46,6 +106,9 @@ struct SqlInputRows<'a> {
     provider_inventory: Vec<&'a str>,
     source_chains: Vec<&'a str>,
     provider_aliases: Vec<ProviderAliasRow<'a>>,
+    segment_merge_groups: &'a [SegmentMergeGroup],
+    segment_merge_deletes: &'a [SegmentMergeDelete],
+    turn_dedup_deletes: &'a [TurnDedupDelete],
 }
 
 #[derive(Debug)]
@@ -62,9 +125,15 @@ pub(crate) fn classify(
     let source_segments = read_source_segments(conn, &source_chains)?;
     let partitions = partition_segments_by_inventory(source_segments, &provider_inventory(target));
     let segments = candidate_segments(partitions, &target.canonical_provider_name);
-    assert_no_segment_collision(conn, &segments)?;
-    assert_no_turn_collision(conn, &segments)?;
-    Ok(candidates_from_segments(source_chains, segments))
+    let (segment_merge_groups, segment_merge_deletes) = build_segment_merge_plan(conn, &segments)?;
+    let turn_dedup_deletes = build_turn_dedup_plan(conn, &segments)?;
+    Ok(candidates_from_segments(
+        source_chains,
+        segments,
+        segment_merge_groups,
+        segment_merge_deletes,
+        turn_dedup_deletes,
+    ))
 }
 
 pub(crate) fn populate_sql_inputs(
@@ -94,7 +163,10 @@ pub(crate) fn cleanup_temp_sql_inputs(conn: &Connection) {
          DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
          DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
          DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
-         DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;",
+         DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;
+         DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_groups;
+         DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_deletes;
+         DROP TABLE IF EXISTS temp.s11_wu4_turn_dedup_deletes;",
     );
 }
 
@@ -105,11 +177,32 @@ fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
          DROP TABLE IF EXISTS s11_wu4_target_provider_inventory;
          DROP TABLE IF EXISTS s11_wu4_provider_aliases;
          DROP TABLE IF EXISTS s11_wu4_source_chain_candidates;
+         DROP TABLE IF EXISTS s11_wu4_segment_merge_groups;
+         DROP TABLE IF EXISTS s11_wu4_segment_merge_deletes;
+         DROP TABLE IF EXISTS s11_wu4_turn_dedup_deletes;
          CREATE TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
          CREATE TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
          CREATE TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
-         CREATE TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);",
+         CREATE TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
+         CREATE TABLE s11_wu4_segment_merge_groups (
+             survivor_segment_id INTEGER PRIMARY KEY,
+             merged_started_at TEXT NOT NULL,
+             merged_ended_at TEXT,
+             merged_last_turn_id TEXT,
+             merged_transition_reason TEXT NOT NULL
+         );
+         CREATE TABLE s11_wu4_segment_merge_deletes (
+             segment_id INTEGER PRIMARY KEY,
+             survivor_segment_id INTEGER NOT NULL
+         );
+         CREATE TABLE s11_wu4_turn_dedup_deletes (
+             loser_turn_row_id INTEGER PRIMARY KEY,
+             winner_turn_row_id INTEGER NOT NULL,
+             new_provider_name TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL
+         );",
     )
     .map_err(Into::into)
 }
@@ -121,11 +214,32 @@ fn create_temp_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
          DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
          DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
          DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;
+         DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_groups;
+         DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_deletes;
+         DROP TABLE IF EXISTS temp.s11_wu4_turn_dedup_deletes;
          CREATE TEMP TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
          CREATE TEMP TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
          CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
          CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
-         CREATE TEMP TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);",
+         CREATE TEMP TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
+         CREATE TEMP TABLE s11_wu4_segment_merge_groups (
+             survivor_segment_id INTEGER PRIMARY KEY,
+             merged_started_at TEXT NOT NULL,
+             merged_ended_at TEXT,
+             merged_last_turn_id TEXT,
+             merged_transition_reason TEXT NOT NULL
+         );
+         CREATE TEMP TABLE s11_wu4_segment_merge_deletes (
+             segment_id INTEGER PRIMARY KEY,
+             survivor_segment_id INTEGER NOT NULL
+         );
+         CREATE TEMP TABLE s11_wu4_turn_dedup_deletes (
+             loser_turn_row_id INTEGER PRIMARY KEY,
+             winner_turn_row_id INTEGER NOT NULL,
+             new_provider_name TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL
+         );",
     )
     .map_err(Into::into)
 }
@@ -159,6 +273,42 @@ fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<()
             params![alias.old_provider_name, alias.new_provider_name],
         )?;
     }
+    for group in rows.segment_merge_groups {
+        conn.execute(
+            "INSERT INTO s11_wu4_segment_merge_groups(
+                 survivor_segment_id, merged_started_at, merged_ended_at,
+                 merged_last_turn_id, merged_transition_reason
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                group.survivor_segment_id,
+                group.merged_started_at,
+                group.merged_ended_at,
+                group.merged_last_turn_id,
+                group.merged_transition_reason,
+            ],
+        )?;
+    }
+    for delete in rows.segment_merge_deletes {
+        conn.execute(
+            "INSERT INTO s11_wu4_segment_merge_deletes(segment_id, survivor_segment_id)
+             VALUES (?1, ?2)",
+            params![delete.segment_id, delete.survivor_segment_id],
+        )?;
+    }
+    for delete in rows.turn_dedup_deletes {
+        conn.execute(
+            "INSERT INTO s11_wu4_turn_dedup_deletes(
+                 loser_turn_row_id, winner_turn_row_id, new_provider_name, session_id, turn_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                delete.loser_turn_row_id,
+                delete.winner_turn_row_id,
+                delete.new_provider_name,
+                delete.session_id,
+                delete.turn_id,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -171,6 +321,9 @@ fn sql_input_rows<'a>(
         provider_inventory: provider_inventory_rows(target),
         source_chains: source_chain_rows(candidates),
         provider_aliases: provider_alias_rows(&remapped_segments(&candidates.segments)),
+        segment_merge_groups: &candidates.segment_merge_groups,
+        segment_merge_deletes: &candidates.segment_merge_deletes,
+        turn_dedup_deletes: &candidates.turn_dedup_deletes,
     }
 }
 
@@ -344,16 +497,28 @@ fn candidate_segment(
 fn candidates_from_segments(
     source_chains: Vec<String>,
     segments: Vec<CandidateSegment>,
+    segment_merge_groups: Vec<SegmentMergeGroup>,
+    segment_merge_deletes: Vec<SegmentMergeDelete>,
+    turn_dedup_deletes: Vec<TurnDedupDelete>,
 ) -> Candidates {
     let issue52_unregistered_segments = issue52_unregistered_segments(&segments) as i64;
+    let segment_rows_merged_away = segment_merge_deletes.len() as i64;
+    let turn_rows_deduped_away = turn_dedup_deletes.len() as i64;
+    let segment_merge_survivors_updated = segment_merge_groups.len() as i64;
     Candidates {
         candidate_chains: source_chains.len() as i64,
         candidate_segments: segments.len() as i64,
         eligible_segments: segments.len() as i64,
         blocked_segments: 0,
         issue52_unregistered_segments,
+        segment_rows_merged_away,
+        turn_rows_deduped_away,
+        segment_merge_survivors_updated,
         source_chains,
         segments,
+        segment_merge_groups,
+        segment_merge_deletes,
+        turn_dedup_deletes,
     }
 }
 
@@ -371,87 +536,203 @@ fn remapped_segments(segments: &[CandidateSegment]) -> Vec<&CandidateSegment> {
         .collect()
 }
 
-fn assert_no_segment_collision(
+fn build_segment_merge_plan(
     conn: &Connection,
     segments: &[CandidateSegment],
-) -> Result<(), DryRunError> {
-    for segment in remapped_segments(segments) {
-        validate_no_segment_collision(segment_collision_exists(conn, segment)?)?;
+) -> Result<(Vec<SegmentMergeGroup>, Vec<SegmentMergeDelete>), DryRunError> {
+    let segment_rows = read_segment_rows(conn, segments)?;
+    let mut groups: BTreeMap<(&str, &str, &str), Vec<&CandidateSegment>> = BTreeMap::new();
+    for segment in segments {
+        groups
+            .entry((
+                segment.chain_id.as_str(),
+                segment.new_provider_name.as_str(),
+                segment.session_id.as_str(),
+            ))
+            .or_default()
+            .push(segment);
     }
-    Ok(())
-}
 
-fn segment_collision_exists(
-    conn: &Connection,
-    segment: &CandidateSegment,
-) -> Result<bool, DryRunError> {
-    conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM session_chain_segments
-            WHERE chain_id = ?1 AND provider_name = ?2 AND session_id = ?3 AND id <> ?4
-         )",
-        params![
-            segment.chain_id,
-            segment.new_provider_name,
-            segment.session_id,
-            segment.segment_id
-        ],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
-}
-
-fn validate_no_segment_collision(exists: bool) -> Result<(), DryRunError> {
-    if exists {
-        return Err(DryRunError::new(
-            "segment provider remap would collide with UNIQUE(chain_id, provider_name, session_id)",
-        ));
+    let mut merge_groups = Vec::new();
+    let mut merge_deletes = Vec::new();
+    for grouped_segments in groups.values().filter(|group| group.len() > 1) {
+        let mut rows = grouped_segments
+            .iter()
+            .map(|segment| {
+                segment_rows
+                    .get(&segment.segment_id)
+                    .ok_or_else(|| DryRunError::new("segment merge plan referenced missing row"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then(left.id.cmp(&right.id))
+        });
+        let earliest = rows
+            .first()
+            .expect("colliding segment group is nonempty after filter");
+        let latest = rows
+            .last()
+            .expect("colliding segment group is nonempty after filter");
+        let latest_id = latest.id;
+        merge_groups.push(SegmentMergeGroup {
+            survivor_segment_id: latest_id,
+            merged_started_at: earliest.started_at.clone(),
+            merged_ended_at: latest.ended_at.clone(),
+            merged_last_turn_id: latest.last_turn_id.clone(),
+            merged_transition_reason: latest.transition_reason.clone(),
+        });
+        for row in rows {
+            if row.id != latest_id {
+                merge_deletes.push(SegmentMergeDelete {
+                    segment_id: row.id,
+                    survivor_segment_id: latest_id,
+                });
+            }
+        }
     }
-    Ok(())
+    Ok((merge_groups, merge_deletes))
 }
 
-fn assert_no_turn_collision(
+fn read_segment_rows(
     conn: &Connection,
     segments: &[CandidateSegment],
-) -> Result<(), DryRunError> {
-    for segment in remapped_segments(segments) {
-        validate_no_turn_collision(turn_collision_exists(conn, segment)?)?;
+) -> Result<BTreeMap<i64, SegmentRow>, DryRunError> {
+    let mut rows = BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, started_at, ended_at, last_turn_id, transition_reason
+         FROM session_chain_segments
+         WHERE id = ?1",
+    )?;
+    for segment in segments {
+        let row = stmt.query_row([segment.segment_id], |row| {
+            Ok(SegmentRow {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                ended_at: row.get(2)?,
+                last_turn_id: row.get(3)?,
+                transition_reason: row.get(4)?,
+            })
+        })?;
+        rows.insert(row.id, row);
     }
-    Ok(())
+    Ok(rows)
 }
 
-fn turn_collision_exists(
+fn build_turn_dedup_plan(
     conn: &Connection,
-    segment: &CandidateSegment,
-) -> Result<bool, DryRunError> {
-    conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1
-            FROM session_turns old_turn
-            JOIN session_turns existing_turn
-              ON existing_turn.provider_name = ?1
-             AND existing_turn.session_id = old_turn.session_id
-             AND existing_turn.turn_id = old_turn.turn_id
-             AND existing_turn.id <> old_turn.id
-            WHERE old_turn.provider_name = ?2 AND old_turn.session_id = ?3
-         )",
-        params![
-            segment.new_provider_name,
-            segment.old_provider_name,
-            segment.session_id
-        ],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+    segments: &[CandidateSegment],
+) -> Result<Vec<TurnDedupDelete>, DryRunError> {
+    let turns = read_candidate_turn_rows(conn, segments)?;
+    let mut groups: BTreeMap<(&str, &str, &str), Vec<&TurnRow>> = BTreeMap::new();
+    for turn in &turns {
+        groups
+            .entry((
+                turn.new_provider_name.as_str(),
+                turn.session_id.as_str(),
+                turn.content.turn_id.as_str(),
+            ))
+            .or_default()
+            .push(turn);
+    }
+
+    let mut deletes = Vec::new();
+    for group in groups.values().filter(|group| group.len() > 1) {
+        let first = &group[0].content;
+        if group.iter().any(|turn| &turn.content != first) {
+            return Err(DryRunError::new(format!(
+                "divergent session_turns collision for session_id={} turn_id={}",
+                group[0].session_id, group[0].content.turn_id
+            )));
+        }
+        let winner = group
+            .iter()
+            .min_by_key(|turn| turn.id)
+            .expect("colliding turn group is nonempty after filter");
+        for loser in group.iter().filter(|turn| turn.id != winner.id) {
+            deletes.push(TurnDedupDelete {
+                loser_turn_row_id: loser.id,
+                winner_turn_row_id: winner.id,
+                new_provider_name: loser.new_provider_name.clone(),
+                session_id: loser.session_id.clone(),
+                turn_id: loser.content.turn_id.clone(),
+            });
+        }
+    }
+    Ok(deletes)
 }
 
-fn validate_no_turn_collision(exists: bool) -> Result<(), DryRunError> {
-    if exists {
-        return Err(DryRunError::new(
-            "session_turns provider remap would collide with UNIQUE(provider_name, session_id, turn_id)",
-        ));
+fn read_candidate_turn_rows(
+    conn: &Connection,
+    segments: &[CandidateSegment],
+) -> Result<Vec<TurnRow>, DryRunError> {
+    let mut owner_remaps = BTreeMap::new();
+    for segment in segments {
+        owner_remaps.insert(
+            (
+                segment.old_provider_name.as_str(),
+                segment.session_id.as_str(),
+            ),
+            segment.new_provider_name.as_str(),
+        );
     }
-    Ok(())
+    let mut owner_stmt = conn.prepare(
+        "SELECT id, turn_id, timestamp, role, parent_turn_id, is_sidechain,
+                is_compaction_boundary, source_file, ingested_at, body
+         FROM session_turns
+         WHERE provider_name = ?1 AND session_id = ?2
+         ORDER BY id",
+    )?;
+    let mut canonical_stmt = conn.prepare(
+        "SELECT id, turn_id, timestamp, role, parent_turn_id, is_sidechain,
+                is_compaction_boundary, source_file, ingested_at, body
+         FROM session_turns
+         WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3
+         ORDER BY id",
+    )?;
+    let mut rows = BTreeMap::new();
+    for ((old_provider_name, session_id), new_provider_name) in owner_remaps {
+        let turn_rows = owner_stmt.query_map(params![old_provider_name, session_id], |row| {
+            read_turn_row(row, new_provider_name, session_id)
+        })?;
+        for turn in turn_rows.collect::<Result<Vec<_>, _>>()? {
+            if old_provider_name != new_provider_name {
+                let canonical_rows = canonical_stmt.query_map(
+                    params![new_provider_name, session_id, turn.content.turn_id.as_str()],
+                    |row| read_turn_row(row, new_provider_name, session_id),
+                )?;
+                for canonical in canonical_rows.collect::<Result<Vec<_>, _>>()? {
+                    rows.insert(canonical.id, canonical);
+                }
+            }
+            rows.insert(turn.id, turn);
+        }
+    }
+    Ok(rows.into_values().collect())
+}
+
+fn read_turn_row(
+    row: &rusqlite::Row<'_>,
+    new_provider_name: &str,
+    session_id: &str,
+) -> Result<TurnRow, rusqlite::Error> {
+    Ok(TurnRow {
+        id: row.get(0)?,
+        new_provider_name: new_provider_name.to_string(),
+        session_id: session_id.to_string(),
+        content: TurnContent {
+            turn_id: row.get(1)?,
+            timestamp: row.get(2)?,
+            role: row.get(3)?,
+            parent_turn_id: row.get(4)?,
+            is_sidechain: row.get(5)?,
+            is_compaction_boundary: row.get(6)?,
+            source_file: row.get(7)?,
+            ingested_at: row.get(8)?,
+            body: row.get(9)?,
+        },
+    })
 }
 
 fn moved_provider_token() -> String {
