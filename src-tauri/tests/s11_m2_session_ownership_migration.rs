@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{StateDb, CURRENT_SCHEMA_VERSION};
-use rusqlite::{params, Connection};
+use oulipoly_state::{CURRENT_SCHEMA_VERSION, StateDb};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,6 +22,7 @@ struct Fixture {
     scratch_dir: PathBuf,
     models_dir: PathBuf,
     config_dir: PathBuf,
+    provider_bin_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,9 +72,11 @@ impl Fixture {
         let config_dir = dir.path().join("config");
         let scratch_dir = dir.path().join("scratch");
         let models_dir = config_dir.join("models");
+        let provider_bin_dir = dir.path().join("provider-bin");
         fs::create_dir_all(&state_dir).unwrap();
         fs::create_dir_all(&scratch_dir).unwrap();
         fs::create_dir_all(&models_dir).unwrap();
+        fs::create_dir_all(&provider_bin_dir).unwrap();
         Self {
             state_path: state_dir.join("state.db"),
             mailbox_path: state_dir.join("pid-identity.db"),
@@ -81,6 +84,7 @@ impl Fixture {
             scratch_dir,
             models_dir,
             config_dir,
+            provider_bin_dir,
         }
     }
 
@@ -90,11 +94,7 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
-        cmd.env("XDG_CONFIG_HOME", &self.config_dir);
-        cmd.env("XDG_DATA_HOME", self.dir.path().join("xdg-data"));
-        cmd.env_remove("OULIPOLY_DATA_DIR");
-        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        let mut cmd = self.base_command();
         cmd.arg("migrate-session-ownership")
             .arg("--dry-run")
             .arg("--scratch-dir")
@@ -106,11 +106,76 @@ impl Fixture {
         cmd
     }
 
+    fn base_command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.env("XDG_CONFIG_HOME", &self.config_dir);
+        cmd.env("XDG_DATA_HOME", self.dir.path().join("xdg-data"));
+        cmd.env_remove("OULIPOLY_DATA_DIR");
+        cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
+        let prior_path = std::env::var_os("PATH").unwrap_or_default();
+        let path_entries = std::iter::once(self.provider_bin_dir.clone())
+            .chain(std::env::split_paths(&prior_path));
+        cmd.env("PATH", std::env::join_paths(path_entries).unwrap());
+        cmd
+    }
+
+    fn apply_command(
+        &self,
+        backup_dir: Option<&Path>,
+        confirm_mutate_live_db: bool,
+        skip_provider_proof: bool,
+        confirm_skip_provider_proof: bool,
+    ) -> Command {
+        let mut cmd = self.base_command();
+        cmd.arg("migrate-session-ownership")
+            .arg("--apply")
+            .arg("--state-db")
+            .arg(&self.state_path)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        if let Some(backup_dir) = backup_dir {
+            cmd.arg("--backup-dir").arg(backup_dir);
+        }
+        if confirm_mutate_live_db {
+            cmd.arg("--confirm-mutate-live-db");
+        }
+        if skip_provider_proof {
+            cmd.arg("--skip-provider-proof");
+        }
+        if confirm_skip_provider_proof {
+            cmd.arg("--confirm-skip-provider-proof");
+        }
+        assert_live_command_guard(&cmd, self);
+        cmd
+    }
+
+    fn rollback_command(&self, confirm_mutate_live_db: bool) -> Command {
+        let mut cmd = self.base_command();
+        cmd.arg("migrate-session-ownership")
+            .arg("--rollback")
+            .arg("--state-db")
+            .arg(&self.state_path)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        if confirm_mutate_live_db {
+            cmd.arg("--confirm-mutate-live-db");
+        }
+        assert_live_command_guard(&cmd, self);
+        cmd
+    }
+
+    fn backup_dir(&self) -> PathBuf {
+        let backup_dir = self.dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+        backup_dir
+    }
+
     fn run(&self) -> Output {
         self.command().output().unwrap()
     }
 
     fn write_target_config(&self) {
+        self.write_fake_contract_provider_binary();
         fs::create_dir_all(&self.models_dir).unwrap();
         fs::write(
             self.models_dir.join(format!("{}.toml", target_model_name())),
@@ -129,7 +194,26 @@ impl Fixture {
         );
     }
 
+    fn write_fake_contract_provider_binary(&self) -> PathBuf {
+        let path = self.provider_bin_dir.join(target_binary());
+        fs::write(&path, fake_contract_provider_script()).unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
     fn write_target_config_with_failing_provider(&self) {
+        let path = self.provider_bin_dir.join(target_binary());
+        fs::write(
+            &path,
+            "provider proof fixture is intentionally not executable\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+
         fs::write(
             self.models_dir
                 .join(format!("{}.toml", target_model_name())),
@@ -597,6 +681,323 @@ fn row_21_state_db_open_does_not_run_session_ownership_migration_or_extend_schem
     );
 }
 
+#[test]
+fn apply_on_fixture_success_migrates_candidate_chains_segments_and_turns_to_external_ownership() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let before = snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(after.chains["chain-active"].model_name, target_model_name());
+    assert_eq!(
+        after.chains["chain-unregistered"].model_name,
+        target_model_name()
+    );
+    assert_eq!(after.chains["chain-closed"].model_name, target_model_name());
+    assert_eq!(
+        after.chains["chain-control"].model_name,
+        target_model_name()
+    );
+    assert_eq!(
+        after.chains.len(),
+        before.chains.len(),
+        "chain delete detected"
+    );
+    assert_eq!(
+        after.segments.len(),
+        before.segments.len(),
+        "segment delete detected"
+    );
+    assert_eq!(
+        after.turns.len(),
+        before.turns.len(),
+        "turn delete detected"
+    );
+    assert_preserved_migrated_chain_timestamps(&before, &after);
+    assert_preserved_non_owned_segment_fields(&before, &after);
+    assert_four_population_segment_ownership(&after);
+    assert_turn_consistency(&before, &after);
+    let combined = combined_output(&output);
+    assert!(combined.contains("live_db_mutated=yes"), "{combined}");
+}
+
+#[test]
+fn apply_idempotence_second_apply_is_noop() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_first_apply = snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(snapshot(&fixture.state_path), after_first_apply);
+    let report = read_report_from_output(&second);
+    assert_report_count(&report, "chain_model_updates_to_apply", 0);
+    assert_report_count(&report, "segment_provider_updates_to_apply", 0);
+    assert_report_count(&report, "turn_provider_updates_to_apply", 0);
+}
+
+#[test]
+fn rollback_restores_preimage_values_after_apply() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let before = snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    assert_ne!(snapshot(&fixture.state_path), before);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(snapshot(&fixture.state_path), before);
+    let report = read_report_from_output(&rollback);
+    assert!(
+        normalize_report_text(&report).contains("restored"),
+        "rollback report missing restored status: {report}"
+    );
+}
+
+#[test]
+fn apply_without_confirm_mutate_live_db_refuses_without_mutation() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let before = snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), false, false, false)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    let combined = combined_output(&output);
+    assert!(combined.contains("--confirm-mutate-live-db"), "{combined}");
+    assert_eq!(snapshot(&fixture.state_path), before);
+    assert!(
+        directory_is_empty(&backup_dir),
+        "backup side effect before ack"
+    );
+}
+
+#[test]
+fn apply_without_backup_dir_refuses_without_mutation() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let before = snapshot(&fixture.state_path);
+
+    let output = fixture
+        .apply_command(None, true, false, false)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    let combined = combined_output(&output);
+    assert!(combined.contains("--backup-dir"), "{combined}");
+    assert_eq!(snapshot(&fixture.state_path), before);
+}
+
+#[test]
+fn successful_apply_produces_backup_path_that_passes_quick_check() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let backup_path = output_path_value(&output, "backup");
+    assert!(backup_path.is_absolute(), "backup path must be absolute");
+    assert!(
+        backup_path.starts_with(&backup_dir),
+        "backup outside fixture"
+    );
+    assert_quick_check_ok(&backup_path);
+}
+
+#[test]
+fn post_apply_counts_match_planned_and_zero_residual_old_owned_rows() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_live_counts_and_zero_residual(&fixture.state_path);
+}
+
+#[test]
+fn larger_synthetic_fixture_exercises_multi_provider_candidate_path() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    fixture.seed_base_population();
+    let conn = fixture.conn();
+    for index in 2..=6 {
+        let chain_id = format!("chain-family-{index}");
+        let session_id = format!("session-family-{index}");
+        let turn_id = format!("turn-family-{index}");
+        let account = unregistered_account_family(index);
+        seed_chain(&conn, &chain_id, &source_model_name());
+        seed_segment(
+            &conn,
+            &chain_id,
+            &account,
+            &session_id,
+            None,
+            Some(&turn_id),
+            "manual",
+        );
+        seed_turn(&conn, &account, &session_id, &turn_id, "assistant");
+        seed_mailbox(&fixture.mailbox_path, &session_id, None);
+    }
+    drop(conn);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = snapshot(&fixture.state_path);
+    for index in 2..=6 {
+        assert_segment_owner(
+            &after,
+            &format!("chain-family-{index}"),
+            &canonical_account(),
+            &format!("session-family-{index}"),
+        );
+        let remapped_turn = after
+            .turns
+            .iter()
+            .find(|turn| turn.session_id == format!("session-family-{index}"))
+            .unwrap_or_else(|| panic!("missing family turn {index}"));
+        assert_eq!(remapped_turn.provider_name, canonical_account());
+    }
+}
+
+#[test]
+fn provider_proof_passes_fails_and_skip_bypasses_only_the_proof_gate() {
+    let proof_passes = Fixture::new();
+    proof_passes.write_target_config();
+    proof_passes.seed_base_population();
+    assert_success(&proof_passes.run());
+
+    let proof_fails = Fixture::new();
+    proof_fails.write_target_config_with_failing_provider();
+    proof_fails.seed_base_population();
+    let before_failure = snapshot(&proof_fails.state_path);
+    let failed = proof_fails.run();
+    assert_failure(&failed);
+    let combined = combined_output(&failed) + &read_report_if_present(&proof_fails.scratch_dir);
+    assert!(
+        combined.contains("proof") || combined.contains("provider"),
+        "provider proof failure not visible: {combined}"
+    );
+    assert_eq!(snapshot(&proof_fails.state_path), before_failure);
+
+    let skipped = Fixture::new();
+    skipped.write_target_config_with_failing_provider();
+    skipped.seed_base_population();
+    let backup_dir = skipped.backup_dir();
+    let output = skipped
+        .apply_command(Some(&backup_dir), true, true, true)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let report = read_report_from_output(&output);
+    assert!(
+        normalize_report_text(&report).contains("provider proof")
+            && normalize_report_text(&report).contains("skipped"),
+        "skip was not recorded in report: {report}"
+    );
+}
+
+#[test]
+fn mode_exclusivity_and_skip_provider_proof_ack_refusals_do_not_mutate() {
+    let exclusive = Fixture::new();
+    exclusive.write_target_config();
+    exclusive.seed_base_population();
+    let before_exclusive = snapshot(&exclusive.state_path);
+    let backup_dir = exclusive.backup_dir();
+    let mut two_modes = exclusive.command();
+    two_modes
+        .arg("--apply")
+        .arg("--backup-dir")
+        .arg(&backup_dir)
+        .arg("--confirm-mutate-live-db");
+    let two_modes_output = two_modes.output().unwrap();
+    assert_failure(&two_modes_output);
+    let two_modes_text = combined_output(&two_modes_output);
+    assert!(
+        (two_modes_text.contains("only one") || two_modes_text.contains("exactly one"))
+            && two_modes_text.contains("--dry-run")
+            && two_modes_text.contains("--apply"),
+        "mode exclusivity refusal missing: {two_modes_text}"
+    );
+    assert_eq!(snapshot(&exclusive.state_path), before_exclusive);
+
+    let skip_ack = Fixture::new();
+    skip_ack.write_target_config();
+    skip_ack.seed_base_population();
+    let before_skip_ack = snapshot(&skip_ack.state_path);
+    let mut missing_skip_ack = skip_ack.command();
+    missing_skip_ack.arg("--skip-provider-proof");
+    let skip_ack_output = missing_skip_ack.output().unwrap();
+    assert_failure(&skip_ack_output);
+    let skip_ack_text = combined_output(&skip_ack_output);
+    assert!(
+        skip_ack_text.contains("--confirm-skip-provider-proof"),
+        "skip ack refusal missing: {skip_ack_text}"
+    );
+    assert_eq!(snapshot(&skip_ack.state_path), before_skip_ack);
+}
+
+#[test]
+fn live_apply_and_rollback_commands_are_guarded_to_temp_state_db_and_redirected_env() {
+    let fixture = Fixture::new();
+    let backup_dir = fixture.backup_dir();
+    let apply = fixture.apply_command(Some(&backup_dir), true, false, false);
+    assert_live_command_guard(&apply, &fixture);
+    let rollback = fixture.rollback_command(true);
+    assert_live_command_guard(&rollback, &fixture);
+}
+
 fn provider_token() -> String {
     ["cla", "ude"].concat()
 }
@@ -623,6 +1024,241 @@ fn accepted_account() -> String {
 
 fn unregistered_account_a() -> String {
     format!("acct-unreg-a-{}", provider_token())
+}
+
+fn provider_token_number(index: u8) -> String {
+    ["cla", "ude", &index.to_string()].concat()
+}
+
+fn unregistered_account_family(index: u8) -> String {
+    format!("acct-unreg-{}", provider_token_number(index))
+}
+
+fn fake_contract_provider_script() -> String {
+    r#"#!/usr/bin/env python3
+import json
+import sys
+
+CONTRACT = "oulipoly.provider/v1"
+request = json.loads(sys.stdin.read() or "{}")
+response = {
+    "contract": request.get("contract", CONTRACT),
+    "request_id": request.get("request_id", "s11-m2b-provider-proof"),
+    "ok": True,
+    "result": {
+        "provider_id": "s11-m2b-proof-provider",
+        "display_name": "S11 M2b Proof Provider",
+        "contract_versions": [CONTRACT],
+        "preferred_contract": CONTRACT,
+        "capabilities": {
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        },
+    },
+}
+json.dump(response, sys.stdout)
+sys.stdout.write("\n")
+"#
+    .to_string()
+}
+
+fn assert_live_command_guard(cmd: &Command, fixture: &Fixture) {
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let state_db_index = args
+        .iter()
+        .position(|arg| arg == "--state-db")
+        .unwrap_or_else(|| panic!("live command missing --state-db: {args:?}"));
+    let state_db_arg = args
+        .get(state_db_index + 1)
+        .unwrap_or_else(|| panic!("live command missing --state-db value: {args:?}"));
+    assert_eq!(Path::new(state_db_arg), fixture.state_path.as_path());
+    assert!(
+        Path::new(state_db_arg).starts_with(fixture.dir.path()),
+        "state DB escaped temp fixture: {state_db_arg}"
+    );
+
+    assert_command_env_eq(cmd, "XDG_CONFIG_HOME", &fixture.config_dir);
+    assert_command_env_eq(cmd, "XDG_DATA_HOME", &fixture.dir.path().join("xdg-data"));
+    assert_command_env_removed(cmd, "OULIPOLY_DATA_DIR");
+    let path = command_env_value(cmd, "PATH")
+        .unwrap_or_else(|| panic!("PATH not set on guarded command"))
+        .unwrap_or_else(|| panic!("PATH was removed on guarded command"));
+    let path_entries: Vec<_> = std::env::split_paths(&path).collect();
+    assert_eq!(path_entries.first(), Some(&fixture.provider_bin_dir));
+}
+
+fn assert_command_env_eq(cmd: &Command, key: &str, expected: &Path) {
+    let value = command_env_value(cmd, key)
+        .unwrap_or_else(|| panic!("{key} not set on command"))
+        .unwrap_or_else(|| panic!("{key} was removed on command"));
+    assert_eq!(Path::new(&value), expected);
+}
+
+fn assert_command_env_removed(cmd: &Command, key: &str) {
+    assert!(
+        matches!(command_env_value(cmd, key), Some(None)),
+        "{key} was not explicitly removed"
+    );
+}
+
+fn command_env_value(cmd: &Command, key: &str) -> Option<Option<std::ffi::OsString>> {
+    cmd.get_envs()
+        .find(|(candidate, _)| candidate.to_string_lossy() == key)
+        .map(|(_, value)| value.map(|value| value.to_os_string()))
+}
+
+fn output_path_value(output: &Output, key: &str) -> PathBuf {
+    let prefix = format!("{key}=");
+    combined_output(output)
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("output missing {prefix}: {}", combined_output(output)))
+}
+
+fn read_report_from_output(output: &Output) -> String {
+    fs::read_to_string(output_path_value(output, "report")).unwrap()
+}
+
+fn assert_quick_check_ok(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    let quick_check: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        quick_check,
+        "ok",
+        "quick_check failed for {}",
+        path.display()
+    );
+}
+
+fn directory_is_empty(path: &Path) -> bool {
+    fs::read_dir(path).unwrap().next().is_none()
+}
+
+fn assert_live_counts_and_zero_residual(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    let chain_planned = last_run_count(&conn, "chain_model_updates_to_apply");
+    let segment_planned = last_run_count(&conn, "segment_provider_updates_to_apply");
+    let turn_planned = last_run_count(&conn, "turn_provider_updates_to_apply");
+    assert_eq!(chain_planned, applied_chain_count(&conn));
+    assert_eq!(segment_planned, applied_segment_count(&conn));
+    assert_eq!(turn_planned, applied_turn_count(&conn));
+    assert_eq!(residual_old_owner_count(&conn), 0);
+    assert!(preimage_row_count(&conn) > 0, "preimage table is empty");
+}
+
+fn last_run_count(conn: &Connection, key: &str) -> i64 {
+    conn.query_row(
+        "SELECT value FROM s11_wu4_last_run_counts WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn applied_chain_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         JOIN session_chains c ON c.chain_id = p.chain_id
+         WHERE p.entity_kind = 'chain'
+           AND p.old_model_name <> p.new_model_name
+           AND c.model_name = p.new_model_name",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn applied_segment_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         JOIN session_chain_segments s ON s.id = p.segment_id
+         WHERE p.entity_kind = 'segment'
+           AND p.old_provider_name <> p.new_provider_name
+           AND s.provider_name = p.new_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn applied_turn_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         JOIN session_turns t ON t.id = p.turn_row_id
+         WHERE p.entity_kind = 'turn'
+           AND p.old_provider_name <> p.new_provider_name
+           AND t.provider_name = p.new_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn residual_old_owner_count(conn: &Connection) -> i64 {
+    let chains: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM s11_wu4_restore_session_ownership_preimage p
+             JOIN session_chains c ON c.chain_id = p.chain_id
+             WHERE p.entity_kind = 'chain'
+               AND p.old_model_name <> p.new_model_name
+               AND c.model_name = p.old_model_name",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let segments: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM s11_wu4_restore_session_ownership_preimage p
+             JOIN session_chain_segments s ON s.id = p.segment_id
+             WHERE p.entity_kind = 'segment'
+               AND p.old_provider_name <> p.new_provider_name
+               AND s.provider_name = p.old_provider_name",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let turns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM s11_wu4_restore_session_ownership_preimage p
+             JOIN session_turns t ON t.id = p.turn_row_id
+             WHERE p.entity_kind = 'turn'
+               AND p.old_provider_name <> p.new_provider_name
+               AND t.provider_name = p.old_provider_name",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    chains + segments + turns
+}
+
+fn preimage_row_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM s11_wu4_restore_session_ownership_preimage",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn provider_toml_entry(name: &str, command: &Path) -> String {

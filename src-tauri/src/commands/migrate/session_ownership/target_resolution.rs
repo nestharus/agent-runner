@@ -2,10 +2,14 @@
 
 use super::DryRunError;
 use crate::cli::paths::default_models_dir;
-use oulipoly_config::{ModelConfig, ProviderConfig, ProvidersConfig, load_models};
+use crate::provider_artifact::provider_artifact_from_ref;
+use crate::provider_proof::prove_provider_artifact;
+use oulipoly_config::{
+    ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig, load_models,
+};
+use oulipoly_provider::resolver::ProviderArtifactRef;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
 
 struct LoadedTargetConfig {
     providers_cfg: ProvidersConfig,
@@ -17,8 +21,7 @@ pub(crate) struct TargetResolution {
     pub(crate) model_name: String,
     pub(crate) canonical_provider_name: String,
     pub(crate) inventory: Vec<String>,
-    pub(crate) runtime_command: String,
-    pub(crate) runtime_args: Vec<String>,
+    provider_artifact: ProviderArtifactRef,
 }
 
 pub(crate) fn resolve_target(
@@ -27,21 +30,17 @@ pub(crate) fn resolve_target(
     let loaded = load_target_config(models_dir_override)?;
     let target_binary = moved_external_provider_binary();
     let model = require_target_model(select_target_model(&loaded.models, &target_binary))?;
+    let provider_artifact = require_provider_artifact(model.provider.as_ref())?;
     let canonical = require_canonical_provider(first_provider(model))?;
-    let (runtime, _) = loaded
+    let _ = loaded
         .providers_cfg
         .runtime_provider(&canonical.name)
         .map_err(|err| DryRunError::new(format!("target provider account failed: {err}")))?;
-    Ok(target_resolution(
-        model,
-        canonical,
-        runtime.command,
-        runtime.args,
-    ))
+    Ok(target_resolution(model, canonical, provider_artifact))
 }
 
 pub(crate) fn prove_provider(target: &TargetResolution) -> Result<(), DryRunError> {
-    validate_provider_proof_status(run_provider_proof_command(target)?)
+    prove_provider_artifact(target.provider_artifact.clone()).map_err(DryRunError::new)
 }
 
 fn load_target_config(
@@ -78,6 +77,17 @@ fn require_target_model(model: Option<&ModelConfig>) -> Result<&ModelConfig, Dry
     model.ok_or_else(|| DryRunError::new("target provider-ref model not found"))
 }
 
+fn require_provider_artifact(
+    provider: Option<&ProviderImplementationRef>,
+) -> Result<ProviderArtifactRef, DryRunError> {
+    provider
+        .ok_or_else(|| DryRunError::new("target provider implementation reference missing"))
+        .and_then(|provider| {
+            provider_artifact_from_ref(provider)
+                .map_err(|err| DryRunError::new(format!("target provider artifact invalid: {err}")))
+        })
+}
+
 fn first_provider(model: &ModelConfig) -> Option<&ProviderConfig> {
     model.providers.first()
 }
@@ -91,8 +101,7 @@ fn require_canonical_provider(
 fn target_resolution(
     model: &ModelConfig,
     canonical: &ProviderConfig,
-    runtime_command: String,
-    runtime_args: Vec<String>,
+    provider_artifact: ProviderArtifactRef,
 ) -> TargetResolution {
     TargetResolution {
         model_name: model.name.clone(),
@@ -102,25 +111,7 @@ fn target_resolution(
             .iter()
             .map(|provider| provider.name.clone())
             .collect(),
-        runtime_command,
-        runtime_args,
-    }
-}
-
-fn run_provider_proof_command(target: &TargetResolution) -> Result<ExitStatus, DryRunError> {
-    Command::new(&target.runtime_command)
-        .args(&target.runtime_args)
-        .status()
-        .map_err(|err| DryRunError::new(format!("provider proof failed to start: {err}")))
-}
-
-fn validate_provider_proof_status(status: ExitStatus) -> Result<(), DryRunError> {
-    if status.success() {
-        Ok(())
-    } else {
-        Err(DryRunError::new(format!(
-            "provider proof failed with status {status}"
-        )))
+        provider_artifact,
     }
 }
 

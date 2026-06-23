@@ -3,14 +3,18 @@
 mod classifier;
 mod db_copy;
 mod error;
+mod live;
 mod preflight;
 mod report;
+mod rollback;
 mod sql;
 mod target_resolution;
 
 use std::path::PathBuf;
 
 pub(crate) use error::DryRunError;
+pub(crate) use live::{ApplyOptions, run_session_ownership_apply};
+pub(crate) use rollback::{RollbackOptions, run_session_ownership_rollback};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DryRunOptions {
@@ -18,6 +22,7 @@ pub(crate) struct DryRunOptions {
     pub(crate) mailbox_db_path: Option<PathBuf>,
     pub(crate) models_dir: Option<PathBuf>,
     pub(crate) scratch_dir: PathBuf,
+    pub(crate) skip_provider_proof: bool,
 }
 
 #[derive(Debug)]
@@ -32,7 +37,9 @@ pub(crate) fn run_session_ownership_dry_run(
     let mut copy = db_copy::open_copy(&paths.state_copy)?;
     let before_forward = preflight::preflight(&copy)?;
     let target = target_resolution::resolve_target(opts.models_dir.as_deref())?;
-    target_resolution::prove_provider(&target)?;
+    if !opts.skip_provider_proof {
+        target_resolution::prove_provider(&target)?;
+    }
     let candidates = classifier::classify(&copy, &target)?;
     classifier::populate_sql_inputs(&mut copy, &target, &candidates)?;
 

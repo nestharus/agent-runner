@@ -21,6 +21,7 @@ mod app_state;
 pub mod commands;
 #[allow(dead_code)]
 mod mailbox_delivery;
+mod provider_artifact;
 #[path = "commands/provider_settings.rs"]
 pub mod provider_settings;
 mod run_tauri;

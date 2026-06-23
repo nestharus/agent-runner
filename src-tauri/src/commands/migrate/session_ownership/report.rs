@@ -1,12 +1,12 @@
 //! Declared role: formatter
 
+use super::DryRunError;
 use super::classifier::Candidates;
 use super::db_copy::SnapshotPaths;
 use super::preflight::IntegrityReport;
-use super::sql::{CwdCompleteness, ForwardCounts, RollbackCounts};
-use super::DryRunError;
+use super::sql::{CwdCompleteness, ForwardCounts, LiveApplyVerification, RollbackCounts};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub(crate) struct ReportInput {
     pub(crate) source_path: PathBuf,
@@ -20,6 +20,33 @@ pub(crate) struct ReportInput {
     pub(crate) idempotence: ForwardCounts,
     pub(crate) rollback: RollbackCounts,
     pub(crate) cwd: CwdCompleteness,
+}
+
+pub(crate) struct ApplyReportInput {
+    pub(crate) report_dir: PathBuf,
+    pub(crate) source_path: PathBuf,
+    pub(crate) backup_path: PathBuf,
+    pub(crate) before: IntegrityReport,
+    pub(crate) verification: LiveApplyVerification,
+    pub(crate) candidates: Candidates,
+    pub(crate) forward: ForwardCounts,
+    pub(crate) provider_proof: ProviderProofStatus,
+}
+
+pub(crate) struct RollbackReportInput {
+    pub(crate) report_dir: PathBuf,
+    pub(crate) source_path: PathBuf,
+    pub(crate) before: IntegrityReport,
+    pub(crate) after: IntegrityReport,
+    pub(crate) preimage_rows: i64,
+    pub(crate) rollback: RollbackCounts,
+    pub(crate) restored_mismatches: std::collections::BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProviderProofStatus {
+    Passed,
+    Skipped,
 }
 
 pub(crate) fn write_report(input: &ReportInput) -> Result<PathBuf, DryRunError> {
@@ -100,9 +127,112 @@ pub(crate) fn write_report(input: &ReportInput) -> Result<PathBuf, DryRunError> 
     Ok(input.paths.report_path.clone())
 }
 
+pub(crate) fn write_apply_report(input: &ApplyReportInput) -> Result<PathBuf, DryRunError> {
+    fs::create_dir_all(&input.report_dir)?;
+    let report_path = input.report_dir.join("session-ownership-apply-report.md");
+    let mut body = String::new();
+    body.push_str("# Session Ownership Apply\n\n");
+    body.push_str("live_db_mutated: yes\n");
+    body.push_str(&format!("source_path: {}\n", input.source_path.display()));
+    body.push_str(&format!("backup_path: {}\n", input.backup_path.display()));
+    body.push_str("preimage_table: s11_wu4_restore_session_ownership_preimage\n");
+    body.push_str(&format!(
+        "provider proof: {}\n\n",
+        provider_proof_label(input.provider_proof)
+    ));
+    push_integrity(&mut body, "before_apply", &input.before);
+    push_integrity(&mut body, "after_apply", &input.verification.integrity);
+    push_candidate_counts(&mut body, &input.candidates);
+    push_counts(&mut body, "planned", &input.forward.counts);
+    push_counts(&mut body, "planned apply", &input.verification.planned);
+    push_counts(&mut body, "applied", &input.verification.applied);
+    body.push_str("\n## Post Apply Verification\n");
+    body.push_str(&format!(
+        "zero residual old-owned rows: {}\n",
+        input.verification.residual_old_owned_rows == 0
+    ));
+    body.push_str(&format!(
+        "residual_old_owned_rows: {}\n",
+        input.verification.residual_old_owned_rows
+    ));
+    body.push_str(&format!(
+        "preimage_rows: {}\n",
+        input.verification.preimage_rows
+    ));
+    fs::write(&report_path, body)?;
+    Ok(report_path)
+}
+
+pub(crate) fn write_rollback_report(input: &RollbackReportInput) -> Result<PathBuf, DryRunError> {
+    fs::create_dir_all(&input.report_dir)?;
+    let report_path = input
+        .report_dir
+        .join("session-ownership-rollback-report.md");
+    let mut body = String::new();
+    body.push_str("# Session Ownership Rollback\n\n");
+    body.push_str("live_db_mutated: yes\n");
+    body.push_str(&format!("source_path: {}\n", input.source_path.display()));
+    body.push_str("preimage_table: s11_wu4_restore_session_ownership_preimage\n");
+    body.push_str(&format!("preimage_rows: {}\n", input.preimage_rows));
+    body.push_str("drift_check: passed\n");
+    body.push_str(&format!(
+        "restored: {}\n\n",
+        input.rollback.restored && input.restored_mismatches.values().all(|value| *value == 0)
+    ));
+    push_integrity(&mut body, "before_rollback", &input.before);
+    push_integrity(&mut body, "after_rollback", &input.after);
+    push_counts(&mut body, "rollback", &input.rollback.counts);
+    push_counts(&mut body, "rollback", &input.rollback.mismatches);
+    push_counts(
+        &mut body,
+        "rollback restored verification",
+        &input.restored_mismatches,
+    );
+    fs::write(&report_path, body)?;
+    Ok(report_path)
+}
+
+fn provider_proof_label(status: ProviderProofStatus) -> &'static str {
+    match status {
+        ProviderProofStatus::Passed => "passed",
+        ProviderProofStatus::Skipped => "skipped",
+    }
+}
+
+pub(crate) fn default_rollback_report_dir(source_path: &Path) -> PathBuf {
+    source_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn push_integrity(body: &mut String, phase: &str, report: &IntegrityReport) {
     body.push_str(&format!("{phase} quick_check: {}\n", report.quick_check));
     body.push_str(&format!("{phase} user_version: {}\n", report.user_version));
+}
+
+fn push_candidate_counts(body: &mut String, candidates: &Candidates) {
+    body.push_str("\n## Candidate Counts\n");
+    body.push_str(&format!(
+        "candidate_chains: {}\n",
+        candidates.candidate_chains
+    ));
+    body.push_str(&format!(
+        "candidate_segments: {}\n",
+        candidates.candidate_segments
+    ));
+    body.push_str(&format!(
+        "eligible_segments: {}\n",
+        candidates.eligible_segments
+    ));
+    body.push_str(&format!(
+        "blocked_segments: {}\n",
+        candidates.blocked_segments
+    ));
+    body.push_str(&format!(
+        "issue52_unregistered_segments: {}\n",
+        candidates.issue52_unregistered_segments
+    ));
 }
 
 fn push_counts(body: &mut String, phase: &str, counts: &std::collections::BTreeMap<String, i64>) {

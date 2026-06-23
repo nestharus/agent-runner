@@ -1,4 +1,3 @@
-use oulipoly_config::ProviderImplementationRef;
 use oulipoly_config::app::SetupBrainConfig;
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions};
 use oulipoly_provider::error::{HostErrorKind, ProviderClientError};
@@ -6,11 +5,11 @@ use oulipoly_provider::generated::{
     CONTRACT_VERSION, DescribeResult, EmptyParams, HostContext, RequestEnvelope,
     SetupBrainTurnResult, SetupObject,
 };
-use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_setup::actions::AgentTurnResult;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+
+pub(crate) use crate::provider_artifact::provider_artifact_from_ref;
 
 pub struct SetupBrainHost {
     config: SetupBrainConfig,
@@ -26,7 +25,8 @@ impl SetupBrainHost {
         system_prompt: String,
         host_context: Value,
     ) -> Result<Self, SetupBrainError> {
-        let artifact = provider_artifact_from_ref(&config.artifact)?;
+        let artifact = provider_artifact_from_ref(&config.artifact)
+            .map_err(|error| setup_brain_protocol_error_for_operation("setup.brain", error))?;
         Ok(Self {
             config,
             client: ProviderClient::new(artifact, ProviderClientOptions::default()),
@@ -241,32 +241,6 @@ pub fn store_setup_brain_conversation_id(host: &mut SetupBrainHost, conversation
 
 pub fn next_setup_brain_conversation_id(host: &SetupBrainHost) -> Option<&str> {
     host.conversation_id.as_deref()
-}
-
-pub(crate) fn provider_artifact_from_ref(
-    artifact: &ProviderImplementationRef,
-) -> Result<ProviderArtifactRef, SetupBrainError> {
-    artifact.validate().map_err(|error| {
-        setup_brain_protocol_error_for_operation("setup.brain", error.to_string())
-    })?;
-    if let Some(path) = &artifact.path {
-        Ok(ProviderArtifactRef::Path {
-            path: PathBuf::from(path),
-        })
-    } else if let Some(binary) = &artifact.binary {
-        Ok(ProviderArtifactRef::Binary {
-            name: binary.clone(),
-        })
-    } else if let Some(script) = &artifact.script {
-        Ok(ProviderArtifactRef::Script {
-            path: PathBuf::from(script),
-        })
-    } else {
-        Err(setup_brain_protocol_error_for_operation(
-            "setup.brain",
-            "unsupported setup brain artifact flavor",
-        ))
-    }
 }
 
 fn describe_request() -> Value {

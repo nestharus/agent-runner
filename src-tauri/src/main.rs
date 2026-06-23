@@ -32,6 +32,8 @@ mod migration_providers;
 #[allow(dead_code)]
 #[path = "main/owned_turn_event_ingest.rs"]
 mod owned_turn_event_ingest;
+mod provider_artifact;
+mod provider_proof;
 mod quota_zero_turn;
 mod redaction;
 mod repl_cli;

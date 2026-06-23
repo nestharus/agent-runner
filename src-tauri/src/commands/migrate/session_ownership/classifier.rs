@@ -2,7 +2,7 @@
 
 use super::DryRunError;
 use super::target_resolution::TargetResolution;
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, params};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone)]
@@ -79,8 +79,27 @@ pub(crate) fn populate_sql_inputs(
     Ok(())
 }
 
-fn create_sql_input_tables(tx: &Transaction<'_>) -> Result<(), DryRunError> {
-    tx.execute_batch(
+pub(crate) fn populate_sql_inputs_temp(
+    conn: &Connection,
+    target: &TargetResolution,
+    candidates: &Candidates,
+) -> Result<(), DryRunError> {
+    create_temp_sql_input_tables(conn)?;
+    write_sql_input_rows(conn, &sql_input_rows(target, candidates))
+}
+
+pub(crate) fn cleanup_temp_sql_inputs(conn: &Connection) {
+    let _ = conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.s11_wu4_migration_params;
+         DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
+         DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
+         DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
+         DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;",
+    );
+}
+
+fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
+    conn.execute_batch(
         "DROP TABLE IF EXISTS s11_wu4_migration_params;
          DROP TABLE IF EXISTS s11_wu4_original_target_provider_inventory;
          DROP TABLE IF EXISTS s11_wu4_target_provider_inventory;
@@ -95,31 +114,47 @@ fn create_sql_input_tables(tx: &Transaction<'_>) -> Result<(), DryRunError> {
     .map_err(Into::into)
 }
 
-fn write_sql_input_rows(tx: &Transaction<'_>, rows: &SqlInputRows<'_>) -> Result<(), DryRunError> {
+fn create_temp_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.s11_wu4_migration_params;
+         DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
+         DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
+         DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
+         DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;
+         CREATE TEMP TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TEMP TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
+         CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
+         CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
+         CREATE TEMP TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);",
+    )
+    .map_err(Into::into)
+}
+
+fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<(), DryRunError> {
     for (key, value) in &rows.migration_params {
-        tx.execute(
+        conn.execute(
             "INSERT INTO s11_wu4_migration_params(key, value) VALUES (?1, ?2)",
             params![key, value],
         )?;
     }
     for provider_name in &rows.provider_inventory {
-        tx.execute(
+        conn.execute(
             "INSERT INTO s11_wu4_original_target_provider_inventory(provider_name, source) VALUES (?1, 'config')",
             [provider_name],
         )?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO s11_wu4_target_provider_inventory(provider_name, source) VALUES (?1, 'config')",
             [provider_name],
         )?;
     }
     for chain_id in &rows.source_chains {
-        tx.execute(
+        conn.execute(
             "INSERT INTO s11_wu4_source_chain_candidates(chain_id, evidence) VALUES (?1, 'copied-state')",
             [chain_id],
         )?;
     }
     for alias in &rows.provider_aliases {
-        tx.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO s11_wu4_provider_aliases(old_provider_name, new_provider_name, reason) VALUES (?1, ?2, 'canonical-remap')",
             params![alias.old_provider_name, alias.new_provider_name],
         )?;

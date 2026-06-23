@@ -5,7 +5,7 @@ use oulipoly_state::StateDb;
 use rusqlite::{Connection, OpenFlags};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotPaths {
@@ -39,6 +39,18 @@ pub(crate) fn copy_state_to_rollback(paths: &SnapshotPaths) -> Result<(), DryRun
     Ok(())
 }
 
+pub(crate) fn create_verified_live_backup(
+    live_state_db_path: &Path,
+    backup_dir: &Path,
+) -> Result<PathBuf, DryRunError> {
+    fs::create_dir_all(backup_dir)?;
+    let backup_dir = backup_dir.canonicalize()?;
+    let backup_path = backup_dir.join(timestamped_backup_name()?);
+    snapshot_state_db_readonly(live_state_db_path, &backup_path)?;
+    verify_backup_quick_check(&backup_path)?;
+    backup_path.canonicalize().map_err(Into::into)
+}
+
 fn prepare_scratch_dir(scratch_dir: &Path) -> Result<(), DryRunError> {
     fs::create_dir_all(scratch_dir).map_err(Into::into)
 }
@@ -52,6 +64,26 @@ fn snapshot_paths(opts: &DryRunOptions) -> SnapshotPaths {
         rollback_copy,
         mailbox_copy: None,
         report_path,
+    }
+}
+
+fn timestamped_backup_name() -> Result<String, DryRunError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| DryRunError::new(format!("system clock before unix epoch: {err}")))?
+        .as_secs();
+    Ok(format!("state-s11-m2b-session-ownership-{seconds}.db"))
+}
+
+fn verify_backup_quick_check(path: &Path) -> Result<(), DryRunError> {
+    let conn = Connection::open(path)?;
+    let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check == "ok" {
+        Ok(())
+    } else {
+        Err(DryRunError::new(format!(
+            "backup quick_check failed: {quick_check}"
+        )))
     }
 }
 
