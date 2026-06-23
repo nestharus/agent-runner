@@ -595,10 +595,84 @@ pub struct SessionExportResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReplaceCanonicalTranscript {
+    pub kind: String,
+    pub data_base64: String,
+    pub sha256: String,
+    pub turn_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReplaceParams {
+    pub settings_id: String,
+    pub session_id: String,
+    pub model_name: String,
+    pub provider_name: String,
+    pub replace_protocol: String,
+    pub operation_id: String,
+    pub canonical_format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_transcript: Option<SessionReplaceCanonicalTranscript>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preimage_sha256_expected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_apply_capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<String>,
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReplaceCanonicalPostimage {
+    pub format_id: String,
+    pub sha256: String,
+    pub turn_count: u64,
+    pub source_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<SessionReplaceArtifactEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionReplaceArtifactEvidence {
+    pub role: String,
+    pub format_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_len: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionReplaceResult {
     pub changed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preimage_sha256_observed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub postimage_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_postimage: Option<SessionReplaceCanonicalPostimage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_preimage_artifact: Option<SessionReplaceArtifactEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_postimage_artifact: Option<SessionReplaceArtifactEvidence>,
     pub artifacts: Vec<Artifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_state_plan: Option<Value>,
@@ -963,7 +1037,7 @@ pub type SessionCaptureErrorResponse = ErrorResponseEnvelope;
 pub type SessionExportRequest = RequestEnvelope<SessionBaseParams>;
 pub type SessionExportResponse = SuccessResponseEnvelope<SessionExportResult>;
 pub type SessionExportErrorResponse = ErrorResponseEnvelope;
-pub type SessionReplaceRequest = RequestEnvelope<SessionBaseParams>;
+pub type SessionReplaceRequest = RequestEnvelope<SessionReplaceParams>;
 pub type SessionReplaceResponse = SuccessResponseEnvelope<SessionReplaceResult>;
 pub type SessionReplaceErrorResponse = ErrorResponseEnvelope;
 pub type RotationAssessRequest = RequestEnvelope<RotationObject>;

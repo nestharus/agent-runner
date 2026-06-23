@@ -58,9 +58,13 @@ pub(crate) fn map_turn_count_mismatch_error() -> ExternalSessionProviderError {
 
 pub(crate) fn map_postimage_hash_mismatch_error() -> ExternalSessionProviderError {
     map_provider_error(
-        "postimage_hash_mismatch",
+        "canonical_postimage_hash_mismatch",
         "provider postimage hash did not match accepted facts",
     )
+}
+
+pub(crate) fn map_provider_owned_token_error(token: &'static str) -> ExternalSessionProviderError {
+    map_provider_error(token, token)
 }
 
 pub(crate) fn map_invalid_artifact_error() -> ExternalSessionProviderError {
