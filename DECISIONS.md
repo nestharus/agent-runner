@@ -4407,3 +4407,42 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
   code. (2) Phase 6c's whole-workspace `cargo fmt` reformatted 21 files of PRE-EXISTING `main`
   fmt-drift; all 21 were reverted to `main` to keep this PR scope-clean, so workspace `cargo fmt
   --check` stays red on that pre-existing drift (out of scope for this WU; CI is non-blocking on fmt).
+
+---
+
+# WU: s11-rx-main-green-recovery (M4 + M2b guard regressions)
+
+## D0. Ticket system: proceeding WITHOUT Linear (manager-max Option B)
+`LINEAR_API_KEY` is unavailable to spooled jobs. Manager-max (autonomous authority) authorized
+proceeding without the ticket system: do all substantive work and open the draft PR on base `main`;
+skip every `linear-operator` step (Phase 0 create/read, Phase 3 update-estimate, Phase 8.X/9/Final
+cross-link comments). `wu_brief_path` is the source of truth. The manager creates+links the NES
+ticket out-of-band after Phase 9. Recorded as the Linear gap; NOT a BLOCKED condition.
+Intended title: "S11-RX: main-green recovery — fix M4 raw-connection reads + M2b setup-brain
+provider-ref guard regressions".
+
+## D1. Proportionate pipeline scoping for a surgical 2-fix recovery WU
+Per manager-max framing ("small, surgical regression-recovery WU — two localized, behavior-preserving
+fixes") and `skip_problem_map_gate=true`, the orchestrator runs a proportionate pipeline:
+Phase 0 (bootstrap) -> Phase 3 (dispatched proposal) -> Phase 6a (orchestrator-authored contract)
+-> Phase 6c (dispatched implementer) -> Phase 8 (dispatched FULL `cargo test --workspace` verification
++ clippy + tsc + token-delta-0) -> Phase 9 (dispatched pr-writer + draft PR on base main).
+
+Load-bearing invariants preserved:
+- The orchestrator writes no source/test code and runs no builds itself; every code change and all
+  verification are performed by dispatched `agents` sub-agents.
+- Phase 6b/6c separation: the failing guard tests (`age_32_connection_boundary`,
+  `age246_s8_setup_dispatch_source_guard`) already exist and ARE the red test contract; they were
+  authored independently of the implementer. The Phase 6c implementer makes source green and is
+  forbidden from editing any test file. No new tests are authored (authoring/weakening guards is
+  forbidden by anti-scope).
+- Phase 8 runs the full workspace suite (not a narrow target set) -- the whole point of the WU.
+
+The 7 Phase-2.5 research artifacts, apply-gate-set child-auditor fanouts, and the three process-tree
+audits are folded into proportionate equivalents for a behavior-preserving 2-function fix whose facts
+are authoritatively supplied and verified by the manager. Recorded for the audit trail.
+
+## D2. This is ONE coherent concern -- do NOT split
+Both fixes restore "full-workspace-green by repairing the two architecture-guard regressions the narrow
+pipeline gate let through." Each is a <15-line localized fix to existing code with the correct pattern
+nearby. The multi-concern judgment treats this as a single regression-recovery unit; no SPLIT.
