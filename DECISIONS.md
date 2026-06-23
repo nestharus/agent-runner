@@ -4384,3 +4384,26 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
   builder/researcher/proposer/test-writer/code-writer/PR-writer phases dispatch as `gpt-high`;
   risk/alignment judgement gates dispatch as `gpt-xhigh`. Every phase that touches source/tests/
   builds is performed by a dispatched `agents` sub-agent — the orchestrator does not implement.
+
+## S11-M2b / D1 — Final disposition (draft PR opened; manager merges)
+- Draft PR opened on base `main`: https://github.com/nestharus/agent-runner/pull/190 (head
+  `s11-m2b-live-apply` @ bb2613dd). `auto_merge_after_phase_9=false` → the manager reviews + merges;
+  CodeRabbit auto-reviews on open. Manager creates+links the NES ticket out-of-band (Option B).
+- Functional bar met: 11/11 new harness tests + 19/19 migration-file tests pass; `cargo build
+  --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `bunx tsc --noEmit` GREEN;
+  harness files rustfmt-clean. `cargo test --workspace` red ONLY on the allowlisted `age245_s7c`
+  provider-name BASE_REF grep guard (pre-existing main-red, WU-delta 0, NOT a regression). Tracked
+  `claude|codex` token count == main baseline (3537; delta 0).
+- Safety proven before PR (Phase 8 verified in the actual diff): backup-first (quick_check before any
+  writable open); short busy-timeout fail-fast ("stop the runner first"); live helper inputs as TEMP
+  tables ⇒ no main-DB mutation before `forward.sql` `BEGIN IMMEDIATE` (no fail-open / no partial
+  apply); post-verify → drift-guarded auto-rollback with no success report on unverified apply;
+  `--rollback` restores preimage; provider proof = real `oulipoly.provider/v1` describe handshake
+  against the external `agent-runner-claude` artifact, ack-skippable. `forward.sql` semantics
+  UNCHANGED; no in-tree reader/parser/storage deleted; tests use synthetic fixtures only.
+- Residuals/decisions accepted: (1) Test §G.12 (post-verify-failure → auto-rollback) is recorded as a
+  test residual (`planning/.../risk/s11-m2b-test-residuals.md`) — not CLI-inducible without changing
+  `forward.sql` or adding test hooks; the auto-rollback PATH is implemented + Phase-8-verified in
+  code. (2) Phase 6c's whole-workspace `cargo fmt` reformatted 21 files of PRE-EXISTING `main`
+  fmt-drift; all 21 were reverted to `main` to keep this PR scope-clean, so workspace `cargo fmt
+  --check` stays red on that pre-existing drift (out of scope for this WU; CI is non-blocking on fmt).
