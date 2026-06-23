@@ -4297,3 +4297,23 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
   (WU-delta 0); whole-workspace `cargo clippy --all-targets` may be red on pre-existing-main files, but M4's
   OWN files must be clippy-clean. Independent post-revert re-verification confirms M4 builds + suites pass.
 - Evidence: .scratch/phase6/step6c-gate-results-postrevert.md (pending).
+
+## S11-M4 / D10 — Phase 6 code-quality HIGH → in-WU remediation (declarations + helper extraction)
+- Phase: Phase 6 apply-gate-set (implementation-phase-6). Provenance rows PASS (output-index, side-channel,
+  alignment, gate-results). Code-quality blocked: cohesion/coupling/function-classification/push-pull HIGH,
+  validation-integrity MEDIUM; process-tree-2 FAIL downstream.
+- Root cause + strategy (STRATEGY_PHASE6_CODE_QUALITY_INWU + HELPER_EXTRACTION + declarations):
+  - cohesion HIGH = no `## Component declared roles`. Orchestrator added `## Component declared roles`
+    (orchestration/validator/parser/mapper/accessor/formatter/predicate/filter) to the contract.
+  - coupling HIGH = no adapter declaration. Orchestrator added `## Adapter declarations` declaring
+    provider-ref-replace as an `adapter` translating host-replace/DB/journal ↔ provider-RPC protocol +
+    canonical-evidence + recovery surfaces (high coupling is intrinsic to the adapter).
+  - push-pull PP-001 = undeclared debug recovery-input file. Orchestrator declared it as a controlled
+    debug-only test interface; code-writer confirms it is debug-gated (production uses provider recovery-mode).
+  - validation-integrity VI-001/002 = schema `required` looser than contract; code-writer tightens
+    SessionReplaceParams + v2 host_state_plan `required` (legacy fixture stays valid).
+  - function-classification FC-001..006 = 6 multi-classifier functions in session_external_provider/mod.rs;
+    code-writer extracts single-classification helpers per the findings' suggested splits.
+- Scope discipline reinforced (no workspace-wide clippy autofix; M4 files only) after the D9 pollution incident.
+- Then rerun apply-gate-set implementation-phase-6.
+- Evidence: risk/phase-6-join-manifest.json (HIGH); code-quality/s11-m4-provider-ref-replace/*.md.

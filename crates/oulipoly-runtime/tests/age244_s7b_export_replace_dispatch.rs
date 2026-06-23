@@ -1404,7 +1404,7 @@ fn external_replace_provider_protocol_hash_plan_and_source_failures_do_not_mutat
             "replace_canonical_postimage_count_mismatch",
             "canonical_postimage_turn_count_mismatch",
         ),
-        ("replace_missing_v2_plan_field", "invalid_host_state_plan"),
+        ("replace_missing_v2_plan_field", "schema_invalid_response"),
         (
             "replace_v2_plan_operation_id_mismatch",
             "host_state_plan_operation_id_mismatch",
@@ -1415,7 +1415,7 @@ fn external_replace_provider_protocol_hash_plan_and_source_failures_do_not_mutat
         ),
         (
             "replace_v2_plan_missing_source_id",
-            "invalid_host_state_plan",
+            "schema_invalid_response",
         ),
         ("replace_recovery_evidence_mismatch", "recovery_id_mismatch"),
     ] {

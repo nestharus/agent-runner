@@ -1,11 +1,11 @@
 //! Role: mapper.
 
-use super::identity::{ExternalSessionIdentity, provider_instance_id};
-use super::provider_error::{ExternalSessionProviderError, map_schema_invalid_request_error};
+use super::identity::{provider_instance_id, ExternalSessionIdentity};
+use super::provider_error::{map_schema_invalid_request_error, ExternalSessionProviderError};
 use super::replace_input_mapper::PreparedReplaceInput;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, HostContext, JsonObject, RequestEnvelope, SessionBaseParams,
-    SessionReplaceCanonicalTranscript, SessionReplaceParams,
+    HostContext, JsonObject, RequestEnvelope, SessionBaseParams, SessionReplaceCanonicalTranscript,
+    SessionReplaceParams, CONTRACT_VERSION,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 pub(crate) const CANONICAL_FORMAT: &str = "oulipoly.canonical_transcript/v1";
 pub(crate) const PROVIDER_OWNED_REPLACE_PROTOCOL: &str = "oulipoly.provider_owned_replace/v1";
 pub(crate) const HOST_APPLY_CAPABILITY: &str = "replace_session_turns_from_canonical_v1";
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 pub(crate) fn build_export_request(
     identity: &ExternalSessionIdentity,
@@ -162,12 +163,7 @@ fn recovery_replace_request_envelope(
     input: Option<&PreparedReplaceInput>,
     request_id: String,
 ) -> RequestEnvelope<SessionReplaceParams> {
-    let canonical_transcript = input.map(|input| SessionReplaceCanonicalTranscript {
-        kind: "bytes".to_string(),
-        data_base64: input.data_base64.clone(),
-        sha256: input.records_sha256.clone(),
-        turn_count: input.turn_count,
-    });
+    let canonical_transcript = Some(recovery_canonical_transcript(input));
     RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id,
@@ -183,11 +179,30 @@ fn recovery_replace_request_envelope(
             canonical_format: CANONICAL_FORMAT.to_string(),
             canonical_transcript,
             preimage_sha256_expected: None,
-            host_apply_capability: None,
+            host_apply_capability: Some(HOST_APPLY_CAPABILITY.to_string()),
             operation_mode: Some("recover".to_string()),
             recovery_action: Some(recovery_action.to_string()),
             recovery_id: recovery_id.map(str::to_string),
             extra: JsonObject::new(),
+        },
+    }
+}
+
+fn recovery_canonical_transcript(
+    input: Option<&PreparedReplaceInput>,
+) -> SessionReplaceCanonicalTranscript {
+    match input {
+        Some(input) => SessionReplaceCanonicalTranscript {
+            kind: "bytes".to_string(),
+            data_base64: input.data_base64.clone(),
+            sha256: input.records_sha256.clone(),
+            turn_count: input.turn_count,
+        },
+        None => SessionReplaceCanonicalTranscript {
+            kind: "bytes".to_string(),
+            data_base64: String::new(),
+            sha256: EMPTY_SHA256.to_string(),
+            turn_count: 0,
         },
     }
 }

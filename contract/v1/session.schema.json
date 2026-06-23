@@ -167,7 +167,24 @@
             "chain_id": { "type": "string", "minLength": 1 },
             "active_segment_id": { "type": "integer" }
           },
-          "required": ["schema_version", "operation"],
+          "required": [
+            "schema_version",
+            "operation",
+            "replace_protocol",
+            "operation_id",
+            "recovery_id",
+            "session_id",
+            "provider_name",
+            "canonical_format",
+            "input_sha256",
+            "postimage_sha256",
+            "preimage_sha256_observed",
+            "turn_count",
+            "db_apply",
+            "source_id",
+            "last_turn_id",
+            "last_used_at"
+          ],
           "additionalProperties": false
         }
       ]
@@ -207,7 +224,9 @@
         "provider_name",
         "replace_protocol",
         "operation_id",
-        "canonical_format"
+        "canonical_format",
+        "canonical_transcript",
+        "host_apply_capability"
       ],
       "additionalProperties": false
     },

@@ -186,28 +186,7 @@ pub fn replace_session(
             return Err(mapped);
         }
     };
-    if accepted.last_turn_id
-        != accepted
-            .records
-            .last()
-            .map(|record| record.turn_id.as_str())
-            .unwrap_or_default()
-    {
-        return Err(ReplaceError::OperationalError {
-            message: "invalid_host_state_plan".to_string(),
-        });
-    }
-    if accepted.last_used_at
-        != accepted
-            .records
-            .last()
-            .map(|record| record.timestamp.as_str())
-            .unwrap_or_default()
-    {
-        return Err(ReplaceError::OperationalError {
-            message: "invalid_host_state_plan".to_string(),
-        });
-    }
+    validate_accepted_host_state_consistency(&accepted)?;
     let receipt =
         replace_host_apply::apply_provider_owned_replace(&identity, session_id, &accepted)?;
     pending_journal.mark_db_applied()?;
@@ -241,33 +220,18 @@ pub fn recover_pending_provider_owned_replaces(
         return Ok(());
     }
     let mut pending = Vec::new();
-    for entry in fs::read_dir(&journal_root).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to scan provider-owned replace journal: {e}"),
-    })? {
-        let path = entry
-            .map_err(|e| ReplaceError::OperationalError {
-                message: format!("failed to read provider-owned replace journal entry: {e}"),
-            })?
-            .path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("session-") || !name.ends_with(".pending") {
+    for path in provider_owned_journal_entry_paths(&journal_root)? {
+        if !is_pending_provider_owned_journal_filename(&path) {
             continue;
         }
-        let Ok(bytes) = fs::read(&path) else {
+        let Some(bytes) = read_optional_provider_owned_journal_bytes(&path) else {
             continue;
         };
-        let Ok(header) = serde_json::from_slice::<ProviderOwnedJournalHeader>(&bytes) else {
+        let Some(header) = parse_provider_owned_journal_header(&bytes) else {
             continue;
         };
-        if header.schema_version == 2 && header.operation == PROVIDER_OWNED_JOURNAL_OPERATION {
-            let journal =
-                serde_json::from_slice::<ProviderOwnedReplaceJournal>(&bytes).map_err(|e| {
-                    ReplaceError::OperationalError {
-                        message: format!("invalid provider-owned replace journal: {e}"),
-                    }
-                })?;
+        if is_provider_owned_pending_journal_header(&header) {
+            let journal = parse_provider_owned_pending_journal(&bytes)?;
             pending.push((path, journal));
         }
     }
@@ -282,12 +246,7 @@ fn recover_provider_owned_journal(
     path: &Path,
     journal: ProviderOwnedReplaceJournal,
 ) -> Result<(), ReplaceError> {
-    let identity = identity::ExternalSessionIdentity {
-        model_name: journal.model_name.clone(),
-        provider_name: journal.provider_name.clone(),
-        provider_instance_id: Some(journal.provider_instance_id.clone()),
-        settings_id: journal.settings_id.clone(),
-    };
+    let identity = map_provider_owned_journal_identity(&journal);
     let client = provider_registry_accessor::provider_client_for_model(registry, &identity)
         .map_err(|error| ReplaceError::OperationalError {
             message: format!("provider_owned_recovery_unavailable: {error}"),
@@ -440,28 +399,16 @@ fn send_provider_owned_recovery_action(
 fn debug_recovery_canonical_input(
     session_id: &str,
 ) -> Result<Option<replace_input_mapper::PreparedReplaceInput>, ReplaceError> {
-    if !cfg!(debug_assertions) {
+    let Some(bytes) = read_debug_recovery_canonical_input()? else {
         return Ok(None);
-    }
-    let path = provider_owned_data_root()?.join("replacement-canonical.jsonl");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path).map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to read debug recovery canonical input: {e}"),
-    })?;
-    let records = crate::session_replace::parse_provider_owned_canonical_input_for_session(
-        session_id, &bytes,
-    )?;
-    let data_base64 = replace_input_formatter::data_base64(&bytes);
-    let records_sha256 = replace_input_formatter::records_sha256(&bytes);
-    Ok(Some(replace_input_mapper::map_prepared_replace_input(
+    };
+    let records = parse_debug_recovery_canonical_records(session_id, &bytes)?;
+    let (data_base64, records_sha256) = format_debug_recovery_canonical_facts(&bytes);
+    Ok(Some(map_debug_recovery_prepared_input(
         bytes,
         data_base64,
         records_sha256,
         records.len() as u64,
-        None,
-        generate_provider_owned_operation_id(),
     )))
 }
 
@@ -488,30 +435,171 @@ fn recovery_input_from_result(
 fn restore_provider_owned_db_from_journal(
     journal: &ProviderOwnedReplaceJournal,
 ) -> Result<(), ReplaceError> {
-    let target = ProviderReplaceDbTarget {
-        provider_name: journal.provider_name.clone(),
-        session_id: journal.session_id.clone(),
-        chain_id: journal.chain_id.clone(),
-        active_segment_id: journal.active_segment_id,
-        source_file: String::new(),
-    };
+    let target = map_provider_owned_journal_db_target(journal);
     crate::session_replace::restore_provider_owned_db_preimage(&target, &journal.db_preimage)
 }
 
 fn provider_owned_current_db_equals_journal_preimage(
     journal: &ProviderOwnedReplaceJournal,
 ) -> Result<bool, ReplaceError> {
-    let target = ProviderReplaceDbTarget {
+    let target = map_provider_owned_journal_db_target(journal);
+    let current = read_provider_owned_db_preimage(&target)?;
+    Ok(provider_owned_db_preimage_matches(
+        &current,
+        &journal.db_preimage,
+    ))
+}
+
+fn validate_accepted_host_state_consistency(
+    accepted: &replace_result_mapper::AcceptedProviderOwnedReplaceEvidence,
+) -> Result<(), ReplaceError> {
+    let expected_last_turn_id = accepted
+        .records
+        .last()
+        .map(|record| record.turn_id.as_str())
+        .unwrap_or_default();
+    if accepted.last_turn_id != expected_last_turn_id {
+        return Err(ReplaceError::OperationalError {
+            message: "invalid_host_state_plan".to_string(),
+        });
+    }
+
+    let expected_last_used_at = accepted
+        .records
+        .last()
+        .map(|record| record.timestamp.as_str())
+        .unwrap_or_default();
+    if accepted.last_used_at != expected_last_used_at {
+        return Err(ReplaceError::OperationalError {
+            message: "invalid_host_state_plan".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn provider_owned_journal_entry_paths(journal_root: &Path) -> Result<Vec<PathBuf>, ReplaceError> {
+    fs::read_dir(journal_root)
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to scan provider-owned replace journal: {e}"),
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|e| ReplaceError::OperationalError {
+                    message: format!("failed to read provider-owned replace journal entry: {e}"),
+                })
+        })
+        .collect()
+}
+
+fn is_pending_provider_owned_journal_filename(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("session-") && name.ends_with(".pending"))
+}
+
+fn read_optional_provider_owned_journal_bytes(path: &Path) -> Option<Vec<u8>> {
+    fs::read(path).ok()
+}
+
+fn parse_provider_owned_journal_header(bytes: &[u8]) -> Option<ProviderOwnedJournalHeader> {
+    serde_json::from_slice(bytes).ok()
+}
+
+fn is_provider_owned_pending_journal_header(header: &ProviderOwnedJournalHeader) -> bool {
+    header.schema_version == 2 && header.operation == PROVIDER_OWNED_JOURNAL_OPERATION
+}
+
+fn parse_provider_owned_pending_journal(
+    bytes: &[u8],
+) -> Result<ProviderOwnedReplaceJournal, ReplaceError> {
+    serde_json::from_slice(bytes).map_err(|e| ReplaceError::OperationalError {
+        message: format!("invalid provider-owned replace journal: {e}"),
+    })
+}
+
+fn map_provider_owned_journal_identity(
+    journal: &ProviderOwnedReplaceJournal,
+) -> identity::ExternalSessionIdentity {
+    identity::ExternalSessionIdentity {
+        model_name: journal.model_name.clone(),
+        provider_name: journal.provider_name.clone(),
+        provider_instance_id: Some(journal.provider_instance_id.clone()),
+        settings_id: journal.settings_id.clone(),
+    }
+}
+
+fn read_debug_recovery_canonical_input() -> Result<Option<Vec<u8>>, ReplaceError> {
+    if !cfg!(debug_assertions) {
+        return Ok(None);
+    }
+    let path = provider_owned_data_root()?.join("replacement-canonical.jsonl");
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read(path)
+        .map(Some)
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to read debug recovery canonical input: {e}"),
+        })
+}
+
+fn parse_debug_recovery_canonical_records(
+    session_id: &str,
+    bytes: &[u8],
+) -> Result<Vec<crate::session_replace::CanonicalRecord>, ReplaceError> {
+    crate::session_replace::parse_provider_owned_canonical_input_for_session(session_id, bytes)
+}
+
+fn format_debug_recovery_canonical_facts(bytes: &[u8]) -> (String, String) {
+    (
+        replace_input_formatter::data_base64(bytes),
+        replace_input_formatter::records_sha256(bytes),
+    )
+}
+
+fn map_debug_recovery_prepared_input(
+    bytes: Vec<u8>,
+    data_base64: String,
+    records_sha256: String,
+    turn_count: u64,
+) -> replace_input_mapper::PreparedReplaceInput {
+    replace_input_mapper::map_prepared_replace_input(
+        bytes,
+        data_base64,
+        records_sha256,
+        turn_count,
+        None,
+        generate_provider_owned_operation_id(),
+    )
+}
+
+fn map_provider_owned_journal_db_target(
+    journal: &ProviderOwnedReplaceJournal,
+) -> ProviderReplaceDbTarget {
+    ProviderReplaceDbTarget {
         provider_name: journal.provider_name.clone(),
         session_id: journal.session_id.clone(),
         chain_id: journal.chain_id.clone(),
         active_segment_id: journal.active_segment_id,
         source_file: String::new(),
-    };
-    let current = crate::session_replace::provider_replace_db_preimage(&target)?;
-    Ok(current.session_turns == journal.db_preimage.session_turns
-        && current.last_turn_id == journal.db_preimage.last_turn_id
-        && current.last_used_at == journal.db_preimage.last_used_at)
+    }
+}
+
+fn read_provider_owned_db_preimage(
+    target: &ProviderReplaceDbTarget,
+) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
+    crate::session_replace::provider_replace_db_preimage(target)
+}
+
+fn provider_owned_db_preimage_matches(
+    current: &ProviderReplaceDbPreimage,
+    expected: &ProviderReplaceDbPreimage,
+) -> bool {
+    current.session_turns == expected.session_turns
+        && current.last_turn_id == expected.last_turn_id
+        && current.last_used_at == expected.last_used_at
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

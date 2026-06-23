@@ -2,13 +2,14 @@
 
 use super::identity::ExternalSessionIdentity;
 use super::provider_error::{
-    ExternalSessionProviderError, map_invalid_artifact_error, map_invalid_host_state_plan_error,
+    map_invalid_artifact_error, map_invalid_host_state_plan_error,
     map_postimage_hash_mismatch_error, map_provider_owned_token_error,
+    ExternalSessionProviderError,
 };
 use super::replace_input_mapper::PreparedReplaceInput;
 use super::request_builder::{CANONICAL_FORMAT, PROVIDER_OWNED_REPLACE_PROTOCOL};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use oulipoly_provider::generated::{SessionReplaceCanonicalPostimage, SessionReplaceResult};
 use serde_json::Value;
 
