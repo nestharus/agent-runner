@@ -8,4 +8,6 @@ pub(crate) mod rebuild;
 pub(crate) mod session_ownership;
 pub(crate) mod validator;
 
-pub(crate) use dispatch::{run_migrate, run_migrate_db, run_migrate_session_ownership};
+pub(crate) use dispatch::{
+    MigrateSessionOwnershipArgs, run_migrate, run_migrate_db, run_migrate_session_ownership,
+};

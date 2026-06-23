@@ -221,15 +221,39 @@ pub(crate) enum Subcommands {
     ResumeList { uuid: String },
     /// Run chain-table backfill explicitly.
     MigrateDb,
-    /// Dry-run the copied session ownership migration.
+    /// Run the session ownership migration harness.
     MigrateSessionOwnership {
-        /// Required safety flag; this command has no live apply mode.
+        /// Run against copied DBs only.
         #[arg(long = "dry-run")]
         dry_run: bool,
 
+        /// Apply the migration to the live state DB.
+        #[arg(long = "apply")]
+        apply: bool,
+
+        /// Roll back a live migration from its durable preimage table.
+        #[arg(long = "rollback")]
+        rollback: bool,
+
         /// Directory where copied DBs and report are written.
         #[arg(long = "scratch-dir")]
-        scratch_dir: PathBuf,
+        scratch_dir: Option<PathBuf>,
+
+        /// Directory where live-apply backups and reports are written.
+        #[arg(long = "backup-dir")]
+        backup_dir: Option<PathBuf>,
+
+        /// Required acknowledgement before mutating the live DB.
+        #[arg(long = "confirm-mutate-live-db")]
+        confirm_mutate_live_db: bool,
+
+        /// Skip external provider contract proof.
+        #[arg(long = "skip-provider-proof")]
+        skip_provider_proof: bool,
+
+        /// Required acknowledgement when provider proof is skipped.
+        #[arg(long = "confirm-skip-provider-proof")]
+        confirm_skip_provider_proof: bool,
 
         /// Override state DB path.
         #[arg(long = "state-db")]

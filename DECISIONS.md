@@ -4367,3 +4367,20 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
 - The Phase 8 gate-set parent was stopped mid-final-aggregation (stalled currentness-recheck loop vs the
   HIGH/DECOMPOSED Phase 6 join); the verified child rows + standalone process-tree #3 are recorded in
   risk/phase-8-join-manifest.json. Advancing to Phase 8.X + Phase 9 draft PR.
+
+## S11-M2b / D0 — Bootstrap + Linear gap (manager-max Option B)
+- WU: S11-M2b — live-apply + rollback harness for the session-ownership migration. Adds an
+  `--apply`/`--rollback` harness around the authoritative `forward.sql` (M2 #186 shipped author +
+  dry-run only). Unblocks WU5 (delete in-tree Claude readers) via the PRESERVE path.
+- Base: `main @ defb9cc2` (WU4 #183, M2 #186, M3 #187, M4 #189). Worktree branch
+  `s11-m2b-live-apply` created on `main@defb9cc22cdd952548e5ba61b76efda054a8e6d0`.
+- Decision (Linear gap): `LINEAR_API_KEY` is unavailable to spooled jobs. The manager (manager-max,
+  autonomous authority) authorized Option B: do all substantive work and open the draft PR on base
+  `main`, **skipping every `linear-operator` step**, using `wu_brief_path` as the source of truth.
+  The manager creates+links the NES ticket out-of-band after Phase 9. The orchestrator does NOT halt
+  on the missing ticket. Intended ticket title: "S11-M2b: live-apply + rollback for the
+  session-ownership migration" (team NES).
+- Orchestration model note: per `~/ai/models/roles.md` (authoritative phase-ownership table),
+  builder/researcher/proposer/test-writer/code-writer/PR-writer phases dispatch as `gpt-high`;
+  risk/alignment judgement gates dispatch as `gpt-xhigh`. Every phase that touches source/tests/
+  builds is performed by a dispatched `agents` sub-agent — the orchestrator does not implement.
