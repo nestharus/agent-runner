@@ -4452,3 +4452,33 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
   30/30 (incl. the T4 SQL-side `ON CONFLICT ROLLBACK` stale-plan guard unit test), `cargo build
   --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `bunx tsc --noEmit`; tracked
   `claude|codex` token count == main baseline (3932; WU delta 0); diff is scope-clean (8 files).
+
+## S11-M2c — Final disposition (draft PR opened; manager merges)
+- Draft PR opened on base `main`: https://github.com/nestharus/agent-runner/pull/191 (head
+  `s11-m2c-collision-resolution` @ 57e9d6b7). `auto_merge_after_phase_9=false` → the manager reviews +
+  merges and creates+links the NES ticket out-of-band (Option B). CodeRabbit auto-reviews on open.
+- Functional bar met: 30/30 session-ownership migration tests pass (incl. the 14 new S11-M2c behaviors
+  and the crate-internal T4 SQL-side `ON CONFLICT ROLLBACK` stale-plan rollback unit test);
+  `cargo build --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `bunx tsc --noEmit`
+  GREEN; changed files rustfmt-clean (scoped). `cargo test --workspace` red ONLY on pre-existing
+  main-red targets — `age244_s7b`/`age245_s7c`/`age246_s8` source guards, `age_32_connection_boundary`,
+  and the `oulipoly-runtime` headless-TUI PTY test — all confirmed red on `main@1b9993db` (WU-delta 0;
+  evidence `planning/.../risk/s11-m2c-phase-8-baseline.md`). Tracked `claude|codex` token count ==
+  main baseline (3932; delta 0).
+- Safety proven before PR (Phase 4 gate PASS + Phase 8 review): lossless-only collision resolution —
+  segment merge (latest-by-started_at survivor, greatest-id tiebreak, started_at=MIN) + byte-identical
+  turn dedup (MIN(id) winner over the 9-column content tuple); HARD divergent-group abort enforced at
+  TWO layers (Rust pre-mutation guard + SQL `INSERT OR ROLLBACK` / `ON CONFLICT ROLLBACK` in the single
+  `BEGIN IMMEDIATE`) plus explicit Rust `ROLLBACK` on any forward-SQL error (no fail-open / no partial
+  apply); full-row preimage (`segment_delete`/`turn_delete`/`segment_merge_survivor` + durable expected
+  postimage) so `--rollback` restores deleted rows and merge survivors EXACTLY; post-apply verify adds
+  zero-remaining-collision under both UNIQUE domains + count reconciliation treating deletes as success;
+  second `--apply` is a no-op (idempotent). M2b single-row remap for non-colliding rows unchanged; no
+  in-tree reader/parser/storage deleted; zero new lowercase provider tokens (reused
+  `moved_provider_token()`); tests synthetic-fixtures only. `forward.sql`/rollback share the dry-run +
+  live path; no new CLI flag; no state-schema-chain migration.
+- Residuals/decisions accepted: (1) Pre-existing workspace-red allowlist extended to include
+  `age246_s8` + `age_32_connection_boundary` + the headless-TUI PTY test (all red on main; WU-delta 0)
+  — see the Phase 8 allowlist-extension entry above. (2) Estimate calibration: inherited=null
+  (Option B), refined=8, actual=13 (closer-best-effort; delta_refined_to_actual=+5;
+  over_2x_inherited=unknown) — no ticket-side calibration comment (no ticket system).
