@@ -1,10 +1,10 @@
 //! Declared role: formatter
 
-use super::DryRunError;
 use super::classifier::Candidates;
 use super::db_copy::SnapshotPaths;
 use super::preflight::IntegrityReport;
 use super::sql::{CwdCompleteness, ForwardCounts, LiveApplyVerification, RollbackCounts};
+use super::DryRunError;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -96,6 +96,18 @@ pub(crate) fn write_report(input: &ReportInput) -> Result<PathBuf, DryRunError> 
         "issue52_unregistered_segments: {}\n",
         input.candidates.issue52_unregistered_segments
     ));
+    body.push_str(&format!(
+        "segment_rows_merged_away: {}\n",
+        input.candidates.segment_rows_merged_away
+    ));
+    body.push_str(&format!(
+        "turn_rows_deduped_away: {}\n",
+        input.candidates.turn_rows_deduped_away
+    ));
+    body.push_str(&format!(
+        "segment_merge_survivors_updated: {}\n",
+        input.candidates.segment_merge_survivors_updated
+    ));
 
     push_counts(&mut body, "first_forward", &input.first_forward.counts);
     push_counts(
@@ -154,6 +166,22 @@ pub(crate) fn write_apply_report(input: &ApplyReportInput) -> Result<PathBuf, Dr
     body.push_str(&format!(
         "residual_old_owned_rows: {}\n",
         input.verification.residual_old_owned_rows
+    ));
+    body.push_str(&format!(
+        "zero remaining segment collisions: {}\n",
+        input.verification.segment_collision_count == 0
+    ));
+    body.push_str(&format!(
+        "post_apply_segment_collision_count: {}\n",
+        input.verification.segment_collision_count
+    ));
+    body.push_str(&format!(
+        "zero remaining turn collisions: {}\n",
+        input.verification.turn_collision_count == 0
+    ));
+    body.push_str(&format!(
+        "post_apply_turn_collision_count: {}\n",
+        input.verification.turn_collision_count
     ));
     body.push_str(&format!(
         "preimage_rows: {}\n",
@@ -232,6 +260,18 @@ fn push_candidate_counts(body: &mut String, candidates: &Candidates) {
     body.push_str(&format!(
         "issue52_unregistered_segments: {}\n",
         candidates.issue52_unregistered_segments
+    ));
+    body.push_str(&format!(
+        "segment_rows_merged_away: {}\n",
+        candidates.segment_rows_merged_away
+    ));
+    body.push_str(&format!(
+        "turn_rows_deduped_away: {}\n",
+        candidates.turn_rows_deduped_away
+    ));
+    body.push_str(&format!(
+        "segment_merge_survivors_updated: {}\n",
+        candidates.segment_merge_survivors_updated
     ));
 }
 

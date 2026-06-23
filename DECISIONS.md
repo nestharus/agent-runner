@@ -4407,3 +4407,48 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
   code. (2) Phase 6c's whole-workspace `cargo fmt` reformatted 21 files of PRE-EXISTING `main`
   fmt-drift; all 21 were reverted to `main` to keep this PR scope-clean, so workspace `cargo fmt
   --check` stays red on that pre-existing drift (out of scope for this WU; CI is non-blocking on fmt).
+
+## S11-M2c / Phase 0 — Bootstrap + Linear gap (manager Option B)
+- **Linear gap (Option B, manager-max authorization):** `LINEAR_API_KEY` is unavailable to spooled
+  jobs. The orchestrator proceeds WITHOUT the ticket system: all substantive work is done and a draft
+  PR is opened on base `main`; every `linear-operator` step is skipped; `wu_brief_path`
+  (`planning/s11-m2c-collision-resolution/brief.md`) is the source of truth. The orchestrator does NOT
+  halt on the missing ticket. The manager creates+links the NES ticket out-of-band after Phase 9.
+  Intended ticket title: "S11-M2c: lossless collision resolution (segment merge + identical-turn
+  dedup) for the session-ownership migration" (team NES).
+- **Pipeline shape:** follows the project-accepted M2b-precedent consolidated realization of
+  `~/ai/workflows/implementation-pipeline.md` (Phase 2.5 research → Phase 3 proposal → Phase 4
+  gpt-xhigh risk gate on the proposal → Phase 6 6a-contract/6b-tests/alignment/6c-code → Phase 8
+  gpt-high PR-review on the diff → Phase 9 pr-writer → draft PR). `skip_problem_map_gate=true`,
+  `auto_merge_after_phase_9=false` (stop at draft PR; manager merges).
+- **Orchestration model note** (per `~/ai/models/roles.md`, authoritative phase-ownership table):
+  researcher/proposer/test-writer/code-writer/PR-writer/test-audit/PR-review phases dispatch as
+  `gpt-high`; scope/shortcut/supported-surface/proof risk + alignment judgement gates dispatch as
+  `gpt-xhigh`. Every phase that touches source/tests/builds is performed by a dispatched `agents`
+  sub-agent — the orchestrator authors only the Step 6a contract + planning/session bookkeeping and
+  evaluates gate artifacts; it does NOT implement.
+- **Worktree:** `worktrees/s11-m2c-collision-resolution` created on `main@1b9993db`; `planning_dir`
+  lives outside the worktree so planning artifacts never enter the PR diff.
+
+## S11-M2c / Phase 8 — workspace-red allowlist extension (accepted residual, WU-delta 0)
+- Phase 8's gpt-high PR-review BLOCKED only because `cargo test --workspace` failed 2 targets outside
+  the brief's *literal* allowlist: `age246_s8_setup_dispatch_source_guard`
+  (`setup brain host missing "ProviderImplementationRef"`) and `age_32_connection_boundary::ti_39_session_replace_uses_state_db_write_transaction_not_raw_connection_writes`
+  (`session_replace must not reopen state.db as a raw writable rusqlite::Connection`).
+- A baseline verification ran the full failing set on `main@1b9993db` (HEAD confirmed
+  `1b9993db…`, clean tree): **all five failing targets are red on main** —
+  `age245_s7c_rotation_source_guard`, `age244_s7b_export_replace_dispatch`,
+  `age246_s8_setup_dispatch_source_guard`, `age_32_connection_boundary`, and the
+  `oulipoly-runtime --lib` PTY relay test `executor::cli::pty_broker::tui::tests::observed_relay_…`
+  (headless TUI init: "No such file or directory (os error 2)" / "Resource temporarily unavailable
+  (os error 11)"; failed all 3 isolated reruns). Evidence: `planning/s11-m2c-collision-resolution/risk/s11-m2c-phase-8-baseline.md`.
+- **Decision:** these are pre-existing main-red failures with **WU-delta 0** (the S11-M2c branch
+  introduces zero new failures; its diff touches only `session_ownership/**` migration code and the
+  migration test — neither setup-dispatch, the state-db connection boundary, nor the PTY TUI). The
+  brief's allowlist (`age244_s7b`/`age245_s7c` grep guards + `age_164_c7` ETXTBSY flake) was
+  illustrative, not exhaustive; it is extended here to record `age246_s8`, `age_32_connection_boundary`,
+  and the PTY headless-environment failure as pre-existing main-red. Phase 8 acceptance treats these as
+  NOT regressions, so the WU proceeds to draft PR. All S11-M2c-specific gates are green: migration suite
+  30/30 (incl. the T4 SQL-side `ON CONFLICT ROLLBACK` stale-plan guard unit test), `cargo build
+  --workspace`, `cargo clippy --workspace --all-targets -D warnings`, `bunx tsc --noEmit`; tracked
+  `claude|codex` token count == main baseline (3932; WU delta 0); diff is scope-clean (8 files).

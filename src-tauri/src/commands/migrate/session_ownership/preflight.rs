@@ -56,6 +56,7 @@ pub(crate) fn preflight(conn: &Connection) -> Result<IntegrityReport, DryRunErro
             "role",
             "source_file",
             "ingested_at",
+            "body",
         ],
     )?;
     require_unique(
