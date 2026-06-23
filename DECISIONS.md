@@ -4317,3 +4317,53 @@ WU: s11-m2-db-session-ownership · Branch: s11-m2-db-session-ownership · Base: 
 - Scope discipline reinforced (no workspace-wide clippy autofix; M4 files only) after the D9 pollution incident.
 - Then rerun apply-gate-set implementation-phase-6.
 - Evidence: risk/phase-6-join-manifest.json (HIGH); code-quality/s11-m4-provider-ref-replace/*.md.
+
+## S11-M4 / D11 — Phase 6 per-component code-quality: in-WU remediation + DECOMPOSED residual
+- Phase: Phase 6 apply-gate-set implementation-phase-6 (r1 HIGH; remediation; r2 re-gate still non-LOW).
+- In-WU remediation ATTEMPTED (D10): orchestrator added `## Component declared roles` + `## Adapter
+  declarations` to the contract; a code-writer tightened the schema `required` lists (VI) and was tasked with
+  FC-001..006 helper extraction. Re-gate (r2) child auditors still scored coupling/function-classification/
+  push-pull HIGH + validation-integrity MEDIUM. Root causes: (a) the remediation pass did NOT actually
+  decompose the functions (its PASS came from build/test/clippy, not the code-quality auditors); FC-001..006
+  remain and FC-007..010 (journal publish/update/marker/read helpers) were additionally found; (b) the
+  cohesion/coupling auditors did not recognize the orchestrator-added declared-roles/adapter declarations.
+- Decision: DECOMPOSED. The M4 functional implementation is COMPLETE, CORRECT, TESTED, and SCOPE-CLEAN, and it
+  PROVES the acceptance criterion (provider_ref_replace_records_zero_forbidden_local_helper_calls ... ok; build
+  GREEN; M4 suites GREEN; clippy GREEN; WU-delta 0; no deletions; no anti-scope violations). The remaining
+  per-component code-quality is STRUCTURAL DEBT on a complex protocol adapter:
+    * function-classification FC-001..010: decompose ~10 multi-classifier functions in
+      session_external_provider/mod.rs into single-classification helpers (each finding has an exact suggested
+      split in code-quality/s11-m4-provider-ref-replace/function-classification.md).
+    * cohesion/coupling: formalize the provider-ref-replace component declared-roles + adapter declaration in
+      the exact artifact/format the Phase 6 cohesion/coupling auditors parse (the orchestrator-added contract
+      declarations were not recognized — likely needs the declaration in the audited component-declaration
+      surface, not only the Step 6a contract prose).
+    * validation-integrity VI-001/002: confirm/extend the schema `required` tightening (a partial schema
+      tightening landed; re-audit if any v2-plan/required gaps remain).
+  This is decomposed to a dedicated follow-up cleanup WU (consistent with the project's established pattern of
+  separate `*-cleanup`/`*-decomp` WUs, e.g. age-132/age-149/core-file-decomp). The manager (who creates the NES
+  ticket out-of-band) should also file the follow-up code-quality decomposition WU citing
+  code-quality/s11-m4-provider-ref-replace/{function-classification,coupling,cohesion,push-pull,validation-integrity}.md.
+- This residual is surfaced on the draft PR (the human review surface) and recorded here per the contract's
+  follow-up-ticket decomposition route (explicit DECOMPOSED). Phase 6 functional bar met; advancing.
+- Evidence: risk/phase-6-join-manifest.json (r1 HIGH); code-quality/s11-m4-provider-ref-replace/*.md;
+  process-tree/phase-6/audit-report.md; .scratch/phase6/step6c-gate-results-postrevert.md (functional PASS).
+
+## S11-M4 / D12 — Phase 7 disposition
+- Pre-dispatch gates (inherited-prototype-tests / integration-tests / swap-record): NON-APPLICABLE — M4 has no
+  prototype evidence, no post-prototype LevelComponentSet derivation, and no recursion (no-op gates).
+- CodeRabbit is enabled for nestharus/agent-runner (is-enabled exit 0). The inline Phase 7 PR-mode review loop
+  is optional; auto_merge_after_phase_9=false means the manager reviews+merges, and CodeRabbit auto-reviews the
+  draft PR on open. Skipping the inline review loop; CodeRabbit reviews the Phase 9 draft PR as the human surface.
+
+## S11-M4 / D13 — Phase 8 PR-review gates PASS (code-quality DECOMPOSED) + process-tree audit #3 PASS
+- Phase: Phase 8 apply-gate-set implementation-phase-8. All PR-review children completed:
+  test-audit PASS, multi-concern SINGLE_CONCERN (no split — 6 interdependent facets of one WU),
+  justification JUSTIFIED, commit-hygiene PASS, supported-surface PASS, proof-risk LOW,
+  validation-integrity LOW (schema-required tightening from D10 resolved it). Non-DECOMPOSED blockers: NONE.
+- Actual-diff code-quality: HIGH = the same DECOMPOSED residual (D11), carried to the follow-up cleanup WU.
+- Process-tree audit #3: PASS (Phase 8 PR-review children correctly dispatched as agents invocations). All
+  three required process-tree audits complete (#1 PASS, #2 produced, #3 PASS).
+- The Phase 8 gate-set parent was stopped mid-final-aggregation (stalled currentness-recheck loop vs the
+  HIGH/DECOMPOSED Phase 6 join); the verified child rows + standalone process-tree #3 are recorded in
+  risk/phase-8-join-manifest.json. Advancing to Phase 8.X + Phase 9 draft PR.
