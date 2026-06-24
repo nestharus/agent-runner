@@ -1583,6 +1583,58 @@ fn larger_synthetic_fixture_exercises_multi_provider_candidate_path() {
 }
 
 #[test]
+fn s11_m2c_perf_scale_smoke_apply_and_rollback() {
+    const SCALE_CHAIN_COUNT: usize = 1_000;
+    const DUP_TURNS_PER_CHAIN: usize = 30;
+    const UNIQUE_OLD_TURNS_PER_CHAIN: usize = 90;
+    const EXPECTED_DEDUP_LOSERS: i64 = (SCALE_CHAIN_COUNT * DUP_TURNS_PER_CHAIN) as i64;
+
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_scale_smoke_population(
+        &fixture,
+        SCALE_CHAIN_COUNT,
+        DUP_TURNS_PER_CHAIN,
+        UNIQUE_OLD_TURNS_PER_CHAIN,
+    );
+    let before = full_snapshot(&fixture.state_path);
+    assert_eq!(before.chains.len(), SCALE_CHAIN_COUNT);
+    assert_eq!(before.segments.len(), SCALE_CHAIN_COUNT * 2);
+    assert_eq!(before.turns.len(), 150_000);
+    let backup_dir = fixture.backup_dir();
+
+    let apply = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&apply);
+    assert_quick_check_ok(&fixture.state_path);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_eq!(
+        last_run_count(&conn, "turn_rows_deduped_away"),
+        EXPECTED_DEDUP_LOSERS
+    );
+    assert!(
+        last_run_count(&conn, "segment_rows_merged_away") >= SCALE_CHAIN_COUNT as i64,
+        "not enough segment rows merged away"
+    );
+    assert_eq!(
+        last_run_count(&conn, "post_apply_segment_collision_count"),
+        0
+    );
+    assert_eq!(last_run_count(&conn, "post_apply_turn_collision_count"), 0);
+    assert_zero_collision_counts(&conn);
+    drop(conn);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_quick_check_ok(&fixture.state_path);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+}
+
+#[test]
 fn provider_proof_passes_fails_and_skip_bypasses_only_the_proof_gate() {
     let proof_passes = Fixture::new();
     proof_passes.write_target_config();
@@ -2510,6 +2562,118 @@ fn seed_large_rotation_collision(fixture: &Fixture) {
     );
     seed_mailbox(&fixture.mailbox_path, "session-large", None);
     seed_mailbox(&fixture.mailbox_path, "session-large-unrelated", None);
+}
+
+fn seed_scale_smoke_population(
+    fixture: &Fixture,
+    chain_count: usize,
+    dup_turns_per_chain: usize,
+    unique_old_turns_per_chain: usize,
+) {
+    let mut conn = fixture.conn();
+    let tx = conn.transaction().unwrap();
+    let source_model = source_model_name();
+    let canonical = canonical_account();
+    let unregistered = unregistered_account_a();
+    {
+        let mut insert_chain = tx
+            .prepare(
+                "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+                 VALUES (?1, ?2, ?2, ?3)",
+            )
+            .unwrap();
+        let mut insert_segment = tx
+            .prepare(
+                "INSERT INTO session_chain_segments
+                 (chain_id, provider_name, session_id, started_at, ended_at, last_turn_id,
+                  transition_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .unwrap();
+        let mut insert_turn = tx
+            .prepare(
+                "INSERT INTO session_turns
+                 (provider_name, session_id, turn_id, timestamp, role, parent_turn_id,
+                  is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            )
+            .unwrap();
+
+        for chain_index in 0..chain_count {
+            let chain_id = format!("chain-scale-{chain_index:04}");
+            let session_id = format!("session-scale-{chain_index:04}");
+            let last_turn_id = format!(
+                "turn-scale-{chain_index:04}-dup-{:02}",
+                dup_turns_per_chain - 1
+            );
+            insert_chain
+                .execute(params![chain_id, FIXED_TS, source_model])
+                .unwrap();
+            insert_segment
+                .execute(params![
+                    chain_id,
+                    unregistered,
+                    session_id,
+                    "2026-06-20T10:00:00Z",
+                    Some("2026-06-20T10:04:00Z"),
+                    last_turn_id,
+                    "manual"
+                ])
+                .unwrap();
+            insert_segment
+                .execute(params![
+                    chain_id,
+                    canonical,
+                    session_id,
+                    "2026-06-20T10:05:00Z",
+                    None::<&str>,
+                    last_turn_id,
+                    "exhausted"
+                ])
+                .unwrap();
+
+            for turn_index in 0..dup_turns_per_chain {
+                let turn_id = format!("turn-scale-{chain_index:04}-dup-{turn_index:02}");
+                for provider in [&unregistered, &canonical] {
+                    insert_turn
+                        .execute(params![
+                            provider,
+                            session_id,
+                            turn_id,
+                            "2026-06-20T10:01:00Z",
+                            "assistant",
+                            Some("scale-parent"),
+                            0,
+                            0,
+                            "scale.jsonl",
+                            "2026-06-20T10:02:00Z",
+                            Some(format!("body-{turn_id}"))
+                        ])
+                        .unwrap();
+                }
+            }
+
+            for turn_index in 0..unique_old_turns_per_chain {
+                let turn_id = format!("turn-scale-{chain_index:04}-unique-{turn_index:02}");
+                insert_turn
+                    .execute(params![
+                        unregistered,
+                        session_id,
+                        turn_id,
+                        "2026-06-20T10:03:00Z",
+                        "user",
+                        Some("scale-parent"),
+                        0,
+                        0,
+                        "scale-unique.jsonl",
+                        "2026-06-20T10:04:00Z",
+                        Some(format!("body-{turn_id}"))
+                    ])
+                    .unwrap();
+            }
+        }
+    }
+    tx.commit().unwrap();
 }
 
 fn occupy_segment_id(path: &Path, id: i64) {

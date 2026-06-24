@@ -1042,6 +1042,238 @@ mod tests {
         assert_eq!(candidates.turn_dedup_deletes.len(), 1);
     }
 
+    #[test]
+    fn s11_m2c_perf_explain_query_plan_searches_preimage_by_index() {
+        let (_dir, mut conn, target) = setup_sql_turn_collision_fixture(|conn| {
+            seed_byte_identical_turn_collision(conn);
+            seed_segment_merge_collision(conn);
+        });
+        conn.execute_batch("PRAGMA automatic_index = OFF;").unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.segment_rows_merged_away, 1);
+        assert_eq!(candidates.segment_merge_survivors_updated, 1);
+        assert_eq!(candidates.turn_rows_deduped_away, 1);
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+
+        let counts = apply_forward(&conn).expect("forward fixture should apply");
+        assert_eq!(counts.counts["segment_rows_merged_away"], 1);
+        assert_eq!(counts.counts["turn_rows_deduped_away"], 1);
+        assert_preimage_entity_kinds(
+            &conn,
+            &[
+                "chain",
+                "segment",
+                "segment_delete",
+                "segment_merge_survivor",
+                "turn",
+                "turn_delete",
+            ],
+        );
+
+        let mut failures = Vec::new();
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "forward turn UPDATE",
+            sql_statement_containing(
+                FORWARD_SQL,
+                "forward turn UPDATE",
+                &[
+                    "UPDATE session_turns",
+                    "preimage.new_provider_name",
+                    "preimage.entity_kind = 'turn'",
+                    "preimage.turn_row_id = session_turns.id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_turn",
+        );
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "forward segment UPDATE",
+            sql_statement_containing(
+                FORWARD_SQL,
+                "forward segment UPDATE",
+                &[
+                    "UPDATE session_chain_segments",
+                    "SET provider_name = (",
+                    "preimage.entity_kind = 'segment'",
+                    "preimage.segment_id = session_chain_segments.id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_segment",
+        );
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "forward chain UPDATE",
+            sql_statement_containing(
+                FORWARD_SQL,
+                "forward chain UPDATE",
+                &[
+                    "UPDATE session_chains",
+                    "preimage.new_model_name",
+                    "preimage.entity_kind = 'chain'",
+                    "preimage.chain_id = session_chains.chain_id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_chain",
+        );
+
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_s11_wu4_preimage_kind_turn;
+             DROP INDEX IF EXISTS idx_s11_wu4_preimage_kind_segment;
+             DROP INDEX IF EXISTS idx_s11_wu4_preimage_kind_chain;",
+        )
+        .unwrap();
+        conn.execute_batch(ROLLBACK_SQL)
+            .expect("rollback fixture should restore");
+
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "rollback segment_merge_survivor UPDATE",
+            sql_statement_containing(
+                ROLLBACK_SQL,
+                "rollback segment_merge_survivor UPDATE",
+                &[
+                    "UPDATE session_chain_segments",
+                    "SET chain_id = (",
+                    "preimage.entity_kind = 'segment_merge_survivor'",
+                    "preimage.segment_id = session_chain_segments.id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_segment",
+        );
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "rollback turn UPDATE",
+            sql_statement_containing(
+                ROLLBACK_SQL,
+                "rollback turn UPDATE",
+                &[
+                    "UPDATE session_turns",
+                    "preimage.old_provider_name",
+                    "preimage.entity_kind = 'turn'",
+                    "preimage.turn_row_id = session_turns.id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_turn",
+        );
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "rollback segment UPDATE",
+            sql_statement_containing(
+                ROLLBACK_SQL,
+                "rollback segment UPDATE",
+                &[
+                    "UPDATE session_chain_segments",
+                    "SET provider_name = (",
+                    "preimage.old_provider_name",
+                    "preimage.entity_kind = 'segment'",
+                    "preimage.segment_id = session_chain_segments.id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_segment",
+        );
+        assert_preimage_plan_searches(
+            &conn,
+            &mut failures,
+            "rollback chain UPDATE",
+            sql_statement_containing(
+                ROLLBACK_SQL,
+                "rollback chain UPDATE",
+                &[
+                    "UPDATE session_chains",
+                    "preimage.old_model_name",
+                    "preimage.entity_kind = 'chain'",
+                    "preimage.chain_id = session_chains.chain_id",
+                ],
+            ),
+            "idx_s11_wu4_preimage_kind_chain",
+        );
+
+        assert!(
+            failures.is_empty(),
+            "preimage hot statements must use committed preimage indexes:\n{}",
+            failures.join("\n\n")
+        );
+    }
+
+    fn assert_preimage_entity_kinds(conn: &Connection, expected: &[&str]) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT entity_kind
+                 FROM s11_wu4_restore_session_ownership_preimage
+                 GROUP BY entity_kind
+                 ORDER BY entity_kind",
+            )
+            .unwrap();
+        let actual = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    fn sql_statement_containing<'a>(batch: &'a str, label: &str, needles: &[&str]) -> &'a str {
+        batch
+            .split(';')
+            .map(str::trim)
+            .find(|statement| {
+                !statement.is_empty() && needles.iter().all(|needle| statement.contains(needle))
+            })
+            .unwrap_or_else(|| panic!("missing SQL statement for {label}"))
+    }
+
+    fn assert_preimage_plan_searches(
+        conn: &Connection,
+        failures: &mut Vec<String>,
+        label: &str,
+        statement: &str,
+        expected_index: &str,
+    ) {
+        let details = explain_query_plan(conn, statement);
+        let preimage_details: Vec<_> = details
+            .iter()
+            .filter(|detail| {
+                detail.contains("s11_wu4_restore_session_ownership_preimage")
+                    || detail.contains("preimage")
+            })
+            .collect();
+        if preimage_details.is_empty()
+            || preimage_details
+                .iter()
+                .any(|detail| detail.contains("SCAN"))
+            || preimage_details.iter().any(|detail| {
+                detail.contains("SEARCH")
+                    && !detail.contains(expected_index)
+                    && !detail.contains("USING INTEGER PRIMARY KEY")
+            })
+        {
+            failures.push(format!(
+                "{label} expected SEARCH with {expected_index}, got:\n{}",
+                details
+                    .iter()
+                    .map(|detail| format!("  {detail}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+    }
+
+    fn explain_query_plan(conn: &Connection, statement: &str) -> Vec<String> {
+        let sql = format!("EXPLAIN QUERY PLAN {statement}");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
     fn write_target_config(models_dir: &Path) {
         let token = moved_provider_token();
         let target_binary = format!("agent-runner-{token}");
