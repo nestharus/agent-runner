@@ -134,9 +134,10 @@ pub(crate) fn verify_live_apply(
         )));
     }
     let preimage_rows = preimage_row_count(conn)?;
-    if preimage_rows == 0 {
+    let planned_any = planned.values().any(|value| *value != 0);
+    if planned_any && last_run_preimage_plan_count(conn)? == 0 {
         return Err(DryRunError::new(
-            "post-apply verification failed: preimage table is empty",
+            "post-apply verification failed: current preimage plan is empty",
         ));
     }
     Ok(LiveApplyVerification {
@@ -449,10 +450,13 @@ fn validate_count_match(
 fn applied_chain_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'chain'
          JOIN session_chains c ON c.chain_id = p.chain_id
-         WHERE p.entity_kind = 'chain'
-           AND p.old_model_name <> p.new_model_name
+         WHERE p.old_model_name <> p.new_model_name
            AND c.model_name = p.new_model_name",
         [],
         |row| row.get(0),
@@ -463,10 +467,13 @@ fn applied_chain_count(conn: &Connection) -> Result<i64, DryRunError> {
 fn applied_segment_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'segment'
          JOIN session_chain_segments s ON s.id = p.segment_id
-         WHERE p.entity_kind = 'segment'
-           AND p.old_provider_name <> p.new_provider_name
+         WHERE p.old_provider_name <> p.new_provider_name
            AND s.provider_name = p.new_provider_name",
         [],
         |row| row.get(0),
@@ -477,10 +484,13 @@ fn applied_segment_count(conn: &Connection) -> Result<i64, DryRunError> {
 fn applied_turn_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'turn'
          JOIN session_turns t ON t.id = p.turn_row_id
-         WHERE p.entity_kind = 'turn'
-           AND p.old_provider_name <> p.new_provider_name
+         WHERE p.old_provider_name <> p.new_provider_name
            AND t.provider_name = p.new_provider_name",
         [],
         |row| row.get(0),
@@ -530,6 +540,15 @@ fn residual_turn_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> 
          WHERE p.entity_kind = 'turn'
            AND p.old_provider_name <> p.new_provider_name
            AND t.provider_name = p.old_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn last_run_preimage_plan_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM s11_wu4_last_run_preimage_plan",
         [],
         |row| row.get(0),
     )
@@ -615,10 +634,13 @@ fn read_turn_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
 fn applied_segment_delete_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'segment_delete'
          LEFT JOIN session_chain_segments s ON s.id = p.segment_id
-         WHERE p.entity_kind = 'segment_delete'
-           AND s.id IS NULL",
+         WHERE s.id IS NULL",
         [],
         |row| row.get(0),
     )
@@ -628,10 +650,13 @@ fn applied_segment_delete_count(conn: &Connection) -> Result<i64, DryRunError> {
 fn applied_turn_delete_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'turn_delete'
          LEFT JOIN session_turns t ON t.id = p.turn_row_id
-         WHERE p.entity_kind = 'turn_delete'
-           AND t.id IS NULL",
+         WHERE t.id IS NULL",
         [],
         |row| row.get(0),
     )
@@ -641,10 +666,13 @@ fn applied_turn_delete_count(conn: &Connection) -> Result<i64, DryRunError> {
 fn applied_segment_merge_survivor_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
         "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'segment_merge_survivor'
          JOIN session_chain_segments s ON s.id = p.segment_id
-         WHERE p.entity_kind = 'segment_merge_survivor'
-           AND s.provider_name = p.new_provider_name
+         WHERE s.provider_name = p.new_provider_name
            AND s.started_at IS p.new_started_at
            AND s.ended_at IS p.new_ended_at
            AND s.last_turn_id IS p.new_last_turn_id
@@ -1018,8 +1046,8 @@ mod tests {
     }
 
     #[test]
-    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction()
-    {
+    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction(
+    ) {
         assert_intrinsic_loser_drift_rolls_back("timestamp", "2026-06-20T10:30:00Z");
     }
 

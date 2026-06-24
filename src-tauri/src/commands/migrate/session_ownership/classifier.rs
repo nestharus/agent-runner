@@ -25,11 +25,17 @@ pub(crate) struct Candidates {
     pub(crate) segment_rows_merged_away: i64,
     pub(crate) turn_rows_deduped_away: i64,
     pub(crate) segment_merge_survivors_updated: i64,
-    pub(crate) source_chains: Vec<String>,
+    pub(crate) source_chains: Vec<SourceChainCandidate>,
     pub(crate) segments: Vec<CandidateSegment>,
     pub(crate) segment_merge_groups: Vec<SegmentMergeGroup>,
     pub(crate) segment_merge_deletes: Vec<SegmentMergeDelete>,
     pub(crate) turn_dedup_deletes: Vec<TurnDedupDelete>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SourceChainCandidate {
+    chain_id: String,
+    is_orphaned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -128,11 +134,17 @@ struct SegmentPartitions {
 struct SqlInputRows<'a> {
     migration_params: Vec<(&'static str, String)>,
     provider_inventory: Vec<&'a str>,
-    source_chains: Vec<&'a str>,
+    source_chains: Vec<SourceChainInputRow<'a>>,
     provider_aliases: Vec<ProviderAliasRow<'a>>,
     segment_merge_groups: &'a [SegmentMergeGroup],
     segment_merge_deletes: &'a [SegmentMergeDelete],
     turn_dedup_deletes: &'a [TurnDedupDelete],
+}
+
+#[derive(Debug)]
+struct SourceChainInputRow<'a> {
+    chain_id: &'a str,
+    is_orphaned: bool,
 }
 
 #[derive(Debug)]
@@ -145,7 +157,7 @@ pub(crate) fn classify(
     conn: &Connection,
     target: &TargetResolution,
 ) -> Result<Candidates, DryRunError> {
-    let source_chains = source_chain_candidates(conn, &target.model_name)?;
+    let source_chains = source_chain_candidates(conn, target)?;
     let source_segments = read_source_segments(conn, &source_chains)?;
     let partitions = partition_segments_by_inventory(source_segments, &provider_inventory(target));
     let segments = candidate_segments(partitions, &target.canonical_provider_name);
@@ -208,7 +220,11 @@ fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
          CREATE TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
          CREATE TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
          CREATE TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
-         CREATE TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
+         CREATE TABLE s11_wu4_source_chain_candidates (
+             chain_id TEXT PRIMARY KEY,
+             evidence TEXT NOT NULL,
+             is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1))
+         );
           CREATE TABLE s11_wu4_segment_merge_groups (
               survivor_segment_id INTEGER PRIMARY KEY,
               expected_chain_id TEXT NOT NULL,
@@ -260,7 +276,11 @@ fn create_temp_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
          CREATE TEMP TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
          CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
          CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
-         CREATE TEMP TABLE s11_wu4_source_chain_candidates (chain_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
+         CREATE TEMP TABLE s11_wu4_source_chain_candidates (
+             chain_id TEXT PRIMARY KEY,
+             evidence TEXT NOT NULL,
+             is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1))
+         );
           CREATE TEMP TABLE s11_wu4_segment_merge_groups (
               survivor_segment_id INTEGER PRIMARY KEY,
               expected_chain_id TEXT NOT NULL,
@@ -315,10 +335,10 @@ fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<()
             [provider_name],
         )?;
     }
-    for chain_id in &rows.source_chains {
+    for source in &rows.source_chains {
         conn.execute(
-            "INSERT INTO s11_wu4_source_chain_candidates(chain_id, evidence) VALUES (?1, 'copied-state')",
-            [chain_id],
+            "INSERT INTO s11_wu4_source_chain_candidates(chain_id, evidence, is_orphaned) VALUES (?1, 'copied-state', ?2)",
+            params![source.chain_id, i64::from(source.is_orphaned)],
         )?;
     }
     for alias in &rows.provider_aliases {
@@ -420,11 +440,14 @@ fn provider_inventory_rows(target: &TargetResolution) -> Vec<&str> {
     target.inventory.iter().map(String::as_str).collect()
 }
 
-fn source_chain_rows(candidates: &Candidates) -> Vec<&str> {
+fn source_chain_rows(candidates: &Candidates) -> Vec<SourceChainInputRow<'_>> {
     candidates
         .source_chains
         .iter()
-        .map(String::as_str)
+        .map(|source| SourceChainInputRow {
+            chain_id: source.chain_id.as_str(),
+            is_orphaned: source.is_orphaned,
+        })
         .collect()
 }
 
@@ -440,25 +463,30 @@ fn provider_alias_rows<'a>(segments: &[&'a CandidateSegment]) -> Vec<ProviderAli
 
 fn source_chain_candidates(
     conn: &Connection,
-    target_model: &str,
-) -> Result<Vec<String>, DryRunError> {
-    read_source_chain_candidates(conn, target_model, &target_provider_pattern())
+    target: &TargetResolution,
+) -> Result<Vec<SourceChainCandidate>, DryRunError> {
+    let rows = read_source_chain_candidates(conn, &target_provider_pattern())?;
+    Ok(rows
+        .into_iter()
+        .map(|(chain_id, model_name)| SourceChainCandidate {
+            chain_id,
+            is_orphaned: !target.provider_ref_model_names.contains(&model_name),
+        })
+        .collect())
 }
 
 fn read_source_chain_candidates(
     conn: &Connection,
-    target_model: &str,
     provider_pattern: &str,
-) -> Result<Vec<String>, DryRunError> {
+) -> Result<Vec<(String, String)>, DryRunError> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT c.chain_id
+        "SELECT DISTINCT c.chain_id, c.model_name
          FROM session_chains c
          LEFT JOIN session_chain_segments s ON s.chain_id = c.chain_id
-         WHERE c.model_name <> ?1
-           AND (lower(c.model_name) LIKE ?2 OR lower(s.provider_name) LIKE ?2)
+         WHERE lower(c.model_name) LIKE ?1 OR lower(s.provider_name) LIKE ?1
          ORDER BY c.chain_id",
     )?;
-    let rows = stmt.query_map(params![target_model, provider_pattern], |row| row.get(0))?;
+    let rows = stmt.query_map([provider_pattern], |row| Ok((row.get(0)?, row.get(1)?)))?;
     rows.collect::<Result<_, _>>().map_err(Into::into)
 }
 
@@ -476,11 +504,11 @@ fn contains_pattern(value: &str) -> String {
 
 fn read_source_segments(
     conn: &Connection,
-    source_chains: &[String],
+    source_chains: &[SourceChainCandidate],
 ) -> Result<Vec<SourceSegment>, DryRunError> {
     let mut segments = Vec::new();
-    for chain_id in source_chains {
-        segments.extend(read_source_segments_for_chain(conn, chain_id)?);
+    for source in source_chains {
+        segments.extend(read_source_segments_for_chain(conn, &source.chain_id)?);
     }
     Ok(segments)
 }
@@ -573,20 +601,21 @@ fn candidate_segment(
 }
 
 fn candidates_from_segments(
-    source_chains: Vec<String>,
+    source_chains: Vec<SourceChainCandidate>,
     segments: Vec<CandidateSegment>,
     segment_merge_groups: Vec<SegmentMergeGroup>,
     segment_merge_deletes: Vec<SegmentMergeDelete>,
     turn_dedup_deletes: Vec<TurnDedupDelete>,
 ) -> Candidates {
+    let actionable = actionable_candidate_counts(&source_chains, &segments);
     let issue52_unregistered_segments = issue52_unregistered_segments(&segments) as i64;
     let segment_rows_merged_away = segment_merge_deletes.len() as i64;
     let turn_rows_deduped_away = turn_dedup_deletes.len() as i64;
     let segment_merge_survivors_updated = segment_merge_groups.len() as i64;
     Candidates {
-        candidate_chains: source_chains.len() as i64,
-        candidate_segments: segments.len() as i64,
-        eligible_segments: segments.len() as i64,
+        candidate_chains: actionable.chains,
+        candidate_segments: actionable.segments,
+        eligible_segments: actionable.segments,
         blocked_segments: 0,
         issue52_unregistered_segments,
         segment_rows_merged_away,
@@ -597,6 +626,36 @@ fn candidates_from_segments(
         segment_merge_groups,
         segment_merge_deletes,
         turn_dedup_deletes,
+    }
+}
+
+struct ActionableCandidateCounts {
+    chains: i64,
+    segments: i64,
+}
+
+fn actionable_candidate_counts(
+    source_chains: &[SourceChainCandidate],
+    segments: &[CandidateSegment],
+) -> ActionableCandidateCounts {
+    let orphaned_chains: BTreeSet<&str> = source_chains
+        .iter()
+        .filter(|source| source.is_orphaned)
+        .map(|source| source.chain_id.as_str())
+        .collect();
+    let mut chains = BTreeSet::new();
+    let mut segment_count = 0;
+    for segment in segments {
+        if orphaned_chains.contains(segment.chain_id.as_str())
+            || segment.old_provider_name != segment.new_provider_name
+        {
+            chains.insert(segment.chain_id.as_str());
+            segment_count += 1;
+        }
+    }
+    ActionableCandidateCounts {
+        chains: chains.len() as i64,
+        segments: segment_count,
     }
 }
 

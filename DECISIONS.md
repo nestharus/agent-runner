@@ -4579,3 +4579,32 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   full-scanning the 44k–250k-row helper tables. Indexes only — zero migration logic/semantic change.
 - **auto_merge_after_phase_9 = false:** stop at the draft PR; the manager merges after a full
   `cargo test --workspace` and re-runs the real-data on-copy proof.
+
+## S11-M2c-scope — re-scope migration candidate selection to the design + re-apply idempotence
+
+- Date: 2026-06-24. Branch `s11-m2c-scope-candidate-correction` off `main @ 79b08bb0`.
+- **D0 — Linear gap (manager-authorized Option B):** `LINEAR_API_KEY` is unavailable to spooled jobs,
+  so no `linear-operator` dispatch can run. The manager (manager-max) authorized **Option B**: do all
+  work, open the draft PR on base `main`, skip every `linear-operator` step, treat `brief.md` as the
+  source of truth, record this gap here. The manager creates + links the NES ticket out-of-band
+  (intended title: "S11-M2c-scope: re-scope migration candidate selection to the design + re-apply
+  idempotence"). Not a BLOCKED condition; the pipeline does not halt on the missing ticket.
+- **D1 — Single cohesive concern (do NOT split):** the model-backfill re-scope, the broad
+  rotation-segment remap, the deterministic target, and the re-apply no-op are one correctness unit.
+  The design is authoritative (brief facts + proposal lines 52-54/161 + WU4 dispatch rule); the
+  orchestrator builds to it, does not re-derive.
+- **D2 — Orchestration shape:** every building phase is dispatched to a fresh `agents` sub-agent; the
+  orchestrator never hand-edits source/tests or runs builds. Tests-first separation is preserved —
+  Phase 6b (tests) and Phase 6c (code) are distinct `agents` invocations with distinct UUIDs.
+- **D3 — Verification:** Phase 8 runs the full `cargo test --workspace` inside a dispatched sub-agent
+  and must prove green except the program-deferred grep guards `age244_s7b_export_replace_dispatch`
+  + `age245_s7c_rotation_source_guard` and the headless `os error 11` PTY flake
+  `executor::cli::pty_broker::tui::tests::observed_relay_*`.
+- **D4 — Condensed gate fan-out (recorded for transparency):** given the tightly-specified
+  single-concern correction with the design handed down and `skip_problem_map_gate=true`, the heavy
+  apply-gate-set / process-tree-auditor multi-operator fan-outs are run as consolidated independent
+  review + full-workspace-verification dispatches rather than dozens of separate sub-gate operator
+  invocations. The load-bearing constraints (sub-agent dispatch per building phase, tests-first
+  separation, full-workspace test green, design fidelity, synthetic fixtures only, zero new
+  provider-family literal tokens) are all enforced. Each consolidated gate is its own fresh `agents`
+  invocation with its own prompt + log under `.scratch/`.

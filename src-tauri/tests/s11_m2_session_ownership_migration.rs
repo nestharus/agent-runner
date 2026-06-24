@@ -262,6 +262,55 @@ impl Fixture {
         self.write_provider_entry(&canonical_account(), &self.failing_script("proof-fails"));
     }
 
+    fn write_s11_m2c_scope_configs(&self) -> S11M2cScopeModels {
+        self.write_fake_contract_provider_binary();
+        fs::create_dir_all(&self.models_dir).unwrap();
+        let models = S11M2cScopeModels::new();
+        for model_name in [&models.target, &models.middle, &models.last] {
+            self.write_s11_m2c_scope_provider_ref_model(
+                model_name,
+                &target_binary(),
+                &[canonical_account(), accepted_account()],
+            );
+        }
+        self.write_s11_m2c_scope_provider_ref_model(
+            &models.non_family_model,
+            "agent-runner-gpt",
+            std::slice::from_ref(&models.non_family_account),
+        );
+        self.write_provider_entry(
+            &canonical_account(),
+            &self.success_script("scope-main-provider"),
+        );
+        self.append_provider_entry(
+            &accepted_account(),
+            &self.success_script("scope-accepted-provider"),
+        );
+        self.append_provider_entry(
+            &models.non_family_account,
+            &self.success_script("scope-gpt-provider"),
+        );
+        models
+    }
+
+    fn write_s11_m2c_scope_provider_ref_model(
+        &self,
+        model_name: &str,
+        binary: &str,
+        providers: &[String],
+    ) {
+        let provider_entries = providers
+            .iter()
+            .map(|provider| format!("[[providers]]\nname = {provider:?}\nargs = []\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            self.models_dir.join(format!("{model_name}.toml")),
+            format!("provider = {{ binary = {binary:?} }}\n\n{provider_entries}"),
+        )
+        .unwrap();
+    }
+
     fn success_script(&self, name: &str) -> PathBuf {
         self.write_script(name, "printf '%s\\n' ok")
     }
@@ -406,6 +455,27 @@ impl Fixture {
 
 struct SeededIds {
     issue52_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct S11M2cScopeModels {
+    target: String,
+    middle: String,
+    last: String,
+    non_family_model: String,
+    non_family_account: String,
+}
+
+impl S11M2cScopeModels {
+    fn new() -> Self {
+        Self {
+            target: format!("aaa-ref-{}", provider_token()),
+            middle: format!("mmm-ref-{}", provider_token()),
+            last: format!("zzz-ref-{}", provider_token()),
+            non_family_model: "gpt-thing".to_string(),
+            non_family_account: "acct-gpt".to_string(),
+        }
+    }
 }
 
 #[test]
@@ -1712,6 +1782,221 @@ fn mode_exclusivity_and_skip_provider_proof_ack_refusals_do_not_mutate() {
 }
 
 #[test]
+fn s11_m2c_scope_preserves_valid_models_remaps_rotation_backfills_orphans() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_s11_m2c_scope_population(&fixture, &models);
+    let before = snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_quick_check_ok(&fixture.state_path);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(
+        after.chains.len(),
+        before.chains.len(),
+        "chain delete detected"
+    );
+    assert_eq!(
+        after.segments.len(),
+        before.segments.len(),
+        "segment delete detected"
+    );
+    assert_eq!(
+        after.turns.len(),
+        before.turns.len(),
+        "turn delete detected"
+    );
+
+    assert_eq!(after.chains["chain-valid-mmm"].model_name, models.middle);
+    assert_eq!(after.chains["chain-valid-zzz"].model_name, models.last);
+    assert_eq!(after.chains["chain-target"].model_name, models.target);
+    assert_eq!(after.chains["chain-orphan"].model_name, models.target);
+    assert_eq!(after.chains["chain-orphan-rot"].model_name, models.target);
+    assert_eq!(after.chains["chain-valid-rot"].model_name, models.middle);
+    assert_eq!(
+        after.chains["chain-gpt"].model_name,
+        models.non_family_model
+    );
+
+    assert_segment_owner(
+        &after,
+        "chain-valid-mmm",
+        &accepted_account(),
+        "session-valid-mmm",
+    );
+    assert_segment_owner(
+        &after,
+        "chain-valid-zzz",
+        &accepted_account(),
+        "session-valid-zzz",
+    );
+    assert_segment_owner(
+        &after,
+        "chain-target",
+        &accepted_account(),
+        "session-target",
+    );
+    assert_segment_owner(
+        &after,
+        "chain-orphan",
+        &canonical_account(),
+        "session-orphan",
+    );
+    assert_segment_owner(
+        &after,
+        "chain-orphan-rot",
+        &canonical_account(),
+        "session-orphan-rot",
+    );
+    assert_segment_owner(
+        &after,
+        "chain-valid-rot",
+        &canonical_account(),
+        "session-valid-rot",
+    );
+    assert_segment_owner(
+        &after,
+        "chain-gpt",
+        &models.non_family_account,
+        "session-gpt",
+    );
+    assert_turn_owner(
+        &after,
+        "session-orphan-rot",
+        "turn-orphan-rot",
+        &canonical_account(),
+    );
+    assert_turn_owner(
+        &after,
+        "session-valid-rot",
+        "turn-valid-rot",
+        &canonical_account(),
+    );
+    assert_turn_owner(
+        &after,
+        "session-gpt",
+        "turn-gpt",
+        &models.non_family_account,
+    );
+    assert_preserved_chain_segment_session(
+        &before,
+        &after,
+        "chain-orphan-rot",
+        "session-orphan-rot",
+    );
+    assert_preserved_chain_segment_session(&before, &after, "chain-valid-rot", "session-valid-rot");
+}
+
+#[test]
+fn s11_m2c_scope_valid_chain_merge_rolls_back_precisely() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-valid-merge", &models.middle);
+    seed_segment_with_started_at(
+        &conn,
+        "chain-valid-merge",
+        &canonical_account(),
+        "session-valid-merge",
+        "2026-06-20T10:00:00Z",
+        Some("2026-06-20T10:04:00Z"),
+        Some("turn-valid-merge-r"),
+        "initial",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-valid-merge",
+        &unregistered_account_a(),
+        "session-valid-merge",
+        "2026-06-20T10:05:00Z",
+        None,
+        Some("turn-valid-merge-t"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &canonical_account(),
+        "session-valid-merge",
+        "turn-valid-merge-r",
+        "assistant",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_a(),
+        "session-valid-merge",
+        "turn-valid-merge-t",
+        "user",
+    );
+    drop(conn);
+    let before = snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_quick_check_ok(&fixture.state_path);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(after.chains["chain-valid-merge"].model_name, models.middle);
+    let merged_segments: Vec<_> = after
+        .segments
+        .iter()
+        .filter(|segment| {
+            segment.chain_id == "chain-valid-merge"
+                && segment.provider_name == canonical_account()
+                && segment.session_id == "session-valid-merge"
+        })
+        .collect();
+    assert_eq!(
+        merged_segments.len(),
+        1,
+        "valid-chain remap collision was not merged: {merged_segments:?}"
+    );
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_quick_check_ok(&fixture.state_path);
+    assert_eq!(snapshot(&fixture.state_path), before);
+}
+
+#[test]
+fn s11_m2c_scope_reapply_is_clean_noop_with_valid_models() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_s11_m2c_scope_population(&fixture, &models);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_first_apply = snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_quick_check_ok(&fixture.state_path);
+    assert_eq!(snapshot(&fixture.state_path), after_first_apply);
+    let report = read_report_from_output(&second);
+    assert_report_count(&report, "chain_model_updates_to_apply", 0);
+    assert_report_count(&report, "segment_provider_updates_to_apply", 0);
+    assert_report_count(&report, "turn_provider_updates_to_apply", 0);
+}
+
+#[test]
 fn live_apply_and_rollback_commands_are_guarded_to_temp_state_db_and_redirected_env() {
     let fixture = Fixture::new();
     let backup_dir = fixture.backup_dir();
@@ -1755,6 +2040,135 @@ fn provider_token_number(index: u8) -> String {
 
 fn unregistered_account_family(index: u8) -> String {
     format!("acct-unreg-{}", provider_token_number(index))
+}
+
+fn seed_s11_m2c_scope_population(fixture: &Fixture, models: &S11M2cScopeModels) {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-valid-mmm", &models.middle);
+    seed_segment(
+        &conn,
+        "chain-valid-mmm",
+        &accepted_account(),
+        "session-valid-mmm",
+        None,
+        Some("turn-valid-mmm"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &accepted_account(),
+        "session-valid-mmm",
+        "turn-valid-mmm",
+        "assistant",
+    );
+
+    seed_chain(&conn, "chain-valid-zzz", &models.last);
+    seed_segment(
+        &conn,
+        "chain-valid-zzz",
+        &accepted_account(),
+        "session-valid-zzz",
+        None,
+        Some("turn-valid-zzz"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &accepted_account(),
+        "session-valid-zzz",
+        "turn-valid-zzz",
+        "assistant",
+    );
+
+    seed_chain(&conn, "chain-target", &models.target);
+    seed_segment(
+        &conn,
+        "chain-target",
+        &accepted_account(),
+        "session-target",
+        None,
+        Some("turn-target"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &accepted_account(),
+        "session-target",
+        "turn-target",
+        "assistant",
+    );
+
+    seed_chain(&conn, "chain-orphan", "<unknown>");
+    seed_segment(
+        &conn,
+        "chain-orphan",
+        &canonical_account(),
+        "session-orphan",
+        None,
+        Some("turn-orphan"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &canonical_account(),
+        "session-orphan",
+        "turn-orphan",
+        "assistant",
+    );
+
+    seed_chain(&conn, "chain-orphan-rot", "<unknown>");
+    seed_segment(
+        &conn,
+        "chain-orphan-rot",
+        &unregistered_account_a(),
+        "session-orphan-rot",
+        None,
+        Some("turn-orphan-rot"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_a(),
+        "session-orphan-rot",
+        "turn-orphan-rot",
+        "user",
+    );
+
+    seed_chain(&conn, "chain-valid-rot", &models.middle);
+    seed_segment(
+        &conn,
+        "chain-valid-rot",
+        &unregistered_account_a(),
+        "session-valid-rot",
+        None,
+        Some("turn-valid-rot"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_a(),
+        "session-valid-rot",
+        "turn-valid-rot",
+        "user",
+    );
+
+    seed_chain(&conn, "chain-gpt", &models.non_family_model);
+    seed_segment(
+        &conn,
+        "chain-gpt",
+        &models.non_family_account,
+        "session-gpt",
+        None,
+        Some("turn-gpt"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &models.non_family_account,
+        "session-gpt",
+        "turn-gpt",
+        "assistant",
+    );
 }
 
 fn fake_contract_provider_script() -> String {
@@ -3252,6 +3666,43 @@ fn assert_segment_owner(
         .unwrap_or_else(|| panic!("missing segment {chain_id}/{expected_session}"));
     assert_eq!(segment.provider_name, expected_provider, "{chain_id}");
     assert_eq!(segment.session_id, expected_session, "{chain_id}");
+}
+
+fn assert_turn_owner(
+    snapshot: &OwnershipSnapshot,
+    expected_session: &str,
+    expected_turn: &str,
+    expected_provider: &str,
+) {
+    let turn = snapshot
+        .turns
+        .iter()
+        .find(|turn| turn.session_id == expected_session && turn.turn_id == expected_turn)
+        .unwrap_or_else(|| panic!("missing turn {expected_session}/{expected_turn}"));
+    assert_eq!(turn.provider_name, expected_provider, "{expected_turn}");
+    assert_eq!(turn.session_id, expected_session, "{expected_turn}");
+}
+
+fn assert_preserved_chain_segment_session(
+    before: &OwnershipSnapshot,
+    after: &OwnershipSnapshot,
+    chain_id: &str,
+    expected_session: &str,
+) {
+    assert!(
+        before
+            .segments
+            .iter()
+            .any(|segment| segment.chain_id == chain_id && segment.session_id == expected_session),
+        "missing pre-apply segment {chain_id}/{expected_session}"
+    );
+    assert!(
+        after
+            .segments
+            .iter()
+            .any(|segment| segment.chain_id == chain_id && segment.session_id == expected_session),
+        "missing post-apply segment {chain_id}/{expected_session}"
+    );
 }
 
 fn assert_turn_consistency(before: &OwnershipSnapshot, after: &OwnershipSnapshot) {
