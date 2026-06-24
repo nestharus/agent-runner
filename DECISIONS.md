@@ -4632,3 +4632,64 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   corrected scope on a copy of the real `state.db`. Linear cross-link/close-comment skipped (Option B);
   the manager creates+links the NES ticket out-of-band. Estimate calibration: inherited=null, refined=5,
   actual=5.
+
+## S11-M2c-turns — session-level rotation-turn canonicalization (this WU)
+
+- **S11-M2c-turns D1 — Linear gap (manager-authorized Option B):** `LINEAR_API_KEY` is unavailable to
+  spooled jobs, so no `linear-operator` step can run. The manager (manager-max) authorized **Option B**:
+  do all work, open the **draft PR on base `main`**, skip every Linear dispatch, treat `wu_brief_path`
+  (`planning/s11-m2c-turns-session-canonicalization/brief.md`) as the source of truth, and let the
+  manager create + link the NES ticket out-of-band. Intended ticket title: "S11-M2c-turns: session-level
+  rotation-turn canonicalization". The pipeline does NOT halt on the missing ticket. `ticket_system=none`;
+  all Phase 0/3/8.X/9/Final ticket-operator dispatches are skipped.
+- **S11-M2c-turns D2 — Orchestration topology adaptation:** this orchestrator runs from an external
+  top-level operator harness, not from within an `agents` process tree, so each phase dispatch
+  (`agents -m <model> -p <worktree> -f <prompt> 2>&1 | tee <log>`) is its own root invocation rather than
+  children of one unifying tree. The contract's three cross-phase process-tree audits (Phase 4/6/8 joins)
+  cannot audit a single spanning tree here. Adaptation: the non-negotiable invariants — Step 6b ≠ Step 6c
+  invocation UUID, risk gate on the proposal (not the diff), each phase a fresh `agents` invocation with
+  its own prompt+log — are verified directly from the `OULIPOLY_INVOCATION` ids in `.scratch/logs/`. The
+  `apply-gate-set` ceremony is replaced by direct dispatch of the substantive risk/review/verification
+  operators plus orchestrator-side gate evaluation. Recorded per the contract's requirement to record any
+  gate adaptation/narrowing.
+- **S11-M2c-turns D3 — auto_merge_after_phase_9=false:** stop at the draft PR (base `main`). The manager
+  merges after a full `cargo test --workspace` and a final comprehensive timed on-copy proof (ZERO
+  non-canonical rotation-account residual in both `session_chain_segments` AND `session_turns`).
+- **S11-M2c-turns D4 — Phase 3 estimate / ticket skip:** proposal refined estimate = 5 (inherited null,
+  source `missing`). `ticket_system=none` ⇒ the pre-Phase-4 `update-estimate` ticket-operator dispatch
+  and all Phase 8.X/Final ticket calibration comments are skipped (Option B). Calibration is recorded in
+  `audit-history.md` only.
+- **S11-M2c-turns D5 — Phase 5 hookpoint consolidation:** the Phase 2.5 problem-map already enumerated
+  the hookpoint surface — reuse points (`build_turn_dedup_plan`/`TurnContent::intrinsic_content_key`,
+  `moved_provider_token()`/`contains_pattern`, the `'turn'`/`'turn_delete'` preimage + rollback-drift
+  machinery), conflicting systems (none; `s11_wu4_candidate_segments` stays segment-scope), and deletion
+  candidates (none beyond the existing dedup/merge deletes). A separate Phase 5 dispatch would re-derive
+  the same content, so Phase 5 is satisfied by the problem-map and re-confirmed inside the Phase 4 risk
+  gate (hookpoint-confirmation section). Recorded per the contract's narrowing-record requirement.
+- **S11-M2c-turns D6 — Phase 4 correctness check (orchestrator):** verified that the proposal's
+  migrated-session enumeration catches the defect sessions: a merged-away/ended rotation segment (a
+  non-canonical numbered rotation account) remains a `CandidateSegment` with `new_provider_name ==
+  canonical` in the in-memory `segments` list before forward.sql deletes it, so its `session_id` is
+  enumerated and its lingering rotation turns are remapped. Idempotence/false-positive paths preserved.
+- **S11-M2c-turns D7 — Phase 6c scope correction (orchestrator-owned revert):** the Step 6c prompt
+  instructed `cargo fmt --all`, which reformatted 23 pre-unformatted workspace files outside the
+  migration surface (import re-ordering / line-wrapping only, no logic) and `target_resolution.rs` +
+  `report.rs` inside the migration dir (also fmt-only). That churn tripped the
+  `age246_s8_setup_dispatch_source_guard::s8_files_introduce_zero_new_concrete_provider_vocabulary`
+  guard, which counts every added `+` line containing the lowercase provider family across the whole
+  `git diff`. The orchestrator reverted all 23 out-of-scope files plus the two fmt-only in-scope-dir
+  files to `HEAD`, and neutralized two provider-family literals in this WU's own decision prose, so the
+  final diff is exactly `classifier.rs`, `forward.sql`, `sql.rs`,
+  `tests/s11_m2_session_ownership_migration.rs`, and `DECISIONS.md`, with ZERO new lowercase
+  provider-family tokens (token delta vs main = 0). The migration logic, the 51/51-green S11 suite, and
+  clippy are unaffected because the reverted edits were formatting-only. Future-prompt fix: scope the
+  formatter to the changed package, not `--all`.
+- **S11-M2c-turns D8 — Final disposition:** draft PR https://github.com/nestharus/agent-runner/pull/197
+  opened on base `main` (commit `18cd6b32`). `auto_merge_after_phase_9=false` ⇒ the pipeline stops at
+  the draft PR; the manager merges after rerunning the full `cargo test --workspace` and the final
+  comprehensive timed on-copy proof (ZERO non-canonical rotation-account residual in both
+  `session_chain_segments` and `session_turns`) on a copy of the real `state.db`. Phase 8 already
+  proved build + clippy (`-D warnings`) + tsc green, the S11 suite 51/51, `cargo test --workspace` red
+  only on the documented `age244_s7b` / `age245_s7c` grep guards + the os-error-11 PTY flake, and token
+  delta vs `main` = 0. Linear cross-link/close-comment skipped (Option B); the manager creates + links
+  the NES ticket out-of-band. Estimate calibration: inherited=null, refined=5, actual=5.

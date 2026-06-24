@@ -1,7 +1,7 @@
 //! Declared roles: accessor, mapper, validator, predicate
 
-use super::preflight::{self, IntegrityReport};
 use super::DryRunError;
+use super::preflight::{self, IntegrityReport};
 use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -534,12 +534,25 @@ fn residual_segment_old_owner_count(conn: &Connection) -> Result<i64, DryRunErro
 
 fn residual_turn_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> {
     conn.query_row(
-        "SELECT COUNT(*)
-         FROM s11_wu4_restore_session_ownership_preimage p
-         JOIN session_turns t ON t.id = p.turn_row_id
-         WHERE p.entity_kind = 'turn'
-           AND p.old_provider_name <> p.new_provider_name
-           AND t.provider_name = p.old_provider_name",
+        "WITH params AS (
+             SELECT
+                 (SELECT value FROM s11_wu4_forward_migration_params WHERE key = 'canonical_provider_name') AS canonical_provider_name,
+                 (SELECT value FROM s11_wu4_forward_migration_params WHERE key = 'moved_provider_like_pattern') AS moved_provider_like_pattern
+         ), migrated_sessions AS (
+             SELECT DISTINCT candidate.session_id
+             FROM s11_wu4_candidate_segments candidate
+             CROSS JOIN params
+             WHERE candidate.new_provider_name = params.canonical_provider_name
+         )
+         SELECT COUNT(*)
+         FROM migrated_sessions migrated
+         JOIN session_turns t ON t.session_id = migrated.session_id
+         CROSS JOIN params
+         LEFT JOIN s11_wu4_forward_target_provider_inventory inventory
+           ON inventory.provider_name = t.provider_name
+         WHERE lower(t.provider_name) LIKE params.moved_provider_like_pattern
+           AND t.provider_name <> params.canonical_provider_name
+           AND inventory.provider_name IS NULL",
         [],
         |row| row.get(0),
     )
@@ -1046,8 +1059,8 @@ mod tests {
     }
 
     #[test]
-    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction(
-    ) {
+    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction()
+     {
         assert_intrinsic_loser_drift_rolls_back("timestamp", "2026-06-20T10:30:00Z");
     }
 

@@ -466,6 +466,14 @@ struct S11M2cScopeModels {
     non_family_account: String,
 }
 
+#[derive(Debug, Clone)]
+struct WidenedComprehensiveSessions {
+    merged_session: &'static str,
+    orphan_session: &'static str,
+    rotation_session: &'static str,
+    accepted_session: &'static str,
+}
+
 impl S11M2cScopeModels {
     fn new() -> Self {
         Self {
@@ -1306,6 +1314,293 @@ fn s11_m2c_t14_dry_run_collision_resolution_preserves_live_and_rolls_back_copy_e
             .filter(|turn| turn.session_id == "session-dedup" && turn.turn_id == "turn-dedup")
             .count(),
         1
+    );
+    assert_eq!(full_snapshot(&rollback_copy), live_before);
+}
+
+#[test]
+fn s11_m2c_turns_merged_away_rotation_owner_is_canonicalized_at_session_level() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let turn_ids = seed_merged_away_rotation_turns(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = full_snapshot(&fixture.state_path);
+    assert_turns_owned_by(
+        &after,
+        "session-turns-merged-away",
+        &turn_ids,
+        &canonical_account(),
+    );
+    assert_no_noncanonical_rotation_turns_in_sessions(&after, &["session-turns-merged-away"]);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_eq!(last_run_count(&conn, "turn_provider_updates_to_apply"), 2);
+}
+
+#[test]
+fn s11_m2c_turns_byte_identical_widened_collision_dedups_min_id() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let expected_winner = seed_merged_away_identical_turn_collision(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    assert_eq!(last_run_count(&conn, "turn_rows_deduped_away"), 1);
+    assert_eq!(last_run_count(&conn, "post_apply_turn_collision_count"), 0);
+    let after = full_snapshot(&fixture.state_path);
+    let survivor = single_turn_by_key(&after, "session-turns-identical", "turn-identical");
+    assert_eq!(
+        survivor.id, expected_winner.id,
+        "dedup winner must be MIN(id)"
+    );
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_same_turn_content(survivor, &expected_winner);
+}
+
+#[test]
+fn s11_m2c_turns_divergent_widened_collision_aborts_without_mutation() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_merged_away_divergent_turn_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let hash_before = file_hash(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    assert_failure_mentions(&output, fixture.dir.path(), "divergent");
+    assert_eq!(
+        file_hash(&fixture.state_path),
+        hash_before,
+        "live DB hash changed"
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        before,
+        "live DB rows changed"
+    );
+}
+
+#[test]
+fn s11_m2c_turns_comprehensive_zero_residual_covers_segments_and_turns() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let sessions = seed_widened_turn_comprehensive_population(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_quick_check_ok(&fixture.state_path);
+    assert_live_counts_and_zero_residual(&fixture.state_path);
+    let after = full_snapshot(&fixture.state_path);
+    assert_turns_owned_by(
+        &after,
+        sessions.merged_session,
+        &["turn-comprehensive-historical"],
+        &canonical_account(),
+    );
+    assert_turns_owned_by(
+        &after,
+        sessions.orphan_session,
+        &["turn-comprehensive-orphan"],
+        &canonical_account(),
+    );
+    assert_turns_owned_by(
+        &after,
+        sessions.rotation_session,
+        &["turn-comprehensive-rotation"],
+        &canonical_account(),
+    );
+    assert_turns_owned_by(
+        &after,
+        sessions.accepted_session,
+        &["turn-comprehensive-accepted"],
+        &accepted_account(),
+    );
+    assert_no_noncanonical_rotation_turns_in_sessions(
+        &after,
+        &[
+            sessions.merged_session,
+            sessions.orphan_session,
+            sessions.rotation_session,
+        ],
+    );
+}
+
+#[test]
+fn s11_m2c_turns_inventory_provider_matching_family_is_not_remapped() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_accepted_inventory_turn(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = full_snapshot(&fixture.state_path);
+    assert_turns_owned_by(
+        &after,
+        "session-turns-accepted",
+        &["turn-accepted-inventory"],
+        &accepted_account(),
+    );
+}
+
+#[test]
+fn s11_m2c_turns_rollback_restores_widened_updates_and_dedup_deletes_exactly() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_widened_rollback_population(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after_apply = full_snapshot(&fixture.state_path);
+    assert_ne!(after_apply, before);
+    let planned_losers =
+        planned_dedup_loser_ids(&before, "session-turns-identical", &["turn-identical"]);
+    assert_eq!(
+        planned_losers.len(),
+        1,
+        "fixture must include one widened dedup loser"
+    );
+    assert_preserved_non_dedup_turns_by_id(&before, &after_apply, &planned_losers);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+    let report = read_report_from_output(&rollback);
+    assert_report_context_count(&report, &ROLLBACK_COPY_PHASE, "turn_rows_reinserted", 1);
+}
+
+#[test]
+fn s11_m2c_turns_reapply_after_widened_success_is_clean_noop() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_widened_rollback_population(&fixture);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_first = full_snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(full_snapshot(&fixture.state_path), after_first);
+    let report = read_report_from_output(&second);
+    for key in [
+        "chain_model_updates_to_apply",
+        "segment_provider_updates_to_apply",
+        "turn_provider_updates_to_apply",
+        "segment_rows_merged_away",
+        "turn_rows_deduped_away",
+        "segment_merge_survivors_updated",
+    ] {
+        assert_report_count(&report, key, 0);
+    }
+}
+
+#[test]
+fn s11_m2c_turns_fresh_widened_runs_are_deterministic() {
+    let first = apply_widened_fixture_snapshot_and_counts();
+    let second = apply_widened_fixture_snapshot_and_counts();
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn s11_m2c_turns_session_ids_are_stable_across_apply_and_rollback() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_widened_rollback_population(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after_apply = full_snapshot(&fixture.state_path);
+    assert_surviving_session_ids_preserved(&before, &after_apply);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+}
+
+#[test]
+fn s11_m2c_turns_dry_run_widened_fixture_preserves_live_and_rolls_back_copy() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_widened_rollback_population(&fixture);
+    let live_before = full_snapshot(&fixture.state_path);
+    let hash_before = file_hash(&fixture.state_path);
+    let mtime_before = file_mtime(&fixture.state_path);
+
+    let output = fixture.run();
+
+    assert_success(&output);
+    assert_eq!(
+        file_hash(&fixture.state_path),
+        hash_before,
+        "live DB hash changed"
+    );
+    assert_eq!(
+        file_mtime(&fixture.state_path),
+        mtime_before,
+        "live DB mtime changed"
+    );
+    assert_eq!(
+        full_snapshot(&fixture.state_path),
+        live_before,
+        "live DB rows changed"
+    );
+    let state_copy = find_artifact(&fixture.scratch_dir, "state-copy.db");
+    let rollback_copy = find_artifact(&fixture.scratch_dir, "rollback-copy.db");
+    let copy_after = full_snapshot(&state_copy);
+    assert_no_noncanonical_rotation_turns_in_sessions(
+        &copy_after,
+        &["session-turns-merged-away", "session-turns-identical"],
     );
     assert_eq!(full_snapshot(&rollback_copy), live_before);
 }
@@ -2295,6 +2590,8 @@ fn assert_live_counts_and_zero_residual(path: &Path) {
     assert_eq!(segment_planned, applied_segment_count(&conn));
     assert_eq!(turn_planned, applied_turn_count(&conn));
     assert_eq!(residual_old_owner_count(&conn), 0);
+    assert_eq!(residual_noncanonical_rotation_segment_owner_count(&conn), 0);
+    assert_eq!(residual_noncanonical_rotation_turn_owner_count(&conn), 0);
     assert!(preimage_row_count(&conn) > 0, "preimage table is empty");
 }
 
@@ -2387,6 +2684,53 @@ fn residual_old_owner_count(conn: &Connection) -> i64 {
         )
         .unwrap();
     chains + segments + turns
+}
+
+fn residual_noncanonical_rotation_segment_owner_count(conn: &Connection) -> i64 {
+    let pattern = format!("%{}%", provider_token());
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM session_chain_segments s
+         JOIN session_chains c ON c.chain_id = s.chain_id
+         WHERE c.model_name = ?4
+           AND s.provider_name LIKE ?1
+           AND s.provider_name <> ?2
+           AND s.provider_name <> ?3",
+        params![
+            pattern,
+            canonical_account(),
+            accepted_account(),
+            target_model_name()
+        ],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn residual_noncanonical_rotation_turn_owner_count(conn: &Connection) -> i64 {
+    let pattern = format!("%{}%", provider_token());
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM session_turns t
+         WHERE t.provider_name LIKE ?1
+           AND t.provider_name <> ?2
+           AND t.provider_name <> ?3
+           AND EXISTS (
+               SELECT 1
+               FROM session_chain_segments s
+               JOIN session_chains c ON c.chain_id = s.chain_id
+               WHERE s.session_id = t.session_id
+                 AND c.model_name = ?4
+           )",
+        params![
+            pattern,
+            canonical_account(),
+            accepted_account(),
+            target_model_name()
+        ],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn preimage_row_count(conn: &Connection) -> i64 {
@@ -2976,6 +3320,283 @@ fn seed_large_rotation_collision(fixture: &Fixture) {
     );
     seed_mailbox(&fixture.mailbox_path, "session-large", None);
     seed_mailbox(&fixture.mailbox_path, "session-large-unrelated", None);
+}
+
+fn seed_merged_away_rotation_turns(fixture: &Fixture) -> Vec<&'static str> {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-turns-merged-away", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-turns-merged-away",
+        &canonical_account(),
+        "session-turns-merged-away",
+        "2026-06-20T19:00:00Z",
+        None,
+        Some("turn-current-survivor"),
+        "exhausted",
+    );
+    seed_turn(
+        &conn,
+        &canonical_account(),
+        "session-turns-merged-away",
+        "turn-current-survivor",
+        "assistant",
+    );
+    let historical_provider = unregistered_account_family(4);
+    let turn_ids = vec!["turn-historical-one", "turn-historical-two"];
+    for turn_id in &turn_ids {
+        seed_turn(
+            &conn,
+            &historical_provider,
+            "session-turns-merged-away",
+            turn_id,
+            "user",
+        );
+    }
+    seed_mailbox(&fixture.mailbox_path, "session-turns-merged-away", None);
+    turn_ids
+}
+
+fn seed_merged_away_identical_turn_collision(fixture: &Fixture) -> TurnRowSnapshot {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-turns-identical", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-turns-identical",
+        &canonical_account(),
+        "session-turns-identical",
+        "2026-06-20T20:00:00Z",
+        None,
+        Some("turn-identical"),
+        "exhausted",
+    );
+    let winner_id = seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-turns-identical",
+        "turn-identical",
+        "2026-06-20T20:01:00Z",
+        "assistant",
+        Some("turn-identical-parent"),
+        0,
+        1,
+        "widened-identical.jsonl",
+        "2026-06-20T20:02:00Z",
+        Some("widened-identical-body"),
+    );
+    seed_turn_full(
+        &conn,
+        &unregistered_account_family(5),
+        "session-turns-identical",
+        "turn-identical",
+        "2026-06-20T20:01:00Z",
+        "assistant",
+        Some("turn-identical-parent"),
+        0,
+        1,
+        "widened-identical.jsonl",
+        "2026-06-20T20:03:00Z",
+        Some("widened-identical-body"),
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-turns-identical", None);
+    query_turns_with_id(&conn)
+        .into_iter()
+        .find(|turn| turn.id == winner_id)
+        .unwrap()
+}
+
+fn seed_merged_away_divergent_turn_collision(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-turns-divergent", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-turns-divergent",
+        &canonical_account(),
+        "session-turns-divergent",
+        "2026-06-20T21:00:00Z",
+        None,
+        Some("turn-widened-divergent"),
+        "exhausted",
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-turns-divergent",
+        "turn-widened-divergent",
+        "2026-06-20T21:01:00Z",
+        "assistant",
+        Some("turn-divergent-parent"),
+        0,
+        0,
+        "widened-divergent.jsonl",
+        "2026-06-20T21:02:00Z",
+        Some("right-widened-body"),
+    );
+    seed_turn_full(
+        &conn,
+        &unregistered_account_family(6),
+        "session-turns-divergent",
+        "turn-widened-divergent",
+        "2026-06-20T21:01:00Z",
+        "assistant",
+        Some("turn-divergent-parent"),
+        0,
+        0,
+        "widened-divergent.jsonl",
+        "2026-06-20T21:03:00Z",
+        Some("left-widened-body"),
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-turns-divergent", None);
+}
+
+fn seed_widened_turn_comprehensive_population(fixture: &Fixture) -> WidenedComprehensiveSessions {
+    let conn = fixture.conn();
+    let sessions = WidenedComprehensiveSessions {
+        merged_session: "session-comprehensive-merged",
+        orphan_session: "session-comprehensive-orphan",
+        rotation_session: "session-comprehensive-rotation",
+        accepted_session: "session-comprehensive-accepted",
+    };
+
+    seed_chain(&conn, "chain-comprehensive-merged", &source_model_name());
+    seed_segment(
+        &conn,
+        "chain-comprehensive-merged",
+        &canonical_account(),
+        sessions.merged_session,
+        None,
+        Some("turn-comprehensive-current"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_family(4),
+        sessions.merged_session,
+        "turn-comprehensive-historical",
+        "user",
+    );
+
+    seed_chain(&conn, "chain-comprehensive-orphan", "<unknown>");
+    seed_segment(
+        &conn,
+        "chain-comprehensive-orphan",
+        &canonical_account(),
+        sessions.orphan_session,
+        None,
+        Some("turn-comprehensive-orphan"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_family(5),
+        sessions.orphan_session,
+        "turn-comprehensive-orphan",
+        "assistant",
+    );
+
+    seed_chain(&conn, "chain-comprehensive-rotation", &source_model_name());
+    seed_segment(
+        &conn,
+        "chain-comprehensive-rotation",
+        &unregistered_account_a(),
+        sessions.rotation_session,
+        None,
+        Some("turn-comprehensive-rotation"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_a(),
+        sessions.rotation_session,
+        "turn-comprehensive-rotation",
+        "assistant",
+    );
+
+    seed_chain(&conn, "chain-comprehensive-accepted", &source_model_name());
+    seed_segment(
+        &conn,
+        "chain-comprehensive-accepted",
+        &canonical_account(),
+        sessions.accepted_session,
+        None,
+        Some("turn-comprehensive-accepted"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &accepted_account(),
+        sessions.accepted_session,
+        "turn-comprehensive-accepted",
+        "assistant",
+    );
+
+    for session_id in [
+        sessions.merged_session,
+        sessions.orphan_session,
+        sessions.rotation_session,
+        sessions.accepted_session,
+    ] {
+        seed_mailbox(&fixture.mailbox_path, session_id, None);
+    }
+    sessions
+}
+
+fn seed_accepted_inventory_turn(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-turns-accepted", &source_model_name());
+    seed_segment(
+        &conn,
+        "chain-turns-accepted",
+        &canonical_account(),
+        "session-turns-accepted",
+        None,
+        Some("turn-accepted-inventory"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &accepted_account(),
+        "session-turns-accepted",
+        "turn-accepted-inventory",
+        "assistant",
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-turns-accepted", None);
+}
+
+fn seed_widened_rollback_population(fixture: &Fixture) {
+    seed_merged_away_rotation_turns(fixture);
+    seed_merged_away_identical_turn_collision(fixture);
+}
+
+fn apply_widened_fixture_snapshot_and_counts() -> (FullOwnershipSnapshot, BTreeMap<String, i64>) {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_widened_rollback_population(&fixture);
+    let backup_dir = fixture.backup_dir();
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    let counts = last_run_counts_for_keys(
+        &conn,
+        &[
+            "chain_model_updates_to_apply",
+            "segment_provider_updates_to_apply",
+            "turn_provider_updates_to_apply",
+            "segment_rows_merged_away",
+            "turn_rows_deduped_away",
+            "post_apply_turn_collision_count",
+        ],
+    );
+    (full_snapshot(&fixture.state_path), counts)
+}
+
+fn last_run_counts_for_keys(conn: &Connection, keys: &[&str]) -> BTreeMap<String, i64> {
+    keys.iter()
+        .map(|key| ((*key).to_string(), last_run_count(conn, key)))
+        .collect()
 }
 
 fn seed_scale_smoke_population(
@@ -3681,6 +4302,69 @@ fn assert_turn_owner(
         .unwrap_or_else(|| panic!("missing turn {expected_session}/{expected_turn}"));
     assert_eq!(turn.provider_name, expected_provider, "{expected_turn}");
     assert_eq!(turn.session_id, expected_session, "{expected_turn}");
+}
+
+fn assert_turns_owned_by(
+    snapshot: &FullOwnershipSnapshot,
+    expected_session: &str,
+    expected_turns: &[&str],
+    expected_provider: &str,
+) {
+    for expected_turn in expected_turns {
+        let turn = snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.session_id == expected_session && turn.turn_id == *expected_turn)
+            .unwrap_or_else(|| panic!("missing turn {expected_session}/{expected_turn}"));
+        assert_eq!(turn.provider_name, expected_provider, "{expected_turn}");
+        assert_eq!(turn.session_id, expected_session, "{expected_turn}");
+    }
+}
+
+fn assert_no_noncanonical_rotation_turns_in_sessions(
+    snapshot: &FullOwnershipSnapshot,
+    session_ids: &[&str],
+) {
+    let residual: Vec<_> = snapshot
+        .turns
+        .iter()
+        .filter(|turn| session_ids.contains(&turn.session_id.as_str()))
+        .filter(|turn| is_noncanonical_rotation_provider(&turn.provider_name))
+        .collect();
+    assert!(
+        residual.is_empty(),
+        "non-canonical rotation turn owners remain: {residual:?}"
+    );
+}
+
+fn is_noncanonical_rotation_provider(provider_name: &str) -> bool {
+    provider_name.contains(&provider_token())
+        && provider_name != canonical_account()
+        && provider_name != accepted_account()
+}
+
+fn assert_surviving_session_ids_preserved(
+    before: &FullOwnershipSnapshot,
+    after: &FullOwnershipSnapshot,
+) {
+    let after_segments_by_id: BTreeMap<_, _> = after
+        .segments
+        .iter()
+        .map(|segment| (segment.id, segment))
+        .collect();
+    for before_segment in &before.segments {
+        if let Some(after_segment) = after_segments_by_id.get(&before_segment.id) {
+            assert_eq!(after_segment.session_id, before_segment.session_id);
+        }
+    }
+
+    let after_turns_by_id: BTreeMap<_, _> =
+        after.turns.iter().map(|turn| (turn.id, turn)).collect();
+    for before_turn in &before.turns {
+        if let Some(after_turn) = after_turns_by_id.get(&before_turn.id) {
+            assert_eq!(after_turn.session_id, before_turn.session_id);
+        }
+    }
 }
 
 fn assert_preserved_chain_segment_session(
