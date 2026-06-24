@@ -45,6 +45,7 @@ CREATE TEMP TABLE s11_wu4_candidate_segments (
     session_id TEXT NOT NULL,
     new_provider_name TEXT NOT NULL,
     remap_reason TEXT NOT NULL,
+    is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1)),
     issue52_unregistered INTEGER NOT NULL CHECK(issue52_unregistered IN (0, 1)),
     PRIMARY KEY (chain_id, segment_id)
 );
@@ -58,6 +59,7 @@ INSERT INTO s11_wu4_candidate_segments (
     session_id,
     new_provider_name,
     remap_reason,
+    is_orphaned,
     issue52_unregistered
 )
 WITH params AS (
@@ -73,6 +75,7 @@ SELECT
     segment.session_id,
     COALESCE(alias.new_provider_name, segment.provider_name),
     COALESCE(alias.reason, inventory.source),
+    source.is_orphaned,
     CASE WHEN original.provider_name IS NULL THEN 1 ELSE 0 END
 FROM s11_wu4_source_chain_candidates source
 JOIN session_chains chain ON chain.chain_id = source.chain_id
@@ -84,7 +87,8 @@ LEFT JOIN s11_wu4_target_provider_inventory inventory
   ON inventory.provider_name = segment.provider_name
 LEFT JOIN s11_wu4_provider_aliases alias
   ON alias.old_provider_name = segment.provider_name
-WHERE chain.model_name <> params.target_model_name;
+WHERE (source.is_orphaned = 1 AND chain.model_name <> params.target_model_name)
+   OR original.provider_name IS NULL;
 
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
@@ -102,7 +106,8 @@ SELECT DISTINCT
     candidate.old_model_name,
     candidate.target_model_name
 FROM s11_wu4_candidate_segments candidate
-WHERE candidate.old_model_name <> candidate.target_model_name;
+WHERE candidate.is_orphaned = 1
+  AND candidate.old_model_name <> candidate.target_model_name;
 
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
@@ -148,7 +153,7 @@ SELECT
     segment.chain_id,
     segment.id,
     segment.provider_name,
-    candidate.new_provider_name,
+    COALESCE(alias.new_provider_name, segment.provider_name),
     segment.session_id,
     segment.started_at,
     segment.ended_at,
@@ -156,7 +161,7 @@ SELECT
     segment.transition_reason
 FROM s11_wu4_segment_merge_deletes planned
 JOIN session_chain_segments segment ON segment.id = planned.segment_id
-JOIN s11_wu4_candidate_segments candidate ON candidate.segment_id = segment.id;
+LEFT JOIN s11_wu4_provider_aliases alias ON alias.old_provider_name = segment.provider_name;
 
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
@@ -183,7 +188,7 @@ SELECT
     segment.chain_id,
     segment.id,
     segment.provider_name,
-    candidate.new_provider_name,
+    COALESCE(alias.new_provider_name, segment.provider_name),
     segment.session_id,
     segment.started_at,
     segment.ended_at,
@@ -195,7 +200,7 @@ SELECT
     planned.merged_transition_reason
 FROM s11_wu4_segment_merge_groups planned
 JOIN session_chain_segments segment ON segment.id = planned.survivor_segment_id
-JOIN s11_wu4_candidate_segments candidate ON candidate.segment_id = segment.id;
+LEFT JOIN s11_wu4_provider_aliases alias ON alias.old_provider_name = segment.provider_name;
 
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
@@ -259,6 +264,55 @@ SELECT
     turn.body
 FROM s11_wu4_turn_dedup_deletes planned
 JOIN session_turns turn ON turn.id = planned.loser_turn_row_id;
+
+DROP TABLE IF EXISTS s11_wu4_last_run_preimage_plan;
+CREATE TABLE s11_wu4_last_run_preimage_plan (
+    entity_kind TEXT NOT NULL,
+    row_pk TEXT NOT NULL,
+    PRIMARY KEY (entity_kind, row_pk)
+);
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT 'chain', candidate.chain_id
+FROM s11_wu4_candidate_segments candidate
+JOIN session_chains chain ON chain.chain_id = candidate.chain_id
+WHERE candidate.is_orphaned = 1
+  AND chain.model_name = candidate.old_model_name
+  AND candidate.old_model_name <> candidate.target_model_name;
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT 'segment', CAST(candidate.segment_id AS TEXT)
+FROM s11_wu4_candidate_segments candidate
+JOIN session_chain_segments segment ON segment.id = candidate.segment_id
+LEFT JOIN s11_wu4_segment_merge_deletes deleted ON deleted.segment_id = candidate.segment_id
+WHERE deleted.segment_id IS NULL
+  AND segment.provider_name = candidate.old_provider_name
+  AND candidate.old_provider_name <> candidate.new_provider_name;
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT DISTINCT 'turn', CAST(turn.id AS TEXT)
+FROM s11_wu4_candidate_segments candidate
+JOIN session_turns turn
+  ON turn.provider_name = candidate.old_provider_name
+ AND turn.session_id = candidate.session_id
+LEFT JOIN s11_wu4_turn_dedup_deletes deleted ON deleted.loser_turn_row_id = turn.id
+WHERE deleted.loser_turn_row_id IS NULL
+  AND candidate.old_provider_name <> candidate.new_provider_name;
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT 'segment_delete', CAST(planned.segment_id AS TEXT)
+FROM s11_wu4_segment_merge_deletes planned
+JOIN session_chain_segments segment ON segment.id = planned.segment_id;
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT 'turn_delete', CAST(planned.loser_turn_row_id AS TEXT)
+FROM s11_wu4_turn_dedup_deletes planned
+JOIN session_turns turn ON turn.id = planned.loser_turn_row_id;
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT 'segment_merge_survivor', CAST(planned.survivor_segment_id AS TEXT)
+FROM s11_wu4_segment_merge_groups planned
+JOIN session_chain_segments segment ON segment.id = planned.survivor_segment_id;
 
 CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_turn
 ON s11_wu4_restore_session_ownership_preimage(entity_kind, turn_row_id);
@@ -345,6 +399,7 @@ SELECT 'chain_model_updates_to_apply', COUNT(DISTINCT candidate.chain_id)
 FROM s11_wu4_candidate_segments candidate
 JOIN session_chains chain ON chain.chain_id = candidate.chain_id
 WHERE chain.model_name = candidate.old_model_name
+  AND candidate.is_orphaned = 1
   AND candidate.old_model_name <> candidate.target_model_name;
 
 INSERT INTO s11_wu4_last_run_counts(key, value)

@@ -5,10 +5,10 @@ use crate::cli::paths::default_models_dir;
 use crate::provider_artifact::provider_artifact_from_ref;
 use crate::provider_proof::prove_provider_artifact;
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig, load_models,
+    load_models, ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 struct LoadedTargetConfig {
@@ -21,6 +21,7 @@ pub(crate) struct TargetResolution {
     pub(crate) model_name: String,
     pub(crate) canonical_provider_name: String,
     pub(crate) inventory: Vec<String>,
+    pub(crate) provider_ref_model_names: BTreeSet<String>,
     provider_artifact: ProviderArtifactRef,
 }
 
@@ -32,11 +33,17 @@ pub(crate) fn resolve_target(
     let model = require_target_model(select_target_model(&loaded.models, &target_binary))?;
     let provider_artifact = require_provider_artifact(model.provider.as_ref())?;
     let canonical = require_canonical_provider(first_provider(model))?;
+    let provider_ref_model_names = provider_ref_model_names(&loaded.models);
     let _ = loaded
         .providers_cfg
         .runtime_provider(&canonical.name)
         .map_err(|err| DryRunError::new(format!("target provider account failed: {err}")))?;
-    Ok(target_resolution(model, canonical, provider_artifact))
+    Ok(target_resolution(
+        model,
+        canonical,
+        provider_artifact,
+        provider_ref_model_names,
+    ))
 }
 
 pub(crate) fn prove_provider(target: &TargetResolution) -> Result<(), DryRunError> {
@@ -70,7 +77,16 @@ fn select_target_model<'a>(
 ) -> Option<&'a ModelConfig> {
     models
         .values()
-        .find(|model| model_provider_binary(model).as_deref() == Some(target_binary))
+        .filter(|model| model_provider_binary(model).as_deref() == Some(target_binary))
+        .min_by(|left, right| left.name.cmp(&right.name))
+}
+
+fn provider_ref_model_names(models: &HashMap<String, ModelConfig>) -> BTreeSet<String> {
+    models
+        .values()
+        .filter(|model| model.provider.is_some())
+        .map(|model| model.name.clone())
+        .collect()
 }
 
 fn require_target_model(model: Option<&ModelConfig>) -> Result<&ModelConfig, DryRunError> {
@@ -102,6 +118,7 @@ fn target_resolution(
     model: &ModelConfig,
     canonical: &ProviderConfig,
     provider_artifact: ProviderArtifactRef,
+    provider_ref_model_names: BTreeSet<String>,
 ) -> TargetResolution {
     TargetResolution {
         model_name: model.name.clone(),
@@ -111,6 +128,7 @@ fn target_resolution(
             .iter()
             .map(|provider| provider.name.clone())
             .collect(),
+        provider_ref_model_names,
         provider_artifact,
     }
 }
@@ -133,4 +151,62 @@ fn moved_external_provider_binary() -> String {
 
 fn moved_provider_token() -> String {
     ["cla", "ude"].concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_config::model::PromptMode;
+
+    #[test]
+    fn s11_m2c_scope_target_selection_is_deterministic() {
+        let token = ["cla", "ude"].concat();
+        let binary = format!("agent-runner-{token}");
+        let expected = format!("aaa-ref-{token}");
+        let names = [
+            expected.clone(),
+            format!("mmm-ref-{token}"),
+            format!("zzz-ref-{token}"),
+            format!("nnn-ref-{token}"),
+            format!("bbb-ref-{token}"),
+            format!("yyy-ref-{token}"),
+        ];
+
+        for offset in 0..names.len() {
+            let mut models = HashMap::new();
+            for index in 0..names.len() {
+                let name = names[(index + offset) % names.len()].clone();
+                models.insert(name.clone(), model_config(&name, &binary));
+            }
+            models.insert(
+                "gpt-thing".to_string(),
+                model_config("gpt-thing", "agent-runner-gpt"),
+            );
+
+            for attempt in 0..4 {
+                let selected = select_target_model(&models, &binary)
+                    .unwrap_or_else(|| panic!("missing target model on offset {offset}"));
+                assert_eq!(
+                    selected.name, expected,
+                    "offset {offset}, attempt {attempt}"
+                );
+            }
+        }
+    }
+
+    fn model_config(name: &str, binary: &str) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider("acct", Vec::new())],
+            inputs: Vec::new(),
+            provider: Some(ProviderImplementationRef {
+                path: None,
+                crate_name: None,
+                version: None,
+                binary: Some(binary.to_string()),
+                script: None,
+            }),
+        }
+    }
 }

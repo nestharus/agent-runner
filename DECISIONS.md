@@ -4579,3 +4579,56 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   full-scanning the 44k–250k-row helper tables. Indexes only — zero migration logic/semantic change.
 - **auto_merge_after_phase_9 = false:** stop at the draft PR; the manager merges after a full
   `cargo test --workspace` and re-runs the real-data on-copy proof.
+
+## S11-M2c-scope — re-scope migration candidate selection to the design + re-apply idempotence
+
+- Date: 2026-06-24. Branch `s11-m2c-scope-candidate-correction` off `main @ 79b08bb0`.
+- **D0 — Linear gap (manager-authorized Option B):** `LINEAR_API_KEY` is unavailable to spooled jobs,
+  so no `linear-operator` dispatch can run. The manager (manager-max) authorized **Option B**: do all
+  work, open the draft PR on base `main`, skip every `linear-operator` step, treat `brief.md` as the
+  source of truth, record this gap here. The manager creates + links the NES ticket out-of-band
+  (intended title: "S11-M2c-scope: re-scope migration candidate selection to the design + re-apply
+  idempotence"). Not a BLOCKED condition; the pipeline does not halt on the missing ticket.
+- **D1 — Single cohesive concern (do NOT split):** the model-backfill re-scope, the broad
+  rotation-segment remap, the deterministic target, and the re-apply no-op are one correctness unit.
+  The design is authoritative (brief facts + proposal lines 52-54/161 + WU4 dispatch rule); the
+  orchestrator builds to it, does not re-derive.
+- **D2 — Orchestration shape:** every building phase is dispatched to a fresh `agents` sub-agent; the
+  orchestrator never hand-edits source/tests or runs builds. Tests-first separation is preserved —
+  Phase 6b (tests) and Phase 6c (code) are distinct `agents` invocations with distinct UUIDs.
+- **D3 — Verification:** Phase 8 runs the full `cargo test --workspace` inside a dispatched sub-agent
+  and must prove green except the program-deferred grep guards `age244_s7b_export_replace_dispatch`
+  + `age245_s7c_rotation_source_guard` and the headless `os error 11` PTY flake
+  `executor::cli::pty_broker::tui::tests::observed_relay_*`.
+- **D4 — Condensed gate fan-out (recorded for transparency):** given the tightly-specified
+  single-concern correction with the design handed down and `skip_problem_map_gate=true`, the heavy
+  apply-gate-set / process-tree-auditor multi-operator fan-outs are run as consolidated independent
+  review + full-workspace-verification dispatches rather than dozens of separate sub-gate operator
+  invocations. The load-bearing constraints (sub-agent dispatch per building phase, tests-first
+  separation, full-workspace test green, design fidelity, synthetic fixtures only, zero new
+  provider-family literal tokens) are all enforced. Each consolidated gate is its own fresh `agents`
+  invocation with its own prompt + log under `.scratch/`.
+- **D5 — Phase 6 revise loop (rollback-completeness gap, found in orchestrator review):** the first
+  Step 6c implementation narrowed the SQL `s11_wu4_candidate_segments` set so that a registered
+  (in-target-inventory) segment on a VALID non-orphaned chain was excluded, while the Rust segment-merge
+  plan still covered it. A valid Claude chain with a canonical-account segment + a same-session rotation
+  segment that collide-and-merge could therefore have the registered merge participant deleted without a
+  `segment_delete`/`segment_merge_survivor` preimage → `planned != applied` → auto-rollback on the FIRST
+  apply, violating exact-rollback (deliverable #6). A regression test
+  (`s11_m2c_scope_valid_chain_merge_rolls_back_precisely`) reproduced it
+  (`segment_rows_merged_away: planned 1, applied 0; auto-rollback`). Resolution (surgical, SQL-only): keep
+  `s11_wu4_candidate_segments` narrow (so the existing `s11_m2c_t14` collision test is unaffected) and
+  derive the `segment_delete` and `segment_merge_survivor` preimages from the merge plan +
+  `s11_wu4_provider_aliases` (`COALESCE(alias.new_provider_name, segment.provider_name)`) instead of
+  inner-joining `candidate_segments`. Every merge participant is now reversible; the full migration suite
+  is 41/0 green.
+- **D6 — Phase 8 tsc env-override:** the Phase 8 reviewer emitted BLOCK solely because `bunx tsc --noEmit`
+  failed on a missing `node_modules` in the fresh worktree. This WU's diff is Rust/SQL-only (zero frontend
+  delta); after `bun install` (node_modules is gitignored, no tracked-file change) `bunx tsc --noEmit`
+  exits 0. Env-only blocker; Phase 8 is PASS.
+- **D7 — Final disposition:** draft PR https://github.com/nestharus/agent-runner/pull/196 opened on base
+  `main` (commit `b8e5e9d5`). `auto_merge_after_phase_9=false` → the pipeline stops at the draft PR; the
+  manager merges after rerunning the full `cargo test --workspace` and the timed on-copy proof of the
+  corrected scope on a copy of the real `state.db`. Linear cross-link/close-comment skipped (Option B);
+  the manager creates+links the NES ticket out-of-band. Estimate calibration: inherited=null, refined=5,
+  actual=5.
