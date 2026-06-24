@@ -90,6 +90,14 @@ LEFT JOIN s11_wu4_provider_aliases alias
 WHERE (source.is_orphaned = 1 AND chain.model_name <> params.target_model_name)
    OR original.provider_name IS NULL;
 
+DROP TABLE IF EXISTS s11_wu4_forward_migration_params;
+CREATE TEMP TABLE s11_wu4_forward_migration_params AS
+SELECT key, value FROM s11_wu4_migration_params;
+
+DROP TABLE IF EXISTS s11_wu4_forward_target_provider_inventory;
+CREATE TEMP TABLE s11_wu4_forward_target_provider_inventory AS
+SELECT provider_name, source FROM s11_wu4_target_provider_inventory;
+
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
     entity_kind,
@@ -216,16 +224,16 @@ SELECT DISTINCT
     'turn',
     CAST(turn.id AS TEXT),
     turn.id,
-    turn.provider_name,
-    candidate.new_provider_name,
-    turn.session_id
-FROM s11_wu4_candidate_segments candidate
-JOIN session_turns turn
-  ON turn.provider_name = candidate.old_provider_name
- AND turn.session_id = candidate.session_id
+    remap.old_provider_name,
+    remap.new_provider_name,
+    remap.session_id
+FROM s11_wu4_session_turn_remaps remap
+JOIN session_turns turn ON turn.id = remap.turn_row_id
 LEFT JOIN s11_wu4_turn_dedup_deletes deleted ON deleted.loser_turn_row_id = turn.id
-WHERE candidate.old_provider_name <> candidate.new_provider_name
-  AND deleted.loser_turn_row_id IS NULL;
+WHERE deleted.loser_turn_row_id IS NULL
+  AND turn.provider_name = remap.old_provider_name
+  AND turn.session_id = remap.session_id
+  AND turn.turn_id = remap.turn_id;
 
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
@@ -291,13 +299,13 @@ WHERE deleted.segment_id IS NULL
 
 INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
 SELECT DISTINCT 'turn', CAST(turn.id AS TEXT)
-FROM s11_wu4_candidate_segments candidate
-JOIN session_turns turn
-  ON turn.provider_name = candidate.old_provider_name
- AND turn.session_id = candidate.session_id
+FROM s11_wu4_session_turn_remaps remap
+JOIN session_turns turn ON turn.id = remap.turn_row_id
 LEFT JOIN s11_wu4_turn_dedup_deletes deleted ON deleted.loser_turn_row_id = turn.id
 WHERE deleted.loser_turn_row_id IS NULL
-  AND candidate.old_provider_name <> candidate.new_provider_name;
+  AND turn.provider_name = remap.old_provider_name
+  AND turn.session_id = remap.session_id
+  AND turn.turn_id = remap.turn_id;
 
 INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
 SELECT 'segment_delete', CAST(planned.segment_id AS TEXT)
@@ -344,6 +352,24 @@ WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
        OR NOT (loser.timestamp IS winner.timestamp)
        OR NOT (loser.role IS winner.role)
         OR NOT (loser.body IS winner.body)
+);
+
+INSERT OR ROLLBACK INTO s11_wu4_forward_guard(id)
+SELECT 1
+WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
+  AND EXISTS (
+    SELECT 1
+    FROM s11_wu4_session_turn_remaps remap
+    LEFT JOIN s11_wu4_turn_dedup_deletes deleted ON deleted.loser_turn_row_id = remap.turn_row_id
+    LEFT JOIN session_turns turn ON turn.id = remap.turn_row_id
+    WHERE deleted.loser_turn_row_id IS NULL
+      AND (
+           turn.id IS NULL
+        OR turn.session_id <> remap.session_id
+        OR turn.turn_id <> remap.turn_id
+        OR (turn.provider_name <> remap.old_provider_name
+            AND turn.provider_name <> remap.new_provider_name)
+      )
 );
 
 INSERT OR ROLLBACK INTO s11_wu4_forward_guard(id)
@@ -413,13 +439,13 @@ WHERE deleted.segment_id IS NULL
 
 INSERT INTO s11_wu4_last_run_counts(key, value)
 SELECT 'turn_provider_updates_to_apply', COUNT(DISTINCT turn.id)
-FROM s11_wu4_candidate_segments candidate
-JOIN session_turns turn
-  ON turn.provider_name = candidate.old_provider_name
- AND turn.session_id = candidate.session_id
+FROM s11_wu4_session_turn_remaps remap
+JOIN session_turns turn ON turn.id = remap.turn_row_id
 LEFT JOIN s11_wu4_turn_dedup_deletes deleted ON deleted.loser_turn_row_id = turn.id
 WHERE deleted.loser_turn_row_id IS NULL
-  AND candidate.old_provider_name <> candidate.new_provider_name;
+  AND turn.provider_name = remap.old_provider_name
+  AND turn.session_id = remap.session_id
+  AND turn.turn_id = remap.turn_id;
 
 INSERT INTO s11_wu4_last_run_counts(key, value)
 SELECT 'segment_rows_merged_away', COUNT(*)
