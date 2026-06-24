@@ -4608,3 +4608,27 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   separation, full-workspace test green, design fidelity, synthetic fixtures only, zero new
   provider-family literal tokens) are all enforced. Each consolidated gate is its own fresh `agents`
   invocation with its own prompt + log under `.scratch/`.
+- **D5 — Phase 6 revise loop (rollback-completeness gap, found in orchestrator review):** the first
+  Step 6c implementation narrowed the SQL `s11_wu4_candidate_segments` set so that a registered
+  (in-target-inventory) segment on a VALID non-orphaned chain was excluded, while the Rust segment-merge
+  plan still covered it. A valid Claude chain with a canonical-account segment + a same-session rotation
+  segment that collide-and-merge could therefore have the registered merge participant deleted without a
+  `segment_delete`/`segment_merge_survivor` preimage → `planned != applied` → auto-rollback on the FIRST
+  apply, violating exact-rollback (deliverable #6). A regression test
+  (`s11_m2c_scope_valid_chain_merge_rolls_back_precisely`) reproduced it
+  (`segment_rows_merged_away: planned 1, applied 0; auto-rollback`). Resolution (surgical, SQL-only): keep
+  `s11_wu4_candidate_segments` narrow (so the existing `s11_m2c_t14` collision test is unaffected) and
+  derive the `segment_delete` and `segment_merge_survivor` preimages from the merge plan +
+  `s11_wu4_provider_aliases` (`COALESCE(alias.new_provider_name, segment.provider_name)`) instead of
+  inner-joining `candidate_segments`. Every merge participant is now reversible; the full migration suite
+  is 41/0 green.
+- **D6 — Phase 8 tsc env-override:** the Phase 8 reviewer emitted BLOCK solely because `bunx tsc --noEmit`
+  failed on a missing `node_modules` in the fresh worktree. This WU's diff is Rust/SQL-only (zero frontend
+  delta); after `bun install` (node_modules is gitignored, no tracked-file change) `bunx tsc --noEmit`
+  exits 0. Env-only blocker; Phase 8 is PASS.
+- **D7 — Final disposition:** draft PR https://github.com/nestharus/agent-runner/pull/196 opened on base
+  `main` (commit `b8e5e9d5`). `auto_merge_after_phase_9=false` → the pipeline stops at the draft PR; the
+  manager merges after rerunning the full `cargo test --workspace` and the timed on-copy proof of the
+  corrected scope on a copy of the real `state.db`. Linear cross-link/close-comment skipped (Option B);
+  the manager creates+links the NES ticket out-of-band. Estimate calibration: inherited=null, refined=5,
+  actual=5.
