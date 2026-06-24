@@ -158,6 +158,12 @@ WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
     ) ambiguous_invocation
 );
 
+DELETE FROM s11_wu4_restore_session_ownership_preimage
+WHERE migration_id = (
+    SELECT value FROM s11_wu4_migration_params WHERE key = 'migration_id'
+)
+  AND EXISTS (SELECT 1 FROM s11_wu4_candidate_segments);
+
 DROP TABLE IF EXISTS s11_wu4_forward_migration_params;
 CREATE TEMP TABLE s11_wu4_forward_migration_params AS
 SELECT key, value FROM s11_wu4_migration_params;

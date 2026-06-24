@@ -557,6 +557,9 @@ const RESUME_CHAIN_ORPHAN: &str = "11111111-1111-4111-8111-111111111111";
 const RESUME_CHAIN_ROTATION: &str = "22222222-2222-4222-8222-222222222222";
 const RESUME_CHAIN_VALID: &str = "33333333-3333-4333-8333-333333333333";
 const RESUME_CHAIN_REPL: &str = "44444444-4444-4444-8444-444444444444";
+const RESUME_CHAIN_STALE_PREIMAGE: &str = "55555555-5555-4555-8555-555555555555";
+const RESUME_STALE_PREIMAGE_SESSION: &str = "session-resume-stale-preimage";
+const SESSION_OWNERSHIP_MIGRATION_ID: &str = "s11-m2-session-ownership";
 
 fn load_fixture_models(fixture: &Fixture) -> oulipoly_state::ModelStore {
     let providers = ProvidersConfig::load(&fixture.config_dir.join("providers.toml")).unwrap();
@@ -673,6 +676,38 @@ fn invocation_preimage_count(path: &Path) -> i64 {
          FROM s11_wu4_restore_session_ownership_preimage
          WHERE entity_kind = 'invocation'",
         [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn invocation_preimage_count_for_identity(
+    path: &Path,
+    invocation_id: i64,
+    old_model_name: &str,
+    new_model_name: &str,
+    old_provider_name: &str,
+    new_provider_name: &str,
+) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage
+         WHERE migration_id = ?1
+           AND entity_kind = 'invocation'
+           AND row_pk = ?2
+           AND old_model_name = ?3
+           AND new_model_name = ?4
+           AND old_provider_name = ?5
+           AND new_provider_name = ?6",
+        params![
+            SESSION_OWNERSHIP_MIGRATION_ID,
+            invocation_id.to_string(),
+            old_model_name,
+            new_model_name,
+            old_provider_name,
+            new_provider_name,
+        ],
         |row| row.get(0),
     )
     .unwrap()
@@ -805,6 +840,97 @@ fn seed_resume_repl_orphaned_provider_ref_chain(fixture: &Fixture) {
         "succeeded",
         "2026-06-20T10:05:00Z",
     );
+}
+
+fn seed_resume_reapply_reconciliation_fixture(
+    fixture: &Fixture,
+    models: &S11M2cScopeModels,
+) -> i64 {
+    let conn = fixture.conn();
+    let stale_provider = unregistered_account_family(2);
+    seed_chain(&conn, RESUME_CHAIN_STALE_PREIMAGE, &models.middle);
+    seed_segment_with_started_at(
+        &conn,
+        RESUME_CHAIN_STALE_PREIMAGE,
+        &stale_provider,
+        RESUME_STALE_PREIMAGE_SESSION,
+        FIXED_TS,
+        None,
+        Some("turn-resume-stale-preimage"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &stale_provider,
+        RESUME_STALE_PREIMAGE_SESSION,
+        "turn-resume-stale-preimage",
+        "assistant",
+    );
+    seed_invocation(
+        &conn,
+        "50000000-0000-4000-8000-000000000001",
+        &models.middle,
+        &stale_provider,
+        RESUME_STALE_PREIMAGE_SESSION,
+        "succeeded",
+        "2026-06-20T10:06:00Z",
+    )
+}
+
+fn seed_stale_invocation_preimage_row(
+    conn: &Connection,
+    invocation_id: i64,
+    model_name: &str,
+    provider_name: &str,
+) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS s11_wu4_restore_session_ownership_preimage (
+            migration_id TEXT NOT NULL,
+            entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'invocation', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
+            row_pk TEXT NOT NULL,
+            chain_id TEXT,
+            segment_id INTEGER,
+            turn_row_id INTEGER,
+            old_model_name TEXT,
+            new_model_name TEXT,
+            old_provider_name TEXT,
+            new_provider_name TEXT,
+            session_id TEXT,
+            segment_started_at TEXT,
+            segment_ended_at TEXT,
+            segment_last_turn_id TEXT,
+            segment_transition_reason TEXT,
+            turn_id TEXT,
+            turn_timestamp TEXT,
+            turn_role TEXT,
+            turn_parent_turn_id TEXT,
+            turn_is_sidechain INTEGER,
+            turn_is_compaction_boundary INTEGER,
+            turn_source_file TEXT,
+            turn_ingested_at TEXT,
+            turn_body TEXT,
+            new_started_at TEXT,
+            new_ended_at TEXT,
+            new_last_turn_id TEXT,
+            new_transition_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (migration_id, entity_kind, row_pk)
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO s11_wu4_restore_session_ownership_preimage
+         (migration_id, entity_kind, row_pk, old_model_name, new_model_name,
+          old_provider_name, new_provider_name)
+         VALUES (?1, 'invocation', ?2, ?3, ?3, ?4, ?4)",
+        params![
+            SESSION_OWNERSHIP_MIGRATION_ID,
+            invocation_id.to_string(),
+            model_name,
+            provider_name,
+        ],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -2809,6 +2935,91 @@ fn s11_m2c_resume_invocation_updates_are_idempotent_and_reported() {
             .apply_command(Some(&backup_dir), true, false, false)
             .output()
             .unwrap(),
+    );
+    let after_first = full_snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(full_snapshot(&fixture.state_path), after_first);
+    let report = read_report_from_output(&second);
+    assert_report_count(&report, "invocation_identity_updates_to_apply", 0);
+}
+
+#[test]
+fn s11_m2c_resume_stale_invocation_preimage_reapply_reconciles_and_counts() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let invocation_id = seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let stale_provider = unregistered_account_family(2);
+    {
+        let conn = Connection::open(&fixture.state_path).unwrap();
+        seed_stale_invocation_preimage_row(
+            &conn,
+            invocation_id,
+            &models.middle,
+            &stale_provider,
+        );
+    }
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_provider_ref_resume(
+        &fixture,
+        RESUME_CHAIN_STALE_PREIMAGE,
+        &models.middle,
+        &canonical_account(),
+    );
+    assert_invocations_reconciled(
+        &fixture,
+        RESUME_STALE_PREIMAGE_SESSION,
+        &models.middle,
+        &canonical_account(),
+    );
+    assert_eq!(
+        invocation_preimage_count_for_identity(
+            &fixture.state_path,
+            invocation_id,
+            &models.middle,
+            &models.middle,
+            &stale_provider,
+            &canonical_account(),
+        ),
+        1,
+        "fresh non-no-op invocation preimage row was not recorded"
+    );
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    let planned = last_run_count(&conn, "invocation_identity_updates_to_apply");
+    let applied = applied_invocation_count(&conn);
+    assert_eq!(planned, 1);
+    assert_eq!(applied, planned);
+    assert_no_external_identity_errors(&output);
+}
+
+#[test]
+fn s11_m2c_resume_clean_double_apply_invocation_reconciliation_is_noop() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let backup_dir = fixture.backup_dir();
+    let first = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+    assert_success(&first);
+    assert_invocations_reconciled(
+        &fixture,
+        RESUME_STALE_PREIMAGE_SESSION,
+        &models.middle,
+        &canonical_account(),
     );
     let after_first = full_snapshot(&fixture.state_path);
 
