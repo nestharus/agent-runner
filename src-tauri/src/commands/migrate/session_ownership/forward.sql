@@ -4,7 +4,7 @@ BEGIN IMMEDIATE;
 
 CREATE TABLE IF NOT EXISTS s11_wu4_restore_session_ownership_preimage (
     migration_id TEXT NOT NULL,
-    entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
+    entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'invocation', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
     row_pk TEXT NOT NULL,
     chain_id TEXT,
     segment_id INTEGER,
@@ -90,6 +90,74 @@ LEFT JOIN s11_wu4_provider_aliases alias
 WHERE (source.is_orphaned = 1 AND chain.model_name <> params.target_model_name)
    OR original.provider_name IS NULL;
 
+DROP TABLE IF EXISTS s11_wu4_invocation_remap_candidates;
+CREATE TEMP TABLE s11_wu4_invocation_remap_candidates AS
+WITH candidate_targets AS (
+    SELECT
+        candidate.chain_id,
+        candidate.segment_id,
+        candidate.session_id,
+        candidate.new_provider_name,
+        CASE
+            WHEN candidate.is_orphaned = 1 THEN candidate.target_model_name
+            ELSE candidate.old_model_name
+        END AS target_chain_model_name
+    FROM s11_wu4_candidate_segments candidate
+)
+SELECT
+    invocation.id AS invocation_id,
+    candidate.chain_id,
+    candidate.segment_id,
+    candidate.session_id,
+    invocation.model_name AS old_model_name,
+    CASE
+        WHEN invocation.model_name IS NULL
+          OR invocation.model_name = '<unknown>'
+          OR provider_ref.model_name IS NULL
+        THEN candidate.target_chain_model_name
+        ELSE invocation.model_name
+    END AS new_model_name,
+    invocation.provider_name AS old_provider_name,
+    candidate.new_provider_name
+FROM invocations invocation
+JOIN candidate_targets candidate
+  ON COALESCE(invocation.provider_session_id, invocation.session_id) = candidate.session_id
+LEFT JOIN s11_wu4_provider_ref_model_names provider_ref
+  ON provider_ref.model_name = invocation.model_name;
+
+DROP TABLE IF EXISTS s11_wu4_invocation_remap_plan;
+CREATE TEMP TABLE s11_wu4_invocation_remap_plan AS
+SELECT
+    invocation_id,
+    MIN(chain_id) AS chain_id,
+    MIN(segment_id) AS segment_id,
+    MIN(session_id) AS session_id,
+    old_model_name,
+    new_model_name,
+    old_provider_name,
+    new_provider_name
+FROM s11_wu4_invocation_remap_candidates
+GROUP BY invocation_id, old_model_name, new_model_name, old_provider_name, new_provider_name;
+
+DROP TABLE IF EXISTS s11_wu4_forward_guard;
+CREATE TEMP TABLE s11_wu4_forward_guard (id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK);
+INSERT INTO s11_wu4_forward_guard(id) VALUES (1);
+INSERT OR ROLLBACK INTO s11_wu4_forward_guard(id)
+SELECT 1
+WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
+  AND EXISTS (
+    SELECT 1
+    FROM (
+        SELECT invocation_id
+        FROM (
+            SELECT DISTINCT invocation_id, new_model_name, new_provider_name
+            FROM s11_wu4_invocation_remap_candidates
+        ) target
+        GROUP BY invocation_id
+        HAVING COUNT(*) > 1
+    ) ambiguous_invocation
+);
+
 DROP TABLE IF EXISTS s11_wu4_forward_migration_params;
 CREATE TEMP TABLE s11_wu4_forward_migration_params AS
 SELECT key, value FROM s11_wu4_migration_params;
@@ -97,6 +165,10 @@ SELECT key, value FROM s11_wu4_migration_params;
 DROP TABLE IF EXISTS s11_wu4_forward_target_provider_inventory;
 CREATE TEMP TABLE s11_wu4_forward_target_provider_inventory AS
 SELECT provider_name, source FROM s11_wu4_target_provider_inventory;
+
+DROP TABLE IF EXISTS s11_wu4_forward_provider_ref_model_names;
+CREATE TEMP TABLE s11_wu4_forward_provider_ref_model_names AS
+SELECT model_name FROM s11_wu4_provider_ref_model_names;
 
 INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
     migration_id,
@@ -273,6 +345,33 @@ SELECT
 FROM s11_wu4_turn_dedup_deletes planned
 JOIN session_turns turn ON turn.id = planned.loser_turn_row_id;
 
+INSERT OR IGNORE INTO s11_wu4_restore_session_ownership_preimage (
+    migration_id,
+    entity_kind,
+    row_pk,
+    chain_id,
+    segment_id,
+    old_model_name,
+    new_model_name,
+    old_provider_name,
+    new_provider_name,
+    session_id
+)
+SELECT
+    (SELECT value FROM s11_wu4_migration_params WHERE key = 'migration_id'),
+    'invocation',
+    CAST(plan.invocation_id AS TEXT),
+    plan.chain_id,
+    plan.segment_id,
+    plan.old_model_name,
+    plan.new_model_name,
+    plan.old_provider_name,
+    plan.new_provider_name,
+    plan.session_id
+FROM s11_wu4_invocation_remap_plan plan
+WHERE NOT (plan.old_model_name IS plan.new_model_name)
+   OR NOT (plan.old_provider_name IS plan.new_provider_name);
+
 DROP TABLE IF EXISTS s11_wu4_last_run_preimage_plan;
 CREATE TABLE s11_wu4_last_run_preimage_plan (
     entity_kind TEXT NOT NULL,
@@ -308,6 +407,15 @@ WHERE deleted.loser_turn_row_id IS NULL
   AND turn.turn_id = remap.turn_id;
 
 INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
+SELECT 'invocation', CAST(invocation.id AS TEXT)
+FROM s11_wu4_invocation_remap_plan plan
+JOIN invocations invocation ON invocation.id = plan.invocation_id
+WHERE invocation.model_name IS plan.old_model_name
+  AND invocation.provider_name IS plan.old_provider_name
+  AND (NOT (plan.old_model_name IS plan.new_model_name)
+       OR NOT (plan.old_provider_name IS plan.new_provider_name));
+
+INSERT OR IGNORE INTO s11_wu4_last_run_preimage_plan(entity_kind, row_pk)
 SELECT 'segment_delete', CAST(planned.segment_id AS TEXT)
 FROM s11_wu4_segment_merge_deletes planned
 JOIN session_chain_segments segment ON segment.id = planned.segment_id;
@@ -330,6 +438,9 @@ ON s11_wu4_restore_session_ownership_preimage(entity_kind, segment_id);
 
 CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_chain
 ON s11_wu4_restore_session_ownership_preimage(entity_kind, chain_id);
+
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_row_pk
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, row_pk);
 
 DROP TABLE IF EXISTS s11_wu4_forward_guard;
 CREATE TEMP TABLE s11_wu4_forward_guard (id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK);
@@ -448,6 +559,15 @@ WHERE deleted.loser_turn_row_id IS NULL
   AND turn.turn_id = remap.turn_id;
 
 INSERT INTO s11_wu4_last_run_counts(key, value)
+SELECT 'invocation_identity_updates_to_apply', COUNT(*)
+FROM s11_wu4_invocation_remap_plan plan
+JOIN invocations invocation ON invocation.id = plan.invocation_id
+WHERE invocation.model_name IS plan.old_model_name
+  AND invocation.provider_name IS plan.old_provider_name
+  AND (NOT (plan.old_model_name IS plan.new_model_name)
+       OR NOT (plan.old_provider_name IS plan.new_provider_name));
+
+INSERT INTO s11_wu4_last_run_counts(key, value)
 SELECT 'segment_rows_merged_away', COUNT(*)
 FROM s11_wu4_segment_merge_deletes planned
 JOIN session_chain_segments segment ON segment.id = planned.segment_id;
@@ -480,6 +600,37 @@ WHERE id IN (
     FROM s11_wu4_restore_session_ownership_preimage preimage
     WHERE preimage.entity_kind = 'turn'
       AND preimage.turn_row_id = session_turns.id
+  );
+
+UPDATE invocations
+SET model_name = (
+        SELECT preimage.new_model_name
+        FROM s11_wu4_restore_session_ownership_preimage preimage
+        WHERE preimage.entity_kind = 'invocation'
+          AND preimage.row_pk = CAST(invocations.id AS TEXT)
+    ),
+    provider_name = (
+        SELECT preimage.new_provider_name
+        FROM s11_wu4_restore_session_ownership_preimage preimage
+        WHERE preimage.entity_kind = 'invocation'
+          AND preimage.row_pk = CAST(invocations.id AS TEXT)
+    )
+WHERE id IN (
+    SELECT CAST(row_pk AS INTEGER)
+    FROM s11_wu4_restore_session_ownership_preimage
+    WHERE entity_kind = 'invocation'
+)
+  AND model_name IS (
+    SELECT preimage.old_model_name
+    FROM s11_wu4_restore_session_ownership_preimage preimage
+    WHERE preimage.entity_kind = 'invocation'
+      AND preimage.row_pk = CAST(invocations.id AS TEXT)
+  )
+  AND provider_name IS (
+    SELECT preimage.old_provider_name
+    FROM s11_wu4_restore_session_ownership_preimage preimage
+    WHERE preimage.entity_kind = 'invocation'
+      AND preimage.row_pk = CAST(invocations.id AS TEXT)
   );
 
 DELETE FROM session_chain_segments

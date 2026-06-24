@@ -4693,3 +4693,74 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   only on the documented `age244_s7b` / `age245_s7c` grep guards + the os-error-11 PTY flake, and token
   delta vs `main` = 0. Linear cross-link/close-comment skipped (Option B); the manager creates + links
   the NES ticket out-of-band. Estimate calibration: inherited=null, refined=5, actual=5.
+
+## D-S11-M2c-resume-000-linear-gap — proceed without Linear (manager Option B)
+
+- **Phase**: Phase 0 (bootstrap).
+- **Decision**: Proceed without Linear. `LINEAR_API_KEY` is unavailable to spooled jobs, so every
+  ticket-operator step (read/create/comment/estimate/calibration/cross-link/close) is skipped for this
+  WU. `planning/s11-m2c-resume-fix/brief.md` is the source of truth.
+- **Authorization**: manager-max, Option B. The manager creates + links the NES ticket out-of-band
+  (intended title: "S11-M2c-resume: fix resume of migrated sessions + add resume proof to the migration
+  gate"). The pipeline does not halt on the missing ticket.
+- **Pipeline effect**: `ticket_system=none`; draft PR on base `main`; `auto_merge_after_phase_9=false`
+  ⇒ stop at the draft PR. Phase 9 omits the optional close-keyword footer and posts no ticket
+  cross-link comment. The manager merges after a full `cargo test --workspace` and a re-apply+resume
+  proof on a copy of the real migrated DB.
+- **Evidence**: `planning/s11-m2c-resume-fix/brief.md`; `planning/s11-m2c-resume-fix/session.json`.
+
+## D-S11-M2c-resume-001-focused-gates — gate execution shape (orchestrator adaptation)
+
+- **Phase**: Phases 4 / 6 / 8 (gate evaluation).
+- **Decision**: For this single coherent bug-fix concern (do-not-split), the orchestrator runs
+  **focused, genuine sub-agent gates** rather than the maximal `apply-gate-set` multi-auditor fan-out:
+  Phase 4 = one gpt-xhigh risk gate on the **proposal** (audit/scope/shortcut/supported-surface/proof
+  + plan code-quality); Phase 6 = orchestrator-authored contract (6a) → fresh test-writer (6b) →
+  tests↔contract alignment review → fresh code-writer (6c, distinct invocation UUID) → focused gate
+  verification; Phase 8 = test-audit + justification + commit-hygiene review on the **actual diff**
+  plus a verification gate that runs the **full `cargo test --workspace`** + `clippy -D warnings` +
+  `bunx tsc --noEmit` + token-delta-vs-main.
+- **Rationale**: The manager's task instructions control and emphasize (1) dispatch every phase via
+  sub-agents, (2) never self-implement/build, (3) Phase 8 MUST run the full `cargo test --workspace`,
+  (4) stop at the draft PR — not the maximal gate operator. All hard invariants are preserved:
+  test-writer (6b) and code-writer (6c) are separate invocations with distinct UUIDs; risk gates run
+  on the proposal, not the diff; synthetic fixtures only; the orchestrator authors no source/tests and
+  runs no builds itself; every dispatch is a parent-visible `agents` invocation captured via `tee`.
+- **Evidence**: task manager-max instructions; `planning/s11-m2c-resume-fix/brief.md` gate recipe.
+
+## D-S11-M2c-resume-002-revert-6b-formatter-noise — test-writer overreach cleanup
+
+- **Phase**: Phase 6 Step 6b (test-writer).
+- **Decision**: The Step 6b test-writer (inv `01f6a2cf`) authored 7 correct RED proof tests (+664 lines
+  in `src-tauri/tests/s11_m2_session_ownership_migration.rs`) but also ran a workspace formatter,
+  producing pure-`rustfmt` reformatting noise (import reordering, method-chain wrapping) in 7 unrelated
+  files: `report.rs`, `target_resolution.rs`, `dispatch/usage_context.rs`, `run/repl/orchestration.rs`,
+  `wake_coordinator/sweep/candidate.rs`, `tests/age153_repl_terminal_signal.rs`,
+  `tests/wu_d_proactive_wake_integration/cases_batch_sweep.rs`. The orchestrator reverted all 7 to
+  `main` (`git checkout main -- …`), keeping ONLY the genuine test additions. This restores the clean
+  test-only RED state so Step 6c (a separate invocation) is the sole implementer of the production fix.
+- **Why safe**: every reverted hunk was verifiably formatting-only (zero functional change); `main`
+  itself is not rustfmt-clean and the brief gate does not run `cargo fmt --check`; the new tests compiled
+  against the existing production API (they assert via migration-report strings, `s11_wu4_last_run_counts`
+  SQL, and `StateDb::resolve_resume` behavior — not via any new production symbol), so reverting cannot
+  affect compilation or the RED reasons. Step 6c re-confirms RED→GREEN on the clean tree.
+- **Authority**: orchestrator destructive-git authority (out-of-contract change cleanup). No new
+  provider-family brand tokens were introduced on added lines.
+- **Evidence**: `git diff main` review of the 7 reverted files (all import/line-wrap only); Step 6b
+  output index + `planning/s11-m2c-resume-fix/.scratch/logs/phase6b-red-proof.log`.
+
+## D-S11-M2c-resume-003-coderabbit-deferred — Phase 7 optional review disposition
+
+- **Phase**: Phase 7 (optional PR-mode review).
+- **Decision**: CodeRabbit is enabled for `nestharus/agent-runner` (repo label marker;
+  `coderabbit_review_driver.py is-enabled` → `enabled: true`). The three Phase 7 readiness checks
+  (inherited-prototype-tests, integration-tests, swap-record) are non-applicable for this WU (no
+  prototype, no `LevelComponentSet`, no `PrototypeSwapRecord`). The orchestrator does NOT drive a
+  synchronous CodeRabbit fix-loop in this run: there is no PR yet (the draft PR opens in Phase 9), the
+  manager owns post-PR review + merge, and the manager flow stops at the draft PR. CodeRabbit
+  auto-reviews the draft PR as part of the manager's review surface.
+- **Rationale**: Running an autonomous fix-loop that posts GitHub comments and auto-pushes fix commits
+  before the manager's review would overshoot "stop at the draft PR" with premature outward churn. The
+  PR + CodeRabbit + Phase 8 gates are the review surface; the manager merges after a full
+  `cargo test --workspace` and a re-apply+resume proof on a copy of the real migrated DB.
+- **Evidence**: `is-enabled` output; manager-max Option B instructions; `brief.md` Anti-scope.

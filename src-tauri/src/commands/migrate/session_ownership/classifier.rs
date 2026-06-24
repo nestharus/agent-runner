@@ -144,6 +144,7 @@ struct SegmentPartitions {
 struct SqlInputRows<'a> {
     migration_params: Vec<(&'static str, String)>,
     provider_inventory: Vec<&'a str>,
+    provider_ref_model_names: Vec<&'a str>,
     source_chains: Vec<SourceChainInputRow<'a>>,
     provider_aliases: Vec<ProviderAliasRow<'a>>,
     segment_merge_groups: &'a [SegmentMergeGroup],
@@ -209,9 +210,10 @@ pub(crate) fn populate_sql_inputs_temp(
 pub(crate) fn cleanup_temp_sql_inputs(conn: &Connection) {
     let _ = conn.execute_batch(
         "DROP TABLE IF EXISTS temp.s11_wu4_migration_params;
-         DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
-         DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
-         DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
+          DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
+          DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
+          DROP TABLE IF EXISTS temp.s11_wu4_provider_ref_model_names;
+          DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
           DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;
           DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_groups;
           DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_deletes;
@@ -223,18 +225,20 @@ pub(crate) fn cleanup_temp_sql_inputs(conn: &Connection) {
 fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
     conn.execute_batch(
         "DROP TABLE IF EXISTS s11_wu4_migration_params;
-         DROP TABLE IF EXISTS s11_wu4_original_target_provider_inventory;
-         DROP TABLE IF EXISTS s11_wu4_target_provider_inventory;
-         DROP TABLE IF EXISTS s11_wu4_provider_aliases;
+          DROP TABLE IF EXISTS s11_wu4_original_target_provider_inventory;
+          DROP TABLE IF EXISTS s11_wu4_target_provider_inventory;
+          DROP TABLE IF EXISTS s11_wu4_provider_ref_model_names;
+          DROP TABLE IF EXISTS s11_wu4_provider_aliases;
           DROP TABLE IF EXISTS s11_wu4_source_chain_candidates;
           DROP TABLE IF EXISTS s11_wu4_segment_merge_groups;
           DROP TABLE IF EXISTS s11_wu4_segment_merge_deletes;
           DROP TABLE IF EXISTS s11_wu4_session_turn_remaps;
           DROP TABLE IF EXISTS s11_wu4_turn_dedup_deletes;
-         CREATE TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
-         CREATE TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
-         CREATE TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
+          CREATE TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+          CREATE TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
+          CREATE TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
+          CREATE TABLE s11_wu4_provider_ref_model_names (model_name TEXT PRIMARY KEY);
+          CREATE TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
          CREATE TABLE s11_wu4_source_chain_candidates (
              chain_id TEXT PRIMARY KEY,
              evidence TEXT NOT NULL,
@@ -287,18 +291,20 @@ fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
 fn create_temp_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
     conn.execute_batch(
         "DROP TABLE IF EXISTS temp.s11_wu4_migration_params;
-         DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
-         DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
-         DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
+          DROP TABLE IF EXISTS temp.s11_wu4_original_target_provider_inventory;
+          DROP TABLE IF EXISTS temp.s11_wu4_target_provider_inventory;
+          DROP TABLE IF EXISTS temp.s11_wu4_provider_ref_model_names;
+          DROP TABLE IF EXISTS temp.s11_wu4_provider_aliases;
           DROP TABLE IF EXISTS temp.s11_wu4_source_chain_candidates;
           DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_groups;
           DROP TABLE IF EXISTS temp.s11_wu4_segment_merge_deletes;
           DROP TABLE IF EXISTS temp.s11_wu4_session_turn_remaps;
           DROP TABLE IF EXISTS temp.s11_wu4_turn_dedup_deletes;
-         CREATE TEMP TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-         CREATE TEMP TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
-         CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
-         CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
+          CREATE TEMP TABLE s11_wu4_migration_params (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+          CREATE TEMP TABLE s11_wu4_original_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
+          CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
+          CREATE TEMP TABLE s11_wu4_provider_ref_model_names (model_name TEXT PRIMARY KEY);
+          CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
          CREATE TEMP TABLE s11_wu4_source_chain_candidates (
              chain_id TEXT PRIMARY KEY,
              evidence TEXT NOT NULL,
@@ -363,6 +369,12 @@ fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<()
         conn.execute(
             "INSERT INTO s11_wu4_target_provider_inventory(provider_name, source) VALUES (?1, 'config')",
             [provider_name],
+        )?;
+    }
+    for model_name in &rows.provider_ref_model_names {
+        conn.execute(
+            "INSERT INTO s11_wu4_provider_ref_model_names(model_name) VALUES (?1)",
+            [model_name],
         )?;
     }
     for source in &rows.source_chains {
@@ -461,6 +473,7 @@ fn sql_input_rows<'a>(
     SqlInputRows {
         migration_params: migration_param_rows(target),
         provider_inventory: provider_inventory_rows(target),
+        provider_ref_model_names: provider_ref_model_name_rows(target),
         source_chains: source_chain_rows(candidates),
         provider_aliases: provider_alias_rows(&remapped_segments(&candidates.segments)),
         segment_merge_groups: &candidates.segment_merge_groups,
@@ -484,6 +497,14 @@ fn migration_param_rows(target: &TargetResolution) -> Vec<(&'static str, String)
 
 fn provider_inventory_rows(target: &TargetResolution) -> Vec<&str> {
     target.inventory.iter().map(String::as_str).collect()
+}
+
+fn provider_ref_model_name_rows(target: &TargetResolution) -> Vec<&str> {
+    target
+        .provider_ref_model_names
+        .iter()
+        .map(String::as_str)
+        .collect()
 }
 
 fn source_chain_rows(candidates: &Candidates) -> Vec<SourceChainInputRow<'_>> {

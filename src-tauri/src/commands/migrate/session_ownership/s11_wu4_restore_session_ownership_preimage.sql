@@ -11,6 +11,9 @@ ON s11_wu4_restore_session_ownership_preimage(entity_kind, segment_id);
 CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_chain
 ON s11_wu4_restore_session_ownership_preimage(entity_kind, chain_id);
 
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_row_pk
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, row_pk);
+
 DROP TABLE IF EXISTS s11_wu4_last_rollback_counts;
 CREATE TABLE s11_wu4_last_rollback_counts (
     key TEXT PRIMARY KEY,
@@ -32,6 +35,13 @@ INSERT INTO s11_wu4_last_rollback_counts(key, value)
 SELECT 'turn_rows_to_restore', COUNT(*)
 FROM s11_wu4_restore_session_ownership_preimage
 WHERE entity_kind = 'turn';
+
+INSERT INTO s11_wu4_last_rollback_counts(key, value)
+SELECT 'invocation_rows_to_restore', COUNT(*)
+FROM s11_wu4_restore_session_ownership_preimage
+WHERE entity_kind = 'invocation'
+  AND (NOT (old_model_name IS new_model_name)
+       OR NOT (old_provider_name IS new_provider_name));
 
 INSERT INTO s11_wu4_last_rollback_counts(key, value)
 SELECT 'segment_rows_reinserted', COUNT(*)
@@ -112,6 +122,37 @@ WHERE id IN (
     FROM s11_wu4_restore_session_ownership_preimage preimage
     WHERE preimage.entity_kind = 'turn'
       AND preimage.turn_row_id = session_turns.id
+  );
+
+UPDATE invocations
+SET model_name = (
+        SELECT preimage.old_model_name
+        FROM s11_wu4_restore_session_ownership_preimage preimage
+        WHERE preimage.entity_kind = 'invocation'
+          AND preimage.row_pk = CAST(invocations.id AS TEXT)
+    ),
+    provider_name = (
+        SELECT preimage.old_provider_name
+        FROM s11_wu4_restore_session_ownership_preimage preimage
+        WHERE preimage.entity_kind = 'invocation'
+          AND preimage.row_pk = CAST(invocations.id AS TEXT)
+    )
+WHERE id IN (
+    SELECT CAST(row_pk AS INTEGER)
+    FROM s11_wu4_restore_session_ownership_preimage
+    WHERE entity_kind = 'invocation'
+)
+  AND model_name IS (
+    SELECT preimage.new_model_name
+    FROM s11_wu4_restore_session_ownership_preimage preimage
+    WHERE preimage.entity_kind = 'invocation'
+      AND preimage.row_pk = CAST(invocations.id AS TEXT)
+  )
+  AND provider_name IS (
+    SELECT preimage.new_provider_name
+    FROM s11_wu4_restore_session_ownership_preimage preimage
+    WHERE preimage.entity_kind = 'invocation'
+      AND preimage.row_pk = CAST(invocations.id AS TEXT)
   );
 
 UPDATE session_chain_segments
