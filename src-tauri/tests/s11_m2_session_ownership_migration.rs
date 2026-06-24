@@ -933,6 +933,51 @@ fn seed_stale_invocation_preimage_row(
     .unwrap();
 }
 
+fn seed_old_check_invocation_preimage_table(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE s11_wu4_restore_session_ownership_preimage (
+            migration_id TEXT NOT NULL,
+            entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
+            row_pk TEXT NOT NULL,
+            chain_id TEXT,
+            segment_id INTEGER,
+            turn_row_id INTEGER,
+            old_model_name TEXT,
+            new_model_name TEXT,
+            old_provider_name TEXT,
+            new_provider_name TEXT,
+            session_id TEXT,
+            segment_started_at TEXT,
+            segment_ended_at TEXT,
+            segment_last_turn_id TEXT,
+            segment_transition_reason TEXT,
+            turn_id TEXT,
+            turn_timestamp TEXT,
+            turn_role TEXT,
+            turn_parent_turn_id TEXT,
+            turn_is_sidechain INTEGER,
+            turn_is_compaction_boundary INTEGER,
+            turn_source_file TEXT,
+            turn_ingested_at TEXT,
+            turn_body TEXT,
+            new_started_at TEXT,
+            new_ended_at TEXT,
+            new_last_turn_id TEXT,
+            new_transition_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (migration_id, entity_kind, row_pk)
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO s11_wu4_restore_session_ownership_preimage
+         (migration_id, entity_kind, row_pk, chain_id, old_model_name, new_model_name)
+         VALUES (?1, 'chain', 'old-check-chain-row', 'old-check-chain', 'old-model', 'new-model')",
+        [SESSION_OWNERSHIP_MIGRATION_ID],
+    )
+    .unwrap();
+}
+
 #[test]
 fn rows_8_9_10_11_15_18_20_dry_run_preserves_live_db_and_reports_reversible_copy() {
     let fixture = Fixture::new();
@@ -3032,6 +3077,95 @@ fn s11_m2c_resume_clean_double_apply_invocation_reconciliation_is_noop() {
     assert_eq!(full_snapshot(&fixture.state_path), after_first);
     let report = read_report_from_output(&second);
     assert_report_count(&report, "invocation_identity_updates_to_apply", 0);
+}
+
+#[test]
+fn s11_m2c_resume_stale_check_preimage_reapply_reconciles_and_rebuilds() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let invocation_id = seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let stale_provider = unregistered_account_family(2);
+    {
+        let conn = Connection::open(&fixture.state_path).unwrap();
+        seed_old_check_invocation_preimage_table(&conn);
+    }
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_invocations_reconciled(
+        &fixture,
+        RESUME_STALE_PREIMAGE_SESSION,
+        &models.middle,
+        &canonical_account(),
+    );
+    assert_eq!(
+        invocation_preimage_count_for_identity(
+            &fixture.state_path,
+            invocation_id,
+            &models.middle,
+            &models.middle,
+            &stale_provider,
+            &canonical_account(),
+        ),
+        1,
+        "rebuilt preimage table did not record an invocation row"
+    );
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    let planned = last_run_count(&conn, "invocation_identity_updates_to_apply");
+    let applied = applied_invocation_count(&conn);
+    assert_eq!(planned, 1);
+    assert_eq!(applied, planned);
+    assert_no_external_identity_errors(&output);
+    let preimage_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 's11_wu4_restore_session_ownership_preimage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        preimage_sql.contains("'invocation'"),
+        "rebuilt preimage CHECK does not admit invocation rows: {preimage_sql}"
+    );
+}
+
+#[test]
+fn s11_m2c_resume_rollback_drops_preimage_table() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert!(
+        !table_exists(&conn, "s11_wu4_restore_session_ownership_preimage"),
+        "rollback should drop the session-ownership preimage table after verified restore"
+    );
+}
+
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 #[test]

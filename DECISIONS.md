@@ -4801,3 +4801,38 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   (`auto_merge_after_phase_9=false`, so the pipeline stops at the draft PR).
 - **Evidence**: `planning/s11-m2c-resume-fix/session.json` `linear_gap`; `brief-v2.md` manager
   authorization; PR #198 head `1a5962ed`.
+
+## D-S11-M2c-resume-v3-001-preimage-schema-lifecycle — v3 corrects the v2 mechanism
+
+- **Phase**: v3 resume bootstrap (Phase 0 verify) + Step 6a contract.
+- **Decision**: The v2 root cause (current-`migration_id` row shadowing) was necessary but
+  **insufficient**: a clear/DELETE cannot fix a stale CHECK. The manager proved on the real `state.db`
+  that the live `s11_wu4_restore_session_ownership_preimage` table (254,071 rows) carries the OLD CHECK
+  lacking `'invocation'` from a prior rolled-back apply; `CREATE TABLE IF NOT EXISTS` keeps that stale
+  CHECK, so every `entity_kind='invocation'` preimage row violates the CHECK and `INSERT OR IGNORE`
+  drops it → planned 1332, applied 0 → auto-rollback. v3 fix = forward.sql DROP+CREATE the preimage
+  table at forward start (current columns + CHECK incl `'invocation'`, inside the BEGIN..COMMIT so
+  guarded aborts still leave no table), remove the now-dead v2 `migration_id` DELETE, and drop the
+  preimage table on successful live `--rollback` (Rust layer in rollback.rs, after verify; NOT in
+  ROLLBACK_SQL, to keep the perf EXPLAIN + dry-run/auto-rollback reads intact). The invocation remap
+  computation, resume REPL guard, and resume tests are CORRECT and unchanged.
+- **Why safe**: `full_snapshot` compares only chains/segments/turns/invocations (not the preimage
+  table), so emptying the preimage on a no-op re-apply keeps the double-apply domain snapshot identical;
+  DROP+CREATE inside the transaction preserves the fail-closed `*_rolls_back_whole_forward_transaction`
+  assertions; the Rust-layer rollback drop runs only after all preimage-reading verification; no
+  `session_id` mutation; no fail-open; token delta vs `main` = 0. v3 follow-up (§9.5): the dry-run
+  computes cwd_completeness after the FIRST forward (before the idempotence re-apply) so the ephemeral
+  preimage is still populated when read.
+- **Evidence**: `planning/s11-m2c-resume-fix/brief-v3.md`; contract §9
+  (`planning/s11-m2c-resume-fix/contracts/s11-m2c-resume-fix-resume.md`).
+
+## D-S11-M2c-resume-v3-002-linear-gap — proceed without Linear (manager Option B, reaffirmed for v3)
+
+- **Phase**: v3 resume bootstrap + Phase 9.
+- **Decision**: `ticket_system=none` for this run (no LINEAR_API_KEY available to the spooled job).
+  Per manager Option B the orchestrator does all work, commits to the existing branch `s11-m2c-resume-fix`,
+  pushes, and ensures the existing draft PR #198 reflects the v3 fix; it does NOT dispatch
+  `linear-operator` and does NOT post a ticket cross-link. `auto_merge_after_phase_9=false`: the pipeline
+  stops at the draft PR; the manager merges after a full `cargo test --workspace` and a re-apply on a
+  copy of the real DB proving 0 stale invocations + `planned == applied`.
+- **Evidence**: v3 dispatch instructions (manager-max Option B); PR #198 head.

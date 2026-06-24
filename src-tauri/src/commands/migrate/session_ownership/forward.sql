@@ -2,7 +2,8 @@ PRAGMA foreign_keys = ON;
 
 BEGIN IMMEDIATE;
 
-CREATE TABLE IF NOT EXISTS s11_wu4_restore_session_ownership_preimage (
+DROP TABLE IF EXISTS s11_wu4_restore_session_ownership_preimage;
+CREATE TABLE s11_wu4_restore_session_ownership_preimage (
     migration_id TEXT NOT NULL,
     entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'invocation', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
     row_pk TEXT NOT NULL,
@@ -157,12 +158,6 @@ WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
         HAVING COUNT(*) > 1
     ) ambiguous_invocation
 );
-
-DELETE FROM s11_wu4_restore_session_ownership_preimage
-WHERE migration_id = (
-    SELECT value FROM s11_wu4_migration_params WHERE key = 'migration_id'
-)
-  AND EXISTS (SELECT 1 FROM s11_wu4_candidate_segments);
 
 DROP TABLE IF EXISTS s11_wu4_forward_migration_params;
 CREATE TEMP TABLE s11_wu4_forward_migration_params AS

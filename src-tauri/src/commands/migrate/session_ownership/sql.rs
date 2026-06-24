@@ -177,6 +177,11 @@ pub(crate) fn verify_rollback_restored(
     Ok(mismatches)
 }
 
+pub(crate) fn drop_preimage_artifacts(conn: &Connection) -> Result<(), DryRunError> {
+    conn.execute_batch("DROP TABLE IF EXISTS s11_wu4_restore_session_ownership_preimage;")?;
+    Ok(())
+}
+
 pub(crate) fn cwd_completeness(
     state: &Connection,
     mailbox_copy: Option<&Path>,

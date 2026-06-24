@@ -42,5 +42,6 @@ pub(crate) fn run_session_ownership_rollback(
         rollback,
         restored_mismatches,
     })?;
+    sql::drop_preimage_artifacts(&conn)?;
     Ok(RollbackOutcome { report_path })
 }
