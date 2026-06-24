@@ -260,6 +260,15 @@ SELECT
 FROM s11_wu4_turn_dedup_deletes planned
 JOIN session_turns turn ON turn.id = planned.loser_turn_row_id;
 
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_turn
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, turn_row_id);
+
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_segment
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, segment_id);
+
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_chain
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, chain_id);
+
 DROP TABLE IF EXISTS s11_wu4_forward_guard;
 CREATE TEMP TABLE s11_wu4_forward_guard (id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK);
 INSERT INTO s11_wu4_forward_guard(id) VALUES (1);

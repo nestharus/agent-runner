@@ -2,6 +2,15 @@ PRAGMA foreign_keys = ON;
 
 BEGIN IMMEDIATE;
 
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_turn
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, turn_row_id);
+
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_segment
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, segment_id);
+
+CREATE INDEX IF NOT EXISTS idx_s11_wu4_preimage_kind_chain
+ON s11_wu4_restore_session_ownership_preimage(entity_kind, chain_id);
+
 DROP TABLE IF EXISTS s11_wu4_last_rollback_counts;
 CREATE TABLE s11_wu4_last_rollback_counts (
     key TEXT PRIMARY KEY,

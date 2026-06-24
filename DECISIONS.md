@@ -4565,3 +4565,17 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   9; `auto_merge_after_phase_9=false` makes the draft PR the terminal artifact for manager review +
   merge (after the manager re-runs the full `cargo test --workspace` + on-copy proof). CodeRabbit
   auto-reviews the draft PR via the repo label, so the manager sees its review at merge time.
+
+## S11-M2c-perf — index the migration working tables (orchestrated WU)
+
+- Date: 2026-06-23. Branch: `s11-m2c-perf-index-working-tables` off `main @ 173423cd`.
+- **Linear gap (Option B, authorized by manager-max):** `LINEAR_API_KEY` is unavailable to spooled
+  jobs. The orchestrator proceeds without Linear: all work is done, a **draft PR on base `main`** is
+  opened, and every `linear-operator` step is skipped. `wu_brief_path` is the source of truth. The
+  manager creates and links the NES ticket out-of-band (intended title:
+  "S11-M2c-perf: index the migration working tables"). The pipeline does NOT halt on the missing ticket.
+- **Concern (single, do-not-split):** add indexes on the `s11_wu4_*` migration working tables so the
+  per-row correlated `UPDATE`/`DELETE` subqueries in `forward.sql` and the rollback SQL stop
+  full-scanning the 44k–250k-row helper tables. Indexes only — zero migration logic/semantic change.
+- **auto_merge_after_phase_9 = false:** stop at the draft PR; the manager merges after a full
+  `cargo test --workspace` and re-runs the real-data on-copy proof.
