@@ -4764,3 +4764,40 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   PR + CodeRabbit + Phase 8 gates are the review surface; the manager merges after a full
   `cargo test --workspace` and a re-apply+resume proof on a copy of the real migrated DB.
 - **Evidence**: `is-enabled` output; manager-max Option B instructions; `brief.md` Anti-scope.
+
+## D-S11-M2c-resume-v2-001-invocation-reapply-idempotence — confirmed root cause supersedes the hypothesis
+
+- **Phase**: v2 resume (Phase 2.5 re-diagnosis -> Phase 6 -> Phase 8 -> Phase 9).
+- **Decision**: The round-1 invocation reconciliation was correct on a fresh single apply but broke on
+  the real **re-apply** (`invocation_identity_updates_to_apply: planned 1332, applied 0; auto-rollback`).
+  An empirical re-diagnosis (synthetic fixtures driving the real apply) **refuted** the manager's
+  multi-candidate hypothesis: pure multi-candidate / heterogeneous shared-session shapes collapse to one
+  deterministic plan row and apply cleanly, and the planned-count query already carries the change
+  filter. The **confirmed** root cause is that `s11_wu4_restore_session_ownership_preimage` is a
+  persistent table with a constant `migration_id` that the forward never cleared before the invocation
+  `INSERT OR IGNORE`; a prior interrupted/rolled-back run's invocation preimage rows shadow the fresh
+  inserts so the update + applied count read a stale no-op row. The fix is a 6-line `forward.sql`
+  current-`migration_id` preimage clear, guarded by `EXISTS(s11_wu4_candidate_segments)` to preserve
+  dry-run/no-op rollback evidence. Empirical evidence was trusted over the hypothesis.
+- **Why safe**: scoped to the current `migration_id` only (no other migration's rows touched); guarded
+  so clean no-candidate re-applies keep prior rollback evidence; no `session_id`/`provider_session_id`
+  mutation; no global scan; `s11_wu4_forward_guard` fail-closed path intact; rides the existing
+  preimage/count/drift/residual/rollback path. Migration target 60/60 green (incl. a stale-preimage
+  re-apply RED-now-green proof + a clean double-apply idempotence guard); full `cargo test --workspace`
+  green except the three documented exceptions; clippy clean; token delta vs `main` = 0.
+- **Evidence**: `planning/s11-m2c-resume-fix/research/s11-m2c-resume-fix-v2-multi-candidate-diagnosis.md`;
+  contract §8; `planning/s11-m2c-resume-fix/alignment/s11-m2c-resume-fix-tests-contracts-v2.md` (ALIGNED);
+  `planning/s11-m2c-resume-fix/risk/s11-m2c-resume-fix-phase-8-aggregate-v2.md` (PHASE-8 VERDICT: PASS);
+  commit `1a5962ed` on PR #198.
+
+## D-S11-M2c-resume-v2-002-linear-gap — proceed without Linear (manager Option B, reaffirmed for v2)
+
+- **Phase**: v2 resume bootstrap + Phase 9.
+- **Decision**: `ticket_system=none` for this run (LINEAR_API_KEY unavailable to the spooled job).
+  Per manager Option B, the orchestrator does all work, commits to the existing branch, pushes, and
+  ensures the existing draft PR #198 reflects the fix; it does NOT dispatch `linear-operator` and does
+  NOT post a ticket cross-link. The manager files/links the NES ticket out-of-band and owns the merge
+  after a re-apply on a copy of the real DB proving 0 stale invocations + `planned == applied`
+  (`auto_merge_after_phase_9=false`, so the pipeline stops at the draft PR).
+- **Evidence**: `planning/s11-m2c-resume-fix/session.json` `linear_gap`; `brief-v2.md` manager
+  authorization; PR #198 head `1a5962ed`.
