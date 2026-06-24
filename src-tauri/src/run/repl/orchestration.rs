@@ -618,6 +618,9 @@ fn migrate_repl_resume_provider(
     input: &mut ReplProviderSelectionInput<'_, '_>,
     resolved: &mut oulipoly_state::ResolvedResume,
 ) -> Result<bool, String> {
+    if should_skip_repl_provider_ref_default_migration(resolved, input.manual_migrate) {
+        return Ok(true);
+    }
     let migration = prepare_repl_migration(input, resolved)?;
     *input.resume_spawn_cwd = Some(migration.effective_spawn_cwd.clone());
     match dispatch_repl_migration(
@@ -640,6 +643,20 @@ fn migrate_repl_resume_provider(
         Err(err) => return Err(format!("migration service failed: {err}")),
     }
     Ok(true)
+}
+
+fn should_skip_repl_provider_ref_default_migration(
+    resolved: &oulipoly_state::ResolvedResume,
+    manual_migrate: Option<&str>,
+) -> bool {
+    manual_migrate.is_none() && repl_resolved_uses_provider_ref(resolved)
+}
+
+fn repl_resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResume) -> bool {
+    resolved
+        .model
+        .as_ref()
+        .is_some_and(|model| model.provider.is_some())
 }
 
 struct PreparedReplMigration {

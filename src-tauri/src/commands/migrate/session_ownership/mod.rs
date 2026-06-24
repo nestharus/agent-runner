@@ -44,6 +44,7 @@ pub(crate) fn run_session_ownership_dry_run(
     classifier::populate_sql_inputs(&mut copy, &target, &candidates)?;
 
     let first_forward = sql::apply_forward(&copy)?;
+    let cwd = sql::cwd_completeness(&copy, paths.mailbox_copy.as_deref())?;
     db_copy::copy_state_to_rollback(&paths)?;
 
     let idempotence = sql::apply_forward(&copy)?;
@@ -57,7 +58,6 @@ pub(crate) fn run_session_ownership_dry_run(
         let rollback_copy = db_copy::open_copy(&paths.rollback_copy)?;
         preflight::inspect_integrity(&rollback_copy)?
     };
-    let cwd = sql::cwd_completeness(&copy, paths.mailbox_copy.as_deref())?;
     let report_path = report::write_report(&report::ReportInput {
         source_path: opts.live_state_db_path,
         scratch_root: opts.scratch_dir,

@@ -1,7 +1,8 @@
 #![cfg(unix)]
 
+use oulipoly_config::{ProvidersConfig, load_models};
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{CURRENT_SCHEMA_VERSION, StateDb};
+use oulipoly_state::{CURRENT_SCHEMA_VERSION, ResolvedResume, StateDb};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -52,6 +53,14 @@ struct TurnSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct InvocationSnapshot {
+    id: i64,
+    model_name: String,
+    provider_name: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SegmentRowSnapshot {
     id: i64,
     chain_id: String,
@@ -84,6 +93,7 @@ struct FullOwnershipSnapshot {
     chains: BTreeMap<String, ChainSnapshot>,
     segments: Vec<SegmentRowSnapshot>,
     turns: Vec<TurnRowSnapshot>,
+    invocations: Vec<InvocationSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +108,7 @@ struct OwnershipSnapshot {
     chains: BTreeMap<String, ChainSnapshot>,
     segments: Vec<SegmentSnapshot>,
     turns: Vec<TurnSnapshot>,
+    invocations: Vec<InvocationSnapshot>,
 }
 
 impl Fixture {
@@ -311,6 +322,62 @@ impl Fixture {
         .unwrap();
     }
 
+    fn write_s11_m2c_local_shadow_model(&self) {
+        fs::write(
+            self.models_dir
+                .join(format!("{}.toml", source_model_name())),
+            format!(
+                "[[providers]]\nname = {:?}\nargs = []\n\n[[providers]]\nname = {:?}\nargs = []\n",
+                canonical_account(),
+                accepted_account()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn rewrite_scope_provider_entries_with_resume(&self) {
+        fs::write(
+            self.config_dir.join("providers.toml"),
+            provider_toml_entry_with_resume(
+                &canonical_account(),
+                &self.success_script("repl-main-provider"),
+            ),
+        )
+        .unwrap();
+        let mut body = fs::read_to_string(self.config_dir.join("providers.toml")).unwrap();
+        body.push_str(&provider_toml_entry_with_resume(
+            &accepted_account(),
+            &self.success_script("repl-accepted-provider"),
+        ));
+        fs::write(self.config_dir.join("providers.toml"), body).unwrap();
+    }
+
+    fn default_runtime_state_path(&self) -> PathBuf {
+        self.dir
+            .path()
+            .join("xdg-data")
+            .join("oulipoly-agent-runner")
+            .join("state.db")
+    }
+
+    fn copy_state_to_default_runtime_path(&self) -> PathBuf {
+        let runtime_state = self.default_runtime_state_path();
+        fs::create_dir_all(runtime_state.parent().unwrap()).unwrap();
+        fs::copy(&self.state_path, &runtime_state).unwrap();
+        runtime_state
+    }
+
+    fn repl_resume_command(&self, resume_input: &str) -> Command {
+        let mut cmd = self.base_command();
+        cmd.current_dir(self.dir.path())
+            .arg("repl")
+            .arg("--resume")
+            .arg(resume_input)
+            .arg("--models-dir")
+            .arg(&self.models_dir);
+        cmd
+    }
+
     fn success_script(&self, name: &str) -> PathBuf {
         self.write_script(name, "printf '%s\\n' ok")
     }
@@ -484,6 +551,431 @@ impl S11M2cScopeModels {
             non_family_account: "acct-gpt".to_string(),
         }
     }
+}
+
+const RESUME_CHAIN_ORPHAN: &str = "11111111-1111-4111-8111-111111111111";
+const RESUME_CHAIN_ROTATION: &str = "22222222-2222-4222-8222-222222222222";
+const RESUME_CHAIN_VALID: &str = "33333333-3333-4333-8333-333333333333";
+const RESUME_CHAIN_REPL: &str = "44444444-4444-4444-8444-444444444444";
+const RESUME_CHAIN_STALE_PREIMAGE: &str = "55555555-5555-4555-8555-555555555555";
+const RESUME_STALE_PREIMAGE_SESSION: &str = "session-resume-stale-preimage";
+const SESSION_OWNERSHIP_MIGRATION_ID: &str = "s11-m2-session-ownership";
+
+fn load_fixture_models(fixture: &Fixture) -> oulipoly_state::ModelStore {
+    let providers = ProvidersConfig::load(&fixture.config_dir.join("providers.toml")).unwrap();
+    load_models(&fixture.models_dir, Some(&providers)).unwrap()
+}
+
+fn resolve_fixture_resume(fixture: &Fixture, resume_input: &str) -> ResolvedResume {
+    let db = StateDb::open(&fixture.state_path).unwrap();
+    let models = load_fixture_models(fixture);
+    db.resolve_resume(&models, resume_input, None).unwrap()
+}
+
+fn assert_provider_ref_resume(
+    fixture: &Fixture,
+    resume_input: &str,
+    expected_model: &str,
+    expected_provider: &str,
+) {
+    let resolved = resolve_fixture_resume(fixture, resume_input);
+    assert_eq!(resolved.model_name.as_deref(), Some(expected_model));
+    assert_eq!(resolved.active_provider, expected_provider);
+    assert!(
+        resolved
+            .model
+            .as_ref()
+            .is_some_and(|model| model.provider.is_some()),
+        "resolved resume model must be provider-ref and skip default migration: {resolved:?}"
+    );
+    assert_provider_ref_default_migration_skips(&resolved);
+}
+
+fn assert_provider_ref_default_migration_skips(resolved: &ResolvedResume) {
+    let manual_migrate_is_none = true;
+    let skip = manual_migrate_is_none
+        && resolved
+            .model
+            .as_ref()
+            .is_some_and(|model| model.provider.is_some());
+    assert!(
+        skip,
+        "provider-ref default migration did not skip: {resolved:?}"
+    );
+}
+
+fn assert_no_external_identity_errors(output: &Output) {
+    let combined = combined_output(output);
+    assert!(
+        !combined.contains("external rotation target"),
+        "resume hit external rotation target path: {combined}"
+    );
+    assert!(
+        !combined.contains("malformed external identity"),
+        "resume hit malformed external identity path: {combined}"
+    );
+}
+
+fn invocation_snapshot_for_session(path: &Path, session_id: &str) -> Vec<InvocationSnapshot> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, model_name, provider_name, status
+             FROM invocations
+             WHERE COALESCE(provider_session_id, session_id) = ?1
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([session_id], |row| {
+        Ok(InvocationSnapshot {
+            id: row.get(0)?,
+            model_name: row.get(1)?,
+            provider_name: row.get(2)?,
+            status: row.get(3)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+fn assert_invocations_reconciled(
+    fixture: &Fixture,
+    session_id: &str,
+    expected_model: &str,
+    expected_provider: &str,
+) {
+    let rows = invocation_snapshot_for_session(&fixture.state_path, session_id);
+    assert!(
+        !rows.is_empty(),
+        "fixture has no invocations for {session_id}"
+    );
+    for row in rows {
+        assert_eq!(row.model_name, expected_model, "invocation {row:?}");
+        assert_eq!(
+            row.provider_name.as_deref(),
+            Some(expected_provider),
+            "invocation {row:?}"
+        );
+    }
+}
+
+fn assert_invocations_preserved(
+    fixture: &Fixture,
+    session_id: &str,
+    expected: &[InvocationSnapshot],
+) {
+    let actual = invocation_snapshot_for_session(&fixture.state_path, session_id);
+    assert_eq!(actual, expected, "invocations changed for {session_id}");
+}
+
+fn invocation_preimage_count(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage
+         WHERE entity_kind = 'invocation'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn invocation_preimage_count_for_identity(
+    path: &Path,
+    invocation_id: i64,
+    old_model_name: &str,
+    new_model_name: &str,
+    old_provider_name: &str,
+    new_provider_name: &str,
+) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage
+         WHERE migration_id = ?1
+           AND entity_kind = 'invocation'
+           AND row_pk = ?2
+           AND old_model_name = ?3
+           AND new_model_name = ?4
+           AND old_provider_name = ?5
+           AND new_provider_name = ?6",
+        params![
+            SESSION_OWNERSHIP_MIGRATION_ID,
+            invocation_id.to_string(),
+            old_model_name,
+            new_model_name,
+            old_provider_name,
+            new_provider_name,
+        ],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn seed_resume_orphaned_chain_with_shadow_invocations(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, RESUME_CHAIN_ORPHAN, "<unknown>");
+    seed_segment(
+        &conn,
+        RESUME_CHAIN_ORPHAN,
+        &unregistered_account_a(),
+        "session-resume-orphan",
+        None,
+        Some("turn-resume-orphan"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_a(),
+        "session-resume-orphan",
+        "turn-resume-orphan",
+        "assistant",
+    );
+    seed_invocation(
+        &conn,
+        "10000000-0000-4000-8000-000000000001",
+        "<unknown>",
+        &unregistered_account_a(),
+        "session-resume-orphan",
+        "failed",
+        "2026-06-20T10:01:00Z",
+    );
+    seed_invocation(
+        &conn,
+        "10000000-0000-4000-8000-000000000002",
+        &source_model_name(),
+        &unregistered_account_a(),
+        "session-resume-orphan",
+        "succeeded",
+        "2026-06-20T10:02:00Z",
+    );
+}
+
+fn seed_resume_rotation_chain_with_shadow_invocation(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, RESUME_CHAIN_ROTATION, &source_model_name());
+    seed_segment(
+        &conn,
+        RESUME_CHAIN_ROTATION,
+        &unregistered_account_a(),
+        "session-resume-rotation",
+        None,
+        Some("turn-resume-rotation"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &unregistered_account_a(),
+        "session-resume-rotation",
+        "turn-resume-rotation",
+        "assistant",
+    );
+    seed_invocation(
+        &conn,
+        "20000000-0000-4000-8000-000000000001",
+        &source_model_name(),
+        &unregistered_account_a(),
+        "session-resume-rotation",
+        "running",
+        "2026-06-20T10:03:00Z",
+    );
+}
+
+fn seed_resume_valid_chain_with_aligned_invocation(fixture: &Fixture, models: &S11M2cScopeModels) {
+    let conn = fixture.conn();
+    seed_chain(&conn, RESUME_CHAIN_VALID, &models.middle);
+    seed_segment(
+        &conn,
+        RESUME_CHAIN_VALID,
+        &accepted_account(),
+        "session-resume-valid",
+        None,
+        Some("turn-resume-valid"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &accepted_account(),
+        "session-resume-valid",
+        "turn-resume-valid",
+        "assistant",
+    );
+    seed_invocation(
+        &conn,
+        "30000000-0000-4000-8000-000000000001",
+        &models.middle,
+        &accepted_account(),
+        "session-resume-valid",
+        "succeeded",
+        "2026-06-20T10:04:00Z",
+    );
+}
+
+fn seed_resume_repl_orphaned_provider_ref_chain(fixture: &Fixture) {
+    let conn = fixture.conn();
+    seed_chain(&conn, RESUME_CHAIN_REPL, "<unknown>");
+    seed_segment(
+        &conn,
+        RESUME_CHAIN_REPL,
+        &canonical_account(),
+        "session-resume-repl",
+        None,
+        Some("turn-resume-repl"),
+        "initial",
+    );
+    seed_turn(
+        &conn,
+        &canonical_account(),
+        "session-resume-repl",
+        "turn-resume-repl",
+        "assistant",
+    );
+    seed_invocation(
+        &conn,
+        "40000000-0000-4000-8000-000000000001",
+        "<unknown>",
+        &canonical_account(),
+        "session-resume-repl",
+        "succeeded",
+        "2026-06-20T10:05:00Z",
+    );
+}
+
+fn seed_resume_reapply_reconciliation_fixture(
+    fixture: &Fixture,
+    models: &S11M2cScopeModels,
+) -> i64 {
+    let conn = fixture.conn();
+    let stale_provider = unregistered_account_family(2);
+    seed_chain(&conn, RESUME_CHAIN_STALE_PREIMAGE, &models.middle);
+    seed_segment_with_started_at(
+        &conn,
+        RESUME_CHAIN_STALE_PREIMAGE,
+        &stale_provider,
+        RESUME_STALE_PREIMAGE_SESSION,
+        FIXED_TS,
+        None,
+        Some("turn-resume-stale-preimage"),
+        "manual",
+    );
+    seed_turn(
+        &conn,
+        &stale_provider,
+        RESUME_STALE_PREIMAGE_SESSION,
+        "turn-resume-stale-preimage",
+        "assistant",
+    );
+    seed_invocation(
+        &conn,
+        "50000000-0000-4000-8000-000000000001",
+        &models.middle,
+        &stale_provider,
+        RESUME_STALE_PREIMAGE_SESSION,
+        "succeeded",
+        "2026-06-20T10:06:00Z",
+    )
+}
+
+fn seed_stale_invocation_preimage_row(
+    conn: &Connection,
+    invocation_id: i64,
+    model_name: &str,
+    provider_name: &str,
+) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS s11_wu4_restore_session_ownership_preimage (
+            migration_id TEXT NOT NULL,
+            entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'invocation', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
+            row_pk TEXT NOT NULL,
+            chain_id TEXT,
+            segment_id INTEGER,
+            turn_row_id INTEGER,
+            old_model_name TEXT,
+            new_model_name TEXT,
+            old_provider_name TEXT,
+            new_provider_name TEXT,
+            session_id TEXT,
+            segment_started_at TEXT,
+            segment_ended_at TEXT,
+            segment_last_turn_id TEXT,
+            segment_transition_reason TEXT,
+            turn_id TEXT,
+            turn_timestamp TEXT,
+            turn_role TEXT,
+            turn_parent_turn_id TEXT,
+            turn_is_sidechain INTEGER,
+            turn_is_compaction_boundary INTEGER,
+            turn_source_file TEXT,
+            turn_ingested_at TEXT,
+            turn_body TEXT,
+            new_started_at TEXT,
+            new_ended_at TEXT,
+            new_last_turn_id TEXT,
+            new_transition_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (migration_id, entity_kind, row_pk)
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO s11_wu4_restore_session_ownership_preimage
+         (migration_id, entity_kind, row_pk, old_model_name, new_model_name,
+          old_provider_name, new_provider_name)
+         VALUES (?1, 'invocation', ?2, ?3, ?3, ?4, ?4)",
+        params![
+            SESSION_OWNERSHIP_MIGRATION_ID,
+            invocation_id.to_string(),
+            model_name,
+            provider_name,
+        ],
+    )
+    .unwrap();
+}
+
+fn seed_old_check_invocation_preimage_table(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE s11_wu4_restore_session_ownership_preimage (
+            migration_id TEXT NOT NULL,
+            entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
+            row_pk TEXT NOT NULL,
+            chain_id TEXT,
+            segment_id INTEGER,
+            turn_row_id INTEGER,
+            old_model_name TEXT,
+            new_model_name TEXT,
+            old_provider_name TEXT,
+            new_provider_name TEXT,
+            session_id TEXT,
+            segment_started_at TEXT,
+            segment_ended_at TEXT,
+            segment_last_turn_id TEXT,
+            segment_transition_reason TEXT,
+            turn_id TEXT,
+            turn_timestamp TEXT,
+            turn_role TEXT,
+            turn_parent_turn_id TEXT,
+            turn_is_sidechain INTEGER,
+            turn_is_compaction_boundary INTEGER,
+            turn_source_file TEXT,
+            turn_ingested_at TEXT,
+            turn_body TEXT,
+            new_started_at TEXT,
+            new_ended_at TEXT,
+            new_last_turn_id TEXT,
+            new_transition_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (migration_id, entity_kind, row_pk)
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO s11_wu4_restore_session_ownership_preimage
+         (migration_id, entity_kind, row_pk, chain_id, old_model_name, new_model_name)
+         VALUES (?1, 'chain', 'old-check-chain-row', 'old-check-chain', 'old-model', 'new-model')",
+        [SESSION_OWNERSHIP_MIGRATION_ID],
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1136,6 +1628,7 @@ fn s11_m2c_t9_idempotent_after_collision_resolution_has_zero_counts() {
         "chain_model_updates_to_apply",
         "segment_provider_updates_to_apply",
         "turn_provider_updates_to_apply",
+        "invocation_identity_updates_to_apply",
         "segment_rows_merged_away",
         "turn_rows_deduped_away",
         "segment_merge_survivors_updated",
@@ -1529,6 +2022,7 @@ fn s11_m2c_turns_reapply_after_widened_success_is_clean_noop() {
         "chain_model_updates_to_apply",
         "segment_provider_updates_to_apply",
         "turn_provider_updates_to_apply",
+        "invocation_identity_updates_to_apply",
         "segment_rows_merged_away",
         "turn_rows_deduped_away",
         "segment_merge_survivors_updated",
@@ -1790,6 +2284,7 @@ fn apply_idempotence_second_apply_is_noop() {
     assert_report_count(&report, "chain_model_updates_to_apply", 0);
     assert_report_count(&report, "segment_provider_updates_to_apply", 0);
     assert_report_count(&report, "turn_provider_updates_to_apply", 0);
+    assert_report_count(&report, "invocation_identity_updates_to_apply", 0);
 }
 
 #[test]
@@ -2292,6 +2787,388 @@ fn s11_m2c_scope_reapply_is_clean_noop_with_valid_models() {
 }
 
 #[test]
+fn s11_m2c_resume_backfilled_orphan_reconciles_invocations_and_resolves_provider_ref() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    fixture.write_s11_m2c_local_shadow_model();
+    seed_resume_orphaned_chain_with_shadow_invocations(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_provider_ref_resume(
+        &fixture,
+        RESUME_CHAIN_ORPHAN,
+        &models.target,
+        &canonical_account(),
+    );
+    assert_invocations_reconciled(
+        &fixture,
+        "session-resume-orphan",
+        &models.target,
+        &canonical_account(),
+    );
+    assert_no_external_identity_errors(&output);
+}
+
+#[test]
+fn s11_m2c_resume_rotation_remapped_chain_reconciles_invocations_and_resolves_provider_ref() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    fixture.write_s11_m2c_local_shadow_model();
+    seed_resume_rotation_chain_with_shadow_invocation(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_provider_ref_resume(
+        &fixture,
+        RESUME_CHAIN_ROTATION,
+        &models.target,
+        &canonical_account(),
+    );
+    assert_invocations_reconciled(
+        &fixture,
+        "session-resume-rotation",
+        &models.target,
+        &canonical_account(),
+    );
+    assert_no_external_identity_errors(&output);
+}
+
+#[test]
+fn s11_m2c_resume_valid_provider_ref_chain_preserves_aligned_invocations() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_resume_valid_chain_with_aligned_invocation(&fixture, &models);
+    let before_chain_model = snapshot(&fixture.state_path)
+        .chains
+        .get(RESUME_CHAIN_VALID)
+        .unwrap()
+        .model_name
+        .clone();
+    assert_eq!(before_chain_model, models.middle);
+    let before = invocation_snapshot_for_session(&fixture.state_path, "session-resume-valid");
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_provider_ref_resume(
+        &fixture,
+        RESUME_CHAIN_VALID,
+        &models.middle,
+        &accepted_account(),
+    );
+    let after_chain_model = snapshot(&fixture.state_path)
+        .chains
+        .get(RESUME_CHAIN_VALID)
+        .unwrap()
+        .model_name
+        .clone();
+    assert_eq!(after_chain_model, before_chain_model);
+    assert_eq!(after_chain_model, models.middle);
+    assert_invocations_preserved(&fixture, "session-resume-valid", &before);
+    let report = read_report_from_output(&output);
+    assert_report_count(&report, "invocation_identity_updates_to_apply", 0);
+    assert_no_external_identity_errors(&output);
+}
+
+#[test]
+fn s11_m2c_resume_no_payload_repl_skips_default_provider_ref_migration() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    fixture.rewrite_scope_provider_entries_with_resume();
+    seed_resume_repl_orphaned_provider_ref_chain(&fixture);
+    let backup_dir = fixture.backup_dir();
+    let apply = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+    assert_success(&apply);
+    assert_provider_ref_resume(
+        &fixture,
+        RESUME_CHAIN_REPL,
+        &models.target,
+        &canonical_account(),
+    );
+    fixture.copy_state_to_default_runtime_path();
+
+    let output = fixture
+        .repl_resume_command(RESUME_CHAIN_REPL)
+        .output()
+        .unwrap();
+
+    assert_no_external_identity_errors(&output);
+    assert_success(&output);
+}
+
+#[test]
+fn s11_m2c_resume_invocation_preimage_rolls_back_exactly() {
+    let fixture = Fixture::new();
+    fixture.write_s11_m2c_scope_configs();
+    fixture.write_s11_m2c_local_shadow_model();
+    seed_resume_orphaned_chain_with_shadow_invocations(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert!(
+        invocation_preimage_count(&fixture.state_path) > 0,
+        "forward migration did not record invocation preimage rows"
+    );
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+    let report = read_report_from_output(&rollback);
+    assert_report_context_count(&report, &ROLLBACK_COPY_PHASE, "invocation_mismatch", 0);
+}
+
+#[test]
+fn s11_m2c_resume_zero_residual_includes_migrated_invocations() {
+    let fixture = Fixture::new();
+    fixture.write_s11_m2c_scope_configs();
+    fixture.write_s11_m2c_local_shadow_model();
+    seed_resume_orphaned_chain_with_shadow_invocations(&fixture);
+    seed_resume_rotation_chain_with_shadow_invocation(&fixture);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_live_counts_and_zero_residual(&fixture.state_path);
+    assert_eq!(
+        residual_noncanonical_rotation_invocation_owner_count(&fixture.state_path),
+        0
+    );
+    assert_eq!(
+        residual_stale_invocation_model_count(&fixture.state_path),
+        0
+    );
+}
+
+#[test]
+fn s11_m2c_resume_invocation_updates_are_idempotent_and_reported() {
+    let fixture = Fixture::new();
+    fixture.write_s11_m2c_scope_configs();
+    fixture.write_s11_m2c_local_shadow_model();
+    seed_resume_orphaned_chain_with_shadow_invocations(&fixture);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+    let after_first = full_snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(full_snapshot(&fixture.state_path), after_first);
+    let report = read_report_from_output(&second);
+    assert_report_count(&report, "invocation_identity_updates_to_apply", 0);
+}
+
+#[test]
+fn s11_m2c_resume_stale_invocation_preimage_reapply_reconciles_and_counts() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let invocation_id = seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let stale_provider = unregistered_account_family(2);
+    {
+        let conn = Connection::open(&fixture.state_path).unwrap();
+        seed_stale_invocation_preimage_row(
+            &conn,
+            invocation_id,
+            &models.middle,
+            &stale_provider,
+        );
+    }
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_provider_ref_resume(
+        &fixture,
+        RESUME_CHAIN_STALE_PREIMAGE,
+        &models.middle,
+        &canonical_account(),
+    );
+    assert_invocations_reconciled(
+        &fixture,
+        RESUME_STALE_PREIMAGE_SESSION,
+        &models.middle,
+        &canonical_account(),
+    );
+    assert_eq!(
+        invocation_preimage_count_for_identity(
+            &fixture.state_path,
+            invocation_id,
+            &models.middle,
+            &models.middle,
+            &stale_provider,
+            &canonical_account(),
+        ),
+        1,
+        "fresh non-no-op invocation preimage row was not recorded"
+    );
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    let planned = last_run_count(&conn, "invocation_identity_updates_to_apply");
+    let applied = applied_invocation_count(&conn);
+    assert_eq!(planned, 1);
+    assert_eq!(applied, planned);
+    assert_no_external_identity_errors(&output);
+}
+
+#[test]
+fn s11_m2c_resume_clean_double_apply_invocation_reconciliation_is_noop() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let backup_dir = fixture.backup_dir();
+    let first = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+    assert_success(&first);
+    assert_invocations_reconciled(
+        &fixture,
+        RESUME_STALE_PREIMAGE_SESSION,
+        &models.middle,
+        &canonical_account(),
+    );
+    let after_first = full_snapshot(&fixture.state_path);
+
+    let second = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(full_snapshot(&fixture.state_path), after_first);
+    let report = read_report_from_output(&second);
+    assert_report_count(&report, "invocation_identity_updates_to_apply", 0);
+}
+
+#[test]
+fn s11_m2c_resume_stale_check_preimage_reapply_reconciles_and_rebuilds() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let invocation_id = seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let stale_provider = unregistered_account_family(2);
+    {
+        let conn = Connection::open(&fixture.state_path).unwrap();
+        seed_old_check_invocation_preimage_table(&conn);
+    }
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_invocations_reconciled(
+        &fixture,
+        RESUME_STALE_PREIMAGE_SESSION,
+        &models.middle,
+        &canonical_account(),
+    );
+    assert_eq!(
+        invocation_preimage_count_for_identity(
+            &fixture.state_path,
+            invocation_id,
+            &models.middle,
+            &models.middle,
+            &stale_provider,
+            &canonical_account(),
+        ),
+        1,
+        "rebuilt preimage table did not record an invocation row"
+    );
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    let planned = last_run_count(&conn, "invocation_identity_updates_to_apply");
+    let applied = applied_invocation_count(&conn);
+    assert_eq!(planned, 1);
+    assert_eq!(applied, planned);
+    assert_no_external_identity_errors(&output);
+    let preimage_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 's11_wu4_restore_session_ownership_preimage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        preimage_sql.contains("'invocation'"),
+        "rebuilt preimage CHECK does not admit invocation rows: {preimage_sql}"
+    );
+}
+
+#[test]
+fn s11_m2c_resume_rollback_drops_preimage_table() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_resume_reapply_reconciliation_fixture(&fixture, &models);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .apply_command(Some(&backup_dir), true, false, false)
+            .output()
+            .unwrap(),
+    );
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert!(
+        !table_exists(&conn, "s11_wu4_restore_session_ownership_preimage"),
+        "rollback should drop the session-ownership preimage table after verified restore"
+    );
+}
+
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
 fn live_apply_and_rollback_commands_are_guarded_to_temp_state_db_and_redirected_env() {
     let fixture = Fixture::new();
     let backup_dir = fixture.backup_dir();
@@ -2586,12 +3463,19 @@ fn assert_live_counts_and_zero_residual(path: &Path) {
     let chain_planned = last_run_count(&conn, "chain_model_updates_to_apply");
     let segment_planned = last_run_count(&conn, "segment_provider_updates_to_apply");
     let turn_planned = last_run_count(&conn, "turn_provider_updates_to_apply");
+    let invocation_planned = last_run_count(&conn, "invocation_identity_updates_to_apply");
     assert_eq!(chain_planned, applied_chain_count(&conn));
     assert_eq!(segment_planned, applied_segment_count(&conn));
     assert_eq!(turn_planned, applied_turn_count(&conn));
+    assert_eq!(invocation_planned, applied_invocation_count(&conn));
     assert_eq!(residual_old_owner_count(&conn), 0);
     assert_eq!(residual_noncanonical_rotation_segment_owner_count(&conn), 0);
     assert_eq!(residual_noncanonical_rotation_turn_owner_count(&conn), 0);
+    assert_eq!(
+        residual_noncanonical_rotation_invocation_owner_count(path),
+        0
+    );
+    assert_eq!(residual_stale_invocation_model_count(path), 0);
     assert!(preimage_row_count(&conn) > 0, "preimage table is empty");
 }
 
@@ -2601,7 +3485,7 @@ fn last_run_count(conn: &Connection, key: &str) -> i64 {
         [key],
         |row| row.get(0),
     )
-    .unwrap()
+    .unwrap_or_else(|err| panic!("missing last-run count {key}: {err}"))
 }
 
 fn applied_chain_count(conn: &Connection) -> i64 {
@@ -2640,6 +3524,21 @@ fn applied_turn_count(conn: &Connection) -> i64 {
          WHERE p.entity_kind = 'turn'
            AND p.old_provider_name <> p.new_provider_name
            AND t.provider_name = p.new_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn applied_invocation_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_restore_session_ownership_preimage p
+         JOIN invocations i ON i.id = CAST(p.row_pk AS INTEGER)
+         WHERE p.entity_kind = 'invocation'
+           AND (p.old_model_name <> p.new_model_name OR p.old_provider_name <> p.new_provider_name)
+           AND i.model_name = p.new_model_name
+           AND i.provider_name IS p.new_provider_name",
         [],
         |row| row.get(0),
     )
@@ -2733,6 +3632,49 @@ fn residual_noncanonical_rotation_turn_owner_count(conn: &Connection) -> i64 {
     .unwrap()
 }
 
+fn residual_noncanonical_rotation_invocation_owner_count(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    let pattern = format!("%{}%", provider_token());
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM invocations i
+         WHERE i.provider_name LIKE ?1
+           AND i.provider_name <> ?2
+           AND i.provider_name <> ?3
+           AND EXISTS (
+               SELECT 1
+               FROM session_chain_segments s
+               JOIN session_chains c ON c.chain_id = s.chain_id
+               WHERE s.session_id = COALESCE(i.provider_session_id, i.session_id)
+                 AND c.model_name = ?4
+           )",
+        params![
+            pattern,
+            canonical_account(),
+            accepted_account(),
+            target_model_name()
+        ],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn residual_stale_invocation_model_count(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM invocations i
+         JOIN session_chain_segments s ON s.session_id = COALESCE(i.provider_session_id, i.session_id)
+         JOIN session_chains c ON c.chain_id = s.chain_id
+         WHERE c.model_name = ?1
+           AND i.model_name <> ?1
+           AND i.model_name <> '<unknown>'",
+        [target_model_name()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn preimage_row_count(conn: &Connection) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM s11_wu4_restore_session_ownership_preimage",
@@ -2745,6 +3687,13 @@ fn preimage_row_count(conn: &Connection) -> i64 {
 fn provider_toml_entry(name: &str, command: &Path) -> String {
     format!(
         "[{name}]\ncommand = {:?}\nargs = []\nprompt_mode = \"arg\"\n\n",
+        command.to_string_lossy()
+    )
+}
+
+fn provider_toml_entry_with_resume(name: &str, command: &Path) -> String {
+    format!(
+        "[{name}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{name}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n",
         command.to_string_lossy()
     )
 }
@@ -2846,6 +3795,43 @@ fn seed_turn_full(
             source_file,
             ingested_at,
             body,
+        ],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+fn seed_invocation(
+    conn: &Connection,
+    invocation_uuid: &str,
+    model_name: &str,
+    provider_name: &str,
+    session_id: &str,
+    status: &str,
+    created_at: &str,
+) -> i64 {
+    conn.execute(
+        "INSERT INTO invocations
+         (invocation_uuid, model_name, provider_name, provider_index, status, success, exit_code,
+          session_id, provider_session_id, created_at, finished_at)
+         VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?7, ?8, ?8)",
+        params![
+            invocation_uuid,
+            model_name,
+            provider_name,
+            status,
+            if status == "succeeded" {
+                Some(1_i64)
+            } else {
+                None
+            },
+            if status == "succeeded" {
+                Some(0_i64)
+            } else {
+                None
+            },
+            session_id,
+            created_at,
         ],
     )
     .unwrap();
@@ -3585,6 +4571,7 @@ fn apply_widened_fixture_snapshot_and_counts() -> (FullOwnershipSnapshot, BTreeM
             "chain_model_updates_to_apply",
             "segment_provider_updates_to_apply",
             "turn_provider_updates_to_apply",
+            "invocation_identity_updates_to_apply",
             "segment_rows_merged_away",
             "turn_rows_deduped_away",
             "post_apply_turn_collision_count",
@@ -3818,6 +4805,7 @@ fn snapshot(path: &Path) -> OwnershipSnapshot {
         chains: query_chains(&conn),
         segments: query_segments(&conn),
         turns: query_turns(&conn),
+        invocations: query_invocations(&conn),
     }
 }
 
@@ -3929,12 +4917,34 @@ fn query_turns(conn: &Connection) -> Vec<TurnSnapshot> {
     .collect()
 }
 
+fn query_invocations(conn: &Connection) -> Vec<InvocationSnapshot> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, model_name, provider_name, status
+             FROM invocations
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok(InvocationSnapshot {
+            id: row.get(0)?,
+            model_name: row.get(1)?,
+            provider_name: row.get(2)?,
+            status: row.get(3)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
 fn full_snapshot(path: &Path) -> FullOwnershipSnapshot {
     let conn = Connection::open(path).unwrap();
     FullOwnershipSnapshot {
         chains: query_chains(&conn),
         segments: query_segments_with_id(&conn),
         turns: query_turns_with_id(&conn),
+        invocations: query_invocations(&conn),
     }
 }
 
@@ -4530,6 +5540,12 @@ fn assert_first_forward_counts(report: &str) {
         "turn_provider_updates_to_apply",
         2,
     );
+    assert_report_context_count(
+        report,
+        &FIRST_FORWARD_PHASE,
+        "invocation_identity_updates_to_apply",
+        0,
+    );
 }
 
 fn assert_candidate_report_counts(report: &str) {
@@ -4558,6 +5574,12 @@ fn assert_idempotence_counts(report: &str) {
         "turn_provider_updates_to_apply",
         0,
     );
+    assert_report_context_count(
+        report,
+        &AFTER_IDEMPOTENCE_PHASE,
+        "invocation_identity_updates_to_apply",
+        0,
+    );
 }
 
 fn assert_rollback_report_counts(report: &str) {
@@ -4565,6 +5587,7 @@ fn assert_rollback_report_counts(report: &str) {
     assert_report_context_count(report, &ROLLBACK_COPY_PHASE, "chain_mismatch", 0);
     assert_report_context_count(report, &ROLLBACK_COPY_PHASE, "segment_mismatch", 0);
     assert_report_context_count(report, &ROLLBACK_COPY_PHASE, "turn_mismatch", 0);
+    assert_report_context_count(report, &ROLLBACK_COPY_PHASE, "invocation_mismatch", 0);
 }
 
 fn assert_cwd_completeness_counts(report: &str) {

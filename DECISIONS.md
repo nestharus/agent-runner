@@ -4693,3 +4693,146 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   only on the documented `age244_s7b` / `age245_s7c` grep guards + the os-error-11 PTY flake, and token
   delta vs `main` = 0. Linear cross-link/close-comment skipped (Option B); the manager creates + links
   the NES ticket out-of-band. Estimate calibration: inherited=null, refined=5, actual=5.
+
+## D-S11-M2c-resume-000-linear-gap — proceed without Linear (manager Option B)
+
+- **Phase**: Phase 0 (bootstrap).
+- **Decision**: Proceed without Linear. `LINEAR_API_KEY` is unavailable to spooled jobs, so every
+  ticket-operator step (read/create/comment/estimate/calibration/cross-link/close) is skipped for this
+  WU. `planning/s11-m2c-resume-fix/brief.md` is the source of truth.
+- **Authorization**: manager-max, Option B. The manager creates + links the NES ticket out-of-band
+  (intended title: "S11-M2c-resume: fix resume of migrated sessions + add resume proof to the migration
+  gate"). The pipeline does not halt on the missing ticket.
+- **Pipeline effect**: `ticket_system=none`; draft PR on base `main`; `auto_merge_after_phase_9=false`
+  ⇒ stop at the draft PR. Phase 9 omits the optional close-keyword footer and posts no ticket
+  cross-link comment. The manager merges after a full `cargo test --workspace` and a re-apply+resume
+  proof on a copy of the real migrated DB.
+- **Evidence**: `planning/s11-m2c-resume-fix/brief.md`; `planning/s11-m2c-resume-fix/session.json`.
+
+## D-S11-M2c-resume-001-focused-gates — gate execution shape (orchestrator adaptation)
+
+- **Phase**: Phases 4 / 6 / 8 (gate evaluation).
+- **Decision**: For this single coherent bug-fix concern (do-not-split), the orchestrator runs
+  **focused, genuine sub-agent gates** rather than the maximal `apply-gate-set` multi-auditor fan-out:
+  Phase 4 = one gpt-xhigh risk gate on the **proposal** (audit/scope/shortcut/supported-surface/proof
+  + plan code-quality); Phase 6 = orchestrator-authored contract (6a) → fresh test-writer (6b) →
+  tests↔contract alignment review → fresh code-writer (6c, distinct invocation UUID) → focused gate
+  verification; Phase 8 = test-audit + justification + commit-hygiene review on the **actual diff**
+  plus a verification gate that runs the **full `cargo test --workspace`** + `clippy -D warnings` +
+  `bunx tsc --noEmit` + token-delta-vs-main.
+- **Rationale**: The manager's task instructions control and emphasize (1) dispatch every phase via
+  sub-agents, (2) never self-implement/build, (3) Phase 8 MUST run the full `cargo test --workspace`,
+  (4) stop at the draft PR — not the maximal gate operator. All hard invariants are preserved:
+  test-writer (6b) and code-writer (6c) are separate invocations with distinct UUIDs; risk gates run
+  on the proposal, not the diff; synthetic fixtures only; the orchestrator authors no source/tests and
+  runs no builds itself; every dispatch is a parent-visible `agents` invocation captured via `tee`.
+- **Evidence**: task manager-max instructions; `planning/s11-m2c-resume-fix/brief.md` gate recipe.
+
+## D-S11-M2c-resume-002-revert-6b-formatter-noise — test-writer overreach cleanup
+
+- **Phase**: Phase 6 Step 6b (test-writer).
+- **Decision**: The Step 6b test-writer (inv `01f6a2cf`) authored 7 correct RED proof tests (+664 lines
+  in `src-tauri/tests/s11_m2_session_ownership_migration.rs`) but also ran a workspace formatter,
+  producing pure-`rustfmt` reformatting noise (import reordering, method-chain wrapping) in 7 unrelated
+  files: `report.rs`, `target_resolution.rs`, `dispatch/usage_context.rs`, `run/repl/orchestration.rs`,
+  `wake_coordinator/sweep/candidate.rs`, `tests/age153_repl_terminal_signal.rs`,
+  `tests/wu_d_proactive_wake_integration/cases_batch_sweep.rs`. The orchestrator reverted all 7 to
+  `main` (`git checkout main -- …`), keeping ONLY the genuine test additions. This restores the clean
+  test-only RED state so Step 6c (a separate invocation) is the sole implementer of the production fix.
+- **Why safe**: every reverted hunk was verifiably formatting-only (zero functional change); `main`
+  itself is not rustfmt-clean and the brief gate does not run `cargo fmt --check`; the new tests compiled
+  against the existing production API (they assert via migration-report strings, `s11_wu4_last_run_counts`
+  SQL, and `StateDb::resolve_resume` behavior — not via any new production symbol), so reverting cannot
+  affect compilation or the RED reasons. Step 6c re-confirms RED→GREEN on the clean tree.
+- **Authority**: orchestrator destructive-git authority (out-of-contract change cleanup). No new
+  provider-family brand tokens were introduced on added lines.
+- **Evidence**: `git diff main` review of the 7 reverted files (all import/line-wrap only); Step 6b
+  output index + `planning/s11-m2c-resume-fix/.scratch/logs/phase6b-red-proof.log`.
+
+## D-S11-M2c-resume-003-coderabbit-deferred — Phase 7 optional review disposition
+
+- **Phase**: Phase 7 (optional PR-mode review).
+- **Decision**: CodeRabbit is enabled for `nestharus/agent-runner` (repo label marker;
+  `coderabbit_review_driver.py is-enabled` → `enabled: true`). The three Phase 7 readiness checks
+  (inherited-prototype-tests, integration-tests, swap-record) are non-applicable for this WU (no
+  prototype, no `LevelComponentSet`, no `PrototypeSwapRecord`). The orchestrator does NOT drive a
+  synchronous CodeRabbit fix-loop in this run: there is no PR yet (the draft PR opens in Phase 9), the
+  manager owns post-PR review + merge, and the manager flow stops at the draft PR. CodeRabbit
+  auto-reviews the draft PR as part of the manager's review surface.
+- **Rationale**: Running an autonomous fix-loop that posts GitHub comments and auto-pushes fix commits
+  before the manager's review would overshoot "stop at the draft PR" with premature outward churn. The
+  PR + CodeRabbit + Phase 8 gates are the review surface; the manager merges after a full
+  `cargo test --workspace` and a re-apply+resume proof on a copy of the real migrated DB.
+- **Evidence**: `is-enabled` output; manager-max Option B instructions; `brief.md` Anti-scope.
+
+## D-S11-M2c-resume-v2-001-invocation-reapply-idempotence — confirmed root cause supersedes the hypothesis
+
+- **Phase**: v2 resume (Phase 2.5 re-diagnosis -> Phase 6 -> Phase 8 -> Phase 9).
+- **Decision**: The round-1 invocation reconciliation was correct on a fresh single apply but broke on
+  the real **re-apply** (`invocation_identity_updates_to_apply: planned 1332, applied 0; auto-rollback`).
+  An empirical re-diagnosis (synthetic fixtures driving the real apply) **refuted** the manager's
+  multi-candidate hypothesis: pure multi-candidate / heterogeneous shared-session shapes collapse to one
+  deterministic plan row and apply cleanly, and the planned-count query already carries the change
+  filter. The **confirmed** root cause is that `s11_wu4_restore_session_ownership_preimage` is a
+  persistent table with a constant `migration_id` that the forward never cleared before the invocation
+  `INSERT OR IGNORE`; a prior interrupted/rolled-back run's invocation preimage rows shadow the fresh
+  inserts so the update + applied count read a stale no-op row. The fix is a 6-line `forward.sql`
+  current-`migration_id` preimage clear, guarded by `EXISTS(s11_wu4_candidate_segments)` to preserve
+  dry-run/no-op rollback evidence. Empirical evidence was trusted over the hypothesis.
+- **Why safe**: scoped to the current `migration_id` only (no other migration's rows touched); guarded
+  so clean no-candidate re-applies keep prior rollback evidence; no `session_id`/`provider_session_id`
+  mutation; no global scan; `s11_wu4_forward_guard` fail-closed path intact; rides the existing
+  preimage/count/drift/residual/rollback path. Migration target 60/60 green (incl. a stale-preimage
+  re-apply RED-now-green proof + a clean double-apply idempotence guard); full `cargo test --workspace`
+  green except the three documented exceptions; clippy clean; token delta vs `main` = 0.
+- **Evidence**: `planning/s11-m2c-resume-fix/research/s11-m2c-resume-fix-v2-multi-candidate-diagnosis.md`;
+  contract §8; `planning/s11-m2c-resume-fix/alignment/s11-m2c-resume-fix-tests-contracts-v2.md` (ALIGNED);
+  `planning/s11-m2c-resume-fix/risk/s11-m2c-resume-fix-phase-8-aggregate-v2.md` (PHASE-8 VERDICT: PASS);
+  commit `1a5962ed` on PR #198.
+
+## D-S11-M2c-resume-v2-002-linear-gap — proceed without Linear (manager Option B, reaffirmed for v2)
+
+- **Phase**: v2 resume bootstrap + Phase 9.
+- **Decision**: `ticket_system=none` for this run (LINEAR_API_KEY unavailable to the spooled job).
+  Per manager Option B, the orchestrator does all work, commits to the existing branch, pushes, and
+  ensures the existing draft PR #198 reflects the fix; it does NOT dispatch `linear-operator` and does
+  NOT post a ticket cross-link. The manager files/links the NES ticket out-of-band and owns the merge
+  after a re-apply on a copy of the real DB proving 0 stale invocations + `planned == applied`
+  (`auto_merge_after_phase_9=false`, so the pipeline stops at the draft PR).
+- **Evidence**: `planning/s11-m2c-resume-fix/session.json` `linear_gap`; `brief-v2.md` manager
+  authorization; PR #198 head `1a5962ed`.
+
+## D-S11-M2c-resume-v3-001-preimage-schema-lifecycle — v3 corrects the v2 mechanism
+
+- **Phase**: v3 resume bootstrap (Phase 0 verify) + Step 6a contract.
+- **Decision**: The v2 root cause (current-`migration_id` row shadowing) was necessary but
+  **insufficient**: a clear/DELETE cannot fix a stale CHECK. The manager proved on the real `state.db`
+  that the live `s11_wu4_restore_session_ownership_preimage` table (254,071 rows) carries the OLD CHECK
+  lacking `'invocation'` from a prior rolled-back apply; `CREATE TABLE IF NOT EXISTS` keeps that stale
+  CHECK, so every `entity_kind='invocation'` preimage row violates the CHECK and `INSERT OR IGNORE`
+  drops it → planned 1332, applied 0 → auto-rollback. v3 fix = forward.sql DROP+CREATE the preimage
+  table at forward start (current columns + CHECK incl `'invocation'`, inside the BEGIN..COMMIT so
+  guarded aborts still leave no table), remove the now-dead v2 `migration_id` DELETE, and drop the
+  preimage table on successful live `--rollback` (Rust layer in rollback.rs, after verify; NOT in
+  ROLLBACK_SQL, to keep the perf EXPLAIN + dry-run/auto-rollback reads intact). The invocation remap
+  computation, resume REPL guard, and resume tests are CORRECT and unchanged.
+- **Why safe**: `full_snapshot` compares only chains/segments/turns/invocations (not the preimage
+  table), so emptying the preimage on a no-op re-apply keeps the double-apply domain snapshot identical;
+  DROP+CREATE inside the transaction preserves the fail-closed `*_rolls_back_whole_forward_transaction`
+  assertions; the Rust-layer rollback drop runs only after all preimage-reading verification; no
+  `session_id` mutation; no fail-open; token delta vs `main` = 0. v3 follow-up (§9.5): the dry-run
+  computes cwd_completeness after the FIRST forward (before the idempotence re-apply) so the ephemeral
+  preimage is still populated when read.
+- **Evidence**: `planning/s11-m2c-resume-fix/brief-v3.md`; contract §9
+  (`planning/s11-m2c-resume-fix/contracts/s11-m2c-resume-fix-resume.md`).
+
+## D-S11-M2c-resume-v3-002-linear-gap — proceed without Linear (manager Option B, reaffirmed for v3)
+
+- **Phase**: v3 resume bootstrap + Phase 9.
+- **Decision**: `ticket_system=none` for this run (no LINEAR_API_KEY available to the spooled job).
+  Per manager Option B the orchestrator does all work, commits to the existing branch `s11-m2c-resume-fix`,
+  pushes, and ensures the existing draft PR #198 reflects the v3 fix; it does NOT dispatch
+  `linear-operator` and does NOT post a ticket cross-link. `auto_merge_after_phase_9=false`: the pipeline
+  stops at the draft PR; the manager merges after a full `cargo test --workspace` and a re-apply on a
+  copy of the real DB proving 0 stale invocations + `planned == applied`.
+- **Evidence**: v3 dispatch instructions (manager-max Option B); PR #198 head.

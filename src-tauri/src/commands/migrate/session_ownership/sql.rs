@@ -177,6 +177,11 @@ pub(crate) fn verify_rollback_restored(
     Ok(mismatches)
 }
 
+pub(crate) fn drop_preimage_artifacts(conn: &Connection) -> Result<(), DryRunError> {
+    conn.execute_batch("DROP TABLE IF EXISTS s11_wu4_restore_session_ownership_preimage;")?;
+    Ok(())
+}
+
 pub(crate) fn cwd_completeness(
     state: &Connection,
     mailbox_copy: Option<&Path>,
@@ -226,6 +231,34 @@ fn rollback_drift_probes() -> Vec<(&'static str, &'static str)> {
                 SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
                 JOIN session_turns t ON t.id = p.turn_row_id
                 WHERE p.entity_kind = 'turn' AND t.provider_name <> p.new_provider_name
+             )",
+        ),
+        (
+            "invocation missing before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                WHERE p.entity_kind = 'invocation'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM invocations i WHERE i.id = CAST(p.row_pk AS INTEGER)
+                  )
+             )",
+        ),
+        (
+            "invocation model drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                JOIN invocations i ON i.id = CAST(p.row_pk AS INTEGER)
+                WHERE p.entity_kind = 'invocation'
+                  AND NOT (i.model_name IS p.new_model_name)
+             )",
+        ),
+        (
+            "invocation provider drift before rollback",
+            "SELECT EXISTS(
+                SELECT 1 FROM s11_wu4_restore_session_ownership_preimage p
+                JOIN invocations i ON i.id = CAST(p.row_pk AS INTEGER)
+                WHERE p.entity_kind = 'invocation'
+                  AND NOT (i.provider_name IS p.new_provider_name)
              )",
         ),
         (
@@ -334,6 +367,7 @@ fn mismatch_count_rows(conn: &Connection) -> Result<Vec<(&'static str, i64)>, Dr
         ("chain_mismatch", read_chain_mismatch_count(conn)?),
         ("segment_mismatch", read_segment_mismatch_count(conn)?),
         ("turn_mismatch", read_turn_mismatch_count(conn)?),
+        ("invocation_mismatch", read_invocation_mismatch_count(conn)?),
         (
             "segment_delete_mismatch",
             read_segment_delete_mismatch_count(conn)?,
@@ -394,6 +428,7 @@ fn planned_apply_counts(forward: &ForwardCounts) -> BTreeMap<String, i64> {
         "chain_model_updates_to_apply",
         "segment_provider_updates_to_apply",
         "turn_provider_updates_to_apply",
+        "invocation_identity_updates_to_apply",
         "segment_rows_merged_away",
         "turn_rows_deduped_away",
         "segment_merge_survivors_updated",
@@ -416,6 +451,10 @@ fn applied_apply_counts(conn: &Connection) -> Result<BTreeMap<String, i64>, DryR
         (
             "turn_provider_updates_to_apply".to_string(),
             applied_turn_count(conn)?,
+        ),
+        (
+            "invocation_identity_updates_to_apply".to_string(),
+            applied_invocation_count(conn)?,
         ),
         (
             "segment_rows_merged_away".to_string(),
@@ -498,10 +537,30 @@ fn applied_turn_count(conn: &Connection) -> Result<i64, DryRunError> {
     .map_err(Into::into)
 }
 
+fn applied_invocation_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_wu4_last_run_preimage_plan plan
+         JOIN s11_wu4_restore_session_ownership_preimage p
+           ON p.entity_kind = plan.entity_kind
+          AND p.row_pk = plan.row_pk
+          AND p.entity_kind = 'invocation'
+         JOIN invocations i ON i.id = CAST(p.row_pk AS INTEGER)
+         WHERE (NOT (p.old_model_name IS p.new_model_name)
+                OR NOT (p.old_provider_name IS p.new_provider_name))
+           AND i.model_name IS p.new_model_name
+           AND i.provider_name IS p.new_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 fn residual_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> {
     Ok(residual_chain_old_owner_count(conn)?
         + residual_segment_old_owner_count(conn)?
-        + residual_turn_old_owner_count(conn)?)
+        + residual_turn_old_owner_count(conn)?
+        + residual_invocation_old_owner_count(conn)?)
 }
 
 fn residual_chain_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> {
@@ -553,6 +612,56 @@ fn residual_turn_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> 
          WHERE lower(t.provider_name) LIKE params.moved_provider_like_pattern
            AND t.provider_name <> params.canonical_provider_name
            AND inventory.provider_name IS NULL",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn residual_invocation_old_owner_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "WITH params AS (
+             SELECT
+                 (SELECT value FROM s11_wu4_forward_migration_params WHERE key = 'canonical_provider_name') AS canonical_provider_name,
+                 (SELECT value FROM s11_wu4_forward_migration_params WHERE key = 'moved_provider_like_pattern') AS moved_provider_like_pattern
+         ), migrated_invocations AS (
+             SELECT DISTINCT
+                 i.id,
+                 i.model_name,
+                 i.provider_name,
+                 CASE
+                     WHEN candidate.is_orphaned = 1 THEN candidate.target_model_name
+                     ELSE candidate.old_model_name
+                 END AS target_chain_model_name
+             FROM invocations i
+             JOIN s11_wu4_candidate_segments candidate
+               ON COALESCE(i.provider_session_id, i.session_id) = candidate.session_id
+         )
+         SELECT
+             (SELECT COUNT(*)
+              FROM s11_wu4_restore_session_ownership_preimage p
+              JOIN invocations i ON i.id = CAST(p.row_pk AS INTEGER)
+              WHERE p.entity_kind = 'invocation'
+                AND ((NOT (p.old_model_name IS p.new_model_name)
+                      AND i.model_name IS p.old_model_name)
+                     OR (NOT (p.old_provider_name IS p.new_provider_name)
+                         AND i.provider_name IS p.old_provider_name)))
+           + (SELECT COUNT(*)
+              FROM migrated_invocations migrated
+              CROSS JOIN params
+              LEFT JOIN s11_wu4_forward_target_provider_inventory inventory
+                ON inventory.provider_name = migrated.provider_name
+              WHERE migrated.provider_name IS NOT NULL
+                AND lower(migrated.provider_name) LIKE params.moved_provider_like_pattern
+                AND migrated.provider_name <> params.canonical_provider_name
+                AND inventory.provider_name IS NULL)
+           + (SELECT COUNT(*)
+              FROM migrated_invocations migrated
+              LEFT JOIN s11_wu4_forward_provider_ref_model_names provider_ref
+                ON provider_ref.model_name = migrated.model_name
+              WHERE migrated.model_name <> '<unknown>'
+                AND provider_ref.model_name IS NULL
+                AND migrated.model_name <> migrated.target_chain_model_name)",
         [],
         |row| row.get(0),
     )
@@ -638,6 +747,22 @@ fn read_turn_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
         "SELECT COUNT(*) FROM s11_wu4_restore_session_ownership_preimage p
          JOIN session_turns t ON t.id = p.turn_row_id
          WHERE p.entity_kind = 'turn' AND t.provider_name <> p.old_provider_name",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn read_invocation_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM s11_wu4_restore_session_ownership_preimage p
+         LEFT JOIN invocations i ON i.id = CAST(p.row_pk AS INTEGER)
+         WHERE p.entity_kind = 'invocation'
+           AND (
+                i.id IS NULL
+             OR NOT (i.model_name IS p.old_model_name)
+             OR NOT (i.provider_name IS p.old_provider_name)
+           )",
         [],
         |row| row.get(0),
     )
