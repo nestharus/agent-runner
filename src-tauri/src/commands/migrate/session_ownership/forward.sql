@@ -280,11 +280,6 @@ WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
         OR winner.turn_id <> planned.turn_id
        OR NOT (loser.timestamp IS winner.timestamp)
        OR NOT (loser.role IS winner.role)
-       OR NOT (loser.parent_turn_id IS winner.parent_turn_id)
-       OR NOT (loser.is_sidechain IS winner.is_sidechain)
-       OR NOT (loser.is_compaction_boundary IS winner.is_compaction_boundary)
-       OR NOT (loser.source_file IS winner.source_file)
-        OR NOT (loser.ingested_at IS winner.ingested_at)
         OR NOT (loser.body IS winner.body)
 );
 

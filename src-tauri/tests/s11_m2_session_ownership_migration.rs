@@ -785,6 +785,109 @@ fn s11_m2c_t3_t5_divergent_turn_collision_aborts_before_mutation() {
 }
 
 #[test]
+fn s11_m2c_fix_ingested_at_only_turn_collision_dedups_min_id_and_rolls_back_exactly() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let expected_winner = seed_ingested_at_only_turn_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    let after = full_snapshot(&fixture.state_path);
+    let planned_losers = planned_dedup_loser_ids(
+        &before,
+        "session-ingested-at-metadata",
+        &["turn-ingested-at-metadata"],
+    );
+    assert_eq!(
+        planned_losers.len(),
+        2,
+        "fixture must have three colliding rows"
+    );
+    assert_preserved_non_dedup_turns_by_id(&before, &after, &planned_losers);
+    let survivor = single_turn_by_key(
+        &after,
+        "session-ingested-at-metadata",
+        "turn-ingested-at-metadata",
+    );
+    assert_eq!(
+        survivor.id, expected_winner.id,
+        "dedup winner must be MIN(id)"
+    );
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_same_turn_content(survivor, &expected_winner);
+    assert_eq!(last_run_count(&conn, "turn_rows_deduped_away"), 2);
+    assert_eq!(last_run_count(&conn, "segment_rows_merged_away"), 2);
+    assert_live_counts_and_zero_residual(&fixture.state_path);
+    drop(conn);
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+}
+
+#[test]
+fn s11_m2c_fix_parent_turn_id_only_turn_collision_dedups_and_keeps_winner_parent() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let expected_winner = seed_parent_turn_id_only_turn_collision(&fixture);
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    assert_zero_collision_counts(&conn);
+    let after = full_snapshot(&fixture.state_path);
+    let planned_losers = planned_dedup_loser_ids(
+        &before,
+        "session-parent-metadata",
+        &["turn-parent-metadata"],
+    );
+    assert_eq!(planned_losers.len(), 1, "fixture must have one dedup loser");
+    assert_preserved_non_dedup_turns_by_id(&before, &after, &planned_losers);
+    let survivor = single_turn_by_key(&after, "session-parent-metadata", "turn-parent-metadata");
+    assert_eq!(
+        survivor.id, expected_winner.id,
+        "dedup winner must be MIN(id)"
+    );
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_eq!(
+        survivor.parent_turn_id, expected_winner.parent_turn_id,
+        "survivor must retain winner's own parent_turn_id"
+    );
+    assert_same_turn_content(survivor, &expected_winner);
+    assert_eq!(last_run_count(&conn, "turn_rows_deduped_away"), 1);
+}
+
+#[test]
+fn s11_m2c_fix_body_divergence_aborts_apply_without_mutation() {
+    assert_intrinsic_divergence_aborts_apply_without_mutation("body");
+}
+
+#[test]
+fn s11_m2c_fix_role_divergence_aborts_apply_without_mutation() {
+    assert_intrinsic_divergence_aborts_apply_without_mutation("role");
+}
+
+#[test]
+fn s11_m2c_fix_timestamp_divergence_aborts_apply_without_mutation() {
+    assert_intrinsic_divergence_aborts_apply_without_mutation("timestamp");
+}
+
+#[test]
 fn s11_m2c_t7_rollback_restores_merged_segments_and_deleted_turns_exactly() {
     let fixture = Fixture::new();
     fixture.write_target_config();
@@ -2119,6 +2222,213 @@ fn seed_divergent_turn_collision(fixture: &Fixture) {
     seed_mailbox(&fixture.mailbox_path, "session-divergent", None);
 }
 
+fn seed_ingested_at_only_turn_collision(fixture: &Fixture) -> TurnRowSnapshot {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-ingested-at-metadata", &source_model_name());
+    let providers = [
+        unregistered_account_a(),
+        canonical_account(),
+        unregistered_account_family(2),
+    ];
+    for (index, provider) in providers.iter().enumerate() {
+        seed_segment_with_started_at(
+            &conn,
+            "chain-ingested-at-metadata",
+            provider,
+            "session-ingested-at-metadata",
+            &format!("2026-06-20T16:0{index}:00Z"),
+            if index == providers.len() - 1 {
+                None
+            } else {
+                Some("2026-06-20T16:09:00Z")
+            },
+            Some("turn-ingested-at-metadata"),
+            if index == providers.len() - 1 {
+                "exhausted"
+            } else {
+                "manual"
+            },
+        );
+    }
+    let mut winner_id = None;
+    for (index, provider) in providers.iter().enumerate() {
+        let row_id = seed_turn_full(
+            &conn,
+            provider,
+            "session-ingested-at-metadata",
+            "turn-ingested-at-metadata",
+            "2026-06-20T16:01:00Z",
+            "assistant",
+            Some("turn-ingested-parent"),
+            1,
+            0,
+            "metadata-ingested.jsonl",
+            &format!("2026-06-20T16:1{index}:00Z"),
+            Some("metadata-identical-body"),
+        );
+        winner_id.get_or_insert(row_id);
+    }
+    seed_mailbox(&fixture.mailbox_path, "session-ingested-at-metadata", None);
+    query_turns_with_id(&conn)
+        .into_iter()
+        .find(|turn| turn.id == winner_id.unwrap())
+        .unwrap()
+}
+
+fn seed_parent_turn_id_only_turn_collision(fixture: &Fixture) -> TurnRowSnapshot {
+    let conn = fixture.conn();
+    seed_chain(&conn, "chain-parent-metadata", &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        "chain-parent-metadata",
+        &unregistered_account_a(),
+        "session-parent-metadata",
+        "2026-06-20T17:00:00Z",
+        Some("2026-06-20T17:04:00Z"),
+        Some("turn-parent-metadata"),
+        "manual",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        "chain-parent-metadata",
+        &canonical_account(),
+        "session-parent-metadata",
+        "2026-06-20T17:05:00Z",
+        None,
+        Some("turn-parent-metadata"),
+        "exhausted",
+    );
+    let winner_id = seed_turn_full(
+        &conn,
+        &unregistered_account_a(),
+        "session-parent-metadata",
+        "turn-parent-metadata",
+        "2026-06-20T17:01:00Z",
+        "assistant",
+        Some("winner-parent"),
+        0,
+        1,
+        "metadata-parent.jsonl",
+        "2026-06-20T17:02:00Z",
+        Some("metadata-identical-body"),
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-parent-metadata",
+        "turn-parent-metadata",
+        "2026-06-20T17:01:00Z",
+        "assistant",
+        Some("loser-parent"),
+        0,
+        1,
+        "metadata-parent.jsonl",
+        "2026-06-20T17:02:00Z",
+        Some("metadata-identical-body"),
+    );
+    seed_mailbox(&fixture.mailbox_path, "session-parent-metadata", None);
+    query_turns_with_id(&conn)
+        .into_iter()
+        .find(|turn| turn.id == winner_id)
+        .unwrap()
+}
+
+fn assert_intrinsic_divergence_aborts_apply_without_mutation(field: &str) {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    seed_single_intrinsic_field_divergence(&fixture, field);
+    let before = snapshot(&fixture.state_path);
+    let hash_before = file_hash(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    assert_failure_mentions(&output, &fixture.scratch_dir, "divergent");
+    assert_eq!(
+        file_hash(&fixture.state_path),
+        hash_before,
+        "live DB hash changed"
+    );
+    assert_eq!(
+        snapshot(&fixture.state_path),
+        before,
+        "live DB rows changed"
+    );
+    assert_copied_db_unchanged_if_present(&fixture.scratch_dir, &before);
+}
+
+fn seed_single_intrinsic_field_divergence(fixture: &Fixture, field: &str) {
+    let conn = fixture.conn();
+    let chain_id = format!("chain-{field}-intrinsic");
+    let session_id = format!("session-{field}-intrinsic");
+    let turn_id = format!("turn-{field}-intrinsic");
+    seed_chain(&conn, &chain_id, &source_model_name());
+    seed_segment_with_started_at(
+        &conn,
+        &chain_id,
+        &unregistered_account_a(),
+        &session_id,
+        "2026-06-20T18:00:00Z",
+        Some("2026-06-20T18:04:00Z"),
+        Some(&turn_id),
+        "manual",
+    );
+    seed_segment_with_started_at(
+        &conn,
+        &chain_id,
+        &canonical_account(),
+        &session_id,
+        "2026-06-20T18:05:00Z",
+        None,
+        Some(&turn_id),
+        "exhausted",
+    );
+    let (left_timestamp, right_timestamp) = if field == "timestamp" {
+        ("2026-06-20T18:01:00Z", "2026-06-20T18:02:00Z")
+    } else {
+        ("2026-06-20T18:01:00Z", "2026-06-20T18:01:00Z")
+    };
+    let (left_role, right_role) = if field == "role" {
+        ("assistant", "user")
+    } else {
+        ("assistant", "assistant")
+    };
+    let (left_body, right_body) = if field == "body" {
+        ("left-intrinsic-body", "right-intrinsic-body")
+    } else {
+        ("shared-intrinsic-body", "shared-intrinsic-body")
+    };
+    for (provider, timestamp, role, body) in [
+        (
+            unregistered_account_a(),
+            left_timestamp,
+            left_role,
+            left_body,
+        ),
+        (canonical_account(), right_timestamp, right_role, right_body),
+    ] {
+        seed_turn_full(
+            &conn,
+            &provider,
+            &session_id,
+            &turn_id,
+            timestamp,
+            role,
+            Some("shared-parent"),
+            1,
+            0,
+            "intrinsic-divergence.jsonl",
+            "2026-06-20T18:03:00Z",
+            Some(body),
+        );
+    }
+    seed_mailbox(&fixture.mailbox_path, &session_id, None);
+}
+
 fn seed_large_rotation_collision(fixture: &Fixture) {
     let conn = fixture.conn();
     seed_chain(&conn, "chain-large-rotation", &source_model_name());
@@ -2546,6 +2856,24 @@ fn min_turn_id(snapshot: &FullOwnershipSnapshot, session_id: &str, turn_id: &str
         .map(|turn| turn.id)
         .min()
         .unwrap_or_else(|| panic!("missing turn group {session_id}/{turn_id}"))
+}
+
+fn single_turn_by_key<'a>(
+    snapshot: &'a FullOwnershipSnapshot,
+    session_id: &str,
+    turn_id: &str,
+) -> &'a TurnRowSnapshot {
+    let matching: Vec<_> = snapshot
+        .turns
+        .iter()
+        .filter(|turn| turn.session_id == session_id && turn.turn_id == turn_id)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "expected exactly one turn for {session_id}/{turn_id}: {matching:?}"
+    );
+    matching[0]
 }
 
 fn planned_merged_segment_count(

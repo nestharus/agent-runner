@@ -91,17 +91,22 @@ struct SegmentRow {
     transition_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct TurnContent {
     turn_id: String,
     timestamp: String,
     role: String,
-    parent_turn_id: Option<String>,
-    is_sidechain: i64,
-    is_compaction_boundary: i64,
-    source_file: Option<String>,
-    ingested_at: String,
     body: Option<String>,
+}
+
+impl TurnContent {
+    fn intrinsic_content_key(&self) -> (&str, &str, Option<&str>) {
+        (
+            self.role.as_str(),
+            self.timestamp.as_str(),
+            self.body.as_deref(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -730,8 +735,11 @@ fn build_turn_dedup_plan(
 
     let mut deletes = Vec::new();
     for group in groups.values().filter(|group| group.len() > 1) {
-        let first = &group[0].content;
-        if group.iter().any(|turn| &turn.content != first) {
+        let first = group[0].content.intrinsic_content_key();
+        if group
+            .iter()
+            .any(|turn| turn.content.intrinsic_content_key() != first)
+        {
             return Err(DryRunError::new(format!(
                 "divergent session_turns collision for session_id={} turn_id={}",
                 group[0].session_id, group[0].content.turn_id
@@ -770,15 +778,13 @@ fn read_candidate_turn_rows(
         );
     }
     let mut owner_stmt = conn.prepare(
-        "SELECT id, turn_id, timestamp, role, parent_turn_id, is_sidechain,
-                is_compaction_boundary, source_file, ingested_at, body
+        "SELECT id, turn_id, timestamp, role, body
          FROM session_turns
          WHERE provider_name = ?1 AND session_id = ?2
          ORDER BY id",
     )?;
     let mut canonical_stmt = conn.prepare(
-        "SELECT id, turn_id, timestamp, role, parent_turn_id, is_sidechain,
-                is_compaction_boundary, source_file, ingested_at, body
+        "SELECT id, turn_id, timestamp, role, body
          FROM session_turns
          WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3
          ORDER BY id",
@@ -819,12 +825,7 @@ fn read_turn_row(
             turn_id: row.get(1)?,
             timestamp: row.get(2)?,
             role: row.get(3)?,
-            parent_turn_id: row.get(4)?,
-            is_sidechain: row.get(5)?,
-            is_compaction_boundary: row.get(6)?,
-            source_file: row.get(7)?,
-            ingested_at: row.get(8)?,
-            body: row.get(9)?,
+            body: row.get(4)?,
         },
     })
 }
