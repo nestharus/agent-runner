@@ -2,8 +2,11 @@
 
 use super::target_resolution::TargetResolution;
 use super::DryRunError;
+use oulipoly_config::ProviderConfig;
 use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateSegment {
@@ -226,11 +229,23 @@ pub(crate) fn build_corrective_plan(
     conn: &Connection,
     target: &TargetResolution,
 ) -> Result<CorrectivePlan, DryRunError> {
-    let rows = if table_exists(conn, "s11_wu4_restore_session_ownership_preimage")? {
+    let has_original_preimage = table_exists(conn, "s11_wu4_restore_session_ownership_preimage")?;
+    let mut rows = if has_original_preimage {
         corrective_primary_plan_rows(conn, target)?
     } else {
         corrective_fallback_plan_rows(conn, target)?
     };
+    let planned_chain_ids = rows
+        .iter()
+        .map(|row| row.chain_id.clone())
+        .collect::<BTreeSet<_>>();
+    rows.extend(corrective_transcript_plan_rows(
+        conn,
+        target,
+        &target.transcript_source_provider,
+        has_original_preimage,
+        &planned_chain_ids,
+    )?);
     Ok(CorrectivePlan { rows })
 }
 
@@ -638,6 +653,82 @@ pub(crate) fn infer_chain_target_model(
     )
 }
 
+pub(crate) fn infer_chain_target_model_from_transcript(
+    provider_config: &ProviderConfig,
+    segment_session_ids: &[String],
+    moved_family_provider_ref_models: &BTreeSet<String>,
+) -> Option<String> {
+    let default_model_name = moved_family_provider_ref_models.iter().next()?;
+    let mut evidence: BTreeMap<String, i64> = BTreeMap::new();
+    for session_id in segment_session_ids {
+        let Some(path) = oulipoly_runtime::migration::find_session_source_from_storage(
+            provider_config,
+            session_id,
+        ) else {
+            continue;
+        };
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if value.get("type").and_then(|value| value.as_str()) != Some("assistant") {
+                continue;
+            }
+            let Some(model_name) = value
+                .get("message")
+                .and_then(|message| message.get("model"))
+                .and_then(|model| model.as_str())
+            else {
+                continue;
+            };
+            if model_name == "<synthetic>" {
+                continue;
+            }
+            if let Some(inventory_model) =
+                transcript_inventory_model(model_name, moved_family_provider_ref_models)
+            {
+                *evidence.entry(inventory_model.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    evidence
+        .into_iter()
+        .max_by(|(left_model, left_count), (right_model, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| right_model.cmp(left_model))
+        })
+        .and_then(|(model, _)| (model != default_model_name.as_str()).then_some(model))
+}
+
+fn transcript_inventory_model<'a>(
+    transcript_model: &str,
+    moved_family_provider_ref_models: &'a BTreeSet<String>,
+) -> Option<&'a str> {
+    let mut best = None;
+    for inventory_model in moved_family_provider_ref_models {
+        let inventory_model_name = inventory_model.as_str();
+        let matches_inventory = transcript_model == inventory_model_name
+            || transcript_model
+                .strip_prefix(inventory_model_name)
+                .is_some_and(|suffix| suffix.starts_with('-'));
+        let is_longest_match = best
+            .as_ref()
+            .map(|current: &&String| inventory_model.len() > current.len())
+            .unwrap_or(true);
+        if matches_inventory && is_longest_match {
+            best = Some(inventory_model);
+        }
+    }
+    best.map(String::as_str)
+}
+
 fn corrective_primary_plan_rows(
     conn: &Connection,
     target: &TargetResolution,
@@ -708,6 +799,113 @@ fn corrective_fallback_plan_rows(
             Err(err) => Some(Err(err)),
         })
         .collect()
+}
+
+fn corrective_transcript_plan_rows(
+    conn: &Connection,
+    target: &TargetResolution,
+    provider_config: &ProviderConfig,
+    has_original_preimage: bool,
+    planned_chain_ids: &BTreeSet<String>,
+) -> Result<Vec<CorrectivePlanRow>, DryRunError> {
+    let candidates = corrective_transcript_candidate_rows(conn, target, has_original_preimage)?;
+    candidates
+        .into_iter()
+        .filter(|(chain_id, _)| !planned_chain_ids.contains(chain_id))
+        .map(|(chain_id, backfill_default_model_name)| {
+            let segment_session_ids = read_segment_session_ids_for_chain(conn, &chain_id)?;
+            if has_different_in_family_evidence(
+                conn,
+                &segment_session_ids,
+                &target.moved_family_provider_ref_models,
+                &backfill_default_model_name,
+                has_original_preimage,
+            )? {
+                return Ok(None);
+            }
+            Ok(infer_chain_target_model_from_transcript(
+                provider_config,
+                &segment_session_ids,
+                &target.moved_family_provider_ref_models,
+            )
+            .filter(|model_name| model_name != &backfill_default_model_name)
+            .map(|new_model_name| CorrectivePlanRow {
+                chain_id,
+                old_model_name: backfill_default_model_name,
+                new_model_name,
+                evidence_source: "transcript".to_string(),
+            }))
+        })
+        .filter_map(|row| match row {
+            Ok(Some(value)) => Some(Ok(value)),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect()
+}
+
+fn corrective_transcript_candidate_rows(
+    conn: &Connection,
+    target: &TargetResolution,
+    has_original_preimage: bool,
+) -> Result<Vec<(String, String)>, DryRunError> {
+    if has_original_preimage {
+        let mut stmt = conn.prepare(
+            "SELECT p.chain_id, p.new_model_name
+             FROM s11_wu4_restore_session_ownership_preimage p
+             JOIN session_chains c ON c.chain_id = p.chain_id
+             WHERE p.entity_kind = 'chain'
+               AND p.old_model_name = '<unknown>'
+               AND c.model_name = p.new_model_name
+             ORDER BY p.chain_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    } else {
+        Ok(
+            read_source_chain_candidates(conn, &target_provider_pattern())?
+                .into_iter()
+                .filter(|(_, model_name)| model_name == &target.model_name)
+                .collect(),
+        )
+    }
+}
+
+fn has_different_in_family_evidence(
+    conn: &Connection,
+    segment_session_ids: &[String],
+    moved_family_provider_ref_models: &BTreeSet<String>,
+    default_model_name: &str,
+    exclude_original_invocation_preimage: bool,
+) -> Result<bool, DryRunError> {
+    let exclude_preimage = exclude_original_invocation_preimage
+        && table_exists(conn, "s11_wu4_restore_session_ownership_preimage")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, model_name
+         FROM invocations
+         WHERE COALESCE(provider_session_id, session_id) = ?1
+         ORDER BY id",
+    )?;
+    for session_id in segment_session_ids {
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (invocation_id, model_name) = row?;
+            if exclude_preimage && original_invocation_preimage_contains(conn, invocation_id)? {
+                continue;
+            }
+            let Some(model_name) = model_name else {
+                continue;
+            };
+            if model_name != default_model_name
+                && moved_family_provider_ref_models.contains(&model_name)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn unique_different_in_family_model(
@@ -1301,6 +1499,12 @@ fn moved_provider_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_config::{ProviderConfig, SessionStorage};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn fixture_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1336,6 +1540,46 @@ mod tests {
         format!("shadow-{}", provider_token())
     }
 
+    fn transcript_provider(projects_dir: PathBuf) -> ProviderConfig {
+        let mut provider =
+            ProviderConfig::new(format!("agent-runner-{}", provider_token()), vec![]);
+        provider.session_storage = Some(transcript_storage(projects_dir));
+        provider
+    }
+
+    fn transcript_storage(projects_dir: PathBuf) -> SessionStorage {
+        toml::from_str(&format!(
+            "kind = {:?}\nprojects_dir = {:?}\n",
+            format!("{}_code", provider_token()),
+            projects_dir
+        ))
+        .unwrap()
+    }
+
+    fn assistant_model_line(model: &str) -> String {
+        format!(r#"{{"type":"assistant","message":{{"model":{model:?}}}}}"#)
+    }
+
+    fn write_transcript(projects_dir: &Path, session_id: &str, lines: &[String]) -> PathBuf {
+        let project_dir = projects_dir.join("synthetic-project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join(format!("{session_id}.jsonl"));
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
+    }
+
+    fn infer_from_transcript(
+        provider: &ProviderConfig,
+        segments: &[&str],
+        models: &BTreeSet<String>,
+    ) -> Option<String> {
+        let segment_session_ids = segments
+            .iter()
+            .map(|session_id| (*session_id).to_string())
+            .collect::<Vec<_>>();
+        infer_chain_target_model_from_transcript(provider, &segment_session_ids, models)
+    }
+
     fn insert_invocation(
         conn: &Connection,
         model_name: Option<&str>,
@@ -1358,6 +1602,219 @@ mod tests {
             .map(|session_id| (*session_id).to_string())
             .collect::<Vec<_>>();
         infer_chain_target_model(conn, &segment_session_ids, &provider_ref_models()).unwrap()
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_dominant_middle_model_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let target = model_name("aaa");
+        let middle = model_name("mmm");
+        write_transcript(
+            &projects_dir,
+            "segment-a",
+            &[
+                assistant_model_line(&middle),
+                assistant_model_line(&middle),
+                assistant_model_line(&target),
+            ],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            Some(middle)
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_dominant_last_model_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let target = model_name("aaa");
+        let last = model_name("zzz");
+        write_transcript(
+            &projects_dir,
+            "segment-a",
+            &[
+                assistant_model_line(&target),
+                assistant_model_line(&last),
+                assistant_model_line(&last),
+            ],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            Some(last)
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_only_default_returns_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let target = model_name("aaa");
+        write_transcript(
+            &projects_dir,
+            "segment-a",
+            &[assistant_model_line(&target), assistant_model_line(&target)],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_missing_synthetic_and_absent_models_return_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        write_transcript(
+            &projects_dir,
+            "synthetic-only",
+            &[assistant_model_line("<synthetic>")],
+        );
+        write_transcript(
+            &projects_dir,
+            "absent-only",
+            &[
+                r#"{"type":"assistant","message":{}}"#.to_string(),
+                r#"{"type":"assistant","message":{"model":42}}"#.to_string(),
+                format!(
+                    r#"{{"type":"user","message":{{"model":{:?}}}}}"#,
+                    model_name("mmm")
+                ),
+            ],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["missing"], &models),
+            None
+        );
+        assert_eq!(
+            infer_from_transcript(&provider, &["synthetic-only"], &models),
+            None
+        );
+        assert_eq!(
+            infer_from_transcript(&provider, &["absent-only"], &models),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn infer_chain_target_model_from_transcript_unreadable_file_returns_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let middle = model_name("mmm");
+        let path = write_transcript(&projects_dir, "segment-a", &[assistant_model_line(&middle)]);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_tie_uses_lexicographically_smallest() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let middle = model_name("mmm");
+        let last = model_name("zzz");
+        write_transcript(
+            &projects_dir,
+            "segment-a",
+            &[assistant_model_line(&last), assistant_model_line(&middle)],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            Some(middle)
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_middle_dominates_default_noise() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let target = model_name("aaa");
+        let middle = model_name("mmm");
+        write_transcript(
+            &projects_dir,
+            "segment-a",
+            &[
+                assistant_model_line(&middle),
+                assistant_model_line(&middle),
+                assistant_model_line(&middle),
+                assistant_model_line(&middle),
+                assistant_model_line(&middle),
+                assistant_model_line(&target),
+                assistant_model_line(&target),
+            ],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            Some(middle)
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_prefix_matches_inventory_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let middle = model_name("mmm");
+        let prefixed_middle = format!("{middle}-4-8");
+        write_transcript(
+            &projects_dir,
+            "segment-a",
+            &[assistant_model_line(&prefixed_middle)],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a"], &models),
+            Some(middle)
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_aggregates_multiple_segment_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let target = model_name("aaa");
+        let middle = model_name("mmm");
+        write_transcript(&projects_dir, "segment-a", &[assistant_model_line(&middle)]);
+        write_transcript(
+            &projects_dir,
+            "segment-b",
+            &[assistant_model_line(&middle), assistant_model_line(&target)],
+        );
+
+        assert_eq!(
+            infer_from_transcript(&provider, &["segment-a", "segment-b"], &models),
+            Some(middle)
+        );
     }
 
     #[test]

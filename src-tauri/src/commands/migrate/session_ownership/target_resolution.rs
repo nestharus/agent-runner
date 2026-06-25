@@ -5,7 +5,7 @@ use crate::cli::paths::default_models_dir;
 use crate::provider_artifact::provider_artifact_from_ref;
 use crate::provider_proof::prove_provider_artifact;
 use oulipoly_config::{
-    ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig, load_models,
+    load_models, ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use std::collections::{BTreeSet, HashMap};
@@ -20,6 +20,7 @@ struct LoadedTargetConfig {
 pub(crate) struct TargetResolution {
     pub(crate) model_name: String,
     pub(crate) canonical_provider_name: String,
+    pub(crate) transcript_source_provider: ProviderConfig,
     pub(crate) inventory: Vec<String>,
     pub(crate) moved_family_provider_ref_models: BTreeSet<String>,
     provider_artifact: ProviderArtifactRef,
@@ -35,13 +36,14 @@ pub(crate) fn resolve_target(
     let canonical = require_canonical_provider(first_provider(model))?;
     let moved_family_provider_ref_models =
         moved_family_provider_ref_models(&loaded.models, &target_binary);
-    let _ = loaded
+    let (transcript_source_provider, _) = loaded
         .providers_cfg
         .runtime_provider(&canonical.name)
         .map_err(|err| DryRunError::new(format!("target provider account failed: {err}")))?;
     Ok(target_resolution(
         model,
         canonical,
+        transcript_source_provider,
         provider_artifact,
         moved_family_provider_ref_models,
     ))
@@ -121,12 +123,14 @@ fn require_canonical_provider(
 fn target_resolution(
     model: &ModelConfig,
     canonical: &ProviderConfig,
+    transcript_source_provider: ProviderConfig,
     provider_artifact: ProviderArtifactRef,
     moved_family_provider_ref_models: BTreeSet<String>,
 ) -> TargetResolution {
     TargetResolution {
         model_name: model.name.clone(),
         canonical_provider_name: canonical.name.clone(),
+        transcript_source_provider,
         inventory: model
             .providers
             .iter()

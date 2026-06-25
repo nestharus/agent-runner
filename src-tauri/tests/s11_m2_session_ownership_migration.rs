@@ -298,6 +298,19 @@ impl Fixture {
     }
 
     fn write_s11_m2c_scope_configs(&self) -> S11M2cScopeModels {
+        self.write_s11_m2c_scope_configs_with_storage(None)
+    }
+
+    fn write_s11_m2c_scope_configs_with_transcript_storage(&self) -> S11M2cScopeModels {
+        let projects_dir = self.transcript_projects_dir();
+        fs::create_dir_all(&projects_dir).unwrap();
+        self.write_s11_m2c_scope_configs_with_storage(Some(&projects_dir))
+    }
+
+    fn write_s11_m2c_scope_configs_with_storage(
+        &self,
+        canonical_projects_dir: Option<&Path>,
+    ) -> S11M2cScopeModels {
         self.write_fake_contract_provider_binary();
         fs::create_dir_all(&self.models_dir).unwrap();
         let models = S11M2cScopeModels::new();
@@ -313,10 +326,16 @@ impl Fixture {
             "agent-runner-gpt",
             std::slice::from_ref(&models.non_family_account),
         );
-        self.write_provider_entry(
-            &canonical_account(),
-            &self.success_script("scope-main-provider"),
-        );
+        let canonical_command = self.success_script("scope-main-provider");
+        if let Some(projects_dir) = canonical_projects_dir {
+            self.write_provider_entry_with_session_storage(
+                &canonical_account(),
+                &canonical_command,
+                projects_dir,
+            );
+        } else {
+            self.write_provider_entry(&canonical_account(), &canonical_command);
+        }
         self.append_provider_entry(
             &accepted_account(),
             &self.success_script("scope-accepted-provider"),
@@ -326,6 +345,10 @@ impl Fixture {
             &self.success_script("scope-gpt-provider"),
         );
         models
+    }
+
+    fn transcript_projects_dir(&self) -> PathBuf {
+        self.dir.path().join("transcript-projects")
     }
 
     fn write_s11_m2c_scope_provider_ref_model(
@@ -435,6 +458,19 @@ impl Fixture {
         let mut body = fs::read_to_string(self.config_dir.join("providers.toml")).unwrap();
         body.push_str(&provider_toml_entry(name, command));
         fs::write(self.config_dir.join("providers.toml"), body).unwrap();
+    }
+
+    fn write_provider_entry_with_session_storage(
+        &self,
+        name: &str,
+        command: &Path,
+        projects_dir: &Path,
+    ) {
+        fs::write(
+            self.config_dir.join("providers.toml"),
+            provider_toml_entry_with_session_storage(name, command, projects_dir),
+        )
+        .unwrap();
     }
 
     fn seed_base_population(&self) -> SeededIds {
@@ -3046,6 +3082,165 @@ fn s11_m2c_corrective_primary_uses_recorded_backfill_default_after_default_chang
 }
 
 #[test]
+fn s11_m2c_corrective_transcript_fallback_retargets_without_overriding_db_evidence() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs_with_transcript_storage();
+    let conn = fixture.conn();
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-transcript-middle",
+        "session-corrective-transcript-middle",
+        &models.target,
+        "<unknown>",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "76000000-0000-4000-8000-000000000001",
+        &models.target,
+        &canonical_account(),
+        "session-corrective-transcript-middle",
+        "succeeded",
+        "2026-06-20T10:01:00Z",
+    );
+    seed_invocation(
+        &conn,
+        "76000000-0000-4000-8000-000000000002",
+        "<unknown>",
+        &canonical_account(),
+        "session-corrective-transcript-middle",
+        "failed",
+        "2026-06-20T10:02:00Z",
+    );
+
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-db-last",
+        "session-corrective-db-last",
+        &models.target,
+        "<unknown>",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "77000000-0000-4000-8000-000000000001",
+        &models.last,
+        &canonical_account(),
+        "session-corrective-db-last",
+        "succeeded",
+        "2026-06-20T10:03:00Z",
+    );
+
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-transcript-default-only",
+        "session-corrective-transcript-default-only",
+        &models.target,
+        "<unknown>",
+        &models.target,
+        &canonical_account(),
+    );
+    drop(conn);
+
+    write_synthetic_transcript(
+        &fixture,
+        "session-corrective-transcript-middle",
+        &[
+            models.middle.as_str(),
+            models.middle.as_str(),
+            models.middle.as_str(),
+            models.target.as_str(),
+        ],
+    );
+    write_synthetic_transcript(
+        &fixture,
+        "session-corrective-db-last",
+        &[
+            models.middle.as_str(),
+            models.middle.as_str(),
+            models.middle.as_str(),
+        ],
+    );
+    write_synthetic_transcript(
+        &fixture,
+        "session-corrective-transcript-default-only",
+        &[models.target.as_str(), "<synthetic>"],
+    );
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .corrective_apply_command(Some(&backup_dir), true)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_quick_check_ok(&fixture.state_path);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(
+        after.chains["chain-corrective-transcript-middle"].model_name,
+        models.middle
+    );
+    assert_eq!(
+        after.chains["chain-corrective-db-last"].model_name,
+        models.last
+    );
+    assert_eq!(
+        after.chains["chain-corrective-transcript-default-only"].model_name,
+        models.target
+    );
+    assert_eq!(corrective_preimage_row_count(&fixture.state_path), 2);
+    assert_eq!(
+        corrective_preimage_models(&fixture.state_path, "chain-corrective-transcript-middle"),
+        (models.target.clone(), models.middle.clone())
+    );
+    assert_eq!(
+        corrective_preimage_evidence_source(
+            &fixture.state_path,
+            "chain-corrective-transcript-middle"
+        ),
+        "transcript"
+    );
+    assert_eq!(
+        corrective_preimage_evidence_source(&fixture.state_path, "chain-corrective-db-last"),
+        "original-preimage-db-evidence"
+    );
+    let report = read_report_from_output(&output);
+    assert_report_count(&report, "corrective_chain_model_updates_to_apply", 2);
+    assert_report_count(&report, "corrective_chain_model_updates_applied", 2);
+    assert_report_count(&report, "evidence_source transcript", 1);
+    assert_report_count(&report, "evidence_source original-preimage-db-evidence", 1);
+
+    let second = fixture
+        .corrective_apply_command(Some(&backup_dir), true)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    let second_report = read_report_from_output(&second);
+    assert_report_count(&second_report, "corrective_chain_model_updates_to_apply", 0);
+    assert_report_count(&second_report, "corrective_chain_model_updates_applied", 0);
+    assert_eq!(corrective_preimage_row_count(&fixture.state_path), 2);
+
+    let rollback = fixture.corrective_rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_quick_check_ok(&fixture.state_path);
+    let after_rollback = snapshot(&fixture.state_path);
+    assert_eq!(
+        after_rollback.chains["chain-corrective-transcript-middle"].model_name,
+        models.target
+    );
+    assert_eq!(
+        after_rollback.chains["chain-corrective-db-last"].model_name,
+        models.target
+    );
+    let rollback_report = read_report_from_output(&rollback);
+    assert_corrective_rollback_report(&rollback_report, 2);
+}
+
+#[test]
 fn s11_m2c_corrective_preimage_absent_fallback_requires_single_different_inventory_model() {
     let fixture = Fixture::new();
     let models = fixture.write_s11_m2c_scope_configs();
@@ -4070,6 +4265,19 @@ fn seed_corrective_fallback_fixture(fixture: &Fixture, models: &S11M2cScopeModel
     );
 }
 
+fn write_synthetic_transcript(fixture: &Fixture, session_id: &str, models: &[&str]) -> PathBuf {
+    let project_dir = fixture.transcript_projects_dir().join("synthetic-project");
+    fs::create_dir_all(&project_dir).unwrap();
+    let body = models
+        .iter()
+        .map(|model| format!(r#"{{"type":"assistant","message":{{"model":{model:?}}}}}"#))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = project_dir.join(format!("{session_id}.jsonl"));
+    fs::write(&path, format!("{body}\n")).unwrap();
+    path
+}
+
 fn seed_current_default_chain(
     conn: &Connection,
     chain_id: &str,
@@ -4204,6 +4412,18 @@ fn corrective_preimage_models(path: &Path, chain_id: &str) -> (String, String) {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .unwrap_or_else(|err| panic!("missing corrective preimage for {chain_id}: {err}"))
+}
+
+fn corrective_preimage_evidence_source(path: &Path, chain_id: &str) -> String {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT evidence_source
+         FROM s11_m2c_model_corrective_preimage
+         WHERE chain_id = ?1",
+        [chain_id],
+        |row| row.get(0),
+    )
+    .unwrap_or_else(|err| panic!("missing corrective preimage evidence for {chain_id}: {err}"))
 }
 
 fn corrective_residual_default_count(path: &Path) -> i64 {
@@ -4616,6 +4836,19 @@ fn provider_toml_entry(name: &str, command: &Path) -> String {
     format!(
         "[{name}]\ncommand = {:?}\nargs = []\nprompt_mode = \"arg\"\n\n",
         command.to_string_lossy()
+    )
+}
+
+fn provider_toml_entry_with_session_storage(
+    name: &str,
+    command: &Path,
+    projects_dir: &Path,
+) -> String {
+    format!(
+        "[{name}]\ncommand = {:?}\nargs = []\nprompt_mode = \"arg\"\n\n[{name}.session_storage]\nkind = {:?}\nprojects_dir = {:?}\n\n",
+        command.to_string_lossy(),
+        format!("{}_code", provider_token()),
+        projects_dir.to_string_lossy()
     )
 }
 
