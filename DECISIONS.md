@@ -4895,3 +4895,33 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   Full gate evidence in `planning/s11-m2c-model/audit-history.md`.
 - **Evidence**: PR https://github.com/nestharus/agent-runner/pull/199; audit-history.md;
   code-quality/s11-m2c-model-impl-summary.md.
+
+## D-S11-M2c-model-004-transcript-fallback — iteration 2 (manager merge-gate gap)
+
+- **Phase**: Iteration 2 (Phases 6->7->8->9 on the same concern).
+- **Decision**: Implemented the brief's inference tier (2), transcript evidence, for the corrective pass.
+  The manager's live-copy proof showed the DB/preimage path correctly fixed 93 chains but left 215
+  backfilled-default chains (incl. the real regressed sessions a49d9250, 57fc3399, cbf11a5e, e1e3768f,
+  45ccb26a) whose Opus history lives only in transcripts. New: for a corrective candidate at the
+  deterministic default with NO DB/preimage evidence, stream the chain's Claude transcript (read-only),
+  count assistant `message.model` by inventory family (prefix-match; ignore `<synthetic>`/absent), pick the
+  dominant, compare against the chain's per-row recorded backfill default → retarget (evidence_source=
+  transcript) or stay. DB tiers stay primary; transcript is fallback only.
+- **Notable sub-decisions**:
+  - Transcript located via the existing `find_claude_source_from_storage` storage primitive, exposed under
+    a neutral 1-line re-export (`find_session_source_from_storage`) so the migration subsystem in
+    src-tauri/src stays provider-token-clean. src-tauri/src net-new claude/codex literals = 0; the single
+    product-source provider-token addition is that unavoidable re-export of the reused primitive (no new
+    model/provider STRING literal). Surfaced transparently to the manager.
+  - Reverted two cosmetic rustfmt import-reorders (report.rs, rollback.rs) the code agent produced, to keep
+    the iter-2 diff scoped to transcript logic.
+  - CodeRabbit (2 rounds total): iter-1 found 4 Major corrective-path issues (fixed in 6a096d9e); iter-2
+    found 1 Major (transcript drop/stay used the global-smallest default instead of the per-row recorded
+    default) fixed in e813f2b2 with a regression test. The CodeRabbit driver loop wedged both times
+    (tooling issue, flagged); reviews were fetched + dispositioned directly by the orchestrator-judge.
+- **Why safe**: transcripts are read-only and streamed (never fully loaded); session_id never changed; the
+  transcript tier flows through the SAME reversible/idempotent/planned==applied/fail-closed corrective
+  preimage+SQL path; DB-evidence chains and the verified 93 are untouched; gates green except the
+  pre-existing program-deferred age245_s7c. Pipeline made NO live changes.
+- **Evidence**: PR #199 (commits 9dbcec7f, e813f2b2); contract Deliverable C; audit-history.md iteration-2
+  sections; code-quality/s11-m2c-model-impl-summary.md.
