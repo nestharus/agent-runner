@@ -4836,3 +4836,41 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   stops at the draft PR; the manager merges after a full `cargo test --workspace` and a re-apply on a
   copy of the real DB proving 0 stale invocations + `planned == applied`.
 - **Evidence**: v3 dispatch instructions (manager-max Option B); PR #198 head.
+
+---
+
+## WU overlay-paste-freeze — Phase 0 Bootstrap (2026-06-25T00:00:00Z)
+
+**WU:** overlay-paste-freeze (non-blocking PTY-broker input forwarding + bracketed paste)
+**Branch:** overlay-paste-freeze @ 6c8dadef28d3a4e76be604e26846af11826f88cc (branched off main@6c8dadef)
+**Orchestrator:** implementation-pipeline-orchestrator (overlay-paste-freeze run)
+
+- **Decision (no-ticket cold start, Option B):** Manager authorized PROCEED WITHOUT LINEAR.
+  ticket_system=none; no `*_issue_key` supplied. No ticket-operator dispatches (Phase 0 read/create,
+  Phase 3 update-estimate, Phase 8.5/9/Final cross-link) will run. **Gap recorded** per manager
+  instruction: ticket-side estimate calibration and status transitions are out-of-band for this WU.
+  Source of truth for scope = brief.md + RESEARCH-FINDINGS.md in planning_dir.
+- **Decision (legacy whole-file debt ratified out-of-scope):** tui.rs (4073 LOC) and mod.rs (1810 LOC)
+  are large pre-existing files. Per standing manager policy, this WU does NOT decompose/refactor that
+  pre-existing whole-file debt; it is routed to the decomposition track as a ratified residual. The
+  binding code-quality bar is THIS WU's NEW code being role-pure, enforced at Phase 8 on the actual
+  diff. Phase 4/6 flags on pre-existing whole-file debt are treated as the ratified out-of-scope
+  decomposition residual (no escalation for that).
+- **Constraints carried into every phase:** synthetic fixtures only; net-new lowercase provider-name
+  CLI-identifier tokens = 0 (pty_broker dir currently has 0); no live changes; auto_merge_after_phase_9=false (draft
+  PR, manager merges after full gate + backpressure responsiveness test); skip_problem_map_gate=true.
+- **ONE coherent concern (do NOT split):** non-blocking PTY-broker child-input relay so a large paste
+  no longer freezes the overlay (Ctrl+C/backspace/enter responsive while pending input drains; large
+  user pastes go as a bracketed-paste batch).
+
+## WU overlay-paste-freeze — Phase 6c scope cleanup
+
+- **Decision (revert out-of-scope rustfmt churn):** Phase 6c (impl) ran whole-crate `cargo fmt`, which
+  reformatted 10 files outside the WU scope that carried pre-existing fmt-drift on main@6c8dadef
+  (balancer/live_load.rs, executor/cli.rs, executor/cli/interactive.rs, observability/{dto,service,
+  provider_inspect_transcript_source}.rs, session_external_provider/{replace_result_mapper,
+  request_builder}.rs, session_provider.rs, session_provider/dispatch.rs). All 10 were formatting-only
+  (import reordering / struct-field & method-chain wrapping), no semantic change. The brief's gate set
+  does NOT include `cargo fmt --check` and the main baseline is fmt-drifted, so this churn is unwanted
+  scope pollution. Reverted all 10 via `git checkout --` to keep the PR diff confined to
+  pty_broker/{mod,tui}.rs (the real change) + DECISIONS.md. Verified build/tests after revert.
