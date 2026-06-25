@@ -4872,3 +4872,26 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   compilation and tests. Deviations are recorded here.
 - **Evidence**: implementation-pipeline-orchestrator.md (judge role: "routing + gate evaluation, not
   synthesis"); orchestrator-dispatch.md ("ONE coherent concern, do NOT split").
+
+## D-S11-M2c-model-003-pipeline-dispositions — execution decision tail
+
+- **Phase**: Phase 8 review + Phase 7 CodeRabbit (PR #199).
+- **Decision**: Three judge dispositions during execution, all accepted:
+  1. **Scope narrowing**: the code agent ran a crate-wide `cargo fmt` that reformatted 5 unrelated
+     files with pre-existing drift; orchestrator reverted them (`git checkout main -- …`) to keep the
+     diff scoped to the WU. rustfmt-only, no behavior change.
+  2. **Data-integrity fix (pre-PR)**: removed an over-reaching `forward.sql` invocation-reconciliation
+     clause (`target_chain_model_name <> invocation.model_name`) that rewrote real provider-ref
+     invocation models to the chain's inferred model — contradicting the brief's preservation of real
+     invocations. Revised the contract (A4-bis), corrected the test assertions to expect preservation,
+     and removed the clause.
+  3. **CodeRabbit remediation**: 4 valid Major findings on the corrective path (per-row recorded
+     backfill default; LEFT-JOIN fail-closed mismatch/drift ×2; ROLLBACK cleanup on corrective rollback)
+     fixed in 6a096d9e with a changed-default regression test. The `coderabbit_review_driver.py` loop
+     wedged after triggering; orchestrator evaluated the comments directly and dispatched the fix
+     (driver-wedge flagged as a tooling issue, not a WU defect).
+- **Why safe**: every disposition preserves the brief's invariants (no session_id change, no transcript
+  edits, reversible/idempotent corrective, no fail-open, net-new product-source claude/codex tokens = 0).
+  Full gate evidence in `planning/s11-m2c-model/audit-history.md`.
+- **Evidence**: PR https://github.com/nestharus/agent-runner/pull/199; audit-history.md;
+  code-quality/s11-m2c-model-impl-summary.md.
