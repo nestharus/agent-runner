@@ -1,8 +1,8 @@
 //! Declared role: mapper, filter, accessor, validator, orchestration
 
-use super::DryRunError;
 use super::target_resolution::TargetResolution;
-use rusqlite::{Connection, params};
+use super::DryRunError;
+use rusqlite::{params, Connection};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -643,18 +643,19 @@ fn corrective_primary_plan_rows(
     target: &TargetResolution,
 ) -> Result<Vec<CorrectivePlanRow>, DryRunError> {
     let mut stmt = conn.prepare(
-        "SELECT p.chain_id
+        "SELECT p.chain_id, p.new_model_name
          FROM s11_wu4_restore_session_ownership_preimage p
          JOIN session_chains c ON c.chain_id = p.chain_id
          WHERE p.entity_kind = 'chain'
            AND p.old_model_name = '<unknown>'
-           AND p.new_model_name = ?1
-           AND c.model_name = ?1
+           AND c.model_name = p.new_model_name
          ORDER BY p.chain_id",
     )?;
-    let rows = stmt.query_map([target.model_name.as_str()], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     rows.map(|row| {
-        let chain_id = row?;
+        let (chain_id, backfill_default_model_name) = row?;
         let segment_session_ids = read_segment_session_ids_for_chain(conn, &chain_id)?;
         let inferred = infer_chain_target_model_excluding_rewritten(
             conn,
@@ -663,10 +664,10 @@ fn corrective_primary_plan_rows(
             true,
         )?;
         Ok(inferred
-            .filter(|model_name| model_name != &target.model_name)
+            .filter(|model_name| model_name != &backfill_default_model_name)
             .map(|new_model_name| CorrectivePlanRow {
                 chain_id,
-                old_model_name: target.model_name.clone(),
+                old_model_name: backfill_default_model_name,
                 new_model_name,
                 evidence_source: "original-preimage-db-evidence".to_string(),
             }))

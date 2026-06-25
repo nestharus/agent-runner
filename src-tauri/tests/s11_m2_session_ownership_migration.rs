@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
-use oulipoly_config::{ProvidersConfig, load_models};
+use oulipoly_config::{load_models, ProvidersConfig};
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{CURRENT_SCHEMA_VERSION, ResolvedResume, StateDb};
-use rusqlite::{Connection, params};
+use oulipoly_state::{ResolvedResume, StateDb, CURRENT_SCHEMA_VERSION};
+use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -2990,6 +2990,62 @@ fn s11_m2c_corrective_apply_is_reversible_idempotent_and_reports_inferred_model(
 }
 
 #[test]
+fn s11_m2c_corrective_primary_uses_recorded_backfill_default_after_default_changed() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let conn = fixture.conn();
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-changed-default",
+        "session-corrective-changed-default",
+        &models.middle,
+        "<unknown>",
+        &models.middle,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "75000000-0000-4000-8000-000000000001",
+        &models.last,
+        &canonical_account(),
+        "session-corrective-changed-default",
+        "succeeded",
+        "2026-06-20T10:07:00Z",
+    );
+    drop(conn);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .corrective_apply_command(Some(&backup_dir), true)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(
+        after.chains["chain-corrective-changed-default"].model_name,
+        models.last
+    );
+    assert_eq!(
+        corrective_preimage_models(&fixture.state_path, "chain-corrective-changed-default"),
+        (models.middle.clone(), models.last.clone())
+    );
+
+    let rollback = fixture.corrective_rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    let after_rollback = snapshot(&fixture.state_path);
+    assert_eq!(
+        after_rollback.chains["chain-corrective-changed-default"].model_name,
+        models.middle
+    );
+    assert_ne!(
+        after_rollback.chains["chain-corrective-changed-default"].model_name,
+        models.target
+    );
+}
+
+#[test]
 fn s11_m2c_corrective_preimage_absent_fallback_requires_single_different_inventory_model() {
     let fixture = Fixture::new();
     let models = fixture.write_s11_m2c_scope_configs();
@@ -4136,6 +4192,18 @@ fn corrective_preimage_row_count(path: &Path) -> i64 {
         |row| row.get(0),
     )
     .unwrap()
+}
+
+fn corrective_preimage_models(path: &Path, chain_id: &str) -> (String, String) {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT old_model_name, new_model_name
+         FROM s11_m2c_model_corrective_preimage
+         WHERE chain_id = ?1",
+        [chain_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap_or_else(|err| panic!("missing corrective preimage for {chain_id}: {err}"))
 }
 
 fn corrective_residual_default_count(path: &Path) -> i64 {

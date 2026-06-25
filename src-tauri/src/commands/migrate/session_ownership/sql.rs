@@ -1,7 +1,7 @@
 //! Declared roles: accessor, mapper, validator, predicate
 
-use super::DryRunError;
 use super::preflight::{self, IntegrityReport};
+use super::DryRunError;
 use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -164,9 +164,16 @@ pub(crate) fn apply_corrective_rollback(
     conn: &Connection,
 ) -> Result<CorrectiveRollbackCounts, DryRunError> {
     assert_no_corrective_rollback_drift(conn)?;
-    conn.execute_batch(CORRECTIVE_ROLLBACK_SQL)?;
-    let counts = read_key_counts(conn, "s11_m2c_model_corrective_last_rollback_counts")?;
-    Ok(corrective_rollback_counts(counts))
+    match conn.execute_batch(CORRECTIVE_ROLLBACK_SQL) {
+        Ok(()) => {
+            let counts = read_key_counts(conn, "s11_m2c_model_corrective_last_rollback_counts")?;
+            Ok(corrective_rollback_counts(counts))
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err.into())
+        }
+    }
 }
 
 pub(crate) fn apply_corrective_rollback_live(
@@ -178,8 +185,14 @@ pub(crate) fn apply_corrective_rollback_live(
             let counts = read_key_counts(conn, "s11_m2c_model_corrective_last_rollback_counts")?;
             Ok(corrective_rollback_counts(counts))
         }
-        Err(err) if is_busy_or_locked(&err) => Err(live_busy_error()),
-        Err(err) => Err(err.into()),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if is_busy_or_locked(&err) {
+                Err(live_busy_error())
+            } else {
+                Err(err.into())
+            }
+        }
     }
 }
 
@@ -355,9 +368,10 @@ fn assert_no_corrective_rollback_drift(conn: &Connection) -> Result<(), DryRunEr
         "SELECT EXISTS(
              SELECT 1
              FROM s11_m2c_model_corrective_preimage preimage
-             JOIN session_chains chain ON chain.chain_id = preimage.chain_id
-             WHERE chain.model_name <> preimage.new_model_name
-         )",
+             LEFT JOIN session_chains chain ON chain.chain_id = preimage.chain_id
+             WHERE chain.chain_id IS NULL
+                OR chain.model_name <> preimage.new_model_name
+          )",
         [],
         |row| row.get::<_, bool>(0),
     )?;
@@ -602,8 +616,9 @@ fn corrective_rollback_mismatch_count(conn: &Connection) -> Result<i64, DryRunEr
     conn.query_row(
         "SELECT COUNT(*)
          FROM s11_m2c_model_corrective_preimage preimage
-         JOIN session_chains chain ON chain.chain_id = preimage.chain_id
-         WHERE chain.model_name <> preimage.old_model_name",
+         LEFT JOIN session_chains chain ON chain.chain_id = preimage.chain_id
+         WHERE chain.chain_id IS NULL
+            OR chain.model_name <> preimage.old_model_name",
         [],
         |row| row.get(0),
     )
@@ -1475,8 +1490,8 @@ mod tests {
     }
 
     #[test]
-    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction()
-     {
+    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction(
+    ) {
         assert_intrinsic_loser_drift_rolls_back("timestamp", "2026-06-20T10:30:00Z");
     }
 
