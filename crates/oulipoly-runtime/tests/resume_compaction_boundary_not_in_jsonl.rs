@@ -4,13 +4,14 @@ use oulipoly_config::{
     ProviderConfig, ResumeKind, ResumeStrategy, SessionStorage, SessionsConfig,
 };
 use oulipoly_runtime::balancer::TransitionReason;
-use oulipoly_runtime::migration::{bound_provider_ref_resume_segment, ProviderRefBoundOutcome};
+use oulipoly_runtime::migration::{
+    bound_provider_ref_resume_segment, MigrationError, ProviderRefBoundOutcome,
+};
 use oulipoly_runtime::services::{
     MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
     ProductionMigrationService, ServiceError,
 };
 use oulipoly_state::{InvocationStart, ResolvedResume, SessionTurnIngest, StateDb};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
 const SESSION_ID: &str = "fc7d9c2c-f197-41a6-a60f-bf2ca7a033e6";
@@ -886,7 +887,6 @@ fn provider_ref_bound_resume_regenerates_fresh_id_active_on_other_chain_before_m
 }
 
 #[test]
-#[allow(clippy::drop_non_drop)]
 fn provider_ref_bound_resume_collision_exhaustion_fails_before_any_mutation() {
     let fixture = Fixture::new();
     let jsonl = seed_source_jsonl_with_boundary_turn(&fixture.source_projects, &fixture.workspace);
@@ -911,19 +911,17 @@ fn provider_ref_bound_resume_collision_exhaustion_fails_before_any_mutation() {
     let before_second_target = std::fs::read(&second_colliding_path).unwrap();
     let before_segments = segment_snapshot(&fixture.state);
     let mut stderr = Vec::new();
-    let mut generated_ids = [COLLIDING_FRESH_SESSION_ID, SECOND_FRESH_SESSION_ID]
-        .iter()
-        .copied();
     let mut generated_count = 0;
-    let mut fresh_session_id = || {
-        generated_count += 1;
-        generated_ids
-            .next()
-            .expect("provider-ref no-clobber must fail before requiring an unbounded id stream")
+    let result = {
+        let mut fresh_session_id = || {
+            generated_count += 1;
+            if generated_count % 2 == 1 {
+                COLLIDING_FRESH_SESSION_ID
+            } else {
+                SECOND_FRESH_SESSION_ID
+            }
             .to_string()
-    };
-
-    let result = catch_unwind(AssertUnwindSafe(|| {
+        };
         bound_provider_ref_resume_segment(
             &fixture.state,
             &SessionsConfig::default(),
@@ -933,16 +931,22 @@ fn provider_ref_bound_resume_collision_exhaustion_fails_before_any_mutation() {
             &mut fresh_session_id,
             &mut stderr,
         )
-    }));
+    };
 
-    match result {
-        Ok(Err(_)) => {}
-        Ok(Ok(outcome)) => panic!(
-            "expected no-clobber collision exhaustion to fail before mutation, got {outcome:?}"
-        ),
-        Err(_) => {}
+    let err = result.expect_err(
+        "expected no-clobber collision exhaustion to return an error before mutation",
+    );
+    match err {
+        MigrationError::TargetAlreadyExists { provider, path } => {
+            assert_eq!(provider, resolved.active_provider);
+            assert!(
+                path == first_colliding_path.display().to_string()
+                    || path == second_colliding_path.display().to_string(),
+                "collision exhaustion must report one of the colliding paths, got {path}"
+            );
+        }
+        other => panic!("expected target-already-exists exhaustion error, got {other:?}"),
     }
-    drop(fresh_session_id);
     assert!(
         generated_count >= 2,
         "collision-exhaustion fixture must exercise regenerated colliding ids before failure"

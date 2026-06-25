@@ -702,7 +702,9 @@ fn validate_provider_ref_repl_resume_target(
     fallback_target: Option<&crate::resume_cli::ResumeExecutionTarget>,
     selected_provider: &str,
 ) -> Result<(), String> {
-    let target = fallback_target.expect("resume target must be resolved before migration");
+    let Some(target) = fallback_target else {
+        return Err(provider_ref_repl_missing_target_message(selected_provider));
+    };
     let model = require_repl_provider_ref_resolved_model(
         provider_ref_repl_resolved_model(resolved),
         selected_provider,
@@ -805,6 +807,10 @@ fn provider_ref_repl_loaded_provider_name(
 
 fn provider_ref_repl_missing_model_message(selected_provider: &str) -> String {
     format!("provider-ref resume target {selected_provider} has no model config")
+}
+
+fn provider_ref_repl_missing_target_message(selected_provider: &str) -> String {
+    format!("provider-ref resume target {selected_provider} has no resolved execution target")
 }
 
 fn provider_ref_repl_missing_implementation_message(selected_provider: &str) -> String {
@@ -1044,4 +1050,26 @@ fn terminal_signal_disposition_for_result(
     );
     // AGE-153 source guard: marker emission routes through emit_terminal_signal_marker.
     apply_terminal_signal_outcome(&result.terminal_signal, &mut terminal_signal_ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_ref_repl_validation_returns_error_when_target_missing() {
+        let selected_provider = "provider-ref-target";
+        let resolved = oulipoly_state::ResolvedResume {
+            chain_id: "chain-target-missing".to_string(),
+            model_name: None,
+            model: None,
+            active_provider: selected_provider.to_string(),
+            active_session_id: "session-target-missing".to_string(),
+        };
+
+        let err = validate_provider_ref_repl_resume_target(&resolved, None, selected_provider)
+            .expect_err("missing target must be returned as validation error");
+
+        assert_eq!(err, provider_ref_repl_missing_target_message(selected_provider));
+    }
 }

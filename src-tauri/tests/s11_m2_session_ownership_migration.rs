@@ -440,7 +440,7 @@ impl Fixture {
     fn recording_script(&self, name: &str, argv_path: &Path) -> PathBuf {
         self.write_script(
             name,
-            &format!("printf '%s\\n' \"$@\" > {:?}", argv_path.to_string_lossy()),
+            &format!("printf '%s\\n' \"$@\" > {}", shell_quote_path(argv_path)),
         )
     }
 
@@ -448,9 +448,9 @@ impl Fixture {
         self.write_script(
             name,
             &format!(
-                "printf '%s\\n' \"$@\" > {:?}\npwd > {:?}",
-                argv_path.to_string_lossy(),
-                pwd_path.to_string_lossy()
+                "printf '%s\\n' \"$@\" > {}\npwd > {}",
+                shell_quote_path(argv_path),
+                shell_quote_path(pwd_path)
             ),
         )
     }
@@ -574,6 +574,10 @@ impl Fixture {
 
         SeededIds { issue52_count: 1 }
     }
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 struct SeededIds {
