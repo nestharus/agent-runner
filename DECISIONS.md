@@ -4998,3 +4998,43 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   WU's bounded scope and named in the Phase-4 Option-A residual-risk as "full locator/storage unification
   is separate decomposition work." ROUTED to the locator/transcript-storage-unification decomposition WU
   (to be absorbed by WU5 / provider-extraction). Authority: manager root authorization (answer artifact).
+
+## Phase 7 — CodeRabbit PR-mode review disposition (2026-06-25)
+
+CodeRabbit is enabled for the repo; draft PR #200 was opened and the review-loop driver was dispatched
+(`coderabbit_review_driver.py review-loop --mode incremental`).
+
+**Tooling defect (recorded for the manager; independent of this WU):** the driver's `trigger_review`
+spins in an un-timed `while True` waiting for a trigger-ack whose body matches
+`is_trigger_ack_body(body,"incremental")`, which requires the literals `"Actions performed"` AND
+`"Review triggered."`. Current CodeRabbit acks instead emit `"✅ Action performed"` (singular) and
+`"Review finished."`, so the matcher never matches and the loop hangs (~2.5h observed) even though
+CodeRabbit completes the review. The shared tool's `ACK_MARKERS` / `is_trigger_ack_body` need updating to
+CodeRabbit's current wording; until then the driver cannot converge any PR to `approved`. The driver was
+stopped after the review completed and the findings were handled by orchestrator dispatch.
+
+**CodeRabbit result captured:** CHANGES_REQUESTED with 6 in-diff comments. Orchestrator triage (the binding
+new-code code-quality gate is Phase 8 on the actual diff):
+
+- **FIXED (commit `bada04a4`, new code/tests only):**
+  - REPL provider-ref resume validation returns `Err(provider_ref_repl_missing_target_message(..))` instead
+    of `.expect()` panicking on a missing resolved target (+ covering unit test). Removes a real panic.
+  - Collision-exhaustion test drives a non-panicking colliding-id generator and asserts the helper returns
+    `MigrationError::TargetAlreadyExists` before any mutation, instead of accepting a `catch_unwind`
+    panic-as-success. Strengthens the no-clobber proof; pre/post no-write snapshots retained.
+  - Test recorder scripts shell-quote embedded paths (`shell_quote_path`) instead of `{:?}`.
+- **DEFERRED (replies posted to the threads):**
+  - Explicit-path target-exists guard (mod.rs:149) and explicit-path transactional rotation (mod.rs:166):
+    pre-existing `migrate_chain_segment` behavior, identical on `main`; held unchanged per the
+    keep-`--migrate`-unchanged constraint. The *new* provider-ref path is already clobber-guarded by
+    `fresh_provider_ref_target`. Routed to the migration-hardening backlog.
+  - Provider-ref rotation/marker atomicity (mod.rs:252): benign narrow window — after rotation commits the
+    fresh session's transcript is already the bounded post-boundary tail, so a re-resume launches correctly
+    whether or not the boundary marker was copied (AlreadyBounded no-op vs NoBoundary launch-fresh both load
+    the bounded transcript); original transcript untouched. A single-transaction fix expands the
+    state-layer migration/transaction coupling already routed to the transcript-storage-unification track;
+    deferred there.
+
+Constraints preserved: self-rotation design unchanged; original transcript never rewritten; no DB rollback;
+no model-choice change; synthetic fixtures only; 0 net-new standalone claude/codex production literals.
+New HEAD `bada04a4`; diff(main..bada04a4) sha256 `775c27eb3601b9c4ad52365f38a76e2ffd2a232aaacc9b49ec9f7d23fc3ad3ae`.
