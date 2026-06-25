@@ -657,8 +657,8 @@ pub(crate) fn infer_chain_target_model_from_transcript(
     provider_config: &ProviderConfig,
     segment_session_ids: &[String],
     moved_family_provider_ref_models: &BTreeSet<String>,
+    backfill_default_model_name: &str,
 ) -> Option<String> {
-    let default_model_name = moved_family_provider_ref_models.iter().next()?;
     let mut evidence: BTreeMap<String, i64> = BTreeMap::new();
     for session_id in segment_session_ids {
         let Some(path) = oulipoly_runtime::migration::find_session_source_from_storage(
@@ -704,7 +704,7 @@ pub(crate) fn infer_chain_target_model_from_transcript(
                 .cmp(right_count)
                 .then_with(|| right_model.cmp(left_model))
         })
-        .and_then(|(model, _)| (model != default_model_name.as_str()).then_some(model))
+        .and_then(|(model, _)| (model != backfill_default_model_name).then_some(model))
 }
 
 fn transcript_inventory_model<'a>(
@@ -827,8 +827,8 @@ fn corrective_transcript_plan_rows(
                 provider_config,
                 &segment_session_ids,
                 &target.moved_family_provider_ref_models,
+                &backfill_default_model_name,
             )
-            .filter(|model_name| model_name != &backfill_default_model_name)
             .map(|new_model_name| CorrectivePlanRow {
                 chain_id,
                 old_model_name: backfill_default_model_name,
@@ -1572,12 +1572,18 @@ mod tests {
         provider: &ProviderConfig,
         segments: &[&str],
         models: &BTreeSet<String>,
+        backfill_default_model_name: &str,
     ) -> Option<String> {
         let segment_session_ids = segments
             .iter()
             .map(|session_id| (*session_id).to_string())
             .collect::<Vec<_>>();
-        infer_chain_target_model_from_transcript(provider, &segment_session_ids, models)
+        infer_chain_target_model_from_transcript(
+            provider,
+            &segment_session_ids,
+            models,
+            backfill_default_model_name,
+        )
     }
 
     fn insert_invocation(
@@ -1623,7 +1629,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &target),
             Some(middle)
         );
     }
@@ -1647,7 +1653,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &target),
             Some(last)
         );
     }
@@ -1666,7 +1672,50 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &target),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_chain_target_model_from_transcript_uses_recorded_backfill_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects_dir = temp.path().join("projects");
+        let provider = transcript_provider(projects_dir.clone());
+        let models = provider_ref_models();
+        let global_default = models.iter().next().unwrap().clone();
+        let recorded_default = model_name("mmm");
+        write_transcript(
+            &projects_dir,
+            "segment-global-default",
+            &[
+                assistant_model_line(&global_default),
+                assistant_model_line(&global_default),
+                assistant_model_line(&recorded_default),
+            ],
+        );
+        write_transcript(
+            &projects_dir,
+            "segment-recorded-default",
+            &[assistant_model_line(&recorded_default)],
+        );
+
+        assert_eq!(
+            infer_from_transcript(
+                &provider,
+                &["segment-global-default"],
+                &models,
+                &recorded_default,
+            ),
+            Some(global_default)
+        );
+        assert_eq!(
+            infer_from_transcript(
+                &provider,
+                &["segment-recorded-default"],
+                &models,
+                &recorded_default,
+            ),
             None
         );
     }
@@ -1677,6 +1726,7 @@ mod tests {
         let projects_dir = temp.path().join("projects");
         let provider = transcript_provider(projects_dir.clone());
         let models = provider_ref_models();
+        let default_model = models.iter().next().unwrap().clone();
         write_transcript(
             &projects_dir,
             "synthetic-only",
@@ -1696,15 +1746,15 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["missing"], &models),
+            infer_from_transcript(&provider, &["missing"], &models, &default_model),
             None
         );
         assert_eq!(
-            infer_from_transcript(&provider, &["synthetic-only"], &models),
+            infer_from_transcript(&provider, &["synthetic-only"], &models, &default_model),
             None
         );
         assert_eq!(
-            infer_from_transcript(&provider, &["absent-only"], &models),
+            infer_from_transcript(&provider, &["absent-only"], &models, &default_model),
             None
         );
     }
@@ -1716,6 +1766,7 @@ mod tests {
         let projects_dir = temp.path().join("projects");
         let provider = transcript_provider(projects_dir.clone());
         let models = provider_ref_models();
+        let default_model = models.iter().next().unwrap().clone();
         let middle = model_name("mmm");
         let path = write_transcript(&projects_dir, "segment-a", &[assistant_model_line(&middle)]);
         let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -1723,7 +1774,7 @@ mod tests {
         fs::set_permissions(&path, permissions).unwrap();
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &default_model),
             None
         );
     }
@@ -1734,6 +1785,7 @@ mod tests {
         let projects_dir = temp.path().join("projects");
         let provider = transcript_provider(projects_dir.clone());
         let models = provider_ref_models();
+        let target = model_name("aaa");
         let middle = model_name("mmm");
         let last = model_name("zzz");
         write_transcript(
@@ -1743,7 +1795,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &target),
             Some(middle)
         );
     }
@@ -1771,7 +1823,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &target),
             Some(middle)
         );
     }
@@ -1782,6 +1834,7 @@ mod tests {
         let projects_dir = temp.path().join("projects");
         let provider = transcript_provider(projects_dir.clone());
         let models = provider_ref_models();
+        let default_model = models.iter().next().unwrap().clone();
         let middle = model_name("mmm");
         let prefixed_middle = format!("{middle}-4-8");
         write_transcript(
@@ -1791,7 +1844,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a"], &models),
+            infer_from_transcript(&provider, &["segment-a"], &models, &default_model),
             Some(middle)
         );
     }
@@ -1812,7 +1865,7 @@ mod tests {
         );
 
         assert_eq!(
-            infer_from_transcript(&provider, &["segment-a", "segment-b"], &models),
+            infer_from_transcript(&provider, &["segment-a", "segment-b"], &models, &target),
             Some(middle)
         );
     }
