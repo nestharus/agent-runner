@@ -4836,3 +4836,116 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   stops at the draft PR; the manager merges after a full `cargo test --workspace` and a re-apply on a
   copy of the real DB proving 0 stale invocations + `planned == applied`.
 - **Evidence**: v3 dispatch instructions (manager-max Option B); PR #198 head.
+
+---
+
+## S11-M2c-resume2 — implementation-pipeline-orchestrator bootstrap (Phase 0)
+
+- **2026-06-25 — No ticket system (Option B).** Manager authorized PROCEED WITHOUT LINEAR.
+  `ticket_system=none`, `linear_issue_key=none`. `planning/s11-m2c-resume2/brief.md` is the source of
+  truth and was rendered to `.scratch/ticket.md`. **Gap recorded:** no Linear issue tracks this WU; no
+  ticket read/create/update-estimate/cross-link/close-comment dispatches run. Phase 3 update-estimate,
+  Phase 9 cross-link, and Final close-comment ticket-operator steps are intentionally skipped.
+  Evidence: dispatch instructions header "Manager authorization — PROCEED WITHOUT LINEAR (Option B)".
+- **2026-06-25 — Session id provenance.** The orchestrator runs directly in the Claude harness, not
+  spawned by an `agents` invocation, so there is no root `agents trace --json` UUID at bootstrap.
+  `session.json.session_id` is an orchestrator-minted UUID (7882533e-f6f2-4a1d-b81c-d7afaafc23f2);
+  per-phase child dispatches create their own invocation UUIDs captured in their logs. This is the
+  documented transitional reality, not a `BLOCKED:session-manifest-init-failed`.
+- **2026-06-25 — Model selection reconciliation.** The orchestrator operator file writes `-m gpt-xhigh`
+  on its literal dispatch lines, while `~/ai/models/roles.md` (cited authoritative phase-ownership
+  table) assigns several build/research/test/prose phases to `gpt-high`. Resolution: named operator
+  agents that exist as `.md` files (apply-gate-set, process-tree-auditor, coverage-analyzer,
+  rebase-drift-checker, code-tracer, pr-writer) are dispatched via `-a <agent.md>` so frontmatter drives
+  the model (per agents-cli.md: never combine `-m` with `-a`). Ad-hoc operator prompts with no agent
+  file (Phase 2.5 researchers, Phase 3 proposer, Phase 5 hookpoint, Phase 6b test-writer, Phase 6c
+  code-writer, closure judge) are dispatched with `-m gpt-xhigh` per this orchestrator's explicit
+  literal dispatch lines and its "you dispatch gpt-xhigh operators" Role statement.
+- **2026-06-25 — Worktree/branch reuse.** `worktrees/s11-m2c-resume2` and branch `s11-m2c-resume2`
+  (off main@6c8dadef) already existed and were verified (clean, correct HEAD); NOT recreated.
+
+## S11-M2c-resume2 — Phase 2.5 discovery dispositions
+
+- **2026-06-25 — Coverage gap is the WU deliverable, not characterization debt.** The 2.5.1 coverage
+  inventory confirms all four acceptance behaviors (boundary-bounds-tail, no-boundary/not-found =>
+  unchanged+warning, idempotent re-resume no-op, both headless+REPL paths) are UNCOVERED. These are the
+  NEW behaviors this WU implements, not pre-existing behavior needing characterization before change, so
+  no precursor characterization-test dispatch and no bug ticket are required. Existing synthetic fixtures
+  (`initiative_05_migration.rs`, `resume_compaction_boundary_not_in_jsonl.rs`, `pr_f_resume_integration.rs`,
+  `s11_m2_session_ownership_migration.rs`, in-memory `StateDb`) will be reused in Phase 6 — synthetic only.
+- **2026-06-25 — `find_turn_offset` substring-match edge: in-scope hardening candidate, NOT a blocker.**
+  2.5.1 flagged that `migrate_chain_segment`'s boundary scan (`crates/oulipoly-runtime/src/migration/mod.rs:159-168`)
+  matches the boundary turn-id as a whole-line substring; a pre-boundary body containing the same UUID
+  could slice too early. It is a latent robustness edge on the touched slicing surface, not a confirmed
+  defect (no failing-against-HEAD test). Disposition: surfaced to the Phase 3 proposer as an OPTIONAL
+  in-scope hardening (exact turn-id field match), not required by acceptance criteria, not blocking. No
+  ticket (Option B, no ticket system).
+- **2026-06-25 — Duplicates/drift findings are design constraints, not out-of-scope consolidation.** The
+  2.5.4 inventory found near-duplicate headless/REPL skip-guards and several divergent primitives
+  (DB-boundary vs export-marker; migration vs metadata JSONL locator; migration plain-write vs replace
+  fsync durability; missing-boundary fail-open). All live inside the touched resume/migration surface and
+  the brief already decided the approach: ONE shared bounding helper invoked from both skip-guards,
+  reusing the migration DB-boundary + migration slicing primitives, with a NO-OP+warn (not fail-open)
+  policy on missing/unfound boundary, and no third locator/writer. These are inputs to the Phase 3
+  proposal, not a divergence requiring scope expansion or a blocking NEEDS_INPUT. Recorded per
+  risk-profile.md "Drift" rule with disposition = proceed-with-note.
+- **2026-06-25 — Inherited-estimate cold-start: prior disposition = proceed without a baseline.** The
+  ticket has `estimate_source: missing` (Option B, no Linear). The manager authorization ("manager-max",
+  "ONE coherent concern (do NOT split)", "Begin Phase 0 now", "build to it") is the prior user
+  disposition equivalent to "Proceed without a baseline estimate"; the Phase 2.5 inherited-estimate gate
+  (step 4a) therefore does not halt for a fresh NEEDS_INPUT.
+
+## S11-M2c-resume2 — Phase 4 apply-gate-set BLOCKED: code-quality disposition escalation
+
+- **2026-06-25 — Phase 4 returned BLOCKED; orchestrator adjudication.** apply-gate-set
+  (caller_mode=implementation-phase-4, root inv 910237c1) returned BLOCKED. Breakdown:
+  - R1 audit-risk LOW, R2 scope-risk LOW, R3 shortcut-risk LOW, R4 supported-surface-risk LOW — the
+    proposal's design is sound (right scope, no purpose-compromising shortcuts, serves the supported
+    surface).
+  - R5/R7 proof-risk HIGH = FORMAT gap only: the proposal supplies proof evidence under
+    `## Test-intent track` (19 deterministic tests) + brief manager copy-proof, but the proof-risk
+    auditor requires an exact `## Proof plan` section with `Runtime claim` / `Proof method` /
+    `Evidence-class match` fields. Substantively fixable via a focused proposal revision.
+  - R6 code-quality HIGH (push-pull + function-classification + cohesion + coupling all HIGH) is
+    ENTIRELY pre-existing whole-file debt in the large legacy touched files: migration/mod.rs (752L, 8
+    classifications, pulls Claude-private projects layout + parses SessionStorage::Script argv +
+    substring turn-id match), repl/mapper.rs (mapper+parser vs mapper-only decl), chain_segments_*.rs,
+    request_builder.rs, interactive.rs, external_branch_orchestration.rs / external_identity_accessor.rs.
+    None is introduced by this WU (no code exists yet); the auditors scored a whole-file review-target
+    surrogate because Phase 4 has no diff.
+  - R10 process-tree-audit-1 FAIL is DERIVATIVE only: the root node self-trace timed out
+    (`tracing_timeout` — the operator traced its own still-running root) and the 6 "canonical-output
+    verdict mismatches" are just R5/R6 HIGHs re-counted. All 9 child gates have correct topology
+    ("PASS topology"): distinct UUIDs, correct models, canonical outputs + prompts/logs present. No
+    independent topology violation.
+- **Disposition: ESCALATED to root (manager) as NEEDS_INPUT.** The proof-risk format gap is fixable, but
+  the code-quality HIGH is a genuine scope/value trade-off: decomposing the 8 legacy files to LOW is
+  multi-WU work that contradicts the manager's "ONE coherent concern (do NOT split)" directive and
+  overlaps the project's existing decomposition initiative; routing the pre-existing debt to
+  decomposition and bounding the WU is convention-authorized ("too large for one WU -> decomposition
+  evidence") but proceeding past a BLOCKED Phase 4 on a HIGH-risk WU is consequential and the manager is
+  the explicit merge-gate owner for this run. Question artifact:
+  `.scratch/questions/q-c7e94609-c841-453b-aca3-72cf815f120b.question.json`. Recommendation: Option A
+  (bound WU + route legacy debt to decomposition + add `## Proof plan` + re-run Phase 4 with a WU-scoped
+  review target; real code-quality gate is Phase 8 on the actual diff). Pipeline HALTED pending answer.
+
+## S11-M2c-resume2 — Manager decision: Option A (bound WU; route legacy debt to decomposition)
+
+- **2026-06-25 — Root answered Option A.** Manager directed: do NOT decompose/refactor the 8 pre-existing
+  legacy large files; that pre-existing debt is OUT of this WU's scope and is routed to the project
+  decomposition initiative (recorded here + in project `planning/risk-profile.md`, Option B routing, no
+  ticket system). The Phase-4 code-quality HIGH on those legacy files (push-pull/function-classification/
+  cohesion/coupling) is pre-existing whole-file debt, not a violation this WU introduces.
+- **Binding code-quality bar for THIS WU:** the WU's NEW code must be role-pure and add ZERO new debt
+  (declared roles, single classification per new function/module, controlled coupling). Enforced in the
+  Phase 6 tests-contracts alignment + per-component code-quality and at Phase 8 on the actual diff.
+- **Proof-plan gap fix:** add an explicit `## Proof plan` section to the proposal, aligned to the brief
+  acceptance criteria and `planning/s11-resume-context-investigation/PROOF-PLAN.md` (deterministic tests
+  for both REPL + headless provider-ref paths; boundary-present → post-boundary tail + original
+  recoverable; boundary-absent / turn-not-found → transcript unchanged + warning, no clobber; idempotent
+  re-resume no-op; the "external rotation target requires an explicit manual target" error must NOT
+  regress).
+- **Phase 4 re-run** uses a WU-scoped review target (the WU's intended new-code change surface only, NOT
+  the legacy files). Continue Phases 5→6→7→8→8.X→9, stop at a draft PR (auto_merge_after_phase_9=false);
+  manager merges after full `cargo test --workspace` + the copy-based proof.
+- Answer artifact: `.scratch/questions/q-c7e94609-c841-453b-aca3-72cf815f120b.answer.json`.

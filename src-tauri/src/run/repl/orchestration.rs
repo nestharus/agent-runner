@@ -14,10 +14,10 @@ use oulipoly_runtime::services::{
 };
 
 use super::disposition::{
-    ReplTerminalControl, ReplTerminalDispositionInput, handle_terminal_signal_disposition,
+    handle_terminal_signal_disposition, ReplTerminalControl, ReplTerminalDispositionInput,
 };
 use super::finalization::{
-    CompletedReplAttemptInput, finalize_completed_repl_attempt, finalize_spawn_error,
+    finalize_completed_repl_attempt, finalize_spawn_error, CompletedReplAttemptInput,
 };
 use super::resolution::resolve_optional_repl_resume;
 use super::{formatter, mapper, validator};
@@ -316,7 +316,10 @@ fn execute_and_finalize_repl_attempt(input: ReplExecutionInput<'_, '_>) -> Resul
         Some(input.invocation_env),
         resume_payload,
         input.model,
-        input.agent_runtime_services.provider_registry_handle.current(),
+        input
+            .agent_runtime_services
+            .provider_registry_handle
+            .current(),
     ) {
         Ok(mut result) => {
             classify_repl_result(
@@ -618,8 +621,8 @@ fn migrate_repl_resume_provider(
     input: &mut ReplProviderSelectionInput<'_, '_>,
     resolved: &mut oulipoly_state::ResolvedResume,
 ) -> Result<bool, String> {
-    if should_skip_repl_provider_ref_default_migration(resolved, input.manual_migrate) {
-        return Ok(true);
+    if validate_repl_provider_ref_default_migration_skip(input, resolved)? {
+        return apply_repl_provider_ref_bound_resume_segment(input, resolved);
     }
     let migration = prepare_repl_migration(input, resolved)?;
     *input.resume_spawn_cwd = Some(migration.effective_spawn_cwd.clone());
@@ -643,6 +646,192 @@ fn migrate_repl_resume_provider(
         Err(err) => return Err(format!("migration service failed: {err}")),
     }
     Ok(true)
+}
+
+fn validate_repl_provider_ref_default_migration_skip(
+    input: &ReplProviderSelectionInput<'_, '_>,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<bool, String> {
+    if !should_skip_repl_provider_ref_default_migration(resolved, input.manual_migrate) {
+        return Ok(false);
+    }
+    validate_provider_ref_repl_resume_target(
+        resolved,
+        input.fallback_target.as_ref(),
+        &resolved.active_provider,
+    )?;
+    Ok(true)
+}
+
+fn apply_repl_provider_ref_bound_resume_segment(
+    input: &mut ReplProviderSelectionInput<'_, '_>,
+    resolved: &mut oulipoly_state::ResolvedResume,
+) -> Result<bool, String> {
+    let migration = prepare_repl_migration(input, resolved)?;
+    *input.resume_spawn_cwd = Some(migration.effective_spawn_cwd.clone());
+    let mut migration_stderr = std::io::stderr();
+    let mut fresh_session_id = || uuid::Uuid::new_v4().to_string();
+    match oulipoly_runtime::migration::bound_provider_ref_resume_segment(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        &migration.model,
+        resolved,
+        &migration.effective_spawn_cwd,
+        &mut fresh_session_id,
+        &mut migration_stderr,
+    ) {
+        Ok(oulipoly_runtime::migration::ProviderRefBoundOutcome::Rotated(segment)) => {
+            apply_repl_migrated_segment(input, resolved, segment)?;
+        }
+        Ok(
+            oulipoly_runtime::migration::ProviderRefBoundOutcome::NoBoundary
+            | oulipoly_runtime::migration::ProviderRefBoundOutcome::BoundaryNotFound
+            | oulipoly_runtime::migration::ProviderRefBoundOutcome::AlreadyBounded,
+        ) => {}
+        Err(
+            oulipoly_runtime::migration::MigrationError::SourceMissingStorage { .. }
+            | oulipoly_runtime::migration::MigrationError::TargetMissingStorage { .. },
+        ) => {}
+        Err(err) => return Err(format!("provider-ref resume bounding failed: {err:?}")),
+    }
+    Ok(true)
+}
+
+fn validate_provider_ref_repl_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    fallback_target: Option<&crate::resume_cli::ResumeExecutionTarget>,
+    selected_provider: &str,
+) -> Result<(), String> {
+    let target = fallback_target.expect("resume target must be resolved before migration");
+    let model = require_repl_provider_ref_resolved_model(
+        provider_ref_repl_resolved_model(resolved),
+        selected_provider,
+    )?;
+    require_repl_provider_ref_model_implementation(model, selected_provider)?;
+    let target_member_name = require_repl_provider_ref_target_member_name(
+        provider_ref_repl_target_member_name(model, target.provider_index),
+        selected_provider,
+        target.provider_index,
+    )?;
+    require_repl_provider_ref_resolved_provider(selected_provider, target_member_name)?;
+    require_repl_provider_ref_loaded_provider(
+        selected_provider,
+        provider_ref_repl_loaded_provider_name(target),
+    )
+}
+
+fn require_repl_provider_ref_resolved_model<'a>(
+    model: Option<&'a oulipoly_config::ModelConfig>,
+    selected_provider: &str,
+) -> Result<&'a oulipoly_config::ModelConfig, String> {
+    model.ok_or_else(|| provider_ref_repl_missing_model_message(selected_provider))
+}
+
+fn require_repl_provider_ref_model_implementation(
+    model: &oulipoly_config::ModelConfig,
+    selected_provider: &str,
+) -> Result<(), String> {
+    if provider_ref_repl_model_has_implementation(model) {
+        Ok(())
+    } else {
+        Err(provider_ref_repl_missing_implementation_message(
+            selected_provider,
+        ))
+    }
+}
+
+fn require_repl_provider_ref_target_member_name<'a>(
+    target_member_name: Option<&'a str>,
+    selected_provider: &str,
+    provider_index: usize,
+) -> Result<&'a str, String> {
+    target_member_name
+        .ok_or_else(|| provider_ref_repl_invalid_index_message(selected_provider, provider_index))
+}
+
+fn require_repl_provider_ref_resolved_provider(
+    selected_provider: &str,
+    target_member_name: &str,
+) -> Result<(), String> {
+    if target_member_name == selected_provider {
+        Ok(())
+    } else {
+        Err(provider_ref_repl_resolved_provider_message(
+            selected_provider,
+            target_member_name,
+        ))
+    }
+}
+
+fn require_repl_provider_ref_loaded_provider(
+    selected_provider: &str,
+    loaded_provider_name: &str,
+) -> Result<(), String> {
+    if loaded_provider_name == selected_provider {
+        Ok(())
+    } else {
+        Err(provider_ref_repl_loaded_provider_message(
+            selected_provider,
+            loaded_provider_name,
+        ))
+    }
+}
+
+fn provider_ref_repl_resolved_model(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Option<&oulipoly_config::ModelConfig> {
+    resolved.model.as_ref()
+}
+
+fn provider_ref_repl_model_has_implementation(model: &oulipoly_config::ModelConfig) -> bool {
+    model.provider.is_some()
+}
+
+fn provider_ref_repl_target_member_name(
+    model: &oulipoly_config::ModelConfig,
+    provider_index: usize,
+) -> Option<&str> {
+    model
+        .providers
+        .get(provider_index)
+        .map(|provider| provider.name.as_str())
+}
+
+fn provider_ref_repl_loaded_provider_name(
+    target: &crate::resume_cli::ResumeExecutionTarget,
+) -> &str {
+    &target.provider.name
+}
+
+fn provider_ref_repl_missing_model_message(selected_provider: &str) -> String {
+    format!("provider-ref resume target {selected_provider} has no model config")
+}
+
+fn provider_ref_repl_missing_implementation_message(selected_provider: &str) -> String {
+    format!("provider-ref resume target {selected_provider} has no provider implementation")
+}
+
+fn provider_ref_repl_invalid_index_message(
+    selected_provider: &str,
+    provider_index: usize,
+) -> String {
+    format!(
+        "provider-ref resume target {selected_provider} has invalid provider index {provider_index}"
+    )
+}
+
+fn provider_ref_repl_resolved_provider_message(
+    selected_provider: &str,
+    resolved_provider: &str,
+) -> String {
+    format!("provider-ref resume target {selected_provider} resolved provider {resolved_provider}")
+}
+
+fn provider_ref_repl_loaded_provider_message(
+    selected_provider: &str,
+    loaded_provider: &str,
+) -> String {
+    format!("provider-ref resume target {selected_provider} loaded provider {loaded_provider}")
 }
 
 fn should_skip_repl_provider_ref_default_migration(

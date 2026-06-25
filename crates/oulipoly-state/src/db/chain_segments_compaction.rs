@@ -31,6 +31,17 @@
 use super::*;
 use chrono::{DateTime, Utc};
 
+struct CompactionBoundaryMarkerRow {
+    turn_id: String,
+    timestamp: String,
+    role: String,
+    parent_turn_id: Option<String>,
+    is_sidechain: i64,
+    source_file: String,
+    ingested_at: String,
+    body: Option<String>,
+}
+
 impl StateDb {
     pub fn update_chain_last_used(&self, chain_id: &str) -> Result<(), DbError> {
         self.conn
@@ -90,6 +101,98 @@ impl StateDb {
 
     fn format_latest_compaction_boundary_query_error(err: sqlite::Error) -> String {
         format!("Failed to query latest compaction boundary: {err}")
+    }
+
+    pub fn preserve_compaction_boundary_for_session(
+        &self,
+        source_provider: &str,
+        source_session_id: &str,
+        target_provider: &str,
+        target_session_id: &str,
+    ) -> Result<bool, DbError> {
+        let Some(marker) =
+            self.latest_compaction_boundary_marker(source_provider, source_session_id)?
+        else {
+            return Ok(false);
+        };
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role,
+                     parent_turn_id, is_sidechain, is_compaction_boundary,
+                     source_file, ingested_at, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10)
+                 ON CONFLICT(provider_name, session_id, turn_id)
+                 DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    role = excluded.role,
+                    parent_turn_id = excluded.parent_turn_id,
+                    is_sidechain = excluded.is_sidechain,
+                    is_compaction_boundary = 1,
+                    source_file = excluded.source_file,
+                    ingested_at = excluded.ingested_at,
+                    body = excluded.body",
+                sqlite::params![
+                    target_provider,
+                    target_session_id,
+                    marker.turn_id,
+                    marker.timestamp,
+                    marker.role,
+                    marker.parent_turn_id,
+                    marker.is_sidechain,
+                    marker.source_file,
+                    marker.ingested_at,
+                    marker.body,
+                ],
+            )
+            .map_err(Self::format_preserve_compaction_boundary_error)?;
+        Ok(Self::has_changed_rows(changed))
+    }
+
+    fn latest_compaction_boundary_marker(
+        &self,
+        source_provider: &str,
+        source_session_id: &str,
+    ) -> Result<Option<CompactionBoundaryMarkerRow>, DbError> {
+        self.conn
+            .query_row(
+                "SELECT turn_id, timestamp, role, parent_turn_id, is_sidechain,
+                        source_file, ingested_at, body
+                 FROM session_turns
+                 WHERE provider_name = ?1
+                   AND session_id = ?2
+                   AND is_compaction_boundary = 1
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                sqlite::params![source_provider, source_session_id],
+                Self::map_compaction_boundary_marker_row,
+            )
+            .optional()
+            .map_err(Self::format_latest_compaction_boundary_marker_error)
+    }
+
+    fn map_compaction_boundary_marker_row(
+        row: &sqlite::Row<'_>,
+    ) -> sqlite::Result<CompactionBoundaryMarkerRow> {
+        Ok(CompactionBoundaryMarkerRow {
+            turn_id: row.get(0)?,
+            timestamp: row.get(1)?,
+            role: row.get(2)?,
+            parent_turn_id: row.get(3)?,
+            is_sidechain: row.get(4)?,
+            source_file: row.get(5)?,
+            ingested_at: row.get(6)?,
+            body: row.get(7)?,
+        })
+    }
+
+    fn format_latest_compaction_boundary_marker_error(err: sqlite::Error) -> String {
+        format!("Failed to query latest compaction boundary marker: {err}")
+    }
+
+    fn format_preserve_compaction_boundary_error(err: sqlite::Error) -> String {
+        format!("Failed to preserve compaction boundary marker: {err}")
     }
 
     fn parse_compaction_boundary_timestamp(raw_ts: &str) -> Result<DateTime<Utc>, DbError> {
