@@ -63,14 +63,10 @@ INSERT INTO s11_wu4_candidate_segments (
     is_orphaned,
     issue52_unregistered
 )
-WITH params AS (
-    SELECT
-        (SELECT value FROM s11_wu4_migration_params WHERE key = 'target_model_name') AS target_model_name
-)
 SELECT
     chain.chain_id,
     chain.model_name,
-    params.target_model_name,
+    source.target_model_name,
     segment.id,
     segment.provider_name,
     segment.session_id,
@@ -81,14 +77,13 @@ SELECT
 FROM s11_wu4_source_chain_candidates source
 JOIN session_chains chain ON chain.chain_id = source.chain_id
 JOIN session_chain_segments segment ON segment.chain_id = chain.chain_id
-CROSS JOIN params
 LEFT JOIN s11_wu4_original_target_provider_inventory original
   ON original.provider_name = segment.provider_name
 LEFT JOIN s11_wu4_target_provider_inventory inventory
   ON inventory.provider_name = segment.provider_name
 LEFT JOIN s11_wu4_provider_aliases alias
   ON alias.old_provider_name = segment.provider_name
-WHERE (source.is_orphaned = 1 AND chain.model_name <> params.target_model_name)
+WHERE (source.is_orphaned = 1 AND chain.model_name <> source.target_model_name)
    OR original.provider_name IS NULL;
 
 DROP TABLE IF EXISTS s11_wu4_invocation_remap_candidates;

@@ -210,6 +210,30 @@ impl Fixture {
         cmd
     }
 
+    fn corrective_dry_run_command(&self) -> Command {
+        let mut cmd = self.command();
+        cmd.arg("--corrective");
+        cmd
+    }
+
+    fn corrective_apply_command(
+        &self,
+        backup_dir: Option<&Path>,
+        confirm_mutate_live_db: bool,
+    ) -> Command {
+        let mut cmd = self.apply_command(backup_dir, confirm_mutate_live_db, false, false);
+        cmd.arg("--corrective");
+        assert_live_command_guard(&cmd, self);
+        cmd
+    }
+
+    fn corrective_rollback_command(&self, confirm_mutate_live_db: bool) -> Command {
+        let mut cmd = self.rollback_command(confirm_mutate_live_db);
+        cmd.arg("--corrective");
+        assert_live_command_guard(&cmd, self);
+        cmd
+    }
+
     fn backup_dir(&self) -> PathBuf {
         let backup_dir = self.dir.path().join("backups");
         fs::create_dir_all(&backup_dir).unwrap();
@@ -656,6 +680,62 @@ fn assert_invocations_reconciled(
             row.provider_name.as_deref(),
             Some(expected_provider),
             "invocation {row:?}"
+        );
+    }
+}
+
+fn assert_invocation_models_and_provider_reconciled(
+    fixture: &Fixture,
+    session_id: &str,
+    expected_provider: &str,
+    expected_models_by_uuid: &[(&str, &str)],
+) {
+    let rows = invocation_snapshot_for_session(&fixture.state_path, session_id);
+    assert_eq!(
+        rows.len(),
+        expected_models_by_uuid.len(),
+        "unexpected invocation count for {session_id}: {rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(
+            row.provider_name.as_deref(),
+            Some(expected_provider),
+            "invocation {row:?}"
+        );
+    }
+
+    let expected: BTreeMap<&str, &str> = expected_models_by_uuid.iter().copied().collect();
+    assert_eq!(
+        expected.len(),
+        expected_models_by_uuid.len(),
+        "duplicate expected invocation UUID for {session_id}"
+    );
+
+    let conn = Connection::open(&fixture.state_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT invocation_uuid, model_name
+             FROM invocations
+             WHERE COALESCE(provider_session_id, session_id) = ?1
+             ORDER BY invocation_uuid",
+        )
+        .unwrap();
+    let actual: BTreeMap<String, String> = stmt
+        .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "unexpected invocation UUID set for {session_id}: {actual:?}"
+    );
+    for (uuid, expected_model) in expected {
+        assert_eq!(
+            actual.get(uuid).map(String::as_str),
+            Some(expected_model),
+            "invocation {uuid} in {session_id}"
         );
     }
 }
@@ -2684,6 +2764,414 @@ fn s11_m2c_scope_preserves_valid_models_remaps_rotation_backfills_orphans() {
 }
 
 #[test]
+fn s11_m2c_forward_apply_uses_per_chain_model_inference_and_preserves_real_invocations() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    fixture.write_s11_m2c_local_shadow_model();
+    seed_s11_m2c_scope_population(&fixture, &models);
+    {
+        let conn = fixture.conn();
+        seed_inference_orphan_chain(
+            &conn,
+            "chain-infer-middle",
+            "session-infer-middle",
+            &canonical_account(),
+        );
+        seed_invocation(
+            &conn,
+            "61000000-0000-4000-8000-000000000001",
+            &models.middle,
+            &canonical_account(),
+            "session-infer-middle",
+            "succeeded",
+            "2026-06-20T10:01:00Z",
+        );
+        seed_invocation(
+            &conn,
+            "61000000-0000-4000-8000-000000000002",
+            &models.middle,
+            &canonical_account(),
+            "session-infer-middle",
+            "succeeded",
+            "2026-06-20T10:02:00Z",
+        );
+        seed_invocation(
+            &conn,
+            "61000000-0000-4000-8000-000000000003",
+            &models.last,
+            &canonical_account(),
+            "session-infer-middle",
+            "succeeded",
+            "2026-06-20T10:03:00Z",
+        );
+        seed_invocation(
+            &conn,
+            "61000000-0000-4000-8000-000000000004",
+            "<unknown>",
+            &canonical_account(),
+            "session-infer-middle",
+            "failed",
+            "2026-06-20T10:04:00Z",
+        );
+        seed_invocation(
+            &conn,
+            "61000000-0000-4000-8000-000000000005",
+            &source_model_name(),
+            &canonical_account(),
+            "session-infer-middle",
+            "succeeded",
+            "2026-06-20T10:05:00Z",
+        );
+
+        seed_inference_orphan_chain(
+            &conn,
+            "chain-infer-last",
+            "session-infer-last",
+            &unregistered_account_a(),
+        );
+        seed_invocation(
+            &conn,
+            "62000000-0000-4000-8000-000000000001",
+            &models.last,
+            &unregistered_account_a(),
+            "session-infer-last",
+            "succeeded",
+            "2026-06-20T10:01:00Z",
+        );
+        seed_invocation(
+            &conn,
+            "62000000-0000-4000-8000-000000000002",
+            &models.last,
+            &unregistered_account_a(),
+            "session-infer-last",
+            "succeeded",
+            "2026-06-20T10:02:00Z",
+        );
+        seed_invocation(
+            &conn,
+            "62000000-0000-4000-8000-000000000003",
+            &models.middle,
+            &unregistered_account_a(),
+            "session-infer-last",
+            "succeeded",
+            "2026-06-20T10:03:00Z",
+        );
+
+        seed_inference_orphan_chain(
+            &conn,
+            "chain-infer-no-evidence",
+            "session-infer-no-evidence",
+            &canonical_account(),
+        );
+        seed_invocation(
+            &conn,
+            "63000000-0000-4000-8000-000000000001",
+            "<unknown>",
+            &canonical_account(),
+            "session-infer-no-evidence",
+            "failed",
+            "2026-06-20T10:01:00Z",
+        );
+    }
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_quick_check_ok(&fixture.state_path);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(after.chains["chain-infer-middle"].model_name, models.middle);
+    assert_eq!(after.chains["chain-infer-last"].model_name, models.last);
+    assert_eq!(
+        after.chains["chain-infer-no-evidence"].model_name,
+        models.target
+    );
+    assert_eq!(after.chains["chain-valid-mmm"].model_name, models.middle);
+    assert_eq!(
+        after.chains["chain-gpt"].model_name,
+        models.non_family_model
+    );
+    assert_chain_preimage_new_model(&fixture.state_path, "chain-infer-middle", &models.middle);
+    assert_chain_preimage_new_model(&fixture.state_path, "chain-infer-last", &models.last);
+    assert_chain_preimage_new_model(
+        &fixture.state_path,
+        "chain-infer-no-evidence",
+        &models.target,
+    );
+    assert_invocation_models_and_provider_reconciled(
+        &fixture,
+        "session-infer-middle",
+        &canonical_account(),
+        &[
+            ("61000000-0000-4000-8000-000000000001", &models.middle),
+            ("61000000-0000-4000-8000-000000000002", &models.middle),
+            ("61000000-0000-4000-8000-000000000003", &models.last),
+            ("61000000-0000-4000-8000-000000000004", &models.middle),
+            ("61000000-0000-4000-8000-000000000005", &models.middle),
+        ],
+    );
+    assert_invocation_models_and_provider_reconciled(
+        &fixture,
+        "session-infer-last",
+        &canonical_account(),
+        &[
+            ("62000000-0000-4000-8000-000000000001", &models.last),
+            ("62000000-0000-4000-8000-000000000002", &models.last),
+            ("62000000-0000-4000-8000-000000000003", &models.middle),
+        ],
+    );
+}
+
+#[test]
+fn s11_m2c_corrective_apply_is_reversible_idempotent_and_reports_inferred_model() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_corrective_primary_fixture(&fixture, &models);
+    let user_version_before = pragma_user_version(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .corrective_apply_command(Some(&backup_dir), true)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_quick_check_ok(&fixture.state_path);
+    assert_eq!(
+        pragma_user_version(&fixture.state_path),
+        user_version_before
+    );
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(
+        after.chains["chain-corrective-middle"].model_name,
+        models.middle
+    );
+    assert_eq!(
+        after.chains["chain-corrective-original-real"].model_name,
+        models.target
+    );
+    assert_eq!(
+        after.chains["chain-corrective-no-different-evidence"].model_name,
+        models.target
+    );
+    assert_eq!(
+        after.chains["chain-corrective-non-family"].model_name,
+        models.non_family_model
+    );
+    assert_eq!(corrective_preimage_row_count(&fixture.state_path), 1);
+    assert_eq!(corrective_residual_default_count(&fixture.state_path), 0);
+    let report = read_report_from_output(&output);
+    assert_corrective_apply_report(&report, &models.middle, 1, 1);
+
+    let second = fixture
+        .corrective_apply_command(Some(&backup_dir), true)
+        .output()
+        .unwrap();
+
+    assert_success(&second);
+    assert_eq!(corrective_preimage_row_count(&fixture.state_path), 1);
+    let second_report = read_report_from_output(&second);
+    assert_corrective_apply_report(&second_report, &models.middle, 0, 0);
+
+    let rollback = fixture.corrective_rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_quick_check_ok(&fixture.state_path);
+    let after_rollback = snapshot(&fixture.state_path);
+    assert_eq!(
+        after_rollback.chains["chain-corrective-middle"].model_name,
+        models.target
+    );
+    let rollback_report = read_report_from_output(&rollback);
+    assert_corrective_rollback_report(&rollback_report, 1);
+}
+
+#[test]
+fn s11_m2c_corrective_preimage_absent_fallback_requires_single_different_inventory_model() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_corrective_fallback_fixture(&fixture, &models);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .corrective_apply_command(Some(&backup_dir), true)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = snapshot(&fixture.state_path);
+    assert_eq!(
+        after.chains["chain-fallback-single"].model_name,
+        models.middle
+    );
+    assert_eq!(
+        after.chains["chain-fallback-none"].model_name,
+        models.target
+    );
+    assert_eq!(
+        after.chains["chain-fallback-conflicting"].model_name,
+        models.target
+    );
+    assert_eq!(
+        after.chains["chain-fallback-out-of-inventory"].model_name,
+        models.target
+    );
+    let report = read_report_from_output(&output);
+    assert_corrective_apply_report(&report, &models.middle, 1, 1);
+}
+
+#[test]
+fn s11_m2c_corrective_dry_run_proves_on_copy_without_live_mutation() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_corrective_primary_fixture(&fixture, &models);
+    let live_before = snapshot(&fixture.state_path);
+    let hash_before = file_hash(&fixture.state_path);
+
+    let output = fixture.corrective_dry_run_command().output().unwrap();
+
+    assert_success(&output);
+    assert_eq!(file_hash(&fixture.state_path), hash_before);
+    assert_eq!(snapshot(&fixture.state_path), live_before);
+    let state_copy = find_artifact(&fixture.scratch_dir, "state-copy.db");
+    let rollback_copy = find_artifact(&fixture.scratch_dir, "rollback-copy.db");
+    let copy_after = snapshot(&state_copy);
+    assert_eq!(
+        copy_after.chains["chain-corrective-middle"].model_name,
+        models.middle
+    );
+    let rollback_after = snapshot(&rollback_copy);
+    assert_eq!(
+        rollback_after.chains["chain-corrective-middle"].model_name,
+        models.target
+    );
+    let report = read_report(&fixture.scratch_dir);
+    assert!(
+        report.contains("s11_m2c_model_corrective_preimage"),
+        "report missing corrective preimage table: {report}"
+    );
+    assert!(
+        report.contains(&models.middle),
+        "report missing grouped inferred model: {report}"
+    );
+    assert_report_context_count(
+        &report,
+        &FIRST_FORWARD_PHASE,
+        "corrective_chain_model_updates_to_apply",
+        1,
+    );
+    assert_report_context_count(
+        &report,
+        &AFTER_IDEMPOTENCE_PHASE,
+        "corrective_chain_model_updates_to_apply",
+        0,
+    );
+    assert_report_context_count(
+        &report,
+        &ROLLBACK_COPY_PHASE,
+        "corrective_chain_model_rollback_mismatches",
+        0,
+    );
+}
+
+#[test]
+fn s11_m2c_corrective_live_mutation_gates_refuse_without_backup_or_confirmation() {
+    let missing_confirm = Fixture::new();
+    let models = missing_confirm.write_s11_m2c_scope_configs();
+    seed_corrective_primary_fixture(&missing_confirm, &models);
+    let before_missing_confirm = snapshot(&missing_confirm.state_path);
+    let backup_dir = missing_confirm.backup_dir();
+
+    let output = missing_confirm
+        .corrective_apply_command(Some(&backup_dir), false)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    assert!(combined_output(&output).contains("--confirm-mutate-live-db"));
+    assert_eq!(
+        snapshot(&missing_confirm.state_path),
+        before_missing_confirm
+    );
+
+    let missing_backup = Fixture::new();
+    let models = missing_backup.write_s11_m2c_scope_configs();
+    seed_corrective_primary_fixture(&missing_backup, &models);
+    let before_missing_backup = snapshot(&missing_backup.state_path);
+
+    let output = missing_backup
+        .corrective_apply_command(None, true)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    assert!(combined_output(&output).contains("--backup-dir"));
+    assert_eq!(snapshot(&missing_backup.state_path), before_missing_backup);
+
+    let rollback_without_confirm = Fixture::new();
+    let models = rollback_without_confirm.write_s11_m2c_scope_configs();
+    seed_corrective_primary_fixture(&rollback_without_confirm, &models);
+    let backup_dir = rollback_without_confirm.backup_dir();
+    assert_success(
+        &rollback_without_confirm
+            .corrective_apply_command(Some(&backup_dir), true)
+            .output()
+            .unwrap(),
+    );
+    let before_rollback_refusal = snapshot(&rollback_without_confirm.state_path);
+
+    let output = rollback_without_confirm
+        .corrective_rollback_command(false)
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    assert!(combined_output(&output).contains("--confirm-mutate-live-db"));
+    assert_eq!(
+        snapshot(&rollback_without_confirm.state_path),
+        before_rollback_refusal
+    );
+}
+
+#[test]
+fn s11_m2c_corrective_rollback_drift_fails_closed() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    seed_corrective_primary_fixture(&fixture, &models);
+    let backup_dir = fixture.backup_dir();
+    assert_success(
+        &fixture
+            .corrective_apply_command(Some(&backup_dir), true)
+            .output()
+            .unwrap(),
+    );
+    fixture
+        .conn()
+        .execute(
+            "UPDATE session_chains SET model_name = ?1 WHERE chain_id = 'chain-corrective-middle'",
+            [&models.last],
+        )
+        .unwrap();
+
+    let rollback = fixture.corrective_rollback_command(true).output().unwrap();
+
+    assert_failure(&rollback);
+    let combined = combined_output(&rollback) + &read_report_if_present(&fixture.scratch_dir);
+    assert!(
+        combined.contains("drift"),
+        "rollback drift missing: {combined}"
+    );
+    assert_eq!(
+        snapshot(&fixture.state_path).chains["chain-corrective-middle"].model_name,
+        models.last
+    );
+    assert_eq!(corrective_preimage_row_count(&fixture.state_path), 1);
+}
+
+#[test]
 fn s11_m2c_scope_valid_chain_merge_rolls_back_precisely() {
     let fixture = Fixture::new();
     let models = fixture.write_s11_m2c_scope_configs();
@@ -3002,12 +3490,7 @@ fn s11_m2c_resume_stale_invocation_preimage_reapply_reconciles_and_counts() {
     let stale_provider = unregistered_account_family(2);
     {
         let conn = Connection::open(&fixture.state_path).unwrap();
-        seed_stale_invocation_preimage_row(
-            &conn,
-            invocation_id,
-            &models.middle,
-            &stale_provider,
-        );
+        seed_stale_invocation_preimage_row(&conn, invocation_id, &models.middle, &stale_provider);
     }
     let backup_dir = fixture.backup_dir();
 
@@ -3341,6 +3824,383 @@ fn seed_s11_m2c_scope_population(fixture: &Fixture, models: &S11M2cScopeModels) 
         "turn-gpt",
         "assistant",
     );
+}
+
+fn seed_inference_orphan_chain(
+    conn: &Connection,
+    chain_id: &str,
+    session_id: &str,
+    provider_name: &str,
+) {
+    let turn_id = format!("turn-{session_id}");
+    seed_chain(conn, chain_id, "<unknown>");
+    seed_segment(
+        conn,
+        chain_id,
+        provider_name,
+        session_id,
+        None,
+        Some(&turn_id),
+        "initial",
+    );
+    seed_turn(conn, provider_name, session_id, &turn_id, "assistant");
+}
+
+fn seed_corrective_primary_fixture(fixture: &Fixture, models: &S11M2cScopeModels) {
+    let conn = fixture.conn();
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-middle",
+        "session-corrective-middle",
+        &models.target,
+        "<unknown>",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "71000000-0000-4000-8000-000000000001",
+        &models.middle,
+        &canonical_account(),
+        "session-corrective-middle",
+        "succeeded",
+        "2026-06-20T10:01:00Z",
+    );
+    seed_invocation(
+        &conn,
+        "71000000-0000-4000-8000-000000000002",
+        &models.middle,
+        &canonical_account(),
+        "session-corrective-middle",
+        "succeeded",
+        "2026-06-20T10:02:00Z",
+    );
+
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-original-real",
+        "session-corrective-original-real",
+        &models.target,
+        &models.middle,
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "72000000-0000-4000-8000-000000000001",
+        &models.last,
+        &canonical_account(),
+        "session-corrective-original-real",
+        "succeeded",
+        "2026-06-20T10:03:00Z",
+    );
+
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-no-different-evidence",
+        "session-corrective-no-different-evidence",
+        &models.target,
+        "<unknown>",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "73000000-0000-4000-8000-000000000001",
+        &models.target,
+        &canonical_account(),
+        "session-corrective-no-different-evidence",
+        "succeeded",
+        "2026-06-20T10:04:00Z",
+    );
+    seed_invocation(
+        &conn,
+        "73000000-0000-4000-8000-000000000002",
+        "<unknown>",
+        &canonical_account(),
+        "session-corrective-no-different-evidence",
+        "failed",
+        "2026-06-20T10:05:00Z",
+    );
+
+    seed_corrective_chain(
+        &conn,
+        "chain-corrective-non-family",
+        "session-corrective-non-family",
+        &models.non_family_model,
+        "<unknown>",
+        &models.target,
+        &models.non_family_account,
+    );
+    seed_invocation(
+        &conn,
+        "74000000-0000-4000-8000-000000000001",
+        &models.last,
+        &models.non_family_account,
+        "session-corrective-non-family",
+        "succeeded",
+        "2026-06-20T10:06:00Z",
+    );
+}
+
+fn seed_corrective_fallback_fixture(fixture: &Fixture, models: &S11M2cScopeModels) {
+    let conn = fixture.conn();
+    seed_current_default_chain(
+        &conn,
+        "chain-fallback-single",
+        "session-fallback-single",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "81000000-0000-4000-8000-000000000001",
+        &models.middle,
+        &canonical_account(),
+        "session-fallback-single",
+        "succeeded",
+        "2026-06-20T10:01:00Z",
+    );
+
+    seed_current_default_chain(
+        &conn,
+        "chain-fallback-none",
+        "session-fallback-none",
+        &models.target,
+        &canonical_account(),
+    );
+
+    seed_current_default_chain(
+        &conn,
+        "chain-fallback-conflicting",
+        "session-fallback-conflicting",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "82000000-0000-4000-8000-000000000001",
+        &models.middle,
+        &canonical_account(),
+        "session-fallback-conflicting",
+        "succeeded",
+        "2026-06-20T10:02:00Z",
+    );
+    seed_invocation(
+        &conn,
+        "82000000-0000-4000-8000-000000000002",
+        &models.last,
+        &canonical_account(),
+        "session-fallback-conflicting",
+        "succeeded",
+        "2026-06-20T10:03:00Z",
+    );
+
+    seed_current_default_chain(
+        &conn,
+        "chain-fallback-out-of-inventory",
+        "session-fallback-out-of-inventory",
+        &models.target,
+        &canonical_account(),
+    );
+    seed_invocation(
+        &conn,
+        "83000000-0000-4000-8000-000000000001",
+        &source_model_name(),
+        &canonical_account(),
+        "session-fallback-out-of-inventory",
+        "succeeded",
+        "2026-06-20T10:04:00Z",
+    );
+}
+
+fn seed_current_default_chain(
+    conn: &Connection,
+    chain_id: &str,
+    session_id: &str,
+    model_name: &str,
+    provider_name: &str,
+) {
+    let turn_id = format!("turn-{session_id}");
+    seed_chain(conn, chain_id, model_name);
+    seed_segment(
+        conn,
+        chain_id,
+        provider_name,
+        session_id,
+        None,
+        Some(&turn_id),
+        "initial",
+    );
+    seed_turn(conn, provider_name, session_id, &turn_id, "assistant");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_corrective_chain(
+    conn: &Connection,
+    chain_id: &str,
+    session_id: &str,
+    current_model_name: &str,
+    original_old_model_name: &str,
+    original_new_model_name: &str,
+    provider_name: &str,
+) {
+    seed_current_default_chain(
+        conn,
+        chain_id,
+        session_id,
+        current_model_name,
+        provider_name,
+    );
+    ensure_original_preimage_table(conn);
+    conn.execute(
+        "INSERT INTO s11_wu4_restore_session_ownership_preimage
+         (migration_id, entity_kind, row_pk, chain_id, old_model_name, new_model_name)
+         VALUES (?1, 'chain', ?2, ?2, ?3, ?4)",
+        params![
+            SESSION_OWNERSHIP_MIGRATION_ID,
+            chain_id,
+            original_old_model_name,
+            original_new_model_name,
+        ],
+    )
+    .unwrap();
+}
+
+fn ensure_original_preimage_table(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS s11_wu4_restore_session_ownership_preimage (
+            migration_id TEXT NOT NULL,
+            entity_kind TEXT NOT NULL CHECK(entity_kind IN ('chain', 'segment', 'turn', 'invocation', 'segment_delete', 'turn_delete', 'segment_merge_survivor')),
+            row_pk TEXT NOT NULL,
+            chain_id TEXT,
+            segment_id INTEGER,
+            turn_row_id INTEGER,
+            old_model_name TEXT,
+            new_model_name TEXT,
+            old_provider_name TEXT,
+            new_provider_name TEXT,
+            session_id TEXT,
+            segment_started_at TEXT,
+            segment_ended_at TEXT,
+            segment_last_turn_id TEXT,
+            segment_transition_reason TEXT,
+            turn_id TEXT,
+            turn_timestamp TEXT,
+            turn_role TEXT,
+            turn_parent_turn_id TEXT,
+            turn_is_sidechain INTEGER,
+            turn_is_compaction_boundary INTEGER,
+            turn_source_file TEXT,
+            turn_ingested_at TEXT,
+            turn_body TEXT,
+            new_started_at TEXT,
+            new_ended_at TEXT,
+            new_last_turn_id TEXT,
+            new_transition_reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (migration_id, entity_kind, row_pk)
+        );",
+    )
+    .unwrap();
+}
+
+fn assert_chain_preimage_new_model(path: &Path, chain_id: &str, expected_new_model: &str) {
+    let conn = Connection::open(path).unwrap();
+    let actual: String = conn
+        .query_row(
+            "SELECT new_model_name
+             FROM s11_wu4_restore_session_ownership_preimage
+             WHERE entity_kind = 'chain' AND chain_id = ?1",
+            [chain_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|err| panic!("missing chain preimage for {chain_id}: {err}"));
+    assert_eq!(actual, expected_new_model);
+}
+
+fn pragma_user_version(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn corrective_preimage_row_count(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    if !table_exists(&conn, "s11_m2c_model_corrective_preimage") {
+        return 0;
+    }
+    conn.query_row(
+        "SELECT COUNT(*) FROM s11_m2c_model_corrective_preimage",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn corrective_residual_default_count(path: &Path) -> i64 {
+    let conn = Connection::open(path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_m2c_model_corrective_preimage p
+         JOIN session_chains c ON c.chain_id = p.chain_id
+         WHERE c.model_name = p.old_model_name",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn assert_corrective_apply_report(
+    report: &str,
+    expected_inferred_model: &str,
+    expected_planned: i64,
+    expected_applied: i64,
+) {
+    assert!(
+        report.contains("preimage_table") && report.contains("s11_m2c_model_corrective_preimage"),
+        "report missing corrective preimage identity: {report}"
+    );
+    assert_report_count(
+        report,
+        "corrective_chain_model_updates_to_apply",
+        expected_planned,
+    );
+    assert_report_count(
+        report,
+        "corrective_chain_model_updates_applied",
+        expected_applied,
+    );
+    assert_report_count(report, "corrective_preimage_rows", expected_applied.max(1));
+    assert!(
+        report.contains("new_model_name") && report.contains(expected_inferred_model),
+        "report missing inferred-model grouping for {expected_inferred_model}: {report}"
+    );
+    assert!(
+        report.contains("quick_check") && report.contains("ok"),
+        "report missing quick_check ok: {report}"
+    );
+    assert!(
+        report.contains("user_version"),
+        "report missing user_version: {report}"
+    );
+}
+
+fn assert_corrective_rollback_report(report: &str, expected_restored: i64) {
+    assert!(
+        report.contains("preimage_table") && report.contains("s11_m2c_model_corrective_preimage"),
+        "rollback report missing corrective preimage identity: {report}"
+    );
+    assert!(
+        report.contains("restored_model_semantics") && report.contains("backfill_default"),
+        "rollback report missing default-restoration semantics: {report}"
+    );
+    assert_report_count(
+        report,
+        "corrective_chain_model_updates_restored",
+        expected_restored,
+    );
+    assert_report_count(report, "corrective_chain_model_rollback_mismatches", 0);
 }
 
 fn fake_contract_provider_script() -> String {

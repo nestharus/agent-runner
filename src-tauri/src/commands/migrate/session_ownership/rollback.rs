@@ -45,3 +45,33 @@ pub(crate) fn run_session_ownership_rollback(
     sql::drop_preimage_artifacts(&conn)?;
     Ok(RollbackOutcome { report_path })
 }
+
+pub(crate) fn run_session_ownership_corrective_rollback(
+    opts: RollbackOptions,
+) -> Result<RollbackOutcome, DryRunError> {
+    let conn = open_live_migration_connection(&opts.live_state_db_path)?;
+    let before = preflight::preflight(&conn)?;
+    let preimage_rows = sql::require_corrective_preimage_rows(&conn)?;
+    let rollback = sql::apply_corrective_rollback_live(&conn)?;
+    let restored_mismatches = sql::verify_corrective_rollback_restored(&conn)?;
+    let after = preflight::inspect_integrity(&conn)?;
+    if after.quick_check != "ok" {
+        return Err(DryRunError::new(format!(
+            "corrective rollback quick_check failed: {}",
+            after.quick_check
+        )));
+    }
+    let source_path = opts.live_state_db_path.canonicalize()?;
+    let report_path =
+        report::write_corrective_rollback_report(&report::CorrectiveRollbackReportInput {
+            report_dir: report::default_rollback_report_dir(&source_path),
+            source_path,
+            before,
+            after,
+            preimage_rows,
+            rollback,
+            restored_mismatches,
+        })?;
+    sql::drop_corrective_preimage_artifacts(&conn)?;
+    Ok(RollbackOutcome { report_path })
+}

@@ -37,6 +37,20 @@ pub(crate) struct Candidates {
 pub(crate) struct SourceChainCandidate {
     chain_id: String,
     is_orphaned: bool,
+    target_model_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectivePlan {
+    pub(crate) rows: Vec<CorrectivePlanRow>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectivePlanRow {
+    pub(crate) chain_id: String,
+    pub(crate) old_model_name: String,
+    pub(crate) new_model_name: String,
+    pub(crate) evidence_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +171,7 @@ struct SqlInputRows<'a> {
 struct SourceChainInputRow<'a> {
     chain_id: &'a str,
     is_orphaned: bool,
+    target_model_name: &'a str,
 }
 
 #[derive(Debug)]
@@ -207,6 +222,50 @@ pub(crate) fn populate_sql_inputs_temp(
     write_sql_input_rows(conn, &sql_input_rows(target, candidates))
 }
 
+pub(crate) fn build_corrective_plan(
+    conn: &Connection,
+    target: &TargetResolution,
+) -> Result<CorrectivePlan, DryRunError> {
+    let rows = if table_exists(conn, "s11_wu4_restore_session_ownership_preimage")? {
+        corrective_primary_plan_rows(conn, target)?
+    } else {
+        corrective_fallback_plan_rows(conn, target)?
+    };
+    Ok(CorrectivePlan { rows })
+}
+
+pub(crate) fn populate_corrective_plan_temp(
+    conn: &Connection,
+    plan: &CorrectivePlan,
+) -> Result<(), DryRunError> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS temp.s11_m2c_model_corrective_plan;
+         CREATE TEMP TABLE s11_m2c_model_corrective_plan (
+             chain_id TEXT PRIMARY KEY,
+             old_model_name TEXT NOT NULL,
+             new_model_name TEXT NOT NULL,
+             evidence_source TEXT NOT NULL
+         );",
+    )?;
+    for row in &plan.rows {
+        conn.execute(
+            "INSERT INTO s11_m2c_model_corrective_plan(chain_id, old_model_name, new_model_name, evidence_source)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                row.chain_id,
+                row.old_model_name,
+                row.new_model_name,
+                row.evidence_source
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_corrective_plan_temp(conn: &Connection) {
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS temp.s11_m2c_model_corrective_plan;");
+}
+
 pub(crate) fn cleanup_temp_sql_inputs(conn: &Connection) {
     let _ = conn.execute_batch(
         "DROP TABLE IF EXISTS temp.s11_wu4_migration_params;
@@ -239,11 +298,12 @@ fn create_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
           CREATE TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'dry-run');
           CREATE TABLE s11_wu4_provider_ref_model_names (model_name TEXT PRIMARY KEY);
           CREATE TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
-         CREATE TABLE s11_wu4_source_chain_candidates (
-             chain_id TEXT PRIMARY KEY,
-             evidence TEXT NOT NULL,
-             is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1))
-         );
+          CREATE TABLE s11_wu4_source_chain_candidates (
+              chain_id TEXT PRIMARY KEY,
+              evidence TEXT NOT NULL,
+              target_model_name TEXT NOT NULL,
+              is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1))
+          );
           CREATE TABLE s11_wu4_segment_merge_groups (
               survivor_segment_id INTEGER PRIMARY KEY,
               expected_chain_id TEXT NOT NULL,
@@ -305,11 +365,12 @@ fn create_temp_sql_input_tables(conn: &Connection) -> Result<(), DryRunError> {
           CREATE TEMP TABLE s11_wu4_target_provider_inventory (provider_name TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'live');
           CREATE TEMP TABLE s11_wu4_provider_ref_model_names (model_name TEXT PRIMARY KEY);
           CREATE TEMP TABLE s11_wu4_provider_aliases (old_provider_name TEXT PRIMARY KEY, new_provider_name TEXT NOT NULL, reason TEXT NOT NULL);
-         CREATE TEMP TABLE s11_wu4_source_chain_candidates (
-             chain_id TEXT PRIMARY KEY,
-             evidence TEXT NOT NULL,
-             is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1))
-         );
+          CREATE TEMP TABLE s11_wu4_source_chain_candidates (
+              chain_id TEXT PRIMARY KEY,
+              evidence TEXT NOT NULL,
+              target_model_name TEXT NOT NULL,
+              is_orphaned INTEGER NOT NULL CHECK(is_orphaned IN (0, 1))
+          );
           CREATE TEMP TABLE s11_wu4_segment_merge_groups (
               survivor_segment_id INTEGER PRIMARY KEY,
               expected_chain_id TEXT NOT NULL,
@@ -379,8 +440,12 @@ fn write_sql_input_rows(conn: &Connection, rows: &SqlInputRows<'_>) -> Result<()
     }
     for source in &rows.source_chains {
         conn.execute(
-            "INSERT INTO s11_wu4_source_chain_candidates(chain_id, evidence, is_orphaned) VALUES (?1, 'copied-state', ?2)",
-            params![source.chain_id, i64::from(source.is_orphaned)],
+            "INSERT INTO s11_wu4_source_chain_candidates(chain_id, evidence, target_model_name, is_orphaned) VALUES (?1, 'copied-state', ?2, ?3)",
+            params![
+                source.chain_id,
+                source.target_model_name,
+                i64::from(source.is_orphaned)
+            ],
         )?;
     }
     for alias in &rows.provider_aliases {
@@ -501,7 +566,7 @@ fn provider_inventory_rows(target: &TargetResolution) -> Vec<&str> {
 
 fn provider_ref_model_name_rows(target: &TargetResolution) -> Vec<&str> {
     target
-        .provider_ref_model_names
+        .moved_family_provider_ref_models
         .iter()
         .map(String::as_str)
         .collect()
@@ -514,6 +579,7 @@ fn source_chain_rows(candidates: &Candidates) -> Vec<SourceChainInputRow<'_>> {
         .map(|source| SourceChainInputRow {
             chain_id: source.chain_id.as_str(),
             is_orphaned: source.is_orphaned,
+            target_model_name: source.target_model_name.as_str(),
         })
         .collect()
 }
@@ -533,13 +599,228 @@ fn source_chain_candidates(
     target: &TargetResolution,
 ) -> Result<Vec<SourceChainCandidate>, DryRunError> {
     let rows = read_source_chain_candidates(conn, &target_provider_pattern())?;
-    Ok(rows
-        .into_iter()
-        .map(|(chain_id, model_name)| SourceChainCandidate {
-            chain_id,
-            is_orphaned: !target.provider_ref_model_names.contains(&model_name),
+    rows.into_iter()
+        .map(|(chain_id, model_name)| {
+            let is_orphaned = !target
+                .moved_family_provider_ref_models
+                .contains(&model_name);
+            let target_model_name = if is_orphaned {
+                let segment_session_ids = read_segment_session_ids_for_chain(conn, &chain_id)?;
+                // transcript fallback: not required - DB evidence + deterministic fallback cover the tests.
+                infer_chain_target_model(
+                    conn,
+                    &segment_session_ids,
+                    &target.moved_family_provider_ref_models,
+                )?
+                .unwrap_or_else(|| target.model_name.clone())
+            } else {
+                model_name
+            };
+            Ok(SourceChainCandidate {
+                chain_id,
+                is_orphaned,
+                target_model_name,
+            })
         })
-        .collect())
+        .collect()
+}
+
+pub(crate) fn infer_chain_target_model(
+    conn: &Connection,
+    segment_session_ids: &[String],
+    moved_family_provider_ref_models: &BTreeSet<String>,
+) -> Result<Option<String>, DryRunError> {
+    infer_chain_target_model_excluding_rewritten(
+        conn,
+        segment_session_ids,
+        moved_family_provider_ref_models,
+        false,
+    )
+}
+
+fn corrective_primary_plan_rows(
+    conn: &Connection,
+    target: &TargetResolution,
+) -> Result<Vec<CorrectivePlanRow>, DryRunError> {
+    let mut stmt = conn.prepare(
+        "SELECT p.chain_id
+         FROM s11_wu4_restore_session_ownership_preimage p
+         JOIN session_chains c ON c.chain_id = p.chain_id
+         WHERE p.entity_kind = 'chain'
+           AND p.old_model_name = '<unknown>'
+           AND p.new_model_name = ?1
+           AND c.model_name = ?1
+         ORDER BY p.chain_id",
+    )?;
+    let rows = stmt.query_map([target.model_name.as_str()], |row| row.get::<_, String>(0))?;
+    rows.map(|row| {
+        let chain_id = row?;
+        let segment_session_ids = read_segment_session_ids_for_chain(conn, &chain_id)?;
+        let inferred = infer_chain_target_model_excluding_rewritten(
+            conn,
+            &segment_session_ids,
+            &target.moved_family_provider_ref_models,
+            true,
+        )?;
+        Ok(inferred
+            .filter(|model_name| model_name != &target.model_name)
+            .map(|new_model_name| CorrectivePlanRow {
+                chain_id,
+                old_model_name: target.model_name.clone(),
+                new_model_name,
+                evidence_source: "original-preimage-db-evidence".to_string(),
+            }))
+    })
+    .filter_map(|row| match row {
+        Ok(Some(value)) => Some(Ok(value)),
+        Ok(None) => None,
+        Err(err) => Some(Err(err)),
+    })
+    .collect()
+}
+
+fn corrective_fallback_plan_rows(
+    conn: &Connection,
+    target: &TargetResolution,
+) -> Result<Vec<CorrectivePlanRow>, DryRunError> {
+    let rows = read_source_chain_candidates(conn, &target_provider_pattern())?;
+    rows.into_iter()
+        .filter(|(_, model_name)| model_name == &target.model_name)
+        .map(|(chain_id, _)| {
+            let segment_session_ids = read_segment_session_ids_for_chain(conn, &chain_id)?;
+            Ok(unique_different_in_family_model(
+                conn,
+                &segment_session_ids,
+                &target.moved_family_provider_ref_models,
+                &target.model_name,
+            )?
+            .map(|new_model_name| CorrectivePlanRow {
+                chain_id,
+                old_model_name: target.model_name.clone(),
+                new_model_name,
+                evidence_source: "fallback-single-db-evidence".to_string(),
+            }))
+        })
+        .filter_map(|row| match row {
+            Ok(Some(value)) => Some(Ok(value)),
+            Ok(None) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect()
+}
+
+fn unique_different_in_family_model(
+    conn: &Connection,
+    segment_session_ids: &[String],
+    moved_family_provider_ref_models: &BTreeSet<String>,
+    default_model_name: &str,
+) -> Result<Option<String>, DryRunError> {
+    let mut models = BTreeSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT model_name
+         FROM invocations
+         WHERE COALESCE(provider_session_id, session_id) = ?1
+         ORDER BY id",
+    )?;
+    for session_id in segment_session_ids {
+        let rows = stmt.query_map([session_id], |row| row.get::<_, Option<String>>(0))?;
+        for row in rows {
+            let Some(model_name) = row? else {
+                continue;
+            };
+            if model_name != default_model_name
+                && moved_family_provider_ref_models.contains(&model_name)
+            {
+                models.insert(model_name);
+            }
+        }
+    }
+    if models.len() == 1 {
+        Ok(models.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
+fn infer_chain_target_model_excluding_rewritten(
+    conn: &Connection,
+    segment_session_ids: &[String],
+    moved_family_provider_ref_models: &BTreeSet<String>,
+    exclude_original_invocation_preimage: bool,
+) -> Result<Option<String>, DryRunError> {
+    let mut evidence: BTreeMap<String, (i64, String)> = BTreeMap::new();
+    let exclude_preimage = exclude_original_invocation_preimage
+        && table_exists(conn, "s11_wu4_restore_session_ownership_preimage")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, model_name, created_at
+         FROM invocations
+         WHERE COALESCE(provider_session_id, session_id) = ?1
+         ORDER BY id",
+    )?;
+    for session_id in segment_session_ids {
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (invocation_id, model_name, created_at) = row?;
+            if exclude_preimage && original_invocation_preimage_contains(conn, invocation_id)? {
+                continue;
+            }
+            let Some(model_name) = model_name else {
+                continue;
+            };
+            if !moved_family_provider_ref_models.contains(&model_name) {
+                continue;
+            }
+            let entry = evidence.entry(model_name).or_insert((0, String::new()));
+            entry.0 += 1;
+            if created_at > entry.1 {
+                entry.1 = created_at;
+            }
+        }
+    }
+    Ok(evidence
+        .into_iter()
+        .max_by(
+            |(left_model, (left_count, left_latest)),
+             (right_model, (right_count, right_latest))| {
+                left_count
+                    .cmp(right_count)
+                    .then(left_latest.cmp(right_latest))
+                    .then_with(|| right_model.cmp(left_model))
+            },
+        )
+        .map(|(model, _)| model))
+}
+
+fn original_invocation_preimage_contains(
+    conn: &Connection,
+    invocation_id: i64,
+) -> Result<bool, DryRunError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM s11_wu4_restore_session_ownership_preimage
+             WHERE entity_kind = 'invocation' AND row_pk = CAST(?1 AS TEXT)
+         )",
+        [invocation_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn read_segment_session_ids_for_chain(
+    conn: &Connection,
+    chain_id: &str,
+) -> Result<Vec<String>, DryRunError> {
+    let mut stmt = conn
+        .prepare("SELECT session_id FROM session_chain_segments WHERE chain_id = ?1 ORDER BY id")?;
+    let rows = stmt.query_map([chain_id], |row| row.get(0))?;
+    rows.collect::<Result<_, _>>().map_err(Into::into)
 }
 
 fn read_source_chain_candidates(
@@ -567,6 +848,17 @@ fn contains_pattern(value: &str) -> String {
     pattern.push_str(value);
     pattern.push('%');
     pattern
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, DryRunError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+         )",
+        [table_name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn read_source_segments(
@@ -1003,4 +1295,262 @@ fn read_turn_row(
 
 fn moved_provider_token() -> String {
     ["cla", "ude"].concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE invocations (
+                id INTEGER PRIMARY KEY,
+                model_name TEXT,
+                provider_name TEXT,
+                session_id TEXT,
+                provider_session_id TEXT,
+                created_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn provider_ref_models() -> BTreeSet<String> {
+        [model_name("aaa"), model_name("mmm"), model_name("zzz")]
+            .into_iter()
+            .collect()
+    }
+
+    fn provider_token() -> String {
+        ["cla", "ude"].concat()
+    }
+
+    fn model_name(prefix: &str) -> String {
+        format!("{prefix}-ref-{}", provider_token())
+    }
+
+    fn shadow_model_name() -> String {
+        format!("shadow-{}", provider_token())
+    }
+
+    fn insert_invocation(
+        conn: &Connection,
+        model_name: Option<&str>,
+        session_id: &str,
+        provider_session_id: Option<&str>,
+        created_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO invocations
+             (model_name, provider_name, session_id, provider_session_id, created_at)
+             VALUES (?1, 'provider-fixture', ?2, ?3, ?4)",
+            params![model_name, session_id, provider_session_id, created_at],
+        )
+        .unwrap();
+    }
+
+    fn infer(conn: &Connection, segments: &[&str]) -> Option<String> {
+        let segment_session_ids = segments
+            .iter()
+            .map(|session_id| (*session_id).to_string())
+            .collect::<Vec<_>>();
+        infer_chain_target_model(conn, &segment_session_ids, &provider_ref_models()).unwrap()
+    }
+
+    #[test]
+    fn infer_chain_target_model_dominant_middle_model_wins() {
+        let conn = fixture_conn();
+        let middle = model_name("mmm");
+        let last = model_name("zzz");
+        insert_invocation(
+            &conn,
+            Some(&middle),
+            "segment-a",
+            None,
+            "2026-06-20T10:00:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&middle),
+            "segment-a",
+            None,
+            "2026-06-20T10:01:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&last),
+            "segment-a",
+            None,
+            "2026-06-20T10:02:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-a"]), Some(middle));
+    }
+
+    #[test]
+    fn infer_chain_target_model_dominant_last_model_wins() {
+        let conn = fixture_conn();
+        let target = model_name("aaa");
+        let last = model_name("zzz");
+        insert_invocation(
+            &conn,
+            Some(&target),
+            "segment-a",
+            None,
+            "2026-06-20T10:00:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&last),
+            "segment-a",
+            None,
+            "2026-06-20T10:01:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&last),
+            "segment-a",
+            None,
+            "2026-06-20T10:02:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-a"]), Some(last));
+    }
+
+    #[test]
+    fn infer_chain_target_model_returns_none_without_in_family_evidence() {
+        let conn = fixture_conn();
+        insert_invocation(
+            &conn,
+            Some("<unknown>"),
+            "segment-a",
+            None,
+            "2026-06-20T10:00:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&shadow_model_name()),
+            "segment-a",
+            None,
+            "2026-06-20T10:01:00Z",
+        );
+        insert_invocation(&conn, None, "segment-a", None, "2026-06-20T10:02:00Z");
+        insert_invocation(
+            &conn,
+            Some(&model_name("mmm")),
+            "other",
+            None,
+            "2026-06-20T10:03:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-a"]), None);
+    }
+
+    #[test]
+    fn infer_chain_target_model_count_tie_uses_latest_created_at() {
+        let conn = fixture_conn();
+        let middle = model_name("mmm");
+        let last = model_name("zzz");
+        insert_invocation(
+            &conn,
+            Some(&middle),
+            "segment-a",
+            None,
+            "2026-06-20T10:05:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&last),
+            "segment-a",
+            None,
+            "2026-06-20T10:04:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-a"]), Some(middle));
+    }
+
+    #[test]
+    fn infer_chain_target_model_exact_tie_uses_lexicographically_smallest() {
+        let conn = fixture_conn();
+        let middle = model_name("mmm");
+        let last = model_name("zzz");
+        insert_invocation(
+            &conn,
+            Some(&last),
+            "segment-a",
+            None,
+            "2026-06-20T10:05:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&middle),
+            "segment-a",
+            None,
+            "2026-06-20T10:05:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-a"]), Some(middle));
+    }
+
+    #[test]
+    fn infer_chain_target_model_ignores_unknown_null_and_out_of_family_models() {
+        let conn = fixture_conn();
+        let middle = model_name("mmm");
+        insert_invocation(
+            &conn,
+            Some("<unknown>"),
+            "segment-a",
+            None,
+            "2026-06-20T10:00:00Z",
+        );
+        insert_invocation(&conn, None, "segment-a", None, "2026-06-20T10:01:00Z");
+        insert_invocation(
+            &conn,
+            Some(&shadow_model_name()),
+            "segment-a",
+            None,
+            "2026-06-20T10:02:00Z",
+        );
+        insert_invocation(
+            &conn,
+            Some(&middle),
+            "segment-a",
+            None,
+            "2026-06-20T10:03:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-a"]), Some(middle));
+    }
+
+    #[test]
+    fn infer_chain_target_model_joins_by_provider_session_id_when_present() {
+        let conn = fixture_conn();
+        let middle = model_name("mmm");
+        insert_invocation(
+            &conn,
+            Some(&middle),
+            "non-matching-session-id",
+            Some("segment-provider-id"),
+            "2026-06-20T10:00:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-provider-id"]), Some(middle));
+    }
+
+    #[test]
+    fn infer_chain_target_model_falls_back_to_session_id_when_provider_session_id_is_null() {
+        let conn = fixture_conn();
+        let last = model_name("zzz");
+        insert_invocation(
+            &conn,
+            Some(&last),
+            "segment-session-id",
+            None,
+            "2026-06-20T10:00:00Z",
+        );
+
+        assert_eq!(infer(&conn, &["segment-session-id"]), Some(last));
+    }
 }

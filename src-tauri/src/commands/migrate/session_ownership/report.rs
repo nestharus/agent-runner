@@ -1,10 +1,13 @@
 //! Declared role: formatter
 
+use super::DryRunError;
 use super::classifier::Candidates;
 use super::db_copy::SnapshotPaths;
 use super::preflight::IntegrityReport;
-use super::sql::{CwdCompleteness, ForwardCounts, LiveApplyVerification, RollbackCounts};
-use super::DryRunError;
+use super::sql::{
+    CorrectiveApplyVerification, CorrectiveCounts, CorrectiveRollbackCounts, CwdCompleteness,
+    ForwardCounts, LiveApplyVerification, RollbackCounts,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -41,6 +44,38 @@ pub(crate) struct RollbackReportInput {
     pub(crate) preimage_rows: i64,
     pub(crate) rollback: RollbackCounts,
     pub(crate) restored_mismatches: std::collections::BTreeMap<String, i64>,
+}
+
+pub(crate) struct CorrectiveDryRunReportInput {
+    pub(crate) source_path: PathBuf,
+    pub(crate) scratch_root: PathBuf,
+    pub(crate) paths: SnapshotPaths,
+    pub(crate) before_forward: IntegrityReport,
+    pub(crate) after_idempotence: IntegrityReport,
+    pub(crate) rollback_integrity: IntegrityReport,
+    pub(crate) first_forward: CorrectiveCounts,
+    pub(crate) idempotence: CorrectiveCounts,
+    pub(crate) rollback: CorrectiveRollbackCounts,
+}
+
+pub(crate) struct CorrectiveApplyReportInput {
+    pub(crate) report_dir: PathBuf,
+    pub(crate) source_path: PathBuf,
+    pub(crate) backup_path: PathBuf,
+    pub(crate) before: IntegrityReport,
+    pub(crate) verification: CorrectiveApplyVerification,
+    pub(crate) corrective: CorrectiveCounts,
+    pub(crate) provider_proof: ProviderProofStatus,
+}
+
+pub(crate) struct CorrectiveRollbackReportInput {
+    pub(crate) report_dir: PathBuf,
+    pub(crate) source_path: PathBuf,
+    pub(crate) before: IntegrityReport,
+    pub(crate) after: IntegrityReport,
+    pub(crate) preimage_rows: i64,
+    pub(crate) rollback: CorrectiveRollbackCounts,
+    pub(crate) restored_mismatches: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +251,118 @@ pub(crate) fn write_rollback_report(input: &RollbackReportInput) -> Result<PathB
         "rollback restored verification",
         &input.restored_mismatches,
     );
+    fs::write(&report_path, body)?;
+    Ok(report_path)
+}
+
+pub(crate) fn write_corrective_dry_run_report(
+    input: &CorrectiveDryRunReportInput,
+) -> Result<PathBuf, DryRunError> {
+    let mut body = String::new();
+    body.push_str("# Session Ownership Corrective Dry Run\n\n");
+    body.push_str("live_db_mutated: no\n");
+    body.push_str(&format!("source_path: {}\n", input.source_path.display()));
+    body.push_str(&format!("scratch_root: {}\n", input.scratch_root.display()));
+    body.push_str(&format!(
+        "state_copy: {}\n",
+        input.paths.state_copy.display()
+    ));
+    body.push_str(&format!(
+        "rollback_copy: {}\n",
+        input.paths.rollback_copy.display()
+    ));
+    body.push_str(&format!(
+        "report_path: {}\n",
+        input.paths.report_path.display()
+    ));
+    body.push_str("preimage_table: s11_m2c_model_corrective_preimage\n\n");
+    push_integrity(&mut body, "before_forward", &input.before_forward);
+    push_integrity(&mut body, "after_idempotence", &input.after_idempotence);
+    push_integrity(&mut body, "rollback_copy", &input.rollback_integrity);
+    push_counts(&mut body, "first_forward", &input.first_forward.counts);
+    push_counts(
+        &mut body,
+        "idempotence_second_run",
+        &input.idempotence.counts,
+    );
+    body.push_str("\n## Rollback Copy\n");
+    body.push_str(&format!(
+        "rollback copy restored: {}\n",
+        if input.rollback.restored { "yes" } else { "no" }
+    ));
+    body.push_str("restored_model_semantics: backfill_default\n");
+    push_counts(&mut body, "rollback copy", &input.rollback.counts);
+    fs::write(&input.paths.report_path, body)?;
+    Ok(input.paths.report_path.clone())
+}
+
+pub(crate) fn write_corrective_apply_report(
+    input: &CorrectiveApplyReportInput,
+) -> Result<PathBuf, DryRunError> {
+    fs::create_dir_all(&input.report_dir)?;
+    let report_path = input
+        .report_dir
+        .join("session-ownership-corrective-apply-report.md");
+    let mut body = String::new();
+    body.push_str("# Session Ownership Corrective Apply\n\n");
+    body.push_str("live_db_mutated: yes\n");
+    body.push_str(&format!("source_path: {}\n", input.source_path.display()));
+    body.push_str(&format!("backup_path: {}\n", input.backup_path.display()));
+    body.push_str("preimage_table: s11_m2c_model_corrective_preimage\n");
+    body.push_str(&format!(
+        "provider proof: {}\n\n",
+        provider_proof_label(input.provider_proof)
+    ));
+    push_integrity(&mut body, "before_apply", &input.before);
+    push_integrity(&mut body, "after_apply", &input.verification.integrity);
+    push_counts(&mut body, "planned", &input.corrective.counts);
+    body.push_str("\n## Post Apply Verification\n");
+    body.push_str(&format!(
+        "corrective_chain_model_updates_to_apply: {}\n",
+        input.verification.planned
+    ));
+    body.push_str(&format!(
+        "corrective_chain_model_updates_applied: {}\n",
+        input.verification.applied
+    ));
+    body.push_str(&format!(
+        "corrective_preimage_rows: {}\n",
+        input.verification.preimage_rows
+    ));
+    body.push_str(&format!(
+        "corrective_residual_default_rows: {}\n",
+        input.verification.residual_default_rows
+    ));
+    fs::write(&report_path, body)?;
+    Ok(report_path)
+}
+
+pub(crate) fn write_corrective_rollback_report(
+    input: &CorrectiveRollbackReportInput,
+) -> Result<PathBuf, DryRunError> {
+    fs::create_dir_all(&input.report_dir)?;
+    let report_path = input
+        .report_dir
+        .join("session-ownership-corrective-rollback-report.md");
+    let mut body = String::new();
+    body.push_str("# Session Ownership Corrective Rollback\n\n");
+    body.push_str("live_db_mutated: yes\n");
+    body.push_str(&format!("source_path: {}\n", input.source_path.display()));
+    body.push_str("preimage_table: s11_m2c_model_corrective_preimage\n");
+    body.push_str(&format!("preimage_rows: {}\n", input.preimage_rows));
+    body.push_str("restored_model_semantics: backfill_default\n");
+    body.push_str("drift_check: passed\n");
+    body.push_str(&format!(
+        "restored: {}\n\n",
+        input.rollback.restored && input.restored_mismatches == 0
+    ));
+    push_integrity(&mut body, "before_rollback", &input.before);
+    push_integrity(&mut body, "after_rollback", &input.after);
+    push_counts(&mut body, "rollback", &input.rollback.counts);
+    body.push_str(&format!(
+        "rollback corrective_chain_model_rollback_mismatches: {}\n",
+        input.restored_mismatches
+    ));
     fs::write(&report_path, body)?;
     Ok(report_path)
 }

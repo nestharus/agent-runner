@@ -5,7 +5,7 @@ use crate::cli::paths::default_models_dir;
 use crate::provider_artifact::provider_artifact_from_ref;
 use crate::provider_proof::prove_provider_artifact;
 use oulipoly_config::{
-    load_models, ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig,
+    ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig, load_models,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use std::collections::{BTreeSet, HashMap};
@@ -21,7 +21,7 @@ pub(crate) struct TargetResolution {
     pub(crate) model_name: String,
     pub(crate) canonical_provider_name: String,
     pub(crate) inventory: Vec<String>,
-    pub(crate) provider_ref_model_names: BTreeSet<String>,
+    pub(crate) moved_family_provider_ref_models: BTreeSet<String>,
     provider_artifact: ProviderArtifactRef,
 }
 
@@ -33,7 +33,8 @@ pub(crate) fn resolve_target(
     let model = require_target_model(select_target_model(&loaded.models, &target_binary))?;
     let provider_artifact = require_provider_artifact(model.provider.as_ref())?;
     let canonical = require_canonical_provider(first_provider(model))?;
-    let provider_ref_model_names = provider_ref_model_names(&loaded.models);
+    let moved_family_provider_ref_models =
+        moved_family_provider_ref_models(&loaded.models, &target_binary);
     let _ = loaded
         .providers_cfg
         .runtime_provider(&canonical.name)
@@ -42,7 +43,7 @@ pub(crate) fn resolve_target(
         model,
         canonical,
         provider_artifact,
-        provider_ref_model_names,
+        moved_family_provider_ref_models,
     ))
 }
 
@@ -81,10 +82,13 @@ fn select_target_model<'a>(
         .min_by(|left, right| left.name.cmp(&right.name))
 }
 
-fn provider_ref_model_names(models: &HashMap<String, ModelConfig>) -> BTreeSet<String> {
+fn moved_family_provider_ref_models(
+    models: &HashMap<String, ModelConfig>,
+    target_binary: &str,
+) -> BTreeSet<String> {
     models
         .values()
-        .filter(|model| model.provider.is_some())
+        .filter(|model| model_provider_binary(model).as_deref() == Some(target_binary))
         .map(|model| model.name.clone())
         .collect()
 }
@@ -118,7 +122,7 @@ fn target_resolution(
     model: &ModelConfig,
     canonical: &ProviderConfig,
     provider_artifact: ProviderArtifactRef,
-    provider_ref_model_names: BTreeSet<String>,
+    moved_family_provider_ref_models: BTreeSet<String>,
 ) -> TargetResolution {
     TargetResolution {
         model_name: model.name.clone(),
@@ -128,7 +132,7 @@ fn target_resolution(
             .iter()
             .map(|provider| provider.name.clone())
             .collect(),
-        provider_ref_model_names,
+        moved_family_provider_ref_models,
         provider_artifact,
     }
 }

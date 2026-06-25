@@ -10,6 +10,7 @@ pub(crate) struct MigrateSessionOwnershipArgs<'a> {
     pub(crate) dry_run: bool,
     pub(crate) apply: bool,
     pub(crate) rollback: bool,
+    pub(crate) corrective: bool,
     pub(crate) scratch_dir: Option<&'a Path>,
     pub(crate) backup_dir: Option<&'a Path>,
     pub(crate) confirm_mutate_live_db: bool,
@@ -42,37 +43,46 @@ pub(crate) fn run_migrate_session_ownership(
     };
     match mode {
         SessionOwnershipMode::DryRun { scratch_dir } => {
-            let outcome = super::session_ownership::run_session_ownership_dry_run(
-                super::session_ownership::DryRunOptions {
-                    live_state_db_path,
-                    mailbox_db_path: None,
-                    models_dir: args.models_dir.map(Path::to_path_buf),
-                    scratch_dir,
-                    skip_provider_proof: args.skip_provider_proof,
-                },
-            )
+            let opts = super::session_ownership::DryRunOptions {
+                live_state_db_path,
+                mailbox_db_path: None,
+                models_dir: args.models_dir.map(Path::to_path_buf),
+                scratch_dir,
+                skip_provider_proof: args.skip_provider_proof,
+            };
+            let outcome = if args.corrective {
+                super::session_ownership::run_session_ownership_corrective_dry_run(opts)
+            } else {
+                super::session_ownership::run_session_ownership_dry_run(opts)
+            }
             .map_err(|err| err.to_string())?;
             println!("report={}", outcome.report_path.display());
             println!("live_db_mutated=no");
         }
         SessionOwnershipMode::Apply { backup_dir } => {
-            let outcome = super::session_ownership::run_session_ownership_apply(
-                super::session_ownership::ApplyOptions {
-                    live_state_db_path,
-                    models_dir: args.models_dir.map(Path::to_path_buf),
-                    backup_dir,
-                    skip_provider_proof: args.skip_provider_proof,
-                },
-            )
+            let opts = super::session_ownership::ApplyOptions {
+                live_state_db_path,
+                models_dir: args.models_dir.map(Path::to_path_buf),
+                backup_dir,
+                skip_provider_proof: args.skip_provider_proof,
+            };
+            let outcome = if args.corrective {
+                super::session_ownership::run_session_ownership_corrective_apply(opts)
+            } else {
+                super::session_ownership::run_session_ownership_apply(opts)
+            }
             .map_err(|err| err.to_string())?;
             println!("report={}", outcome.report_path.display());
             println!("live_db_mutated=yes");
             println!("backup={}", outcome.backup_path.display());
         }
         SessionOwnershipMode::Rollback => {
-            let outcome = super::session_ownership::run_session_ownership_rollback(
-                super::session_ownership::RollbackOptions { live_state_db_path },
-            )
+            let opts = super::session_ownership::RollbackOptions { live_state_db_path };
+            let outcome = if args.corrective {
+                super::session_ownership::run_session_ownership_corrective_rollback(opts)
+            } else {
+                super::session_ownership::run_session_ownership_rollback(opts)
+            }
             .map_err(|err| err.to_string())?;
             println!("report={}", outcome.report_path.display());
             println!("live_db_mutated=yes");

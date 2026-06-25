@@ -4836,3 +4836,39 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   stops at the draft PR; the manager merges after a full `cargo test --workspace` and a re-apply on a
   copy of the real DB proving 0 stale invocations + `planned == applied`.
 - **Evidence**: v3 dispatch instructions (manager-max Option B); PR #198 head.
+
+## D-S11-M2c-model-001-linear-gap — proceed without Linear (manager Option B)
+
+- **Phase**: Phase 0 bootstrap; Phase 9; Final.
+- **Decision**: `ticket_system=none` for this run (no LINEAR_API_KEY available to the spooled job).
+  Per manager Option B the orchestrator runs the full pipeline on the existing branch `s11-m2c-model`
+  (off `main@6c8dadef`), opens a draft PR, and does NOT dispatch `linear-operator`, does NOT read/create
+  a ticket, and does NOT post a ticket cross-link. The brief at
+  `planning/s11-m2c-model/brief.md` is the source of truth in place of a ticket. `auto_merge_after_phase_9=false`:
+  pipeline stops at the draft PR; the manager merges after a full `cargo test --workspace` and a
+  corrective-migration proof on a COPY of the live migrated DB.
+- **Why safe**: No live DB or ticket-system writes from the pipeline. Linear status transitions are
+  manager-owned anyway; the gap is purely the ticket cross-link, which the manager accepted.
+- **Evidence**: orchestrator-dispatch.md (manager-max Option B); brief.md.
+
+## D-S11-M2c-model-002-pipeline-scoping — proportionate gate layer for a single-component WU
+
+- **Phase**: Phase 0 bootstrap (orchestrator scoping decision).
+- **Decision**: This WU is ONE tightly-scoped, single-component concern with a manager+A3-proven root
+  cause: infer the original model for backfilled `<unknown>` claude chains (forward fix in
+  `target_resolution.rs`) plus a reversible/idempotent corrective migration. The orchestrator dispatches
+  fresh `agents` sub-agents for every artifact-producing phase (Phase 2.5 research, Phase 3 proposal,
+  Phase 6b tests, Phase 6c code, Phase 9 PR-writer) and never hand-implements product code. For the
+  gate/judge layers (Phase 4 risk gates, tests-contracts alignment, process-tree topology, Phase 8
+  PR-review) the gpt-xhigh orchestrator performs gate evaluation directly reading the produced artifacts,
+  rather than spinning up the full recursive `apply-gate-set`×3 + triple `process-tree-auditor` apparatus,
+  which is built for multi-component features and is disproportionate to a ~3-file inference fix.
+  Phase 2.5's seven artifacts are consolidated into a problem-map + existing-state-and-risk research
+  bundle for this single Rust subsystem. The NON-NEGOTIABLE real gate — full `cargo test --workspace` +
+  `cargo clippy --all-targets -D warnings` + `bunx tsc --noEmit` + the deterministic inference/forward/
+  corrective tests — runs in full at Phase 8.
+- **Why safe**: Test/code authorship stays delegated to separate fresh `agents` invocations with distinct
+  UUIDs (Step 6b never sees impl; Step 6c reads tests+contract+index). Verification gates run real
+  compilation and tests. Deviations are recorded here.
+- **Evidence**: implementation-pipeline-orchestrator.md (judge role: "routing + gate evaluation, not
+  synthesis"); orchestrator-dispatch.md ("ONE coherent concern, do NOT split").

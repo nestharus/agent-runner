@@ -13,8 +13,12 @@ mod target_resolution;
 use std::path::PathBuf;
 
 pub(crate) use error::DryRunError;
-pub(crate) use live::{ApplyOptions, run_session_ownership_apply};
-pub(crate) use rollback::{RollbackOptions, run_session_ownership_rollback};
+pub(crate) use live::{
+    ApplyOptions, run_session_ownership_apply, run_session_ownership_corrective_apply,
+};
+pub(crate) use rollback::{
+    RollbackOptions, run_session_ownership_corrective_rollback, run_session_ownership_rollback,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DryRunOptions {
@@ -71,5 +75,50 @@ pub(crate) fn run_session_ownership_dry_run(
         rollback,
         cwd,
     })?;
+    Ok(DryRunOutcome { report_path })
+}
+
+pub(crate) fn run_session_ownership_corrective_dry_run(
+    opts: DryRunOptions,
+) -> Result<DryRunOutcome, DryRunError> {
+    let paths = db_copy::snapshot_inputs(&opts)?;
+    let copy = db_copy::open_copy(&paths.state_copy)?;
+    let before_forward = preflight::preflight(&copy)?;
+    let target = target_resolution::resolve_target(opts.models_dir.as_deref())?;
+    if !opts.skip_provider_proof {
+        target_resolution::prove_provider(&target)?;
+    }
+    let plan = classifier::build_corrective_plan(&copy, &target)?;
+    classifier::populate_corrective_plan_temp(&copy, &plan)?;
+    let first_forward = sql::apply_corrective_forward(&copy)?;
+    classifier::cleanup_corrective_plan_temp(&copy);
+    db_copy::copy_state_to_rollback(&paths)?;
+
+    let idempotence_plan = classifier::build_corrective_plan(&copy, &target)?;
+    classifier::populate_corrective_plan_temp(&copy, &idempotence_plan)?;
+    let idempotence = sql::apply_corrective_forward(&copy)?;
+    classifier::cleanup_corrective_plan_temp(&copy);
+    let after_idempotence = preflight::inspect_integrity(&copy)?;
+
+    let rollback = {
+        let rollback_copy = db_copy::open_copy(&paths.rollback_copy)?;
+        sql::apply_corrective_rollback(&rollback_copy)?
+    };
+    let rollback_integrity = {
+        let rollback_copy = db_copy::open_copy(&paths.rollback_copy)?;
+        preflight::inspect_integrity(&rollback_copy)?
+    };
+    let report_path =
+        report::write_corrective_dry_run_report(&report::CorrectiveDryRunReportInput {
+            source_path: opts.live_state_db_path,
+            scratch_root: opts.scratch_dir,
+            paths,
+            before_forward,
+            after_idempotence,
+            rollback_integrity,
+            first_forward,
+            idempotence,
+            rollback,
+        })?;
     Ok(DryRunOutcome { report_path })
 }
