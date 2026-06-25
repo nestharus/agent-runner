@@ -804,9 +804,11 @@ fn trim_jsonl_newline(line: &[u8]) -> &[u8] {
 }
 
 fn jsonl_line_turn_id_matches(line: &[u8], turn_id: &str) -> bool {
-    serde_json::from_slice::<serde_json::Value>(line)
-        .ok()
-        .is_some_and(|value| json_turn_id_field_matches(&value, turn_id))
+    parse_jsonl_line(line).is_some_and(|value| json_turn_id_field_matches(&value, turn_id))
+}
+
+fn parse_jsonl_line(line: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice::<serde_json::Value>(line).ok()
 }
 
 fn json_turn_id_field_matches(value: &serde_json::Value, turn_id: &str) -> bool {

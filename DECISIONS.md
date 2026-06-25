@@ -4949,3 +4949,52 @@ nearby. The multi-concern judgment treats this as a single regression-recovery u
   the legacy files). Continue Phases 5→6→7→8→8.X→9, stop at a draft PR (auto_merge_after_phase_9=false);
   manager merges after full `cargo test --workspace` + the copy-based proof.
 - Answer artifact: `.scratch/questions/q-c7e94609-c841-453b-aca3-72cf815f120b.answer.json`.
+
+## S11-M2c-resume2 — Phase 6 apply-gate-set BLOCKED: code-quality disposition
+
+- **2026-06-25 — Phase 6 apply-gate-set returned BLOCKED; orchestrator adjudication.** Proof-risk LOW,
+  validation-integrity LOW, tests-contract alignment ALIGNED, cohesion/coupling + halt-state +
+  prototype-swap explicitly non-applicable. Three blockers:
+  - **Stale ACR-247 currentness — FIXED by orchestrator (procedural):** the side-channel manifest pinned
+    source_index_sha256 9ec600b5… but the live index was 4d6ba02a… because the orchestrator appended an
+    implementation-discovered-procedural-obligations table to the index AFTER the projection. That table
+    is Step-6c-discovered metadata, not consumed Step-6b output, so it was moved to
+    `.scratch/phase6/step6c-procedural-obligations.md`, restoring the index to its projected sha 9ec600b5…
+    (re-verified: side-file matches a re-projection). No re-projection needed (timing preserved).
+  - **FC-001 function-classification HIGH (in-scope, will fix):** the new `jsonl_line_turn_id_matches`
+    mixes `parser` (serde_json parse) + `predicate` (turn-id match) classifications. Clean role-purity
+    split into a parser helper + a predicate helper — in-scope per Option A's "new code role-pure" bar.
+  - **PP-002/PP-003 push-pull HIGH (ESCALATED to manager):** the push-pull auditor correctly did NOT
+    re-score legacy whole-file debt (Option A honored); it flags the WU's NEW helpers
+    (`locate_migration_source_path`/`find_provider_source_from_storage_cwd`/`target_jsonl_path`/
+    `fresh_provider_ref_target`; `find_turn_offset`/`jsonl_line_turn_id_matches`/`json_turn_id_field_matches`)
+    for reading the provider-native Claude file layout + JSONL field names directly ("uncontrolled-source
+    coupler"). This coupling is INHERENT to the migration subsystem (`migrate_chain_segment` already does
+    it; the WU's helpers are the prescribed extraction/reuse). The remediation (a runner-owned
+    transcript-storage abstraction interface) is a cross-cutting refactor that would also have to change
+    `migrate_chain_segment`, and the proposal residual-risk (manager-ratified under Option A) already
+    named "full locator unification is separate decomposition work." Option A internally conflicts here
+    ("new code zero new debt" vs "do NOT expand scope"). Escalated as
+    `.scratch/questions/q-0f097afb-0dcf-4833-bee7-178f18232a65.question.json`; recommendation = Option A
+    (accept PP-002/PP-003 as decomposition residual + fix FC-001 + re-run; real code-quality gate at
+    Phase 8). Pipeline HALTED pending root answer.
+
+## S11-M2c-resume2 — Manager decision: Phase 6 Option A (fix FC-001; ratify PP-002/PP-003 residual)
+
+- **2026-06-25 — Root answered Option A.** FC-001 = FIX (role-purity split of
+  `jsonl_line_turn_id_matches` → a parser helper that extracts the turn-id field + a predicate helper
+  that matches). PP-002/PP-003 = ACCEPT as Option-A ratified **decomposition residual**, raw HIGH
+  preserved, manager-ratified exception. Re-run Phase 6 to PASS treating PP-002/PP-003 as the ratified
+  exception; binding new-code code-quality gate is Phase 8 actual diff. Answer artifact:
+  `.scratch/questions/q-0f097afb-0dcf-4833-bee7-178f18232a65.answer.json`.
+- **PP-002/PP-003 ratified-residual record (manager-authorized exception):** the WU's new migration
+  helpers read the Claude-native transcript file layout (`locate_migration_source_path`,
+  `find_provider_source_from_storage_cwd`, `target_jsonl_path`, `fresh_provider_ref_target`) and parse the
+  provider-native JSONL turn-id field names (`find_turn_offset`, `jsonl_line_turn_id_matches`,
+  `json_turn_id_field_matches`). This "uncontrolled-source coupling" is INHERENT to the migration
+  subsystem and already present in `migrate_chain_segment`; the WU's helpers are the prescribed
+  extraction/reuse of those exact primitives (NOT a forked second reader). Remediation = a runner-owned
+  transcript-storage abstraction interface, which would also rewrite `migrate_chain_segment` — out of this
+  WU's bounded scope and named in the Phase-4 Option-A residual-risk as "full locator/storage unification
+  is separate decomposition work." ROUTED to the locator/transcript-storage-unification decomposition WU
+  (to be absorbed by WU5 / provider-extraction). Authority: manager root authorization (answer artifact).
