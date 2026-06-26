@@ -352,6 +352,29 @@ impl Fixture {
         fs::write(self.config_dir.join("providers.toml"), body).unwrap();
     }
 
+    fn rewrite_scope_provider_entries_with_resume_storage(
+        &self,
+        canonical_command: &Path,
+        projects_dir: &Path,
+    ) {
+        fs::write(
+            self.config_dir.join("providers.toml"),
+            provider_toml_entry_with_resume_storage(
+                &canonical_account(),
+                canonical_command,
+                projects_dir,
+            ),
+        )
+        .unwrap();
+        let mut body = fs::read_to_string(self.config_dir.join("providers.toml")).unwrap();
+        body.push_str(&provider_toml_entry_with_resume_storage(
+            &accepted_account(),
+            &self.success_script("repl-bound-accepted-provider"),
+            projects_dir,
+        ));
+        fs::write(self.config_dir.join("providers.toml"), body).unwrap();
+    }
+
     fn default_runtime_state_path(&self) -> PathBuf {
         self.dir
             .path()
@@ -367,7 +390,19 @@ impl Fixture {
         runtime_state
     }
 
+    fn default_runtime_mailbox_path(&self) -> PathBuf {
+        self.dir
+            .path()
+            .join("xdg-data")
+            .join("oulipoly-agent-runner")
+            .join("pid-identity.db")
+    }
+
     fn repl_resume_command(&self, resume_input: &str) -> Command {
+        self.repl_resume_command_with_model(resume_input, None)
+    }
+
+    fn repl_resume_command_with_model(&self, resume_input: &str, model_name: Option<&str>) -> Command {
         let mut cmd = self.base_command();
         cmd.current_dir(self.dir.path())
             .arg("repl")
@@ -375,6 +410,9 @@ impl Fixture {
             .arg(resume_input)
             .arg("--models-dir")
             .arg(&self.models_dir);
+        if let Some(model_name) = model_name {
+            cmd.arg(model_name);
+        }
         cmd
     }
 
@@ -397,6 +435,24 @@ impl Fixture {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    fn recording_script(&self, name: &str, argv_path: &Path) -> PathBuf {
+        self.write_script(
+            name,
+            &format!("printf '%s\\n' \"$@\" > {}", shell_quote_path(argv_path)),
+        )
+    }
+
+    fn recording_script_with_pwd(&self, name: &str, argv_path: &Path, pwd_path: &Path) -> PathBuf {
+        self.write_script(
+            name,
+            &format!(
+                "printf '%s\\n' \"$@\" > {}\npwd > {}",
+                shell_quote_path(argv_path),
+                shell_quote_path(pwd_path)
+            ),
+        )
     }
 
     fn write_provider_entry(&self, name: &str, command: &Path) {
@@ -520,6 +576,10 @@ impl Fixture {
     }
 }
 
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 struct SeededIds {
     issue52_count: i64,
 }
@@ -531,6 +591,23 @@ struct S11M2cScopeModels {
     last: String,
     non_family_model: String,
     non_family_account: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProviderRefNonRotatedCase {
+    NoBoundary,
+    BoundaryNotFound,
+    AlreadyBounded,
+}
+
+impl ProviderRefNonRotatedCase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoBoundary => "no-boundary",
+            Self::BoundaryNotFound => "boundary-not-found",
+            Self::AlreadyBounded => "already-bounded",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -559,6 +636,7 @@ const RESUME_CHAIN_VALID: &str = "33333333-3333-4333-8333-333333333333";
 const RESUME_CHAIN_REPL: &str = "44444444-4444-4444-8444-444444444444";
 const RESUME_CHAIN_STALE_PREIMAGE: &str = "55555555-5555-4555-8555-555555555555";
 const RESUME_STALE_PREIMAGE_SESSION: &str = "session-resume-stale-preimage";
+const PROVIDER_REF_BOUNDARY_TURN_ID: &str = "9a9d64d6-58e5-4efe-b688-a98329ff1f4a";
 const SESSION_OWNERSHIP_MIGRATION_ID: &str = "s11-m2-session-ownership";
 
 fn load_fixture_models(fixture: &Fixture) -> oulipoly_state::ModelStore {
@@ -840,6 +918,219 @@ fn seed_resume_repl_orphaned_provider_ref_chain(fixture: &Fixture) {
         "succeeded",
         "2026-06-20T10:05:00Z",
     );
+}
+
+fn seed_provider_ref_boundary_resume_chain(fixture: &Fixture, model_name: &str) {
+    let conn = fixture.conn();
+    seed_chain(&conn, RESUME_CHAIN_REPL, model_name);
+    seed_segment(
+        &conn,
+        RESUME_CHAIN_REPL,
+        &canonical_account(),
+        "session-resume-repl",
+        None,
+        Some(PROVIDER_REF_BOUNDARY_TURN_ID),
+        "initial",
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-resume-repl",
+        "turn-before-provider-ref-boundary",
+        "2026-06-20T10:04:00Z",
+        "user",
+        None,
+        0,
+        0,
+        "provider-ref-boundary.jsonl",
+        "2026-06-20T10:04:00Z",
+        Some("pre-boundary repl prompt"),
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-resume-repl",
+        PROVIDER_REF_BOUNDARY_TURN_ID,
+        "2026-06-20T10:05:00Z",
+        "assistant",
+        Some("turn-before-provider-ref-boundary"),
+        0,
+        1,
+        "provider-ref-boundary.jsonl",
+        "2026-06-20T10:05:00Z",
+        Some("compact summary"),
+    );
+    seed_invocation(
+        &conn,
+        "41000000-0000-4000-8000-000000000001",
+        model_name,
+        &canonical_account(),
+        "session-resume-repl",
+        "succeeded",
+        "2026-06-20T10:05:00Z",
+    );
+}
+
+fn seed_provider_ref_no_boundary_resume_chain(fixture: &Fixture, model_name: &str) {
+    let conn = fixture.conn();
+    seed_chain(&conn, RESUME_CHAIN_REPL, model_name);
+    seed_segment(
+        &conn,
+        RESUME_CHAIN_REPL,
+        &canonical_account(),
+        "session-resume-repl",
+        None,
+        Some("turn-provider-ref-no-boundary"),
+        "initial",
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-resume-repl",
+        "turn-provider-ref-no-boundary",
+        "2026-06-20T10:05:00Z",
+        "assistant",
+        None,
+        0,
+        0,
+        "provider-ref-no-boundary.jsonl",
+        "2026-06-20T10:05:00Z",
+        Some("repl prompt without recorded boundary"),
+    );
+    seed_invocation(
+        &conn,
+        "42000000-0000-4000-8000-000000000001",
+        model_name,
+        &canonical_account(),
+        "session-resume-repl",
+        "succeeded",
+        "2026-06-20T10:05:00Z",
+    );
+}
+
+fn stage_provider_ref_boundary_jsonl(
+    projects_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+) -> (PathBuf, String, String, String) {
+    let transcript_dir = projects_dir.join(claude_project_dir_name(cwd));
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let source_path = transcript_dir.join(format!("{session_id}.jsonl"));
+    let pre_boundary = serde_json::json!({
+        "uuid": "turn-before-provider-ref-boundary",
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:04:00Z",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "pre-boundary repl prompt"}],
+        },
+    });
+    let boundary = serde_json::json!({
+        "uuid": PROVIDER_REF_BOUNDARY_TURN_ID,
+        "parentUuid": "turn-before-provider-ref-boundary",
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:05:00Z",
+        "type": "assistant",
+        "isCompactSummary": true,
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "compact summary"}],
+        },
+    });
+    let post_boundary = serde_json::json!({
+        "uuid": "turn-after-provider-ref-boundary",
+        "parentUuid": PROVIDER_REF_BOUNDARY_TURN_ID,
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:06:00Z",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "post-boundary repl prompt"}],
+        },
+    });
+    let pre_boundary_line = pre_boundary.to_string();
+    let boundary_line = boundary.to_string();
+    let post_boundary_line = post_boundary.to_string();
+    fs::write(
+        &source_path,
+        format!("{pre_boundary_line}\n{boundary_line}\n{post_boundary_line}\n"),
+    )
+    .unwrap();
+    (
+        source_path,
+        boundary_line,
+        pre_boundary_line,
+        post_boundary_line,
+    )
+}
+
+fn stage_provider_ref_jsonl_without_boundary(
+    projects_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+) -> PathBuf {
+    let transcript_dir = projects_dir.join(claude_project_dir_name(cwd));
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let source_path = transcript_dir.join(format!("{session_id}.jsonl"));
+    let first = serde_json::json!({
+        "uuid": "turn-provider-ref-no-boundary-a",
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:04:00Z",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "repl no-boundary prompt"}],
+        },
+    });
+    let second = serde_json::json!({
+        "uuid": "turn-provider-ref-no-boundary-b",
+        "parentUuid": "turn-provider-ref-no-boundary-a",
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:05:00Z",
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "repl no-boundary answer"}],
+        },
+    });
+    fs::write(&source_path, format!("{first}\n{second}\n")).unwrap();
+    source_path
+}
+
+fn stage_provider_ref_boundary_at_head_jsonl(
+    projects_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+) -> PathBuf {
+    let transcript_dir = projects_dir.join(claude_project_dir_name(cwd));
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let source_path = transcript_dir.join(format!("{session_id}.jsonl"));
+    let boundary = serde_json::json!({
+        "uuid": PROVIDER_REF_BOUNDARY_TURN_ID,
+        "parentUuid": null,
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:05:00Z",
+        "type": "assistant",
+        "isCompactSummary": true,
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "compact summary"}],
+        },
+    });
+    let post_boundary = serde_json::json!({
+        "uuid": "turn-after-provider-ref-boundary",
+        "parentUuid": PROVIDER_REF_BOUNDARY_TURN_ID,
+        "sessionId": session_id,
+        "timestamp": "2026-06-20T10:06:00Z",
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "post-boundary repl prompt"}],
+        },
+    });
+    fs::write(&source_path, format!("{boundary}\n{post_boundary}\n")).unwrap();
+    source_path
 }
 
 fn seed_resume_reapply_reconciliation_fixture(
@@ -2915,6 +3206,246 @@ fn s11_m2c_resume_no_payload_repl_skips_default_provider_ref_migration() {
 }
 
 #[test]
+fn s11_m2c_provider_ref_repl_bounds_transcript_before_launch() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let projects_dir = fixture.dir.path().join("repl-provider-projects");
+    let argv_path = fixture.dir.path().join("repl-bound-argv.txt");
+    let pwd_path = fixture.dir.path().join("repl-bound-pwd.txt");
+    let resolved_launch_cwd = fixture.dir.path().join("resolved-repl-launch-cwd");
+    fs::create_dir_all(&resolved_launch_cwd).unwrap();
+    let recorder = fixture.recording_script_with_pwd("repl-bound-provider", &argv_path, &pwd_path);
+    fixture.rewrite_scope_provider_entries_with_resume_storage(&recorder, &projects_dir);
+    seed_provider_ref_boundary_resume_chain(&fixture, &models.target);
+    let (source_path, boundary_line, pre_boundary_line, post_boundary_line) =
+        stage_provider_ref_boundary_jsonl(
+            &projects_dir,
+            &resolved_launch_cwd,
+            "session-resume-repl",
+        );
+    let original_source = fs::read(&source_path).unwrap();
+    seed_mailbox(
+        &fixture.default_runtime_mailbox_path(),
+        "session-resume-repl",
+        Some(resolved_launch_cwd.to_str().unwrap()),
+    );
+    fixture.copy_state_to_default_runtime_path();
+
+    let output = fixture
+        .repl_resume_command(RESUME_CHAIN_REPL)
+        .output()
+        .unwrap();
+
+    assert_no_external_identity_errors(&output);
+    assert_success(&output);
+    let argv = fs::read_to_string(&argv_path).unwrap();
+    let argv_lines: Vec<_> = argv.lines().collect();
+    let resume_flag = argv_lines
+        .iter()
+        .position(|line| *line == "--resume")
+        .unwrap_or_else(|| panic!("REPL launch did not receive configured resume flag: {argv}"));
+    let fresh_session_id = argv_lines
+        .get(resume_flag + 1)
+        .copied()
+        .expect("REPL resume flag should be followed by the provider session id");
+    assert_ne!(
+        fresh_session_id, "session-resume-repl",
+        "provider-ref REPL resume must pass a fresh bounded provider session id"
+    );
+    let fresh_path = projects_dir
+        .join(claude_project_dir_name(&resolved_launch_cwd))
+        .join(format!("{fresh_session_id}.jsonl"));
+    let caller_cwd_fresh_path = projects_dir
+        .join(claude_project_dir_name(fixture.dir.path()))
+        .join(format!("{fresh_session_id}.jsonl"));
+    let fresh_contents = fs::read_to_string(&fresh_path).unwrap();
+    assert_eq!(
+        fresh_contents,
+        format!("{boundary_line}\n{post_boundary_line}\n"),
+        "launch-selected fresh JSONL must contain the complete post-boundary tail"
+    );
+    assert!(!fresh_contents.contains(&pre_boundary_line), "{fresh_contents}");
+    assert!(
+        !caller_cwd_fresh_path.exists(),
+        "fresh bounded JSONL must be written under the resolved launch cwd, not the caller cwd"
+    );
+    assert_eq!(
+        fs::read_to_string(&pwd_path).unwrap().trim(),
+        resolved_launch_cwd.to_string_lossy().as_ref(),
+        "REPL resume_spawn_cwd must use the resolved launch cwd"
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), original_source);
+}
+
+#[test]
+fn s11_m2c_provider_ref_repl_no_boundary_launches_original_session() {
+    assert_repl_non_rotated_provider_ref_resume(ProviderRefNonRotatedCase::NoBoundary);
+}
+
+#[test]
+fn s11_m2c_provider_ref_repl_boundary_not_found_launches_original_session() {
+    assert_repl_non_rotated_provider_ref_resume(ProviderRefNonRotatedCase::BoundaryNotFound);
+}
+
+#[test]
+fn s11_m2c_provider_ref_repl_already_bounded_launches_original_session() {
+    assert_repl_non_rotated_provider_ref_resume(ProviderRefNonRotatedCase::AlreadyBounded);
+}
+
+fn assert_repl_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCase) {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let projects_dir = fixture.dir.path().join(format!("repl-{}-projects", case.label()));
+    let argv_path = fixture.dir.path().join(format!("repl-{}-argv.txt", case.label()));
+    let pwd_path = fixture.dir.path().join(format!("repl-{}-pwd.txt", case.label()));
+    let resolved_launch_cwd = fixture
+        .dir
+        .path()
+        .join(format!("resolved-repl-{}-cwd", case.label()));
+    fs::create_dir_all(&resolved_launch_cwd).unwrap();
+    let recorder = fixture.recording_script_with_pwd(
+        &format!("repl-{}-provider", case.label()),
+        &argv_path,
+        &pwd_path,
+    );
+    fixture.rewrite_scope_provider_entries_with_resume_storage(&recorder, &projects_dir);
+    let source_path = match case {
+        ProviderRefNonRotatedCase::NoBoundary => {
+            seed_provider_ref_no_boundary_resume_chain(&fixture, &models.target);
+            stage_provider_ref_jsonl_without_boundary(
+                &projects_dir,
+                &resolved_launch_cwd,
+                "session-resume-repl",
+            )
+        }
+        ProviderRefNonRotatedCase::BoundaryNotFound => {
+            seed_provider_ref_boundary_resume_chain(&fixture, &models.target);
+            stage_provider_ref_jsonl_without_boundary(
+                &projects_dir,
+                &resolved_launch_cwd,
+                "session-resume-repl",
+            )
+        }
+        ProviderRefNonRotatedCase::AlreadyBounded => {
+            seed_provider_ref_boundary_resume_chain(&fixture, &models.target);
+            stage_provider_ref_boundary_at_head_jsonl(
+                &projects_dir,
+                &resolved_launch_cwd,
+                "session-resume-repl",
+            )
+        }
+    };
+    let transcript_dir = projects_dir.join(claude_project_dir_name(&resolved_launch_cwd));
+    let original_source = fs::read(&source_path).unwrap();
+    let before_files = transcript_file_snapshot(&transcript_dir);
+    seed_mailbox(
+        &fixture.default_runtime_mailbox_path(),
+        "session-resume-repl",
+        Some(resolved_launch_cwd.to_str().unwrap()),
+    );
+    let runtime_state = fixture.copy_state_to_default_runtime_path();
+    let before_segments = full_snapshot(&runtime_state).segments;
+
+    let output = fixture
+        .repl_resume_command(RESUME_CHAIN_REPL)
+        .output()
+        .unwrap();
+
+    assert_no_external_identity_errors(&output);
+    assert_success(&output);
+    let combined = combined_output(&output);
+    match case {
+        ProviderRefNonRotatedCase::NoBoundary => {
+            assert!(combined.contains("Warning"), "{combined}");
+            assert!(combined.contains("compaction boundary"), "{combined}");
+            assert!(combined.contains("session-resume-repl"), "{combined}");
+        }
+        ProviderRefNonRotatedCase::BoundaryNotFound => {
+            assert!(combined.contains("Warning"), "{combined}");
+            assert!(combined.contains(PROVIDER_REF_BOUNDARY_TURN_ID), "{combined}");
+            assert!(combined.contains("session-resume-repl"), "{combined}");
+        }
+        ProviderRefNonRotatedCase::AlreadyBounded => {
+            assert!(!combined.contains("Warning"), "{combined}");
+        }
+    }
+    let argv = fs::read_to_string(&argv_path).unwrap();
+    let argv_lines: Vec<_> = argv.lines().collect();
+    let resume_flag = argv_lines
+        .iter()
+        .position(|line| *line == "--resume")
+        .unwrap_or_else(|| panic!("REPL launch did not receive configured resume flag: {argv}"));
+    assert_eq!(
+        argv_lines.get(resume_flag + 1).copied(),
+        Some("session-resume-repl"),
+        "non-rotated provider-ref REPL resume must keep the original provider session id for {case:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&pwd_path).unwrap().trim(),
+        resolved_launch_cwd.to_string_lossy().as_ref(),
+        "non-rotated provider-ref REPL resume must keep the resolved launch cwd for {case:?}"
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), original_source);
+    assert_eq!(
+        transcript_file_snapshot(&transcript_dir),
+        before_files,
+        "non-rotated provider-ref REPL resume must not create a fresh JSONL or temp file for {case:?}"
+    );
+    assert_eq!(
+        full_snapshot(&runtime_state).segments,
+        before_segments,
+        "non-rotated provider-ref REPL resume must not close/open chain segments for {case:?}"
+    );
+}
+
+#[test]
+fn s11_m2c_provider_ref_repl_model_provider_mismatch_rejects_before_bounding() {
+    let fixture = Fixture::new();
+    let models = fixture.write_s11_m2c_scope_configs();
+    let projects_dir = fixture.dir.path().join("repl-provider-projects");
+    let argv_path = fixture.dir.path().join("repl-mismatch-argv.txt");
+    let recorder = fixture.recording_script("repl-mismatch-provider", &argv_path);
+    fixture.rewrite_scope_provider_entries_with_resume_storage(&recorder, &projects_dir);
+    fixture.append_provider_entry(
+        &models.non_family_account,
+        &fixture.success_script("repl-mismatch-non-family-provider"),
+    );
+    seed_provider_ref_boundary_resume_chain(&fixture, &models.target);
+    let (source_path, _boundary_line, _pre_boundary_line, _post_boundary_line) =
+        stage_provider_ref_boundary_jsonl(&projects_dir, fixture.dir.path(), "session-resume-repl");
+    let transcript_dir = projects_dir.join(claude_project_dir_name(fixture.dir.path()));
+    let original_source = fs::read(&source_path).unwrap();
+    let before_files = transcript_file_snapshot(&transcript_dir);
+    let runtime_state = fixture.copy_state_to_default_runtime_path();
+    let before_state = full_snapshot(&runtime_state);
+
+    let output = fixture
+        .repl_resume_command_with_model(RESUME_CHAIN_REPL, Some(&models.non_family_model))
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    let combined = combined_output(&output);
+    assert!(
+        combined.contains(&format!(
+            "session {RESUME_CHAIN_REPL} belongs to provider {}, which is not in model {}'s provider pool",
+            canonical_account(),
+            models.non_family_model
+        )),
+        "{combined}"
+    );
+    assert_no_external_identity_errors(&output);
+    assert!(
+        !argv_path.exists(),
+        "provider command must not launch after provider-ref mismatch: {}",
+        combined
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), original_source);
+    assert_eq!(transcript_file_snapshot(&transcript_dir), before_files);
+    assert_eq!(full_snapshot(&runtime_state), before_state);
+}
+
+#[test]
 fn s11_m2c_resume_invocation_preimage_rolls_back_exactly() {
     let fixture = Fixture::new();
     fixture.write_s11_m2c_scope_configs();
@@ -3696,6 +4227,44 @@ fn provider_toml_entry_with_resume(name: &str, command: &Path) -> String {
         "[{name}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{name}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n",
         command.to_string_lossy()
     )
+}
+
+fn provider_toml_entry_with_resume_storage(
+    name: &str,
+    command: &Path,
+    projects_dir: &Path,
+) -> String {
+    format!(
+        "[{name}]\ncommand = {:?}\nargs = []\ninteractive_args = []\nprompt_mode = \"arg\"\n\n[{name}.resume]\nkind = \"flag\"\nflag = \"--resume\"\n\n[{name}.session_storage]\nkind = \"claude_code\"\nprojects_dir = {:?}\n\n",
+        command.to_string_lossy(),
+        projects_dir.to_string_lossy()
+    )
+}
+
+fn claude_project_dir_name(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '-',
+            c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn transcript_file_snapshot(dir: &Path) -> Vec<(String, String)> {
+    let mut files = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read_to_string(entry.path()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 fn seed_chain(conn: &Connection, chain_id: &str, model_name: &str) {

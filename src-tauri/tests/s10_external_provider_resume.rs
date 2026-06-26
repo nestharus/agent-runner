@@ -36,7 +36,7 @@
 mod age153_support;
 
 use age153_support::assert_result_envelope_shape;
-use oulipoly_state::InvocationStatus;
+use oulipoly_state::{InvocationStatus, SessionTurnIngest, StateDb};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -44,8 +44,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const MODEL: &str = "provider-ref-model";
+const MISMATCH_MODEL: &str = "provider-ref-wrong-provider-model";
 const PROVIDER: &str = "provider-ref-account";
+const MISMATCH_PROVIDER: &str = "provider-ref-other-account";
 const SESSION_ID: &str = "a9a8c8d0-8f5f-402e-857c-c5c549446beb";
+const COMPACTION_BOUNDARY_TURN_ID: &str = "68a65f70-d8ef-466f-a0b2-2396d64f353b";
 const INCIDENT_TERMINAL_REASON: &str =
     "provider error: opencode UnknownError: Failed to execute statement";
 
@@ -56,6 +59,7 @@ struct Fixture {
     models_dir: PathBuf,
     workspace: PathBuf,
     hostile_cwd: PathBuf,
+    projects_dir: PathBuf,
     record_path: PathBuf,
 }
 
@@ -66,10 +70,11 @@ struct FixturePaths {
     models_dir: PathBuf,
     workspace: PathBuf,
     hostile_cwd: PathBuf,
+    projects_dir: PathBuf,
     record_path: PathBuf,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct InvocationSessionRow {
     session_id: Option<String>,
     session_capture_method: Option<String>,
@@ -78,7 +83,7 @@ struct InvocationSessionRow {
     provider_session_capture_method: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct InvocationOutcomeRow {
     status: String,
     success: i64,
@@ -86,9 +91,35 @@ struct InvocationOutcomeRow {
     terminal_reason: Option<String>,
 }
 
+type InvocationSnapshotRow = (
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProviderRefStateSnapshot {
+    chains: Vec<(String, String)>,
+    segments: Vec<(i64, String, String, String, Option<String>)>,
+    turns: Vec<(i64, String, String, String, i64)>,
+    invocations: Vec<InvocationSnapshotRow>,
+}
+
+#[derive(Clone, Copy)]
 struct ProviderOptions {
     launch_session_key: &'static str,
     session_capability: bool,
+    session_storage: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProviderRefNonRotatedCase {
+    NoBoundary,
+    BoundaryNotFound,
+    AlreadyBounded,
 }
 
 impl ProviderOptions {
@@ -96,6 +127,14 @@ impl ProviderOptions {
         Self {
             launch_session_key: "provider_session_id",
             session_capability: true,
+            session_storage: false,
+        }
+    }
+
+    fn provider_session_id_with_storage() -> Self {
+        Self {
+            session_storage: true,
+            ..Self::provider_session_id()
         }
     }
 
@@ -103,6 +142,7 @@ impl ProviderOptions {
         Self {
             launch_session_key: "session_id",
             session_capability: false,
+            session_storage: false,
         }
     }
 }
@@ -110,6 +150,10 @@ impl ProviderOptions {
 impl Fixture {
     fn new() -> Self {
         Self::new_with_provider_options(ProviderOptions::provider_session_id())
+    }
+
+    fn new_with_provider_storage() -> Self {
+        Self::new_with_provider_options(ProviderOptions::provider_session_id_with_storage())
     }
 
     fn new_with_provider_options(options: ProviderOptions) -> Self {
@@ -142,8 +186,12 @@ impl Fixture {
     }
 
     fn resume_command(&self) -> Command {
+        self.resume_command_with_model(MODEL)
+    }
+
+    fn resume_command_with_model(&self, model: &str) -> Command {
         let mut cmd = self.command();
-        apply_resume_command_shape(&mut cmd, &self.hostile_cwd, &self.models_dir);
+        apply_resume_command_shape(&mut cmd, &self.hostile_cwd, &self.models_dir, model);
         cmd
     }
 
@@ -173,6 +221,158 @@ impl Fixture {
     fn records(&self) -> Vec<Value> {
         provider_records_from_path(&self.record_path)
     }
+
+    fn write_mismatched_provider_ref_model(&self) {
+        fs::write(
+            self.models_dir.join(format!("{MISMATCH_MODEL}.toml")),
+            mismatched_model_config_toml(),
+        )
+        .unwrap();
+        let providers_path = self
+            .config_home
+            .join("oulipoly-agent-runner")
+            .join("providers.toml");
+        let mut providers = fs::read_to_string(&providers_path).unwrap();
+        providers.push_str(&mismatched_provider_config_toml());
+        fs::write(providers_path, providers).unwrap();
+    }
+
+    fn provider_ref_transcript_dir(&self) -> PathBuf {
+        self.projects_dir
+            .join(claude_project_dir_name(&self.workspace))
+    }
+
+    fn seed_provider_ref_boundary_jsonl(&self) -> (PathBuf, String, String, String) {
+        let transcript_dir = self.provider_ref_transcript_dir();
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{SESSION_ID}.jsonl"));
+        let pre_boundary = serde_json::json!({
+            "uuid": "00000000-0000-4000-8000-000000000001",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:00:00Z",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "pre-boundary headless prompt"}],
+            },
+        });
+        let boundary = serde_json::json!({
+            "uuid": COMPACTION_BOUNDARY_TURN_ID,
+            "parentUuid": "00000000-0000-4000-8000-000000000001",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:01:00Z",
+            "type": "assistant",
+            "isCompactSummary": true,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "compact summary"}],
+            },
+        });
+        let post_boundary = serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "parentUuid": COMPACTION_BOUNDARY_TURN_ID,
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:02:00Z",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "post-boundary headless prompt"}],
+            },
+        });
+        let pre_boundary_line = pre_boundary.to_string();
+        let boundary_line = boundary.to_string();
+        let post_boundary_line = post_boundary.to_string();
+        fs::write(
+            &transcript_path,
+            format!("{pre_boundary_line}\n{boundary_line}\n{post_boundary_line}\n"),
+        )
+        .unwrap();
+        (
+            transcript_path,
+            boundary_line,
+            pre_boundary_line,
+            post_boundary_line,
+        )
+    }
+
+    fn seed_provider_ref_jsonl_without_boundary(&self) -> PathBuf {
+        let transcript_dir = self.provider_ref_transcript_dir();
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{SESSION_ID}.jsonl"));
+        let first = serde_json::json!({
+            "uuid": "00000000-0000-4000-8000-000000000011",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:00:00Z",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "headless no-boundary prompt"}],
+            },
+        });
+        let second = serde_json::json!({
+            "uuid": "00000000-0000-4000-8000-000000000012",
+            "parentUuid": "00000000-0000-4000-8000-000000000011",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:01:00Z",
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "headless no-boundary answer"}],
+            },
+        });
+        fs::write(&transcript_path, format!("{first}\n{second}\n")).unwrap();
+        transcript_path
+    }
+
+    fn seed_provider_ref_boundary_at_head_jsonl(&self) -> PathBuf {
+        let transcript_dir = self.provider_ref_transcript_dir();
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join(format!("{SESSION_ID}.jsonl"));
+        let boundary = serde_json::json!({
+            "uuid": COMPACTION_BOUNDARY_TURN_ID,
+            "parentUuid": null,
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:01:00Z",
+            "type": "assistant",
+            "isCompactSummary": true,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "compact summary"}],
+            },
+        });
+        let post = serde_json::json!({
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "parentUuid": COMPACTION_BOUNDARY_TURN_ID,
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-06-01T00:02:00Z",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "headless already-bounded prompt"}],
+            },
+        });
+        fs::write(&transcript_path, format!("{boundary}\n{post}\n")).unwrap();
+        transcript_path
+    }
+
+    fn seed_recorded_compaction_boundary(&self) {
+        let state = StateDb::open(&self.db_path()).unwrap();
+        state
+            .ingest_session_turns_batch(
+                PROVIDER,
+                &[SessionTurnIngest {
+                    session_id: SESSION_ID.to_string(),
+                    turn_id: COMPACTION_BOUNDARY_TURN_ID.to_string(),
+                    timestamp: timestamp("2026-06-01T00:01:00Z"),
+                    role: "assistant".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: false,
+                    is_compaction_boundary: true,
+                    body: Some("compact summary".to_string()),
+                }],
+            )
+            .unwrap();
+    }
 }
 
 fn command_with_envs(mut cmd: Command, envs: &[(&str, &str)]) -> Command {
@@ -195,13 +395,18 @@ fn apply_launch_command_shape(cmd: &mut Command, workspace: &Path, models_dir: &
         .arg("first prompt");
 }
 
-fn apply_resume_command_shape(cmd: &mut Command, hostile_cwd: &Path, models_dir: &Path) {
+fn apply_resume_command_shape(
+    cmd: &mut Command,
+    hostile_cwd: &Path,
+    models_dir: &Path,
+    model: &str,
+) {
     cmd.current_dir(hostile_cwd)
         .arg("resume")
         .arg("--models-dir")
         .arg(models_dir)
         .arg("--model")
-        .arg(MODEL)
+        .arg(model)
         .arg("--session-id")
         .arg(SESSION_ID)
         .arg("--prompt")
@@ -216,7 +421,12 @@ fn materialize_fixture(root: &Path, paths: &FixturePaths, options: ProviderOptio
     create_fixture_directories(paths);
     let provider_path = write_external_provider(root, &paths.record_path, options);
     write_model_config(&paths.models_dir, &provider_path);
-    write_providers_config(&paths.app_config_dir);
+    write_providers_config(
+        &paths.app_config_dir,
+        options
+            .session_storage
+            .then_some(paths.projects_dir.as_path()),
+    );
 }
 
 fn fixture_paths(root: &Path) -> FixturePaths {
@@ -227,6 +437,7 @@ fn fixture_paths(root: &Path) -> FixturePaths {
         models_dir: app_config_dir.join("models"),
         workspace: root.join("workspace"),
         hostile_cwd: root.join("hostile-cwd"),
+        projects_dir: root.join("provider-projects"),
         record_path: root.join("provider-records.jsonl"),
         config_home,
         app_config_dir,
@@ -237,6 +448,7 @@ fn create_fixture_directories(paths: &FixturePaths) {
     fs::create_dir_all(&paths.models_dir).unwrap();
     fs::create_dir_all(&paths.workspace).unwrap();
     fs::create_dir_all(&paths.hostile_cwd).unwrap();
+    fs::create_dir_all(&paths.projects_dir).unwrap();
 }
 
 fn write_model_config(models_dir: &Path, provider_path: &Path) {
@@ -261,20 +473,56 @@ args = ["--model", "haiku"]
     )
 }
 
-fn write_providers_config(app_config_dir: &Path) {
+fn mismatched_model_config_toml() -> String {
+    format!(
+        r#"provider = {{ path = "/synthetic/provider-ref-mismatch" }}
+prompt_mode = "arg"
+
+[[providers]]
+name = {MISMATCH_PROVIDER:?}
+args = []
+"#,
+    )
+}
+
+fn mismatched_provider_config_toml() -> String {
+    format!(
+        r#"
+[{MISMATCH_PROVIDER}]
+command = "native-provider"
+args = []
+prompt_mode = "arg"
+"#,
+    )
+}
+
+fn write_providers_config(app_config_dir: &Path, storage_projects_dir: Option<&Path>) {
     fs::write(
         app_config_dir.join("providers.toml"),
-        providers_config_toml(),
+        providers_config_toml(storage_projects_dir),
     )
     .unwrap();
 }
 
-fn providers_config_toml() -> String {
+fn providers_config_toml(storage_projects_dir: Option<&Path>) -> String {
+    let storage = storage_projects_dir
+        .map(|projects_dir| {
+            format!(
+                r#"
+[{PROVIDER}.session_storage]
+kind = "claude_code"
+projects_dir = {:?}
+"#,
+                projects_dir.display().to_string()
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"[{PROVIDER}]
 command = "native-provider"
 args = ["--base"]
 prompt_mode = "arg"
+{storage}
 "#,
     )
 }
@@ -287,8 +535,26 @@ fn fixture_from_paths(dir: tempfile::TempDir, paths: FixturePaths) -> Fixture {
         models_dir: paths.models_dir,
         workspace: paths.workspace,
         hostile_cwd: paths.hostile_cwd,
+        projects_dir: paths.projects_dir,
         record_path: paths.record_path,
     }
+}
+
+fn claude_project_dir_name(path: &Path) -> String {
+    path.to_string_lossy()
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' => '-',
+            c if (c.is_ascii() && c.is_alphanumeric()) || c == '-' => c,
+            _ => '-',
+        })
+        .collect()
+}
+
+fn timestamp(value: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&chrono::Utc)
 }
 
 fn invocation_session_rows_from_db(path: &Path) -> Vec<InvocationSessionRow> {
@@ -367,6 +633,117 @@ fn provider_record_text(path: &Path) -> String {
 
 fn provider_records_from_path(path: &Path) -> Vec<Value> {
     parse_provider_records(&provider_record_text(path))
+}
+
+fn provider_ref_state_snapshot(path: &Path) -> ProviderRefStateSnapshot {
+    let conn = open_invocation_db(path);
+    ProviderRefStateSnapshot {
+        chains: query_chain_snapshot(&conn),
+        segments: query_segment_snapshot(&conn),
+        turns: query_turn_snapshot(&conn),
+        invocations: query_invocation_snapshot(&conn),
+    }
+}
+
+fn provider_ref_segment_snapshot(
+    path: &Path,
+) -> Vec<(i64, String, String, String, Option<String>)> {
+    let conn = open_invocation_db(path);
+    query_segment_snapshot(&conn)
+}
+
+fn query_chain_snapshot(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+    let mut stmt = conn
+        .prepare("SELECT chain_id, model_name FROM session_chains ORDER BY chain_id")
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn query_segment_snapshot(
+    conn: &rusqlite::Connection,
+) -> Vec<(i64, String, String, String, Option<String>)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, chain_id, provider_name, session_id, ended_at
+             FROM session_chain_segments
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn query_turn_snapshot(conn: &rusqlite::Connection) -> Vec<(i64, String, String, String, i64)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, provider_name, session_id, turn_id, is_compaction_boundary
+             FROM session_turns
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn query_invocation_snapshot(conn: &rusqlite::Connection) -> Vec<InvocationSnapshotRow> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, model_name, provider_name, session_id, provider_session_id, status
+             FROM invocations
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+fn transcript_file_snapshot(dir: &Path) -> Vec<(String, String)> {
+    let mut files = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                fs::read_to_string(entry.path()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 fn parse_provider_records(text: &str) -> Vec<Value> {
@@ -450,6 +827,194 @@ fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd
     );
 
     assert_external_launch_session_capture_rows(&fixture.invocation_session_rows());
+}
+
+#[test]
+fn external_provider_ref_resume_bounds_transcript_before_headless_launch() {
+    let fixture = Fixture::new_with_provider_storage();
+
+    let launch = fixture.run_launch();
+    assert_success(&launch);
+    let (source_path, boundary_line, pre_boundary_line, post_boundary_line) =
+        fixture.seed_provider_ref_boundary_jsonl();
+    fixture.seed_recorded_compaction_boundary();
+    let original_source = fs::read(&source_path).unwrap();
+
+    let resume = fixture.run_resume();
+
+    assert_success(&resume);
+    let resume_stderr = String::from_utf8_lossy(&resume.stderr);
+    assert!(
+        !resume_stderr.contains("external rotation target requires an explicit manual target"),
+        "default provider-ref resume must not route through the external manual-target branch: {resume_stderr}"
+    );
+    let records = fixture.records();
+    assert_no_rotation_or_migration_provider_calls(&records);
+    let launches = records_for_subcommand(&records, "launch");
+    assert_eq!(launches.len(), 2, "records: {records:?}");
+    let resume_launch = &launches[1]["request"];
+    let fresh_session_id = resume_launch["params"]["session"]["known_provider_session_id"]
+        .as_str()
+        .expect("provider-ref bounded resume launch should carry a known provider session id");
+    assert_ne!(
+        fresh_session_id, SESSION_ID,
+        "provider-ref default resume must launch the fresh bounded provider session id"
+    );
+    assert_eq!(
+        resume_launch["params"]["session"]["start_mode"].as_str(),
+        Some("resume")
+    );
+    assert_eq!(
+        resume_launch["params"]["model"]["provider_args"],
+        serde_json::json!(["--model", "haiku"]),
+        "provider-ref bounding must not change model/provider argument choice"
+    );
+    let fresh_path = fixture
+        .projects_dir
+        .join(claude_project_dir_name(&fixture.workspace))
+        .join(format!("{fresh_session_id}.jsonl"));
+    let fresh_contents = fs::read_to_string(&fresh_path).unwrap();
+    assert_eq!(
+        fresh_contents,
+        format!("{boundary_line}\n{post_boundary_line}\n"),
+        "launch-selected fresh JSONL must contain the complete post-boundary tail"
+    );
+    assert!(
+        !fresh_contents.contains(&pre_boundary_line),
+        "{fresh_contents}"
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), original_source);
+}
+
+#[test]
+fn external_provider_ref_resume_no_boundary_launches_original_headless_session() {
+    assert_headless_non_rotated_provider_ref_resume(ProviderRefNonRotatedCase::NoBoundary);
+}
+
+#[test]
+fn external_provider_ref_resume_boundary_not_found_launches_original_headless_session() {
+    assert_headless_non_rotated_provider_ref_resume(ProviderRefNonRotatedCase::BoundaryNotFound);
+}
+
+#[test]
+fn external_provider_ref_resume_already_bounded_launches_original_headless_session() {
+    assert_headless_non_rotated_provider_ref_resume(ProviderRefNonRotatedCase::AlreadyBounded);
+}
+
+fn assert_headless_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCase) {
+    let fixture = Fixture::new_with_provider_storage();
+
+    let launch = fixture.run_launch();
+    assert_success(&launch);
+    let source_path = match case {
+        ProviderRefNonRotatedCase::NoBoundary | ProviderRefNonRotatedCase::BoundaryNotFound => {
+            fixture.seed_provider_ref_jsonl_without_boundary()
+        }
+        ProviderRefNonRotatedCase::AlreadyBounded => {
+            fixture.seed_provider_ref_boundary_at_head_jsonl()
+        }
+    };
+    if !matches!(case, ProviderRefNonRotatedCase::NoBoundary) {
+        fixture.seed_recorded_compaction_boundary();
+    }
+    let transcript_dir = fixture.provider_ref_transcript_dir();
+    let original_source = fs::read(&source_path).unwrap();
+    let before_files = transcript_file_snapshot(&transcript_dir);
+    let before_segments = provider_ref_segment_snapshot(&fixture.db_path());
+
+    let resume = fixture.run_resume();
+
+    assert_success(&resume);
+    let resume_stderr = String::from_utf8_lossy(&resume.stderr);
+    assert!(
+        !resume_stderr.contains("external rotation target requires an explicit manual target"),
+        "default provider-ref resume must not route through the external manual-target branch: {resume_stderr}"
+    );
+    match case {
+        ProviderRefNonRotatedCase::NoBoundary => {
+            assert!(resume_stderr.contains("Warning"), "{resume_stderr}");
+            assert!(
+                resume_stderr.contains("compaction boundary"),
+                "{resume_stderr}"
+            );
+            assert!(resume_stderr.contains(SESSION_ID), "{resume_stderr}");
+        }
+        ProviderRefNonRotatedCase::BoundaryNotFound => {
+            assert!(resume_stderr.contains("Warning"), "{resume_stderr}");
+            assert!(
+                resume_stderr.contains(COMPACTION_BOUNDARY_TURN_ID),
+                "{resume_stderr}"
+            );
+            assert!(resume_stderr.contains(SESSION_ID), "{resume_stderr}");
+        }
+        ProviderRefNonRotatedCase::AlreadyBounded => {
+            assert!(!resume_stderr.contains("Warning"), "{resume_stderr}");
+        }
+    }
+    let records = fixture.records();
+    assert_no_rotation_or_migration_provider_calls(&records);
+    let launches = records_for_subcommand(&records, "launch");
+    assert_eq!(launches.len(), 2, "records: {records:?}");
+    let resume_launch = &launches[1]["request"];
+    assert_eq!(
+        resume_launch["params"]["session"]["known_provider_session_id"].as_str(),
+        Some(SESSION_ID),
+        "non-rotated provider-ref headless resume must keep the original provider session id for {case:?}"
+    );
+    assert_eq!(
+        resume_launch["params"]["session"]["start_mode"].as_str(),
+        Some("resume")
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), original_source);
+    assert_eq!(
+        transcript_file_snapshot(&transcript_dir),
+        before_files,
+        "non-rotated provider-ref headless resume must not create a fresh JSONL or temp file for {case:?}"
+    );
+    assert_eq!(
+        provider_ref_segment_snapshot(&fixture.db_path()),
+        before_segments,
+        "non-rotated provider-ref headless resume must not close/open chain segments for {case:?}"
+    );
+}
+
+#[test]
+fn external_provider_ref_resume_model_provider_mismatch_rejects_before_bounding() {
+    let fixture = Fixture::new_with_provider_storage();
+    fixture.write_mismatched_provider_ref_model();
+
+    let launch = fixture.run_launch();
+    assert_success(&launch);
+    let (source_path, _boundary_line, _pre_boundary_line, _post_boundary_line) =
+        fixture.seed_provider_ref_boundary_jsonl();
+    fixture.seed_recorded_compaction_boundary();
+    let transcript_dir = fixture
+        .projects_dir
+        .join(claude_project_dir_name(&fixture.workspace));
+    let original_source = fs::read(&source_path).unwrap();
+    let before_files = transcript_file_snapshot(&transcript_dir);
+    let before_state = provider_ref_state_snapshot(&fixture.db_path());
+
+    let output = run_fixture_command(fixture.resume_command_with_model(MISMATCH_MODEL));
+
+    assert_failed_resume_resolution(&output);
+    let combined = combined_output(&output);
+    assert!(
+        combined.contains(&format!(
+            "session {SESSION_ID} belongs to provider {PROVIDER}, which is not in model {MISMATCH_MODEL}'s provider pool"
+        )),
+        "{combined}"
+    );
+    assert!(
+        !combined.contains("external rotation target requires an explicit manual target"),
+        "mismatch must fail before the external migration branch: {combined}"
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), original_source);
+    assert_eq!(transcript_file_snapshot(&transcript_dir), before_files);
+    assert_eq!(
+        provider_ref_state_snapshot(&fixture.db_path()),
+        before_state
+    );
 }
 
 #[test]
@@ -538,6 +1103,24 @@ fn assert_success(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_failed_resume_resolution(output: &Output) {
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn assert_failed_terminal_error_output(output: &Output) {

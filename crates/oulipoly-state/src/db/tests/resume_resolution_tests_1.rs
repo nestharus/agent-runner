@@ -241,3 +241,79 @@ fn resolve_resume_validates_provider_in_model_pool() {
         other => panic!("expected provider/model mismatch, got {other:?}"),
     }
 }
+
+#[test]
+fn preserve_compaction_boundary_for_session_copies_only_latest_marker_to_fresh_session() {
+    let db = test_db();
+    let ts = |value: &str| {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    db.ingest_session_turns_batch(
+        "provider-a",
+        &[
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "pre-boundary".to_string(),
+                timestamp: ts("2026-04-17T07:59:00Z"),
+                role: "user".to_string(),
+                parent_turn_id: None,
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: Some("pre-boundary history".to_string()),
+            },
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "boundary-turn".to_string(),
+                timestamp: ts("2026-04-17T08:00:00Z"),
+                role: "assistant".to_string(),
+                parent_turn_id: Some("pre-boundary".to_string()),
+                is_sidechain: false,
+                is_compaction_boundary: true,
+                body: Some("compact summary".to_string()),
+            },
+            SessionTurnIngest {
+                session_id: SESSION_A.to_string(),
+                turn_id: "post-boundary".to_string(),
+                timestamp: ts("2026-04-17T08:01:00Z"),
+                role: "user".to_string(),
+                parent_turn_id: Some("boundary-turn".to_string()),
+                is_sidechain: false,
+                is_compaction_boundary: false,
+                body: Some("post-boundary prompt".to_string()),
+            },
+        ],
+    )
+    .unwrap();
+
+    let preserved = db
+        .preserve_compaction_boundary_for_session("provider-a", SESSION_A, "provider-a", SESSION_B)
+        .unwrap();
+
+    assert!(preserved, "expected boundary marker to be inserted for the fresh session");
+    assert_eq!(
+        db.latest_compaction_boundary("provider-a", SESSION_B)
+            .unwrap()
+            .map(|(turn_id, _)| turn_id),
+        Some("boundary-turn".to_string())
+    );
+    assert_eq!(db.count_session_turns("provider-a", SESSION_A).unwrap().total, 3);
+    assert_eq!(
+        db.count_session_turns("provider-a", SESSION_B).unwrap().total,
+        1,
+        "fresh session should receive only the boundary marker metadata, not pre-boundary history"
+    );
+    assert_eq!(
+        db.connection()
+            .query_row(
+                "SELECT body FROM session_turns
+                 WHERE provider_name = ?1 AND session_id = ?2 AND turn_id = ?3",
+                rusqlite::params!["provider-a", SESSION_B, "boundary-turn"],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref(),
+        Some("compact summary")
+    );
+}

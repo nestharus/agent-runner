@@ -16,11 +16,11 @@ use oulipoly_runtime::{executor, sessions};
 use sha2::{Digest, Sha256};
 
 use super::disposition::{
-    ResumeLoopControl, ResumeTerminalDispositionInput, confirmed_zero_turn_maybe_quota,
-    handle_terminal_signal_disposition,
+    confirmed_zero_turn_maybe_quota, handle_terminal_signal_disposition, ResumeLoopControl,
+    ResumeTerminalDispositionInput,
 };
 use super::finalization::{
-    CompletedAttemptControl, CompletedAttemptInput, finalize_completed_attempt,
+    finalize_completed_attempt, CompletedAttemptControl, CompletedAttemptInput,
 };
 use super::{formatter, mapper, validator};
 use crate::captured_child::emit_captured_child_marker_lines;
@@ -38,11 +38,11 @@ use crate::resume_cli::{
 };
 use crate::spawn_cwd::effective_resume_spawn_cwd;
 use crate::terminal_outcome_adapter::{
-    TerminalSignalDisposition, apply_age153_terminal_signal_fixture_override,
-    confirm_maybe_quota_exhausted, resume_terminal_signal_for_outcome, terminal_signal_reason,
+    apply_age153_terminal_signal_fixture_override, confirm_maybe_quota_exhausted,
+    resume_terminal_signal_for_outcome, terminal_signal_reason, TerminalSignalDisposition,
 };
 use crate::wiring;
-use crate::zero_turn_orchestration::{ZeroTurnAction, ZeroTurnConfirmationState, next_action};
+use crate::zero_turn_orchestration::{next_action, ZeroTurnAction, ZeroTurnConfirmationState};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resume(
@@ -1305,7 +1305,7 @@ fn migrate_resume_target(
     effective_spawn_cwd: &Path,
 ) -> Result<(), i32> {
     if validate_provider_ref_default_migration_skip(resolved, target, manual_migrate)? {
-        return Ok(());
+        return apply_provider_ref_bound_resume_segment(env, resolved, target, effective_spawn_cwd);
     }
     let migration_model = migration_model_for_attempt(env, resolved, manual_migrate, attempts);
     let migration_result = dispatch_resume_migration(
@@ -1331,6 +1331,45 @@ fn validate_provider_ref_default_migration_skip(
     validate_provider_ref_headless_resume_target(resolved, target, &resolved.active_provider)
         .map_err(|message| provider_ref_resume_block_exit_code(&message))?;
     Ok(true)
+}
+
+fn apply_provider_ref_bound_resume_segment(
+    env: &crate::migration_providers::ResumeExecutionEnvironment,
+    resolved: &mut oulipoly_state::ResolvedResume,
+    target: &mut crate::resume_cli::ResumeExecutionTarget,
+    effective_spawn_cwd: &Path,
+) -> Result<(), i32> {
+    let model = migration_model_pool(env, resolved);
+    let mut migration_stderr = std::io::stderr();
+    let mut fresh_session_id = || uuid::Uuid::new_v4().to_string();
+    match oulipoly_runtime::migration::bound_provider_ref_resume_segment(
+        &env.state,
+        &env.sessions_cfg,
+        &model,
+        resolved,
+        effective_spawn_cwd,
+        &mut fresh_session_id,
+        &mut migration_stderr,
+    ) {
+        Ok(oulipoly_runtime::migration::ProviderRefBoundOutcome::Rotated(segment)) => {
+            apply_migrated_segment(env, resolved, target, segment)
+        }
+        Ok(
+            oulipoly_runtime::migration::ProviderRefBoundOutcome::NoBoundary
+            | oulipoly_runtime::migration::ProviderRefBoundOutcome::BoundaryNotFound
+            | oulipoly_runtime::migration::ProviderRefBoundOutcome::AlreadyBounded,
+        ) => Ok(()),
+        Err(
+            oulipoly_runtime::migration::MigrationError::SourceMissingStorage { .. }
+            | oulipoly_runtime::migration::MigrationError::TargetMissingStorage { .. },
+        ) => Ok(()),
+        Err(err) => {
+            emit_migration_service_error(MigrationServiceErrorMessage::Dependency(format!(
+                "{err:?}"
+            )));
+            Err(1)
+        }
+    }
 }
 
 fn apply_resume_migration_result(

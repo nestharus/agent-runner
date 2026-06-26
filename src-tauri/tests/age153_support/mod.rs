@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;

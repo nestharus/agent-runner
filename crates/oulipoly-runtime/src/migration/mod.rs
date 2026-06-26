@@ -1,9 +1,16 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `accessor`, `mapper`, `predicate`, `formatter`
+
 use crate::balancer::TransitionReason;
 use crate::sessions::locate_transcript;
 use oulipoly_config::{ModelConfig, ScriptSessionStorageType, SessionStorage, SessionsConfig};
-use oulipoly_state::{ResolvedResume, StateDb};
+use oulipoly_state::{ChainSegmentRotationInput, ResolvedResume, StateDb};
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+const MAX_FRESH_SESSION_ID_ATTEMPTS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub enum MigrationError {
@@ -80,6 +87,25 @@ pub struct MigratedSegment {
     pub reason: TransitionReason,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRefBoundOutcome {
+    NoBoundary,
+    BoundaryNotFound,
+    AlreadyBounded,
+    Rotated(MigratedSegment),
+}
+
+enum BoundaryTailSelection<'a> {
+    NoBoundary,
+    BoundaryNotFound {
+        turn_id: String,
+    },
+    Found {
+        located_source_offset: Option<usize>,
+        slice: Cow<'a, [u8]>,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn migrate_chain_segment(
     state: &StateDb,
@@ -91,137 +117,36 @@ pub fn migrate_chain_segment(
     reason: TransitionReason,
     stderr: &mut dyn Write,
 ) -> Result<MigratedSegment, MigrationError> {
-    let source = model
-        .providers
-        .iter()
-        .find(|provider| provider.name == resolved.active_provider)
-        .ok_or_else(|| MigrationError::ProviderNotInModelPool {
-            provider: resolved.active_provider.clone(),
-            model_name: model.name.clone(),
-        })?;
-    let target = model.providers.get(target_provider_index).ok_or_else(|| {
-        MigrationError::ProviderNotInModelPool {
-            provider: target_provider_index.to_string(),
-            model_name: model.name.clone(),
-        }
-    })?;
-    if source.resume.is_none() {
-        return Err(MigrationError::ProviderMissingResume {
-            provider: source.name.clone(),
-        });
-    }
-    if target.resume.is_none() {
-        return Err(MigrationError::ProviderMissingResume {
-            provider: target.name.clone(),
-        });
-    }
-    if provider_storage_class(source) == Some(ScriptSessionStorageType::CodexSession)
-        || provider_storage_class(target) == Some(ScriptSessionStorageType::CodexSession)
-    {
-        return Err(MigrationError::CodexMigrationDeferred {
-            provider: source.name.clone(),
-        });
-    }
-
-    let source_path = locate_transcript(sessions_cfg, &source.name, &resolved.active_session_id)
-        .map_err(|message| MigrationError::TranscriptLocatorFailed {
-            provider: source.name.clone(),
-            message,
-        })?
-        .or_else(|| find_claude_source_from_storage(source, &resolved.active_session_id))
-        .ok_or_else(|| MigrationError::SourceMissingStorage {
-            provider: source.name.clone(),
-        })?;
-    if !source_path.is_absolute() {
-        return Err(MigrationError::SourcePathMalformed {
-            provider: source.name.clone(),
-            path: source_path.display().to_string(),
-        });
-    }
-    if !source_path.exists() {
-        return Err(MigrationError::SourceMissing {
-            provider: source.name.clone(),
-            session_id: resolved.active_session_id.clone(),
-        });
-    }
-
+    let source = source_provider_for_model(model, resolved)?;
+    let target = target_provider_for_index(model, target_provider_index)?;
+    require_provider_resume(source)?;
+    require_provider_resume(target)?;
+    ensure_migration_storage_supported(source, target)?;
+    let source_path = locate_migration_source_path(
+        sessions_cfg,
+        source,
+        &resolved.active_session_id,
+        Some(resume_working_dir),
+        stderr,
+    )?;
     let target_session_id = resolved.active_session_id.clone();
-    let projects_dir = claude_projects_dir_from_provider_storage(target).ok_or_else(|| {
-        MigrationError::TargetMissingStorage {
-            provider: target.name.clone(),
-        }
-    })?;
-    let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir, stderr)?;
-    let bytes = std::fs::read(&source_path).map_err(|e| MigrationError::Io {
-        path: source_path.display().to_string(),
-        message: e.to_string(),
-    })?;
-    let find_turn_offset = |buf: &[u8], turn_id: &str| -> Option<usize> {
-        let text = String::from_utf8_lossy(buf);
-        let mut offset = 0usize;
-        for line in text.lines() {
-            if line.contains(turn_id) {
-                return Some(offset);
-            }
-            offset += line.len() + 1;
-        }
-        None
-    };
-    let slice: std::borrow::Cow<'_, [u8]> = if let Some((turn_id, _)) = state
-        .latest_compaction_boundary(&source.name, &resolved.active_session_id)
-        .map_err(|message| MigrationError::Db { message })?
-    {
-        if let Some(offset) = find_turn_offset(&bytes, &turn_id) {
-            std::borrow::Cow::Borrowed(&bytes[offset..])
-        } else if let Some(alternate) = find_alternate_jsonl_with_boundary(
-            source,
-            &resolved.active_session_id,
-            &source_path,
-            &turn_id,
-            &find_turn_offset,
-        ) {
-            std::borrow::Cow::Owned(alternate)
-        } else {
-            let _ = writeln!(
-                stderr,
-                "Warning: recorded compaction boundary turn_id={turn_id} not found in any candidate JSONL for session_id={session} located_path={path}; falling back to full source slice",
-                turn_id = turn_id,
-                session = resolved.active_session_id,
-                path = source_path.display(),
-            );
-            std::borrow::Cow::Borrowed(&bytes[..])
-        }
-    } else {
-        std::borrow::Cow::Borrowed(&bytes[..])
-    };
-
-    let target_dir = projects_dir.join(&cwd_project_dir);
-    std::fs::create_dir_all(&target_dir).map_err(|e| {
-        MigrationError::TargetDirectoryCreateFailed {
-            path: target_dir.display().to_string(),
-            message: e.to_string(),
-        }
-    })?;
-    let target_path = target_dir.join(format!("{target_session_id}.jsonl"));
-    if let Some(conflicting_chain_id) = state
-        .find_conflicting_active_segment(&target.name, &target_session_id, &resolved.chain_id)
-        .map_err(|message| MigrationError::Db { message })?
-    {
-        return Err(MigrationError::TargetSessionInUseByOtherChain {
-            provider: target.name.clone(),
-            session_id: target_session_id.clone(),
-            conflicting_chain_id,
-        });
-    }
-    let tmp = target_path.with_extension("jsonl.tmp");
-    std::fs::write(&tmp, slice).map_err(|e| MigrationError::Io {
-        path: tmp.display().to_string(),
-        message: e.to_string(),
-    })?;
-    std::fs::rename(&tmp, &target_path).map_err(|e| MigrationError::Io {
-        path: target_path.display().to_string(),
-        message: e.to_string(),
-    })?;
+    let target_path = target_jsonl_path(target, resume_working_dir, &target_session_id, stderr)?;
+    let bytes = read_jsonl_bytes(&source_path)?;
+    let slice = explicit_migration_slice(
+        state,
+        source,
+        &resolved.active_session_id,
+        &source_path,
+        &bytes,
+        stderr,
+    )?;
+    ensure_no_conflicting_active_segment(
+        state,
+        &target.name,
+        &target_session_id,
+        &resolved.chain_id,
+    )?;
+    write_jsonl_atomic(&target_path, slice.as_ref())?;
 
     let now = chrono::Utc::now();
     state
@@ -260,6 +185,463 @@ pub fn migrate_chain_segment(
         target_session_id,
         target_jsonl_path: target_path,
         reason,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bound_provider_ref_resume_segment(
+    state: &StateDb,
+    sessions_cfg: &SessionsConfig,
+    model: &ModelConfig,
+    resolved: &ResolvedResume,
+    resume_working_dir: &Path,
+    fresh_session_id: &mut dyn FnMut() -> String,
+    stderr: &mut dyn Write,
+) -> Result<ProviderRefBoundOutcome, MigrationError> {
+    let (target_provider_index, source) = provider_with_index_for_model(model, resolved)?;
+    ensure_provider_storage_supported(source)?;
+    let source_path = locate_migration_source_path(
+        sessions_cfg,
+        source,
+        &resolved.active_session_id,
+        Some(resume_working_dir),
+        stderr,
+    )?;
+    let bytes = read_jsonl_bytes(&source_path)?;
+    let slice = match select_recorded_boundary_tail(
+        state,
+        source,
+        &resolved.active_session_id,
+        &source_path,
+        &bytes,
+    )? {
+        BoundaryTailSelection::NoBoundary => {
+            warn_provider_ref_no_boundary(stderr, &source.name, &resolved.active_session_id);
+            return Ok(ProviderRefBoundOutcome::NoBoundary);
+        }
+        BoundaryTailSelection::BoundaryNotFound { turn_id } => {
+            warn_provider_ref_boundary_not_found(
+                stderr,
+                &resolved.active_session_id,
+                &source_path,
+                &turn_id,
+            );
+            return Ok(ProviderRefBoundOutcome::BoundaryNotFound);
+        }
+        BoundaryTailSelection::Found {
+            located_source_offset: Some(0),
+            ..
+        } => return Ok(ProviderRefBoundOutcome::AlreadyBounded),
+        BoundaryTailSelection::Found { slice, .. } => slice,
+    };
+    let (target_session_id, target_path) = fresh_provider_ref_target(
+        state,
+        source,
+        &resolved.chain_id,
+        resume_working_dir,
+        fresh_session_id,
+        stderr,
+    )?;
+    write_jsonl_atomic(&target_path, slice.as_ref())?;
+    rotate_provider_ref_chain_segment(state, source, resolved, &target_session_id)?;
+    preserve_provider_ref_boundary(
+        state,
+        source,
+        &resolved.active_session_id,
+        &target_session_id,
+    )?;
+    emit_migration_line(stderr, &source.name, &source.name, TransitionReason::Manual)?;
+
+    Ok(ProviderRefBoundOutcome::Rotated(MigratedSegment {
+        chain_id: resolved.chain_id.clone(),
+        source_provider: source.name.clone(),
+        source_session_id: resolved.active_session_id.clone(),
+        target_provider: source.name.clone(),
+        target_provider_index,
+        target_session_id,
+        target_jsonl_path: target_path,
+        reason: TransitionReason::Manual,
+    }))
+}
+
+fn provider_with_index_for_model<'a>(
+    model: &'a ModelConfig,
+    resolved: &ResolvedResume,
+) -> Result<(usize, &'a oulipoly_config::ProviderConfig), MigrationError> {
+    model
+        .providers
+        .iter()
+        .enumerate()
+        .find(|(_, provider)| provider.name == resolved.active_provider)
+        .ok_or_else(|| MigrationError::ProviderNotInModelPool {
+            provider: resolved.active_provider.clone(),
+            model_name: model.name.clone(),
+        })
+}
+
+fn source_provider_for_model<'a>(
+    model: &'a ModelConfig,
+    resolved: &ResolvedResume,
+) -> Result<&'a oulipoly_config::ProviderConfig, MigrationError> {
+    provider_with_index_for_model(model, resolved).map(|(_, provider)| provider)
+}
+
+fn target_provider_for_index(
+    model: &ModelConfig,
+    target_provider_index: usize,
+) -> Result<&oulipoly_config::ProviderConfig, MigrationError> {
+    model.providers.get(target_provider_index).ok_or_else(|| {
+        MigrationError::ProviderNotInModelPool {
+            provider: target_provider_index.to_string(),
+            model_name: model.name.clone(),
+        }
+    })
+}
+
+fn require_provider_resume(
+    provider: &oulipoly_config::ProviderConfig,
+) -> Result<(), MigrationError> {
+    if provider.resume.is_some() {
+        Ok(())
+    } else {
+        Err(MigrationError::ProviderMissingResume {
+            provider: provider.name.clone(),
+        })
+    }
+}
+
+fn ensure_migration_storage_supported(
+    source: &oulipoly_config::ProviderConfig,
+    target: &oulipoly_config::ProviderConfig,
+) -> Result<(), MigrationError> {
+    ensure_provider_storage_supported(source)?;
+    ensure_provider_storage_supported(target)
+}
+
+fn ensure_provider_storage_supported(
+    provider: &oulipoly_config::ProviderConfig,
+) -> Result<(), MigrationError> {
+    if provider_storage_class(provider) == Some(ScriptSessionStorageType::CodexSession) {
+        Err(MigrationError::CodexMigrationDeferred {
+            provider: provider.name.clone(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn locate_migration_source_path(
+    sessions_cfg: &SessionsConfig,
+    source: &oulipoly_config::ProviderConfig,
+    session_id: &str,
+    preferred_working_dir: Option<&Path>,
+    stderr: &mut dyn Write,
+) -> Result<PathBuf, MigrationError> {
+    if let Some(source_path) =
+        locate_transcript(sessions_cfg, &source.name, session_id).map_err(|message| {
+            MigrationError::TranscriptLocatorFailed {
+                provider: source.name.clone(),
+                message,
+            }
+        })?
+    {
+        return validate_source_path(source, session_id, source_path);
+    }
+    if let Some(source_path) = preferred_working_dir
+        .map(|cwd| find_provider_source_from_storage_cwd(source, session_id, cwd, stderr))
+        .transpose()?
+        .flatten()
+    {
+        return validate_source_path(source, session_id, source_path);
+    }
+    let source_path = find_claude_source_from_storage(source, session_id).ok_or_else(|| {
+        MigrationError::SourceMissingStorage {
+            provider: source.name.clone(),
+        }
+    })?;
+    validate_source_path(source, session_id, source_path)
+}
+
+fn find_provider_source_from_storage_cwd(
+    provider: &oulipoly_config::ProviderConfig,
+    session_id: &str,
+    cwd: &Path,
+    stderr: &mut dyn Write,
+) -> Result<Option<PathBuf>, MigrationError> {
+    let Some(projects_dir) = claude_projects_dir_from_provider_storage(provider) else {
+        return Ok(None);
+    };
+    let project_dir = claude_project_dir_for(&provider.name, cwd, stderr)?;
+    let candidate = projects_dir
+        .join(project_dir)
+        .join(format!("{session_id}.jsonl"));
+    Ok(candidate.exists().then_some(candidate))
+}
+
+fn validate_source_path(
+    source: &oulipoly_config::ProviderConfig,
+    session_id: &str,
+    source_path: PathBuf,
+) -> Result<PathBuf, MigrationError> {
+    if !source_path.is_absolute() {
+        return Err(MigrationError::SourcePathMalformed {
+            provider: source.name.clone(),
+            path: source_path.display().to_string(),
+        });
+    }
+    if !source_path.exists() {
+        return Err(MigrationError::SourceMissing {
+            provider: source.name.clone(),
+            session_id: session_id.to_string(),
+        });
+    }
+    Ok(source_path)
+}
+
+fn target_jsonl_path(
+    target: &oulipoly_config::ProviderConfig,
+    resume_working_dir: &Path,
+    target_session_id: &str,
+    stderr: &mut dyn Write,
+) -> Result<PathBuf, MigrationError> {
+    let projects_dir = claude_projects_dir_from_provider_storage(target).ok_or_else(|| {
+        MigrationError::TargetMissingStorage {
+            provider: target.name.clone(),
+        }
+    })?;
+    let cwd_project_dir = claude_project_dir_for(&target.name, resume_working_dir, stderr)?;
+    Ok(projects_dir
+        .join(cwd_project_dir)
+        .join(format!("{target_session_id}.jsonl")))
+}
+
+fn read_jsonl_bytes(path: &Path) -> Result<Vec<u8>, MigrationError> {
+    std::fs::read(path).map_err(|e| MigrationError::Io {
+        path: path.display().to_string(),
+        message: e.to_string(),
+    })
+}
+
+fn explicit_migration_slice<'a>(
+    state: &StateDb,
+    source: &oulipoly_config::ProviderConfig,
+    session_id: &str,
+    source_path: &Path,
+    bytes: &'a [u8],
+    stderr: &mut dyn Write,
+) -> Result<Cow<'a, [u8]>, MigrationError> {
+    match select_recorded_boundary_tail(state, source, session_id, source_path, bytes)? {
+        BoundaryTailSelection::NoBoundary => Ok(Cow::Borrowed(bytes)),
+        BoundaryTailSelection::BoundaryNotFound { turn_id } => {
+            warn_explicit_boundary_not_found(stderr, session_id, source_path, &turn_id);
+            Ok(Cow::Borrowed(bytes))
+        }
+        BoundaryTailSelection::Found { slice, .. } => Ok(slice),
+    }
+}
+
+fn select_recorded_boundary_tail<'a>(
+    state: &StateDb,
+    source: &oulipoly_config::ProviderConfig,
+    session_id: &str,
+    source_path: &Path,
+    bytes: &'a [u8],
+) -> Result<BoundaryTailSelection<'a>, MigrationError> {
+    let Some((turn_id, _)) = state
+        .latest_compaction_boundary(&source.name, session_id)
+        .map_err(|message| MigrationError::Db { message })?
+    else {
+        return Ok(BoundaryTailSelection::NoBoundary);
+    };
+    if let Some(offset) = find_turn_offset(bytes, &turn_id) {
+        return Ok(BoundaryTailSelection::Found {
+            located_source_offset: Some(offset),
+            slice: Cow::Borrowed(&bytes[offset..]),
+        });
+    }
+    if let Some(alternate) =
+        find_alternate_jsonl_with_boundary(source, session_id, source_path, &turn_id)
+    {
+        return Ok(BoundaryTailSelection::Found {
+            located_source_offset: None,
+            slice: Cow::Owned(alternate),
+        });
+    }
+    Ok(BoundaryTailSelection::BoundaryNotFound { turn_id })
+}
+
+fn warn_explicit_boundary_not_found(
+    stderr: &mut dyn Write,
+    session_id: &str,
+    source_path: &Path,
+    turn_id: &str,
+) {
+    let _ = writeln!(
+        stderr,
+        "Warning: recorded compaction boundary turn_id={turn_id} not found in any candidate JSONL for session_id={session_id} located_path={path}; falling back to full source slice",
+        path = source_path.display(),
+    );
+}
+
+fn warn_provider_ref_no_boundary(stderr: &mut dyn Write, provider: &str, session_id: &str) {
+    let _ = writeln!(
+        stderr,
+        "Warning: no recorded compaction boundary for provider={provider} session_id={session_id}; using original session id"
+    );
+}
+
+fn warn_provider_ref_boundary_not_found(
+    stderr: &mut dyn Write,
+    session_id: &str,
+    source_path: &Path,
+    turn_id: &str,
+) {
+    let _ = writeln!(
+        stderr,
+        "Warning: recorded compaction boundary turn_id={turn_id} not found in any candidate JSONL for session_id={session_id} located_path={path}; using original session id",
+        path = source_path.display(),
+    );
+}
+
+fn ensure_no_conflicting_active_segment(
+    state: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    own_chain_id: &str,
+) -> Result<(), MigrationError> {
+    if let Some(conflicting_chain_id) = state
+        .find_conflicting_active_segment(provider_name, session_id, own_chain_id)
+        .map_err(|message| MigrationError::Db { message })?
+    {
+        return Err(MigrationError::TargetSessionInUseByOtherChain {
+            provider: provider_name.to_string(),
+            session_id: session_id.to_string(),
+            conflicting_chain_id,
+        });
+    }
+    Ok(())
+}
+
+fn write_jsonl_atomic(target_path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
+    let target_dir =
+        target_path
+            .parent()
+            .ok_or_else(|| MigrationError::TargetDirectoryCreateFailed {
+                path: target_path.display().to_string(),
+                message: "target path has no parent directory".to_string(),
+            })?;
+    std::fs::create_dir_all(target_dir).map_err(|e| {
+        MigrationError::TargetDirectoryCreateFailed {
+            path: target_dir.display().to_string(),
+            message: e.to_string(),
+        }
+    })?;
+    let tmp = target_path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| MigrationError::Io {
+        path: tmp.display().to_string(),
+        message: e.to_string(),
+    })?;
+    std::fs::rename(&tmp, target_path).map_err(|e| MigrationError::Io {
+        path: target_path.display().to_string(),
+        message: e.to_string(),
+    })
+}
+
+fn fresh_provider_ref_target(
+    state: &StateDb,
+    provider: &oulipoly_config::ProviderConfig,
+    chain_id: &str,
+    resume_working_dir: &Path,
+    fresh_session_id: &mut dyn FnMut() -> String,
+    stderr: &mut dyn Write,
+) -> Result<(String, PathBuf), MigrationError> {
+    let mut last_error = None;
+    for _ in 0..MAX_FRESH_SESSION_ID_ATTEMPTS {
+        let candidate = fresh_session_id();
+        let target_path = target_jsonl_path(provider, resume_working_dir, &candidate, stderr)?;
+        if target_path.exists() {
+            last_error = Some(MigrationError::TargetAlreadyExists {
+                provider: provider.name.clone(),
+                path: target_path.display().to_string(),
+            });
+            continue;
+        }
+        match ensure_no_conflicting_active_segment(state, &provider.name, &candidate, chain_id) {
+            Ok(()) => return Ok((candidate, target_path)),
+            Err(err @ MigrationError::TargetSessionInUseByOtherChain { .. }) => {
+                last_error = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(
+        last_error.unwrap_or_else(|| MigrationError::TargetAlreadyExists {
+            provider: provider.name.clone(),
+            path: resume_working_dir.display().to_string(),
+        }),
+    )
+}
+
+fn rotate_provider_ref_chain_segment(
+    state: &StateDb,
+    source: &oulipoly_config::ProviderConfig,
+    resolved: &ResolvedResume,
+    target_session_id: &str,
+) -> Result<(), MigrationError> {
+    let now = chrono::Utc::now();
+    state
+        .rotate_chain_segment_transactionally(ChainSegmentRotationInput {
+            chain_id: &resolved.chain_id,
+            source_provider_name: &source.name,
+            source_session_id: &resolved.active_session_id,
+            target_provider_name: &source.name,
+            target_session_id,
+            changed_at: &now,
+            reason: TransitionReason::Manual,
+        })
+        .map(|_| ())
+        .map_err(|message| MigrationError::Db { message })
+}
+
+fn preserve_provider_ref_boundary(
+    state: &StateDb,
+    source: &oulipoly_config::ProviderConfig,
+    source_session_id: &str,
+    target_session_id: &str,
+) -> Result<(), MigrationError> {
+    let preserved = state
+        .preserve_compaction_boundary_for_session(
+            &source.name,
+            source_session_id,
+            &source.name,
+            target_session_id,
+        )
+        .map_err(|message| MigrationError::Db { message })?;
+    if preserved {
+        Ok(())
+    } else {
+        Err(MigrationError::Db {
+            message: "compaction boundary disappeared before preservation".to_string(),
+        })
+    }
+}
+
+fn emit_migration_line(
+    stderr: &mut dyn Write,
+    source_provider: &str,
+    target_provider: &str,
+    reason: TransitionReason,
+) -> Result<(), MigrationError> {
+    writeln!(
+        stderr,
+        "[migrate] {} -> {} reason={}",
+        source_provider,
+        target_provider,
+        reason.as_str()
+    )
+    .map_err(|e| MigrationError::Io {
+        path: "<stderr>".to_string(),
+        message: e.to_string(),
     })
 }
 
@@ -384,7 +766,6 @@ fn find_alternate_jsonl_with_boundary(
     session_id: &str,
     located_path: &Path,
     turn_id: &str,
-    find_turn_offset: &dyn Fn(&[u8], &str) -> Option<usize>,
 ) -> Option<Vec<u8>> {
     let projects_dir = claude_projects_dir_from_provider_storage(provider)?;
     let entries = std::fs::read_dir(&projects_dir).ok()?;
@@ -404,6 +785,36 @@ fn find_alternate_jsonl_with_boundary(
         }
     }
     None
+}
+
+fn find_turn_offset(buf: &[u8], turn_id: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in buf.split_inclusive(|byte| *byte == b'\n') {
+        if jsonl_line_turn_id_matches(trim_jsonl_newline(line), turn_id) {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn trim_jsonl_newline(line: &[u8]) -> &[u8] {
+    let without_lf = line.strip_suffix(b"\n").unwrap_or(line);
+    without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
+}
+
+fn jsonl_line_turn_id_matches(line: &[u8], turn_id: &str) -> bool {
+    parse_jsonl_line(line).is_some_and(|value| json_turn_id_field_matches(&value, turn_id))
+}
+
+fn parse_jsonl_line(line: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice::<serde_json::Value>(line).ok()
+}
+
+fn json_turn_id_field_matches(value: &serde_json::Value, turn_id: &str) -> bool {
+    ["uuid", "turn_id", "turnId", "id"]
+        .into_iter()
+        .any(|field| value.get(field).and_then(|raw| raw.as_str()) == Some(turn_id))
 }
 
 #[cfg(test)]
