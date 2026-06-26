@@ -3945,7 +3945,7 @@ fn s11_m2c_resume_no_payload_repl_skips_default_provider_ref_migration() {
 }
 
 #[test]
-fn s11_m2c_provider_ref_repl_bounds_transcript_before_launch() {
+fn s11_m2c_provider_ref_repl_launches_existing_session_unbounded() {
     let fixture = Fixture::new();
     let models = fixture.write_s11_m2c_scope_configs();
     let projects_dir = fixture.dir.path().join("repl-provider-projects");
@@ -3956,19 +3956,22 @@ fn s11_m2c_provider_ref_repl_bounds_transcript_before_launch() {
     let recorder = fixture.recording_script_with_pwd("repl-bound-provider", &argv_path, &pwd_path);
     fixture.rewrite_scope_provider_entries_with_resume_storage(&recorder, &projects_dir);
     seed_provider_ref_boundary_resume_chain(&fixture, &models.target);
-    let (source_path, boundary_line, pre_boundary_line, post_boundary_line) =
+    let (source_path, _boundary_line, _pre_boundary_line, _post_boundary_line) =
         stage_provider_ref_boundary_jsonl(
             &projects_dir,
             &resolved_launch_cwd,
             "session-resume-repl",
         );
+    let transcript_dir = projects_dir.join(claude_project_dir_name(&resolved_launch_cwd));
     let original_source = fs::read(&source_path).unwrap();
+    let before_files = transcript_file_snapshot(&transcript_dir);
     seed_mailbox(
         &fixture.default_runtime_mailbox_path(),
         "session-resume-repl",
         Some(resolved_launch_cwd.to_str().unwrap()),
     );
-    fixture.copy_state_to_default_runtime_path();
+    let runtime_state = fixture.copy_state_to_default_runtime_path();
+    let before_segments = full_snapshot(&runtime_state).segments;
 
     let output = fixture
         .repl_resume_command(RESUME_CHAIN_REPL)
@@ -3983,37 +3986,27 @@ fn s11_m2c_provider_ref_repl_bounds_transcript_before_launch() {
         .iter()
         .position(|line| *line == "--resume")
         .unwrap_or_else(|| panic!("REPL launch did not receive configured resume flag: {argv}"));
-    let fresh_session_id = argv_lines
-        .get(resume_flag + 1)
-        .copied()
-        .expect("REPL resume flag should be followed by the provider session id");
-    assert_ne!(
-        fresh_session_id, "session-resume-repl",
-        "provider-ref REPL resume must pass a fresh bounded provider session id"
-    );
-    let fresh_path = projects_dir
-        .join(claude_project_dir_name(&resolved_launch_cwd))
-        .join(format!("{fresh_session_id}.jsonl"));
-    let caller_cwd_fresh_path = projects_dir
-        .join(claude_project_dir_name(fixture.dir.path()))
-        .join(format!("{fresh_session_id}.jsonl"));
-    let fresh_contents = fs::read_to_string(&fresh_path).unwrap();
     assert_eq!(
-        fresh_contents,
-        format!("{boundary_line}\n{post_boundary_line}\n"),
-        "launch-selected fresh JSONL must contain the complete post-boundary tail"
-    );
-    assert!(!fresh_contents.contains(&pre_boundary_line), "{fresh_contents}");
-    assert!(
-        !caller_cwd_fresh_path.exists(),
-        "fresh bounded JSONL must be written under the resolved launch cwd, not the caller cwd"
+        argv_lines.get(resume_flag + 1).copied(),
+        Some("session-resume-repl"),
+        "provider-ref REPL resume must pass the existing provider session id unbounded"
     );
     assert_eq!(
         fs::read_to_string(&pwd_path).unwrap().trim(),
-        resolved_launch_cwd.to_string_lossy().as_ref(),
-        "REPL resume_spawn_cwd must use the resolved launch cwd"
+        fixture.dir.path().to_string_lossy().as_ref(),
+        "provider-ref REPL skip must not compute a migration/bounding launch cwd"
     );
     assert_eq!(fs::read(&source_path).unwrap(), original_source);
+    assert_eq!(
+        transcript_file_snapshot(&transcript_dir),
+        before_files,
+        "provider-ref REPL resume must not create a fresh JSONL or temp file"
+    );
+    assert_eq!(
+        full_snapshot(&runtime_state).segments,
+        before_segments,
+        "provider-ref REPL resume must not close/open chain segments"
+    );
 }
 
 #[test]
@@ -4092,22 +4085,6 @@ fn assert_repl_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCase) 
 
     assert_no_external_identity_errors(&output);
     assert_success(&output);
-    let combined = combined_output(&output);
-    match case {
-        ProviderRefNonRotatedCase::NoBoundary => {
-            assert!(combined.contains("Warning"), "{combined}");
-            assert!(combined.contains("compaction boundary"), "{combined}");
-            assert!(combined.contains("session-resume-repl"), "{combined}");
-        }
-        ProviderRefNonRotatedCase::BoundaryNotFound => {
-            assert!(combined.contains("Warning"), "{combined}");
-            assert!(combined.contains(PROVIDER_REF_BOUNDARY_TURN_ID), "{combined}");
-            assert!(combined.contains("session-resume-repl"), "{combined}");
-        }
-        ProviderRefNonRotatedCase::AlreadyBounded => {
-            assert!(!combined.contains("Warning"), "{combined}");
-        }
-    }
     let argv = fs::read_to_string(&argv_path).unwrap();
     let argv_lines: Vec<_> = argv.lines().collect();
     let resume_flag = argv_lines
@@ -4121,8 +4098,8 @@ fn assert_repl_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCase) 
     );
     assert_eq!(
         fs::read_to_string(&pwd_path).unwrap().trim(),
-        resolved_launch_cwd.to_string_lossy().as_ref(),
-        "non-rotated provider-ref REPL resume must keep the resolved launch cwd for {case:?}"
+        fixture.dir.path().to_string_lossy().as_ref(),
+        "non-rotated provider-ref REPL resume must keep the pre-resume2 skip cwd for {case:?}"
     );
     assert_eq!(fs::read(&source_path).unwrap(), original_source);
     assert_eq!(
@@ -4138,7 +4115,7 @@ fn assert_repl_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCase) 
 }
 
 #[test]
-fn s11_m2c_provider_ref_repl_model_provider_mismatch_rejects_before_bounding() {
+fn s11_m2c_provider_ref_repl_model_provider_mismatch_rejects_before_default_migration() {
     let fixture = Fixture::new();
     let models = fixture.write_s11_m2c_scope_configs();
     let projects_dir = fixture.dir.path().join("repl-provider-projects");
