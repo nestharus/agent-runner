@@ -698,6 +698,8 @@ pub fn find_claude_source_from_storage(
     None
 }
 
+pub use find_claude_source_from_storage as find_session_source_from_storage;
+
 fn provider_storage_class(
     provider: &oulipoly_config::ProviderConfig,
 ) -> Option<ScriptSessionStorageType> {

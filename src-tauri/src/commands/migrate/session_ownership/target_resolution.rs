@@ -20,8 +20,9 @@ struct LoadedTargetConfig {
 pub(crate) struct TargetResolution {
     pub(crate) model_name: String,
     pub(crate) canonical_provider_name: String,
+    pub(crate) transcript_source_provider: ProviderConfig,
     pub(crate) inventory: Vec<String>,
-    pub(crate) provider_ref_model_names: BTreeSet<String>,
+    pub(crate) moved_family_provider_ref_models: BTreeSet<String>,
     provider_artifact: ProviderArtifactRef,
 }
 
@@ -33,16 +34,18 @@ pub(crate) fn resolve_target(
     let model = require_target_model(select_target_model(&loaded.models, &target_binary))?;
     let provider_artifact = require_provider_artifact(model.provider.as_ref())?;
     let canonical = require_canonical_provider(first_provider(model))?;
-    let provider_ref_model_names = provider_ref_model_names(&loaded.models);
-    let _ = loaded
+    let moved_family_provider_ref_models =
+        moved_family_provider_ref_models(&loaded.models, &target_binary);
+    let (transcript_source_provider, _) = loaded
         .providers_cfg
         .runtime_provider(&canonical.name)
         .map_err(|err| DryRunError::new(format!("target provider account failed: {err}")))?;
     Ok(target_resolution(
         model,
         canonical,
+        transcript_source_provider,
         provider_artifact,
-        provider_ref_model_names,
+        moved_family_provider_ref_models,
     ))
 }
 
@@ -81,10 +84,13 @@ fn select_target_model<'a>(
         .min_by(|left, right| left.name.cmp(&right.name))
 }
 
-fn provider_ref_model_names(models: &HashMap<String, ModelConfig>) -> BTreeSet<String> {
+fn moved_family_provider_ref_models(
+    models: &HashMap<String, ModelConfig>,
+    target_binary: &str,
+) -> BTreeSet<String> {
     models
         .values()
-        .filter(|model| model.provider.is_some())
+        .filter(|model| model_provider_binary(model).as_deref() == Some(target_binary))
         .map(|model| model.name.clone())
         .collect()
 }
@@ -117,18 +123,20 @@ fn require_canonical_provider(
 fn target_resolution(
     model: &ModelConfig,
     canonical: &ProviderConfig,
+    transcript_source_provider: ProviderConfig,
     provider_artifact: ProviderArtifactRef,
-    provider_ref_model_names: BTreeSet<String>,
+    moved_family_provider_ref_models: BTreeSet<String>,
 ) -> TargetResolution {
     TargetResolution {
         model_name: model.name.clone(),
         canonical_provider_name: canonical.name.clone(),
+        transcript_source_provider,
         inventory: model
             .providers
             .iter()
             .map(|provider| provider.name.clone())
             .collect(),
-        provider_ref_model_names,
+        moved_family_provider_ref_models,
         provider_artifact,
     }
 }

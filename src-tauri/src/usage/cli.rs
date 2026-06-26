@@ -235,6 +235,10 @@ pub(crate) enum Subcommands {
         #[arg(long = "rollback")]
         rollback: bool,
 
+        /// Run the model corrective variant for the selected mode.
+        #[arg(long = "corrective")]
+        corrective: bool,
+
         /// Directory where copied DBs and report are written.
         #[arg(long = "scratch-dir")]
         scratch_dir: Option<PathBuf>,

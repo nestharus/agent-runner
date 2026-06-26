@@ -1,14 +1,16 @@
 //! Declared roles: accessor, mapper, validator, predicate
 
-use super::DryRunError;
 use super::preflight::{self, IntegrityReport};
+use super::DryRunError;
 use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const FORWARD_SQL: &str = include_str!("forward.sql");
 const ROLLBACK_SQL: &str = include_str!("s11_wu4_restore_session_ownership_preimage.sql");
+const CORRECTIVE_FORWARD_SQL: &str = include_str!("corrective_forward.sql");
+const CORRECTIVE_ROLLBACK_SQL: &str = include_str!("corrective_rollback.sql");
 
 #[derive(Debug, Clone)]
 pub(crate) struct ForwardCounts {
@@ -19,6 +21,17 @@ pub(crate) struct ForwardCounts {
 pub(crate) struct RollbackCounts {
     pub(crate) counts: BTreeMap<String, i64>,
     pub(crate) mismatches: BTreeMap<String, i64>,
+    pub(crate) restored: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectiveCounts {
+    pub(crate) counts: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectiveRollbackCounts {
+    pub(crate) counts: BTreeMap<String, i64>,
     pub(crate) restored: bool,
 }
 
@@ -38,6 +51,15 @@ pub(crate) struct LiveApplyVerification {
     pub(crate) segment_collision_count: i64,
     pub(crate) turn_collision_count: i64,
     pub(crate) preimage_rows: i64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CorrectiveApplyVerification {
+    pub(crate) integrity: IntegrityReport,
+    pub(crate) planned: i64,
+    pub(crate) applied: i64,
+    pub(crate) preimage_rows: i64,
+    pub(crate) residual_default_rows: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +103,38 @@ pub(crate) fn apply_forward_live(conn: &Connection) -> Result<ForwardCounts, Dry
     }
 }
 
+pub(crate) fn apply_corrective_forward(conn: &Connection) -> Result<CorrectiveCounts, DryRunError> {
+    validate_corrective_preimage_compatible(conn)?;
+    match conn.execute_batch(CORRECTIVE_FORWARD_SQL) {
+        Ok(()) => Ok(CorrectiveCounts {
+            counts: read_key_counts(conn, "s11_m2c_model_corrective_last_run_counts")?,
+        }),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err.into())
+        }
+    }
+}
+
+pub(crate) fn apply_corrective_forward_live(
+    conn: &Connection,
+) -> Result<CorrectiveCounts, DryRunError> {
+    validate_corrective_preimage_compatible(conn)?;
+    match conn.execute_batch(CORRECTIVE_FORWARD_SQL) {
+        Ok(()) => Ok(CorrectiveCounts {
+            counts: read_key_counts(conn, "s11_m2c_model_corrective_last_run_counts")?,
+        }),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if is_busy_or_locked(&err) {
+                Err(live_busy_error())
+            } else {
+                Err(err.into())
+            }
+        }
+    }
+}
+
 pub(crate) fn apply_rollback(conn: &Connection) -> Result<RollbackCounts, DryRunError> {
     assert_no_rollback_drift(conn)?;
     conn.execute_batch(ROLLBACK_SQL)?;
@@ -103,6 +157,42 @@ pub(crate) fn apply_rollback_live(conn: &Connection) -> Result<RollbackCounts, D
         }
         Err(err) if is_busy_or_locked(&err) => Err(live_busy_error()),
         Err(err) => Err(err.into()),
+    }
+}
+
+pub(crate) fn apply_corrective_rollback(
+    conn: &Connection,
+) -> Result<CorrectiveRollbackCounts, DryRunError> {
+    assert_no_corrective_rollback_drift(conn)?;
+    match conn.execute_batch(CORRECTIVE_ROLLBACK_SQL) {
+        Ok(()) => {
+            let counts = read_key_counts(conn, "s11_m2c_model_corrective_last_rollback_counts")?;
+            Ok(corrective_rollback_counts(counts))
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err.into())
+        }
+    }
+}
+
+pub(crate) fn apply_corrective_rollback_live(
+    conn: &Connection,
+) -> Result<CorrectiveRollbackCounts, DryRunError> {
+    assert_no_corrective_rollback_drift(conn)?;
+    match conn.execute_batch(CORRECTIVE_ROLLBACK_SQL) {
+        Ok(()) => {
+            let counts = read_key_counts(conn, "s11_m2c_model_corrective_last_rollback_counts")?;
+            Ok(corrective_rollback_counts(counts))
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if is_busy_or_locked(&err) {
+                Err(live_busy_error())
+            } else {
+                Err(err.into())
+            }
+        }
     }
 }
 
@@ -151,6 +241,49 @@ pub(crate) fn verify_live_apply(
     })
 }
 
+pub(crate) fn verify_corrective_apply(
+    conn: &Connection,
+    before: &IntegrityReport,
+    counts: &CorrectiveCounts,
+    moved_family_provider_ref_models: &BTreeSet<String>,
+) -> Result<CorrectiveApplyVerification, DryRunError> {
+    let integrity = preflight::inspect_integrity(conn)?;
+    validate_live_integrity(before, &integrity)?;
+    let planned = *counts
+        .counts
+        .get("corrective_chain_model_updates_to_apply")
+        .unwrap_or(&0);
+    let applied = *counts
+        .counts
+        .get("corrective_chain_model_updates_applied")
+        .unwrap_or(&0);
+    if planned != applied {
+        return Err(DryRunError::new(format!(
+            "post-apply count mismatch for corrective_chain_model_updates_to_apply: planned {planned}, applied {applied}"
+        )));
+    }
+    let preimage_rows = corrective_preimage_row_count(conn)?;
+    if planned != 0 && preimage_rows == 0 {
+        return Err(DryRunError::new(
+            "post-apply verification failed: corrective preimage is empty",
+        ));
+    }
+    let residual_default_rows = corrective_residual_default_rows(conn)?;
+    if residual_default_rows != 0 {
+        return Err(DryRunError::new(format!(
+            "post-apply verification failed: residual corrective default rows: {residual_default_rows}"
+        )));
+    }
+    validate_corrective_targets_in_inventory(conn, moved_family_provider_ref_models)?;
+    Ok(CorrectiveApplyVerification {
+        integrity,
+        planned,
+        applied,
+        preimage_rows,
+        residual_default_rows,
+    })
+}
+
 pub(crate) fn require_preimage_rows(conn: &Connection) -> Result<i64, DryRunError> {
     let rows = preimage_row_count(conn).map_err(|err| {
         DryRunError::new(format!(
@@ -160,6 +293,20 @@ pub(crate) fn require_preimage_rows(conn: &Connection) -> Result<i64, DryRunErro
     if rows == 0 {
         return Err(DryRunError::new(
             "nothing to roll back: preimage table is empty",
+        ));
+    }
+    Ok(rows)
+}
+
+pub(crate) fn require_corrective_preimage_rows(conn: &Connection) -> Result<i64, DryRunError> {
+    let rows = corrective_preimage_row_count(conn).map_err(|err| {
+        DryRunError::new(format!(
+            "nothing to roll back: corrective preimage table missing or unreadable: {err}"
+        ))
+    })?;
+    if rows == 0 {
+        return Err(DryRunError::new(
+            "nothing to roll back: corrective preimage table is empty",
         ));
     }
     Ok(rows)
@@ -177,8 +324,29 @@ pub(crate) fn verify_rollback_restored(
     Ok(mismatches)
 }
 
+pub(crate) fn verify_corrective_rollback_restored(conn: &Connection) -> Result<i64, DryRunError> {
+    let mismatches = corrective_rollback_mismatch_count(conn)?;
+    if mismatches != 0 {
+        return Err(DryRunError::new(format!(
+            "corrective rollback verification failed: mismatches remain: {mismatches}"
+        )));
+    }
+    Ok(mismatches)
+}
+
 pub(crate) fn drop_preimage_artifacts(conn: &Connection) -> Result<(), DryRunError> {
     conn.execute_batch("DROP TABLE IF EXISTS s11_wu4_restore_session_ownership_preimage;")?;
+    Ok(())
+}
+
+pub(crate) fn drop_corrective_preimage_artifacts(conn: &Connection) -> Result<(), DryRunError> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS s11_m2c_model_corrective_preimage;
+         DROP TABLE IF EXISTS s11_m2c_model_corrective_last_run_plan;
+         DROP TABLE IF EXISTS s11_m2c_model_corrective_last_run_counts;
+         DROP TABLE IF EXISTS s11_m2c_model_corrective_last_rollback_plan;
+         DROP TABLE IF EXISTS s11_m2c_model_corrective_last_rollback_counts;",
+    )?;
     Ok(())
 }
 
@@ -193,6 +361,54 @@ pub(crate) fn cwd_completeness(
 
 fn assert_no_rollback_drift(conn: &Connection) -> Result<(), DryRunError> {
     validate_no_rollback_drift(read_rollback_drift(conn)?)
+}
+
+fn assert_no_corrective_rollback_drift(conn: &Connection) -> Result<(), DryRunError> {
+    let drift = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM s11_m2c_model_corrective_preimage preimage
+             LEFT JOIN session_chains chain ON chain.chain_id = preimage.chain_id
+             WHERE chain.chain_id IS NULL
+                OR chain.model_name <> preimage.new_model_name
+          )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if drift {
+        return Err(DryRunError::new("corrective chain drift before rollback"));
+    }
+    Ok(())
+}
+
+fn validate_corrective_preimage_compatible(conn: &Connection) -> Result<(), DryRunError> {
+    if !table_exists(conn, "s11_m2c_model_corrective_preimage")? {
+        return Ok(());
+    }
+    let plan_rows = table_row_count(conn, "s11_m2c_model_corrective_plan")?;
+    let preimage_rows = table_row_count(conn, "s11_m2c_model_corrective_preimage")?;
+    if plan_rows == 0 || preimage_rows == 0 {
+        return Ok(());
+    }
+    let incompatible = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM s11_m2c_model_corrective_plan plan
+             LEFT JOIN s11_m2c_model_corrective_preimage preimage
+               ON preimage.chain_id = plan.chain_id
+              AND preimage.old_model_name = plan.old_model_name
+              AND preimage.new_model_name = plan.new_model_name
+             WHERE preimage.chain_id IS NULL
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if incompatible {
+        return Err(DryRunError::new(
+            "corrective preimage already exists with a different pending plan",
+        ));
+    }
+    Ok(())
 }
 
 fn read_rollback_drift(conn: &Connection) -> Result<Vec<DriftProbeResult>, DryRunError> {
@@ -351,6 +567,25 @@ fn validate_no_rollback_drift(results: Vec<DriftProbeResult>) -> Result<(), DryR
     Ok(())
 }
 
+fn validate_corrective_targets_in_inventory(
+    conn: &Connection,
+    moved_family_provider_ref_models: &BTreeSet<String>,
+) -> Result<(), DryRunError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT new_model_name FROM s11_m2c_model_corrective_preimage ORDER BY new_model_name",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let model_name = row?;
+        if !moved_family_provider_ref_models.contains(&model_name) {
+            return Err(DryRunError::new(format!(
+                "corrective target outside provider-ref inventory: {model_name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_drift_probe(result: DriftProbeResult) -> Result<(), DryRunError> {
     if result.exists {
         return Err(DryRunError::new(result.kind));
@@ -360,6 +595,34 @@ fn validate_drift_probe(result: DriftProbeResult) -> Result<(), DryRunError> {
 
 fn preimage_mismatch_counts(conn: &Connection) -> Result<BTreeMap<String, i64>, DryRunError> {
     Ok(mismatch_count_map(mismatch_count_rows(conn)?))
+}
+
+fn corrective_residual_default_rows(conn: &Connection) -> Result<i64, DryRunError> {
+    if !table_exists(conn, "s11_m2c_model_corrective_last_run_plan")? {
+        return Ok(0);
+    }
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_m2c_model_corrective_last_run_plan plan
+         JOIN session_chains chain ON chain.chain_id = plan.chain_id
+         WHERE chain.model_name = plan.old_model_name",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn corrective_rollback_mismatch_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM s11_m2c_model_corrective_preimage preimage
+         LEFT JOIN session_chains chain ON chain.chain_id = preimage.chain_id
+         WHERE chain.chain_id IS NULL
+            OR chain.model_name <> preimage.old_model_name",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn mismatch_count_rows(conn: &Connection) -> Result<Vec<(&'static str, i64)>, DryRunError> {
@@ -714,6 +977,38 @@ fn preimage_row_count(conn: &Connection) -> Result<i64, DryRunError> {
     .map_err(Into::into)
 }
 
+fn corrective_preimage_row_count(conn: &Connection) -> Result<i64, DryRunError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM s11_m2c_model_corrective_preimage",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn table_row_count(conn: &Connection, table_name: &str) -> Result<i64, DryRunError> {
+    if !table_exists(conn, table_name)? {
+        return Ok(0);
+    }
+    conn.query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
+        row.get(0)
+    })
+    .map_err(Into::into)
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, DryRunError> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+             UNION ALL
+             SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?1
+         )",
+        [table_name],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 fn is_busy_or_locked(err: &rusqlite::Error) -> bool {
     matches!(
         err,
@@ -899,6 +1194,17 @@ fn rollback_counts(
         restored: all_zero(&mismatches),
         counts,
         mismatches,
+    }
+}
+
+fn corrective_rollback_counts(counts: BTreeMap<String, i64>) -> CorrectiveRollbackCounts {
+    let mismatches = counts
+        .get("corrective_chain_model_rollback_mismatches")
+        .copied()
+        .unwrap_or(0);
+    CorrectiveRollbackCounts {
+        restored: mismatches == 0,
+        counts,
     }
 }
 
@@ -1184,8 +1490,8 @@ mod tests {
     }
 
     #[test]
-    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction()
-     {
+    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction(
+    ) {
         assert_intrinsic_loser_drift_rolls_back("timestamp", "2026-06-20T10:30:00Z");
     }
 

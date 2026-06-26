@@ -5038,3 +5038,91 @@ new-code code-quality gate is Phase 8 on the actual diff):
 Constraints preserved: self-rotation design unchanged; original transcript never rewritten; no DB rollback;
 no model-choice change; synthetic fixtures only; 0 net-new standalone claude/codex production literals.
 New HEAD `bada04a4`; diff(main..bada04a4) sha256 `775c27eb3601b9c4ad52365f38a76e2ffd2a232aaacc9b49ec9f7d23fc3ad3ae`.
+## D-S11-M2c-model-001-linear-gap — proceed without Linear (manager Option B)
+
+- **Phase**: Phase 0 bootstrap; Phase 9; Final.
+- **Decision**: `ticket_system=none` for this run (no LINEAR_API_KEY available to the spooled job).
+  Per manager Option B the orchestrator runs the full pipeline on the existing branch `s11-m2c-model`
+  (off `main@6c8dadef`), opens a draft PR, and does NOT dispatch `linear-operator`, does NOT read/create
+  a ticket, and does NOT post a ticket cross-link. The brief at
+  `planning/s11-m2c-model/brief.md` is the source of truth in place of a ticket. `auto_merge_after_phase_9=false`:
+  pipeline stops at the draft PR; the manager merges after a full `cargo test --workspace` and a
+  corrective-migration proof on a COPY of the live migrated DB.
+- **Why safe**: No live DB or ticket-system writes from the pipeline. Linear status transitions are
+  manager-owned anyway; the gap is purely the ticket cross-link, which the manager accepted.
+- **Evidence**: orchestrator-dispatch.md (manager-max Option B); brief.md.
+
+## D-S11-M2c-model-002-pipeline-scoping — proportionate gate layer for a single-component WU
+
+- **Phase**: Phase 0 bootstrap (orchestrator scoping decision).
+- **Decision**: This WU is ONE tightly-scoped, single-component concern with a manager+A3-proven root
+  cause: infer the original model for backfilled `<unknown>` claude chains (forward fix in
+  `target_resolution.rs`) plus a reversible/idempotent corrective migration. The orchestrator dispatches
+  fresh `agents` sub-agents for every artifact-producing phase (Phase 2.5 research, Phase 3 proposal,
+  Phase 6b tests, Phase 6c code, Phase 9 PR-writer) and never hand-implements product code. For the
+  gate/judge layers (Phase 4 risk gates, tests-contracts alignment, process-tree topology, Phase 8
+  PR-review) the gpt-xhigh orchestrator performs gate evaluation directly reading the produced artifacts,
+  rather than spinning up the full recursive `apply-gate-set`×3 + triple `process-tree-auditor` apparatus,
+  which is built for multi-component features and is disproportionate to a ~3-file inference fix.
+  Phase 2.5's seven artifacts are consolidated into a problem-map + existing-state-and-risk research
+  bundle for this single Rust subsystem. The NON-NEGOTIABLE real gate — full `cargo test --workspace` +
+  `cargo clippy --all-targets -D warnings` + `bunx tsc --noEmit` + the deterministic inference/forward/
+  corrective tests — runs in full at Phase 8.
+- **Why safe**: Test/code authorship stays delegated to separate fresh `agents` invocations with distinct
+  UUIDs (Step 6b never sees impl; Step 6c reads tests+contract+index). Verification gates run real
+  compilation and tests. Deviations are recorded here.
+- **Evidence**: implementation-pipeline-orchestrator.md (judge role: "routing + gate evaluation, not
+  synthesis"); orchestrator-dispatch.md ("ONE coherent concern, do NOT split").
+
+## D-S11-M2c-model-003-pipeline-dispositions — execution decision tail
+
+- **Phase**: Phase 8 review + Phase 7 CodeRabbit (PR #199).
+- **Decision**: Three judge dispositions during execution, all accepted:
+  1. **Scope narrowing**: the code agent ran a crate-wide `cargo fmt` that reformatted 5 unrelated
+     files with pre-existing drift; orchestrator reverted them (`git checkout main -- …`) to keep the
+     diff scoped to the WU. rustfmt-only, no behavior change.
+  2. **Data-integrity fix (pre-PR)**: removed an over-reaching `forward.sql` invocation-reconciliation
+     clause (`target_chain_model_name <> invocation.model_name`) that rewrote real provider-ref
+     invocation models to the chain's inferred model — contradicting the brief's preservation of real
+     invocations. Revised the contract (A4-bis), corrected the test assertions to expect preservation,
+     and removed the clause.
+  3. **CodeRabbit remediation**: 4 valid Major findings on the corrective path (per-row recorded
+     backfill default; LEFT-JOIN fail-closed mismatch/drift ×2; ROLLBACK cleanup on corrective rollback)
+     fixed in 6a096d9e with a changed-default regression test. The `coderabbit_review_driver.py` loop
+     wedged after triggering; orchestrator evaluated the comments directly and dispatched the fix
+     (driver-wedge flagged as a tooling issue, not a WU defect).
+- **Why safe**: every disposition preserves the brief's invariants (no session_id change, no transcript
+  edits, reversible/idempotent corrective, no fail-open, net-new product-source claude/codex tokens = 0).
+  Full gate evidence in `planning/s11-m2c-model/audit-history.md`.
+- **Evidence**: PR https://github.com/nestharus/agent-runner/pull/199; audit-history.md;
+  code-quality/s11-m2c-model-impl-summary.md.
+
+## D-S11-M2c-model-004-transcript-fallback — iteration 2 (manager merge-gate gap)
+
+- **Phase**: Iteration 2 (Phases 6->7->8->9 on the same concern).
+- **Decision**: Implemented the brief's inference tier (2), transcript evidence, for the corrective pass.
+  The manager's live-copy proof showed the DB/preimage path correctly fixed 93 chains but left 215
+  backfilled-default chains (incl. the real regressed sessions a49d9250, 57fc3399, cbf11a5e, e1e3768f,
+  45ccb26a) whose Opus history lives only in transcripts. New: for a corrective candidate at the
+  deterministic default with NO DB/preimage evidence, stream the chain's Claude transcript (read-only),
+  count assistant `message.model` by inventory family (prefix-match; ignore `<synthetic>`/absent), pick the
+  dominant, compare against the chain's per-row recorded backfill default → retarget (evidence_source=
+  transcript) or stay. DB tiers stay primary; transcript is fallback only.
+- **Notable sub-decisions**:
+  - Transcript located via the existing `find_claude_source_from_storage` storage primitive, exposed under
+    a neutral 1-line re-export (`find_session_source_from_storage`) so the migration subsystem in
+    src-tauri/src stays provider-token-clean. src-tauri/src net-new claude/codex literals = 0; the single
+    product-source provider-token addition is that unavoidable re-export of the reused primitive (no new
+    model/provider STRING literal). Surfaced transparently to the manager.
+  - Reverted two cosmetic rustfmt import-reorders (report.rs, rollback.rs) the code agent produced, to keep
+    the iter-2 diff scoped to transcript logic.
+  - CodeRabbit (2 rounds total): iter-1 found 4 Major corrective-path issues (fixed in 6a096d9e); iter-2
+    found 1 Major (transcript drop/stay used the global-smallest default instead of the per-row recorded
+    default) fixed in e813f2b2 with a regression test. The CodeRabbit driver loop wedged both times
+    (tooling issue, flagged); reviews were fetched + dispositioned directly by the orchestrator-judge.
+- **Why safe**: transcripts are read-only and streamed (never fully loaded); session_id never changed; the
+  transcript tier flows through the SAME reversible/idempotent/planned==applied/fail-closed corrective
+  preimage+SQL path; DB-evidence chains and the verified 93 are untouched; gates green except the
+  pre-existing program-deferred age245_s7c. Pipeline made NO live changes.
+- **Evidence**: PR #199 (commits 9dbcec7f, e813f2b2); contract Deliverable C; audit-history.md iteration-2
+  sections; code-quality/s11-m2c-model-impl-summary.md.
