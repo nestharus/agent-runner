@@ -1172,7 +1172,7 @@ fn readable(revents: i16) -> bool {
 }
 
 fn writable(revents: i16) -> bool {
-    revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+    revents & libc::POLLOUT != 0
 }
 
 fn relay_real_input(
@@ -2102,6 +2102,9 @@ mod tests {
 
         assert!(!writable(0));
         assert!(writable(libc::POLLOUT));
+        assert!(!writable(libc::POLLHUP));
+        assert!(!writable(libc::POLLERR));
+        assert!(writable(libc::POLLOUT | libc::POLLHUP));
 
         let idle_pollfds = relay_poll_fds(real_read.as_raw_fd(), master.as_raw_fd(), None, false);
         let idle_master = idle_pollfds
