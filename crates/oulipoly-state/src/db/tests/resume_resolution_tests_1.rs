@@ -235,6 +235,31 @@ fn resolve_resume_infers_model_from_latest_invocation() {
 }
 
 #[test]
+fn resolve_resume_prefers_chain_model_name_over_latest_invocation() {
+    let db = test_db();
+    seed_test_chain(
+        &db,
+        CHAIN_A,
+        "provider-a",
+        SESSION_A,
+        "provider-a-haiku",
+        "2026-04-17T08:00:00Z",
+    );
+    seed_invocation_for_session(
+        &db,
+        "provider-a-opus",
+        "provider-a",
+        SESSION_A,
+        "2026-04-17T09:00:00Z",
+    );
+    let models = resolver_model_store();
+
+    let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
+
+    assert_eq!(resolved.model_name.as_deref(), Some("provider-a-haiku"));
+}
+
+#[test]
 fn resolve_resume_falls_back_to_chain_model_name_when_no_invocations() {
     let db = test_db();
     seed_test_chain(
