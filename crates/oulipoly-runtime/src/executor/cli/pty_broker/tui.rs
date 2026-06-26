@@ -9,7 +9,7 @@
 //!   commands.
 //! - mapper: [`top_pane_winsize`]/[`child_winsize`] map the real terminal size
 //!   to the child PTY size; [`vt_color`]/[`vt_modifier`] map a `vt100` cell to
-//!   `ratatui` style; [`render_vt_screen`] maps the virtual screen grid into the
+//!   `ratatui` style; [`render_screen_snapshot`] maps the virtual screen grid into the
 //!   top-pane buffer; [`status_word`]/[`status_color`]/[`kind_word`]/
 //!   [`liveness_glyph`] map snapshot enums to display tokens.
 //! - formatter: [`render_frame`]/[`render_monitor`]/[`render_status_row`]/
@@ -58,6 +58,11 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ExitStatus};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Rows reserved for the collapsed monitor row at the bottom of the screen.
@@ -68,6 +73,10 @@ const MIN_TERMINAL_ROWS: u16 = 10;
 const MIN_TERMINAL_COLS: u16 = 40;
 /// Reserved focus-toggle byte: Ctrl+O.
 const FOCUS_TOGGLE_BYTE: u8 = 0x0f;
+/// Target render cadence while the monitor overlay owns focus.
+pub(super) const FOREGROUND_RENDER_FPS: u64 = 60;
+/// Target render cadence while the monitor overlay is collapsed/backgrounded.
+pub(super) const BACKGROUND_RENDER_FPS: u64 = 10;
 
 /// Bracketed-paste delimiters (DECSET 2004) the broker wraps an injected notification in
 /// when the child has advertised the mode, so the body is treated as pasted content and
@@ -831,10 +840,11 @@ const TOP_SCROLL_STEP: i32 = 3;
 
 /// Bottom-pane monitor state: collapse/expand, the latest read-only snapshot, and
 /// the current selection. Holds no terminal or IO handles.
+#[derive(Clone)]
 struct MonitorPane {
     collapsed: bool,
     selected: usize,
-    snapshot: Option<MonitorSnapshot>,
+    snapshot: Option<Arc<MonitorSnapshot>>,
     last_refresh: Option<Instant>,
     inspecting: bool,
     inspect: Vec<String>,
@@ -906,7 +916,7 @@ impl MonitorPane {
 
     fn store_snapshot(&mut self, snapshot: MonitorSnapshot, now: Instant) {
         self.clamp_selection(snapshot_node_count(&snapshot));
-        self.snapshot = Some(snapshot);
+        self.snapshot = Some(Arc::new(snapshot));
         self.last_refresh = Some(now);
     }
 
@@ -1355,16 +1365,97 @@ fn vt_cell_render(cell: Option<&vt100::Cell>) -> (&str, Style) {
     }
 }
 
-/// Render the virtual terminal screen grid into the top-pane buffer cells.
-fn render_vt_screen(
+#[derive(Clone)]
+struct RenderCellSnapshot {
+    symbol: String,
+    style: Style,
+}
+
+#[derive(Clone)]
+struct ScreenRenderSnapshot {
+    rows: u16,
+    cols: u16,
+    cells: Arc<[RenderCellSnapshot]>,
+    scrollback: usize,
+    hide_cursor: bool,
+    cursor_position: (u16, u16),
+}
+
+impl ScreenRenderSnapshot {
+    fn from_screen(screen: &vt100::Screen) -> Self {
+        let (rows, cols) = screen.size();
+        let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+        for row in 0..rows {
+            for col in 0..cols {
+                cells.push(render_cell_snapshot(screen.cell(row, col)));
+            }
+        }
+        Self {
+            rows,
+            cols,
+            cells: Arc::from(cells.into_boxed_slice()),
+            scrollback: screen.scrollback(),
+            hide_cursor: screen.hide_cursor(),
+            cursor_position: screen.cursor_position(),
+        }
+    }
+
+    fn cell(&self, row: u16, col: u16) -> Option<&RenderCellSnapshot> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let index = usize::from(row) * usize::from(self.cols) + usize::from(col);
+        self.cells.get(index)
+    }
+}
+
+fn render_cell_snapshot(cell: Option<&vt100::Cell>) -> RenderCellSnapshot {
+    let (symbol, style) = vt_cell_render(cell);
+    RenderCellSnapshot {
+        symbol: symbol.to_string(),
+        style,
+    }
+}
+
+#[derive(Clone)]
+struct RenderSnapshot {
+    screen: ScreenRenderSnapshot,
+    focus: Focus,
+    pane: MonitorPane,
+    selection: Option<SelectionSpan>,
+    mouse_request: MouseRequest,
+}
+
+impl RenderSnapshot {
+    fn capture(
+        screen: &vt100::Screen,
+        focus: Focus,
+        pane: &MonitorPane,
+        selection: Option<SelectionSpan>,
+    ) -> Self {
+        Self {
+            screen: ScreenRenderSnapshot::from_screen(screen),
+            focus,
+            pane: pane.clone(),
+            selection,
+            mouse_request: effective_mouse_request(mouse_request_from_screen(screen)),
+        }
+    }
+}
+
+/// Render the virtual terminal screen snapshot into the top-pane buffer cells.
+fn render_screen_snapshot(
     buf: &mut Buffer,
     area: Rect,
-    screen: &vt100::Screen,
+    screen: &ScreenRenderSnapshot,
     selection: Option<SelectionSpan>,
 ) {
     for row in 0..area.height {
         for col in 0..area.width {
-            let (symbol, mut style) = vt_cell_render(screen.cell(row, col));
+            let (symbol, mut style) = screen
+                .cell(row, col)
+                .map(|cell| (cell.symbol.as_str(), cell.style))
+                .unwrap_or((" ", Style::default()));
             if selection.is_some_and(|span| cell_in_selection(span, row, col)) {
                 style = style.add_modifier(Modifier::REVERSED);
             }
@@ -1374,6 +1465,7 @@ fn render_vt_screen(
 }
 
 /// Split the screen into the interactive top pane and the monitor, and render both.
+#[cfg(test)]
 fn render_frame(
     frame: &mut ratatui::Frame,
     screen: &vt100::Screen,
@@ -1381,21 +1473,27 @@ fn render_frame(
     pane: &MonitorPane,
     selection: Option<SelectionSpan>,
 ) {
+    let snapshot = RenderSnapshot::capture(screen, focus, pane, selection);
+    render_snapshot_frame(frame, &snapshot);
+}
+
+fn render_snapshot_frame(frame: &mut ratatui::Frame, snapshot: &RenderSnapshot) {
     let area = frame.area();
-    let bottom_rows = pane.bottom_rows(area.height);
+    let screen = &snapshot.screen;
+    let bottom_rows = snapshot.pane.bottom_rows(area.height);
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
-    render_vt_screen(frame.buffer_mut(), top, screen, selection);
-    render_scrollback_indicator(frame.buffer_mut(), top, screen.scrollback());
-    render_monitor(frame.buffer_mut(), bottom, pane, focus);
+    render_screen_snapshot(frame.buffer_mut(), top, screen, snapshot.selection);
+    render_scrollback_indicator(frame.buffer_mut(), top, screen.scrollback);
+    render_monitor(frame.buffer_mut(), bottom, &snapshot.pane, snapshot.focus);
     // Suppress the child cursor while scrolled back or selecting — it belongs to the live
     // tail, not the history/selection the operator is reading.
-    if focus == Focus::Top
-        && !screen.hide_cursor()
-        && screen.scrollback() == 0
-        && selection.is_none()
+    if snapshot.focus == Focus::Top
+        && !screen.hide_cursor
+        && screen.scrollback == 0
+        && snapshot.selection.is_none()
     {
-        let (crow, ccol) = screen.cursor_position();
+        let (crow, ccol) = screen.cursor_position;
         if crow < top.height && ccol < top.width {
             frame.set_cursor_position(Position::new(top.x + ccol, top.y + crow));
         }
@@ -1777,6 +1875,294 @@ fn format_interactive_child_poll_error(err: io::Error) -> String {
     format!("Failed to poll interactive child: {err}")
 }
 
+#[derive(Default)]
+struct RenderShared {
+    snapshot: Mutex<Option<Arc<RenderSnapshot>>>,
+    clipboard: Mutex<Vec<String>>,
+    shutdown: AtomicBool,
+    error: Mutex<Option<String>>,
+    wake: Condvar,
+    #[cfg(test)]
+    frame_count: AtomicUsize,
+}
+
+impl RenderShared {
+    fn publish(&self, snapshot: RenderSnapshot) {
+        *lock_or_recover(&self.snapshot) = Some(Arc::new(snapshot));
+        self.wake.notify_one();
+    }
+
+    fn latest_snapshot(&self) -> Option<Arc<RenderSnapshot>> {
+        lock_or_recover(&self.snapshot).clone()
+    }
+
+    fn queue_clipboard_copy(&self, text: String) {
+        lock_or_recover(&self.clipboard).push(text);
+        self.wake.notify_one();
+    }
+
+    fn drain_clipboard_copies(&self) -> Vec<String> {
+        std::mem::take(&mut *lock_or_recover(&self.clipboard))
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    fn set_error(&self, message: String) {
+        let mut error = lock_or_recover(&self.error);
+        if error.is_none() {
+            *error = Some(message);
+        }
+        self.request_shutdown();
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        match lock_or_recover(&self.error).as_ref() {
+            Some(message) => Err(message.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn wait_until(&self, deadline: Instant) {
+        if self.shutdown_requested() {
+            return;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let guard = lock_or_recover(&self.snapshot);
+        match self.wake.wait_timeout(guard, deadline - now) {
+            Ok((guard, _)) => drop(guard),
+            Err(poisoned) => drop(poisoned.into_inner()),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_frame(&self) {
+        self.frame_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn frame_count(&self) -> usize {
+        self.frame_count.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+struct RenderPublisher {
+    shared: Arc<RenderShared>,
+}
+
+impl RenderPublisher {
+    fn publish(&self, snapshot: RenderSnapshot) {
+        self.shared.publish(snapshot);
+    }
+
+    fn copy_to_clipboard(&self, text: String) {
+        if !text.is_empty() {
+            self.shared.queue_clipboard_copy(text);
+        }
+    }
+
+    fn check_error(&self) -> Result<(), String> {
+        self.shared.check_error()
+    }
+
+    #[cfg(test)]
+    fn frame_count(&self) -> usize {
+        self.shared.frame_count()
+    }
+}
+
+struct RenderThread {
+    shared: Arc<RenderShared>,
+    join: Option<JoinHandle<Result<(), String>>>,
+}
+
+impl RenderThread {
+    fn start(writer: File) -> Result<Self, String> {
+        let shared = Arc::new(RenderShared::default());
+        let thread_shared = Arc::clone(&shared);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("pty-broker-render".to_string())
+            .spawn(move || {
+                let result = render_thread_entry(writer, Arc::clone(&thread_shared), ready_tx);
+                if let Err(message) = &result {
+                    thread_shared.set_error(message.clone());
+                }
+                result
+            })
+            .map_err(format_render_thread_spawn_error)?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                shared,
+                join: Some(join),
+            }),
+            Ok(Err(message)) => {
+                shared.request_shutdown();
+                let _ = join.join();
+                Err(message)
+            }
+            Err(err) => {
+                shared.request_shutdown();
+                let _ = join.join();
+                Err(format_render_thread_ready_error(err))
+            }
+        }
+    }
+
+    fn publisher(&self) -> RenderPublisher {
+        RenderPublisher {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    fn shutdown_and_join(mut self) -> Result<(), String> {
+        self.shared.request_shutdown();
+        if let Some(join) = self.join.take() {
+            join.join().map_err(|_| render_thread_panic_error())??;
+        }
+        self.shared.check_error()
+    }
+}
+
+impl Drop for RenderThread {
+    fn drop(&mut self) {
+        self.shared.request_shutdown();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn render_thread_entry(
+    writer: File,
+    shared: Arc<RenderShared>,
+    ready: mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let alt_writer = match clone_terminal_writer(&writer).map_err(format_tui_terminal_clone_error) {
+        Ok(writer) => writer,
+        Err(message) => return report_render_ready_error(ready, message),
+    };
+    let mut alt = match AltScreenGuard::enter(alt_writer) {
+        Ok(alt) => alt,
+        Err(message) => return report_render_ready_error(ready, message),
+    };
+    let mut terminal = match new_tui_terminal(writer).map_err(format_tui_terminal_init_error) {
+        Ok(terminal) => terminal,
+        Err(message) => return report_render_ready_error(ready, message),
+    };
+    let _ = ready.send(Ok(()));
+    run_render_loop(&shared, &mut terminal, &mut alt)
+}
+
+fn report_render_ready_error(
+    ready: mpsc::Sender<Result<(), String>>,
+    message: String,
+) -> Result<(), String> {
+    let _ = ready.send(Err(message.clone()));
+    Err(message)
+}
+
+fn run_render_loop(
+    shared: &RenderShared,
+    terminal: &mut Terminal<CrosstermBackend<File>>,
+    alt: &mut AltScreenGuard,
+) -> Result<(), String> {
+    let mut next_frame = Instant::now();
+    loop {
+        if shared.shutdown_requested() {
+            render_latest_snapshot(shared, terminal, alt)?;
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now < next_frame {
+            shared.wait_until(next_frame);
+            continue;
+        }
+        let Some(snapshot) = shared.latest_snapshot() else {
+            next_frame = Instant::now() + render_frame_interval(BACKGROUND_RENDER_FPS);
+            continue;
+        };
+        render_snapshot(shared, terminal, alt, &snapshot)?;
+        next_frame = Instant::now() + snapshot_frame_interval(&snapshot);
+    }
+}
+
+fn render_latest_snapshot(
+    shared: &RenderShared,
+    terminal: &mut Terminal<CrosstermBackend<File>>,
+    alt: &mut AltScreenGuard,
+) -> Result<(), String> {
+    if let Some(snapshot) = shared.latest_snapshot() {
+        render_snapshot(shared, terminal, alt, &snapshot)?;
+    }
+    Ok(())
+}
+
+fn render_snapshot(
+    shared: &RenderShared,
+    terminal: &mut Terminal<CrosstermBackend<File>>,
+    alt: &mut AltScreenGuard,
+    snapshot: &RenderSnapshot,
+) -> Result<(), String> {
+    for text in shared.drain_clipboard_copies() {
+        alt.copy_to_clipboard(&text)?;
+    }
+    alt.sync_mouse(snapshot.mouse_request)?;
+    draw_snapshot(terminal, snapshot)?;
+    #[cfg(test)]
+    shared.record_frame();
+    Ok(())
+}
+
+fn snapshot_frame_interval(snapshot: &RenderSnapshot) -> Duration {
+    render_frame_interval(snapshot_render_fps(snapshot))
+}
+
+fn snapshot_render_fps(snapshot: &RenderSnapshot) -> u64 {
+    if snapshot_is_foreground(snapshot) {
+        FOREGROUND_RENDER_FPS
+    } else {
+        BACKGROUND_RENDER_FPS
+    }
+}
+
+fn snapshot_is_foreground(snapshot: &RenderSnapshot) -> bool {
+    snapshot.focus == Focus::Bottom && !snapshot.pane.collapsed
+}
+
+fn render_frame_interval(fps: u64) -> Duration {
+    Duration::from_nanos(1_000_000_000 / fps.max(1))
+}
+
+fn format_render_thread_spawn_error(err: io::Error) -> String {
+    format!("Failed to spawn TUI render thread: {err}")
+}
+
+fn format_render_thread_ready_error(err: mpsc::RecvError) -> String {
+    format!("TUI render thread exited before initialization: {err}")
+}
+
+fn render_thread_panic_error() -> String {
+    "TUI render thread panicked".to_string()
+}
+
 /// Run the split-pane relay until the child exits, returning its exit status.
 pub(super) fn relay_until_exit_observed(
     input_fd: RawFd,
@@ -1789,9 +2175,8 @@ pub(super) fn relay_until_exit_observed(
 ) -> Result<ExitStatus, String> {
     let real_fd = input_fd;
     let master_fd = master.as_raw_fd();
-    let alt_writer = clone_terminal_writer(&writer).map_err(format_tui_terminal_clone_error)?;
-    let mut alt = AltScreenGuard::enter(alt_writer)?;
-    let mut terminal = new_tui_terminal(writer).map_err(format_tui_terminal_init_error)?;
+    let renderer = RenderThread::start(writer)?;
+    let publisher = renderer.publisher();
 
     let mut pane = MonitorPane::new();
     let initial = child_pane_winsize(real_fd, &pane);
@@ -1805,8 +2190,10 @@ pub(super) fn relay_until_exit_observed(
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
     let mut status = None;
+    publish_render_snapshot(&publisher, &parser, router.focus, &pane, None);
 
     while status.is_none() {
+        publisher.check_error()?;
         let mut dirty = apply_sizing(
             real_fd,
             master_fd,
@@ -1862,15 +2249,15 @@ pub(super) fn relay_until_exit_observed(
                     &mut selection,
                     &gestures,
                     parser.screen(),
-                    &mut alt,
+                    &publisher,
                     top_scrollback,
                     &mut clipboard,
                 )?;
             }
             if let Some(click) = right_click {
                 let mut io = MouseActionIo {
-                    alt: &mut alt,
                     clipboard: &mut clipboard,
+                    renderer: &publisher,
                     line_state: &mut line_state,
                     pending_child_input: &mut pending_child_input,
                 };
@@ -1902,30 +2289,27 @@ pub(super) fn relay_until_exit_observed(
             let _ = service_control(control, &mut control_io);
             dirty = true;
         }
-        alt.sync_mouse(effective_mouse_request(mouse_request_from_screen(
-            parser.screen(),
-        )))?;
         // Re-assert the scrollback view each frame (clamped to retained history) so it
         // survives child output and resizes; reading it back keeps our offset honest.
         parser.screen_mut().set_scrollback(top_scrollback);
         top_scrollback = parser.screen().scrollback();
         if dirty {
-            let render_selection = selection.as_ref().and_then(|sel| {
-                visible_selection_span(sel, top_scrollback, parser.screen().size().0)
-            });
-            draw(
-                &mut terminal,
+            publish_render_snapshot(
+                &publisher,
                 &parser,
                 router.focus,
                 &pane,
-                render_selection,
-            )?;
+                current_render_selection(&selection, top_scrollback, parser.screen().size().0),
+            );
         }
+        publisher.check_error()?;
         status = try_wait_child(child).map_err(format_interactive_child_poll_error)?;
     }
 
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
-    draw(&mut terminal, &parser, router.focus, &pane, None)?;
+    parser.screen_mut().set_scrollback(top_scrollback);
+    publish_render_snapshot(&publisher, &parser, router.focus, &pane, None);
+    renderer.shutdown_and_join()?;
     Ok(status.expect("status checked above"))
 }
 
@@ -2235,7 +2619,7 @@ fn apply_selection_gestures(
     selection: &mut Option<TopSelection>,
     gestures: &[TopMouse],
     screen: &vt100::Screen,
-    alt: &mut AltScreenGuard,
+    renderer: &RenderPublisher,
     scrollback_at: usize,
     clipboard: &mut String,
 ) -> Result<bool, String> {
@@ -2278,7 +2662,7 @@ fn apply_selection_gestures(
                             *selection = None;
                         } else {
                             *clipboard = text.clone();
-                            alt.copy_to_clipboard(&text)?;
+                            renderer.copy_to_clipboard(text);
                         }
                     }
                     ReleaseOutcome::Clear => *selection = None,
@@ -2325,8 +2709,8 @@ fn visible_selection_span(
 
 /// Mutable IO handles the relay loop lends to top-pane mouse-action helpers.
 struct MouseActionIo<'a> {
-    alt: &'a mut AltScreenGuard,
     clipboard: &'a mut String,
+    renderer: &'a RenderPublisher,
     line_state: &'a mut InputLineState,
     pending_child_input: &'a mut PendingChildInput,
 }
@@ -2352,7 +2736,7 @@ fn handle_top_right_click(
             let text = extract_selection_text(screen, span);
             if !text.is_empty() {
                 *io.clipboard = text.clone();
-                io.alt.copy_to_clipboard(&text)?;
+                io.renderer.copy_to_clipboard(text);
             }
         }
         *selection = None;
@@ -2535,17 +2919,38 @@ fn format_pty_output_drain_error(err: io::Error) -> String {
     format!("Failed to drain PTY output: {err}")
 }
 
-/// Render one frame to the real terminal.
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<File>>,
+fn current_render_selection(
+    selection: &Option<TopSelection>,
+    top_scrollback: usize,
+    screen_height: u16,
+) -> Option<SelectionSpan> {
+    selection
+        .as_ref()
+        .and_then(|sel| visible_selection_span(sel, top_scrollback, screen_height))
+}
+
+fn publish_render_snapshot(
+    publisher: &RenderPublisher,
     parser: &vt100::Parser,
     focus: Focus,
     pane: &MonitorPane,
     selection: Option<SelectionSpan>,
+) {
+    publisher.publish(RenderSnapshot::capture(
+        parser.screen(),
+        focus,
+        pane,
+        selection,
+    ));
+}
+
+/// Render one frame to the real terminal.
+fn draw_snapshot(
+    terminal: &mut Terminal<CrosstermBackend<File>>,
+    snapshot: &RenderSnapshot,
 ) -> Result<(), String> {
-    let screen = parser.screen();
     terminal
-        .draw(|frame| render_frame(frame, screen, focus, pane, selection))
+        .draw(|frame| render_snapshot_frame(frame, snapshot))
         .map(|_| ())
         .map_err(|err| format!("Failed to render TUI frame: {err}"))
 }
@@ -3347,6 +3752,66 @@ mod tests {
         assert!(bottom_row.contains("OBS"), "bottom row: {bottom_row:?}");
     }
 
+    #[test]
+    fn render_cadence_tracks_overlay_focus() {
+        let parser = vt100::Parser::new(5, 80, 0);
+        let background =
+            RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
+        assert_eq!(snapshot_render_fps(&background), BACKGROUND_RENDER_FPS);
+
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let foreground = RenderSnapshot::capture(parser.screen(), Focus::Bottom, &pane, None);
+        assert_eq!(snapshot_render_fps(&foreground), FOREGROUND_RENDER_FPS);
+    }
+
+    #[test]
+    fn render_thread_keeps_drawing_while_processing_side_is_busy() {
+        let outer = open_outer_pty(24, 80);
+        make_raw(outer.slave.as_raw_fd());
+        let mut drain_master = outer.master.try_clone().expect("clone drain master");
+        set_nonblocking(drain_master.as_raw_fd());
+        let done = Arc::new(AtomicBool::new(false));
+        let done_reader = Arc::clone(&done);
+        let reader = thread::spawn(move || {
+            let mut buf = [0_u8; 8192];
+            while !done_reader.load(Ordering::SeqCst) {
+                match drain_master.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let renderer = RenderThread::start(outer.slave.try_clone().expect("clone render writer"))
+            .expect("start renderer");
+        let publisher = renderer.publisher();
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let mut parser = vt100::Parser::new(10, 80, 0);
+        parser.process(b"responsive input echo");
+        publish_render_snapshot(&publisher, &parser, Focus::Bottom, &pane, None);
+
+        let before = publisher.frame_count();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(350) {
+            std::hint::spin_loop();
+        }
+        let frames = publisher.frame_count().saturating_sub(before);
+
+        renderer.shutdown_and_join().expect("renderer shutdown");
+        done.store(true, Ordering::SeqCst);
+        reader.join().expect("reader thread");
+        assert!(
+            frames >= 3,
+            "render thread should keep drawing while processing is busy; frames={frames}"
+        );
+    }
+
     struct OuterPty {
         master: File,
         slave: File,
@@ -3706,7 +4171,7 @@ mod tests {
         MonitorPane {
             collapsed,
             selected,
-            snapshot: Some(snapshot),
+            snapshot: Some(Arc::new(snapshot)),
             last_refresh: None,
             inspecting: false,
             inspect: Vec::new(),
