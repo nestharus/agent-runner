@@ -830,15 +830,18 @@ fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd
 }
 
 #[test]
-fn external_provider_ref_resume_bounds_transcript_before_headless_launch() {
+fn external_provider_ref_resume_launches_existing_headless_session_unbounded() {
     let fixture = Fixture::new_with_provider_storage();
 
     let launch = fixture.run_launch();
     assert_success(&launch);
-    let (source_path, boundary_line, pre_boundary_line, post_boundary_line) =
+    let (source_path, _boundary_line, _pre_boundary_line, _post_boundary_line) =
         fixture.seed_provider_ref_boundary_jsonl();
     fixture.seed_recorded_compaction_boundary();
+    let transcript_dir = fixture.provider_ref_transcript_dir();
     let original_source = fs::read(&source_path).unwrap();
+    let before_files = transcript_file_snapshot(&transcript_dir);
+    let before_segments = provider_ref_segment_snapshot(&fixture.db_path());
 
     let resume = fixture.run_resume();
 
@@ -853,12 +856,10 @@ fn external_provider_ref_resume_bounds_transcript_before_headless_launch() {
     let launches = records_for_subcommand(&records, "launch");
     assert_eq!(launches.len(), 2, "records: {records:?}");
     let resume_launch = &launches[1]["request"];
-    let fresh_session_id = resume_launch["params"]["session"]["known_provider_session_id"]
-        .as_str()
-        .expect("provider-ref bounded resume launch should carry a known provider session id");
-    assert_ne!(
-        fresh_session_id, SESSION_ID,
-        "provider-ref default resume must launch the fresh bounded provider session id"
+    assert_eq!(
+        resume_launch["params"]["session"]["known_provider_session_id"].as_str(),
+        Some(SESSION_ID),
+        "provider-ref default resume must launch the existing provider session id unbounded"
     );
     assert_eq!(
         resume_launch["params"]["session"]["start_mode"].as_str(),
@@ -867,23 +868,19 @@ fn external_provider_ref_resume_bounds_transcript_before_headless_launch() {
     assert_eq!(
         resume_launch["params"]["model"]["provider_args"],
         serde_json::json!(["--model", "haiku"]),
-        "provider-ref bounding must not change model/provider argument choice"
-    );
-    let fresh_path = fixture
-        .projects_dir
-        .join(claude_project_dir_name(&fixture.workspace))
-        .join(format!("{fresh_session_id}.jsonl"));
-    let fresh_contents = fs::read_to_string(&fresh_path).unwrap();
-    assert_eq!(
-        fresh_contents,
-        format!("{boundary_line}\n{post_boundary_line}\n"),
-        "launch-selected fresh JSONL must contain the complete post-boundary tail"
-    );
-    assert!(
-        !fresh_contents.contains(&pre_boundary_line),
-        "{fresh_contents}"
+        "provider-ref unbounded resume must not change model/provider argument choice"
     );
     assert_eq!(fs::read(&source_path).unwrap(), original_source);
+    assert_eq!(
+        transcript_file_snapshot(&transcript_dir),
+        before_files,
+        "provider-ref default resume must not create a fresh JSONL or temp file"
+    );
+    assert_eq!(
+        provider_ref_segment_snapshot(&fixture.db_path()),
+        before_segments,
+        "provider-ref default resume must not close/open chain segments"
+    );
 }
 
 #[test]
@@ -930,27 +927,6 @@ fn assert_headless_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCa
         !resume_stderr.contains("external rotation target requires an explicit manual target"),
         "default provider-ref resume must not route through the external manual-target branch: {resume_stderr}"
     );
-    match case {
-        ProviderRefNonRotatedCase::NoBoundary => {
-            assert!(resume_stderr.contains("Warning"), "{resume_stderr}");
-            assert!(
-                resume_stderr.contains("compaction boundary"),
-                "{resume_stderr}"
-            );
-            assert!(resume_stderr.contains(SESSION_ID), "{resume_stderr}");
-        }
-        ProviderRefNonRotatedCase::BoundaryNotFound => {
-            assert!(resume_stderr.contains("Warning"), "{resume_stderr}");
-            assert!(
-                resume_stderr.contains(COMPACTION_BOUNDARY_TURN_ID),
-                "{resume_stderr}"
-            );
-            assert!(resume_stderr.contains(SESSION_ID), "{resume_stderr}");
-        }
-        ProviderRefNonRotatedCase::AlreadyBounded => {
-            assert!(!resume_stderr.contains("Warning"), "{resume_stderr}");
-        }
-    }
     let records = fixture.records();
     assert_no_rotation_or_migration_provider_calls(&records);
     let launches = records_for_subcommand(&records, "launch");
@@ -979,7 +955,7 @@ fn assert_headless_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCa
 }
 
 #[test]
-fn external_provider_ref_resume_model_provider_mismatch_rejects_before_bounding() {
+fn external_provider_ref_resume_model_provider_mismatch_rejects_before_default_migration() {
     let fixture = Fixture::new_with_provider_storage();
     fixture.write_mismatched_provider_ref_model();
 
