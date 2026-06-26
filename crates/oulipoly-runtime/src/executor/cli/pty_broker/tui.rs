@@ -35,9 +35,10 @@ use super::cancel::{
 use super::transcript_view::project_transcript_tail;
 use super::{
     ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput, RELAY_BUFFER_BYTES,
-    flush_pending_child_input, is_pty_eof_error, poll_relay_fds, poll_single_fd,
-    queue_control_injection, read_control_request, read_fd, send_signal_to_child_group,
-    set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq, write_control_response,
+    flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd, poll_relay_fds,
+    poll_single_fd, queue_control_injection, read_control_request, read_fd, readable,
+    send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq,
+    writable, write_control_response,
 };
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
@@ -79,7 +80,6 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// dropped, leaving the notification unsent until the operator presses Enter themselves.
 /// Waiting lets the paste commit land first so the Enter actually submits.
 const CONTROL_SUBMIT_DELAY: Duration = Duration::from_millis(400);
-const PASTE_BURST_MIN_BYTES: usize = 32;
 const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
 const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
 const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
@@ -2032,7 +2032,7 @@ fn forward_real_input(
         Ok(n) => {
             let full = terminal_winsize_with_fallback(read_terminal_winsize(real_fd));
             let routed = route_real_input(&buffer[..n], router, pane, mouse_request, &full);
-            enqueue_routed_child_input(line_state, pending_child_input, &routed, n);
+            enqueue_routed_child_input(line_state, pending_child_input, &routed);
             Ok(routed)
         }
         Err(err) => Err(format_user_terminal_input_read_error(err)),
@@ -2404,12 +2404,11 @@ fn enqueue_routed_child_input(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
     routed: &RoutedInput,
-    read_len: usize,
 ) {
     let Some(bytes) = routed_child_input(routed) else {
         return;
     };
-    let child_bytes = child_input_for_real_read(bytes, read_len);
+    let child_bytes = child_input_for_real_read(bytes);
     line_state.observe_user_input(&child_bytes);
     pending_child_input.enqueue(&child_bytes);
 }
@@ -2604,12 +2603,7 @@ fn inject_control_payload(
     let payload = read_tui_control_payload(stream)?;
     wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
-    submit_control_payload(
-        io.pending_child_input,
-        &payload,
-        io.line_state,
-        bracketed_paste,
-    );
+    submit_control_payload(io, &payload, bracketed_paste)?;
     Ok(())
 }
 
@@ -2622,18 +2616,58 @@ fn read_tui_control_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> 
 }
 
 fn submit_control_payload(
-    pending_child_input: &mut PendingChildInput,
+    io: &mut ControlInjectionIo<'_>,
     payload: &[u8],
-    line_state: &mut InputLineState,
     bracketed_paste: bool,
-) {
+) -> Result<(), String> {
+    queue_control_injection(io.pending_child_input, payload, bracketed_paste, false);
+    drain_control_payload_body(io)?;
     // Let the child commit the (pasted) body to its input buffer before the Enter, so the
     // submit doesn't race ahead of the async paste commit and get dropped.
     if bracketed_paste {
         std::thread::sleep(CONTROL_SUBMIT_DELAY);
     }
-    queue_control_injection(pending_child_input, payload, bracketed_paste, true);
-    line_state.mark_submitted();
+    io.pending_child_input.enqueue(b"\r");
+    io.line_state.mark_submitted();
+    Ok(())
+}
+
+fn drain_control_payload_body(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
+    let start = Instant::now();
+    while !io.pending_child_input.is_empty() {
+        if start.elapsed() >= INJECT_WAIT_LIMIT {
+            return Err("control_submit_body_drain_timeout".to_string());
+        }
+        let ready = poll_control_submit_pty(io.master_fd)?;
+        if ready.pty_writable {
+            flush_pending_child_input(io.master_fd, io.pending_child_input)?;
+        }
+        if ready.pty_output && !pump_pty_output(io.master_fd, io.parser, io.buffer)? {
+            return Err("control_submit_pty_closed".to_string());
+        }
+    }
+    Ok(())
+}
+
+struct ControlSubmitReady {
+    pty_output: bool,
+    pty_writable: bool,
+}
+
+fn poll_control_submit_pty(master_fd: RawFd) -> Result<ControlSubmitReady, String> {
+    let mut pollfd = poll_master_fd(master_fd, true);
+    poll_fds(
+        std::slice::from_mut(&mut pollfd),
+        format_control_submit_poll_error,
+    )?;
+    Ok(ControlSubmitReady {
+        pty_output: readable(pollfd.revents),
+        pty_writable: writable(pollfd.revents),
+    })
+}
+
+fn format_control_submit_poll_error(err: io::Error) -> String {
+    format!("Failed to poll PTY before control submit: {err}")
 }
 
 /// The bytes to inject for a control payload. When the child advertised bracketed-paste
@@ -2657,19 +2691,8 @@ fn wrap_real_terminal_paste(child_bytes: &[u8]) -> Vec<u8> {
     control_payload_bytes(child_bytes, true)
 }
 
-fn real_input_is_paste_burst(read_len: usize) -> bool {
-    read_len >= PASTE_BURST_MIN_BYTES
-}
-
-fn child_input_for_real_read(forward: &[u8], read_len: usize) -> Vec<u8> {
-    if forward.is_empty() {
-        return Vec::new();
-    }
-    if real_input_is_paste_burst(read_len) {
-        wrap_real_terminal_paste(forward)
-    } else {
-        forward.to_vec()
-    }
+fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
+    forward.to_vec()
 }
 
 /// Wait until the child input is at a safe line boundary, pumping output into the
@@ -3069,23 +3092,58 @@ mod tests {
     }
 
     #[test]
-    fn real_input_paste_burst_heuristic_distinguishes_burst_from_keystroke() {
-        assert!(real_input_is_paste_burst(RELAY_BUFFER_BYTES));
-        assert!(!real_input_is_paste_burst(1));
+    fn real_terminal_input_forwards_byte_for_byte() {
+        let burst = vec![b'a'; RELAY_BUFFER_BYTES];
+        assert_eq!(child_input_for_real_read(&burst), burst);
+
+        assert_eq!(child_input_for_real_read(b"x"), b"x".to_vec());
+
+        assert!(child_input_for_real_read(&[]).is_empty());
     }
 
     #[test]
-    fn burst_wrapping_applies_only_to_child_forward_subset() {
-        let burst = vec![b'a'; RELAY_BUFFER_BYTES];
-        assert_eq!(
-            child_input_for_real_read(&burst, burst.len()),
-            wrap_real_terminal_paste(&burst)
-        );
+    fn real_terminal_bracketed_paste_markers_are_preserved() {
+        let paste = b"\x1b[200~abc\x1b[201~";
+        assert_eq!(child_input_for_real_read(paste), paste.to_vec());
+    }
 
-        assert_eq!(child_input_for_real_read(b"x", 1), b"x".to_vec());
+    #[test]
+    fn control_submit_drains_body_before_queueing_enter() {
+        let (mut read_end, write_end) = pipe_files();
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut line_state = InputLineState::default();
+        let mut pending_child_input = PendingChildInput::new();
+        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
+        let mut io = ControlInjectionIo {
+            real_fd: read_end.as_raw_fd(),
+            master_fd: write_end.as_raw_fd(),
+            router: &mut router,
+            pane: &pane,
+            parser: &mut parser,
+            line_state: &mut line_state,
+            pending_child_input: &mut pending_child_input,
+            buffer: &mut buffer,
+        };
 
-        assert!(real_input_is_paste_burst(RELAY_BUFFER_BYTES));
-        assert!(child_input_for_real_read(&[], RELAY_BUFFER_BYTES).is_empty());
+        submit_control_payload(&mut io, b"body", true).expect("submit payload");
+
+        let expected_body = control_payload_bytes(b"body", true);
+        let mut received_body = vec![0_u8; expected_body.len()];
+        read_end
+            .read_exact(&mut received_body)
+            .expect("body should drain before submit returns");
+        assert_eq!(received_body, expected_body);
+        assert_eq!(pending_child_input.pending_len(), 1);
+
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending_child_input)
+            .expect("flush queued enter");
+        let mut enter = [0_u8; 1];
+        read_end
+            .read_exact(&mut enter)
+            .expect("submit enter should remain queued after body drain");
+        assert_eq!(enter, [b'\r']);
     }
 
     fn mouse(button: u16, col: u16, row: u16, released: bool) -> MouseEvent {
@@ -3334,6 +3392,13 @@ mod tests {
     fn set_nonblocking(fd: RawFd) {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
+
+    fn pipe_files() -> (File, File) {
+        let mut fds = [0; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe failed: {}", std::io::Error::last_os_error());
+        unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
     }
 
     /// Strip ANSI control sequences so the rendered terminal stream can be
