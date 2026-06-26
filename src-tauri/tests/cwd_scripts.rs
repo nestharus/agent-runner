@@ -15,7 +15,7 @@ fn scripts_dir() -> PathBuf {
 
 #[test]
 fn cwd_scripts_unchanged() {
-    for script_name in ["claude-code-cwd", "codex-cwd"] {
+    for script_name in ["claude-code-cwd", "codex-cwd", "opencode-cwd"] {
         let path = scripts_dir().join(script_name);
         let metadata = fs::metadata(&path).unwrap();
         assert!(metadata.is_file(), "{path:?} should be a file");
@@ -85,4 +85,43 @@ fn codex_cwd_reads_payload_cwd_from_rollout_first_line() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["found"], true);
     assert_eq!(value["cwd"], workspace.path().to_string_lossy().as_ref());
+}
+
+#[test]
+fn opencode_cwd_reads_directory_from_opencode_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let session_id = "ses_1012bcfe8ffe7SLrwzf1UrYGtW";
+    let db_path = dir.path().join("opencode.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE session (id text PRIMARY KEY, directory text NOT NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+        rusqlite::params![session_id, workspace.path().to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let output = Command::new(scripts_dir().join("opencode-cwd"))
+        .arg(dir.path())
+        .arg(session_id)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["found"], true);
+    assert_eq!(
+        value["cwd"],
+        workspace
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
 }

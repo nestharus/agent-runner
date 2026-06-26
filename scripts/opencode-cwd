@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Resolve an OpenCode session id to its original cwd from opencode.db."""
+
+import json
+import sqlite3
+import sys
+from pathlib import Path
+
+
+def emit(value: dict) -> int:
+    print(json.dumps(value, separators=(",", ":")))
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        return emit({"found": False, "error": "usage: opencode-cwd BASE_DIR SESSION_ID"})
+
+    base = Path(sys.argv[1]).expanduser()
+    session_id = sys.argv[2]
+    db_path = base / "opencode.db"
+    if not db_path.is_file():
+        return emit({"found": False})
+
+    try:
+        directory = session_directory(db_path, session_id)
+    except sqlite3.Error as exc:
+        return emit({"found": False, "error": f"opencode_db_query_failed: {exc}"})
+
+    if directory is None:
+        return emit({"found": False})
+    return emit_valid_cwd(directory)
+
+
+def session_directory(db_path: Path, session_id: str) -> str | None:
+    uri = db_path.resolve(strict=False).as_uri() + "?mode=ro"
+    with sqlite3.connect(uri, uri=True) as conn:
+        row = conn.execute(
+            "SELECT directory FROM session WHERE id = ? LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
+def emit_valid_cwd(cwd: str) -> int:
+    if not isinstance(cwd, str) or not cwd:
+        return emit({"found": False, "error": "opencode_missing_cwd"})
+    path = Path(cwd)
+    if not path.is_absolute():
+        return emit({"found": False, "error": f"opencode_cwd_not_absolute: {cwd}"})
+    if not path.exists():
+        return emit({"found": False, "error": f"opencode_cwd_missing: {cwd}"})
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        return emit({"found": False, "error": f"opencode_cwd_canonicalize_failed: {cwd}: {exc}"})
+    return emit({"found": True, "cwd": str(resolved)})
+
+
+if __name__ == "__main__":
+    sys.exit(main())
