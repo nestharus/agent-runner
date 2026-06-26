@@ -32,6 +32,7 @@
 use super::cancel::{
     CancelRequest, cancel_outcome_message, cancel_request_for_node, execute_cancel,
 };
+use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::transcript_view::project_transcript_tail;
 use super::{
     ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput, RELAY_BUFFER_BYTES,
@@ -43,8 +44,9 @@ use super::{
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
     MonitorNodeId, MonitorNodeKind, MonitorSnapshot, MonitorStatus, ObservabilityRoot,
-    ObservabilitySnapshotPort, SnapshotLimits,
 };
+#[cfg(test)]
+use crate::observability::{ObservabilitySnapshotPort, SnapshotLimits};
 use base64::Engine as _;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -845,7 +847,6 @@ struct MonitorPane {
     collapsed: bool,
     selected: usize,
     snapshot: Option<Arc<MonitorSnapshot>>,
-    last_refresh: Option<Instant>,
     inspecting: bool,
     inspect: Vec<String>,
     /// The node id awaiting cancel confirmation, if the operator pressed `x`.
@@ -862,7 +863,6 @@ impl MonitorPane {
             collapsed: true,
             selected: 0,
             snapshot: None,
-            last_refresh: None,
             inspecting: false,
             inspect: Vec::new(),
             pending_cancel: None,
@@ -896,28 +896,25 @@ impl MonitorPane {
         }
     }
 
-    fn refresh_due(&self, now: Instant) -> bool {
-        match self.last_refresh {
-            None => true,
-            Some(last) => now.duration_since(last) >= self.refresh_interval(),
+    fn adopt_snapshot(&mut self, snapshot: Option<Arc<MonitorSnapshot>>) -> bool {
+        let Some(snapshot) = snapshot else {
+            return false;
+        };
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &snapshot))
+        {
+            return false;
         }
+        self.store_snapshot(snapshot);
+        true
     }
 
-    fn refresh(
-        &mut self,
-        monitor: &dyn ObservabilitySnapshotPort,
-        root: &ObservabilityRoot,
-        now: Instant,
-    ) {
-        let snapshot = read_monitor_snapshot(monitor, root);
-        self.store_snapshot(snapshot, now);
-        self.update_inspect();
-    }
-
-    fn store_snapshot(&mut self, snapshot: MonitorSnapshot, now: Instant) {
+    fn store_snapshot(&mut self, snapshot: Arc<MonitorSnapshot>) {
         self.clamp_selection(snapshot_node_count(&snapshot));
-        self.snapshot = Some(Arc::new(snapshot));
-        self.last_refresh = Some(now);
+        self.snapshot = Some(snapshot);
+        self.update_inspect();
     }
 
     fn node_count(&self) -> usize {
@@ -1100,13 +1097,6 @@ fn node_id(node: &MonitorNode) -> MonitorNodeId {
 
 fn node_is_cancelable(node: &MonitorNode) -> bool {
     node.cancel_ref.is_some()
-}
-
-fn read_monitor_snapshot(
-    monitor: &dyn ObservabilitySnapshotPort,
-    root: &ObservabilityRoot,
-) -> MonitorSnapshot {
-    monitor.snapshot(root, SnapshotLimits::default())
 }
 
 /// Build the inspect-pane content for a node: an identity header plus its live
@@ -2170,8 +2160,8 @@ pub(super) fn relay_until_exit_observed(
     master: &File,
     control: Option<&ControlSocket>,
     child: &mut Child,
-    monitor: &dyn ObservabilitySnapshotPort,
-    root: &ObservabilityRoot,
+    monitor: MonitorSnapshotProvider,
+    root: ObservabilityRoot,
 ) -> Result<ExitStatus, String> {
     let real_fd = input_fd;
     let master_fd = master.as_raw_fd();
@@ -2179,6 +2169,7 @@ pub(super) fn relay_until_exit_observed(
     let publisher = renderer.publisher();
 
     let mut pane = MonitorPane::new();
+    let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
     let initial = child_pane_winsize(real_fd, &pane);
     let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
@@ -2194,7 +2185,8 @@ pub(super) fn relay_until_exit_observed(
 
     while status.is_none() {
         publisher.check_error()?;
-        let mut dirty = apply_sizing(
+        let mut dirty = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
+        dirty |= apply_sizing(
             real_fd,
             master_fd,
             child.id(),
@@ -2202,10 +2194,6 @@ pub(super) fn relay_until_exit_observed(
             &mut parser,
             &mut applied,
         );
-        if pane.refresh_due(Instant::now()) {
-            pane.refresh(monitor, root, Instant::now());
-            dirty = true;
-        }
         let ready = poll_relay_fds(
             real_fd,
             master_fd,
@@ -2231,7 +2219,7 @@ pub(super) fn relay_until_exit_observed(
             let typed_to_child = !routed.forward.is_empty();
             let right_click = routed.right_click;
             let gestures = std::mem::take(&mut routed.top_mouse);
-            dirty |= apply_routed_to_pane(&mut pane, routed, monitor, root);
+            dirty |= apply_routed_to_pane(&mut pane, routed, &snapshot_worker);
             if typed_to_child {
                 // Typing snaps to the live tail and drops the selection highlight.
                 selection = None;
@@ -2308,8 +2296,10 @@ pub(super) fn relay_until_exit_observed(
 
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
     parser.screen_mut().set_scrollback(top_scrollback);
+    let _ = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
     publish_render_snapshot(&publisher, &parser, router.focus, &pane, None);
     renderer.shutdown_and_join()?;
+    snapshot_worker.shutdown_and_join()?;
     Ok(status.expect("status checked above"))
 }
 
@@ -2802,16 +2792,16 @@ fn enqueue_routed_child_input(
 fn apply_routed_to_pane(
     pane: &mut MonitorPane,
     routed: RoutedInput,
-    monitor: &dyn ObservabilitySnapshotPort,
-    root: &ObservabilityRoot,
+    snapshot_worker: &MonitorSnapshotWorker,
 ) -> bool {
     if routed.focus_bottom {
         pane.expand();
     }
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
+    snapshot_worker.set_interval(pane.refresh_interval());
     if pane_refresh_required(force_refresh, cancelled) {
-        pane.refresh(monitor, root, Instant::now());
+        snapshot_worker.request_refresh();
     }
     routed.redraw
 }
@@ -3975,12 +3965,12 @@ mod tests {
         let master = pty.master;
         let done = Arc::new(AtomicBool::new(false));
         let done_relay = Arc::clone(&done);
-        let monitor = FakeMonitor::new(empty_snapshot());
+        let monitor = Box::new(FakeMonitor::new(empty_snapshot()));
         let root = ObservabilityRoot::default();
         let relay = thread::spawn(move || {
             let mut child = child;
             let result = relay_until_exit_observed(
-                input_fd, writer, &master, None, &mut child, &monitor, &root,
+                input_fd, writer, &master, None, &mut child, monitor, root,
             );
             done_relay.store(true, Ordering::SeqCst);
             result
@@ -4031,6 +4021,77 @@ mod tests {
         assert!(
             stripped.contains("OBS"),
             "collapsed monitor row should be painted to the real terminal; stripped: {stripped:?}"
+        );
+    }
+
+    #[test]
+    fn observed_relay_forwards_input_while_snapshot_provider_is_slow() {
+        let outer = open_outer_pty(24, 80);
+        make_raw(outer.slave.as_raw_fd());
+        let full = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let termios = tty_termios(outer.slave.as_raw_fd());
+        let pty = PtyPair::open(&top_pane_winsize(&full), &termios).expect("inner pty");
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(
+            r#"[ -t 0 ] || exit 7; IFS= read -r -t 1 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
+        );
+        configure_child_pty(&mut cmd, &pty).expect("configure child pty");
+        let child = cmd.spawn().expect("spawn child");
+        drop(pty.slave);
+
+        let writer = outer.slave.try_clone().expect("clone writer");
+        let input_fd = outer.slave.as_raw_fd();
+        let master = pty.master;
+        let done = Arc::new(AtomicBool::new(false));
+        let done_relay = Arc::clone(&done);
+        let monitor = Box::new(SlowMonitor::new(
+            empty_snapshot(),
+            Duration::from_millis(1500),
+        ));
+        let root = ObservabilityRoot::default();
+        let relay = thread::spawn(move || {
+            let mut child = child;
+            let result = relay_until_exit_observed(
+                input_fd, writer, &master, None, &mut child, monitor, root,
+            );
+            done_relay.store(true, Ordering::SeqCst);
+            result
+        });
+
+        set_nonblocking(outer.master.as_raw_fd());
+        let mut buf = [0_u8; 8192];
+        let start = Instant::now();
+        let mut injected = false;
+        loop {
+            let _ = (&outer.master).read(&mut buf);
+            if !injected && start.elapsed() >= Duration::from_millis(200) {
+                (&outer.master).write_all(b"ping\n").expect("write input");
+                injected = true;
+            }
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                start.elapsed() <= Duration::from_secs(6),
+                "relay should finish even while the snapshot worker is sleeping"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let status = relay
+            .join()
+            .expect("relay thread panicked")
+            .expect("relay error");
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "child read timeout proves input was forwarded without waiting for the slow snapshot"
         );
     }
 
@@ -4167,12 +4228,29 @@ mod tests {
         }
     }
 
+    struct SlowMonitor {
+        snapshot: MonitorSnapshot,
+        delay: Duration,
+    }
+
+    impl SlowMonitor {
+        fn new(snapshot: MonitorSnapshot, delay: Duration) -> Self {
+            Self { snapshot, delay }
+        }
+    }
+
+    impl ObservabilitySnapshotPort for SlowMonitor {
+        fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
+            thread::sleep(self.delay);
+            self.snapshot.clone()
+        }
+    }
+
     fn pane_with(snapshot: MonitorSnapshot, collapsed: bool, selected: usize) -> MonitorPane {
         MonitorPane {
             collapsed,
             selected,
             snapshot: Some(Arc::new(snapshot)),
-            last_refresh: None,
             inspecting: false,
             inspect: Vec::new(),
             pending_cancel: None,
@@ -4645,18 +4723,11 @@ mod tests {
     }
 
     #[test]
-    fn refresh_is_due_initially_then_respects_cadence() {
-        let monitor = FakeMonitor::new(empty_snapshot());
-        let root = ObservabilityRoot::default();
+    fn pane_adopts_new_worker_snapshot_once() {
         let mut pane = MonitorPane::new();
-        let now = Instant::now();
-        assert!(pane.refresh_due(now), "first refresh is always due");
-        pane.refresh(&monitor, &root, now);
-        assert!(!pane.refresh_due(now), "not due immediately after refresh");
-        assert!(
-            pane.refresh_due(now + COLLAPSED_REFRESH),
-            "due again after the collapsed interval"
-        );
+        let snapshot = Arc::new(empty_snapshot());
+        assert!(pane.adopt_snapshot(Some(Arc::clone(&snapshot))));
+        assert!(!pane.adopt_snapshot(Some(snapshot)));
         assert!(pane.snapshot.is_some());
     }
 }

@@ -13,7 +13,9 @@
 
 use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
 use super::terminal_signal::{InteractiveSignalGuard, exit_code_from_status};
-use crate::observability::{ObservabilityRoot, ProductionObservabilitySnapshotService};
+use crate::observability::{
+    ObservabilityRoot, ObservabilitySnapshotPort, ProductionObservabilitySnapshotService,
+};
 use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::{self, SessionProviderIdentity};
 use oulipoly_config::ProviderConfig;
@@ -31,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod cancel;
+mod snapshot_worker;
 mod transcript_view;
 mod tui;
 
@@ -171,15 +174,16 @@ pub(super) fn execute_interactive_child_observed(
         .writer_clone()
         .map_err(format_tui_writer_clone_error)?;
     let root = observability_root(provider, context);
-    let monitor = observability_monitor(provider, context, provider_inspect);
+    let monitor: Box<dyn ObservabilitySnapshotPort + Send> =
+        Box::new(observability_monitor(provider, context, provider_inspect));
     let status = tui::relay_until_exit_observed(
         raw_tty.fd(),
         writer,
         &pty.master,
         control.as_ref(),
         &mut child,
-        &monitor,
-        &root,
+        monitor,
+        root,
     );
     idle_guard.exit_code = status.as_ref().ok().map(exit_code_from_status);
     drop(signal_guard);
