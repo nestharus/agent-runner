@@ -224,7 +224,9 @@ fn observability_monitor(
     match provider_inspect {
         Some(inspect) => provider_inspect_monitor(provider, context, inspect)
             .unwrap_or_else(|| ProductionObservabilitySnapshotService::for_session(None)),
-        None => ProductionObservabilitySnapshotService::for_session(provider.session_storage.clone()),
+        None => {
+            ProductionObservabilitySnapshotService::for_session(provider.session_storage.clone())
+        }
     }
 }
 
@@ -236,7 +238,8 @@ fn provider_inspect_monitor(
     let context = context?;
     let model_name = context.model_name()?;
     let session_id = context.session_id()?;
-    let identity = provider_inspect_identity(inspect.registry.as_ref(), model_name, &provider.name)?;
+    let identity =
+        provider_inspect_identity(inspect.registry.as_ref(), model_name, &provider.name)?;
     Some(
         ProductionObservabilitySnapshotService::for_provider_inspect_registry(
             Arc::clone(&inspect.registry),
@@ -1015,6 +1018,7 @@ fn relay_until_exit(
     let mut current_winsize = terminal_winsize(real_tty.fd()).ok();
     let mut status = None;
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
+    let mut pending_child_input = PendingChildInput::new();
     while status.is_none() {
         maybe_propagate_winsize(
             real_tty.fd(),
@@ -1026,12 +1030,16 @@ fn relay_until_exit(
             real_tty.fd(),
             master.as_raw_fd(),
             control.map(ControlSocket::fd),
+            !pending_child_input.is_empty(),
         )?;
+        if ready.pty_writable {
+            flush_pending_child_input(master.as_raw_fd(), &mut pending_child_input)?;
+        }
         if ready.real_input {
             relay_real_input(
                 real_tty.fd(),
-                master.as_raw_fd(),
                 &mut line_state,
+                &mut pending_child_input,
                 &mut buffer,
             )?;
         }
@@ -1046,6 +1054,7 @@ fn relay_until_exit(
                 real_tty.fd(),
                 master.as_raw_fd(),
                 &mut line_state,
+                &mut pending_child_input,
                 &mut buffer,
             );
         }
@@ -1063,6 +1072,7 @@ fn format_child_poll_error(err: io::Error) -> String {
 struct ReadyFds {
     real_input: bool,
     pty_output: bool,
+    pty_writable: bool,
     control: bool,
 }
 
@@ -1070,8 +1080,9 @@ fn poll_relay_fds(
     real_fd: RawFd,
     master_fd: RawFd,
     control_fd: Option<RawFd>,
+    want_child_write: bool,
 ) -> Result<ReadyFds, String> {
-    let mut fds = relay_poll_fds(real_fd, master_fd, control_fd);
+    let mut fds = relay_poll_fds(real_fd, master_fd, control_fd, want_child_write);
     poll_fds(&mut fds, format_relay_poll_error)?;
     Ok(ready_fds_from_pollfds(&fds))
 }
@@ -1080,14 +1091,22 @@ fn relay_poll_fds(
     real_fd: RawFd,
     master_fd: RawFd,
     control_fd: Option<RawFd>,
+    want_child_write: bool,
 ) -> Vec<libc::pollfd> {
-    let mut fds = relay_base_poll_fds(real_fd, master_fd);
+    let mut fds = relay_base_poll_fds(real_fd, master_fd, want_child_write);
     fds.extend(control_poll_fd(control_fd));
     fds
 }
 
-fn relay_base_poll_fds(real_fd: RawFd, master_fd: RawFd) -> Vec<libc::pollfd> {
-    vec![poll_read_fd(real_fd), poll_read_fd(master_fd)]
+fn relay_base_poll_fds(
+    real_fd: RawFd,
+    master_fd: RawFd,
+    want_child_write: bool,
+) -> Vec<libc::pollfd> {
+    vec![
+        poll_read_fd(real_fd),
+        poll_master_fd(master_fd, want_child_write),
+    ]
 }
 
 fn control_poll_fd(control_fd: Option<RawFd>) -> Option<libc::pollfd> {
@@ -1100,6 +1119,14 @@ fn poll_read_fd(fd: RawFd) -> libc::pollfd {
         events: libc::POLLIN,
         revents: 0,
     }
+}
+
+fn poll_master_fd(fd: RawFd, want_child_write: bool) -> libc::pollfd {
+    let mut pollfd = poll_read_fd(fd);
+    if want_child_write {
+        pollfd.events |= libc::POLLOUT;
+    }
+    pollfd
 }
 
 fn poll_fds(fds: &mut [libc::pollfd], format_error: fn(io::Error) -> String) -> Result<(), String> {
@@ -1135,6 +1162,7 @@ fn ready_fds_from_pollfds(fds: &[libc::pollfd]) -> ReadyFds {
     ReadyFds {
         real_input: readable(fds[0].revents),
         pty_output: readable(fds[1].revents),
+        pty_writable: writable(fds[1].revents),
         control: fds.get(2).is_some_and(|fd| readable(fd.revents)),
     }
 }
@@ -1143,20 +1171,35 @@ fn readable(revents: i16) -> bool {
     revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
 }
 
+fn writable(revents: i16) -> bool {
+    revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
+}
+
 fn relay_real_input(
     real_fd: RawFd,
-    master_fd: RawFd,
     line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
     buffer: &mut [u8],
 ) -> Result<(), String> {
     match read_fd(real_fd, buffer) {
         Ok(0) => Ok(()),
         Ok(n) => {
             line_state.observe_user_input(&buffer[..n]);
-            write_all_fd(master_fd, &buffer[..n]).map_err(format_user_input_write_error)
+            pending_child_input.enqueue(&buffer[..n]);
+            Ok(())
         }
         Err(err) => Err(format_user_input_read_error(err)),
     }
+}
+
+fn flush_pending_child_input(
+    master_fd: RawFd,
+    pending_child_input: &mut PendingChildInput,
+) -> Result<(), String> {
+    pending_child_input
+        .flush_some(master_fd)
+        .map(|_| ())
+        .map_err(format_user_input_write_error)
 }
 
 fn format_user_input_write_error(err: io::Error) -> String {
@@ -1254,6 +1297,78 @@ fn format_drain_poll_error(err: io::Error) -> String {
     format!("Failed to poll PTY drain fd: {err}")
 }
 
+struct PendingChildInput {
+    bytes: Vec<u8>,
+    drained: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlushProgress {
+    wrote: usize,
+    fully_drained: bool,
+}
+
+impl PendingChildInput {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            drained: 0,
+        }
+    }
+
+    fn enqueue(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending_len() == 0
+    }
+
+    fn pending_len(&self) -> usize {
+        self.bytes.len().saturating_sub(self.drained)
+    }
+
+    fn flush_some(&mut self, fd: RawFd) -> io::Result<FlushProgress> {
+        if self.is_empty() {
+            self.compact_if_drained();
+            return Ok(FlushProgress {
+                wrote: 0,
+                fully_drained: true,
+            });
+        }
+
+        let wrote = write_some_fd(fd, &self.bytes[self.drained..])?;
+        self.drained += wrote;
+        let fully_drained = self.is_empty();
+        if fully_drained {
+            self.compact_if_drained();
+        }
+        Ok(FlushProgress {
+            wrote,
+            fully_drained,
+        })
+    }
+
+    fn compact_if_drained(&mut self) {
+        if self.drained == self.bytes.len() {
+            self.bytes.clear();
+            self.drained = 0;
+        }
+    }
+}
+
+fn queue_control_injection(
+    pending: &mut PendingChildInput,
+    payload: &[u8],
+    bracketed: bool,
+    submit: bool,
+) {
+    pending.enqueue(&tui::control_payload_bytes(payload, bracketed));
+    if submit {
+        pending.enqueue(b"\r");
+    }
+}
+
 fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     loop {
         let rc = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -1265,6 +1380,65 @@ fn read_fd(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
             continue;
         }
         return Err(err);
+    }
+}
+
+fn write_some_fd(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let original_flags = fd_flags(fd)?;
+    let restore_flags = set_nonblocking_for_write(fd, original_flags)?;
+    let result = write_some_nonblocking(fd, bytes);
+    restore_fd_flags(fd, restore_flags)?;
+    result
+}
+
+fn write_some_nonblocking(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    loop {
+        let rc = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if rc >= 0 {
+            return Ok(rc as usize);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(code) if code == libc::EINTR => continue,
+            Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => return Ok(0),
+            _ => return Err(err),
+        }
+    }
+}
+
+fn fd_flags(fd: RawFd) -> io::Result<i32> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(flags)
+    }
+}
+
+fn set_nonblocking_for_write(fd: RawFd, flags: i32) -> io::Result<Option<i32>> {
+    if flags & libc::O_NONBLOCK != 0 {
+        return Ok(None);
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(Some(flags))
+    }
+}
+
+fn restore_fd_flags(fd: RawFd, flags: Option<i32>) -> io::Result<()> {
+    let Some(flags) = flags else {
+        return Ok(());
+    };
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -1371,6 +1545,7 @@ fn handle_control_request(
     real_fd: RawFd,
     master_fd: RawFd,
     line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
     buffer: &mut [u8],
 ) -> Result<(), String> {
     let (mut stream, _) = control
@@ -1383,7 +1558,14 @@ fn handle_control_request(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(format_control_write_timeout_error)?;
-    let response = process_control_request(&mut stream, real_fd, master_fd, line_state, buffer);
+    let response = process_control_request_with_pending(
+        &mut stream,
+        real_fd,
+        master_fd,
+        line_state,
+        pending_child_input,
+        buffer,
+    );
     let (ack, message) = control_response_parts(response);
     write_control_response(&mut stream, ack, &message).map_err(format_control_response_write_error)
 }
@@ -1411,6 +1593,7 @@ fn format_control_response_write_error(err: io::Error) -> String {
     format!("Failed to write PTY control response: {err}")
 }
 
+#[cfg(test)]
 fn process_control_request(
     stream: &mut UnixStream,
     real_fd: RawFd,
@@ -1418,10 +1601,33 @@ fn process_control_request(
     line_state: &mut InputLineState,
     buffer: &mut [u8],
 ) -> Result<(), String> {
+    let mut pending_child_input = PendingChildInput::new();
+    let result = process_control_request_with_pending(
+        stream,
+        real_fd,
+        master_fd,
+        line_state,
+        &mut pending_child_input,
+        buffer,
+    );
+    if result.is_ok() {
+        flush_pending_child_input_to_completion(master_fd, &mut pending_child_input)?;
+    }
+    result
+}
+
+fn process_control_request_with_pending(
+    stream: &mut UnixStream,
+    real_fd: RawFd,
+    master_fd: RawFd,
+    line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
+    buffer: &mut [u8],
+) -> Result<(), String> {
     validate_control_request_peer(stream)?;
     let payload = read_control_request_payload(stream)?;
-    wait_until_safe_to_inject(real_fd, master_fd, line_state, buffer)?;
-    submit_control_request_payload(master_fd, &payload)?;
+    wait_until_safe_to_inject(real_fd, master_fd, line_state, pending_child_input, buffer)?;
+    submit_control_request_payload(pending_child_input, &payload);
     line_state.mark_submitted();
     Ok(())
 }
@@ -1430,21 +1636,12 @@ fn validate_control_request_peer(stream: &UnixStream) -> Result<(), String> {
     validate_peer_uid(stream)
 }
 
-fn submit_control_request_payload(master_fd: RawFd, payload: &[u8]) -> Result<(), String> {
-    write_all_fd(master_fd, payload).map_err(format_control_payload_write_error)?;
+fn submit_control_request_payload(pending_child_input: &mut PendingChildInput, payload: &[u8]) {
     // Submit with a carriage return (`\r`), the byte the Enter key sends. Raw-mode TUI
-    // children (e.g. Claude Code) submit on `\r` and treat `\n` as a literal newline, so a
-    // `\n` here would leave the payload sitting unsubmitted in the input box. Cooked-mode
-    // children still submit because the pty's `ICRNL` maps the incoming `\r` to `\n`.
-    write_all_fd(master_fd, b"\r").map_err(format_control_submit_write_error)
-}
-
-fn format_control_payload_write_error(err: io::Error) -> String {
-    format!("pty_write_failed: {err}")
-}
-
-fn format_control_submit_write_error(err: io::Error) -> String {
-    format!("pty_submit_failed: {err}")
+    // children submit on `\r` and treat `\n` as a literal newline, so a `\n` here would
+    // leave the payload sitting unsubmitted in the input box. Cooked-mode children still
+    // submit because the pty's `ICRNL` maps the incoming `\r` to `\n`.
+    queue_control_injection(pending_child_input, payload, false, true);
 }
 
 fn read_control_request_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
@@ -1538,9 +1735,10 @@ fn wait_until_safe_to_inject(
     real_fd: RawFd,
     master_fd: RawFd,
     line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
     buffer: &mut [u8],
 ) -> Result<(), String> {
-    pump_until_safe_to_inject(real_fd, master_fd, line_state, buffer)?;
+    pump_until_safe_to_inject(real_fd, master_fd, line_state, pending_child_input, buffer)?;
     validate_safe_to_inject(line_state)
 }
 
@@ -1548,6 +1746,7 @@ fn pump_until_safe_to_inject(
     real_fd: RawFd,
     master_fd: RawFd,
     line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
     buffer: &mut [u8],
 ) -> Result<(), String> {
     let start = Instant::now();
@@ -1555,7 +1754,7 @@ fn pump_until_safe_to_inject(
         if line_state.is_safe_to_inject() {
             return Ok(());
         }
-        pump_injection_wait_io(real_fd, master_fd, line_state, buffer)?;
+        pump_injection_wait_io(real_fd, master_fd, line_state, pending_child_input, buffer)?;
     }
     Ok(())
 }
@@ -1564,14 +1763,29 @@ fn pump_injection_wait_io(
     real_fd: RawFd,
     master_fd: RawFd,
     line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
     buffer: &mut [u8],
 ) -> Result<(), String> {
-    let ready = poll_relay_fds(real_fd, master_fd, None)?;
+    let ready = poll_relay_fds(real_fd, master_fd, None, !pending_child_input.is_empty())?;
+    if ready.pty_writable {
+        flush_pending_child_input(master_fd, pending_child_input)?;
+    }
     if ready.real_input {
-        relay_real_input(real_fd, master_fd, line_state, buffer)?;
+        relay_real_input(real_fd, line_state, pending_child_input, buffer)?;
     }
     if ready.pty_output {
         relay_pty_output(master_fd, real_fd, buffer)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn flush_pending_child_input_to_completion(
+    master_fd: RawFd,
+    pending_child_input: &mut PendingChildInput,
+) -> Result<(), String> {
+    while !pending_child_input.is_empty() {
+        flush_pending_child_input(master_fd, pending_child_input)?;
     }
     Ok(())
 }
@@ -1798,6 +2012,240 @@ mod tests {
             read_control_request(&mut big_server).unwrap_err(),
             "oversize_frame"
         );
+    }
+
+    #[test]
+    fn pending_child_input_flush_some_is_nonblocking_under_backpressure() {
+        let (_read_end, write_end) = pipe_files();
+        set_nonblocking(write_end.as_raw_fd());
+        let mut pending = PendingChildInput::new();
+        pending.enqueue(&deterministic_bytes(LARGE_CHILD_INPUT_BYTES));
+
+        let mut saw_partial_pending = false;
+        let mut saw_would_block = false;
+        for _ in 0..128 {
+            let before = pending.pending_len();
+            let progress = pending.flush_some(write_end.as_raw_fd()).unwrap();
+            assert!(
+                progress.wrote < before,
+                "one bounded flush must not drain the whole queue: {progress:?}, before={before}"
+            );
+            if !progress.fully_drained && !pending.is_empty() {
+                saw_partial_pending = true;
+            }
+            if progress.wrote == 0 {
+                saw_would_block = true;
+                assert_eq!(write_some_fd(write_end.as_raw_fd(), b"x").unwrap(), 0);
+                break;
+            }
+        }
+
+        assert!(
+            saw_partial_pending,
+            "queue should remain pending under backpressure"
+        );
+        assert!(
+            saw_would_block,
+            "nonblocking pipe should eventually report EAGAIN"
+        );
+        assert!(!pending.is_empty());
+    }
+
+    #[test]
+    fn pending_child_input_preserves_order_and_integrity_across_partial_flushes() {
+        let (read_end, write_end) = pipe_files();
+        set_nonblocking(read_end.as_raw_fd());
+        set_nonblocking(write_end.as_raw_fd());
+        let expected = deterministic_bytes(LARGE_CHILD_INPUT_BYTES);
+        let mut pending = PendingChildInput::new();
+        pending.enqueue(&expected);
+
+        let received =
+            flush_pending_to_pipe(&mut pending, write_end.as_raw_fd(), read_end.as_raw_fd());
+
+        assert!(pending.is_empty());
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn poll_relay_fds_observes_real_ctrl_c_while_child_burst_is_pending() {
+        let (real_read, mut real_write) = pipe_files();
+        let (master, _peer) = socketpair_files();
+        let mut pending = PendingChildInput::new();
+        pending.enqueue(&deterministic_bytes(LARGE_CHILD_INPUT_BYTES));
+        real_write.write_all(&[0x03]).unwrap();
+
+        let ready = poll_relay_fds(real_read.as_raw_fd(), master.as_raw_fd(), None, true).unwrap();
+
+        assert!(
+            ready.real_input,
+            "Ctrl+C must remain observable while draining child input"
+        );
+        assert!(
+            ready.pty_writable,
+            "pending child input should arm writable readiness"
+        );
+        assert!(pending.pending_len() >= LARGE_CHILD_INPUT_BYTES);
+        let mut byte = [0_u8; 1];
+        assert_eq!(read_fd(real_read.as_raw_fd(), &mut byte).unwrap(), 1);
+        assert_eq!(byte[0], 0x03);
+        assert!(
+            !pending.is_empty(),
+            "Ctrl+C should be read before the burst fully flushes"
+        );
+    }
+
+    #[test]
+    fn poll_relay_fds_reports_pty_writable_only_when_child_write_is_requested() {
+        let (real_read, _real_write) = pipe_files();
+        let (master, _peer) = socketpair_files();
+
+        assert!(!writable(0));
+        assert!(writable(libc::POLLOUT));
+
+        let idle_pollfds = relay_poll_fds(real_read.as_raw_fd(), master.as_raw_fd(), None, false);
+        let idle_master = idle_pollfds
+            .iter()
+            .find(|pollfd| pollfd.fd == master.as_raw_fd())
+            .expect("master fd should be present in idle poll set");
+        assert_eq!(
+            idle_master.events & libc::POLLOUT,
+            0,
+            "idle relay must not request POLLOUT"
+        );
+
+        let draining_pollfds =
+            relay_poll_fds(real_read.as_raw_fd(), master.as_raw_fd(), None, true);
+        let draining_master = draining_pollfds
+            .iter()
+            .find(|pollfd| pollfd.fd == master.as_raw_fd())
+            .expect("master fd should be present in draining poll set");
+        assert!(
+            draining_master.events & libc::POLLOUT != 0,
+            "pending queue must request POLLOUT"
+        );
+    }
+
+    #[test]
+    fn pending_child_input_keeps_control_payload_after_queued_user_bytes() {
+        for (bracketed, submit, expected_control) in [
+            (false, true, b"[notification payload]".to_vec()),
+            (
+                true,
+                true,
+                b"\x1b[200~[notification payload]\x1b[201~".to_vec(),
+            ),
+            (false, false, b"[notification payload]".to_vec()),
+        ] {
+            let (read_end, write_end) = pipe_files();
+            set_nonblocking(read_end.as_raw_fd());
+            set_nonblocking(write_end.as_raw_fd());
+            let queued_user = deterministic_bytes(64 * 1024);
+            let mut expected = queued_user.clone();
+            expected.extend_from_slice(&expected_control);
+            if submit {
+                expected.push(b'\r');
+            }
+            let mut pending = PendingChildInput::new();
+            pending.enqueue(&queued_user);
+
+            queue_control_injection(&mut pending, b"[notification payload]", bracketed, submit);
+            let received =
+                flush_pending_to_pipe(&mut pending, write_end.as_raw_fd(), read_end.as_raw_fd());
+
+            assert_eq!(received, expected);
+            assert_eq!(&received[..queued_user.len()], queued_user.as_slice());
+            let control_start = queued_user.len();
+            let control_end = control_start + expected_control.len();
+            assert_eq!(
+                &received[control_start..control_end],
+                expected_control.as_slice()
+            );
+            if submit {
+                assert_eq!(received[control_end], b'\r');
+            } else {
+                assert_eq!(control_end, received.len());
+                assert!(!received.ends_with(b"\r"));
+            }
+        }
+    }
+
+    const LARGE_CHILD_INPUT_BYTES: usize = 256 * 1024;
+
+    fn deterministic_bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| ((index.wrapping_mul(31) + index / 7) % 251) as u8)
+            .collect()
+    }
+
+    fn set_nonblocking(fd: RawFd) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_ne!(flags, -1, "F_GETFL failed: {}", io::Error::last_os_error());
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_ne!(rc, -1, "F_SETFL failed: {}", io::Error::last_os_error());
+    }
+
+    fn flush_pending_to_pipe(
+        pending: &mut PendingChildInput,
+        write_fd: RawFd,
+        read_fd: RawFd,
+    ) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut attempts = 0;
+        while !pending.is_empty() {
+            attempts += 1;
+            assert!(
+                attempts < 4096,
+                "pending queue did not drain deterministically"
+            );
+            let before = pending.pending_len();
+            let progress = pending.flush_some(write_fd).unwrap();
+            assert!(progress.wrote <= before);
+            assert_eq!(progress.fully_drained, pending.is_empty());
+            let drained = drain_available(read_fd, &mut received).unwrap();
+            assert!(
+                progress.wrote > 0 || drained > 0,
+                "flush made no progress and no pipe bytes were available"
+            );
+        }
+        drain_available(read_fd, &mut received).unwrap();
+        received
+    }
+
+    fn drain_available(read_fd: RawFd, output: &mut Vec<u8>) -> io::Result<usize> {
+        let mut total = 0;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let rc = unsafe { libc::read(read_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if rc > 0 {
+                let n = rc as usize;
+                output.extend_from_slice(&buffer[..n]);
+                total += n;
+                continue;
+            }
+            if rc == 0 {
+                return Ok(total);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(code) if code == libc::EINTR => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    return Ok(total);
+                }
+                _ => return Err(err),
+            }
+        }
+    }
+
+    fn socketpair_files() -> (File, File) {
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let left = unsafe { File::from_raw_fd(fds[0]) };
+        let right = unsafe { File::from_raw_fd(fds[1]) };
+        (left, right)
     }
 
     fn pipe_files() -> (File, File) {
