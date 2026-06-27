@@ -253,6 +253,24 @@ pub(super) fn resume_execution_target(
     resume_provider_execution_target(&resolved.active_provider, providers_cfg)
 }
 
+pub(super) fn interactive_resume_execution_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    providers_cfg: &ProvidersConfig,
+) -> Result<ResumeExecutionTarget, oulipoly_state::ResumeError> {
+    let target = resume_execution_target(resolved, providers_cfg)?;
+    // Existing provider sessions already carry model/variant state; interactive
+    // resume should use the runtime provider argv, not model launch argv.
+    let (provider, prompt_mode) = providers_cfg
+        .runtime_provider(&resolved.active_provider)
+        .map_err(resume_db_error)?;
+    Ok(ResumeExecutionTarget {
+        model: target.model,
+        provider_index: target.provider_index,
+        provider,
+        prompt_mode,
+    })
+}
+
 fn resume_model_execution_target(
     model: &ModelConfig,
     active_provider: &str,

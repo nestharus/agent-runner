@@ -30,7 +30,9 @@ use crate::quota_zero_turn::{
     host_observed_completion_from_interactive_result, zero_turn_classify_after_completion,
     zero_turn_record_baseline,
 };
-use crate::resume_cli::{format_resume_error, resume_execution_target, resume_migration_pool};
+use crate::resume_cli::{
+    format_resume_error, interactive_resume_execution_target, resume_migration_pool,
+};
 use crate::spawn_cwd::{effective_resume_spawn_cwd, effective_spawn_cwd};
 use crate::terminal_outcome_adapter::{
     apply_age153_terminal_signal_fixture_override_to_fields, apply_terminal_signal_outcome,
@@ -221,7 +223,8 @@ fn fallback_target_for_resume(
 ) -> Result<Option<crate::resume_cli::ResumeExecutionTarget>, String> {
     resolved_resume
         .map(|resolved| {
-            resume_execution_target(resolved, &env.providers_cfg).map_err(format_resume_error)
+            interactive_resume_execution_target(resolved, &env.providers_cfg)
+                .map_err(format_resume_error)
         })
         .transpose()
 }
@@ -729,7 +732,8 @@ fn apply_repl_migrated_segment(
     resolved.active_provider = migrated.target_provider;
     resolved.active_session_id = migrated.target_session_id;
     *input.fallback_target = Some(
-        resume_execution_target(resolved, &input.env.providers_cfg).map_err(format_resume_error)?,
+        interactive_resume_execution_target(resolved, &input.env.providers_cfg)
+            .map_err(format_resume_error)?,
     );
     Ok(())
 }

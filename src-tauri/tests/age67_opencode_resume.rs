@@ -181,6 +181,7 @@ fn model_toml() -> String {
         r#"[[providers]]
 name = "{PROVIDER}"
 args = []
+interactive_args = ["model-interactive-arg", "--variant", "poison"]
 "#
     )
 }
