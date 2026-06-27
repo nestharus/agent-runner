@@ -154,6 +154,7 @@ impl RoutingServicePort for ProductionRoutingService {
             )
             .map_err(|error| ServiceError::Unavailable {
                 message: error.to_string(),
+                code: None,
             })?,
         })
     }

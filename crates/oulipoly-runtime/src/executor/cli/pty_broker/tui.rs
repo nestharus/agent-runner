@@ -2346,7 +2346,7 @@ fn format_pseudo_input_line(pane: &MonitorPane) -> String {
     let mut text = pane.pseudo_input.buffer.clone();
     let cursor = pane.pseudo_input.cursor_chars();
     let marker = if text.is_empty() { "" } else { " " };
-    text.insert_str(pane.pseudo_input.cursor, "▌");
+    text.insert(pane.pseudo_input.cursor, '▌');
     format!(" input[{cursor}] >{marker}{text}")
 }
 
@@ -4061,7 +4061,7 @@ fn start_next_outbound_message(
     let Some(body) = outbound.message(id).map(|message| message.body.clone()) else {
         return false;
     };
-    if body.as_bytes().len() > PSEUDO_INPUT_MAX_BYTES {
+    if body.len() > PSEUDO_INPUT_MAX_BYTES {
         return outbound.set_status(
             id,
             OutboundStatus::Failed,

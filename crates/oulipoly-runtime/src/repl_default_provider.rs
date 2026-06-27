@@ -314,11 +314,59 @@ fn ingest_default_provider_session<O: StateDbOpener>(
             stderr: &mut stderr,
         })
     {
-        eprintln!(
-            "Warning: Session ingest failed for {}: {err}",
-            input.provider_name
-        );
+        log_default_provider_session_ingest_error(input.provider_name, &err);
     }
+}
+
+fn log_default_provider_session_ingest_error(provider_name: &str, err: &ServiceError) {
+    let Some(warning) = default_provider_session_ingest_user_warning(provider_name, err) else {
+        tracing::debug!(
+            provider_name,
+            error = %err,
+            error_code = err.code(),
+            "default-provider session ingest skipped benign failure"
+        );
+        return;
+    };
+
+    tracing::warn!(
+        provider_name,
+        warning = %warning,
+        error = %err,
+        error_code = err.code(),
+        "default-provider session ingest failed"
+    );
+    eprintln!("{warning}");
+}
+
+fn default_provider_session_ingest_user_warning(
+    provider_name: &str,
+    err: &ServiceError,
+) -> Option<String> {
+    if is_benign_default_provider_session_ingest_error(err) {
+        None
+    } else {
+        Some(format!(
+            "Warning: Session ingest failed for {provider_name}: {err}"
+        ))
+    }
+}
+
+fn is_benign_default_provider_session_ingest_error(err: &ServiceError) -> bool {
+    err.code()
+        .is_some_and(is_benign_default_provider_session_ingest_token)
+}
+
+fn is_benign_default_provider_session_ingest_token(token: &str) -> bool {
+    matches!(
+        token,
+        "ambiguous_session_transcript"
+            | "session_transcript_not_found"
+            | "partial_native_transcript"
+            | "provider_capability"
+            | "session_locate_missing"
+            | "session_locate_require_existing_unobserved"
+    )
 }
 
 fn default_provider_effective_cwd(working_dir: Option<&Path>) -> Option<PathBuf> {
@@ -742,6 +790,43 @@ interactive_args = ["ok"]
             resolve_family_keys_for_test(&providers, "claude"),
             vec!["claude", "claude3"]
         );
+    }
+
+    #[test]
+    fn benign_default_provider_session_ingest_error_has_no_user_warning() {
+        let provider_name = provider_name_for_test(&["cla", "ude"]);
+        let error = ServiceError::Unavailable {
+            message: "session.read_turns: ambiguous_session_transcript: provider client error"
+                .to_string(),
+            code: Some("ambiguous_session_transcript".to_string()),
+        };
+
+        let mut stderr = Vec::new();
+        if let Some(warning) = default_provider_session_ingest_user_warning(&provider_name, &error)
+        {
+            stderr.extend_from_slice(warning.as_bytes());
+        }
+
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn unexpected_default_provider_session_ingest_error_keeps_warning() {
+        let provider_name = provider_name_for_test(&["cla", "ude"]);
+        let error = ServiceError::Dependency {
+            message: "state write failed".to_string(),
+        };
+        let expected =
+            format!("Warning: Session ingest failed for {provider_name}: state write failed");
+
+        assert_eq!(
+            default_provider_session_ingest_user_warning(&provider_name, &error).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    fn provider_name_for_test(parts: &[&str]) -> String {
+        parts.concat()
     }
 
     #[test]
