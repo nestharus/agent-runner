@@ -139,6 +139,7 @@ pub(super) enum Focus {
 enum MonitorCommand {
     SelectNext,
     SelectPrev,
+    SelectIndex(usize),
     Refresh,
     Collapse,
     ToggleInspect,
@@ -942,6 +943,12 @@ impl MonitorPane {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    fn select_index(&mut self, index: usize) {
+        if index < self.node_count() {
+            self.selected = index;
+        }
+    }
+
     /// Apply a decoded monitor command. Returns whether a forced refresh is wanted.
     fn apply(&mut self, command: MonitorCommand) -> bool {
         match command {
@@ -952,6 +959,11 @@ impl MonitorPane {
             }
             MonitorCommand::SelectPrev => {
                 self.select_prev();
+                self.update_inspect();
+                false
+            }
+            MonitorCommand::SelectIndex(index) => {
+                self.select_index(index);
                 self.update_inspect();
                 false
             }
@@ -2439,7 +2451,14 @@ fn route_mouse_aware_input(
     let mut i = 0;
     while i < bytes.len() {
         if let Some(parsed) = parse_mouse_event(&bytes[i..]) {
-            route_mouse_event(parsed.event, areas, mouse_request, &mut routed);
+            route_mouse_event(
+                parsed.event,
+                areas,
+                router,
+                pane,
+                mouse_request,
+                &mut routed,
+            );
             i += parsed.consumed;
         } else {
             i += router.route_next_input(&bytes[i..], &mut routed);
@@ -2451,17 +2470,29 @@ fn route_mouse_aware_input(
 fn route_mouse_event(
     event: MouseEvent,
     areas: PaneAreas,
+    router: &mut InputRouter,
+    pane: &MonitorPane,
     mouse_request: MouseRequest,
     routed: &mut RoutedInput,
 ) {
     match route_mouse_to_pane(event, areas) {
-        MousePaneRoute::Top(local) => route_top_mouse_event(local, mouse_request, routed),
-        MousePaneRoute::Bottom(bottom) => route_bottom_mouse_event(bottom, routed),
+        MousePaneRoute::Top(local) => route_top_mouse_event(local, mouse_request, router, routed),
+        MousePaneRoute::Bottom(bottom) => {
+            route_bottom_mouse_event(bottom, areas.bottom, pane, router, routed)
+        }
         MousePaneRoute::Outside => {}
     }
 }
 
-fn route_top_mouse_event(event: MouseEvent, child_mouse: MouseRequest, routed: &mut RoutedInput) {
+fn route_top_mouse_event(
+    event: MouseEvent,
+    child_mouse: MouseRequest,
+    router: &mut InputRouter,
+    routed: &mut RoutedInput,
+) {
+    if is_primary_press(event) && router.focus == Focus::Bottom {
+        router.focus_top(routed);
+    }
     // A child that requested mouse owns its own events (including the wheel, e.g. a
     // full-screen TUI agent): forward them in the child's encoding.
     if child_mouse.is_enabled() {
@@ -2494,6 +2525,13 @@ fn mouse_button_is_motion(button: u16) -> bool {
 /// trigger, mirroring the right-click-to-paste convention of many terminals.
 fn is_right_press(event: MouseEvent) -> bool {
     event.button & 0b11 == 2 && !event.released && !mouse_button_is_motion(event.button)
+}
+
+fn is_primary_press(event: MouseEvent) -> bool {
+    event.button & 0b11 == 0
+        && !event.released
+        && !mouse_button_is_motion(event.button)
+        && !mouse_button_is_wheel(event.button)
 }
 
 /// Classify a non-wheel top-pane mouse event as a left-button selection gesture, or
@@ -2752,9 +2790,51 @@ fn inject_clipboard_paste(
     pending_child_input.enqueue(&bytes);
 }
 
-fn route_bottom_mouse_event(event: MouseEvent, routed: &mut RoutedInput) {
+fn route_bottom_mouse_event(
+    event: MouseEvent,
+    bottom: Rect,
+    pane: &MonitorPane,
+    router: &mut InputRouter,
+    routed: &mut RoutedInput,
+) {
     if let Some(command) = mouse_wheel_command(event) {
         apply_monitor_command(routed, command);
+    } else if is_primary_press(event) {
+        router.focus_bottom(routed);
+        if let Some(index) = bottom_visible_row_index(event, bottom, pane) {
+            apply_monitor_command(routed, MonitorCommand::SelectIndex(index));
+        }
+    }
+}
+
+fn bottom_visible_row_index(event: MouseEvent, bottom: Rect, pane: &MonitorPane) -> Option<usize> {
+    let list = bottom_list_area(bottom, pane)?;
+    if !rect_contains_mouse(list, event) {
+        return None;
+    }
+    let snapshot = pane.snapshot.as_ref()?;
+    let row = usize::from(event.row.saturating_sub(list.y.saturating_add(1)));
+    let offset = scroll_offset(pane.selected, snapshot.nodes.len(), list.height as usize);
+    let index = offset + row;
+    (index < snapshot.nodes.len()).then_some(index)
+}
+
+fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
+    if pane.collapsed || bottom.height <= 1 {
+        return None;
+    }
+    let body = Rect {
+        y: bottom.y + 1,
+        height: bottom.height - 1,
+        ..bottom
+    };
+    if pane.inspecting && body.height >= 4 {
+        Some(Rect {
+            height: (body.height / 2).max(2),
+            ..body
+        })
+    } else {
+        Some(body)
     }
 }
 
@@ -3335,6 +3415,141 @@ mod tests {
         let routed = route_real_input(b"\x1b[<65;4;10M", &mut router, &pane, request, &winsize);
         assert!(routed.forward.is_empty());
         assert_eq!(routed.commands, vec![MonitorCommand::SelectNext]);
+    }
+
+    #[test]
+    fn bottom_status_row_primary_click_focuses_bottom_and_requests_expansion() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 20,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<0;4;10M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+
+        assert_eq!(router.focus, Focus::Bottom);
+        assert!(routed.focus_bottom);
+        assert!(routed.redraw);
+        assert!(routed.forward.is_empty());
+        assert!(routed.commands.is_empty());
+    }
+
+    #[test]
+    fn top_pane_primary_click_restores_top_focus_from_bottom() {
+        let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<0;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+
+        assert_eq!(router.focus, Focus::Top);
+        assert!(routed.redraw);
+        assert!(routed.forward.is_empty());
+        assert_eq!(
+            routed.top_mouse,
+            vec![TopMouse {
+                gesture: TopGesture::Press,
+                row: 3,
+                col: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn top_pane_primary_click_restores_focus_and_forwards_when_child_mouse_enabled() {
+        let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let child = MouseRequest {
+            mode: vt100::MouseProtocolMode::ButtonMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+
+        let routed = route_real_input(b"\x1b[<0;4;3M", &mut router, &pane, child, &winsize);
+
+        assert_eq!(router.focus, Focus::Top);
+        assert_eq!(routed.forward, b"\x1b[<0;4;3M".to_vec());
+        assert!(routed.top_mouse.is_empty());
+        assert!(routed.commands.is_empty());
+    }
+
+    #[test]
+    fn bottom_visible_row_primary_click_selects_row_after_scroll_offset() {
+        let mut router = InputRouter::new();
+        let pane = pane_with(snapshot_with_nodes(12), false, 9);
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<0;4;17M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+
+        assert_eq!(router.focus, Focus::Bottom);
+        assert!(routed.focus_bottom);
+        assert_eq!(routed.commands, vec![MonitorCommand::SelectIndex(6)]);
+        let mut applied = pane.clone();
+        applied.apply(routed.commands[0]);
+        assert_eq!(applied.selected, 6);
+    }
+
+    #[test]
+    fn bottom_non_row_primary_click_does_not_select_or_forward() {
+        let mut router = InputRouter::new();
+        let pane = pane_with(snapshot_with_nodes(1), false, 0);
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let child = MouseRequest {
+            mode: vt100::MouseProtocolMode::ButtonMotion,
+            encoding: vt100::MouseProtocolEncoding::Sgr,
+        };
+
+        let routed = route_real_input(b"\x1b[<0;4;16M", &mut router, &pane, child, &winsize);
+
+        assert_eq!(router.focus, Focus::Bottom);
+        assert!(routed.focus_bottom);
+        assert!(routed.commands.is_empty());
+        assert!(routed.forward.is_empty());
     }
 
     #[test]
@@ -4210,6 +4425,21 @@ mod tests {
             wake: None,
             mailbox: None,
         }
+    }
+
+    fn snapshot_with_nodes(count: usize) -> MonitorSnapshot {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = (0..count)
+            .map(|index| {
+                node(
+                    &format!("node:{index}"),
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    &format!("node {index}"),
+                )
+            })
+            .collect();
+        snapshot
     }
 
     struct FakeMonitor {
