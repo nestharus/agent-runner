@@ -7,7 +7,7 @@
 use crate::SESSION;
 use crate::fake_cli::notify_command;
 use crate::fixtures::Fixture;
-use crate::liveness::{delivered_rows_without_pending_or_claim, wait_until};
+use crate::liveness::{delivered_rows_without_pending_or_claim, wait_for_file, wait_until};
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
     assert_capture_notify_wake_busy, assert_no_wake_claim, assert_pending_handle_without_error,
@@ -17,9 +17,10 @@ use serde_json::Value;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Child, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub(crate) fn live_pty_nack_pending_is_retried_by_sweep() {
     let _guard = integration_test_guard();
@@ -125,6 +126,81 @@ pub(crate) fn live_pty_repeated_nack_keeps_pending_without_claim() {
     assert_xdg_isolated(&fixture);
 }
 
+pub(crate) fn foreground_owner_retries_live_pty_without_second_command_and_stops() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(
+        r#"printf 'started\n' > "$WU_D_WORK_DIR/live-pty-owner-started"
+sleep 10"#,
+    );
+    let control = spawn_control_socket(
+        &fixture,
+        "live-pty-owner-driver.sock",
+        vec![
+            control_nack("unsafe_mid_line"),
+            control_ack("ok"),
+            control_ack("leaked"),
+        ],
+    );
+    let identity = fixture.seed_live_pty_runtime(&control.path);
+    fixture.record_identity(&identity);
+
+    let mut owner = fixture.spawn_agent("owner stays alive");
+    wait_for_file(&fixture.work_dir.join("live-pty-owner-started"));
+
+    let output = notify_command(&fixture, "h-live-pty-owner-driver", &identity)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let notify = notify_response(&output);
+    assert_notify_pty_status(&notify, "unsafe_mid_line");
+    assert_notify_pty_submitted(&notify, false);
+    assert_capture_notify_wake_busy(&notify);
+
+    wait_until("owner-hosted live PTY retry delivered", || {
+        delivered_rows_without_pending_or_claim(&fixture, SESSION, 1)
+    });
+    wait_until("notify plus owner retry reached PTY control", || {
+        control.accepted_count() == 2
+    });
+
+    stop_owner(&mut owner);
+    fixture.seed_mailbox(SESSION, "h-after-owner-exit");
+    std::thread::sleep(Duration::from_millis(3_500));
+
+    assert_eq!(control.accepted_count(), 2);
+    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    assert_no_wake_claim(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn auto_wake_owner_does_not_host_live_pty_retry_driver() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(
+        r#"printf 'started\n' > "$WU_D_WORK_DIR/auto-wake-owner-started"
+sleep 4"#,
+    );
+    let control = spawn_control_socket(
+        &fixture,
+        "live-pty-auto-wake-no-driver.sock",
+        vec![control_ack("unexpected")],
+    );
+    let identity = fixture.seed_live_pty_runtime(&control.path);
+    fixture.record_identity(&identity);
+    fixture.seed_mailbox(SESSION, "h-auto-wake-no-driver");
+
+    let mut owner = fixture.spawn_agent_as_auto_wake("auto wake child");
+    wait_for_file(&fixture.work_dir.join("auto-wake-owner-started"));
+    std::thread::sleep(Duration::from_millis(3_500));
+    stop_owner(&mut owner);
+
+    assert_eq!(control.accepted_count(), 0);
+    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    assert_no_wake_claim(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
 struct ControlSocketScript {
     path: PathBuf,
     accepted: Arc<AtomicUsize>,
@@ -221,6 +297,11 @@ fn control_nack(message: &str) -> ControlResponse {
         ack: false,
         message: message.to_string(),
     }
+}
+
+fn stop_owner(owner: &mut Child) {
+    let _ = owner.kill();
+    let _ = owner.wait();
 }
 
 fn notify_response(output: &Output) -> Value {

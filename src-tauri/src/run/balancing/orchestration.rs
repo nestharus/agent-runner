@@ -417,6 +417,7 @@ fn execute_balanced_attempt(
             attempt.start_known_provider_session_mode,
         ),
     );
+    let _live_pty_retry_driver = start_live_pty_retry_driver_if_applicable(provider);
     match agent_runtime_services
         .executor_service
         .execute(executor_request)
@@ -441,6 +442,15 @@ fn execute_balanced_attempt(
             Err(err)
         }
     }
+}
+
+fn start_live_pty_retry_driver_if_applicable(
+    provider: &ProviderConfig,
+) -> Option<crate::wake_coordinator::LivePtyRetryDriverGuard> {
+    provider
+        .interactive_args
+        .as_ref()
+        .and_then(|_| crate::wake_coordinator::start_live_pty_retry_driver_for_owner())
 }
 
 struct BalancedZeroTurnInput<'a> {
