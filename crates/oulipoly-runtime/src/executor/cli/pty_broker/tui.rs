@@ -153,6 +153,7 @@ enum MonitorCommand {
 struct RoutedInput {
     forward: Vec<u8>,
     commands: Vec<MonitorCommand>,
+    pseudo_input: Vec<PseudoInputAction>,
     /// The operator toggled focus into the monitor (expand + focus bottom).
     focus_bottom: bool,
     /// Net wheel scroll for the top pane's scrollback: positive moves toward older
@@ -250,16 +251,23 @@ enum TopInputRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BottomKey {
     FocusToggle,
-    Quit,
+    Enter,
+    Backspace,
+    Delete,
+    LeftArrow,
+    RightArrow,
     UpArrow,
     DownArrow,
-    VimUp,
-    VimDown,
+    MoveStart,
+    MoveEnd,
+    Clear,
     Refresh,
+    Collapse,
     Inspect,
     Cancel,
     Confirm,
     Abort,
+    Printable(char),
     Unknown,
 }
 
@@ -274,7 +282,21 @@ enum BottomInputRoute {
     FocusTop,
     Command(MonitorCommand),
     CommandAndFocusTop(MonitorCommand),
+    PseudoInput(PseudoInputAction),
     Consume,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PseudoInputAction {
+    Insert(char),
+    Backspace,
+    Delete,
+    MoveLeft,
+    MoveRight,
+    MoveStart,
+    MoveEnd,
+    Clear,
+    Submit,
 }
 
 enum InspectContentSource<'a> {
@@ -364,6 +386,7 @@ impl InputRouter {
                 apply_monitor_command(routed, command);
                 self.focus_top(routed);
             }
+            BottomInputRoute::PseudoInput(action) => apply_pseudo_input_action(routed, action),
             BottomInputRoute::Consume => {}
         }
         consumed
@@ -381,9 +404,17 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::FocusToggle,
             consumed: 1,
         },
-        [b'q', ..] => ParsedBottomKey {
-            key: BottomKey::Quit,
+        [b'\r', ..] | [b'\n', ..] => ParsedBottomKey {
+            key: BottomKey::Enter,
             consumed: 1,
+        },
+        [0x7f, ..] | [0x08, ..] => ParsedBottomKey {
+            key: BottomKey::Backspace,
+            consumed: 1,
+        },
+        [0x1b, b'[', b'3', b'~', ..] => ParsedBottomKey {
+            key: BottomKey::Delete,
+            consumed: 4,
         },
         [0x1b, b'[', b'A', ..] => ParsedBottomKey {
             key: BottomKey::UpArrow,
@@ -393,32 +424,52 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::DownArrow,
             consumed: 3,
         },
-        [b'k', ..] => ParsedBottomKey {
-            key: BottomKey::VimUp,
+        [0x1b, b'[', b'D', ..] => ParsedBottomKey {
+            key: BottomKey::LeftArrow,
+            consumed: 3,
+        },
+        [0x1b, b'[', b'C', ..] => ParsedBottomKey {
+            key: BottomKey::RightArrow,
+            consumed: 3,
+        },
+        [0x01, ..] => ParsedBottomKey {
+            key: BottomKey::MoveStart,
             consumed: 1,
         },
-        [b'j', ..] => ParsedBottomKey {
-            key: BottomKey::VimDown,
+        [0x05, ..] => ParsedBottomKey {
+            key: BottomKey::MoveEnd,
             consumed: 1,
         },
-        [b'r', ..] => ParsedBottomKey {
+        [0x15, ..] => ParsedBottomKey {
+            key: BottomKey::Clear,
+            consumed: 1,
+        },
+        [0x12, ..] => ParsedBottomKey {
             key: BottomKey::Refresh,
             consumed: 1,
         },
-        [b'i', ..] | [b'\r', ..] | [b'\n', ..] => ParsedBottomKey {
+        [0x11, ..] => ParsedBottomKey {
+            key: BottomKey::Collapse,
+            consumed: 1,
+        },
+        [0x09, ..] => ParsedBottomKey {
             key: BottomKey::Inspect,
             consumed: 1,
         },
-        [b'x', ..] => ParsedBottomKey {
+        [0x18, ..] => ParsedBottomKey {
             key: BottomKey::Cancel,
             consumed: 1,
         },
-        [b'y', ..] => ParsedBottomKey {
+        [0x19, ..] => ParsedBottomKey {
             key: BottomKey::Confirm,
             consumed: 1,
         },
-        [b'n', ..] => ParsedBottomKey {
+        [0x0e, ..] => ParsedBottomKey {
             key: BottomKey::Abort,
+            consumed: 1,
+        },
+        [byte, ..] if byte.is_ascii_graphic() || *byte == b' ' => ParsedBottomKey {
+            key: BottomKey::Printable(*byte as char),
             consumed: 1,
         },
         _ => ParsedBottomKey {
@@ -431,24 +482,34 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
 fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
     match key {
         BottomKey::FocusToggle => BottomInputRoute::FocusTop,
-        BottomKey::Quit => BottomInputRoute::CommandAndFocusTop(MonitorCommand::Collapse),
-        BottomKey::UpArrow | BottomKey::VimUp => {
-            BottomInputRoute::Command(MonitorCommand::SelectPrev)
-        }
-        BottomKey::DownArrow | BottomKey::VimDown => {
-            BottomInputRoute::Command(MonitorCommand::SelectNext)
-        }
+        BottomKey::Enter => BottomInputRoute::PseudoInput(PseudoInputAction::Submit),
+        BottomKey::Backspace => BottomInputRoute::PseudoInput(PseudoInputAction::Backspace),
+        BottomKey::Delete => BottomInputRoute::PseudoInput(PseudoInputAction::Delete),
+        BottomKey::LeftArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveLeft),
+        BottomKey::RightArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveRight),
+        BottomKey::UpArrow => BottomInputRoute::Command(MonitorCommand::SelectPrev),
+        BottomKey::DownArrow => BottomInputRoute::Command(MonitorCommand::SelectNext),
+        BottomKey::MoveStart => BottomInputRoute::PseudoInput(PseudoInputAction::MoveStart),
+        BottomKey::MoveEnd => BottomInputRoute::PseudoInput(PseudoInputAction::MoveEnd),
+        BottomKey::Clear => BottomInputRoute::PseudoInput(PseudoInputAction::Clear),
         BottomKey::Refresh => BottomInputRoute::Command(MonitorCommand::Refresh),
+        BottomKey::Collapse => BottomInputRoute::CommandAndFocusTop(MonitorCommand::Collapse),
         BottomKey::Inspect => BottomInputRoute::Command(MonitorCommand::ToggleInspect),
         BottomKey::Cancel => BottomInputRoute::Command(MonitorCommand::RequestCancel),
         BottomKey::Confirm => BottomInputRoute::Command(MonitorCommand::ConfirmCancel),
         BottomKey::Abort => BottomInputRoute::Command(MonitorCommand::AbortCancel),
+        BottomKey::Printable(ch) => BottomInputRoute::PseudoInput(PseudoInputAction::Insert(ch)),
         BottomKey::Unknown => BottomInputRoute::Consume,
     }
 }
 
 fn apply_monitor_command(routed: &mut RoutedInput, command: MonitorCommand) {
     routed.commands.push(command);
+    routed.redraw = true;
+}
+
+fn apply_pseudo_input_action(routed: &mut RoutedInput, action: PseudoInputAction) {
+    routed.pseudo_input.push(action);
     routed.redraw = true;
 }
 
@@ -840,6 +901,397 @@ const TOP_PANE_MIN_ROWS: u16 = 5;
 const TOP_PANE_SCROLLBACK_ROWS: usize = 10_000;
 /// Rows moved per wheel notch when scrolling the top-pane scrollback.
 const TOP_SCROLL_STEP: i32 = 3;
+/// Rows reserved at the bottom of the expanded overlay for the pseudo input lane.
+const PSEUDO_INPUT_ROWS: u16 = 2;
+/// Rows reserved below the pseudo input for outbound message state.
+const OUTBOUND_STATUS_ROWS: u16 = 1;
+/// Broker-owned input messages larger than this fail before reaching the child.
+const PSEUDO_INPUT_MAX_BYTES: usize = 64 * 1024;
+/// Poll cadence for a live recent-turn reader while a message awaits consumption.
+const RECENT_TURN_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Sent messages fail safe to ambiguous when no consumption proof appears in time.
+const OUTBOUND_CONSUMPTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Default)]
+struct PseudoInputState {
+    buffer: String,
+    cursor: usize,
+}
+
+impl PseudoInputState {
+    fn apply(&mut self, action: PseudoInputAction) -> Option<String> {
+        match action {
+            PseudoInputAction::Insert(ch) => self.insert(ch),
+            PseudoInputAction::Backspace => self.backspace(),
+            PseudoInputAction::Delete => self.delete(),
+            PseudoInputAction::MoveLeft => self.move_left(),
+            PseudoInputAction::MoveRight => self.move_right(),
+            PseudoInputAction::MoveStart => self.move_start(),
+            PseudoInputAction::MoveEnd => self.move_end(),
+            PseudoInputAction::Clear => self.clear(),
+            PseudoInputAction::Submit => return self.take_submission(),
+        }
+        None
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.buffer.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        let Some(prev) = previous_char_boundary(&self.buffer, self.cursor) else {
+            return;
+        };
+        self.buffer.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    fn delete(&mut self) {
+        let Some(next) = next_char_boundary(&self.buffer, self.cursor) else {
+            return;
+        };
+        self.buffer.drain(self.cursor..next);
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = previous_char_boundary(&self.buffer, self.cursor) {
+            self.cursor = prev;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = next_char_boundary(&self.buffer, self.cursor) {
+            self.cursor = next;
+        }
+    }
+
+    fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.buffer.len();
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+    }
+
+    fn take_submission(&mut self) -> Option<String> {
+        if self.buffer.trim().is_empty() {
+            return None;
+        }
+        let body = std::mem::take(&mut self.buffer);
+        self.cursor = 0;
+        Some(body)
+    }
+
+    fn cursor_chars(&self) -> usize {
+        self.buffer[..self.cursor].chars().count()
+    }
+}
+
+fn previous_char_boundary(value: &str, cursor: usize) -> Option<usize> {
+    value[..cursor]
+        .char_indices()
+        .last()
+        .map(|(index, _)| index)
+}
+
+fn next_char_boundary(value: &str, cursor: usize) -> Option<usize> {
+    value[cursor..]
+        .char_indices()
+        .nth(1)
+        .map(|(index, _)| cursor + index)
+        .or_else(|| (cursor < value.len()).then_some(value.len()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundStatus {
+    Queued,
+    Sending,
+    Sent,
+    Consumed,
+    Ambiguous,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct OutboundMessage {
+    id: u64,
+    body: String,
+    status: OutboundStatus,
+    created_at: Instant,
+    sent_at: Option<Instant>,
+    baseline_turn_count: Option<u64>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutboundQueue {
+    next_id: u64,
+    messages: Vec<OutboundMessage>,
+    active: Option<ActiveOutboundSend>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveOutboundSend {
+    message_id: u64,
+    phase: OutboundSendPhase,
+    bracketed_paste: bool,
+}
+
+#[derive(Debug, Clone)]
+enum OutboundSendPhase {
+    Body,
+    DelayUntil(Instant),
+    Submit,
+}
+
+impl OutboundQueue {
+    fn enqueue(&mut self, body: String, now: Instant) -> u64 {
+        let id = self.next_message_id();
+        self.messages.push(OutboundMessage {
+            id,
+            body,
+            status: OutboundStatus::Queued,
+            created_at: now,
+            sent_at: None,
+            baseline_turn_count: None,
+            detail: None,
+        });
+        id
+    }
+
+    fn next_message_id(&mut self) -> u64 {
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        self.next_id
+    }
+
+    fn has_sent_or_sending(&self) -> bool {
+        self.messages.iter().any(|message| {
+            matches!(
+                message.status,
+                OutboundStatus::Sending | OutboundStatus::Sent
+            )
+        })
+    }
+
+    fn has_unresolved_blocker(&self) -> bool {
+        self.messages.iter().any(|message| {
+            matches!(
+                message.status,
+                OutboundStatus::Sending
+                    | OutboundStatus::Sent
+                    | OutboundStatus::Ambiguous
+                    | OutboundStatus::Failed
+            )
+        })
+    }
+
+    fn next_queued_id(&self) -> Option<u64> {
+        self.messages
+            .iter()
+            .find(|message| message.status == OutboundStatus::Queued)
+            .map(|message| message.id)
+    }
+
+    fn message(&self, id: u64) -> Option<&OutboundMessage> {
+        self.messages.iter().find(|message| message.id == id)
+    }
+
+    fn message_mut(&mut self, id: u64) -> Option<&mut OutboundMessage> {
+        self.messages.iter_mut().find(|message| message.id == id)
+    }
+
+    fn set_status(
+        &mut self,
+        id: u64,
+        status: OutboundStatus,
+        now: Instant,
+        detail: Option<String>,
+    ) -> bool {
+        let Some(message) = self.message_mut(id) else {
+            return false;
+        };
+        let changed = message.status != status || message.detail != detail;
+        message.status = status;
+        message.detail = detail;
+        if status == OutboundStatus::Sent && message.sent_at.is_none() {
+            message.sent_at = Some(now);
+        }
+        changed
+    }
+
+    fn mark_sending(&mut self, id: u64, baseline_turn_count: Option<u64>) -> bool {
+        let Some(message) = self.message_mut(id) else {
+            return false;
+        };
+        message.status = OutboundStatus::Sending;
+        message.baseline_turn_count = baseline_turn_count;
+        message.detail = None;
+        true
+    }
+
+    #[cfg(test)]
+    fn status(&self, id: u64) -> Option<OutboundStatus> {
+        self.message(id).map(|message| message.status)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecentUserTurn {
+    ordinal: u64,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecentTurnSnapshot {
+    user_turns: Vec<RecentUserTurn>,
+    turn_count: u64,
+    complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+enum RecentTurnRead {
+    Available(RecentTurnSnapshot),
+    Unavailable(String),
+    Failed(String),
+}
+
+trait RecentTurnReader {
+    fn read_recent_turns(&mut self) -> RecentTurnRead;
+}
+
+struct RecentTurnPump {
+    reader: Option<Box<dyn RecentTurnReader + Send>>,
+    next_poll_at: Instant,
+    last_snapshot: Option<RecentTurnSnapshot>,
+}
+
+impl RecentTurnPump {
+    fn disabled(now: Instant) -> Self {
+        Self {
+            reader: None,
+            next_poll_at: now + RECENT_TURN_POLL_INTERVAL,
+            last_snapshot: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reader(reader: Box<dyn RecentTurnReader + Send>, now: Instant) -> Self {
+        Self {
+            reader: Some(reader),
+            next_poll_at: now,
+            last_snapshot: None,
+        }
+    }
+
+    fn last_turn_count(&self) -> Option<u64> {
+        self.last_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.turn_count)
+    }
+
+    fn poll_if_due(&mut self, now: Instant, outbound: &mut OutboundQueue) -> bool {
+        if !outbound.has_sent_or_sending() || now < self.next_poll_at {
+            return false;
+        }
+        self.next_poll_at = now + RECENT_TURN_POLL_INTERVAL;
+        let Some(reader) = self.reader.as_mut() else {
+            return false;
+        };
+        match reader.read_recent_turns() {
+            RecentTurnRead::Available(snapshot) => {
+                let dirty = apply_recent_turn_snapshot(outbound, &snapshot, now);
+                self.last_snapshot = Some(snapshot);
+                dirty
+            }
+            RecentTurnRead::Unavailable(_) | RecentTurnRead::Failed(_) => false,
+        }
+    }
+}
+
+fn apply_recent_turn_snapshot(
+    outbound: &mut OutboundQueue,
+    snapshot: &RecentTurnSnapshot,
+    now: Instant,
+) -> bool {
+    let _ = snapshot.complete;
+    let mut dirty = false;
+    let sent_ids: Vec<u64> = outbound
+        .messages
+        .iter()
+        .filter(|message| message.status == OutboundStatus::Sent)
+        .map(|message| message.id)
+        .collect();
+    for id in sent_ids {
+        dirty |= apply_recent_turn_snapshot_to_message(outbound, id, snapshot, now);
+    }
+    dirty
+}
+
+fn apply_recent_turn_snapshot_to_message(
+    outbound: &mut OutboundQueue,
+    id: u64,
+    snapshot: &RecentTurnSnapshot,
+    now: Instant,
+) -> bool {
+    let Some(message) = outbound.message(id).cloned() else {
+        return false;
+    };
+    let candidates = candidate_turns_after_baseline(snapshot, message.baseline_turn_count);
+    if candidates.is_empty() {
+        return false;
+    }
+    let matches = exact_matching_turn_count(&message.body, candidates.iter().copied());
+    match matches {
+        1 => outbound.set_status(id, OutboundStatus::Consumed, now, None),
+        0 => outbound.set_status(
+            id,
+            OutboundStatus::Ambiguous,
+            now,
+            Some("new_user_turn_did_not_match".to_string()),
+        ),
+        _ => outbound.set_status(
+            id,
+            OutboundStatus::Ambiguous,
+            now,
+            Some("duplicate_matching_user_turns".to_string()),
+        ),
+    }
+}
+
+fn candidate_turns_after_baseline(
+    snapshot: &RecentTurnSnapshot,
+    baseline: Option<u64>,
+) -> Vec<&RecentUserTurn> {
+    snapshot
+        .user_turns
+        .iter()
+        .filter(|turn| baseline.is_none_or(|count| turn.ordinal > count))
+        .collect()
+}
+
+fn exact_matching_turn_count<'a>(
+    body: &str,
+    turns: impl Iterator<Item = &'a RecentUserTurn>,
+) -> usize {
+    let wanted = normalize_message_body(body);
+    turns
+        .filter(|turn| normalize_message_body(&turn.body) == wanted)
+        .count()
+}
+
+fn normalize_message_body(body: &str) -> String {
+    body.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string()
+}
 
 /// Bottom-pane monitor state: collapse/expand, the latest read-only snapshot, and
 /// the current selection. Holds no terminal or IO handles.
@@ -848,6 +1300,8 @@ struct MonitorPane {
     collapsed: bool,
     selected: usize,
     snapshot: Option<Arc<MonitorSnapshot>>,
+    pseudo_input: PseudoInputState,
+    outbound: OutboundQueue,
     inspecting: bool,
     inspect: Vec<String>,
     /// The node id awaiting cancel confirmation, if the operator pressed `x`.
@@ -864,6 +1318,8 @@ impl MonitorPane {
             collapsed: true,
             selected: 0,
             snapshot: None,
+            pseudo_input: PseudoInputState::default(),
+            outbound: OutboundQueue::default(),
             inspecting: false,
             inspect: Vec::new(),
             pending_cancel: None,
@@ -992,6 +1448,12 @@ impl MonitorPane {
                 self.abort_cancel();
                 false
             }
+        }
+    }
+
+    fn apply_pseudo_input(&mut self, action: PseudoInputAction, now: Instant) {
+        if let Some(body) = self.pseudo_input.apply(action) {
+            self.outbound.enqueue(body, now);
         }
     }
 
@@ -1531,11 +1993,54 @@ fn render_monitor(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Focus
     if pane.collapsed || area.height <= 1 {
         return;
     }
-    let body = Rect {
+    let body = bottom_body_area(area);
+    let layout = expanded_bottom_layout(body);
+    render_monitor_body(buf, layout.content, pane);
+    render_pseudo_input(buf, layout.input, pane, focus);
+    render_outbound_status(buf, layout.outbound, pane);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpandedBottomLayout {
+    content: Rect,
+    input: Rect,
+    outbound: Rect,
+}
+
+fn bottom_body_area(area: Rect) -> Rect {
+    Rect {
         y: area.y + 1,
         height: area.height - 1,
         ..area
-    };
+    }
+}
+
+fn expanded_bottom_layout(body: Rect) -> ExpandedBottomLayout {
+    let outbound_rows = OUTBOUND_STATUS_ROWS.min(body.height);
+    let input_rows = PSEUDO_INPUT_ROWS.min(body.height.saturating_sub(outbound_rows));
+    let content_rows = body.height.saturating_sub(input_rows + outbound_rows);
+    ExpandedBottomLayout {
+        content: Rect {
+            height: content_rows,
+            ..body
+        },
+        input: Rect {
+            y: body.y + content_rows,
+            height: input_rows,
+            ..body
+        },
+        outbound: Rect {
+            y: body.y + content_rows + input_rows,
+            height: outbound_rows,
+            ..body
+        },
+    }
+}
+
+fn render_monitor_body(buf: &mut Buffer, body: Rect, pane: &MonitorPane) {
+    if body.height == 0 {
+        return;
+    }
     if pane.inspecting && body.height >= 4 {
         let list_height = (body.height / 2).max(2);
         let list_area = Rect {
@@ -1551,6 +2056,91 @@ fn render_monitor(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Focus
         render_inspect_pane(buf, inspect_area, pane);
     } else {
         render_node_list(buf, body, pane);
+    }
+}
+
+fn render_pseudo_input(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Focus) {
+    if area.height == 0 {
+        return;
+    }
+    let style = if focus == Focus::Bottom {
+        Style::default().fg(Color::White).bg(Color::Indexed(235))
+    } else {
+        Style::default().fg(Color::Gray).bg(Color::Indexed(235))
+    };
+    let draft = format_pseudo_input_line(pane);
+    buf.set_string(area.x, area.y, pad_to_width(draft, area.width), style);
+    if area.height > 1 {
+        let help = "Enter queue · arrows move list/cursor · Ctrl+O top · Ctrl+U clear";
+        buf.set_string(
+            area.x,
+            area.y + 1,
+            pad_to_width(help.to_string(), area.width),
+            style,
+        );
+    }
+}
+
+fn format_pseudo_input_line(pane: &MonitorPane) -> String {
+    let mut text = pane.pseudo_input.buffer.clone();
+    let cursor = pane.pseudo_input.cursor_chars();
+    let marker = if text.is_empty() { "" } else { " " };
+    text.insert_str(pane.pseudo_input.cursor, "▌");
+    format!(" input[{cursor}] >{marker}{text}")
+}
+
+fn render_outbound_status(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
+    if area.height == 0 {
+        return;
+    }
+    buf.set_string(
+        area.x,
+        area.y,
+        pad_to_width(outbound_summary_text(&pane.outbound), area.width),
+        Style::default().fg(Color::Cyan).bg(Color::Indexed(234)),
+    );
+}
+
+fn outbound_summary_text(outbound: &OutboundQueue) -> String {
+    let visible: Vec<String> = outbound
+        .messages
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .map(format_outbound_message_summary)
+        .collect();
+    if visible.is_empty() {
+        " outbound: idle".to_string()
+    } else {
+        format!(" outbound: {}", visible.join(" · "))
+    }
+}
+
+fn format_outbound_message_summary(message: &OutboundMessage) -> String {
+    let age = message.created_at.elapsed().as_secs();
+    match message.detail.as_deref() {
+        Some(detail) => format!(
+            "#{} {} {age}s ({detail})",
+            message.id,
+            outbound_status_word(message.status)
+        ),
+        None => format!(
+            "#{} {} {age}s",
+            message.id,
+            outbound_status_word(message.status)
+        ),
+    }
+}
+
+fn outbound_status_word(status: OutboundStatus) -> &'static str {
+    match status {
+        OutboundStatus::Queued => "queued",
+        OutboundStatus::Sending => "sending",
+        OutboundStatus::Sent => "sent",
+        OutboundStatus::Consumed => "consumed",
+        OutboundStatus::Ambiguous => "ambiguous",
+        OutboundStatus::Failed => "failed",
     }
 }
 
@@ -1614,8 +2204,10 @@ fn bottom_status_hint(pane: &MonitorPane) -> String {
         return "confirm cancel: y = SIGTERM · n = abort".to_string();
     }
     match pane.cancel_feedback.as_deref() {
-        Some(feedback) => format!("j/k · i inspect · x cancel · q close  ({feedback})"),
-        None => "j/k move · i inspect · x cancel · r refresh · q close".to_string(),
+        Some(feedback) => {
+            format!("type to draft · Enter queue · ↑/↓ move · Ctrl+O top  ({feedback})")
+        }
+        None => "type to draft · Enter queue · ↑/↓ move · Ctrl+O top".to_string(),
     }
 }
 
@@ -2192,6 +2784,7 @@ pub(super) fn relay_until_exit_observed(
     let mut applied: Option<(libc::winsize, u16)> = None;
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
+    let mut recent_turns = RecentTurnPump::disabled(Instant::now());
     let mut status = None;
     publish_render_snapshot(&publisher, &parser, router.focus, &pane, None);
 
@@ -2206,6 +2799,14 @@ pub(super) fn relay_until_exit_observed(
             &mut parser,
             &mut applied,
         );
+        dirty |= pump_outbound_queue(
+            &mut pane,
+            &mut pending_child_input,
+            &mut line_state,
+            parser.screen().bracketed_paste(),
+            &mut recent_turns,
+            Instant::now(),
+        );
         let ready = poll_relay_fds(
             real_fd,
             master_fd,
@@ -2214,6 +2815,14 @@ pub(super) fn relay_until_exit_observed(
         )?;
         if ready.pty_writable {
             flush_pending_child_input(master_fd, &mut pending_child_input)?;
+            dirty |= pump_outbound_queue(
+                &mut pane,
+                &mut pending_child_input,
+                &mut line_state,
+                parser.screen().bracketed_paste(),
+                &mut recent_turns,
+                Instant::now(),
+            );
         }
         if ready.real_input {
             let mut routed = forward_real_input(
@@ -2232,6 +2841,14 @@ pub(super) fn relay_until_exit_observed(
             let right_click = routed.right_click;
             let gestures = std::mem::take(&mut routed.top_mouse);
             dirty |= apply_routed_to_pane(&mut pane, routed, &snapshot_worker);
+            dirty |= pump_outbound_queue(
+                &mut pane,
+                &mut pending_child_input,
+                &mut line_state,
+                parser.screen().bracketed_paste(),
+                &mut recent_turns,
+                Instant::now(),
+            );
             if typed_to_child {
                 // Typing snaps to the live tail and drops the selection highlight.
                 selection = None;
@@ -2823,11 +3440,10 @@ fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
     if pane.collapsed || bottom.height <= 1 {
         return None;
     }
-    let body = Rect {
-        y: bottom.y + 1,
-        height: bottom.height - 1,
-        ..bottom
-    };
+    let body = expanded_bottom_layout(bottom_body_area(bottom)).content;
+    if body.height == 0 {
+        return None;
+    }
     if pane.inspecting && body.height >= 4 {
         Some(Rect {
             height: (body.height / 2).max(2),
@@ -2877,6 +3493,7 @@ fn apply_routed_to_pane(
     if routed.focus_bottom {
         pane.expand();
     }
+    apply_routed_pseudo_input(pane, &routed.pseudo_input);
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
     snapshot_worker.set_interval(pane.refresh_interval());
@@ -2884,6 +3501,13 @@ fn apply_routed_to_pane(
         snapshot_worker.request_refresh();
     }
     routed.redraw
+}
+
+fn apply_routed_pseudo_input(pane: &mut MonitorPane, actions: &[PseudoInputAction]) {
+    let now = Instant::now();
+    for action in actions {
+        pane.apply_pseudo_input(*action, now);
+    }
 }
 
 fn apply_routed_commands(pane: &mut MonitorPane, commands: &[MonitorCommand]) -> bool {
@@ -3012,6 +3636,172 @@ fn publish_render_snapshot(
         pane,
         selection,
     ));
+}
+
+fn pump_outbound_queue(
+    pane: &mut MonitorPane,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    bracketed_paste: bool,
+    recent_turns: &mut RecentTurnPump,
+    now: Instant,
+) -> bool {
+    let mut dirty = recent_turns.poll_if_due(now, &mut pane.outbound);
+    dirty |= mark_outbound_timeouts(&mut pane.outbound, now);
+    dirty |= advance_active_outbound_send(&mut pane.outbound, pending_child_input, line_state, now);
+    dirty |= start_next_outbound_message(
+        &mut pane.outbound,
+        pending_child_input,
+        line_state,
+        bracketed_paste,
+        recent_turns.last_turn_count(),
+        now,
+    );
+    dirty
+}
+
+fn mark_outbound_timeouts(outbound: &mut OutboundQueue, now: Instant) -> bool {
+    let mut dirty = false;
+    let timed_out: Vec<u64> = outbound
+        .messages
+        .iter()
+        .filter(|message| outbound_message_timed_out(message, now))
+        .map(|message| message.id)
+        .collect();
+    for id in timed_out {
+        dirty |= outbound.set_status(
+            id,
+            OutboundStatus::Ambiguous,
+            now,
+            Some("consumption_timeout".to_string()),
+        );
+    }
+    dirty
+}
+
+fn outbound_message_timed_out(message: &OutboundMessage, now: Instant) -> bool {
+    message.status == OutboundStatus::Sent
+        && message
+            .sent_at
+            .is_some_and(|sent| now.duration_since(sent) >= OUTBOUND_CONSUMPTION_TIMEOUT)
+}
+
+fn advance_active_outbound_send(
+    outbound: &mut OutboundQueue,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    now: Instant,
+) -> bool {
+    if pending_child_input.pending_len() != 0 {
+        return false;
+    }
+    let Some(active) = outbound.active.clone() else {
+        return false;
+    };
+    match active.phase {
+        OutboundSendPhase::Body => {
+            advance_outbound_after_body(outbound, pending_child_input, line_state, active, now)
+        }
+        OutboundSendPhase::DelayUntil(deadline) => advance_outbound_after_delay(
+            outbound,
+            pending_child_input,
+            line_state,
+            active,
+            deadline,
+            now,
+        ),
+        OutboundSendPhase::Submit => finish_outbound_send(outbound, active.message_id, now),
+    }
+}
+
+fn advance_outbound_after_body(
+    outbound: &mut OutboundQueue,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    mut active: ActiveOutboundSend,
+    now: Instant,
+) -> bool {
+    if active.bracketed_paste {
+        active.phase = OutboundSendPhase::DelayUntil(now + CONTROL_SUBMIT_DELAY);
+        outbound.active = Some(active);
+        false
+    } else {
+        queue_outbound_submit_delimiter(pending_child_input, line_state);
+        active.phase = OutboundSendPhase::Submit;
+        outbound.active = Some(active);
+        false
+    }
+}
+
+fn advance_outbound_after_delay(
+    outbound: &mut OutboundQueue,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    mut active: ActiveOutboundSend,
+    deadline: Instant,
+    now: Instant,
+) -> bool {
+    if now < deadline {
+        return false;
+    }
+    queue_outbound_submit_delimiter(pending_child_input, line_state);
+    active.phase = OutboundSendPhase::Submit;
+    outbound.active = Some(active);
+    false
+}
+
+fn finish_outbound_send(outbound: &mut OutboundQueue, id: u64, now: Instant) -> bool {
+    outbound.active = None;
+    outbound.set_status(id, OutboundStatus::Sent, now, None)
+}
+
+fn start_next_outbound_message(
+    outbound: &mut OutboundQueue,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    bracketed_paste: bool,
+    baseline_turn_count: Option<u64>,
+    now: Instant,
+) -> bool {
+    if outbound.active.is_some()
+        || outbound.has_unresolved_blocker()
+        || !pending_child_input.is_empty()
+        || !safe_to_inject(line_state)
+    {
+        return false;
+    }
+    let Some(id) = outbound.next_queued_id() else {
+        return false;
+    };
+    let Some(body) = outbound.message(id).map(|message| message.body.clone()) else {
+        return false;
+    };
+    if body.as_bytes().len() > PSEUDO_INPUT_MAX_BYTES {
+        return outbound.set_status(
+            id,
+            OutboundStatus::Failed,
+            now,
+            Some("oversize_message".to_string()),
+        );
+    }
+    let child_bytes = control_payload_bytes(body.as_bytes(), bracketed_paste);
+    line_state.observe_user_input(&child_bytes);
+    pending_child_input.enqueue(&child_bytes);
+    outbound.mark_sending(id, baseline_turn_count);
+    outbound.active = Some(ActiveOutboundSend {
+        message_id: id,
+        phase: OutboundSendPhase::Body,
+        bracketed_paste,
+    });
+    true
+}
+
+fn queue_outbound_submit_delimiter(
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+) {
+    pending_child_input.enqueue(b"\r");
+    line_state.mark_submitted();
 }
 
 /// Render one frame to the real terminal.
@@ -3176,14 +3966,18 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 /// virtual terminal and routing real input meanwhile, bounded by the inject limit.
 fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let start = Instant::now();
-    while injection_wait_should_pump(start, io.line_state) {
+    while injection_wait_should_pump(start, io.line_state, io.pending_child_input) {
         pump_inject_wait_io(io)?;
     }
-    validate_safe_to_inject(io.line_state)
+    validate_safe_to_inject(io.line_state, io.pending_child_input)
 }
 
-fn injection_wait_should_pump(start: Instant, line_state: &InputLineState) -> bool {
-    inject_wait_remaining(start) && !safe_to_inject(line_state)
+fn injection_wait_should_pump(
+    start: Instant,
+    line_state: &InputLineState,
+    pending_child_input: &PendingChildInput,
+) -> bool {
+    inject_wait_remaining(start) && !safe_to_inject_now(line_state, pending_child_input)
 }
 
 fn inject_wait_remaining(start: Instant) -> bool {
@@ -3194,8 +3988,18 @@ fn safe_to_inject(line_state: &InputLineState) -> bool {
     line_state.is_safe_to_inject()
 }
 
-fn validate_safe_to_inject(line_state: &InputLineState) -> Result<(), String> {
-    if safe_to_inject(line_state) {
+fn safe_to_inject_now(
+    line_state: &InputLineState,
+    pending_child_input: &PendingChildInput,
+) -> bool {
+    safe_to_inject(line_state) && pending_child_input.is_empty()
+}
+
+fn validate_safe_to_inject(
+    line_state: &InputLineState,
+    pending_child_input: &PendingChildInput,
+) -> Result<(), String> {
+    if safe_to_inject_now(line_state, pending_child_input) {
         Ok(())
     } else {
         Err(unsafe_mid_line_error())
@@ -3311,13 +4115,22 @@ mod tests {
     }
 
     #[test]
-    fn bottom_focus_consumes_input_until_toggle_returns() {
+    fn bottom_focus_edits_draft_until_toggle_returns_to_top() {
         let mut router = InputRouter::new();
         router.route_input(&[FOCUS_TOGGLE_BYTE]);
         assert_eq!(router.focus, Focus::Bottom);
 
         let routed = router.route_input(b"jjkk");
         assert!(routed.forward.is_empty());
+        assert_eq!(
+            routed.pseudo_input,
+            vec![
+                PseudoInputAction::Insert('j'),
+                PseudoInputAction::Insert('j'),
+                PseudoInputAction::Insert('k'),
+                PseudoInputAction::Insert('k'),
+            ]
+        );
         assert_eq!(router.focus, Focus::Bottom);
 
         let routed = router.route_input(&[FOCUS_TOGGLE_BYTE]);
@@ -3516,7 +4329,7 @@ mod tests {
         };
 
         let routed = route_real_input(
-            b"\x1b[<0;4;17M",
+            b"\x1b[<0;4;14M",
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -3546,7 +4359,7 @@ mod tests {
             encoding: vt100::MouseProtocolEncoding::Sgr,
         };
 
-        let routed = route_real_input(b"\x1b[<0;4;16M", &mut router, &pane, child, &winsize);
+        let routed = route_real_input(b"\x1b[<0;4;19M", &mut router, &pane, child, &winsize);
 
         assert_eq!(router.focus, Focus::Bottom);
         assert!(routed.focus_bottom);
@@ -3756,6 +4569,366 @@ mod tests {
             .read_exact(&mut enter)
             .expect("submit enter should remain queued after body drain");
         assert_eq!(enter, [b'\r']);
+    }
+
+    #[test]
+    fn pseudo_input_draft_bytes_do_not_forward_before_enter() {
+        let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        let mut pane = MonitorPane::new();
+        let routed = router.route_input(b"draft only");
+
+        assert!(routed.forward.is_empty());
+        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input);
+
+        assert_eq!(pane.pseudo_input.buffer, "draft only");
+        assert!(pane.outbound.messages.is_empty());
+    }
+
+    #[test]
+    fn enter_queues_message_clears_draft_and_scheduler_sends_once() {
+        let now = Instant::now();
+        let mut pane = MonitorPane::new();
+        for action in [
+            PseudoInputAction::Insert('h'),
+            PseudoInputAction::Insert('i'),
+            PseudoInputAction::Submit,
+        ] {
+            pane.apply_pseudo_input(action, now);
+        }
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::disabled(now);
+
+        assert_eq!(pane.pseudo_input.buffer, "");
+        assert_eq!(pane.outbound.messages.len(), 1);
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        let pending_after_start = pending.pending_len();
+        assert_eq!(pending_after_start, 2);
+
+        assert!(!pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        ));
+        assert_eq!(
+            pending.pending_len(),
+            pending_after_start,
+            "no duplicate send"
+        );
+    }
+
+    #[test]
+    fn queued_message_transitions_sending_to_sent_after_body_and_enter_drain() {
+        let now = Instant::now();
+        let (mut read_end, write_end) = pipe_files();
+        let mut pane = queued_pane("hello", now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::disabled(now);
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, b"hello");
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, b"\r");
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+    }
+
+    #[test]
+    fn bracketed_paste_send_reuses_body_delay_before_submit_delimiter() {
+        let now = Instant::now();
+        let (mut read_end, write_end) = pipe_files();
+        let mut pane = queued_pane("hello", now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::disabled(now);
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            &mut recent,
+            now,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, &control_payload_bytes(b"hello", true));
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            &mut recent,
+            now,
+        );
+        assert_eq!(pending.pending_len(), 0, "submit waits for paste delay");
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            &mut recent,
+            now + CONTROL_SUBMIT_DELAY,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, b"\r");
+    }
+
+    #[test]
+    fn sent_message_becomes_consumed_on_exact_recent_user_turn_match() {
+        let now = Instant::now();
+        let mut pane = sent_pane("hello", Some(0), now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::with_reader(
+            Box::new(FakeRecentTurnReader::new(vec![RecentTurnRead::Available(
+                recent_snapshot([(1, "hello")]),
+            )])),
+            now,
+        );
+
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        ));
+
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
+    }
+
+    #[test]
+    fn duplicate_or_transformed_turns_mark_sent_message_ambiguous() {
+        let now = Instant::now();
+        let mut duplicate = sent_pane("hello", Some(0), now);
+        assert!(apply_recent_turn_snapshot(
+            &mut duplicate.outbound,
+            &recent_snapshot([(1, "hello"), (2, "hello")]),
+            now,
+        ));
+        assert_eq!(
+            duplicate.outbound.status(1),
+            Some(OutboundStatus::Ambiguous)
+        );
+
+        let mut transformed = sent_pane("hello", Some(0), now);
+        assert!(apply_recent_turn_snapshot(
+            &mut transformed.outbound,
+            &recent_snapshot([(1, "HELLO")]),
+            now,
+        ));
+        assert_eq!(
+            transformed.outbound.status(1),
+            Some(OutboundStatus::Ambiguous)
+        );
+    }
+
+    #[test]
+    fn unavailable_turn_source_times_out_sent_message_to_ambiguous() {
+        let now = Instant::now();
+        let mut pane = sent_pane(
+            "hello",
+            Some(0),
+            now - OUTBOUND_CONSUMPTION_TIMEOUT - Duration::from_millis(1),
+        );
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::disabled(now);
+
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        ));
+
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Ambiguous));
+    }
+
+    #[test]
+    fn single_flight_blocks_later_message_until_first_is_consumed() {
+        let now = Instant::now();
+        let mut pane = MonitorPane::new();
+        pane.outbound.enqueue("first".to_string(), now);
+        pane.outbound.enqueue("second".to_string(), now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::disabled(now);
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+        drain_pending_without_pipe(&mut pending);
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+        drain_pending_without_pipe(&mut pending);
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        assert!(pending.is_empty());
+
+        apply_recent_turn_snapshot(&mut pane.outbound, &recent_snapshot([(1, "first")]), now);
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now,
+        );
+
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
+    }
+
+    struct FakeRecentTurnReader {
+        reads: Vec<RecentTurnRead>,
+    }
+
+    impl FakeRecentTurnReader {
+        fn new(reads: Vec<RecentTurnRead>) -> Self {
+            Self { reads }
+        }
+    }
+
+    impl RecentTurnReader for FakeRecentTurnReader {
+        fn read_recent_turns(&mut self) -> RecentTurnRead {
+            if self.reads.is_empty() {
+                RecentTurnRead::Unavailable("empty_fake_reader".to_string())
+            } else {
+                self.reads.remove(0)
+            }
+        }
+    }
+
+    fn queued_pane(body: &str, now: Instant) -> MonitorPane {
+        let mut pane = MonitorPane::new();
+        pane.outbound.enqueue(body.to_string(), now);
+        pane
+    }
+
+    fn sent_pane(body: &str, baseline: Option<u64>, sent_at: Instant) -> MonitorPane {
+        let mut pane = queued_pane(body, sent_at);
+        pane.outbound.mark_sending(1, baseline);
+        pane.outbound
+            .set_status(1, OutboundStatus::Sent, sent_at, None);
+        pane
+    }
+
+    fn recent_snapshot<const N: usize>(turns: [(u64, &str); N]) -> RecentTurnSnapshot {
+        RecentTurnSnapshot {
+            turn_count: turns.last().map(|(ordinal, _)| *ordinal).unwrap_or(0),
+            user_turns: turns
+                .into_iter()
+                .map(|(ordinal, body)| RecentUserTurn {
+                    ordinal,
+                    body: body.to_string(),
+                })
+                .collect(),
+            complete: true,
+        }
+    }
+
+    fn assert_pipe_bytes(read_end: &mut File, expected: &[u8]) {
+        let mut received = vec![0_u8; expected.len()];
+        read_end.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected);
+    }
+
+    fn drain_pending_without_pipe(pending: &mut PendingChildInput) {
+        let (read_end, write_end) = pipe_files();
+        set_nonblocking(read_end.as_raw_fd());
+        set_nonblocking(write_end.as_raw_fd());
+        let mut received = Vec::new();
+        while !pending.is_empty() {
+            pending.flush_some(write_end.as_raw_fd()).unwrap();
+            drain_available(read_end.as_raw_fd(), &mut received).unwrap();
+        }
+    }
+
+    fn drain_available(read_fd: RawFd, output: &mut Vec<u8>) -> io::Result<usize> {
+        let mut total = 0;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let rc = unsafe { libc::read(read_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if rc > 0 {
+                let n = rc as usize;
+                output.extend_from_slice(&buffer[..n]);
+                total += n;
+                continue;
+            }
+            if rc == 0 {
+                return Ok(total);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(code) if code == libc::EINTR => continue,
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                    return Ok(total);
+                }
+                _ => return Err(err),
+            }
+        }
     }
 
     fn mouse(button: u16, col: u16, row: u16, released: bool) -> MouseEvent {
@@ -4483,6 +5656,8 @@ mod tests {
             collapsed,
             selected,
             snapshot: Some(Arc::new(snapshot)),
+            pseudo_input: PseudoInputState::default(),
+            outbound: OutboundQueue::default(),
             inspecting: false,
             inspect: Vec::new(),
             pending_cancel: None,
@@ -4560,23 +5735,18 @@ mod tests {
     }
 
     #[test]
-    fn inspect_keys_toggle_and_route() {
+    fn pseudo_input_actions_apply_to_draft_and_queue() {
         let mut router = InputRouter::new();
         router.route_input(&[FOCUS_TOGGLE_BYTE]);
-        assert_eq!(
-            router.route_input(b"i").commands,
-            vec![MonitorCommand::ToggleInspect]
-        );
-        assert_eq!(
-            router.route_input(b"\r").commands,
-            vec![MonitorCommand::ToggleInspect]
-        );
         let mut pane = pane_with(empty_snapshot(), false, 0);
-        assert!(!pane.inspecting);
-        pane.apply(MonitorCommand::ToggleInspect);
-        assert!(pane.inspecting);
-        pane.apply(MonitorCommand::ToggleInspect);
-        assert!(!pane.inspecting);
+        let routed = router.route_input(b"hi\x1b[D!\r");
+
+        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input);
+
+        assert_eq!(pane.pseudo_input.buffer, "");
+        assert_eq!(pane.outbound.messages.len(), 1);
+        assert_eq!(pane.outbound.messages[0].body, "h!i");
+        assert_eq!(pane.outbound.messages[0].status, OutboundStatus::Queued);
     }
 
     #[test]
@@ -4717,22 +5887,18 @@ mod tests {
     }
 
     #[test]
-    fn bottom_focus_keys_decode_to_monitor_commands() {
+    fn bottom_focus_arrows_decode_to_monitor_commands_and_printable_edits() {
         let mut router = InputRouter::new();
         router.route_input(&[FOCUS_TOGGLE_BYTE]);
         assert_eq!(router.focus, Focus::Bottom);
 
         assert_eq!(
-            router.route_input(b"j").commands,
-            vec![MonitorCommand::SelectNext]
+            router.route_input(b"j").pseudo_input,
+            vec![PseudoInputAction::Insert('j')]
         );
         assert_eq!(
-            router.route_input(b"k").commands,
-            vec![MonitorCommand::SelectPrev]
-        );
-        assert_eq!(
-            router.route_input(b"r").commands,
-            vec![MonitorCommand::Refresh]
+            router.route_input(b"k").pseudo_input,
+            vec![PseudoInputAction::Insert('k')]
         );
         assert_eq!(
             router.route_input(&[0x1b, b'[', b'B']).commands,
@@ -4744,8 +5910,8 @@ mod tests {
         );
 
         let routed = router.route_input(b"q");
-        assert_eq!(routed.commands, vec![MonitorCommand::Collapse]);
-        assert_eq!(router.focus, Focus::Top);
+        assert_eq!(routed.pseudo_input, vec![PseudoInputAction::Insert('q')]);
+        assert_eq!(router.focus, Focus::Bottom);
     }
 
     #[test]
@@ -4873,15 +6039,15 @@ mod tests {
         let mut router = InputRouter::new();
         router.route_input(&[FOCUS_TOGGLE_BYTE]);
         assert_eq!(
-            router.route_input(b"x").commands,
+            router.route_input(&[0x18]).commands,
             vec![MonitorCommand::RequestCancel]
         );
         assert_eq!(
-            router.route_input(b"y").commands,
+            router.route_input(&[0x19]).commands,
             vec![MonitorCommand::ConfirmCancel]
         );
         assert_eq!(
-            router.route_input(b"n").commands,
+            router.route_input(&[0x0e]).commands,
             vec![MonitorCommand::AbortCancel]
         );
     }
