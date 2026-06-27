@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
+const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 4628;
 
 #[test]
 fn exactly_one_legacy_fallback_caller_exists_and_is_gated_by_missing_config() {
@@ -133,27 +133,35 @@ fn full_provider_name_occurrence_count(root: &Path, pattern: &str) -> usize {
 }
 
 fn full_provider_name_grep_output(root: &Path, pattern: &str) -> Output {
-    Command::new("git")
+    Command::new("rg")
         .current_dir(root)
         .args([
-            "grep",
-            "-iE",
+            "--hidden",
+            "-o",
             pattern,
-            "--",
-            ".",
-            ":(exclude)planning/*-gate/**",
-            ":(exclude)planning/wu-e/**",
-            ":(exclude)planning/opencode-contract/**",
-            ":(exclude)planning/s10-moveout/**",
+            "-g",
+            "!.git/**",
+            "-g",
+            "!src-tauri/target/**",
+            "-g",
+            "!target/**",
+            "-g",
+            "!planning/*-gate/**",
+            "-g",
+            "!planning/wu-e/**",
+            "-g",
+            "!planning/opencode-contract/**",
+            "-g",
+            "!planning/s10-moveout/**",
         ])
         .output()
-        .expect("git grep must run")
+        .expect("rg must run")
 }
 
 fn assert_full_provider_name_grep_status(output: &Output) {
     assert!(
         output.status.success() || output.status.code() == Some(1),
-        "git grep failed: {}",
+        "rg failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

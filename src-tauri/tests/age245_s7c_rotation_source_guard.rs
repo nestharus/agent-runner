@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BASELINE_COMMIT: &str = "8718b547557cddfc79c47f30a0146fd7d994c00b";
-const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 5391;
+const BASELINE_COMMIT: &str = "ba61435d6b68674901427da4cf61d7def10a6b39";
+const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 4628;
 
 #[test]
 fn s7c_production_wiring_passes_registry_handle_into_migration_service() {
@@ -100,7 +100,7 @@ fn s7c_provider_name_grep_invariant_uses_authoritative_manager_baseline() {
         real_provider_token(&["cod", "ex"])
     );
     assert_eq!(
-        MANAGER_BASELINE_PROVIDER_NAME_COUNT, 5391,
+        MANAGER_BASELINE_PROVIDER_NAME_COUNT, 4628,
         "AGE-245 S7c must preserve the manager-approved provider-name baseline"
     );
     let current_count = provider_name_occurrence_count(&root, &pattern);
@@ -174,6 +174,8 @@ fn provider_name_occurrence_output(root: &Path, pattern: &str) -> Output {
             "--hidden",
             "-o",
             pattern,
+            "-g",
+            "!.git/**",
             "-g",
             "!src-tauri/target/**",
             "-g",
