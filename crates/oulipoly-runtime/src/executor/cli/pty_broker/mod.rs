@@ -1690,6 +1690,8 @@ fn process_control_request_with_pending(
 ) -> Result<(), String> {
     validate_control_request_peer(stream)?;
     let payload = read_control_request_payload(stream)?;
+    // Safe proactive delivery means the real input line is empty and debounced.
+    // If the user is mid-line, the request is rejected before the payload is queued.
     wait_until_safe_to_inject(real_fd, master_fd, line_state, pending_child_input, buffer)?;
     submit_control_request_payload(pending_child_input, &payload);
     line_state.mark_submitted();
@@ -2087,7 +2089,7 @@ mod tests {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
         let (real_read_end, _real_write_end) = pipe_files();
-        let (_read_end, write_end) = pipe_files();
+        let (read_end, write_end) = pipe_files();
         let mut state = InputLineState::default();
         state.observe_user_input(b"partial");
         let mut buffer = [0_u8; 256];
@@ -2102,6 +2104,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, "unsafe_mid_line");
+        drop(write_end);
+        let mut read_end = read_end;
+        let mut received = String::new();
+        read_end.read_to_string(&mut received).unwrap();
+        assert!(received.is_empty(), "unsafe injection wrote: {received:?}");
     }
 
     #[test]

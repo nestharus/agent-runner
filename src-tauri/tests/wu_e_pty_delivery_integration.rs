@@ -278,6 +278,7 @@ fn notify_live_pty_ack_marks_delivered_and_skips_headless_wake() {
     let value = stdout_json(&output);
     assert_eq!(value["status"], "enqueued");
     assert_eq!(value["pty_delivery"]["status"], "acked");
+    assert_eq!(value["pty_delivery"]["submitted"], true);
     assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([1]));
     assert!(value["wake"].is_null());
     let payload = captured.lock().unwrap().clone();
@@ -311,6 +312,7 @@ fn notify_live_pty_failure_leaves_pending_and_wake_busy() {
     assert_success(&output);
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "unsafe_mid_line");
+    assert_eq!(value["pty_delivery"]["submitted"], false);
     assert_eq!(value["wake"]["status"], "busy");
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
@@ -380,6 +382,7 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
     assert_success(&output);
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "acked");
+    assert_eq!(value["pty_delivery"]["submitted"], true);
     assert!(value["wake"].is_null());
 
     let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));

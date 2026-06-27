@@ -3076,6 +3076,8 @@ fn inject_control_payload(
 ) -> Result<(), String> {
     validate_control_peer(stream)?;
     let payload = read_tui_control_payload(stream)?;
+    // Match the non-TUI broker contract: only submit proactive control payloads
+    // after the input line is at a clean, debounced boundary.
     wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload, bracketed_paste)?;
