@@ -37,7 +37,8 @@ fn repl_non_clean_signal_threads_derived_provider_name() {
     let fixture = Age153Fixture::new();
     let provider = format!("{}-age153-derived", primary_policy_token());
     fixture.write_model("age153-derived-repl", &[provider.as_str()]);
-    fixture.write_providers_with_bodies(&[(&provider, "printf '%s\n' 'derived stderr' >&2\nexit 42")]);
+    fixture
+        .write_providers_with_bodies(&[(&provider, "printf '%s\n' 'derived stderr' >&2\nexit 42")]);
 
     let output = fixture.run_repl("age153-derived-repl");
 

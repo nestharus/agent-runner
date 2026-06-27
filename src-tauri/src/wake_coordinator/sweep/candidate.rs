@@ -208,7 +208,9 @@ fn pending_rows_have_live_owner(rows: &[MailboxRow]) -> Result<bool, String> {
 }
 
 fn pending_rows_liveness(rows: &[MailboxRow]) -> Result<Vec<bool>, String> {
-    rows.iter().map(mailbox_row_has_live_owner_identity).collect()
+    rows.iter()
+        .map(mailbox_row_has_live_owner_identity)
+        .collect()
 }
 
 fn wake_sweep_candidate_is_abandoned_transient(

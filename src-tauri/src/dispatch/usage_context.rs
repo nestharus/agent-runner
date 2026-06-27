@@ -2,7 +2,7 @@
 
 use crate::cli::paths::{default_config_root, resolve_models_dir};
 use crate::usage::cli::Cli;
-use oulipoly_config::{load_models, ModelConfig, ProvidersConfig};
+use oulipoly_config::{ModelConfig, ProvidersConfig, load_models};
 use std::collections::HashMap;
 
 pub(super) struct UsageContext {

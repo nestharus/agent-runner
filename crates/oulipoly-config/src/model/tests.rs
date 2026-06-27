@@ -485,7 +485,7 @@ fn render_validated_model_toml_rejects_duplicate_codex_interactive_args() {
     );
     let mut model = test_model("codex", &["-m", "gpt-5.5"]);
     model.providers[0].interactive_args = Some(vec![
-        "--dangerously-bypass-approvals-and-sandbox".to_string()
+        "--dangerously-bypass-approvals-and-sandbox".to_string(),
     ]);
 
     let err = super::render_validated_model_toml(&model, Some(&providers)).unwrap_err();

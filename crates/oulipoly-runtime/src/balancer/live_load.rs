@@ -57,7 +57,12 @@ fn candidate_live_loads(
 ) -> Vec<(usize, i64)> {
     candidates
         .iter()
-        .map(|&provider_index| (provider_index, provider_live_load(model, state, provider_index)))
+        .map(|&provider_index| {
+            (
+                provider_index,
+                provider_live_load(model, state, provider_index),
+            )
+        })
         .collect()
 }
 

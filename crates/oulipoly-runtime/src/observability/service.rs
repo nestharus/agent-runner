@@ -211,9 +211,9 @@ impl ProductionObservabilitySnapshotService {
         root_invocation_uuid: Option<&str>,
         limits: SnapshotLimits,
     ) {
-        let Some(transcript) = self
-            .transcript
-            .resolve(root.provider_name.as_deref(), active_session_id, limits)
+        let Some(transcript) =
+            self.transcript
+                .resolve(root.provider_name.as_deref(), active_session_id, limits)
         else {
             return;
         };
@@ -258,7 +258,8 @@ fn attach_transcript_inspect_ref(
         root_invocation_node.as_deref(),
     );
     for index in target_indices {
-        nodes[index].inspect_ref = Some(session_transcript_inspect_ref(&transcript, max_tail_bytes));
+        nodes[index].inspect_ref =
+            Some(session_transcript_inspect_ref(&transcript, max_tail_bytes));
     }
 }
 

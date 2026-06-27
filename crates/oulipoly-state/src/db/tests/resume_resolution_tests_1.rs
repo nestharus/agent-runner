@@ -291,16 +291,26 @@ fn preserve_compaction_boundary_for_session_copies_only_latest_marker_to_fresh_s
         .preserve_compaction_boundary_for_session("provider-a", SESSION_A, "provider-a", SESSION_B)
         .unwrap();
 
-    assert!(preserved, "expected boundary marker to be inserted for the fresh session");
+    assert!(
+        preserved,
+        "expected boundary marker to be inserted for the fresh session"
+    );
     assert_eq!(
         db.latest_compaction_boundary("provider-a", SESSION_B)
             .unwrap()
             .map(|(turn_id, _)| turn_id),
         Some("boundary-turn".to_string())
     );
-    assert_eq!(db.count_session_turns("provider-a", SESSION_A).unwrap().total, 3);
     assert_eq!(
-        db.count_session_turns("provider-a", SESSION_B).unwrap().total,
+        db.count_session_turns("provider-a", SESSION_A)
+            .unwrap()
+            .total,
+        3
+    );
+    assert_eq!(
+        db.count_session_turns("provider-a", SESSION_B)
+            .unwrap()
+            .total,
         1,
         "fresh session should receive only the boundary marker metadata, not pre-boundary history"
     );

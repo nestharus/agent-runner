@@ -16,11 +16,11 @@ use oulipoly_runtime::{executor, sessions};
 use sha2::{Digest, Sha256};
 
 use super::disposition::{
-    confirmed_zero_turn_maybe_quota, handle_terminal_signal_disposition, ResumeLoopControl,
-    ResumeTerminalDispositionInput,
+    ResumeLoopControl, ResumeTerminalDispositionInput, confirmed_zero_turn_maybe_quota,
+    handle_terminal_signal_disposition,
 };
 use super::finalization::{
-    finalize_completed_attempt, CompletedAttemptControl, CompletedAttemptInput,
+    CompletedAttemptControl, CompletedAttemptInput, finalize_completed_attempt,
 };
 use super::{formatter, mapper, validator};
 use crate::captured_child::emit_captured_child_marker_lines;
@@ -38,11 +38,11 @@ use crate::resume_cli::{
 };
 use crate::spawn_cwd::effective_resume_spawn_cwd;
 use crate::terminal_outcome_adapter::{
-    apply_age153_terminal_signal_fixture_override, confirm_maybe_quota_exhausted,
-    resume_terminal_signal_for_outcome, terminal_signal_reason, TerminalSignalDisposition,
+    TerminalSignalDisposition, apply_age153_terminal_signal_fixture_override,
+    confirm_maybe_quota_exhausted, resume_terminal_signal_for_outcome, terminal_signal_reason,
 };
 use crate::wiring;
-use crate::zero_turn_orchestration::{next_action, ZeroTurnAction, ZeroTurnConfirmationState};
+use crate::zero_turn_orchestration::{ZeroTurnAction, ZeroTurnConfirmationState, next_action};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_resume(

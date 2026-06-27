@@ -333,9 +333,7 @@ impl StateDb {
         Self::has_text_chunk(&mut texts).then(|| Self::fold_canonical_text(texts))
     }
 
-    fn has_text_chunk<'a>(
-        texts: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
-    ) -> bool {
+    fn has_text_chunk<'a>(texts: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>) -> bool {
         texts.peek().is_some()
     }
 
