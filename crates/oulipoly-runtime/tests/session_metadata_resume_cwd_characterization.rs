@@ -6,7 +6,7 @@ use oulipoly_config::{
 };
 use oulipoly_runtime::session_metadata::resolve_resume_workspace_root;
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{ModelStore, StateDb};
+use oulipoly_state::{InvocationStart, ModelStore, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -19,8 +19,12 @@ const MODEL_REF: &str = "model-ref";
 const MODEL_LOCAL: &str = "model-local";
 const SESSION_MAILBOX: &str = "11111111-1111-4111-8111-111111111111";
 const SESSION_FALLBACK: &str = "22222222-2222-4222-8222-222222222222";
+const SESSION_LIVE_RUNTIME: &str = "33333333-3333-4333-8333-333333333333";
+const SESSION_IMPORTED: &str = "ses_importedWorkspace123456";
 const CHAIN_MAILBOX: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const CHAIN_FALLBACK: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CHAIN_LIVE_RUNTIME: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const CHAIN_IMPORTED: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -183,6 +187,100 @@ fn historical_no_ref_direct_storage_runs_cwd_command_with_session_env_and_uses_r
     );
 }
 
+#[test]
+fn imported_script_session_cwd_precedes_stale_mailbox_and_failing_script() {
+    let fixture = Fixture::new();
+    let marker = fixture.root.join("fail-script-touched");
+    let script = fixture.root.join("fail-cwd.sh");
+    write_shell_script(
+        &script,
+        &format!(
+            "#!/usr/bin/env bash\nprintf touched > {:?}\nexit 44\n",
+            marker.display().to_string()
+        ),
+    );
+    let imported_cwd = fixture.root.join("rfq");
+    let stale_mailbox_cwd = fixture.root.join("stale-mailbox-cwd");
+    std::fs::create_dir_all(&imported_cwd).unwrap();
+    std::fs::create_dir_all(&stale_mailbox_cwd).unwrap();
+    fixture.seed_active_chain(CHAIN_IMPORTED, SESSION_IMPORTED, MODEL_LOCAL);
+    let state = fixture.open_state();
+    seed_provider_session_resolved_account(&state, SESSION_IMPORTED, &imported_cwd);
+    let models = model_store(vec![model_config(MODEL_LOCAL, false)]);
+    let providers = providers_config(&script);
+    let mut mailbox = MailboxDb::open_default().unwrap();
+    let stale_mailbox_cwd_text = stale_mailbox_cwd.display().to_string();
+    mailbox
+        .upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: SESSION_IMPORTED,
+            mode: "pty_interactive",
+            invocation_uuid: Some("44444444-4444-4444-8444-444444444444"),
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL_LOCAL),
+            pty_control_path: Some("/tmp/oulipoly-stale.sock"),
+            models_dir: None,
+            effective_cwd: Some(&stale_mailbox_cwd_text),
+        })
+        .unwrap();
+    drop(mailbox);
+
+    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_IMPORTED)
+        .expect("imported cwd");
+
+    assert_eq!(actual, imported_cwd);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
+    let fixture = Fixture::new();
+    let marker = fixture.root.join("fail-script-touched");
+    let script = fixture.root.join("fail-cwd.sh");
+    write_shell_script(
+        &script,
+        &format!(
+            "#!/usr/bin/env bash\nprintf touched > {:?}\nexit 44\n",
+            marker.display().to_string()
+        ),
+    );
+    let recorded_cwd = fixture.root.join("recorded-cwd");
+    let live_runtime_cwd = fixture.root.join("live-runtime-cwd");
+    std::fs::create_dir_all(&recorded_cwd).unwrap();
+    std::fs::create_dir_all(&live_runtime_cwd).unwrap();
+    fixture.seed_active_chain(CHAIN_LIVE_RUNTIME, SESSION_LIVE_RUNTIME, MODEL_REF);
+    let state = fixture.open_state();
+    seed_provider_session_resolved_account_for_model(
+        &state,
+        SESSION_LIVE_RUNTIME,
+        &recorded_cwd,
+        MODEL_REF,
+    );
+    let models = model_store(vec![model_config(MODEL_REF, true)]);
+    let providers = providers_config(&script);
+    let mut mailbox = MailboxDb::open_default().unwrap();
+    let live_runtime_cwd_text = live_runtime_cwd.display().to_string();
+    mailbox
+        .upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: SESSION_LIVE_RUNTIME,
+            mode: "pty_interactive",
+            invocation_uuid: Some("55555555-5555-4555-8555-555555555555"),
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL_REF),
+            pty_control_path: Some("/tmp/oulipoly-live.sock"),
+            models_dir: None,
+            effective_cwd: Some(&live_runtime_cwd_text),
+        })
+        .unwrap();
+    drop(mailbox);
+
+    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_LIVE_RUNTIME)
+        .expect("live runtime cwd");
+
+    assert_eq!(actual, live_runtime_cwd);
+    assert_ne!(actual, recorded_cwd);
+    assert!(!marker.exists());
+}
+
 fn mailbox_precedence_scenario() {
     let fixture = Fixture::new();
     let marker = fixture.root.join("fail-script-touched");
@@ -257,6 +355,38 @@ fn script_fallback_scenario() {
         records.lines().collect::<Vec<_>>(),
         vec![format!("{SESSION_FALLBACK}|{SESSION_FALLBACK}")]
     );
+}
+
+fn seed_provider_session_resolved_account(state: &StateDb, session_id: &str, workspace: &Path) {
+    seed_provider_session_resolved_account_for_model(state, session_id, workspace, MODEL_LOCAL);
+}
+
+fn seed_provider_session_resolved_account_for_model(
+    state: &StateDb,
+    session_id: &str,
+    workspace: &Path,
+    model_name: &str,
+) {
+    let invocation_row_id = state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: uuid::Uuid::new_v4().to_string(),
+            model_name: model_name.to_string(),
+            provider_name: PROVIDER.to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: session_id.to_string(),
+                capture_method: "turn_script",
+                resume_input_id: None,
+                provider_session_resolved_account: Some(workspace.display().to_string()),
+            },
+        )
+        .unwrap();
 }
 
 fn model_config(name: &str, has_ref: bool) -> ModelConfig {

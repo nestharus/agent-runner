@@ -1,12 +1,23 @@
-use crate::services::{ProductionRoutingService, RoutingServicePort, RoutingServiceRequest};
+use crate::services::{
+    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    InvocationLifecycleStartRequest, ProductionInvocationLifecycleService,
+    ProductionRoutingService, ProductionSessionLifecycleService, RoutingServicePort,
+    RoutingServiceRequest, SessionLifecycleIngestMode, SessionLifecycleRequest,
+    SessionLifecycleServicePort,
+};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig};
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
+use oulipoly_state::{CompositeInvocationId, InvocationStart};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
+
+const UNKNOWN_DEFAULT_PROVIDER_MODEL: &str = "<unknown>";
+const DEFAULT_PROVIDER_REPL_CAPTURE_METHOD: &str = "turn_script";
 
 pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
     pub config_root: PathBuf,
@@ -34,7 +45,12 @@ impl RuntimeServices<ProductionStateDbOpener> {
 
 #[allow(dead_code)]
 pub(crate) trait InteractiveLauncher {
-    fn launch(&self, provider: &ProviderConfig, working_dir: Option<&Path>) -> Result<i32, String>;
+    fn launch(
+        &self,
+        provider: &ProviderConfig,
+        working_dir: Option<&Path>,
+        parent_invocation_env: Option<&str>,
+    ) -> Result<crate::executor::cli::InteractiveExecutionResult, String>;
 }
 
 pub struct RuntimeLauncherService;
@@ -57,16 +73,18 @@ impl LauncherServicePort for RuntimeLauncherService {
 }
 
 impl InteractiveLauncher for RuntimeLauncherService {
-    fn launch(&self, provider: &ProviderConfig, working_dir: Option<&Path>) -> Result<i32, String> {
-        <Self as LauncherServicePort>::launch(
-            self,
-            LauncherServiceRequest {
-                provider: provider.clone(),
-                working_dir: working_dir.map(Path::to_path_buf),
-            },
+    fn launch(
+        &self,
+        provider: &ProviderConfig,
+        working_dir: Option<&Path>,
+        parent_invocation_env: Option<&str>,
+    ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+        crate::executor::cli::execute_interactive_with_result(
+            provider,
+            working_dir,
+            parent_invocation_env,
+            None,
         )
-        .map(|output| output.exit_code)
-        .map_err(|error| error.to_string())
     }
 }
 
@@ -135,12 +153,178 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
         .get(provider_index)
         .ok_or_else(|| format!("selected provider index {provider_index} is out of bounds"))?;
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
+    let selected_provider_name = provider.name.clone();
     let launch_provider = ProviderConfig {
         name: carrier_model.name,
         ..provider
     };
 
-    launcher.launch(&launch_provider, services.working_dir.as_deref())
+    run_registered_default_provider_repl(RegisteredDefaultProviderReplInput {
+        services: &services,
+        state: &state,
+        providers: &providers,
+        provider_name: &selected_provider_name,
+        provider_index,
+        launch_provider: &launch_provider,
+        launcher,
+    })
+}
+
+struct RegisteredDefaultProviderReplInput<'a, O: StateDbOpener> {
+    services: &'a RuntimeServices<O>,
+    state: &'a oulipoly_state::StateDb,
+    providers: &'a ProvidersConfig,
+    provider_name: &'a str,
+    provider_index: usize,
+    launch_provider: &'a ProviderConfig,
+    launcher: &'a dyn InteractiveLauncher,
+}
+
+fn run_registered_default_provider_repl<O: StateDbOpener>(
+    input: RegisteredDefaultProviderReplInput<'_, O>,
+) -> Result<i32, String> {
+    let lifecycle = ProductionInvocationLifecycleService::new();
+    let invocation = default_provider_invocation(input.provider_name);
+    let invocation_start =
+        default_provider_invocation_start(&invocation, input.provider_name, input.provider_index);
+    let invocation_row_id = lifecycle
+        .start_invocation(InvocationLifecycleStartRequest {
+            state: input.state,
+            start: &invocation_start,
+        })
+        .map_err(|err| err.to_string())?
+        .invocation_row_id;
+    let parent_invocation_env = serde_json::to_string(&invocation)
+        .map_err(|err| format!("Failed to serialize invocation id: {err}"))?;
+
+    let result = match input.launcher.launch(
+        input.launch_provider,
+        input.services.working_dir.as_deref(),
+        Some(&parent_invocation_env),
+    ) {
+        Ok(result) => result,
+        Err(err) => {
+            finalize_default_provider_spawn_error(&lifecycle, input.state, invocation_row_id)?;
+            return Err(err);
+        }
+    };
+
+    finalize_default_provider_repl_result(&lifecycle, input.state, invocation_row_id, &result)?;
+    if result.exit_code == 0 {
+        ingest_default_provider_session(DefaultProviderSessionIngestInput {
+            services: input.services,
+            state: input.state,
+            providers: input.providers,
+            provider_name: input.provider_name,
+            invocation_row_id,
+            invocation_uuid: &invocation.id,
+        });
+    }
+    Ok(result.exit_code)
+}
+
+fn default_provider_invocation(provider_name: &str) -> CompositeInvocationId {
+    CompositeInvocationId {
+        source: provider_name.to_string(),
+        id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn default_provider_invocation_start(
+    invocation: &CompositeInvocationId,
+    provider_name: &str,
+    provider_index: usize,
+) -> InvocationStart {
+    InvocationStart {
+        invocation_uuid: invocation.id.clone(),
+        model_name: UNKNOWN_DEFAULT_PROVIDER_MODEL.to_string(),
+        provider_name: provider_name.to_string(),
+        provider_index,
+        parent_invocation_id: None,
+    }
+}
+
+fn finalize_default_provider_repl_result(
+    lifecycle: &ProductionInvocationLifecycleService,
+    state: &oulipoly_state::StateDb,
+    invocation_row_id: i64,
+    result: &crate::executor::cli::InteractiveExecutionResult,
+) -> Result<(), String> {
+    lifecycle
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state,
+            invocation_row_id,
+            success: result.exit_code == 0,
+            exit_code: result.exit_code,
+            error_category: None,
+            terminal_reason: result.terminal_reason.as_deref(),
+        })
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn finalize_default_provider_spawn_error(
+    lifecycle: &ProductionInvocationLifecycleService,
+    state: &oulipoly_state::StateDb,
+    invocation_row_id: i64,
+) -> Result<(), String> {
+    lifecycle
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state,
+            invocation_row_id,
+            success: false,
+            exit_code: 1,
+            error_category: Some("spawn_error"),
+            terminal_reason: Some("spawn_error"),
+        })
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+struct DefaultProviderSessionIngestInput<'a, O: StateDbOpener> {
+    services: &'a RuntimeServices<O>,
+    state: &'a oulipoly_state::StateDb,
+    providers: &'a ProvidersConfig,
+    provider_name: &'a str,
+    invocation_row_id: i64,
+    invocation_uuid: &'a str,
+}
+
+fn ingest_default_provider_session<O: StateDbOpener>(
+    input: DefaultProviderSessionIngestInput<'_, O>,
+) {
+    let sessions_cfg =
+        oulipoly_config::SessionsConfig::load(&input.services.config_root.join("sessions.toml"))
+            .unwrap_or_default();
+    let effective_cwd = default_provider_effective_cwd(input.services.working_dir.as_deref());
+    let mut stderr = std::io::stderr();
+    if let Err(err) =
+        ProductionSessionLifecycleService::new().ingest_session(SessionLifecycleRequest {
+            state: input.state,
+            sessions_cfg: &sessions_cfg,
+            providers_cfg: Some(input.providers),
+            provider_name: input.provider_name,
+            external_provider: None,
+            invocation_row_id: input.invocation_row_id,
+            invocation_uuid: input.invocation_uuid,
+            effective_cwd: effective_cwd.as_deref(),
+            mode: SessionLifecycleIngestMode::Unpinned {
+                capture_method: DEFAULT_PROVIDER_REPL_CAPTURE_METHOD.to_string(),
+            },
+            stderr: &mut stderr,
+        })
+    {
+        eprintln!(
+            "Warning: Session ingest failed for {}: {err}",
+            input.provider_name
+        );
+    }
+}
+
+fn default_provider_effective_cwd(working_dir: Option<&Path>) -> Option<PathBuf> {
+    working_dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
 }
 
 #[allow(dead_code)]
@@ -258,6 +442,11 @@ mod tests {
         std::fs::write(root.join("providers.toml"), contents).unwrap();
     }
 
+    fn write_sessions(root: &Path, contents: &str) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join("sessions.toml"), contents).unwrap();
+    }
+
     fn provider_fixture(name: &str) -> String {
         format!(
             r#"[{name}]
@@ -272,9 +461,11 @@ interactive_args = ["ok"]
         ProvidersConfig::load(&root.join("providers.toml")).unwrap()
     }
 
+    type LauncherCall = (String, Option<PathBuf>, Option<String>);
+
     #[derive(Default)]
     struct RecordingLauncher {
-        calls: RefCell<Vec<(String, Option<PathBuf>)>>,
+        calls: RefCell<Vec<LauncherCall>>,
     }
 
     impl InteractiveLauncher for RecordingLauncher {
@@ -282,11 +473,51 @@ interactive_args = ["ok"]
             &self,
             provider: &ProviderConfig,
             working_dir: Option<&Path>,
-        ) -> Result<i32, String> {
-            self.calls
-                .borrow_mut()
-                .push((provider.name.clone(), working_dir.map(Path::to_path_buf)));
-            Ok(0)
+            parent_invocation_env: Option<&str>,
+        ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+            self.calls.borrow_mut().push((
+                provider.name.clone(),
+                working_dir.map(Path::to_path_buf),
+                parent_invocation_env.map(str::to_string),
+            ));
+            Ok(successful_interactive_result())
+        }
+    }
+
+    fn successful_interactive_result() -> crate::executor::cli::InteractiveExecutionResult {
+        crate::executor::cli::InteractiveExecutionResult {
+            exit_code: 0,
+            terminal_reason: None,
+            terminal_signal: None,
+        }
+    }
+
+    #[cfg(unix)]
+    struct TurnWritingLauncher {
+        turns_path: PathBuf,
+        session_id: String,
+    }
+
+    #[cfg(unix)]
+    impl InteractiveLauncher for TurnWritingLauncher {
+        fn launch(
+            &self,
+            _provider: &ProviderConfig,
+            _working_dir: Option<&Path>,
+            _parent_invocation_env: Option<&str>,
+        ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            std::fs::write(
+                &self.turns_path,
+                format!(
+                    r#"{{"session_id":"{}","turn_id":"turn-1","timestamp":"{}","role":"assistant"}}
+"#,
+                    self.session_id, timestamp
+                ),
+            )
+            .unwrap();
+            Ok(successful_interactive_result())
         }
     }
 
@@ -294,6 +525,30 @@ interactive_args = ["ok"]
         let conn = Connection::open(db_path).unwrap();
         let sql = format!("SELECT COUNT(*) FROM {table}");
         conn.query_row(&sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn invocation_row(db_path: &Path) -> (String, String, String, Option<String>, Option<String>) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(
+            "SELECT model_name, provider_name, status, provider_session_id, provider_session_capture_method
+             FROM invocations
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap()
+    }
+
+    fn single_string_column(db_path: &Path, sql: &str) -> String {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn toml_path(path: &Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     }
 
     #[cfg(unix)]
@@ -354,11 +609,11 @@ exit 17"#,
                 working_dir: Some(working_dir.path().to_path_buf()),
             })
             .expect("service launch");
-        let private_exit_code = private_launcher
-            .launch(&provider, Some(working_dir.path()))
+        let private_result = private_launcher
+            .launch(&provider, Some(working_dir.path()), None)
             .expect("private seam launch");
 
-        assert_eq!(service_output.exit_code, private_exit_code);
+        assert_eq!(service_output.exit_code, private_result.exit_code);
         assert_eq!(service_output.exit_code, 17);
         assert_eq!(
             std::fs::read_to_string(marker.path()).unwrap(),
@@ -534,12 +789,12 @@ interactive_args = ["ok"]
     }
 
     #[test]
-    fn does_not_create_invocation_row() {
+    fn creates_unknown_model_invocation_row() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
         StateDb::open(&state_path).unwrap();
-        write_config(temp.path(), r#"default_provider = "claude""#);
-        write_providers(temp.path(), &provider_fixture("claude"));
+        write_config(temp.path(), r#"default_provider = "generic""#);
+        write_providers(temp.path(), &provider_fixture("generic"));
         let launcher = RecordingLauncher::default();
 
         let code = run_repl_with_default_provider_with_launcher(
@@ -549,16 +804,23 @@ interactive_args = ["ok"]
         .expect("stubbed launcher should allow the default-provider path to complete");
 
         assert_eq!(code, 0);
-        assert_eq!(table_count(&state_path, "invocations"), 0);
+        assert_eq!(table_count(&state_path, "invocations"), 1);
+        let (model_name, provider_name, status, provider_session_id, capture_method) =
+            invocation_row(&state_path);
+        assert_eq!(model_name, "<unknown>");
+        assert_eq!(provider_name, "generic");
+        assert_eq!(status, "succeeded");
+        assert_eq!(provider_session_id, None);
+        assert_eq!(capture_method, None);
     }
 
     #[test]
-    fn does_not_update_session_capture() {
+    fn passes_parent_invocation_env_to_launcher() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
         StateDb::open(&state_path).unwrap();
-        write_config(temp.path(), r#"default_provider = "claude""#);
-        write_providers(temp.path(), &provider_fixture("claude"));
+        write_config(temp.path(), r#"default_provider = "generic""#);
+        write_providers(temp.path(), &provider_fixture("generic"));
         let launcher = RecordingLauncher::default();
 
         let code = run_repl_with_default_provider_with_launcher(
@@ -568,7 +830,75 @@ interactive_args = ["ok"]
         .expect("stubbed launcher should allow the default-provider path to complete");
 
         assert_eq!(code, 0);
-        assert_eq!(table_count(&state_path, "invocations"), 0);
+        let parent_env = launcher.calls.borrow()[0]
+            .2
+            .clone()
+            .expect("parent invocation env");
+        let parsed = CompositeInvocationId::parse_env_value(&parent_env).unwrap();
+        let (_model_name, provider_name, _status, _provider_session_id, _capture_method) =
+            invocation_row(&state_path);
+        assert_eq!(parsed.source, provider_name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registers_ingested_session_chain() {
+        const SESSION_ID: &str = "session-from-new-repl";
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        let turns_path = temp.path().join("turns.jsonl");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "generic""#);
+        write_providers(temp.path(), &provider_fixture("generic"));
+        let (_turn_script_dir, turn_script_path) =
+            launcher_fixture_script(&format!(r#"cat "{turns}""#, turns = turns_path.display()));
+        write_sessions(
+            temp.path(),
+            &format!(
+                r#"[generic]
+turn_script = "{}"
+"#,
+                toml_path(&turn_script_path)
+            ),
+        );
+        let launcher = TurnWritingLauncher {
+            turns_path,
+            session_id: SESSION_ID.to_string(),
+        };
+
+        let code = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+            &launcher,
+        )
+        .expect("stubbed launcher should allow the default-provider path to complete");
+
+        assert_eq!(code, 0);
+        assert_eq!(table_count(&state_path, "invocations"), 1);
+        assert_eq!(table_count(&state_path, "session_chains"), 1);
+        assert_eq!(table_count(&state_path, "session_chain_segments"), 1);
+        let (model_name, provider_name, status, provider_session_id, capture_method) =
+            invocation_row(&state_path);
+        assert_eq!(model_name, "<unknown>");
+        assert_eq!(provider_name, "generic");
+        assert_eq!(status, "succeeded");
+        assert_eq!(provider_session_id.as_deref(), Some(SESSION_ID));
+        assert_eq!(capture_method.as_deref(), Some("turn_script"));
+        assert_eq!(
+            single_string_column(&state_path, "SELECT model_name FROM session_chains"),
+            "<unknown>"
+        );
+        assert_eq!(
+            single_string_column(
+                &state_path,
+                "SELECT provider_name FROM session_chain_segments"
+            ),
+            "generic"
+        );
+        assert_eq!(
+            single_string_column(&state_path, "SELECT session_id FROM session_chain_segments"),
+            SESSION_ID
+        );
     }
 
     #[test]
