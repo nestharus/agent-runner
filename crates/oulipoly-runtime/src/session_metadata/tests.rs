@@ -4,6 +4,7 @@
 use super::*;
 use chrono::Utc;
 use oulipoly_config::{ProviderEntry, ResumeKind, ResumeStrategy, SessionSourceEntry};
+use oulipoly_state::{InvocationStart, ProviderSessionBinding};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
@@ -215,6 +216,50 @@ fn resolve_resume_workspace_root_reports_malformed_cwd_script_json() {
     let err = resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
 
     assert_reason_contains(&err, "cwd_script_malformed_json");
+}
+
+#[test]
+fn resolve_resume_workspace_root_uses_imported_script_session_cwd_before_cwd_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("rfq");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let provider_name = "opencode2";
+    let session_id = "ses_importedCwdFallback123456";
+    let db = state_with_session(provider_name, session_id);
+    seed_provider_session_resolved_account(&db, provider_name, session_id, &workspace);
+    let cfg = providers_cfg(provider_name, "/bin/false".to_string());
+
+    let resolved =
+        resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap();
+
+    assert_eq!(resolved, workspace);
+}
+
+fn seed_provider_session_resolved_account(
+    db: &StateDb,
+    provider_name: &str,
+    session_id: &str,
+    workspace: &std::path::Path,
+) {
+    let invocation_row_id = db
+        .start_invocation(&InvocationStart {
+            invocation_uuid: uuid::Uuid::new_v4().to_string(),
+            model_name: "<unknown>".to_string(),
+            provider_name: provider_name.to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    db.bind_invocation_provider_session_start(
+        invocation_row_id,
+        &ProviderSessionBinding {
+            provider_session_id: session_id.to_string(),
+            capture_method: "turn_script",
+            resume_input_id: None,
+            provider_session_resolved_account: Some(workspace.display().to_string()),
+        },
+    )
+    .unwrap();
 }
 
 #[test]
