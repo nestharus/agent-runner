@@ -687,6 +687,15 @@ pub fn resolve_resume_workspace_root(
         .resolve_resume(models, input, None)
         .map_err(map_resume_error)?;
     let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+    if resolved_uses_external_provider(&resolved)
+        && let Some(workspace_root) = session_runtime_workspace_root(&resolved)?
+    {
+        return Ok(workspace_root);
+    }
+    // Script-storage imports can leave stale mailbox/runtime cwd rows behind.
+    // The invocation-bound account cwd was captured with the provider session
+    // id, so it is the durable fallback unless a live external-provider runtime
+    // row has already claimed authority above.
     if let Some(workspace_root) =
         invocation_resolved_workspace_root(state, provider.session_storage.as_ref(), &resolved)?
     {
