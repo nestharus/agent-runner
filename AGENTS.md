@@ -269,6 +269,19 @@ cargo tauri build        # Full app build
 bunx playwright test e2e/screenshots.spec.ts  # Generate screenshot catalog
 ```
 
+## Opencode Agent-Bash Tooling
+
+Opencode has a global custom `bash` tool at
+`~/.config/opencode/tools/bash.ts`. It intentionally replaces opencode's
+built-in bash tool and must stay enabled in `~/.config/opencode/opencode.json`
+with `tools.bash = true`.
+
+For child agent dispatches from opencode, use
+`/home/nes/.local/bin/agent-bash run -- agents ...`. Do not run `agents ...` or
+`oulipoly-agent-runner ...` directly for child workloads. The `agent-bash run --`
+wrapper captures caller ancestry and delivers `agent_bash_complete`
+notifications through the mailbox/wake system.
+
 ## Release Process
 
 Cut releases from GitHub Actions by manually running the `Release` workflow
