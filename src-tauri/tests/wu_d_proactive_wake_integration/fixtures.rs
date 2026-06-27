@@ -9,7 +9,7 @@ use crate::{MODEL, SESSION};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 
 pub(crate) struct Fixture {
     pub(crate) dir: tempfile::TempDir,
@@ -61,6 +61,30 @@ impl Fixture {
     }
 
     pub(crate) fn run(&self, mut cmd: Command) -> Output {
+        self.prepare_command(&mut cmd);
+        cmd.output().unwrap()
+    }
+
+    pub(crate) fn spawn_agent(&self, prompt: &str) -> Child {
+        let mut cmd = self.agent_command(prompt);
+        self.prepare_command(&mut cmd);
+        cmd.stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    pub(crate) fn spawn_agent_as_auto_wake(&self, prompt: &str) -> Child {
+        let mut cmd = self.agent_command(prompt);
+        self.prepare_command(&mut cmd);
+        cmd.env("OULIPOLY_AUTO_WAKE", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn prepare_command(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
             .env("HOME", &self.home_dir)
@@ -73,17 +97,21 @@ impl Fixture {
             .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
             .current_dir(self.dir.path());
-        cmd.output().unwrap()
     }
 
     pub(crate) fn run_agent(&self, prompt: &str) -> Output {
+        let cmd = self.agent_command(prompt);
+        self.run(cmd)
+    }
+
+    fn agent_command(&self, prompt: &str) -> Command {
         let mut cmd = Command::new(crate::parse::runner_bin());
         cmd.arg("-m")
             .arg(MODEL)
             .arg("--models-dir")
             .arg(&self.models_dir)
             .arg(prompt);
-        self.run(cmd)
+        cmd
     }
 
     pub(crate) fn run_agent_with_auto_wake_max(&self, prompt: &str, max: &str) -> Output {

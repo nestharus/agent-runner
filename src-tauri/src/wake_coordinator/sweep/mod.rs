@@ -9,13 +9,17 @@ mod state;
 use oulipoly_state::mailbox::{
     MailboxDb, SessionLiveness, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeSweepCandidate,
 };
+use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::auto_wake_env::is_auto_wake_invocation;
 use super::constants::{
-    WAKE_RECLAIM_REAP_ROWS_PER_SESSION, WAKE_RECLAIM_REAP_SESSION_LIMIT,
-    WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+    LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_REAP_ROWS_PER_SESSION,
+    WAKE_RECLAIM_REAP_SESSION_LIMIT, WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT,
+    WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
 };
 use super::diagnostics::WakeDiagnostic;
 use super::wake_start::{StartWakeInput, start_wake_chain};
@@ -29,8 +33,64 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
 }
 
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
+    if is_auto_wake_invocation() {
+        return;
+    }
     static DRIVER: OnceLock<()> = OnceLock::new();
     DRIVER.get_or_init(spawn_wake_reclaim_maintenance_driver);
+}
+
+pub(crate) struct LivePtyRetryDriverGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for LivePtyRetryDriverGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            if let Err(err) = handle.join() {
+                tracing::warn!(?err, "Live PTY retry driver failed to join cleanly");
+            }
+        }
+    }
+}
+
+pub(crate) fn start_live_pty_retry_driver_for_owner() -> Option<LivePtyRetryDriverGuard> {
+    if is_auto_wake_invocation() {
+        return None;
+    }
+    spawn_live_pty_retry_driver()
+}
+
+fn spawn_live_pty_retry_driver() -> Option<LivePtyRetryDriverGuard> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    match std::thread::Builder::new()
+        .name("oulipoly-live-pty-retry".to_string())
+        .spawn(move || live_pty_retry_loop(thread_stop))
+    {
+        Ok(handle) => Some(LivePtyRetryDriverGuard {
+            stop,
+            handle: Some(handle),
+        }),
+        Err(err) => {
+            tracing::warn!("Failed to start live PTY retry driver: {err}");
+            None
+        }
+    }
+}
+
+fn live_pty_retry_loop(stop: Arc<AtomicBool>) {
+    retry_pending_live_pty_deliveries_or_warn("live_pty_retry_start");
+    loop {
+        std::thread::park_timeout(Duration::from_secs(LIVE_PTY_RETRY_INTERVAL_SECONDS));
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        retry_pending_live_pty_deliveries_or_warn("live_pty_retry_tick");
+    }
 }
 
 fn spawn_wake_reclaim_maintenance_driver() {
@@ -81,6 +141,19 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
         trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
     }
     Ok(())
+}
+
+fn retry_pending_live_pty_deliveries_or_warn(trigger: &str) {
+    if let Err(err) = retry_pending_live_pty_deliveries_from_default_db() {
+        warn_wake_reclaim_sweep_failed(trigger, err);
+    }
+}
+
+fn retry_pending_live_pty_deliveries_from_default_db() -> Result<(), String> {
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(());
+    };
+    retry_pending_live_pty_deliveries(&mut db)
 }
 
 fn retry_pending_live_pty_deliveries(db: &mut MailboxDb) -> Result<(), String> {

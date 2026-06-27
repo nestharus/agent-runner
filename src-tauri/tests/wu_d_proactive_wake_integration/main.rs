@@ -156,6 +156,16 @@ fn live_pty_repeated_nack_keeps_pending_without_claim() {
 }
 
 #[test]
+fn foreground_owner_retries_live_pty_without_second_command_and_stops() {
+    cases_live_pty_retry::foreground_owner_retries_live_pty_without_second_command_and_stops();
+}
+
+#[test]
+fn auto_wake_owner_does_not_host_live_pty_retry_driver() {
+    cases_live_pty_retry::auto_wake_owner_does_not_host_live_pty_retry_driver();
+}
+
+#[test]
 fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris() {
     cases_wake_backlog::wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris();
 }

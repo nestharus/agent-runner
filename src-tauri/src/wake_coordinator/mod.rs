@@ -13,6 +13,7 @@ mod turn_recheck;
 mod wake_start;
 
 pub(crate) type WakeDiagnostic = diagnostics::WakeDiagnostic;
+pub(crate) use sweep::LivePtyRetryDriverGuard;
 
 pub(crate) fn mark_session_idle_after_turn(
     session_id: &str,
@@ -32,6 +33,10 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
 
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
     sweep::start_wake_reclaim_maintenance_driver();
+}
+
+pub(crate) fn start_live_pty_retry_driver_for_owner() -> Option<LivePtyRetryDriverGuard> {
+    sweep::start_live_pty_retry_driver_for_owner()
 }
 
 pub(crate) fn mark_successful_turn_idle_and_recheck(
