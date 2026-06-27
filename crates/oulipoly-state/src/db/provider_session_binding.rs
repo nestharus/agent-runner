@@ -46,6 +46,32 @@ struct InvocationChainMintRow {
 }
 
 impl StateDb {
+    pub fn latest_provider_session_resolved_account(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT provider_session_resolved_account
+                 FROM invocations
+                 WHERE provider_name = ?1
+                   AND (provider_session_id = ?2 OR session_id = ?2)
+                   AND provider_session_resolved_account IS NOT NULL
+                   AND trim(provider_session_resolved_account) <> ''
+                 ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+                 LIMIT 1",
+                sqlite::params![provider_name, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| {
+                format!(
+                    "Failed to read provider_session_resolved_account for {provider_name}/{session_id}: {e}"
+                )
+            })
+    }
+
     pub fn bind_invocation_provider_session_start(
         &self,
         invocation_row_id: i64,

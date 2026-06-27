@@ -36,8 +36,10 @@
 //!         that resume/metadata resolution reads
 //!       - external-provider session-locate surface (ProviderRegistry,
 //!         session_provider identity/locate/describe, oulipoly_provider DescribeResult)
-//!       - external session-runtime workspace-root lookup over
+//!       - session-runtime workspace-root lookup over
 //!         oulipoly_state::mailbox::MailboxDb session_runtime rows
+//!       - script-backed imported-session workspace-root fallback through
+//!         invocations.provider_session_resolved_account
 //!       - the session-metadata-resolution sibling resolvers (ambiguity, cwd,
 //!         errors, ids, locator, metadata_shape, mutability, registry, resume,
 //!         transcript, workspace) this facade sequences
@@ -684,10 +686,24 @@ pub fn resolve_resume_workspace_root(
     let resolved = state
         .resolve_resume(models, input, None)
         .map_err(map_resume_error)?;
-    if let Some(workspace_root) = external_session_runtime_workspace_root(&resolved)? {
+    let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+    if resolved_uses_external_provider(&resolved)
+        && let Some(workspace_root) = session_runtime_workspace_root(&resolved)?
+    {
         return Ok(workspace_root);
     }
-    let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
+    // Script-storage imports can leave stale mailbox/runtime cwd rows behind.
+    // The invocation-bound account cwd was captured with the provider session
+    // id, so it is the durable fallback unless a live external-provider runtime
+    // row has already claimed authority above.
+    if let Some(workspace_root) =
+        invocation_resolved_workspace_root(state, provider.session_storage.as_ref(), &resolved)?
+    {
+        return Ok(workspace_root);
+    }
+    if let Some(workspace_root) = session_runtime_workspace_root(&resolved)? {
+        return Ok(workspace_root);
+    }
     resolve_cwd_from_session_storage(
         provider.session_storage.as_ref(),
         &resolved.active_provider,
@@ -695,12 +711,9 @@ pub fn resolve_resume_workspace_root(
     )
 }
 
-fn external_session_runtime_workspace_root(
+fn session_runtime_workspace_root(
     resolved: &oulipoly_state::ResolvedResume,
 ) -> Result<Option<PathBuf>, MetadataError> {
-    if !resolved_uses_external_provider(resolved) {
-        return Ok(None);
-    }
     let Some(db) = external_session_runtime_db()? else {
         return Ok(None);
     };
@@ -711,8 +724,29 @@ fn external_session_runtime_workspace_root(
         return Ok(None);
     };
     row.effective_cwd
-        .map(validate_external_session_runtime_cwd)
+        .map(|value| validate_stored_workspace_root(value, "session_runtime_effective_cwd"))
         .transpose()
+}
+
+fn invocation_resolved_workspace_root(
+    state: &StateDb,
+    session_storage: Option<&SessionStorage>,
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Result<Option<PathBuf>, MetadataError> {
+    if !supports_invocation_workspace_fallback(session_storage) {
+        return Ok(None);
+    }
+    let value = metadata_db_result(state.latest_provider_session_resolved_account(
+        &resolved.active_provider,
+        &resolved.active_session_id,
+    ))?;
+    value
+        .map(|value| validate_stored_workspace_root(value, "provider_session_resolved_account"))
+        .transpose()
+}
+
+fn supports_invocation_workspace_fallback(session_storage: Option<&SessionStorage>) -> bool {
+    matches!(session_storage, Some(SessionStorage::Script { .. }))
 }
 
 fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::MailboxDb>, MetadataError>
@@ -721,37 +755,37 @@ fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::Mailb
         .map_err(external_session_runtime_error)
 }
 
-fn validate_external_session_runtime_cwd(value: String) -> Result<PathBuf, MetadataError> {
-    require_absolute_external_session_runtime_cwd(external_session_runtime_cwd_path(value))
+fn validate_stored_workspace_root(value: String, source: &str) -> Result<PathBuf, MetadataError> {
+    require_absolute_stored_workspace_root(stored_workspace_root_path(value), source)
 }
 
-fn external_session_runtime_cwd_path(value: String) -> PathBuf {
+fn stored_workspace_root_path(value: String) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn require_absolute_external_session_runtime_cwd(path: PathBuf) -> Result<PathBuf, MetadataError> {
-    if external_session_runtime_cwd_is_absolute(&path) {
+fn require_absolute_stored_workspace_root(
+    path: PathBuf,
+    source: &str,
+) -> Result<PathBuf, MetadataError> {
+    if stored_workspace_root_is_absolute(&path) {
         Ok(path)
     } else {
-        Err(external_session_runtime_cwd_not_absolute(&path))
+        Err(stored_workspace_root_not_absolute(&path, source))
     }
 }
 
-fn external_session_runtime_cwd_is_absolute(path: &std::path::Path) -> bool {
+fn stored_workspace_root_is_absolute(path: &std::path::Path) -> bool {
     path.is_absolute()
 }
 
-fn external_session_runtime_cwd_not_absolute(path: &std::path::Path) -> MetadataError {
+fn stored_workspace_root_not_absolute(path: &std::path::Path, source: &str) -> MetadataError {
     MetadataError::Operational {
-        message: external_session_runtime_cwd_not_absolute_message(path),
+        message: stored_workspace_root_not_absolute_message(path, source),
     }
 }
 
-fn external_session_runtime_cwd_not_absolute_message(path: &std::path::Path) -> String {
-    format!(
-        "session_runtime_effective_cwd_not_absolute: {}",
-        path.display()
-    )
+fn stored_workspace_root_not_absolute_message(path: &std::path::Path, source: &str) -> String {
+    format!("{source}_not_absolute: {}", path.display())
 }
 
 fn external_session_runtime_error(message: String) -> MetadataError {
