@@ -14,10 +14,10 @@ use oulipoly_runtime::services::{
 };
 
 use super::disposition::{
-    handle_terminal_signal_disposition, ReplTerminalControl, ReplTerminalDispositionInput,
+    ReplTerminalControl, ReplTerminalDispositionInput, handle_terminal_signal_disposition,
 };
 use super::finalization::{
-    finalize_completed_repl_attempt, finalize_spawn_error, CompletedReplAttemptInput,
+    CompletedReplAttemptInput, finalize_completed_repl_attempt, finalize_spawn_error,
 };
 use super::resolution::resolve_optional_repl_resume;
 use super::{formatter, mapper, validator};

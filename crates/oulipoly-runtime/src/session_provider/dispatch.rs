@@ -7,7 +7,8 @@ use super::turns;
 use super::types::{
     SessionProviderCaptureRequest, SessionProviderCaptureResult, SessionProviderError,
     SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLocateRequest,
-    SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
+    SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest,
+    SessionProviderReadTurnsResult,
 };
 use crate::session_metadata::LocatedTranscript;
 use oulipoly_provider::client::ProviderClient;
@@ -38,7 +39,11 @@ pub fn locate_transcript_with_raw_metadata(
             &request.identity,
             Some(request.session_id),
             request.effective_cwd,
-            locate_extra(request.lookup_mode, request.purpose, request.tail_bytes_hint),
+            locate_extra(
+                request.lookup_mode,
+                request.purpose,
+                request.tail_bytes_hint,
+            ),
             "locate",
         )?,
     )?;

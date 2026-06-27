@@ -25,6 +25,7 @@ pub use turns::{assert_turn_count_diagnostic, ingest_owned_turns};
 pub use types::{
     NoRefProofOutput, NoRefProofRequest, S7A_NEUTRAL_SETTINGS_ID, SessionProviderCaptureRequest,
     SessionProviderCaptureResult, SessionProviderError, SessionProviderIdentity,
-    SessionProviderLifecycleContext, SessionProviderLocateRequest, SessionProviderLocatedTranscript,
-    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult, SessionProviderTurn,
+    SessionProviderLifecycleContext, SessionProviderLocateRequest,
+    SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest,
+    SessionProviderReadTurnsResult, SessionProviderTurn,
 };

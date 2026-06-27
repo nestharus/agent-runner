@@ -90,7 +90,8 @@ pub use headless::{
 pub(crate) use input_flags::resolve_input_flags;
 pub use interactive::{
     InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
-    execute_interactive_with_result_and_model_config, execute_interactive_with_result_and_model_identity,
+    execute_interactive_with_result_and_model_config,
+    execute_interactive_with_result_and_model_identity,
 };
 pub use provider_identity::{provider_name, shell_split};
 pub use request::EffectiveExecuteRequest;

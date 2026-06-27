@@ -25,12 +25,12 @@
 //!       - filesystem Path/PathBuf and HashMap carriers used by model loading
 //! ```
 //!
-use crate::claude_tool_filter::{validate_proxy_claude_filter_shape, ClaudeToolFilterShape};
+use crate::claude_tool_filter::{ClaudeToolFilterShape, validate_proxy_claude_filter_shape};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::codex_overlap::validate_codex_model_arg_overlap;
-use super::config::{parse_inputs, ModelConfig, PromptMode};
+use super::config::{ModelConfig, PromptMode, parse_inputs};
 use super::error::ModelError;
 use super::provider_config::{InvocationMode, ProviderConfig};
 use super::provider_name::derive_provider_name;

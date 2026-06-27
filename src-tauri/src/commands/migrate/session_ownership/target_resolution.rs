@@ -5,7 +5,7 @@ use crate::cli::paths::default_models_dir;
 use crate::provider_artifact::provider_artifact_from_ref;
 use crate::provider_proof::prove_provider_artifact;
 use oulipoly_config::{
-    load_models, ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig,
+    ModelConfig, ProviderConfig, ProviderImplementationRef, ProvidersConfig, load_models,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use std::collections::{BTreeSet, HashMap};

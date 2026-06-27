@@ -1,11 +1,11 @@
 use chrono::{DateTime, Utc};
 use oulipoly_config::{
-    provider_implementation_ref::ProviderImplementationRef, ModelConfig, PromptMode,
-    ProviderConfig, ResumeKind, ResumeStrategy, SessionStorage, SessionsConfig,
+    ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy, SessionStorage,
+    SessionsConfig, provider_implementation_ref::ProviderImplementationRef,
 };
 use oulipoly_runtime::balancer::TransitionReason;
 use oulipoly_runtime::migration::{
-    bound_provider_ref_resume_segment, MigrationError, ProviderRefBoundOutcome,
+    MigrationError, ProviderRefBoundOutcome, bound_provider_ref_resume_segment,
 };
 use oulipoly_runtime::services::{
     MigrationServiceOutput, MigrationServicePort, MigrationServiceRequest,
@@ -933,9 +933,8 @@ fn provider_ref_bound_resume_collision_exhaustion_fails_before_any_mutation() {
         )
     };
 
-    let err = result.expect_err(
-        "expected no-clobber collision exhaustion to return an error before mutation",
-    );
+    let err = result
+        .expect_err("expected no-clobber collision exhaustion to return an error before mutation");
     match err {
         MigrationError::TargetAlreadyExists { provider, path } => {
             assert_eq!(provider, resolved.active_provider);

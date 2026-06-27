@@ -31,8 +31,8 @@ impl ProviderInspectTranscriptResolver {
     }
 
     pub(crate) fn resolve(&self, limits: SnapshotLimits) -> Option<ResolvedSessionTranscript> {
-        let located = session_provider::locate_transcript_with_raw_metadata(
-            SessionProviderLocateRequest {
+        let located =
+            session_provider::locate_transcript_with_raw_metadata(SessionProviderLocateRequest {
                 registry: self.registry.as_ref(),
                 identity: self.identity.clone(),
                 session_id: &self.active_session_id,
@@ -40,10 +40,11 @@ impl ProviderInspectTranscriptResolver {
                 effective_cwd: self.effective_cwd.as_deref(),
                 purpose: Some("inspect"),
                 tail_bytes_hint: Some(limits.transcript_tail_bytes),
-            },
-        )
-        .ok()?;
-        let format_id = located.format_id.filter(|format_id| !format_id.is_empty())?;
+            })
+            .ok()?;
+        let format_id = located
+            .format_id
+            .filter(|format_id| !format_id.is_empty())?;
         Some(ResolvedSessionTranscript::with_metadata(
             located.path,
             Some(format_id),

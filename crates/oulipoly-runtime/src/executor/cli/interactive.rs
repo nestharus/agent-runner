@@ -133,7 +133,8 @@ fn execute_interactive_with_result_and_monitor_context(
     if pty_broker::controlling_terminal_available() {
         let cmd =
             interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
-        let provider_inspect = provider_registry.map(pty_broker::ProviderInspectMonitorContext::new);
+        let provider_inspect =
+            provider_registry.map(pty_broker::ProviderInspectMonitorContext::new);
         let status = if pty_broker::observed_tui_enabled() {
             pty_broker::execute_interactive_child_observed(
                 cmd,

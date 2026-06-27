@@ -1,11 +1,11 @@
 //! Role: mapper.
 
-use super::identity::{provider_instance_id, ExternalSessionIdentity};
-use super::provider_error::{map_schema_invalid_request_error, ExternalSessionProviderError};
+use super::identity::{ExternalSessionIdentity, provider_instance_id};
+use super::provider_error::{ExternalSessionProviderError, map_schema_invalid_request_error};
 use super::replace_input_mapper::PreparedReplaceInput;
 use oulipoly_provider::generated::{
-    HostContext, JsonObject, RequestEnvelope, SessionBaseParams, SessionReplaceCanonicalTranscript,
-    SessionReplaceParams, CONTRACT_VERSION,
+    CONTRACT_VERSION, HostContext, JsonObject, RequestEnvelope, SessionBaseParams,
+    SessionReplaceCanonicalTranscript, SessionReplaceParams,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
