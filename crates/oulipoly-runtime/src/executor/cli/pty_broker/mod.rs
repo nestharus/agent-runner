@@ -1500,6 +1500,18 @@ fn send_signal_to_child_group(child_pid: u32, signal: i32) {
 struct InputLineState {
     at_line_boundary: bool,
     last_user_input_at: Option<Instant>,
+    enter_escape_state: EnterEscapeState,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum EnterEscapeState {
+    #[default]
+    None,
+    Esc,
+    Csi,
+    CsiOne,
+    CsiThirteen,
+    ApplicationKeypad,
 }
 
 impl Default for InputLineState {
@@ -1507,6 +1519,7 @@ impl Default for InputLineState {
         Self {
             at_line_boundary: true,
             last_user_input_at: None,
+            enter_escape_state: EnterEscapeState::None,
         }
     }
 }
@@ -1518,12 +1531,58 @@ impl InputLineState {
         }
         self.last_user_input_at = Some(Instant::now());
         for byte in bytes.iter().copied() {
+            self.observe_user_input_byte(byte);
+        }
+    }
+
+    fn observe_user_input_byte(&mut self, byte: u8) {
+        if self.enter_escape_state != EnterEscapeState::None {
+            self.observe_enter_escape_byte(byte);
+            return;
+        }
+        self.observe_non_escape_byte(byte);
+    }
+
+    fn observe_enter_escape_byte(&mut self, byte: u8) {
+        let next = match (self.enter_escape_state, byte) {
+            (EnterEscapeState::Esc, b'[') => Some(EnterEscapeState::Csi),
+            (EnterEscapeState::Esc, b'O') => Some(EnterEscapeState::ApplicationKeypad),
+            (EnterEscapeState::Csi, b'1') => Some(EnterEscapeState::CsiOne),
+            (EnterEscapeState::CsiOne, b'3') => Some(EnterEscapeState::CsiThirteen),
+            (EnterEscapeState::CsiThirteen, b'u') => {
+                self.enter_escape_state = EnterEscapeState::None;
+                self.at_line_boundary = true;
+                return;
+            }
+            (EnterEscapeState::ApplicationKeypad, b'M') => {
+                self.enter_escape_state = EnterEscapeState::None;
+                self.at_line_boundary = true;
+                return;
+            }
+            _ => None,
+        };
+
+        if let Some(next) = next {
+            self.enter_escape_state = next;
+            self.at_line_boundary = false;
+        } else {
+            self.enter_escape_state = EnterEscapeState::None;
+            self.observe_non_escape_byte(byte);
+        }
+    }
+
+    fn observe_non_escape_byte(&mut self, byte: u8) {
+        if byte == 0x1b {
+            self.enter_escape_state = EnterEscapeState::Esc;
+            self.at_line_boundary = false;
+        } else {
             self.at_line_boundary = line_boundary_after_input_byte(byte);
         }
     }
 
     fn is_safe_to_inject(&self) -> bool {
         self.at_line_boundary
+            && self.enter_escape_state == EnterEscapeState::None
             && self
                 .last_user_input_at
                 .map(|last| last.elapsed() >= INJECT_DEBOUNCE)
@@ -1533,6 +1592,7 @@ impl InputLineState {
     fn mark_submitted(&mut self) {
         self.at_line_boundary = true;
         self.last_user_input_at = None;
+        self.enter_escape_state = EnterEscapeState::None;
     }
 }
 
@@ -1878,6 +1938,56 @@ mod tests {
         state.last_user_input_at =
             Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
         assert!(state.is_safe_to_inject());
+    }
+
+    #[test]
+    fn input_line_state_recognizes_enter_escape_sequences() {
+        let mut state = InputLineState::default();
+
+        state.observe_user_input(b"partial\x1b[13u");
+        assert!(state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+
+        state.observe_user_input(b"partial\x1bOM");
+        assert!(state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+    }
+
+    #[test]
+    fn input_line_state_keeps_split_csi_u_enter_pending_until_complete() {
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"partial");
+
+        state.observe_user_input(b"\x1b[1");
+        assert!(!state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::CsiOne);
+        state.last_user_input_at =
+            Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
+        assert!(!state.is_safe_to_inject());
+
+        state.observe_user_input(b"3u");
+        assert!(state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+    }
+
+    #[test]
+    fn input_line_state_preserves_existing_boundaries_and_midline_detection() {
+        for byte in [b'\r', b'\n', 0x03, 0x04, 0x15] {
+            let mut state = InputLineState::default();
+            state.observe_user_input(b"partial");
+            assert!(!state.at_line_boundary);
+
+            state.observe_user_input(&[byte]);
+            assert!(state.at_line_boundary, "byte {byte:#04x} should submit");
+        }
+
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"partial");
+        assert!(!state.at_line_boundary);
+
+        state.observe_user_input(b"\x1b[A");
+        assert!(!state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
     }
 
     #[test]
