@@ -13,6 +13,7 @@
 - `crates/oulipoly-runtime/src/executor/cli/input_flags/schema_access.rs`
 - `crates/oulipoly-runtime/src/executor/cli/input_flags/predicates.rs`
 - `crates/oulipoly-runtime/src/executor/cli/interactive.rs`
+- `crates/oulipoly-runtime/src/executor/cli/pty_broker/tui.rs`
 - `crates/oulipoly-runtime/src/executor/cli/ipc/mod.rs`
 - `crates/oulipoly-runtime/src/executor/cli/ipc/return_channel.rs`
 - `crates/oulipoly-runtime/src/executor/cli/ipc/return_channel_path.rs`
