@@ -23,6 +23,9 @@
 - `crates/oulipoly-runtime/src/session_metadata/workspace.rs`
 - `crates/oulipoly-runtime/src/session_replace/mod.rs`
 - `crates/oulipoly-runtime/src/migration/mod.rs`
+- `src-tauri/src/commands/migrate/session_ownership/classifier.rs`
+- `src-tauri/src/commands/migrate/session_ownership/forward.sql`
+- `src-tauri/src/commands/migrate/session_ownership/sql.rs`
 - `src-tauri/src/commands/compaction_backfill/mod.rs`
 - `src-tauri/src/commands/compaction_backfill/orchestration.rs`
 - `src-tauri/src/commands/compaction_backfill/accessor.rs`
@@ -152,6 +155,7 @@ tests.
 - `src-tauri/tests/initiative_06_locate.rs`
 - `src-tauri/tests/initiative_06_pause_handshake.rs`
 - `src-tauri/tests/initiative_06_schema_probe.rs`
+- `src-tauri/tests/s11_m2_session_ownership_migration.rs`
 - `src-tauri/tests/session_lock_cross_platform.rs`
 - `src-tauri/tests/session_metadata_component.rs`
 - `src-tauri/tests/session_migration_rca/rc1_cwd_project_dir_mismatch.rs`

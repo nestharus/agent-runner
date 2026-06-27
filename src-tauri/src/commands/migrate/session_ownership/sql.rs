@@ -1,7 +1,7 @@
 //! Declared roles: accessor, mapper, validator, predicate
 
-use super::preflight::{self, IntegrityReport};
 use super::DryRunError;
+use super::preflight::{self, IntegrityReport};
 use oulipoly_state::CURRENT_SCHEMA_VERSION;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1386,9 +1386,46 @@ mod tests {
             [loser_id],
         )
         .unwrap();
+        assert!(segment_merge_delete_plan_drift_exists(&conn));
         let before_forward = full_db_snapshot(&conn);
 
         let err = apply_forward(&conn).expect_err("stale segment plan must fail closed");
+
+        assert_forward_guard_error(&err);
+        assert_eq!(full_db_snapshot(&conn), before_forward);
+        assert!(!table_exists(
+            &conn,
+            "s11_wu4_restore_session_ownership_preimage"
+        ));
+        assert!(!table_exists(&conn, "s11_wu4_last_run_counts"));
+    }
+
+    #[test]
+    fn session_ownership_sql_open_segment_merge_plan_closing_group_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.db");
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_target_config(&models_dir);
+
+        let _ = StateDb::open(&state_path).unwrap();
+        let mut conn = Connection::open(&state_path).unwrap();
+        seed_segment_merge_collision(&conn);
+
+        let target = target_resolution::resolve_target(Some(&models_dir)).unwrap();
+        let candidates = classifier::classify(&conn, &target).unwrap();
+        assert_eq!(candidates.segment_rows_merged_away, 1);
+        assert_eq!(candidates.segment_merge_survivors_updated, 1);
+        classifier::populate_sql_inputs(&mut conn, &target, &candidates).unwrap();
+        conn.execute(
+            "UPDATE s11_wu4_segment_merge_groups
+             SET merged_ended_at = '2026-06-20T10:30:00Z'",
+            [],
+        )
+        .unwrap();
+        let before_forward = full_db_snapshot(&conn);
+
+        let err = apply_forward(&conn).expect_err("open-closing segment plan must fail closed");
 
         assert_forward_guard_error(&err);
         assert_eq!(full_db_snapshot(&conn), before_forward);
@@ -1490,8 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn session_ownership_sql_stale_turn_dedup_plan_timestamp_drift_rolls_back_whole_forward_transaction(
-    ) {
+    fn session_ownership_sql_turn_dedup_timestamp_drift_fails_closed() {
         assert_intrinsic_loser_drift_rolls_back("timestamp", "2026-06-20T10:30:00Z");
     }
 
@@ -1896,6 +1932,27 @@ mod tests {
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM session_turns WHERE id = ?1)",
             [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn segment_merge_delete_plan_drift_exists(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM s11_wu4_segment_merge_deletes planned
+                 LEFT JOIN session_chain_segments segment ON segment.id = planned.segment_id
+                 WHERE segment.id IS NULL
+                    OR NOT (segment.chain_id IS planned.expected_chain_id)
+                    OR NOT (segment.provider_name IS planned.expected_provider_name)
+                    OR NOT (segment.session_id IS planned.expected_session_id)
+                    OR NOT (segment.started_at IS planned.expected_started_at)
+                    OR NOT (segment.ended_at IS planned.expected_ended_at)
+                    OR NOT (segment.last_turn_id IS planned.expected_last_turn_id)
+                    OR NOT (segment.transition_reason IS planned.expected_transition_reason)
+             )",
+            [],
             |row| row.get(0),
         )
         .unwrap()

@@ -1,9 +1,9 @@
 #![cfg(unix)]
 
-use oulipoly_config::{load_models, ProvidersConfig};
+use oulipoly_config::{ProvidersConfig, load_models};
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{ResolvedResume, StateDb, CURRENT_SCHEMA_VERSION};
-use rusqlite::{params, Connection};
+use oulipoly_state::{CURRENT_SCHEMA_VERSION, ResolvedResume, StateDb};
+use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -449,7 +449,11 @@ impl Fixture {
         self.repl_resume_command_with_model(resume_input, None)
     }
 
-    fn repl_resume_command_with_model(&self, resume_input: &str, model_name: Option<&str>) -> Command {
+    fn repl_resume_command_with_model(
+        &self,
+        resume_input: &str,
+        model_name: Option<&str>,
+    ) -> Command {
         let mut cmd = self.base_command();
         cmd.current_dir(self.dir.path())
             .arg("repl")
@@ -1601,6 +1605,67 @@ fn row_13_segment_tuple_collision_merges_with_greatest_id_tiebreak() {
 }
 
 #[test]
+fn s11_m2c_segment_merge_preserves_open_survivor_when_closed_row_started_later() {
+    let fixture = Fixture::new();
+    fixture.write_target_config();
+    let (open_id, closed_later_id) = seed_open_survivor_collision(&fixture);
+    assert!(
+        closed_later_id > open_id,
+        "fixture must expose the prior latest-start/id survivor bug"
+    );
+    let before = full_snapshot(&fixture.state_path);
+    let backup_dir = fixture.backup_dir();
+
+    let output = fixture
+        .apply_command(Some(&backup_dir), true, false, false)
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    let after = full_snapshot(&fixture.state_path);
+    let merged: Vec<_> = after
+        .segments
+        .iter()
+        .filter(|segment| {
+            segment.chain_id == "chain-open-survivor-regression"
+                && segment.session_id == "session-open-survivor-regression"
+        })
+        .collect();
+    assert_eq!(
+        merged.len(),
+        1,
+        "merge must collapse the post-alias tuple: {merged:?}"
+    );
+    let survivor = merged[0];
+    assert_eq!(survivor.id, open_id, "open segment must survive");
+    assert_eq!(survivor.provider_name, canonical_account());
+    assert_eq!(survivor.started_at, "2026-06-20T10:00:00Z");
+    assert_eq!(survivor.ended_at, None, "merged segment must stay open");
+    assert_eq!(
+        survivor.last_turn_id.as_deref(),
+        Some("turn-closed-later-tail"),
+        "latest boundary tail must be selected independently from survivor identity"
+    );
+    assert_eq!(survivor.transition_reason, "manual");
+    let open_count = after
+        .segments
+        .iter()
+        .filter(|segment| {
+            segment.chain_id == "chain-open-survivor-regression" && segment.ended_at.is_none()
+        })
+        .count();
+    assert_eq!(
+        open_count, 1,
+        "chain must have exactly one open segment after merge"
+    );
+
+    let rollback = fixture.rollback_command(true).output().unwrap();
+
+    assert_success(&rollback);
+    assert_eq!(full_snapshot(&fixture.state_path), before);
+}
+
+#[test]
 fn row_14_turn_tuple_collision_aborts_with_unchanged_copy() {
     let fixture = Fixture::new();
     fixture.write_target_config();
@@ -2013,6 +2078,7 @@ fn s11_m2c_t9_idempotent_after_collision_resolution_has_zero_counts() {
     let fixture = Fixture::new();
     fixture.write_target_config();
     seed_three_segment_collision(&fixture);
+    seed_open_survivor_collision(&fixture);
     seed_turn_dedup_collision(&fixture);
     let backup_dir = fixture.backup_dir();
     assert_success(
@@ -4027,9 +4093,18 @@ fn s11_m2c_provider_ref_repl_already_bounded_launches_original_session() {
 fn assert_repl_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCase) {
     let fixture = Fixture::new();
     let models = fixture.write_s11_m2c_scope_configs();
-    let projects_dir = fixture.dir.path().join(format!("repl-{}-projects", case.label()));
-    let argv_path = fixture.dir.path().join(format!("repl-{}-argv.txt", case.label()));
-    let pwd_path = fixture.dir.path().join(format!("repl-{}-pwd.txt", case.label()));
+    let projects_dir = fixture
+        .dir
+        .path()
+        .join(format!("repl-{}-projects", case.label()));
+    let argv_path = fixture
+        .dir
+        .path()
+        .join(format!("repl-{}-argv.txt", case.label()));
+    let pwd_path = fixture
+        .dir
+        .path()
+        .join(format!("repl-{}-pwd.txt", case.label()));
     let resolved_launch_cwd = fixture
         .dir
         .path()
@@ -5610,6 +5685,69 @@ fn seed_three_segment_collision(fixture: &Fixture) {
     }
     seed_mailbox(&fixture.mailbox_path, "session-merge", None);
     seed_mailbox(&fixture.mailbox_path, "session-unrelated", None);
+}
+
+fn seed_open_survivor_collision(fixture: &Fixture) -> (i64, i64) {
+    let conn = fixture.conn();
+    seed_chain(
+        &conn,
+        "chain-open-survivor-regression",
+        &source_model_name(),
+    );
+    let open_id = seed_segment_with_started_at(
+        &conn,
+        "chain-open-survivor-regression",
+        &canonical_account(),
+        "session-open-survivor-regression",
+        "2026-06-20T10:00:00Z",
+        None,
+        Some("turn-open-active"),
+        "manual",
+    );
+    let closed_later_id = seed_segment_with_started_at(
+        &conn,
+        "chain-open-survivor-regression",
+        &unregistered_account_family(2),
+        "session-open-survivor-regression",
+        "2026-06-20T10:05:00Z",
+        Some("2026-06-20T10:06:00Z"),
+        Some("turn-closed-later-tail"),
+        "quota_threshold",
+    );
+    seed_turn_full(
+        &conn,
+        &canonical_account(),
+        "session-open-survivor-regression",
+        "turn-open-active",
+        "2026-06-20T10:01:00Z",
+        "assistant",
+        None,
+        0,
+        0,
+        "open-survivor.jsonl",
+        "2026-06-20T10:01:00Z",
+        Some("open active body"),
+    );
+    seed_turn_full(
+        &conn,
+        &unregistered_account_family(2),
+        "session-open-survivor-regression",
+        "turn-closed-later-tail",
+        "2026-06-20T10:06:00Z",
+        "assistant",
+        Some("turn-open-active"),
+        0,
+        0,
+        "open-survivor.jsonl",
+        "2026-06-20T10:06:00Z",
+        Some("later closed tail body"),
+    );
+    seed_mailbox(
+        &fixture.mailbox_path,
+        "session-open-survivor-regression",
+        None,
+    );
+    (open_id, closed_later_id)
 }
 
 fn seed_turn_dedup_collision(fixture: &Fixture) -> TurnRowSnapshot {

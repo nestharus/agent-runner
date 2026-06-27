@@ -494,7 +494,12 @@ WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
        OR NOT (segment.ended_at IS planned.expected_ended_at)
        OR NOT (segment.last_turn_id IS planned.expected_last_turn_id)
        OR NOT (segment.transition_reason IS planned.expected_transition_reason)
-    UNION ALL
+  );
+
+INSERT OR ROLLBACK INTO s11_wu4_forward_guard(id)
+SELECT 1
+WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
+  AND EXISTS (
     SELECT 1
     FROM s11_wu4_segment_merge_groups planned
     LEFT JOIN session_chain_segments segment ON segment.id = planned.survivor_segment_id
@@ -506,7 +511,25 @@ WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
        OR NOT (segment.ended_at IS planned.expected_ended_at)
        OR NOT (segment.last_turn_id IS planned.expected_last_turn_id)
        OR NOT (segment.transition_reason IS planned.expected_transition_reason)
- );
+  );
+
+INSERT OR ROLLBACK INTO s11_wu4_forward_guard(id)
+SELECT 1
+WHERE EXISTS (SELECT 1 FROM s11_wu4_candidate_segments)
+  AND EXISTS (
+    SELECT 1
+    FROM s11_wu4_segment_merge_groups planned
+    WHERE (planned.expected_ended_at IS NOT NULL OR planned.merged_ended_at IS NOT NULL)
+      AND (
+           planned.expected_ended_at IS NULL
+        OR EXISTS (
+            SELECT 1
+            FROM s11_wu4_segment_merge_deletes deleted
+            WHERE deleted.survivor_segment_id = planned.survivor_segment_id
+              AND deleted.expected_ended_at IS NULL
+        )
+      )
+  );
 
 DROP TABLE IF EXISTS s11_wu4_last_run_counts;
 CREATE TABLE s11_wu4_last_run_counts (

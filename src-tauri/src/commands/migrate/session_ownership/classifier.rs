@@ -1,9 +1,9 @@
 //! Declared role: mapper, filter, accessor, validator, orchestration
 
-use super::target_resolution::TargetResolution;
 use super::DryRunError;
+use super::target_resolution::TargetResolution;
 use oulipoly_config::ProviderConfig;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -1266,32 +1266,34 @@ fn build_segment_merge_plan(
                 .cmp(&right.started_at)
                 .then(left.id.cmp(&right.id))
         });
-        let earliest = rows
-            .first()
-            .expect("colliding segment group is nonempty after filter");
-        let latest = rows
-            .last()
-            .expect("colliding segment group is nonempty after filter");
-        let latest_id = latest.id;
+        let earliest = select_segment_merge_start(&rows);
+        let survivor = select_segment_merge_survivor(&rows);
+        let tail = select_segment_merge_tail(&rows);
+        let merged_ended_at = if rows.iter().any(|row| row.ended_at.is_none()) {
+            None
+        } else {
+            tail.ended_at.clone()
+        };
+        let survivor_id = survivor.id;
         merge_groups.push(SegmentMergeGroup {
-            survivor_segment_id: latest_id,
-            expected_chain_id: latest.chain_id.clone(),
-            expected_provider_name: latest.provider_name.clone(),
-            expected_session_id: latest.session_id.clone(),
-            expected_started_at: latest.started_at.clone(),
-            expected_ended_at: latest.ended_at.clone(),
-            expected_last_turn_id: latest.last_turn_id.clone(),
-            expected_transition_reason: latest.transition_reason.clone(),
+            survivor_segment_id: survivor_id,
+            expected_chain_id: survivor.chain_id.clone(),
+            expected_provider_name: survivor.provider_name.clone(),
+            expected_session_id: survivor.session_id.clone(),
+            expected_started_at: survivor.started_at.clone(),
+            expected_ended_at: survivor.ended_at.clone(),
+            expected_last_turn_id: survivor.last_turn_id.clone(),
+            expected_transition_reason: survivor.transition_reason.clone(),
             merged_started_at: earliest.started_at.clone(),
-            merged_ended_at: latest.ended_at.clone(),
-            merged_last_turn_id: latest.last_turn_id.clone(),
-            merged_transition_reason: latest.transition_reason.clone(),
+            merged_ended_at,
+            merged_last_turn_id: tail.last_turn_id.clone(),
+            merged_transition_reason: survivor.transition_reason.clone(),
         });
         for row in rows {
-            if row.id != latest_id {
+            if row.id != survivor_id {
                 merge_deletes.push(SegmentMergeDelete {
                     segment_id: row.id,
-                    survivor_segment_id: latest_id,
+                    survivor_segment_id: survivor_id,
                     expected_chain_id: row.chain_id.clone(),
                     expected_provider_name: row.provider_name.clone(),
                     expected_session_id: row.session_id.clone(),
@@ -1304,6 +1306,38 @@ fn build_segment_merge_plan(
         }
     }
     Ok((merge_groups, merge_deletes))
+}
+
+fn select_segment_merge_survivor<'a>(rows: &[&'a SegmentRow]) -> &'a SegmentRow {
+    rows.iter()
+        .copied()
+        .max_by(|left, right| {
+            left.ended_at
+                .is_none()
+                .cmp(&right.ended_at.is_none())
+                .then_with(|| compare_segment_latest(left, right))
+        })
+        .expect("colliding segment group is nonempty after filter")
+}
+
+fn select_segment_merge_start<'a>(rows: &[&'a SegmentRow]) -> &'a SegmentRow {
+    rows.iter()
+        .copied()
+        .min_by(|left, right| compare_segment_latest(left, right))
+        .expect("colliding segment group is nonempty after filter")
+}
+
+fn select_segment_merge_tail<'a>(rows: &[&'a SegmentRow]) -> &'a SegmentRow {
+    rows.iter()
+        .copied()
+        .max_by(|left, right| compare_segment_latest(left, right))
+        .expect("colliding segment group is nonempty after filter")
+}
+
+fn compare_segment_latest(left: &SegmentRow, right: &SegmentRow) -> std::cmp::Ordering {
+    left.started_at
+        .cmp(&right.started_at)
+        .then(left.id.cmp(&right.id))
 }
 
 fn read_segment_rows(
