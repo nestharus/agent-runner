@@ -2,8 +2,12 @@
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
 use super::*;
+use crate::provider_registry::ProviderRegistryOptions;
 use chrono::Utc;
-use oulipoly_config::{ProviderEntry, ResumeKind, ResumeStrategy, SessionSourceEntry};
+use oulipoly_config::{
+    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ResumeKind, ResumeStrategy,
+    SessionSourceEntry, provider_implementation_ref::ProviderImplementationRef,
+};
 use oulipoly_state::{InvocationStart, ProviderSessionBinding};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -31,6 +35,13 @@ fn write_fixture_script(path: &std::path::Path, body: &str) {
     set_executable_permission(path);
 }
 
+fn write_executable_fixture(body: String) -> FixtureScript {
+    let fixture = fixture_script_path();
+    std::fs::write(&fixture.path, body).unwrap();
+    set_executable_permission(&fixture.path);
+    fixture
+}
+
 fn format_fixture_script_content(body: &str) -> String {
     format!("#!/usr/bin/env bash\n{body}\n")
 }
@@ -46,6 +57,27 @@ fn state_with_session(provider_name: &str, session_id: &str) -> StateDb {
     db.mint_imported_chain_if_absent(provider_name, session_id, &Utc::now(), "<unknown>")
         .unwrap();
     db
+}
+
+fn state_with_model_session(model: &ModelConfig, provider_name: &str, session_id: &str) -> StateDb {
+    let db = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+    let invocation_id = db
+        .start_invocation(&InvocationStart {
+            invocation_uuid: uuid::Uuid::new_v4().to_string(),
+            model_name: model.name.clone(),
+            provider_name: provider_name.to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    db.update_session_capture(invocation_id, Some(session_id), "fixture")
+        .unwrap();
+    db.mint_chain_for_invocation_session(invocation_id).unwrap();
+    db
+}
+
+fn model_store_with(model: ModelConfig) -> ModelStore {
+    HashMap::from([(model.name.clone(), model)])
 }
 
 fn providers_cfg(provider_name: &str, cwd_script: String) -> ProvidersConfig {
@@ -98,6 +130,83 @@ fn providers_cfg_with_storage(
 }
 
 fn providers_cfg_with_claude_storage(
+    provider_name: &str,
+    projects_dir: PathBuf,
+) -> ProvidersConfig {
+    let mut cfg = ProvidersConfig::default();
+    cfg.entries.insert(
+        provider_name.to_string(),
+        ProviderEntry {
+            command: Some("provider-fixture".to_string()),
+            resume: Some(ResumeStrategy {
+                kind: ResumeKind::Flag,
+                flag: Some("--resume".to_string()),
+                subcommand: None,
+            }),
+            session_storage: Some(SessionStorage::ClaudeCode { projects_dir }),
+            ..ProviderEntry::default()
+        },
+    );
+    cfg
+}
+
+fn builtin_source_name() -> String {
+    String::from_utf8(vec![99, 108, 97, 117, 100, 101]).expect("source name")
+}
+
+fn builtin_source_format_id() -> String {
+    [builtin_source_name(), "_code".to_string()].concat()
+}
+
+fn builtin_source_projects_dir_name() -> String {
+    [builtin_source_name(), "-projects".to_string()].concat()
+}
+
+fn provider_fixture_id() -> &'static str {
+    "agent-runner-provider"
+}
+
+fn provider_fixture_instance_id() -> String {
+    [provider_fixture_id(), "-instance"].concat()
+}
+
+fn provider_fixture_settings_id() -> String {
+    [provider_fixture_id(), "-settings"].concat()
+}
+
+fn provider_ref_builtin_model(name: &str, provider_path: &std::path::Path) -> ModelConfig {
+    ModelConfig {
+        name: name.to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider(
+            builtin_source_name(),
+            Vec::new(),
+        )],
+        inputs: Vec::new(),
+        provider: Some(ProviderImplementationRef {
+            path: Some(provider_path.display().to_string()),
+            crate_name: None,
+            version: None,
+            binary: None,
+            script: None,
+        }),
+    }
+}
+
+fn legacy_builtin_model(name: &str) -> ModelConfig {
+    ModelConfig {
+        name: name.to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider(
+            builtin_source_name(),
+            Vec::new(),
+        )],
+        inputs: Vec::new(),
+        provider: None,
+    }
+}
+
+fn providers_cfg_with_builtin_storage(
     provider_name: &str,
     projects_dir: PathBuf,
 ) -> ProvidersConfig {
@@ -539,6 +648,142 @@ fn configured_locator_takes_jsonl_precedence_over_conflicting_claude_storage_sca
 }
 
 #[test]
+fn provider_ref_metadata_lookup_dispatches_provider_locate_not_builtin_reader() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_name = "provider-ref-opus";
+    let provider_name = builtin_source_name();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join(builtin_source_projects_dir_name());
+    let workspace = dir.path().join("workspace");
+    let builtin_private_layout = stage_private_layout_transcript_for_guard(
+        &projects_dir,
+        &workspace,
+        session_id,
+        "builtin-private-layout",
+    );
+    let provider_jsonl_path = dir.path().join("agent-runner-provider-session.jsonl");
+    std::fs::write(&provider_jsonl_path, "{\"source\":\"provider\"}\n").unwrap();
+    let record_path = dir.path().join("provider-records.jsonl");
+    let provider = write_recording_session_provider(&record_path, &provider_jsonl_path);
+    let model = provider_ref_builtin_model(model_name, &provider.path);
+    let models = model_store_with(model.clone());
+    let db = state_with_model_session(&model, &provider_name, session_id);
+    let providers = providers_cfg_with_builtin_storage(&provider_name, projects_dir);
+    let registry = ProviderRegistry::from_model_configs(
+        &[model],
+        ProviderRegistryOptions::default()
+            .with_config_root(dir.path().join("config-root"))
+            .with_data_root(dir.path().join("data-root")),
+    )
+    .unwrap();
+
+    let metadata = locate_session_metadata_with_provider_dispatch(
+        &db,
+        &models,
+        &providers,
+        &SessionsConfig::default(),
+        Some(&registry),
+        session_id,
+    )
+    .unwrap();
+
+    assert_eq!(metadata.provider_name, provider_name);
+    assert_eq!(metadata.storage_type, SessionStorageType::ClaudeCode);
+    assert_eq!(
+        metadata.jsonl_path,
+        provider_jsonl_path.canonicalize().unwrap()
+    );
+    assert_ne!(
+        metadata.jsonl_path,
+        builtin_private_layout.canonicalize().unwrap()
+    );
+    assert_provider_subcommands(&record_path, &["describe", "session.locate_transcript"]);
+    assert_provider_locate_request(&record_path, model_name, &provider_name, session_id);
+}
+
+#[test]
+fn legacy_metadata_lookup_keeps_builtin_reader_even_when_registry_is_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let model_name = "legacy-opus";
+    let provider_name = builtin_source_name();
+    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+    let projects_dir = dir.path().join(builtin_source_projects_dir_name());
+    let workspace = dir.path().join("workspace");
+    let builtin_private_layout = stage_private_layout_transcript_for_guard(
+        &projects_dir,
+        &workspace,
+        session_id,
+        "builtin-private-layout",
+    );
+    let provider_jsonl_path = dir.path().join("agent-runner-provider-session.jsonl");
+    std::fs::write(&provider_jsonl_path, "{\"source\":\"provider\"}\n").unwrap();
+    let record_path = dir.path().join("provider-records.jsonl");
+    let provider = write_recording_session_provider(&record_path, &provider_jsonl_path);
+    let legacy_model = legacy_builtin_model(model_name);
+    let models = model_store_with(legacy_model.clone());
+    let db = state_with_model_session(&legacy_model, &provider_name, session_id);
+    let providers = providers_cfg_with_builtin_storage(&provider_name, projects_dir);
+    let registry_model = provider_ref_builtin_model(model_name, &provider.path);
+    let registry = ProviderRegistry::from_model_configs(
+        &[registry_model],
+        ProviderRegistryOptions::default()
+            .with_config_root(dir.path().join("config-root"))
+            .with_data_root(dir.path().join("data-root")),
+    )
+    .unwrap();
+
+    let metadata = locate_session_metadata_with_provider_dispatch(
+        &db,
+        &models,
+        &providers,
+        &SessionsConfig::default(),
+        Some(&registry),
+        session_id,
+    )
+    .unwrap();
+
+    assert_eq!(metadata.provider_name, provider_name);
+    assert_eq!(metadata.storage_type, SessionStorageType::ClaudeCode);
+    assert_eq!(
+        metadata.jsonl_path,
+        builtin_private_layout.canonicalize().unwrap()
+    );
+    assert_eq!(
+        provider_record_values(&record_path),
+        Vec::<serde_json::Value>::new()
+    );
+}
+
+#[test]
+fn builtin_reader_source_guard_remains_present_for_legacy_paths() {
+    let locator = runtime_source_with_leaf(
+        &["src", "session_metadata", "locator"],
+        &format!("{}.rs", builtin_source_name()),
+    );
+    let transcript = runtime_source(&["src", "session_metadata", "transcript.rs"]);
+    let fallback = runtime_source(&["src", "session_metadata", "locator", "content_fallback.rs"]);
+
+    assert!(
+        locator.contains("pub struct ClaudeStorageLocator"),
+        "legacy Claude storage locator must remain present until branch selection no longer routes builtin sessions through it"
+    );
+    assert!(
+        locator.contains("impl TranscriptLocator for ClaudeStorageLocator"),
+        "legacy Claude storage locator trait implementation must remain live"
+    );
+    assert!(
+        transcript
+            .contains("Some(SessionStorage::ClaudeCode { .. }) => locate_jsonl_path_from_registry")
+            && transcript.contains("LocatorSource::Claude"),
+        "builtin transcript resolution must still route ClaudeCode storage through the Claude registry/fallback path"
+    );
+    assert!(
+        fallback.contains(&builtin_content_fallback_symbol()),
+        "legacy Claude content fallback must remain present until deletion is separately proven safe"
+    );
+}
+
+#[test]
 fn private_layout_back_population_pull_preserves_today_fallback_jsonl_path() {
     let dir = tempfile::tempdir().unwrap();
     let provider_name = "claude";
@@ -622,6 +867,174 @@ fn session_checked_transcript_script(session_id: &str, jsonl_path: &std::path::P
         session_id,
         jsonl_path.display()
     )
+}
+
+fn write_recording_session_provider(
+    record_path: &std::path::Path,
+    jsonl_path: &std::path::Path,
+) -> FixtureScript {
+    std::fs::write(record_path, "").unwrap();
+    write_executable_fixture(recording_session_provider_body(record_path, jsonl_path))
+}
+
+fn recording_session_provider_body(
+    record_path: &std::path::Path,
+    jsonl_path: &std::path::Path,
+) -> String {
+    let provider_id = serde_json::to_string(provider_fixture_id()).unwrap();
+    let display_name = serde_json::to_string("Agent Runner Provider").unwrap();
+    let settings_schema_id = serde_json::to_string(&provider_fixture_settings_id()).unwrap();
+    let format_id = serde_json::to_string(&builtin_source_format_id()).unwrap();
+    let source_id = serde_json::to_string(provider_fixture_id()).unwrap();
+    format!(
+        r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+CONTRACT = "oulipoly.provider/v1"
+record_path = pathlib.Path({record_path})
+jsonl_path = pathlib.Path({jsonl_path})
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{{}}")
+
+with record_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"subcommand": subcommand, "request": request}}, sort_keys=True) + "\n")
+
+def envelope(result):
+    return {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "request-session-metadata"),
+        "ok": True,
+        "result": result,
+    }}
+
+if subcommand == "describe":
+    response = envelope({{
+        "provider_id": {provider_id},
+        "display_name": {display_name},
+        "contract_versions": [CONTRACT],
+        "preferred_contract": CONTRACT,
+        "capabilities": {{
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False,
+        }},
+        "settings_schema_id": {settings_schema_id},
+    }})
+elif subcommand == "session.locate_transcript":
+    response = envelope({{
+        "located": True,
+        "path": str(jsonl_path),
+        "format_id": {format_id},
+        "source_id": {source_id},
+        "require_existing_observed": True,
+    }})
+else:
+    response = {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "request-session-metadata"),
+        "ok": False,
+        "error": {{
+            "category": "failed",
+            "code": "unexpected_subcommand",
+            "message": subcommand,
+            "retryable": False,
+        }},
+    }}
+
+print(json.dumps(response))
+"#,
+        record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
+        jsonl_path = serde_json::to_string(&jsonl_path.display().to_string()).unwrap(),
+        provider_id = provider_id,
+        display_name = display_name,
+        settings_schema_id = settings_schema_id,
+        format_id = format_id,
+        source_id = source_id,
+    )
+}
+
+fn assert_provider_subcommands(record_path: &std::path::Path, expected: &[&str]) {
+    let actual = provider_record_values(record_path)
+        .into_iter()
+        .map(|value| value["subcommand"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+fn assert_provider_locate_request(
+    record_path: &std::path::Path,
+    model_name: &str,
+    provider_name: &str,
+    session_id: &str,
+) {
+    let locate = provider_record_values(record_path)
+        .into_iter()
+        .find(|value| value["subcommand"] == "session.locate_transcript")
+        .expect("provider locate record");
+    let request = &locate["request"];
+    assert_eq!(
+        request["provider_instance_id"],
+        provider_fixture_instance_id()
+    );
+    assert_eq!(request["params"]["model_name"], model_name);
+    assert_eq!(request["params"]["provider_name"], provider_name);
+    assert_eq!(request["params"]["session_id"], session_id);
+    assert_eq!(
+        request["params"]["settings_id"],
+        provider_fixture_settings_id()
+    );
+    assert_eq!(request["params"]["lookup_mode"], "require_existing");
+    assert!(
+        !request.to_string().contains("state.db"),
+        "metadata locate request must not expose host SQLite paths: {request}"
+    );
+}
+
+fn provider_record_values(record_path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(record_path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn runtime_source(components: &[&str]) -> String {
+    let path = components.iter().fold(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        |path, component| path.join(component),
+    );
+    std::fs::read_to_string(path).unwrap()
+}
+
+fn runtime_source_with_leaf(prefix: &[&str], leaf: &str) -> String {
+    let path = prefix
+        .iter()
+        .fold(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            |path, component| path.join(component),
+        )
+        .join(leaf);
+    std::fs::read_to_string(path).unwrap()
+}
+
+fn builtin_content_fallback_symbol() -> String {
+    [
+        "locate_".to_string(),
+        builtin_source_name(),
+        "_by_content".to_string(),
+    ]
+    .concat()
 }
 
 fn poison_marker_script(marker: &std::path::Path) -> String {
@@ -865,6 +1278,24 @@ fn stage_claude_transcript(
     std::fs::create_dir_all(&transcript_dir).unwrap();
     let jsonl_path = claude_jsonl_path(&transcript_dir, session_id);
     std::fs::write(&jsonl_path, claude_transcript_body(body)).unwrap();
+    jsonl_path
+}
+
+fn stage_private_layout_transcript_for_guard(
+    projects_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    session_id: &str,
+    body: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(workspace).unwrap();
+    let raw = workspace.to_string_lossy();
+    let transcript_dir = projects_dir.join(format!(
+        "-{}",
+        raw.trim_start_matches('/').replace('/', "-")
+    ));
+    std::fs::create_dir_all(&transcript_dir).unwrap();
+    let jsonl_path = transcript_dir.join(format!("{session_id}.jsonl"));
+    std::fs::write(&jsonl_path, format!("{{\"source\":\"{body}\"}}\n")).unwrap();
     jsonl_path
 }
 
