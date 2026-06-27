@@ -30,6 +30,7 @@
 
 mod cases_basic;
 mod cases_batch_sweep;
+mod cases_live_pty_retry;
 mod cases_opencode;
 mod cases_wake_backlog;
 mod fake_cli;
@@ -137,6 +138,16 @@ fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
 fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
     cases_wake_backlog::wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox(
     );
+}
+
+#[test]
+fn live_pty_nack_pending_is_retried_by_sweep() {
+    cases_live_pty_retry::live_pty_nack_pending_is_retried_by_sweep();
+}
+
+#[test]
+fn live_pty_repeated_nack_keeps_pending_without_claim() {
+    cases_live_pty_retry::live_pty_repeated_nack_keeps_pending_without_claim();
 }
 
 #[test]

@@ -3,10 +3,16 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxRow, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
+    MailboxDb, MailboxRow, SessionRuntimeRow, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
 };
+use serde::Serialize;
 use std::path::Path;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use oulipoly_runtime::executor::cli::pty_broker::{
+    PtyControlClientErrorKind, inject_control_envelope,
+};
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
@@ -28,6 +34,120 @@ pub(crate) struct PreparedPtyMailboxDelivery {
     pub seqs: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PtyMailboxDeliveryDiagnostic {
+    pub(crate) attempted: bool,
+    pub(crate) status: String,
+    pub(crate) control_path: Option<String>,
+    pub(crate) delivered_seqs: Vec<i64>,
+    pub(crate) remaining_pending: Option<usize>,
+    pub(crate) message: Option<String>,
+}
+
+#[cfg(unix)]
+pub(crate) fn attempt_pty_mailbox_delivery(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+) -> PtyMailboxDeliveryDiagnostic {
+    let runtime = match mailbox.session_runtime(session_id) {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => {
+            return pty_status(
+                false,
+                "no_runtime",
+                None,
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                None,
+            );
+        }
+        Err(err) => return pty_status(false, "no_runtime", None, Vec::new(), None, Some(err)),
+    };
+    if runtime.mode != "pty_interactive" {
+        return pty_status(
+            false,
+            "not_pty",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        );
+    }
+    let Some(control_path) = live_pty_control_path(&runtime) else {
+        return pty_status(
+            false,
+            "no_socket",
+            runtime.pty_control_path,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        );
+    };
+    let Some(prepared) = (match prepare_pty_mailbox_delivery(mailbox, session_id) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            return pty_status(
+                false,
+                "protocol_error",
+                Some(control_path),
+                Vec::new(),
+                None,
+                Some(err),
+            );
+        }
+    }) else {
+        return pty_status(
+            false,
+            "no_pending",
+            Some(control_path),
+            Vec::new(),
+            Some(0),
+            None,
+        );
+    };
+    if prepared.envelope.len() > mailbox_prefix_max_bytes() {
+        return pty_status(
+            false,
+            "protocol_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("oversize_frame".to_string()),
+        );
+    }
+    match inject_control_envelope(&control_path, &prepared.envelope) {
+        Ok(response) if response.ack => {
+            mark_pty_batch_delivered(mailbox, session_id, &runtime, &prepared.seqs, control_path)
+        }
+        Ok(response) => {
+            let status = if response.message == "unsafe_mid_line" {
+                "unsafe_mid_line"
+            } else {
+                "protocol_error"
+            };
+            pty_status(
+                true,
+                status,
+                Some(control_path),
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                Some(response.message),
+            )
+        }
+        Err(err) => {
+            pty_client_error_status(mailbox, session_id, control_path, err.kind, err.message)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn attempt_pty_mailbox_delivery(
+    _mailbox: &mut MailboxDb,
+    _session_id: &str,
+) -> PtyMailboxDeliveryDiagnostic {
+    pty_status(false, "not_pty", None, Vec::new(), None, None)
+}
+
 pub(crate) fn prepare_pty_mailbox_delivery(
     db: &MailboxDb,
     session_id: &str,
@@ -45,6 +165,99 @@ pub(crate) fn prepare_pty_mailbox_delivery(
 
 pub(crate) fn mailbox_prefix_max_bytes() -> usize {
     MAILBOX_PREFIX_MAX_BYTES
+}
+
+#[cfg(unix)]
+fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
+    (runtime.run_state == "running")
+        .then_some(runtime.pty_control_path.as_ref())
+        .flatten()
+        .filter(|path| !path.is_empty())
+        .cloned()
+}
+
+#[cfg(unix)]
+fn mark_pty_batch_delivered(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    runtime: &SessionRuntimeRow,
+    seqs: &[i64],
+    control_path: String,
+) -> PtyMailboxDeliveryDiagnostic {
+    let Some(invocation_uuid) = runtime.running_invocation_uuid.as_deref() else {
+        return pty_status(
+            true,
+            "mark_delivered_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("running invocation missing".to_string()),
+        );
+    };
+    match mailbox.mark_delivered(session_id, seqs, invocation_uuid) {
+        Ok(()) => pty_status(
+            true,
+            "acked",
+            Some(control_path),
+            seqs.to_vec(),
+            pending_count(mailbox, session_id),
+            Some("ok".to_string()),
+        ),
+        Err(err) => pty_status(
+            true,
+            "mark_delivered_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some(err),
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn pty_client_error_status(
+    mailbox: &MailboxDb,
+    session_id: &str,
+    control_path: String,
+    kind: PtyControlClientErrorKind,
+    message: String,
+) -> PtyMailboxDeliveryDiagnostic {
+    let status = match kind {
+        PtyControlClientErrorKind::Connect => "connect_error",
+        PtyControlClientErrorKind::Protocol
+        | PtyControlClientErrorKind::Oversize
+        | PtyControlClientErrorKind::EmptyPayload => "protocol_error",
+    };
+    pty_status(
+        true,
+        status,
+        Some(control_path),
+        Vec::new(),
+        pending_count(mailbox, session_id),
+        Some(message),
+    )
+}
+
+fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
+    mailbox.list_pending(session_id).map(|rows| rows.len()).ok()
+}
+
+fn pty_status(
+    attempted: bool,
+    status: &str,
+    control_path: Option<String>,
+    delivered_seqs: Vec<i64>,
+    remaining_pending: Option<usize>,
+    message: Option<String>,
+) -> PtyMailboxDeliveryDiagnostic {
+    PtyMailboxDeliveryDiagnostic {
+        attempted,
+        status: status.to_string(),
+        control_path,
+        delivered_seqs,
+        remaining_pending,
+        message,
+    }
 }
 
 pub(crate) fn prepare_headless_resume_delivery(

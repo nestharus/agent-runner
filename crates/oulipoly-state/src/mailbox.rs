@@ -635,6 +635,10 @@ impl MailboxDb {
         self.wake_sweep_candidates_for_sessions(stale_after_seconds, limit, session_ids)
     }
 
+    pub fn pending_delivery_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
+        self.pending_wake_session_ids(limit)
+    }
+
     fn wake_sweep_candidates_for_sessions(
         &mut self,
         stale_after_seconds: i64,
