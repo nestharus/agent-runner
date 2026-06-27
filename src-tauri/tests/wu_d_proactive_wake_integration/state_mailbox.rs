@@ -10,11 +10,14 @@ use crate::model_config::path_string;
 use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::Connection;
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 struct SeedMailboxArtifacts {
@@ -137,6 +140,27 @@ impl Fixture {
             effective_cwd: None,
         })
         .unwrap();
+    }
+
+    pub(crate) fn seed_live_pty_runtime(&self, control_path: &Path) -> ProcessIdentity {
+        let identity = crate::wake_claim_setup::current_process_identity();
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let models_dir = path_string(&self.models_dir);
+        let control_path = path_string(control_path);
+        db.mark_session_running(SessionRuntimeRunningUpdate {
+            session_id: SESSION,
+            mode: "pty_interactive",
+            invocation_uuid: INVOCATION,
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL),
+            identity: &identity,
+            pty_control_path: Some(&control_path),
+            turn_start_max_mailbox_seq: None,
+            models_dir: Some(&models_dir),
+            effective_cwd: None,
+        })
+        .unwrap();
+        identity
     }
 
     pub(crate) fn seed_active_chain_for(

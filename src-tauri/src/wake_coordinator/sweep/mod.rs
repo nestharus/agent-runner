@@ -6,7 +6,9 @@ mod candidate;
 mod consumed;
 mod state;
 
-use oulipoly_state::mailbox::{MailboxDb, WAKE_SWEEP_ABANDONED_ERROR, WakeSweepCandidate};
+use oulipoly_state::mailbox::{
+    MailboxDb, SessionLiveness, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeSweepCandidate,
+};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -17,6 +19,7 @@ use super::constants::{
 };
 use super::diagnostics::WakeDiagnostic;
 use super::wake_start::{StartWakeInput, start_wake_chain};
+use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
 
 pub(crate) fn run_startup_wake_reclaim_sweep() {
     if is_auto_wake_invocation() {
@@ -65,6 +68,7 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
+    retry_pending_live_pty_deliveries(&mut db)?;
     let candidates = db.wake_sweep_candidates(
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
@@ -77,6 +81,36 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
         trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
     }
     Ok(())
+}
+
+fn retry_pending_live_pty_deliveries(db: &mut MailboxDb) -> Result<(), String> {
+    let session_ids = db.pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
+    for session_id in session_ids {
+        if live_pty_retry_is_applicable(db, &session_id)? {
+            let diagnostic = crate::mailbox_delivery::attempt_pty_mailbox_delivery(db, &session_id);
+            trace_live_pty_retry(&session_id, &diagnostic);
+        }
+    }
+    Ok(())
+}
+
+fn live_pty_retry_is_applicable(db: &mut MailboxDb, session_id: &str) -> Result<bool, String> {
+    let Some(runtime) = db.session_runtime(session_id)? else {
+        return Ok(false);
+    };
+    if !runtime_is_running_pty_with_socket(&runtime) {
+        return Ok(false);
+    }
+    Ok(db.session_liveness(session_id)? == SessionLiveness::Busy)
+}
+
+fn runtime_is_running_pty_with_socket(runtime: &SessionRuntimeRow) -> bool {
+    runtime.mode == "pty_interactive"
+        && runtime.run_state == "running"
+        && runtime
+            .pty_control_path
+            .as_deref()
+            .is_some_and(|path| !path.is_empty())
 }
 
 fn wake_sweep_start_input<'a>(
@@ -186,5 +220,14 @@ fn trace_wake_sweep_candidate(session_id: &str, diagnostic: &WakeDiagnostic) {
         session_id,
         status = diagnostic.status.as_str(),
         "Wake reclaim sweep candidate evaluated"
+    );
+}
+
+fn trace_live_pty_retry(session_id: &str, diagnostic: &PtyMailboxDeliveryDiagnostic) {
+    tracing::debug!(
+        session_id,
+        status = diagnostic.status.as_str(),
+        delivered = diagnostic.delivered_seqs.len(),
+        "Wake reclaim sweep retried live PTY mailbox delivery"
     );
 }
