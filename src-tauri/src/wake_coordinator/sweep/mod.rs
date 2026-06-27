@@ -128,7 +128,7 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    retry_pending_live_pty_deliveries(&mut db)?;
+    retry_pending_live_pty_deliveries(&mut db, trigger)?;
     let candidates = db.wake_sweep_candidates(
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
@@ -144,37 +144,81 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
 }
 
 fn retry_pending_live_pty_deliveries_or_warn(trigger: &str) {
-    if let Err(err) = retry_pending_live_pty_deliveries_from_default_db() {
+    if let Err(err) = retry_pending_live_pty_deliveries_from_default_db(trigger) {
         warn_wake_reclaim_sweep_failed(trigger, err);
     }
 }
 
-fn retry_pending_live_pty_deliveries_from_default_db() -> Result<(), String> {
+fn retry_pending_live_pty_deliveries_from_default_db(trigger: &str) -> Result<(), String> {
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    retry_pending_live_pty_deliveries(&mut db)
+    retry_pending_live_pty_deliveries(&mut db, trigger)
 }
 
-fn retry_pending_live_pty_deliveries(db: &mut MailboxDb) -> Result<(), String> {
+fn retry_pending_live_pty_deliveries(db: &mut MailboxDb, trigger: &str) -> Result<(), String> {
     let session_ids = db.pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
     for session_id in session_ids {
-        if live_pty_retry_is_applicable(db, &session_id)? {
-            let diagnostic = crate::mailbox_delivery::attempt_pty_mailbox_delivery(db, &session_id);
-            trace_live_pty_retry(&session_id, &diagnostic);
+        match live_pty_retry_applicability(db, &session_id)? {
+            LivePtyRetryApplicability::Applicable => {
+                let diagnostic = crate::mailbox_delivery::attempt_pty_mailbox_delivery_with_trigger(
+                    db,
+                    &session_id,
+                    trigger,
+                );
+                trace_live_pty_retry(trigger, &session_id, &diagnostic);
+            }
+            LivePtyRetryApplicability::Skip { reason, liveness } => {
+                trace_live_pty_retry_skip(trigger, &session_id, reason, liveness.as_deref());
+            }
         }
     }
     Ok(())
 }
 
-fn live_pty_retry_is_applicable(db: &mut MailboxDb, session_id: &str) -> Result<bool, String> {
+enum LivePtyRetryApplicability {
+    Applicable,
+    Skip {
+        reason: &'static str,
+        liveness: Option<String>,
+    },
+}
+
+fn live_pty_retry_applicability(
+    db: &mut MailboxDb,
+    session_id: &str,
+) -> Result<LivePtyRetryApplicability, String> {
     let Some(runtime) = db.session_runtime(session_id)? else {
-        return Ok(false);
+        return Ok(LivePtyRetryApplicability::Skip {
+            reason: "no_runtime",
+            liveness: None,
+        });
     };
     if !runtime_is_running_pty_with_socket(&runtime) {
-        return Ok(false);
+        return Ok(LivePtyRetryApplicability::Skip {
+            reason: runtime_skip_reason(&runtime),
+            liveness: None,
+        });
     }
-    Ok(db.session_liveness(session_id)? == SessionLiveness::Busy)
+    let liveness = db.session_liveness(session_id)?;
+    if liveness == SessionLiveness::Busy {
+        Ok(LivePtyRetryApplicability::Applicable)
+    } else {
+        Ok(LivePtyRetryApplicability::Skip {
+            reason: "not_busy",
+            liveness: Some(format!("{liveness:?}")),
+        })
+    }
+}
+
+fn runtime_skip_reason(runtime: &SessionRuntimeRow) -> &'static str {
+    if runtime.mode != "pty_interactive" {
+        "not_pty"
+    } else if runtime.run_state != "running" {
+        "not_running"
+    } else {
+        "no_socket"
+    }
 }
 
 fn runtime_is_running_pty_with_socket(runtime: &SessionRuntimeRow) -> bool {
@@ -296,12 +340,58 @@ fn trace_wake_sweep_candidate(session_id: &str, diagnostic: &WakeDiagnostic) {
     );
 }
 
-fn trace_live_pty_retry(session_id: &str, diagnostic: &PtyMailboxDeliveryDiagnostic) {
+fn trace_live_pty_retry(
+    trigger: &str,
+    session_id: &str,
+    diagnostic: &PtyMailboxDeliveryDiagnostic,
+) {
     tracing::debug!(
         session_id,
         status = diagnostic.status.as_str(),
         submitted = diagnostic.submitted,
         delivered = diagnostic.delivered_seqs.len(),
         "Wake reclaim sweep retried live PTY mailbox delivery"
+    );
+    if crate::mailbox_delivery::trace_notify_enabled() {
+        eprintln!(
+            concat!(
+                "oulipoly_notify_trace trigger={} session_id={} liveness=Busy ",
+                "attempted={} decision={} inject_status={} submitted={} ",
+                "remaining_pending={:?} message={:?}"
+            ),
+            trigger,
+            session_id,
+            diagnostic.attempted,
+            if diagnostic.submitted {
+                "inject"
+            } else {
+                "skip"
+            },
+            diagnostic.status,
+            diagnostic.submitted,
+            diagnostic.remaining_pending,
+            diagnostic.message,
+        );
+    }
+}
+
+fn trace_live_pty_retry_skip(
+    trigger: &str,
+    session_id: &str,
+    reason: &str,
+    liveness: Option<&str>,
+) {
+    if !crate::mailbox_delivery::trace_notify_enabled() {
+        return;
+    }
+    eprintln!(
+        concat!(
+            "oulipoly_notify_trace trigger={} session_id={} liveness={} ",
+            "attempted=false decision=skip inject_status={} submitted=false"
+        ),
+        trigger,
+        session_id,
+        liveness.unwrap_or("unknown"),
+        reason,
     );
 }

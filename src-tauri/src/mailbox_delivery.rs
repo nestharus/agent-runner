@@ -46,7 +46,18 @@ pub(crate) struct PtyMailboxDeliveryDiagnostic {
 }
 
 #[cfg(unix)]
-pub(crate) fn attempt_pty_mailbox_delivery(
+pub(crate) fn attempt_pty_mailbox_delivery_with_trigger(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    trigger: &str,
+) -> PtyMailboxDeliveryDiagnostic {
+    let diagnostic = attempt_pty_mailbox_delivery_inner(mailbox, session_id);
+    trace_notify_pty_attempt(trigger, session_id, &diagnostic);
+    diagnostic
+}
+
+#[cfg(unix)]
+fn attempt_pty_mailbox_delivery_inner(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> PtyMailboxDeliveryDiagnostic {
@@ -121,14 +132,10 @@ pub(crate) fn attempt_pty_mailbox_delivery(
             mark_pty_batch_delivered(mailbox, session_id, &runtime, &prepared.seqs, control_path)
         }
         Ok(response) => {
-            let status = if response.message == "unsafe_mid_line" {
-                "unsafe_mid_line"
-            } else {
-                "protocol_error"
-            };
+            let status = pty_nack_status(&response.message).to_string();
             pty_status(
                 true,
-                status,
+                &status,
                 Some(control_path),
                 Vec::new(),
                 pending_count(mailbox, session_id),
@@ -142,9 +149,10 @@ pub(crate) fn attempt_pty_mailbox_delivery(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn attempt_pty_mailbox_delivery(
+pub(crate) fn attempt_pty_mailbox_delivery_with_trigger(
     _mailbox: &mut MailboxDb,
     _session_id: &str,
+    _trigger: &str,
 ) -> PtyMailboxDeliveryDiagnostic {
     pty_status(false, "not_pty", None, Vec::new(), None, None)
 }
@@ -264,6 +272,57 @@ fn pty_status(
 
 fn pty_status_implies_submit(status: &str) -> bool {
     matches!(status, "acked" | "mark_delivered_error")
+}
+
+fn pty_nack_status(message: &str) -> &str {
+    match message {
+        "unsafe_mid_line"
+        | "unsafe_child_output_active"
+        | "unsafe_foreground_process"
+        | "unsafe_foreground_unknown" => message,
+        _ => "protocol_error",
+    }
+}
+
+pub(crate) fn trace_notify_enabled() -> bool {
+    matches!(
+        std::env::var("OULIPOLY_TRACE_NOTIFY").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+fn trace_notify_pty_attempt(
+    trigger: &str,
+    session_id: &str,
+    diagnostic: &PtyMailboxDeliveryDiagnostic,
+) {
+    if !trace_notify_enabled() {
+        return;
+    }
+    eprintln!(
+        concat!(
+            "oulipoly_notify_trace trigger={} session_id={} attempted={} ",
+            "control_path_present={} decision={} inject_status={} submitted={} ",
+            "delivered_count={} remaining_pending={:?} message={:?} consumed=unknown"
+        ),
+        trigger,
+        session_id,
+        diagnostic.attempted,
+        diagnostic
+            .control_path
+            .as_deref()
+            .is_some_and(|path| !path.is_empty()),
+        if diagnostic.submitted {
+            "inject"
+        } else {
+            "skip"
+        },
+        diagnostic.status,
+        diagnostic.submitted,
+        diagnostic.delivered_seqs.len(),
+        diagnostic.remaining_pending,
+        diagnostic.message,
+    );
 }
 
 pub(crate) fn prepare_headless_resume_delivery(

@@ -211,7 +211,11 @@ fn delivery_and_wake_after_enqueue(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> (PtyMailboxDeliveryDiagnostic, Option<WakeDiagnostic>) {
-    let pty_delivery = crate::mailbox_delivery::attempt_pty_mailbox_delivery(mailbox, session_id);
+    let pty_delivery = crate::mailbox_delivery::attempt_pty_mailbox_delivery_with_trigger(
+        mailbox,
+        session_id,
+        "notify-time",
+    );
     let wake = if pty_delivery.delivered_seqs.is_empty() {
         Some(crate::wake_coordinator::trigger_notify_wake(session_id))
     } else {
