@@ -55,6 +55,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -140,6 +141,7 @@ enum MonitorCommand {
     SelectNext,
     SelectPrev,
     SelectIndex(usize),
+    ToggleTreeMode,
     Refresh,
     Collapse,
     ToggleInspect,
@@ -261,6 +263,7 @@ enum BottomKey {
     MoveStart,
     MoveEnd,
     Clear,
+    TreeMode,
     Refresh,
     Collapse,
     Inspect,
@@ -444,6 +447,10 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::Clear,
             consumed: 1,
         },
+        [0x14, ..] => ParsedBottomKey {
+            key: BottomKey::TreeMode,
+            consumed: 1,
+        },
         [0x12, ..] => ParsedBottomKey {
             key: BottomKey::Refresh,
             consumed: 1,
@@ -492,6 +499,7 @@ fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
         BottomKey::MoveStart => BottomInputRoute::PseudoInput(PseudoInputAction::MoveStart),
         BottomKey::MoveEnd => BottomInputRoute::PseudoInput(PseudoInputAction::MoveEnd),
         BottomKey::Clear => BottomInputRoute::PseudoInput(PseudoInputAction::Clear),
+        BottomKey::TreeMode => BottomInputRoute::Command(MonitorCommand::ToggleTreeMode),
         BottomKey::Refresh => BottomInputRoute::Command(MonitorCommand::Refresh),
         BottomKey::Collapse => BottomInputRoute::CommandAndFocusTop(MonitorCommand::Collapse),
         BottomKey::Inspect => BottomInputRoute::Command(MonitorCommand::ToggleInspect),
@@ -1296,11 +1304,27 @@ fn normalize_message_body(body: &str) -> String {
         .to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorViewMode {
+    Flat,
+    Tree,
+}
+
+impl MonitorViewMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Flat => Self::Tree,
+            Self::Tree => Self::Flat,
+        }
+    }
+}
+
 /// Bottom-pane monitor state: collapse/expand, the latest read-only snapshot, and
 /// the current selection. Holds no terminal or IO handles.
 #[derive(Clone)]
 struct MonitorPane {
     collapsed: bool,
+    view_mode: MonitorViewMode,
     selected: usize,
     selected_node_id: Option<MonitorNodeId>,
     snapshot: Option<Arc<MonitorSnapshot>>,
@@ -1323,6 +1347,7 @@ impl MonitorPane {
     fn new() -> Self {
         Self {
             collapsed: true,
+            view_mode: MonitorViewMode::Flat,
             selected: 0,
             selected_node_id: None,
             snapshot: None,
@@ -1400,16 +1425,33 @@ impl MonitorPane {
     }
 
     fn select_next(&mut self) {
-        let len = self.node_count();
-        if len > 0 {
-            self.selected = (self.selected + 1).min(len - 1);
-            self.sync_selected_node_id();
-        }
+        let Some(next) = self.adjacent_selection(1) else {
+            return;
+        };
+        self.selected = next;
+        self.sync_selected_node_id();
     }
 
     fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let Some(prev) = self.adjacent_selection(-1) else {
+            return;
+        };
+        self.selected = prev;
         self.sync_selected_node_id();
+    }
+
+    fn adjacent_selection(&self, delta: isize) -> Option<usize> {
+        let snapshot = self.snapshot.as_ref()?;
+        let rows = projected_monitor_rows(snapshot, self.view_mode);
+        let current = selected_projected_position(&rows, self.selected).unwrap_or(0);
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(rows.len().saturating_sub(1))
+        };
+        rows.get(next).map(|row| row.index)
     }
 
     fn select_index(&mut self, index: usize) {
@@ -1417,6 +1459,11 @@ impl MonitorPane {
             self.selected = index;
             self.sync_selected_node_id();
         }
+    }
+
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.toggled();
+        self.sync_selected_node_id();
     }
 
     /// Apply a decoded monitor command. Returns whether a forced refresh is wanted.
@@ -1435,6 +1482,10 @@ impl MonitorPane {
             MonitorCommand::SelectIndex(index) => {
                 self.select_index(index);
                 self.update_inspect();
+                false
+            }
+            MonitorCommand::ToggleTreeMode => {
+                self.toggle_view_mode();
                 false
             }
             MonitorCommand::Refresh => true,
@@ -1856,6 +1907,146 @@ fn snapshot_node_count(snapshot: &MonitorSnapshot) -> usize {
     snapshot.nodes.len()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectedMonitorRow {
+    index: usize,
+    prefix: String,
+}
+
+fn projected_monitor_rows(
+    snapshot: &MonitorSnapshot,
+    mode: MonitorViewMode,
+) -> Vec<ProjectedMonitorRow> {
+    match mode {
+        MonitorViewMode::Flat => flat_monitor_rows(snapshot),
+        MonitorViewMode::Tree => tree_monitor_rows(snapshot),
+    }
+}
+
+fn flat_monitor_rows(snapshot: &MonitorSnapshot) -> Vec<ProjectedMonitorRow> {
+    (0..snapshot.nodes.len())
+        .map(|index| ProjectedMonitorRow {
+            index,
+            prefix: String::new(),
+        })
+        .collect()
+}
+
+fn tree_monitor_rows(snapshot: &MonitorSnapshot) -> Vec<ProjectedMonitorRow> {
+    let index_by_id = monitor_index_by_id(snapshot);
+    let children = monitor_children_by_parent(snapshot, &index_by_id);
+    let roots = monitor_tree_roots(snapshot, &index_by_id);
+    let mut rows = Vec::with_capacity(snapshot.nodes.len());
+    let mut emitted = HashSet::new();
+    for (position, root) in roots.iter().copied().enumerate() {
+        push_tree_row(
+            root,
+            position + 1 == roots.len(),
+            &[],
+            &children,
+            &mut emitted,
+            &mut rows,
+        );
+    }
+    for index in 0..snapshot.nodes.len() {
+        if emitted.contains(&index) {
+            continue;
+        }
+        push_tree_row(index, true, &[], &children, &mut emitted, &mut rows);
+    }
+    rows
+}
+
+fn monitor_index_by_id(snapshot: &MonitorSnapshot) -> HashMap<&str, usize> {
+    let mut index_by_id = HashMap::new();
+    for (index, node) in snapshot.nodes.iter().enumerate() {
+        index_by_id.entry(node.id.as_str()).or_insert(index);
+    }
+    index_by_id
+}
+
+fn monitor_children_by_parent(
+    snapshot: &MonitorSnapshot,
+    index_by_id: &HashMap<&str, usize>,
+) -> HashMap<usize, Vec<usize>> {
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, node) in snapshot.nodes.iter().enumerate() {
+        let Some(parent) = node.parent_id.as_deref() else {
+            continue;
+        };
+        if let Some(parent_index) = index_by_id.get(parent).copied() {
+            children.entry(parent_index).or_default().push(index);
+        }
+    }
+    children
+}
+
+fn monitor_tree_roots(
+    snapshot: &MonitorSnapshot,
+    index_by_id: &HashMap<&str, usize>,
+) -> Vec<usize> {
+    snapshot
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| monitor_node_is_root(node, index_by_id).then_some(index))
+        .collect()
+}
+
+fn monitor_node_is_root(node: &MonitorNode, index_by_id: &HashMap<&str, usize>) -> bool {
+    node.parent_id
+        .as_deref()
+        .is_none_or(|parent| !index_by_id.contains_key(parent))
+}
+
+fn push_tree_row(
+    index: usize,
+    is_last: bool,
+    ancestor_last: &[bool],
+    children: &HashMap<usize, Vec<usize>>,
+    emitted: &mut HashSet<usize>,
+    rows: &mut Vec<ProjectedMonitorRow>,
+) {
+    if !emitted.insert(index) {
+        return;
+    }
+    rows.push(ProjectedMonitorRow {
+        index,
+        prefix: tree_prefix(ancestor_last, is_last),
+    });
+    let Some(child_indexes) = children.get(&index) else {
+        return;
+    };
+    let mut child_ancestors = ancestor_last.to_vec();
+    child_ancestors.push(is_last);
+    for (position, child) in child_indexes.iter().copied().enumerate() {
+        push_tree_row(
+            child,
+            position + 1 == child_indexes.len(),
+            &child_ancestors,
+            children,
+            emitted,
+            rows,
+        );
+    }
+}
+
+fn tree_prefix(ancestor_last: &[bool], is_last: bool) -> String {
+    if ancestor_last.is_empty() {
+        return String::new();
+    }
+    let mut prefix = String::new();
+    for last in &ancestor_last[..ancestor_last.len() - 1] {
+        prefix.push_str(if *last { "   " } else { "│  " });
+    }
+    prefix.push_str(if is_last { "└─ " } else { "├─ " });
+    prefix
+}
+
+fn selected_projected_position(rows: &[ProjectedMonitorRow], selected: usize) -> Option<usize> {
+    rows.iter().position(|row| row.index == selected)
+}
+
 /// Map a `vt100` colour to a `ratatui` colour.
 fn vt_color(color: vt100::Color) -> Color {
     match color {
@@ -2251,7 +2442,11 @@ fn visible_inspect_rows(pane: &MonitorPane, body_height: u16) -> impl Iterator<I
 fn render_status_row(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Focus) {
     let hint = status_hint(pane, focus);
     let label = pad_to_width(
-        format!(" OBS  {}  —  {hint}", monitor_summary_text(pane)),
+        format!(
+            " OBS  {} · {}  —  {hint}",
+            monitor_summary_text(pane),
+            view_mode_word(pane.view_mode)
+        ),
         area.width,
     );
     let style = Style::default()
@@ -2275,9 +2470,18 @@ fn bottom_status_hint(pane: &MonitorPane) -> String {
     }
     match pane.cancel_feedback.as_deref() {
         Some(feedback) => {
-            format!("type to draft · Enter queue · ↑/↓ move · Ctrl+O top  ({feedback})")
+            format!(
+                "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top  ({feedback})"
+            )
         }
-        None => "type to draft · Enter queue · ↑/↓ move · Ctrl+O top".to_string(),
+        None => "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top".to_string(),
+    }
+}
+
+fn view_mode_word(mode: MonitorViewMode) -> &'static str {
+    match mode {
+        MonitorViewMode::Flat => "flat",
+        MonitorViewMode::Tree => "tree",
     }
 }
 
@@ -2310,13 +2514,19 @@ fn render_node_list(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
         );
         return;
     }
-    for VisibleNodeRow { index, y, node } in visible_node_rows(pane, snapshot, area) {
+    for VisibleNodeRow {
+        index,
+        y,
+        node,
+        prefix,
+    } in visible_node_rows(pane, snapshot, area)
+    {
         let row = Rect {
             y,
             height: 1,
             ..area
         };
-        render_node_row(buf, row, node, index == pane.selected);
+        render_node_row(buf, row, node, &prefix, index == pane.selected);
     }
 }
 
@@ -2324,38 +2534,41 @@ struct VisibleNodeRow<'a> {
     index: usize,
     y: u16,
     node: &'a MonitorNode,
+    prefix: String,
 }
 
 fn visible_node_rows<'a>(
     pane: &'a MonitorPane,
     snapshot: &'a MonitorSnapshot,
     area: Rect,
-) -> impl Iterator<Item = VisibleNodeRow<'a>> {
+) -> Vec<VisibleNodeRow<'a>> {
+    let projected = projected_monitor_rows(snapshot, pane.view_mode);
     let rows = area.height as usize;
-    let offset = scroll_offset(pane.selected, snapshot.nodes.len(), rows);
-    visible_node_window(snapshot, offset, rows)
-        .map(move |(index, node)| visible_node_row(area.y, offset, index, node))
+    let selected_position = selected_projected_position(&projected, pane.selected).unwrap_or(0);
+    let offset = scroll_offset(selected_position, projected.len(), rows);
+    projected
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(rows)
+        .filter_map(|(position, row)| visible_node_row(area.y, offset, position, row, snapshot))
+        .collect()
 }
 
-fn visible_node_window(
-    snapshot: &MonitorSnapshot,
-    offset: usize,
-    rows: usize,
-) -> impl Iterator<Item = (usize, &MonitorNode)> {
-    snapshot.nodes.iter().enumerate().skip(offset).take(rows)
-}
-
-fn visible_node_row(
+fn visible_node_row<'a>(
     area_y: u16,
     offset: usize,
-    index: usize,
-    node: &MonitorNode,
-) -> VisibleNodeRow<'_> {
-    VisibleNodeRow {
-        index,
-        y: area_y + (index - offset) as u16,
+    position: usize,
+    row: &ProjectedMonitorRow,
+    snapshot: &'a MonitorSnapshot,
+) -> Option<VisibleNodeRow<'a>> {
+    let node = snapshot.nodes.get(row.index)?;
+    Some(VisibleNodeRow {
+        index: row.index,
+        y: area_y + (position - offset) as u16,
         node,
-    }
+        prefix: row.prefix.clone(),
+    })
 }
 
 /// Keep the selected node visible within `rows` visible lines.
@@ -2369,7 +2582,7 @@ fn scroll_offset(selected: usize, len: usize, rows: usize) -> usize {
 
 /// Render a single node row: `kind [status]<anomaly> pid=… <label>`, with
 /// completed-OK nodes dimmed and the selected row highlighted.
-fn render_node_row(buf: &mut Buffer, area: Rect, node: &MonitorNode, selected: bool) {
+fn render_node_row(buf: &mut Buffer, area: Rect, node: &MonitorNode, prefix: &str, selected: bool) {
     let marker = if selected { '>' } else { ' ' };
     let pid = node
         .pid
@@ -2377,7 +2590,7 @@ fn render_node_row(buf: &mut Buffer, area: Rect, node: &MonitorNode, selected: b
         .unwrap_or_default();
     let text = pad_to_width(
         format!(
-            "{marker} {} [{}]{}{} {}",
+            "{marker} {prefix}{} [{}]{}{} {}",
             kind_word(node.kind),
             status_word(node.status),
             liveness_glyph(node.liveness),
@@ -3502,9 +3715,10 @@ fn bottom_visible_row_index(event: MouseEvent, bottom: Rect, pane: &MonitorPane)
     }
     let snapshot = pane.snapshot.as_ref()?;
     let row = usize::from(event.row.saturating_sub(list.y.saturating_add(1)));
-    let offset = scroll_offset(pane.selected, snapshot.nodes.len(), list.height as usize);
-    let index = offset + row;
-    (index < snapshot.nodes.len()).then_some(index)
+    let projected = projected_monitor_rows(snapshot, pane.view_mode);
+    let selected_position = selected_projected_position(&projected, pane.selected).unwrap_or(0);
+    let offset = scroll_offset(selected_position, projected.len(), list.height as usize);
+    projected.get(offset + row).map(|row| row.index)
 }
 
 fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
@@ -5673,6 +5887,11 @@ mod tests {
         }
     }
 
+    fn parented(mut node: MonitorNode, parent_id: &str) -> MonitorNode {
+        node.parent_id = Some(parent_id.to_string());
+        node
+    }
+
     fn snapshot_with_nodes(count: usize) -> MonitorSnapshot {
         let mut snapshot = empty_snapshot();
         snapshot.nodes = (0..count)
@@ -5686,6 +5905,20 @@ mod tests {
             })
             .collect();
         snapshot
+    }
+
+    fn projected_ids(snapshot: &MonitorSnapshot, mode: MonitorViewMode) -> Vec<String> {
+        projected_monitor_rows(snapshot, mode)
+            .into_iter()
+            .map(|row| snapshot.nodes[row.index].id.clone())
+            .collect()
+    }
+
+    fn projected_labels(snapshot: &MonitorSnapshot, mode: MonitorViewMode) -> Vec<String> {
+        projected_monitor_rows(snapshot, mode)
+            .into_iter()
+            .map(|row| format!("{}{}", row.prefix, snapshot.nodes[row.index].label))
+            .collect()
     }
 
     struct FakeMonitor {
@@ -5726,6 +5959,7 @@ mod tests {
         let selected_node_id = snapshot.nodes.get(selected).map(node_id);
         MonitorPane {
             collapsed,
+            view_mode: MonitorViewMode::Flat,
             selected,
             selected_node_id,
             snapshot: Some(Arc::new(snapshot)),
@@ -5827,6 +6061,124 @@ mod tests {
         assert!(row.contains("OBS"), "status row: {row:?}");
         assert!(row.contains("running"), "status row: {row:?}");
         assert!(row.contains("3 mailbox pending"), "status row: {row:?}");
+    }
+
+    #[test]
+    fn ctrl_t_routes_to_tree_mode_toggle_without_forwarding() {
+        let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+
+        let routed = router.route_input(&[0x14]);
+
+        assert!(routed.forward.is_empty());
+        assert_eq!(routed.commands, vec![MonitorCommand::ToggleTreeMode]);
+    }
+
+    #[test]
+    fn tree_projection_orders_session_invocation_process_and_bash_children() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node(
+                    "invocation:i",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "invocation i",
+                ),
+                "session:s",
+            ),
+            parented(
+                node(
+                    "process:i:10",
+                    MonitorNodeKind::ProviderProcess,
+                    MonitorStatus::Running,
+                    "provider pid 10",
+                ),
+                "invocation:i",
+            ),
+            parented(
+                node(
+                    "agent-bash:h",
+                    MonitorNodeKind::AgentBashWorkload,
+                    MonitorStatus::Running,
+                    "agent-bash cargo test",
+                ),
+                "process:i:10",
+            ),
+        ];
+
+        assert_eq!(
+            projected_ids(&snapshot, MonitorViewMode::Tree),
+            vec!["session:s", "invocation:i", "process:i:10", "agent-bash:h"]
+        );
+        assert_eq!(
+            projected_labels(&snapshot, MonitorViewMode::Tree),
+            vec![
+                "session s",
+                "└─ invocation i",
+                "   └─ provider pid 10",
+                "      └─ agent-bash cargo test",
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_projection_roots_orphans_with_missing_parents() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![parented(
+            node(
+                "agent-bash:orphan",
+                MonitorNodeKind::AgentBashWorkload,
+                MonitorStatus::Running,
+                "orphan bash",
+            ),
+            "missing:parent",
+        )];
+
+        assert_eq!(
+            projected_labels(&snapshot, MonitorViewMode::Tree),
+            vec!["orphan bash"]
+        );
+    }
+
+    #[test]
+    fn tree_projection_guards_cycles_without_recursing_forever() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            parented(
+                node(
+                    "invocation:a",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "a",
+                ),
+                "invocation:b",
+            ),
+            parented(
+                node(
+                    "invocation:b",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "b",
+                ),
+                "invocation:a",
+            ),
+        ];
+
+        assert_eq!(
+            projected_ids(&snapshot, MonitorViewMode::Tree),
+            vec!["invocation:a", "invocation:b"]
+        );
+        assert_eq!(
+            projected_labels(&snapshot, MonitorViewMode::Tree),
+            vec!["a", "└─ b"]
+        );
     }
 
     #[test]
@@ -6187,6 +6539,260 @@ mod tests {
             text.lines()
                 .any(|line| line.contains('>') && line.contains("cargo test")),
             "selected row should be marked: {text}"
+        );
+    }
+
+    #[test]
+    fn tree_mode_renders_indented_parent_child_rows() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.summary = snapshot_summary(MonitorStatus::Running, 3, 1, 0, 0);
+        snapshot.nodes = vec![
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node(
+                    "invocation:i",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "invocation i",
+                ),
+                "session:s",
+            ),
+            parented(
+                node(
+                    "agent-bash:h",
+                    MonitorNodeKind::AgentBashWorkload,
+                    MonitorStatus::Running,
+                    "cargo test",
+                ),
+                "invocation:i",
+            ),
+        ];
+        let mut pane = pane_with(snapshot, false, 0);
+        pane.view_mode = MonitorViewMode::Tree;
+        let parser = vt100::Parser::new(5, 80, 0);
+
+        terminal
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
+            .unwrap();
+
+        let text = screen_text(terminal.backend().buffer(), 12, 80);
+        assert!(
+            text.contains("tree"),
+            "status row should expose tree mode: {text}"
+        );
+        assert!(
+            text.contains("└─ invocation [running] invocation i")
+                || text.contains("└─ invocation i"),
+            "tree child row should include a branch glyph: {text}"
+        );
+        assert!(text.contains("   └─ bash [running] cargo test"), "{text}");
+    }
+
+    #[test]
+    fn tree_mode_keyboard_selection_follows_projected_order_by_node_id() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            parented(
+                node(
+                    "agent-bash:h",
+                    MonitorNodeKind::AgentBashWorkload,
+                    MonitorStatus::Running,
+                    "cargo test",
+                ),
+                "invocation:i",
+            ),
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node(
+                    "invocation:i",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "invocation i",
+                ),
+                "session:s",
+            ),
+        ];
+        let mut pane = pane_with(snapshot, false, 1);
+        pane.view_mode = MonitorViewMode::Tree;
+
+        pane.apply(MonitorCommand::SelectNext);
+        assert_eq!(pane.selected_node_id.as_deref(), Some("invocation:i"));
+        pane.apply(MonitorCommand::SelectNext);
+        assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:h"));
+        pane.apply(MonitorCommand::SelectPrev);
+        assert_eq!(pane.selected_node_id.as_deref(), Some("invocation:i"));
+    }
+
+    #[test]
+    fn tree_mode_toggle_preserves_selected_node_id() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            parented(
+                node(
+                    "agent-bash:h",
+                    MonitorNodeKind::AgentBashWorkload,
+                    MonitorStatus::Running,
+                    "cargo test",
+                ),
+                "invocation:i",
+            ),
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node(
+                    "invocation:i",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "invocation i",
+                ),
+                "session:s",
+            ),
+        ];
+        let mut pane = pane_with(snapshot, false, 0);
+
+        pane.apply(MonitorCommand::ToggleTreeMode);
+
+        assert_eq!(pane.view_mode, MonitorViewMode::Tree);
+        assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:h"));
+        assert_eq!(
+            pane.selected_node().map(|node| node.id.as_str()),
+            Some("agent-bash:h")
+        );
+    }
+
+    #[test]
+    fn tree_mode_click_selection_opens_selected_detail() {
+        let (_dir, path) = write_inspect_log_fixture("tree detail sentinel\n");
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node_with_log("agent-bash:h", "cargo test", &path),
+                "session:s",
+            ),
+        ];
+        let mut pane = pane_with(snapshot, false, 0);
+        pane.view_mode = MonitorViewMode::Tree;
+        let mut router = InputRouter::new();
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<0;4;15M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        for command in routed.commands {
+            pane.apply(command);
+        }
+
+        assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:h"));
+        assert!(
+            pane.inspect
+                .iter()
+                .any(|line| line == "tree detail sentinel"),
+            "tree click selection should reuse WU2 detail output: {:?}",
+            pane.inspect
+        );
+    }
+
+    #[test]
+    fn tree_mode_snapshot_refresh_preserves_selection_and_valid_scroll() {
+        let mut first = empty_snapshot();
+        first.nodes = vec![
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node(
+                    "agent-bash:h",
+                    MonitorNodeKind::AgentBashWorkload,
+                    MonitorStatus::Running,
+                    "cargo test",
+                ),
+                "session:s",
+            ),
+        ];
+        let mut pane = pane_with(first, false, 1);
+        pane.view_mode = MonitorViewMode::Tree;
+        let mut refreshed = empty_snapshot();
+        refreshed.nodes = vec![
+            node(
+                "session:s",
+                MonitorNodeKind::Session,
+                MonitorStatus::Running,
+                "session s",
+            ),
+            parented(
+                node(
+                    "invocation:new",
+                    MonitorNodeKind::Invocation,
+                    MonitorStatus::Running,
+                    "inserted invocation",
+                ),
+                "session:s",
+            ),
+            parented(
+                node(
+                    "agent-bash:h",
+                    MonitorNodeKind::AgentBashWorkload,
+                    MonitorStatus::Running,
+                    "cargo test",
+                ),
+                "invocation:new",
+            ),
+        ];
+
+        pane.store_snapshot(Arc::new(refreshed));
+        let snapshot = pane.snapshot.as_ref().expect("snapshot");
+        let rows = visible_node_rows(
+            &pane,
+            snapshot,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 2,
+            },
+        );
+
+        assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:h"));
+        assert!(
+            rows.iter().any(|row| row.node.id == "agent-bash:h"),
+            "selected tree node should remain visible after inserted rows: {:?}",
+            rows.iter()
+                .map(|row| row.node.id.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
