@@ -35,11 +35,11 @@ use super::cancel::{
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::transcript_view::project_transcript_tail;
 use super::{
-    ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput, RELAY_BUFFER_BYTES,
-    flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd, poll_relay_fds,
-    poll_single_fd, queue_control_injection, read_control_request, read_fd, readable,
-    send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq,
-    writable, write_control_response,
+    ChildOutputState, ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput,
+    RELAY_BUFFER_BYTES, flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd,
+    poll_relay_fds, poll_single_fd, queue_control_injection, read_control_request, read_fd,
+    readable, send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid,
+    winsize_eq, writable, write_control_response,
 };
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
@@ -3064,6 +3064,7 @@ pub(super) fn relay_until_exit_observed(
     let mut clipboard = String::new();
     let mut router = InputRouter::new();
     let mut line_state = InputLineState::default();
+    let mut child_output_state = ChildOutputState::default();
     let mut applied: Option<(libc::winsize, u16)> = None;
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
@@ -3171,8 +3172,9 @@ pub(super) fn relay_until_exit_observed(
                 )?;
             }
         }
-        if ready.pty_output {
-            dirty |= pump_pty_output(master_fd, &mut parser, &mut buffer)?;
+        if ready.pty_output && pump_pty_output(master_fd, &mut parser, &mut buffer)? {
+            child_output_state.observe_child_output();
+            dirty = true;
         }
         if ready.control
             && let Some(control) = control
@@ -3184,8 +3186,10 @@ pub(super) fn relay_until_exit_observed(
                 pane: &pane,
                 parser: &mut parser,
                 line_state: &mut line_state,
+                child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
                 buffer: &mut buffer,
+                child_pid: Some(child.id()),
             };
             let _ = service_control(control, &mut control_io);
             dirty = true;
@@ -4051,7 +4055,7 @@ fn start_next_outbound_message(
     if outbound.active.is_some()
         || outbound.has_unresolved_blocker()
         || !pending_child_input.is_empty()
-        || !safe_to_inject(line_state)
+        || !line_state.is_safe_to_inject()
     {
         return false;
     }
@@ -4107,8 +4111,10 @@ struct ControlInjectionIo<'a> {
     pane: &'a MonitorPane,
     parser: &'a mut vt100::Parser,
     line_state: &'a mut InputLineState,
+    child_output_state: &'a mut ChildOutputState,
     pending_child_input: &'a mut PendingChildInput,
     buffer: &'a mut [u8],
+    child_pid: Option<u32>,
 }
 
 /// Service a control-socket notify injection while the TUI owns the screen:
@@ -4118,6 +4124,15 @@ fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> 
     let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
     let response = inject_control_payload(&mut stream, io);
     let (ack, message) = control_response_message(response);
+    super::trace_notify_gate_decision(
+        control,
+        io.master_fd,
+        io.child_pid,
+        io.line_state,
+        io.child_output_state,
+        if ack { "inject" } else { "skip" },
+        &message,
+    );
     write_tui_control_response(&mut stream, ack, &message)
         .map_err(format_control_response_write_error)
 }
@@ -4194,8 +4209,12 @@ fn drain_control_payload_body(io: &mut ControlInjectionIo<'_>) -> Result<(), Str
         if ready.pty_writable {
             flush_pending_child_input(io.master_fd, io.pending_child_input)?;
         }
-        if ready.pty_output && !pump_pty_output(io.master_fd, io.parser, io.buffer)? {
-            return Err("control_submit_pty_closed".to_string());
+        if ready.pty_output {
+            if pump_pty_output(io.master_fd, io.parser, io.buffer)? {
+                io.child_output_state.observe_child_output();
+            } else {
+                return Err("control_submit_pty_closed".to_string());
+            }
         }
     }
     Ok(())
@@ -4251,43 +4270,77 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 /// virtual terminal and routing real input meanwhile, bounded by the inject limit.
 fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let start = Instant::now();
-    while injection_wait_should_pump(start, io.line_state, io.pending_child_input) {
+    while injection_wait_should_pump(
+        start,
+        io.master_fd,
+        io.child_pid,
+        io.line_state,
+        io.child_output_state,
+        io.pending_child_input,
+    ) {
         pump_inject_wait_io(io)?;
     }
-    validate_safe_to_inject(io.line_state, io.pending_child_input)
+    validate_safe_to_inject(
+        io.master_fd,
+        io.child_pid,
+        io.line_state,
+        io.child_output_state,
+        io.pending_child_input,
+    )
 }
 
 fn injection_wait_should_pump(
     start: Instant,
+    master_fd: RawFd,
+    child_pid: Option<u32>,
     line_state: &InputLineState,
+    child_output_state: &ChildOutputState,
     pending_child_input: &PendingChildInput,
 ) -> bool {
-    inject_wait_remaining(start) && !safe_to_inject_now(line_state, pending_child_input)
+    inject_wait_remaining(start)
+        && !safe_to_inject_now(
+            master_fd,
+            child_pid,
+            line_state,
+            child_output_state,
+            pending_child_input,
+        )
 }
 
 fn inject_wait_remaining(start: Instant) -> bool {
     start.elapsed() < INJECT_WAIT_LIMIT
 }
 
-fn safe_to_inject(line_state: &InputLineState) -> bool {
-    line_state.is_safe_to_inject()
-}
-
 fn safe_to_inject_now(
+    master_fd: RawFd,
+    child_pid: Option<u32>,
     line_state: &InputLineState,
+    child_output_state: &ChildOutputState,
     pending_child_input: &PendingChildInput,
 ) -> bool {
-    safe_to_inject(line_state) && pending_child_input.is_empty()
+    pending_child_input.is_empty()
+        && super::safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok()
 }
 
 fn validate_safe_to_inject(
+    master_fd: RawFd,
+    child_pid: Option<u32>,
     line_state: &InputLineState,
+    child_output_state: &ChildOutputState,
     pending_child_input: &PendingChildInput,
 ) -> Result<(), String> {
-    if safe_to_inject_now(line_state, pending_child_input) {
+    if !pending_child_input.is_empty() {
+        return Err(unsafe_mid_line_error());
+    }
+    if super::safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok() {
         Ok(())
     } else {
-        Err(unsafe_mid_line_error())
+        Err(
+            super::safe_to_inject(master_fd, child_pid, line_state, child_output_state)
+                .err()
+                .map(super::unsafe_reason_message)
+                .unwrap_or_else(unsafe_mid_line_error),
+        )
     }
 }
 
@@ -4312,8 +4365,8 @@ fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
             io.buffer,
         )?;
     }
-    if ready.pty_output {
-        let _ = pump_pty_output(io.master_fd, io.parser, io.buffer)?;
+    if ready.pty_output && pump_pty_output(io.master_fd, io.parser, io.buffer)? {
+        io.child_output_state.observe_child_output();
     }
     Ok(())
 }
@@ -4824,6 +4877,7 @@ mod tests {
         let pane = MonitorPane::new();
         let mut parser = vt100::Parser::new(10, 20, 0);
         let mut line_state = InputLineState::default();
+        let mut child_output_state = ChildOutputState::default();
         let mut pending_child_input = PendingChildInput::new();
         let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
         let mut io = ControlInjectionIo {
@@ -4833,8 +4887,10 @@ mod tests {
             pane: &pane,
             parser: &mut parser,
             line_state: &mut line_state,
+            child_output_state: &mut child_output_state,
             pending_child_input: &mut pending_child_input,
             buffer: &mut buffer,
+            child_pid: None,
         };
 
         submit_control_payload(&mut io, b"body", true).expect("submit payload");

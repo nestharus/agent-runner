@@ -99,6 +99,16 @@ impl Fixture {
     }
 
     fn run_notify(&self, handle: &str, metadata: Value) -> Output {
+        self.run(self.notify_command(handle, metadata))
+    }
+
+    fn run_notify_with_trace(&self, handle: &str, metadata: Value) -> Output {
+        let mut cmd = self.notify_command(handle, metadata);
+        cmd.env("OULIPOLY_TRACE_NOTIFY", "1");
+        self.run(cmd)
+    }
+
+    fn notify_command(&self, handle: &str, metadata: Value) -> Command {
         let artifacts = self.write_notify_artifacts(handle, metadata, 0);
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("notify")
@@ -116,7 +126,7 @@ impl Fixture {
             .arg("--rc")
             .arg(&artifacts.rc)
             .arg("--json");
-        self.run(cmd)
+        cmd
     }
 
     fn base_repl_command(&self, model_name: &str, session_id: &str) -> Command {
@@ -318,6 +328,48 @@ fn notify_live_pty_failure_leaves_pending_and_wake_busy() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
     assert!(captured.lock().unwrap().contains("h-unsafe"));
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn notify_live_pty_child_output_active_is_precise_nack_and_traced() {
+    let fixture = Fixture::new();
+    let identity = current_identity();
+    fixture.record_owner_identity(&identity);
+    let socket = fixture.socket_path("child-output-active.sock");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let server = spawn_control_server(
+        &socket,
+        false,
+        "unsafe_child_output_active",
+        Arc::clone(&captured),
+    );
+    fixture.mark_live_pty_runtime(&identity, &socket);
+
+    let output = fixture.run_notify_with_trace("h-child-output-active", caller_chain(&identity));
+    server.join().unwrap();
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(
+        value["pty_delivery"]["status"],
+        "unsafe_child_output_active"
+    );
+    assert_eq!(value["pty_delivery"]["submitted"], false);
+    assert_eq!(value["wake"]["status"], "busy");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("oulipoly_notify_trace trigger=notify-time"),
+        "stderr was {stderr}"
+    );
+    assert!(
+        stderr.contains("inject_status=unsafe_child_output_active"),
+        "stderr was {stderr}"
+    );
+    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered_at.is_none());
+    assert!(captured.lock().unwrap().contains("h-child-output-active"));
     fixture.assert_default_user_paths_untouched();
 }
 
