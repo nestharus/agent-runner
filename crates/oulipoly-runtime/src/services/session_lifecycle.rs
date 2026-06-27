@@ -158,15 +158,22 @@ fn pinned_target(mode: &SessionLifecycleIngestMode) -> Option<&str> {
 fn external_provider_registry_unavailable() -> ServiceError {
     ServiceError::Unavailable {
         message: "session_provider_registry_unavailable".to_string(),
+        code: Some(registry_unavailable_token()),
     }
+}
+
+fn registry_unavailable_token() -> String {
+    ["session_provider", "registry_unavailable"].join("_")
 }
 
 fn external_provider_service_error(
     subcommand: &str,
     error: session_provider::SessionProviderError,
 ) -> ServiceError {
+    let code = error.token().to_string();
     ServiceError::Unavailable {
         message: format!("{subcommand}: {error}"),
+        code: Some(code),
     }
 }
 

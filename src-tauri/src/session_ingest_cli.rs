@@ -93,7 +93,7 @@ fn session_lifecycle_ingest_result(
         Ok(output) => SessionLifecycleIngestResult::Emitted(output),
         Err(ServiceError::Dependency { message })
         | Err(ServiceError::InvalidRequest { message })
-        | Err(ServiceError::Unavailable { message }) => {
+        | Err(ServiceError::Unavailable { message, .. }) => {
             SessionLifecycleIngestResult::Failed(message)
         }
     }

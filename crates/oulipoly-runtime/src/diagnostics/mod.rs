@@ -147,6 +147,7 @@ fn diagnose_terminal_classify_hook(
 fn terminal_registry_unavailable() -> ServiceError {
     ServiceError::Unavailable {
         message: "external provider terminal classify registry unavailable".to_string(),
+        code: None,
     }
 }
 

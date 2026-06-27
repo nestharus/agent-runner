@@ -103,6 +103,10 @@ impl SessionProviderError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
 }
 
 impl fmt::Display for SessionProviderError {
