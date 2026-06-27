@@ -215,6 +215,10 @@ fn line_doomed_dir_links<'a>(regex: &'a Regex, line: &'a str) -> impl Iterator<I
 
 fn file_doomed_dir_link_violations(root: &Path, regex: &Regex, tracked_file: &str) -> Vec<String> {
     let path = root.join(tracked_file);
+    if !path.exists() {
+        return Vec::new();
+    }
+
     let content = read_tracked_file(&path);
     let content = decode_tracked_file(&content);
 

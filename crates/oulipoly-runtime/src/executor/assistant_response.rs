@@ -38,10 +38,8 @@ const PRODUCED_ASSISTANT_RESPONSE_MARKER: &str = "oulipoly.produced_assistant_re
 
 /// Legacy path: the host observes the provider's stdout output channel directly.
 /// A real assistant response appears as human-readable (non-structured-JSON)
-/// text on stdout — opencode, the only provider whose session-turn delta is
-/// unavailable, prints its answer as plain text there. Providers that emit only
-/// structured JSON are confirmed via the session-turn delta instead, so they
-/// need no signal from this path.
+/// text on stdout. Providers that emit only structured JSON are confirmed via
+/// the session-turn delta instead, so they need no signal from this path.
 pub(crate) fn legacy_stdout_produced_assistant_response(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout)
         .lines()
