@@ -146,6 +146,11 @@ fn live_pty_nack_pending_is_retried_by_sweep() {
 }
 
 #[test]
+fn live_pty_acked_pending_is_submitted_once_across_repeated_sweeps() {
+    cases_live_pty_retry::live_pty_acked_pending_is_submitted_once_across_repeated_sweeps();
+}
+
+#[test]
 fn live_pty_repeated_nack_keeps_pending_without_claim() {
     cases_live_pty_retry::live_pty_repeated_nack_keeps_pending_without_claim();
 }

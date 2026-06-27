@@ -227,6 +227,7 @@ fn trace_live_pty_retry(session_id: &str, diagnostic: &PtyMailboxDeliveryDiagnos
     tracing::debug!(
         session_id,
         status = diagnostic.status.as_str(),
+        submitted = diagnostic.submitted,
         delivered = diagnostic.delivered_seqs.len(),
         "Wake reclaim sweep retried live PTY mailbox delivery"
     );

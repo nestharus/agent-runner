@@ -38,6 +38,7 @@ pub(crate) fn live_pty_nack_pending_is_retried_by_sweep() {
     assert_success(&output);
     let notify = notify_response(&output);
     assert_notify_pty_status(&notify, "unsafe_mid_line");
+    assert_notify_pty_submitted(&notify, false);
     assert_capture_notify_wake_busy(&notify);
     assert_pending_mailbox_count(&fixture, SESSION, 1);
     assert_no_wake_claim(&fixture, SESSION);
@@ -53,6 +54,41 @@ pub(crate) fn live_pty_nack_pending_is_retried_by_sweep() {
     assert_eq!(payloads.len(), 2, "control payloads: {payloads:?}");
     assert_payload_contains_handle(&payloads[0], "h-live-pty-retry");
     assert_payload_contains_handle(&payloads[1], "h-live-pty-retry");
+    assert_no_wake_claim(&fixture, SESSION);
+    assert_xdg_isolated(&fixture);
+}
+
+pub(crate) fn live_pty_acked_pending_is_submitted_once_across_repeated_sweeps() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    let control = spawn_control_socket(
+        &fixture,
+        "live-pty-submit-once.sock",
+        vec![control_ack("ok")],
+    );
+    let identity = fixture.seed_live_pty_runtime(&control.path);
+    fixture.record_identity(&identity);
+
+    let output = notify_command(&fixture, "h-live-pty-submit-once", &identity)
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let notify = notify_response(&output);
+    assert_notify_pty_status(&notify, "acked");
+    assert_notify_pty_submitted(&notify, true);
+    assert_pending_mailbox_count(&fixture, SESSION, 0);
+    assert_no_wake_claim(&fixture, SESSION);
+
+    for _ in 0..3 {
+        let output = fixture.run_mailbox_list(SESSION);
+        assert_success(&output);
+    }
+
+    assert_eq!(control.accepted_count(), 1);
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert_eq!(rows.len(), 1, "mailbox rows: {rows:?}");
+    assert!(rows[0].delivered_at.is_some(), "mailbox rows: {rows:?}");
+    assert_eq!(rows[0].delivery_attempts, 1, "mailbox rows: {rows:?}");
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
@@ -77,6 +113,7 @@ pub(crate) fn live_pty_repeated_nack_keeps_pending_without_claim() {
     assert_success(&output);
     let notify = notify_response(&output);
     assert_notify_pty_status(&notify, "unsafe_mid_line");
+    assert_notify_pty_submitted(&notify, false);
     assert_capture_notify_wake_busy(&notify);
 
     let output = fixture.run_mailbox_list(SESSION);
@@ -197,6 +234,17 @@ fn assert_notify_pty_status(notify: &Value, status: &str) {
             .and_then(|delivery| delivery.get("status"))
             .and_then(Value::as_str),
         Some(status),
+        "notify response: {notify}"
+    );
+}
+
+fn assert_notify_pty_submitted(notify: &Value, submitted: bool) {
+    assert_eq!(
+        notify
+            .get("pty_delivery")
+            .and_then(|delivery| delivery.get("submitted"))
+            .and_then(Value::as_bool),
+        Some(submitted),
         "notify response: {notify}"
     );
 }

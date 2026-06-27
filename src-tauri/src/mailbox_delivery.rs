@@ -39,6 +39,7 @@ pub(crate) struct PtyMailboxDeliveryDiagnostic {
     pub(crate) attempted: bool,
     pub(crate) status: String,
     pub(crate) control_path: Option<String>,
+    pub(crate) submitted: bool,
     pub(crate) delivered_seqs: Vec<i64>,
     pub(crate) remaining_pending: Option<usize>,
     pub(crate) message: Option<String>,
@@ -254,10 +255,15 @@ fn pty_status(
         attempted,
         status: status.to_string(),
         control_path,
+        submitted: pty_status_implies_submit(status),
         delivered_seqs,
         remaining_pending,
         message,
     }
+}
+
+fn pty_status_implies_submit(status: &str) -> bool {
+    matches!(status, "acked" | "mark_delivered_error")
 }
 
 pub(crate) fn prepare_headless_resume_delivery(
