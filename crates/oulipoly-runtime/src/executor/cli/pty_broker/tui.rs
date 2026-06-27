@@ -891,6 +891,9 @@ fn localize_mouse_event(event: MouseEvent, rect: Rect) -> MouseEvent {
 const COLLAPSED_REFRESH: Duration = Duration::from_millis(2000);
 /// Expanded monitor refresh cadence (the operator is actively watching).
 const EXPANDED_REFRESH: Duration = Duration::from_millis(500);
+/// Local selected-detail refresh cadence. This is intentionally separate from
+/// snapshot refreshes so live output tails update without polling every source.
+const DETAIL_REFRESH: Duration = Duration::from_millis(250);
 /// Expanded monitor target share of terminal height, and its floor.
 const EXPANDED_MIN_ROWS: u16 = 8;
 /// Rows always reserved for the interactive top pane.
@@ -1299,11 +1302,15 @@ fn normalize_message_body(body: &str) -> String {
 struct MonitorPane {
     collapsed: bool,
     selected: usize,
+    selected_node_id: Option<MonitorNodeId>,
     snapshot: Option<Arc<MonitorSnapshot>>,
     pseudo_input: PseudoInputState,
     outbound: OutboundQueue,
+    /// Manual detail override for nodes without an InspectRef. Nodes with an
+    /// InspectRef show detail automatically while selected in the expanded pane.
     inspecting: bool,
     inspect: Vec<String>,
+    last_inspect_refresh: Option<Instant>,
     /// The node id awaiting cancel confirmation, if the operator pressed `x`.
     pending_cancel: Option<MonitorNodeId>,
     /// A cancel request the operator confirmed, drained and executed by the loop.
@@ -1317,11 +1324,13 @@ impl MonitorPane {
         Self {
             collapsed: true,
             selected: 0,
+            selected_node_id: None,
             snapshot: None,
             pseudo_input: PseudoInputState::default(),
             outbound: OutboundQueue::default(),
             inspecting: false,
             inspect: Vec::new(),
+            last_inspect_refresh: None,
             pending_cancel: None,
             cancel_request: None,
             cancel_feedback: None,
@@ -1343,6 +1352,7 @@ impl MonitorPane {
 
     fn expand(&mut self) {
         self.collapsed = false;
+        self.update_inspect();
     }
 
     fn refresh_interval(&self) -> Duration {
@@ -1369,8 +1379,9 @@ impl MonitorPane {
     }
 
     fn store_snapshot(&mut self, snapshot: Arc<MonitorSnapshot>) {
-        self.clamp_selection(snapshot_node_count(&snapshot));
+        self.preserve_or_clamp_selection(&snapshot);
         self.snapshot = Some(snapshot);
+        self.sync_selected_node_id();
         self.update_inspect();
     }
 
@@ -1380,28 +1391,31 @@ impl MonitorPane {
             .map_or(0, |snapshot| snapshot.nodes.len())
     }
 
-    fn clamp_selection(&mut self, len: usize) {
-        if len == 0 {
-            self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
-        }
+    fn preserve_or_clamp_selection(&mut self, snapshot: &MonitorSnapshot) {
+        let current_id = self
+            .selected_node_id
+            .as_deref()
+            .or_else(|| self.selected_node().map(|node| node.id.as_str()));
+        self.selected = selection_index_for_snapshot(snapshot, current_id, self.selected);
     }
 
     fn select_next(&mut self) {
         let len = self.node_count();
         if len > 0 {
             self.selected = (self.selected + 1).min(len - 1);
+            self.sync_selected_node_id();
         }
     }
 
     fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.sync_selected_node_id();
     }
 
     fn select_index(&mut self, index: usize) {
         if index < self.node_count() {
             self.selected = index;
+            self.sync_selected_node_id();
         }
     }
 
@@ -1428,6 +1442,7 @@ impl MonitorPane {
                 self.collapsed = true;
                 self.inspecting = false;
                 self.inspect.clear();
+                self.last_inspect_refresh = None;
                 self.pending_cancel = None;
                 false
             }
@@ -1461,6 +1476,10 @@ impl MonitorPane {
         self.snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.nodes.get(self.selected))
+    }
+
+    fn sync_selected_node_id(&mut self) {
+        self.selected_node_id = self.selected_node().map(node_id);
     }
 
     /// Arm a cancel for the selected node, only when it exposes a cancel ref.
@@ -1506,11 +1525,36 @@ impl MonitorPane {
     /// Refresh the inspect buffer from the selected node's live source plus any
     /// diagnostics scoped to it, while the inspect pane is open; clear it otherwise.
     fn update_inspect(&mut self) {
-        self.inspect = if self.inspecting {
+        self.inspect = if self.detail_visible() {
             self.build_inspect_content()
         } else {
             Vec::new()
         };
+        self.last_inspect_refresh = self.detail_refresh_active().then_some(Instant::now());
+    }
+
+    /// Refresh only the selected node's bounded detail source. This runs from the
+    /// relay loop, not the render thread, and never requests a fresh snapshot.
+    fn refresh_detail_if_due(&mut self, now: Instant) -> bool {
+        if !self.detail_refresh_active() || !detail_refresh_due(self.last_inspect_refresh, now) {
+            return false;
+        }
+        let previous = self.inspect.clone();
+        self.inspect = self.build_inspect_content();
+        self.last_inspect_refresh = Some(now);
+        self.inspect != previous
+    }
+
+    fn detail_visible(&self) -> bool {
+        !self.collapsed && (self.inspecting || self.selected_node_has_inspect_ref())
+    }
+
+    fn detail_refresh_active(&self) -> bool {
+        self.detail_visible() && self.selected_node_has_inspect_ref()
+    }
+
+    fn selected_node_has_inspect_ref(&self) -> bool {
+        self.selected_node().is_some_and(node_has_inspect_ref)
     }
 
     /// The selected node's inspect content followed by its scoped diagnostics.
@@ -1567,6 +1611,32 @@ fn diagnostic_severity_glyph(severity: MonitorDiagnosticSeverity) -> &'static st
 
 fn node_id(node: &MonitorNode) -> MonitorNodeId {
     node.id.clone()
+}
+
+fn node_has_inspect_ref(node: &MonitorNode) -> bool {
+    node.inspect_ref.is_some()
+}
+
+fn selection_index_for_snapshot(
+    snapshot: &MonitorSnapshot,
+    selected_id: Option<&str>,
+    fallback_index: usize,
+) -> usize {
+    selected_id
+        .and_then(|id| node_index_by_id(snapshot, id))
+        .unwrap_or_else(|| clamp_selection_index(snapshot_node_count(snapshot), fallback_index))
+}
+
+fn node_index_by_id(snapshot: &MonitorSnapshot, id: &str) -> Option<usize> {
+    snapshot.nodes.iter().position(|node| node.id == id)
+}
+
+fn clamp_selection_index(len: usize, index: usize) -> usize {
+    if len == 0 { 0 } else { index.min(len - 1) }
+}
+
+fn detail_refresh_due(last_refresh: Option<Instant>, now: Instant) -> bool {
+    last_refresh.is_none_or(|last| now.duration_since(last) >= DETAIL_REFRESH)
 }
 
 fn node_is_cancelable(node: &MonitorNode) -> bool {
@@ -2041,7 +2111,7 @@ fn render_monitor_body(buf: &mut Buffer, body: Rect, pane: &MonitorPane) {
     if body.height == 0 {
         return;
     }
-    if pane.inspecting && body.height >= 4 {
+    if pane.detail_visible() && body.height >= 4 {
         let list_height = (body.height / 2).max(2);
         let list_area = Rect {
             height: list_height,
@@ -2153,7 +2223,7 @@ fn render_inspect_pane(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
     buf.set_string(
         area.x,
         area.y,
-        pad_to_width(" inspect — i/Enter to close ".to_string(), area.width),
+        pad_to_width(" detail — selected live output ".to_string(), area.width),
         Style::default().fg(Color::Black).bg(Color::Indexed(244)),
     );
     let body = Rect {
@@ -2791,6 +2861,7 @@ pub(super) fn relay_until_exit_observed(
     while status.is_none() {
         publisher.check_error()?;
         let mut dirty = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
+        dirty |= pane.refresh_detail_if_due(Instant::now());
         dirty |= apply_sizing(
             real_fd,
             master_fd,
@@ -3444,7 +3515,7 @@ fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
     if body.height == 0 {
         return None;
     }
-    if pane.inspecting && body.height >= 4 {
+    if pane.detail_visible() && body.height >= 4 {
         Some(Rect {
             height: (body.height / 2).max(2),
             ..body
@@ -5652,14 +5723,17 @@ mod tests {
     }
 
     fn pane_with(snapshot: MonitorSnapshot, collapsed: bool, selected: usize) -> MonitorPane {
+        let selected_node_id = snapshot.nodes.get(selected).map(node_id);
         MonitorPane {
             collapsed,
             selected,
+            selected_node_id,
             snapshot: Some(Arc::new(snapshot)),
             pseudo_input: PseudoInputState::default(),
             outbound: OutboundQueue::default(),
             inspecting: false,
             inspect: Vec::new(),
+            last_inspect_refresh: None,
             pending_cancel: None,
             cancel_request: None,
             cancel_feedback: None,
@@ -5698,6 +5772,27 @@ mod tests {
         let path = dir.path().join("inspect-session.jsonl");
         std::fs::write(&path, format!("{contents}\n")).unwrap();
         (dir, path.display().to_string())
+    }
+
+    fn write_inspect_log_fixture(contents: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-bash.log");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path.display().to_string())
+    }
+
+    fn node_with_log(id: &str, label: &str, path: &str) -> MonitorNode {
+        let mut node = node(
+            id,
+            MonitorNodeKind::AgentBashWorkload,
+            MonitorStatus::Running,
+            label,
+        );
+        node.inspect_ref = Some(InspectRef::AgentBashLog {
+            path: path.to_string(),
+            max_tail_bytes: 4096,
+        });
+        node
     }
 
     fn native_projectable_line(sentinel: &str) -> String {
@@ -5787,8 +5882,217 @@ mod tests {
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
         let text = screen_text(terminal.backend().buffer(), 16, 60);
-        assert!(text.contains("inspect"), "{text}");
+        assert!(text.contains("detail"), "{text}");
         assert!(text.contains("running 12 tests"), "{text}");
+    }
+
+    #[test]
+    fn selected_node_with_inspect_ref_opens_detail_without_manual_toggle() {
+        let (_dir, path) = write_inspect_log_fixture("auto detail sentinel\n");
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node_with_log("agent-bash:h1", "cargo test", &path)];
+        let mut pane = MonitorPane::new();
+
+        pane.expand();
+        pane.store_snapshot(Arc::new(snapshot));
+
+        assert!(!pane.inspecting, "manual inspect override was not toggled");
+        assert!(pane.detail_visible(), "inspect ref should auto-open detail");
+        assert!(
+            pane.inspect
+                .iter()
+                .any(|line| line == "auto detail sentinel"),
+            "detail reads bounded inspect content: {:?}",
+            pane.inspect
+        );
+    }
+
+    #[test]
+    fn keyboard_selection_updates_auto_detail_output() {
+        let (_dir_a, path_a) = write_inspect_log_fixture("alpha output\n");
+        let (_dir_b, path_b) = write_inspect_log_fixture("bravo output\n");
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            node_with_log("agent-bash:a", "alpha", &path_a),
+            node_with_log("agent-bash:b", "bravo", &path_b),
+        ];
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        pane.store_snapshot(Arc::new(snapshot));
+
+        assert!(pane.inspect.iter().any(|line| line == "alpha output"));
+        pane.apply(MonitorCommand::SelectNext);
+
+        assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:b"));
+        assert!(
+            pane.inspect.iter().any(|line| line == "bravo output"),
+            "selection should refresh detail: {:?}",
+            pane.inspect
+        );
+        assert!(!pane.inspect.iter().any(|line| line == "alpha output"));
+    }
+
+    #[test]
+    fn bottom_click_selection_opens_selected_node_detail() {
+        let (_dir_a, path_a) = write_inspect_log_fixture("alpha output\n");
+        let (_dir_b, path_b) = write_inspect_log_fixture("bravo output\n");
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            node_with_log("agent-bash:a", "alpha", &path_a),
+            node_with_log("agent-bash:b", "bravo", &path_b),
+        ];
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        pane.store_snapshot(Arc::new(snapshot));
+        let mut router = InputRouter::new();
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<0;4;15M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        for command in routed.commands {
+            pane.apply(command);
+        }
+
+        assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:b"));
+        assert!(
+            pane.inspect.iter().any(|line| line == "bravo output"),
+            "click selection should open selected detail: {:?}",
+            pane.inspect
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_preserves_selection_by_node_id() {
+        let first = snapshot_with_nodes(3);
+        let mut pane = pane_with(first, false, 1);
+        let mut refreshed = empty_snapshot();
+        refreshed.nodes = vec![
+            node(
+                "node:inserted",
+                MonitorNodeKind::Invocation,
+                MonitorStatus::Running,
+                "inserted",
+            ),
+            node(
+                "node:2",
+                MonitorNodeKind::Invocation,
+                MonitorStatus::Running,
+                "node 2",
+            ),
+            node(
+                "node:1",
+                MonitorNodeKind::Invocation,
+                MonitorStatus::Running,
+                "node 1",
+            ),
+            node(
+                "node:0",
+                MonitorNodeKind::Invocation,
+                MonitorStatus::Running,
+                "node 0",
+            ),
+        ];
+
+        pane.store_snapshot(Arc::new(refreshed));
+
+        assert_eq!(pane.selected, 2);
+        assert_eq!(pane.selected_node_id.as_deref(), Some("node:1"));
+    }
+
+    #[test]
+    fn snapshot_refresh_falls_back_to_clamped_row_when_selected_id_disappears() {
+        let first = snapshot_with_nodes(3);
+        let mut pane = pane_with(first, false, 2);
+        let (_dir, path) = write_inspect_log_fixture("fallback detail\n");
+        let mut refreshed = empty_snapshot();
+        refreshed.nodes = vec![
+            node(
+                "node:new",
+                MonitorNodeKind::Invocation,
+                MonitorStatus::Running,
+                "new",
+            ),
+            node_with_log("node:fallback", "fallback", &path),
+        ];
+
+        pane.store_snapshot(Arc::new(refreshed));
+
+        assert_eq!(pane.selected, 1);
+        assert_eq!(pane.selected_node_id.as_deref(), Some("node:fallback"));
+        assert!(
+            pane.inspect.iter().any(|line| line == "fallback detail"),
+            "fallback row detail remains valid: {:?}",
+            pane.inspect
+        );
+    }
+
+    #[test]
+    fn render_detail_consumes_prepared_rows_without_tailing_files() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node_with_log(
+            "agent-bash:missing",
+            "missing log",
+            "/definitely/missing/agent-bash.log",
+        )];
+        let mut pane = pane_with(snapshot, false, 0);
+        pane.inspect = vec!["prepared detail sentinel".to_string()];
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let parser = vt100::Parser::new(5, 60, 0);
+
+        terminal
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
+            .unwrap();
+
+        let text = screen_text(terminal.backend().buffer(), 16, 60);
+        assert!(text.contains("prepared detail sentinel"), "{text}");
+        assert!(
+            !text.contains("cannot read log"),
+            "render must not tail files: {text}"
+        );
+    }
+
+    #[test]
+    fn detail_refresh_tails_selected_inspect_ref_without_snapshot_refresh() {
+        let (_dir, path) = write_inspect_log_fixture("first detail\n");
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node_with_log("agent-bash:h1", "cargo test", &path)];
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        pane.store_snapshot(Arc::new(snapshot));
+        assert!(pane.inspect.iter().any(|line| line == "first detail"));
+
+        std::fs::write(&path, "first detail\nsecond detail\n").unwrap();
+        pane.last_inspect_refresh =
+            Some(Instant::now() - DETAIL_REFRESH - Duration::from_millis(1));
+
+        assert!(pane.refresh_detail_if_due(Instant::now()));
+        assert!(
+            pane.inspect.iter().any(|line| line == "second detail"),
+            "local detail refresh should pick up the changed bounded tail: {:?}",
+            pane.inspect
+        );
+    }
+
+    #[test]
+    fn detail_refresh_is_inactive_without_visible_inspect_ref_detail() {
+        let mut pane = pane_with(snapshot_with_nodes(1), false, 0);
+        pane.last_inspect_refresh =
+            Some(Instant::now() - DETAIL_REFRESH - Duration::from_millis(1));
+
+        assert!(!pane.detail_visible());
+        assert!(!pane.refresh_detail_if_due(Instant::now()));
+        assert!(pane.inspect.is_empty());
     }
 
     #[test]
