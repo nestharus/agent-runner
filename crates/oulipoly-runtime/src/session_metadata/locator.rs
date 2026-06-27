@@ -26,11 +26,9 @@ use std::io::ErrorKind as StdIoErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-mod claude;
 mod codex;
 mod content_fallback;
 
-pub use claude::ClaudeStorageLocator;
 pub use codex::CodexStorageLocator;
 pub(super) use content_fallback::{locate_claude_by_content, locate_codex_by_content};
 

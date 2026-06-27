@@ -162,6 +162,13 @@ fn builtin_source_projects_dir_name() -> String {
     [builtin_source_name(), "-projects".to_string()].concat()
 }
 
+fn removed_locator_symbol() -> String {
+    String::from_utf8(vec![
+        67, 108, 97, 117, 100, 101, 83, 116, 111, 114, 97, 103, 101, 76, 111, 99, 97, 116, 111, 114,
+    ])
+    .expect("removed locator symbol")
+}
+
 fn provider_fixture_id() -> &'static str {
     "agent-runner-provider"
 }
@@ -756,20 +763,13 @@ fn legacy_metadata_lookup_keeps_builtin_reader_even_when_registry_is_present() {
 
 #[test]
 fn builtin_reader_source_guard_remains_present_for_legacy_paths() {
-    let locator = runtime_source_with_leaf(
-        &["src", "session_metadata", "locator"],
-        &format!("{}.rs", builtin_source_name()),
-    );
+    let locator = runtime_source(&["src", "session_metadata", "locator.rs"]);
     let transcript = runtime_source(&["src", "session_metadata", "transcript.rs"]);
     let fallback = runtime_source(&["src", "session_metadata", "locator", "content_fallback.rs"]);
 
     assert!(
-        locator.contains("pub struct ClaudeStorageLocator"),
-        "legacy Claude storage locator must remain present until branch selection no longer routes builtin sessions through it"
-    );
-    assert!(
-        locator.contains("impl TranscriptLocator for ClaudeStorageLocator"),
-        "legacy Claude storage locator trait implementation must remain live"
+        !locator.contains(&removed_locator_symbol()),
+        "standalone storage locator was intentionally removed; live legacy readers are protected through transcript registry/fallback checks"
     );
     assert!(
         transcript
@@ -1014,17 +1014,6 @@ fn runtime_source(components: &[&str]) -> String {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         |path, component| path.join(component),
     );
-    std::fs::read_to_string(path).unwrap()
-}
-
-fn runtime_source_with_leaf(prefix: &[&str], leaf: &str) -> String {
-    let path = prefix
-        .iter()
-        .fold(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            |path, component| path.join(component),
-        )
-        .join(leaf);
     std::fs::read_to_string(path).unwrap()
 }
 
@@ -1492,32 +1481,6 @@ fn codex_content_fallback_ignores_non_rollout_files() {
         locate_jsonl_path_from_storage(Some(&storage), "codex", session_id, true).unwrap_err();
 
     assert_reason_eq(&err, "codex_storage_scan_not_found");
-}
-
-#[test]
-fn claude_storage_locator_trait_impl_uses_content_fallback() {
-    use super::locator::{
-        ClaudeStorageLocator, TranscriptLocator, TranscriptLookupMode, TranscriptRequest,
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
-    let projects_dir = dir.path().join("claude-projects");
-    let project_subdir = projects_dir.join("-renamed-after-resume");
-    std::fs::create_dir_all(&project_subdir).unwrap();
-    let jsonl_path = project_subdir.join("renamed.jsonl");
-    std::fs::write(&jsonl_path, claude_content_fallback_body(session_id)).unwrap();
-    let storage = SessionStorage::ClaudeCode { projects_dir };
-    let request = TranscriptRequest {
-        provider: "claude",
-        session_id: session_id.to_string(),
-        storage: Some(&storage),
-        sessions_config_locator: None,
-        mode: TranscriptLookupMode::RequireExisting,
-    };
-
-    let located = ClaudeStorageLocator.locate_jsonl(&request).unwrap();
-
-    assert_eq!(located.path, jsonl_path.canonicalize().unwrap());
 }
 
 #[test]

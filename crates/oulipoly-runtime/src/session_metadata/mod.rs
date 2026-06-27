@@ -59,10 +59,10 @@ mod transcript;
 mod workspace;
 
 pub use locator::{
-    ClaudeStorageLocator, CodexStorageLocator, IoErrorKind, LocatedTranscript, LocatorError,
-    LocatorSource, ProviderName, ScriptKind, SessionId, SessionsConfigLocator, TranscriptLocator,
-    TranscriptLookupMode, TranscriptRequest, TranscriptScriptLocator, UnsupportedStorageReason,
-    locator_error_to_stem, unsupported_storage_reason_to_stem,
+    CodexStorageLocator, IoErrorKind, LocatedTranscript, LocatorError, LocatorSource, ProviderName,
+    ScriptKind, SessionId, SessionsConfigLocator, TranscriptLocator, TranscriptLookupMode,
+    TranscriptRequest, TranscriptScriptLocator, UnsupportedStorageReason, locator_error_to_stem,
+    unsupported_storage_reason_to_stem,
 };
 pub use registry::{
     TranscriptLocatorEntry, TranscriptLocatorRegistry, discover_transcript_locator_registry,

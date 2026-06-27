@@ -48,21 +48,18 @@ const TEST_BLOCK_AFTER_RENAME: &str = "block-after-transcript-rename-before-db-c
 const TEST_FAIL_POSTIMAGE_VERIFY: &str = "fail-postimage-verification";
 
 static RESOLVE_REPLACE_METADATA_CALLS: AtomicUsize = AtomicUsize::new(0);
-static WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static RENDER_FOR_STORAGE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForbiddenHelperCallCounts {
     pub resolve_replace_metadata: usize,
-    pub write_external_provider_preimage_snapshot: usize,
     pub canonical_records_from_provider_file: usize,
     pub render_for_storage: usize,
 }
 
 pub fn reset_forbidden_helper_recorder() {
     RESOLVE_REPLACE_METADATA_CALLS.store(0, Ordering::SeqCst);
-    WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS.store(0, Ordering::SeqCst);
     CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS.store(0, Ordering::SeqCst);
     RENDER_FOR_STORAGE_CALLS.store(0, Ordering::SeqCst);
 }
@@ -70,8 +67,6 @@ pub fn reset_forbidden_helper_recorder() {
 pub fn forbidden_helper_call_counts() -> ForbiddenHelperCallCounts {
     ForbiddenHelperCallCounts {
         resolve_replace_metadata: RESOLVE_REPLACE_METADATA_CALLS.load(Ordering::SeqCst),
-        write_external_provider_preimage_snapshot: WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS
-            .load(Ordering::SeqCst),
         canonical_records_from_provider_file: CANONICAL_RECORDS_FROM_PROVIDER_FILE_CALLS
             .load(Ordering::SeqCst),
         render_for_storage: RENDER_FOR_STORAGE_CALLS.load(Ordering::SeqCst),
@@ -438,304 +433,6 @@ pub(crate) fn run_import_replace_bytes(
     )
 }
 
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn validate_import_replace_bytes_for_session(
-    session_id: &str,
-    input: &[u8],
-) -> Result<u64, ReplaceError> {
-    Uuid::try_parse(session_id).map_err(|_| ReplaceError::InvalidSessionId {
-        input: session_id.to_string(),
-    })?;
-    let records = parse_and_validate_canonical_input(input)?;
-    let metadata = resolve_replace_metadata(session_id)?;
-    if metadata.storage_type == SessionStorageType::Other {
-        return Err(ReplaceError::UnsupportedStorage {
-            provider_name: metadata.provider_name,
-            reason: "provider has no supported session_storage".to_string(),
-        });
-    }
-    validate_records_match_metadata(&records, &metadata)?;
-    Ok(records.len() as u64)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn begin_external_provider_replace(
-    session_id: &str,
-    input: &[u8],
-    preimage_sha256: Option<&str>,
-) -> Result<ExternalProviderReplaceTransaction, ReplaceError> {
-    let replace_input = prepare_replace_input(session_id, input)?;
-    let data_root = prepare_replace_data_root(session_id)?;
-    let workspace = stage_replace_journal_input(&data_root, &replace_input.canonical_bytes)?;
-    let metadata =
-        resolve_replace_metadata_for_staged_input(session_id, &replace_input.records, &workspace)?;
-    let lock = initialize_replace_session_lock(&data_root)?;
-    let lease = acquire_external_provider_replace_lease(&lock, &metadata, &workspace)?;
-    maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
-
-    let preimage = canonical_hash_from_provider_file(&metadata).inspect_err(|_| {
-        release_external_provider_lease(&lock, &lease).ok();
-        remove_staged_replace_input(&workspace);
-    })?;
-    validate_requested_preimage(preimage_sha256, &preimage).inspect_err(|_| {
-        release_external_provider_lease(&lock, &lease).ok();
-        remove_staged_replace_input(&workspace);
-    })?;
-    let preimage_snapshot_path = write_external_provider_preimage_snapshot(&workspace, &metadata)
-        .inspect_err(|_| {
-        release_external_provider_lease(&lock, &lease).ok();
-        remove_staged_replace_input(&workspace);
-    })?;
-    let published = publish_replace_journal_with_snapshot(
-        &workspace,
-        &metadata,
-        replace_input.records.len(),
-        Some(&preimage),
-        None,
-        Some(preimage_snapshot_path),
-    )
-    .inspect_err(|_| {
-        release_external_provider_lease(&lock, &lease).ok();
-        remove_staged_replace_input(&workspace);
-    })?;
-    Ok(ExternalProviderReplaceTransaction {
-        input: replace_input,
-        metadata,
-        workspace,
-        published,
-        lock,
-        lease,
-        preimage_sha256: preimage,
-    })
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-impl ExternalProviderReplaceTransaction {
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
-        &self.input.canonical_bytes
-    }
-
-    pub(crate) fn preimage_sha256(&self) -> &str {
-        &self.preimage_sha256
-    }
-
-    pub(crate) fn turn_count(&self) -> u64 {
-        self.input.records.len() as u64
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn rollback_external_provider_replace(
-    transaction: ExternalProviderReplaceTransaction,
-) -> Result<(), ReplaceError> {
-    restore_external_provider_preimage_snapshot(&transaction)?;
-    cleanup_replace_journal_publication(&transaction.workspace, &transaction.published)?;
-    release_external_provider_lease(&transaction.lock, &transaction.lease)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn rollback_external_provider_replace_after_error(
-    transaction: ExternalProviderReplaceTransaction,
-    error: ReplaceError,
-) -> ReplaceError {
-    match rollback_external_provider_replace(transaction) {
-        Ok(()) => error,
-        Err(rollback_error) => external_provider_rollback_error(error, rollback_error),
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn commit_external_provider_replace(
-    transaction: ExternalProviderReplaceTransaction,
-    expected_postimage_sha256: &str,
-) -> Result<ReplaceReceipt, ReplaceError> {
-    let actual_postimage =
-        match verify_external_provider_commit_postimage(&transaction, expected_postimage_sha256) {
-            Ok(postimage) => postimage,
-            Err(error) => return rollback_external_provider_precommit_error(transaction, error),
-        };
-    if let Err(error) = update_replace_journal_postimage(&transaction, expected_postimage_sha256) {
-        return rollback_external_provider_precommit_error(transaction, error);
-    }
-    if let Err(error) = apply_replace_sqlite(&transaction.metadata, &transaction.input.records) {
-        return external_provider_postcommit_error(&transaction, error);
-    }
-    if let Err(error) =
-        cleanup_replace_journal_publication(&transaction.workspace, &transaction.published)
-    {
-        return external_provider_postcommit_error(&transaction, error);
-    }
-    release_external_provider_lease(&transaction.lock, &transaction.lease)?;
-    Ok(format_replace_receipt(
-        &transaction.metadata,
-        transaction.preimage_sha256,
-        actual_postimage,
-    ))
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn verify_external_provider_commit_postimage(
-    transaction: &ExternalProviderReplaceTransaction,
-    expected_postimage_sha256: &str,
-) -> Result<String, ReplaceError> {
-    verify_replace_postimage(
-        &transaction.metadata,
-        &transaction.input.records,
-        expected_postimage_sha256,
-    )
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn rollback_external_provider_precommit_error(
-    transaction: ExternalProviderReplaceTransaction,
-    error: ReplaceError,
-) -> Result<ReplaceReceipt, ReplaceError> {
-    Err(rollback_external_provider_replace_after_error(
-        transaction,
-        error,
-    ))
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn external_provider_postcommit_error(
-    transaction: &ExternalProviderReplaceTransaction,
-    error: ReplaceError,
-) -> Result<ReplaceReceipt, ReplaceError> {
-    release_external_provider_lease(&transaction.lock, &transaction.lease).ok();
-    Err(error)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn external_provider_rollback_error(
-    primary_error: ReplaceError,
-    rollback_error: ReplaceError,
-) -> ReplaceError {
-    ReplaceError::OperationalError {
-        message: format!(
-            "external provider replace failed before durable commit ({}); rollback failed ({})",
-            primary_error.code(),
-            rollback_error.code()
-        ),
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn parse_external_provider_postimage_canonical_input(
-    input: &[u8],
-) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    parse_and_validate_canonical_input(input)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn access_external_provider_replace_metadata(
-    session_id: &str,
-) -> Result<SessionMetadata, ReplaceError> {
-    resolve_replace_metadata(session_id)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn map_external_provider_postimage_artifact_metadata(
-    mut metadata: SessionMetadata,
-    artifact_path: &Path,
-) -> SessionMetadata {
-    metadata.jsonl_path = artifact_path.to_path_buf();
-    metadata
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn access_external_provider_artifact_canonical_hash(
-    metadata: &SessionMetadata,
-) -> Result<String, ReplaceError> {
-    access_external_provider_artifact_file(metadata)?;
-    canonical_hash_from_provider_file(metadata)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn access_external_provider_artifact_file(metadata: &SessionMetadata) -> Result<(), ReplaceError> {
-    let file_metadata = fs::metadata(&metadata.jsonl_path)
-        .map_err(|_| format_invalid_external_provider_artifact_error())?;
-    if !file_metadata.is_file() {
-        return Err(format_invalid_external_provider_artifact_error());
-    }
-    File::open(&metadata.jsonl_path)
-        .map(|_| ())
-        .map_err(|_| format_invalid_external_provider_artifact_error())
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn format_invalid_external_provider_artifact_error() -> ReplaceError {
-    ReplaceError::OperationalError {
-        message: "invalid_artifact".to_string(),
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn validate_external_provider_postimage_hash(
-    actual_postimage_sha256: &str,
-    expected_postimage_sha256: &str,
-) -> Result<(), ReplaceError> {
-    if actual_postimage_sha256 == expected_postimage_sha256 {
-        Ok(())
-    } else {
-        Err(format_postimage_hash_mismatch_error())
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn access_external_provider_artifact_canonical_records(
-    metadata: &SessionMetadata,
-) -> Result<Vec<CanonicalRecord>, ReplaceError> {
-    access_external_provider_artifact_file(metadata)?;
-    canonical_records_from_provider_file(metadata)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) fn validate_external_provider_postimage_semantics(
-    expected: &[CanonicalRecord],
-    actual: &[CanonicalRecord],
-) -> Result<(), ReplaceError> {
-    if canonical_semantics_equal(expected, actual) {
-        Ok(())
-    } else {
-        Err(format_semantic_verification_mismatch_error())
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn format_postimage_hash_mismatch_error() -> ReplaceError {
-    ReplaceError::OperationalError {
-        message: "postimage_hash_mismatch".to_string(),
-    }
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn format_semantic_verification_mismatch_error() -> ReplaceError {
-    ReplaceError::OperationalError {
-        message: "semantic_verification_mismatch".to_string(),
-    }
-}
-
 enum ReplacePostimageAuthority {
     BuiltInRender,
 }
@@ -760,18 +457,6 @@ struct PublishedReplaceJournal {
 struct ReplacePostimagePlan {
     rendered: Option<Vec<u8>>,
     expected_sha256: String,
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-pub(crate) struct ExternalProviderReplaceTransaction {
-    input: ReplaceInput,
-    metadata: SessionMetadata,
-    workspace: ReplaceJournalWorkspace,
-    published: PublishedReplaceJournal,
-    lock: SessionLock,
-    lease: Lease,
-    preimage_sha256: String,
 }
 
 fn run_import_replace_with_postimage(
@@ -941,94 +626,6 @@ fn acquire_import_replace_lease<'a>(
     })
 }
 
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn acquire_external_provider_replace_lease(
-    lock: &SessionLock,
-    metadata: &SessionMetadata,
-    workspace: &ReplaceJournalWorkspace,
-) -> Result<Lease, ReplaceError> {
-    lock.acquire(
-        &metadata.session_id,
-        &metadata.provider_name,
-        Duration::from_secs(300),
-    )
-    .inspect_err(|_| remove_staged_replace_input(workspace))
-    .map_err(map_lock_error)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn release_external_provider_lease(lock: &SessionLock, lease: &Lease) -> Result<(), ReplaceError> {
-    lock.release(&lease.session_id, &lease.token)
-        .map(|_| ())
-        .map_err(map_lock_error)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn write_external_provider_preimage_snapshot(
-    workspace: &ReplaceJournalWorkspace,
-    metadata: &SessionMetadata,
-) -> Result<PathBuf, ReplaceError> {
-    WRITE_EXTERNAL_PROVIDER_PREIMAGE_SNAPSHOT_CALLS.fetch_add(1, Ordering::SeqCst);
-    let bytes = fs::read(&metadata.jsonl_path).map_err(|e| ReplaceError::OperationalError {
-        message: format!(
-            "failed to snapshot transcript {}: {e}",
-            metadata.jsonl_path.display()
-        ),
-    })?;
-    let snapshot_path = workspace
-        .journal_root
-        .join(format!("session-{}.preimage", metadata.session_id));
-    atomic_write_bytes(&snapshot_path, &bytes)?;
-    Ok(snapshot_path)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn restore_external_provider_preimage_snapshot(
-    transaction: &ExternalProviderReplaceTransaction,
-) -> Result<(), ReplaceError> {
-    let Some(snapshot_path) = &transaction.published.preimage_snapshot_path else {
-        return Ok(());
-    };
-    let bytes = fs::read(snapshot_path).map_err(|e| ReplaceError::OperationalError {
-        message: format!(
-            "failed to read external replace preimage snapshot {}: {e}",
-            snapshot_path.display()
-        ),
-    })?;
-    atomic_write_bytes(&transaction.metadata.jsonl_path, &bytes)
-}
-
-// S11-WU5: remove with host-local provider-ref replace deletion.
-#[allow(dead_code)]
-fn update_replace_journal_postimage(
-    transaction: &ExternalProviderReplaceTransaction,
-    postimage_sha256: &str,
-) -> Result<(), ReplaceError> {
-    let journal = ReplaceJournal {
-        schema_version: 1,
-        operation: "import-replace".to_string(),
-        operation_uuid: transaction.workspace.operation_uuid.clone(),
-        started_at: Utc::now().to_rfc3339(),
-        session_id: transaction.metadata.session_id.clone(),
-        chain_id: transaction.metadata.chain_id.clone(),
-        active_segment_id: transaction.metadata.active_segment_id,
-        provider_name: transaction.metadata.provider_name.clone(),
-        storage_type: storage_type_as_str(transaction.metadata.storage_type).to_string(),
-        jsonl_path: transaction.metadata.jsonl_path.clone(),
-        preimage_sha256: Some(transaction.preimage_sha256.clone()),
-        postimage_sha256: Some(postimage_sha256.to_string()),
-        canonical_records_path: transaction.published.canonical_records_path.clone(),
-        preimage_snapshot_path: transaction.published.preimage_snapshot_path.clone(),
-        db_state_pending: true,
-        expected_turn_count: transaction.input.records.len(),
-    };
-    atomic_write_json(&transaction.published.pending_path, &journal)
-}
-
 fn resolve_replace_preimage(
     authority: &ReplacePostimageAuthority,
     metadata: &SessionMetadata,
@@ -1048,24 +645,6 @@ fn publish_replace_journal(
     expected_turn_count: usize,
     preimage_sha256: &str,
     postimage_sha256: &str,
-) -> Result<PublishedReplaceJournal, ReplaceError> {
-    publish_replace_journal_with_snapshot(
-        workspace,
-        metadata,
-        expected_turn_count,
-        Some(preimage_sha256),
-        Some(postimage_sha256),
-        None,
-    )
-}
-
-fn publish_replace_journal_with_snapshot(
-    workspace: &ReplaceJournalWorkspace,
-    metadata: &SessionMetadata,
-    expected_turn_count: usize,
-    preimage_sha256: Option<&str>,
-    postimage_sha256: Option<&str>,
-    preimage_snapshot_path: Option<PathBuf>,
 ) -> Result<PublishedReplaceJournal, ReplaceError> {
     let canonical_records_path = workspace
         .journal_root
@@ -1092,10 +671,10 @@ fn publish_replace_journal_with_snapshot(
         provider_name: metadata.provider_name.clone(),
         storage_type: storage_type_as_str(metadata.storage_type).to_string(),
         jsonl_path: metadata.jsonl_path.clone(),
-        preimage_sha256: preimage_sha256.map(str::to_string),
-        postimage_sha256: postimage_sha256.map(str::to_string),
+        preimage_sha256: Some(preimage_sha256.to_string()),
+        postimage_sha256: Some(postimage_sha256.to_string()),
         canonical_records_path: canonical_records_path.clone(),
-        preimage_snapshot_path: preimage_snapshot_path.clone(),
+        preimage_snapshot_path: None,
         db_state_pending: true,
         expected_turn_count,
     };
@@ -1103,7 +682,7 @@ fn publish_replace_journal_with_snapshot(
     Ok(PublishedReplaceJournal {
         pending_path,
         canonical_records_path,
-        preimage_snapshot_path,
+        preimage_snapshot_path: None,
     })
 }
 

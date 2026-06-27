@@ -1,4 +1,4 @@
-/// JSON schema passed to `claude --json-schema` to constrain agent output.
+/// JSON schema passed to the setup agent to constrain agent output.
 pub const AGENT_TURN_SCHEMA: &str = r#"{
   "type": "object",
   "properties": {

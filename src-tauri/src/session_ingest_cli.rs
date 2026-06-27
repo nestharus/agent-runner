@@ -142,8 +142,7 @@ pub(crate) fn session_external_provider_identity(
     provider_name: &str,
 ) -> Option<SessionServiceExternalProviderIdentity> {
     let model = external_provider_model(model)?;
-    let describe =
-        describe_external_provider_for_session(agent_runtime_services, &model.name, provider_name)?;
+    let describe = describe_external_provider_for_session(agent_runtime_services, &model.name)?;
     Some(session_service_external_provider_identity(
         model,
         provider_name,
@@ -159,15 +158,11 @@ struct ExternalProviderSessionDescribe {
 fn describe_external_provider_for_session(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: &str,
-    provider_name: &str,
 ) -> Option<ExternalProviderSessionDescribe> {
     let registry = session_provider_registry(agent_runtime_services);
     require_external_provider_artifact(&registry, model_name)?;
     let describe = describe_session_provider_model(&registry, model_name);
-    Some(external_provider_session_describe(
-        provider_name,
-        describe.as_ref(),
-    ))
+    Some(external_provider_session_describe(describe.as_ref()))
 }
 
 fn session_provider_registry(
@@ -192,28 +187,16 @@ fn describe_session_provider_model(
 }
 
 fn external_provider_session_describe(
-    provider_name: &str,
     describe: Option<&oulipoly_provider::generated::DescribeResult>,
 ) -> ExternalProviderSessionDescribe {
     ExternalProviderSessionDescribe {
         provider_instance_id: provider_instance_id_from_describe(describe),
-        settings_id: session_settings_id(provider_name, describe),
+        settings_id: session_settings_id(describe),
     }
 }
 
-fn session_settings_id(
-    provider_name: &str,
-    describe: Option<&oulipoly_provider::generated::DescribeResult>,
-) -> String {
-    opencode_settings_id(provider_name).unwrap_or_else(|| settings_id_from_describe(describe))
-}
-
-fn opencode_settings_id(provider_name: &str) -> Option<String> {
-    match provider_name {
-        "opencode" | "opencode1" => Some("opencode1".to_string()),
-        "opencode2" | "opencode3" | "opencode4" | "opencode5" => Some(provider_name.to_string()),
-        _ => None,
-    }
+fn session_settings_id(describe: Option<&oulipoly_provider::generated::DescribeResult>) -> String {
+    settings_id_from_describe(describe)
 }
 
 fn provider_instance_id_from_describe(
@@ -424,24 +407,13 @@ mod tests {
     }
 
     #[test]
-    fn production_session_settings_id_canonicalizes_opencode_accounts() {
+    fn production_session_settings_id_uses_provider_described_schema_id() {
         let describe = describe_with_settings_schema("opencode.settings/v1");
 
+        assert_eq!(session_settings_id(Some(&describe)), "opencode.settings/v1");
         assert_eq!(
-            session_settings_id("opencode", Some(&describe)),
-            "opencode1"
-        );
-        assert_eq!(
-            session_settings_id("opencode1", Some(&describe)),
-            "opencode1"
-        );
-        assert_eq!(
-            session_settings_id("opencode2", Some(&describe)),
-            "opencode2"
-        );
-        assert_eq!(
-            session_settings_id("provider-a", Some(&describe)),
-            "opencode.settings/v1"
+            session_settings_id(None),
+            oulipoly_runtime::session_provider::S7A_NEUTRAL_SETTINGS_ID
         );
     }
 

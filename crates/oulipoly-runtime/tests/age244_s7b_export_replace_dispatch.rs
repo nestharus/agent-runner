@@ -2327,10 +2327,6 @@ fn assert_forbidden_helper_counts_zero() {
         "provider-ref must not resolve local metadata"
     );
     assert_eq!(
-        counts.write_external_provider_preimage_snapshot, 0,
-        "provider-ref must not write local preimage snapshots"
-    );
-    assert_eq!(
         counts.canonical_records_from_provider_file, 0,
         "provider-ref must not parse native provider files"
     );
