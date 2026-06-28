@@ -213,6 +213,12 @@ impl Fixture {
         dir.join(name)
     }
 
+    fn notify_trace_path(&self) -> PathBuf {
+        self.state_home
+            .join("oulipoly-agent-runner")
+            .join("notify-trace.log")
+    }
+
     fn write_interactive_model(&self, model_name: &str, provider_name: &str, script: &Path) {
         fs::write(
             self.models_dir.join(format!("{model_name}.toml")),
@@ -295,6 +301,10 @@ fn notify_live_pty_ack_marks_delivered_and_skips_headless_wake() {
     assert!(payload.contains("[OULIPOLY NOTIFICATIONS]"));
     assert!(payload.contains("handle: h-live-ack"));
     assert!(!payload.contains("log for h-live-ack"));
+    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
+    assert!(trace.contains("trigger=notify-time"), "trace was {trace}");
+    assert!(trace.contains("decision=inject"), "trace was {trace}");
+    assert!(trace.contains("inject_status=acked"), "trace was {trace}");
 
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
@@ -324,6 +334,15 @@ fn notify_live_pty_failure_leaves_pending_and_wake_busy() {
     assert_eq!(value["pty_delivery"]["status"], "unsafe_mid_line");
     assert_eq!(value["pty_delivery"]["submitted"], false);
     assert_eq!(value["wake"]["status"], "busy");
+    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
+    assert!(
+        trace.contains("decision=skip-unsafe_mid_line"),
+        "trace was {trace}"
+    );
+    assert!(
+        trace.contains("inject_status=unsafe_mid_line"),
+        "trace was {trace}"
+    );
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
@@ -366,6 +385,15 @@ fn notify_live_pty_child_output_active_is_precise_nack_and_traced() {
         stderr.contains("inject_status=unsafe_child_output_active"),
         "stderr was {stderr}"
     );
+    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
+    assert!(
+        trace.contains("decision=skip-unsafe_child_output_active"),
+        "trace was {trace}"
+    );
+    assert!(
+        trace.contains("inject_status=unsafe_child_output_active"),
+        "trace was {trace}"
+    );
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
@@ -401,6 +429,15 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     assert_eq!(runtime.run_state, "idle");
     assert!(runtime.pty_control_path.is_none());
     assert!(!stale_socket.exists());
+    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
+    assert!(
+        trace.contains("decision=skip-connect_error"),
+        "trace was {trace}"
+    );
+    assert!(
+        trace.contains("inject_status=connect_error"),
+        "trace was {trace}"
+    );
     fixture.assert_default_user_paths_untouched();
 }
 
