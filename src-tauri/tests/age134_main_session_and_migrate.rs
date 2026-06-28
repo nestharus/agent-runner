@@ -3,6 +3,8 @@
 //! ## Declared roles
 //! orchestration, accessor, mapper, parser, filter, predicate, validator, formatter
 
+use chrono::{DateTime, Utc};
+use oulipoly_state::{ImportedSessionDisplayMetadataUpsert, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -89,6 +91,10 @@ fn stderr_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stderr).unwrap()
 }
 
+fn ts(value: &str) -> DateTime<Utc> {
+    value.parse::<DateTime<Utc>>().unwrap()
+}
+
 fn read_optional(path: &Path) -> Option<Vec<u8>> {
     fs::read(path).ok()
 }
@@ -135,6 +141,44 @@ fn migrate_config_output(fixture: &CliFixture) -> Output {
         .arg(&fixture.models_dir)
         .output()
         .unwrap()
+}
+
+fn seed_session_list_rows(fixture: &CliFixture) {
+    let db = StateDb::open(&fixture.db_path()).unwrap();
+    db.mint_imported_chain_if_absent(
+        "provider-a",
+        "provider-a-native",
+        &ts("2026-06-01T00:01:00Z"),
+        "<unknown>",
+    )
+    .unwrap();
+    db.upsert_imported_session_display_metadata(&ImportedSessionDisplayMetadataUpsert {
+        provider_name: "provider-a".to_string(),
+        provider_session_id: "provider-a-native".to_string(),
+        title: Some("Provider A imported".to_string()),
+        cwd: Some("/tmp/provider-a".to_string()),
+        turn_count: Some(3),
+        provider_updated_at: Some(ts("2026-06-01T00:01:00Z")),
+        seen_at: ts("2026-06-01T00:02:00Z"),
+    })
+    .unwrap();
+    db.mint_imported_chain_if_absent(
+        "opencode",
+        "opencode-native",
+        &ts("2026-06-01T00:03:00Z"),
+        "<unknown>",
+    )
+    .unwrap();
+    db.upsert_imported_session_display_metadata(&ImportedSessionDisplayMetadataUpsert {
+        provider_name: "opencode".to_string(),
+        provider_session_id: "opencode-native".to_string(),
+        title: Some("OpenCode imported".to_string()),
+        cwd: None,
+        turn_count: Some(5),
+        provider_updated_at: Some(ts("2026-06-01T00:03:00Z")),
+        seen_at: ts("2026-06-01T00:04:00Z"),
+    })
+    .unwrap();
 }
 
 use std::io::Write;
@@ -215,6 +259,118 @@ fn age134_resume_list_empty_outputs_no_chains_for_user_and_hidden_syntax() {
         assert_eq!(stdout(&output), format!("No chains found for {uuid}\n"));
         assert!(output.stderr.is_empty(), "{output:?}");
     }
+}
+
+#[test]
+fn age134_session_list_empty_outputs_clean_human_and_json() {
+    let fixture = CliFixture::new();
+
+    let output = fixture
+        .command()
+        .arg("session")
+        .arg("list")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(stdout(&output), "No sessions found\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        !fixture.db_path().exists(),
+        "session list must not create state.db"
+    );
+
+    let output = fixture
+        .command()
+        .arg("session")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        Value::Array(vec![])
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        !fixture.db_path().exists(),
+        "session list --json must not create state.db"
+    );
+}
+
+#[test]
+fn age134_session_list_skips_startup_recovery_side_effects() {
+    let fixture = CliFixture::new();
+    let journal_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner/replace_journal");
+    fs::create_dir_all(&journal_root).unwrap();
+    let pending = journal_root.join("session-bad.pending");
+    fs::write(&pending, b"not json").unwrap();
+
+    let output = fixture
+        .command()
+        .arg("session")
+        .arg("list")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(stdout(&output), "No sessions found\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        pending.exists(),
+        "session list must not recover pending journals"
+    );
+    assert!(
+        !journal_root.join("quarantine/session-bad.pending").exists(),
+        "session list must not quarantine pending journals"
+    );
+    assert!(
+        !fixture.db_path().exists(),
+        "session list must not create state.db"
+    );
+}
+
+#[test]
+fn age134_session_list_prints_seeded_rows_and_json() {
+    let fixture = CliFixture::new();
+    seed_session_list_rows(&fixture);
+
+    let output = fixture
+        .command()
+        .arg("session")
+        .arg("list")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = stdout(&output);
+    assert!(stdout.contains("ACTIVE_PROVIDER_SESSION_ID"), "{stdout}");
+    assert!(stdout.contains("opencode-native"), "{stdout}");
+    assert!(stdout.contains("OpenCode imported"), "{stdout}");
+    assert!(stdout.contains("provider-a-native"), "{stdout}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let output = fixture
+        .command()
+        .arg("session")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let rows: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2, "{rows}");
+    assert_eq!(rows[0]["active_provider"], "opencode");
+    assert_eq!(rows[0]["active_provider_session_id"], "opencode-native");
+    assert_eq!(rows[0]["turn_count"], 0);
+    assert_eq!(rows[0]["is_imported"], true);
+    assert_eq!(rows[1]["active_provider"], "provider-a");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]

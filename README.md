@@ -146,6 +146,10 @@ Subcommands:
   session locate <session-id> [--json]
         Locate stable metadata for a provider session (see Locating a Session)
 
+  session list [--json]
+        List resumable/imported provider sessions known to the state DB
+        (see Listing Sessions).
+
   session schema-probe
         Inspect the default state-DB schema and supported session features
         (see Probing the Session Surface).
@@ -574,6 +578,21 @@ Exit codes:
 | `12` | `unsupported-storage` | `MetadataError::UnsupportedStorage`; absent storage block, transcript not canonical/available, workspace_root not derivable, etc. No partial success JSON ever emitted. |
 
 `trace --json` remains invocation-tree scoped and degrades to `no_locator` or `missing` transcript states for diagnostics. `session locate` is action-oriented and refuses partial locations with `unsupported-storage`.
+
+### Listing Sessions
+
+```bash
+oulipoly-agent-runner session list
+oulipoly-agent-runner session list --json
+```
+
+`session list` is a read-only view of resumable sessions known to the local state DB. It joins active session chains with imported provider-native display metadata, so sessions discovered through provider-native enumeration can be resumed without first knowing their provider-native id.
+
+Human output is a tab-separated table with these columns: `CHAIN_ID`, `ACTIVE_PROVIDER`, `ACTIVE_PROVIDER_SESSION_ID`, `TITLE`, `CWD`, `LAST_USED_OR_UPDATED_AT`, `TURN_COUNT`, and `IS_IMPORTED`. Missing title/cwd values render as `-`. Empty stores print `No sessions found` and exit `0`.
+
+`--json` emits an array of objects with matching snake_case fields: `chain_id`, `active_provider`, `active_provider_session_id`, `title`, `cwd`, `last_used_or_updated_at`, `turn_count`, and `is_imported`. `turn_count` counts turns ingested into `state.db`; an imported provider-native session with no backfilled turns appears with `turn_count: 0`.
+
+Use `active_provider_session_id` with `--resume <id>`, `resume --session-id <id>`, or `repl --resume <id>`. Provider-native stores are not read or mutated by `session list`; it only reads `state.db`.
 
 ### Probing the Session Surface
 
@@ -1023,6 +1042,14 @@ To implement a provider, begin with the [`Provider Contract Crate (oulipoly-prov
 3. Optionally declare the implementation in a model TOML via `provider = { ... }`. The four flavors are `path`, `crate` (plus optional `version`), `binary`, and `script`.
 
 > **Parse-only in this release:** Dynamic loading and runtime dispatch are not implemented in this release; the `provider = { ... }` field is recorded by the parser but has no effect on routing or execution.
+
+### Provider-Native Session Enumeration
+
+External provider binaries that support provider-native session discovery advertise `capabilities.session_enumerate: true` in `describe` and implement the `session.enumerate` subcommand. The runner uses this command for session import/listing metadata and treats provider-native stores as **read-only** during import: enumeration records chain rows and display metadata in `state.db`, and optional turn backfill reads through `session.read_turns`; it does not write to Claude, OpenCode, or any other provider-native store.
+
+`session.enumerate` receives `SessionEnumerateParams`: `settings_id`, optional `limit`, optional `cursor`, optional `include_cwd`, optional `include_turn_count`, and optional `since_unix_ms`. It returns `SessionEnumerateResult` with `sessions`, `complete`, optional `next_cursor`, and `warnings`.
+
+Each session entry contains `provider_session_id`, optional `title`, optional absolute `cwd`, optional `created_unix_ms`, optional `updated_unix_ms`, optional provider-reported `turn_count`, and a `source` object with `kind` plus optional `detail`. Relative `cwd` values are rejected. `provider_session_id` is the opaque native id users can pass to resume commands after `session list` surfaces it.
 
 **Provider vocabulary précis** (full definitions in [AGENTS.md §Provider Term Glossary](AGENTS.md#provider-term-glossary)):
 

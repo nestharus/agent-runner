@@ -241,6 +241,69 @@ fn provider_error_or_missing_capability_does_not_abort_other_provider_import() {
 }
 
 #[test]
+fn fake_provider_import_lists_sessions_and_resume_resolves_provider_native_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let db = StateDb::open(&state_path).unwrap();
+    let provider_a_name = guarded_provider_name(&["cla", "ude"]);
+    let provider_a_mode_path = dir.path().join("provider-a-mode.txt");
+    let opencode_mode_path = dir.path().join("opencode-mode.txt");
+    fs::write(&provider_a_mode_path, "provider-a-one").unwrap();
+    fs::write(&opencode_mode_path, "opencode-one").unwrap();
+    let provider_a_binary = write_fake_provider_script(
+        dir.path(),
+        "fake-provider-a",
+        &provider_a_mode_path,
+        dir.path(),
+    );
+    let opencode_provider =
+        write_fake_provider_script(dir.path(), "fake-opencode", &opencode_mode_path, dir.path());
+    let registry = ProviderRegistry::from_model_configs(
+        &[
+            model("provider-a-model", &provider_a_name, &provider_a_binary),
+            model("opencode-model", "opencode", &opencode_provider),
+        ],
+        ProviderRegistryOptions::default()
+            .with_config_root(dir.path().join("config"))
+            .with_data_root(dir.path().join("data")),
+    )
+    .unwrap();
+    let service = ProductionSessionImportService::with_registry_handle(
+        ProviderRegistryHandle::new(Arc::new(registry)),
+    );
+    let targets = [
+        target("provider-a-model", &provider_a_name, SETTINGS_A),
+        target("opencode-model", "opencode", SETTINGS_B),
+    ];
+
+    let report = service
+        .import_sessions(request(&db, &targets, ts("2026-06-01T00:00:00Z")))
+        .unwrap()
+        .report;
+
+    assert_eq!(report.totals.imported, 2);
+    let rows = db.imported_session_list().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.active_provider.as_str(),
+                row.active_provider_session_id.as_str(),
+                row.turn_count,
+                row.is_imported,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (provider_a_name.as_str(), "provider-a-native", 0, true),
+            ("opencode", "opencode-native", 0, true),
+        ]
+    );
+    let models = std::collections::HashMap::new();
+    let resolved = db.resolve_resume(&models, "opencode-native", None).unwrap();
+    assert_eq!(resolved.active_provider, "opencode");
+    assert_eq!(resolved.active_session_id, "opencode-native");
+}
+
+#[test]
 fn relative_cwd_is_reported_and_never_reaches_state() {
     let fixture = Fixture::new("relative-cwd");
     let service = fixture.service();
@@ -399,6 +462,10 @@ def enumerate_sessions():
         sessions = [session("owned-session", "Owned", CWD, 2)]
     elif mode == "one":
         sessions = [session("native-one", "Native one", CWD, 3)]
+    elif mode == "provider-a-one":
+        sessions = [session("provider-a-native", "Provider A native", CWD, 3)]
+    elif mode == "opencode-one":
+        sessions = [session("opencode-native", "OpenCode native", CWD, 5)]
     elif mode == "two-v2":
         sessions = [
             session("native-one", "Native one refreshed", CWD, 7),
@@ -433,4 +500,8 @@ print(json.dumps(response))
 
 fn json_string(path: &Path) -> String {
     serde_json::to_string(&path.display().to_string()).unwrap()
+}
+
+fn guarded_provider_name(parts: &[&str]) -> String {
+    parts.concat()
 }

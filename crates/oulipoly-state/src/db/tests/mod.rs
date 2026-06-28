@@ -48,6 +48,7 @@ mod artifact_tests;
 mod chain_backfill_tests_1;
 mod chain_backfill_tests_2;
 mod common;
+mod imported_session_list_tests;
 mod invocation_lifecycle_tests_1;
 mod invocation_lifecycle_tests_2;
 mod invocation_records_tests;

@@ -62,7 +62,9 @@ pub use db::{
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
-pub use db::{ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert};
+pub use db::{
+    ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,
+};
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
@@ -155,6 +157,7 @@ mod age160_root_reexport_tests {
             std::any::type_name::<crate::ParamType>(),
             std::any::type_name::<crate::CompactSummaryEvidence>(),
             std::any::type_name::<crate::OwnedTurnEventRow>(),
+            std::any::type_name::<crate::ImportedSessionListRow>(),
             std::any::type_name::<dyn crate::LifecycleEventSink>(),
             std::any::type_name::<crate::NoopLifecycleEventSink>(),
         ];

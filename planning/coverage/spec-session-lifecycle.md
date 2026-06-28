@@ -22,6 +22,7 @@
 - `crates/oulipoly-runtime/src/session_metadata/transcript.rs`
 - `crates/oulipoly-runtime/src/session_metadata/workspace.rs`
 - `crates/oulipoly-runtime/src/session_replace/mod.rs`
+- `crates/oulipoly-state/src/db/imported_session_list.rs`
 - `crates/oulipoly-runtime/src/migration/mod.rs`
 - `src-tauri/src/commands/migrate/session_ownership/classifier.rs`
 - `src-tauri/src/commands/migrate/session_ownership/forward.sql`
@@ -88,6 +89,7 @@ co-located unit tests in `src-tauri/src/commands/session_locate_export/{mapper,v
 | Resume a session that no longer exists on disk. | Return a structured "not found" error carrying the provider/account; do NOT auto-create a new session. |
 | Two callers race to resume the same session id. | `session_lock` serializes: first wins, second blocks or errors per the lock policy. |
 | Session export request. | Emit a canonical transcript record covering the session's full chain; `session_export/metadata.rs` produces the metadata sidecar. |
+| Session list query. | Return active chain rows joined to imported display metadata and ingested turn counts, sorted by last-used/updated descending then provider/session id. |
 | Session replace request (overwrite ingest). | Resolve target session, validate the replacement payload, atomically swap on-disk artifacts. |
 | Locator queries with ambiguous (cwd, workspace) — multiple matches. | `ambiguity.rs` returns an explicit `Ambiguous` outcome carrying every candidate; caller must disambiguate, runtime does not guess. |
 
@@ -125,6 +127,7 @@ co-located unit tests in `src-tauri/src/commands/session_locate_export/{mapper,v
   recognizer.
 - Session metadata writes go through the row-version-tracked `oulipoly-state`
   surface; the lifecycle module never bypasses that.
+- Session listing is read-only over `state.db`; it does not enumerate provider-native stores or mutate imported metadata.
 
 ## Declared test patterns
 
