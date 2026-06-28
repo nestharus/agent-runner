@@ -91,7 +91,17 @@ where
 }
 
 fn map_registry_error(error: ProviderRegistryError) -> SessionProviderError {
-    SessionProviderError::new("provider_registry_error", error.to_string())
+    let token = match &error {
+        ProviderRegistryError::ProviderTransport { .. }
+        | ProviderRegistryError::ProviderProtocol { .. }
+        | ProviderRegistryError::ProviderDescribeFailed { .. }
+        | ProviderRegistryError::RuntimeDisabledArtifact { .. }
+        | ProviderRegistryError::ModelProviderNotConfigured { .. } => {
+            "session_provider_describe_unavailable"
+        }
+        ProviderRegistryError::InvalidImplementationRef { .. } => "provider_registry_error",
+    };
+    SessionProviderError::new(token, error.to_string())
 }
 
 fn map_client_error(error: ProviderClientError) -> SessionProviderError {

@@ -362,9 +362,35 @@ fn provider_ref_from_effective_provider(
     }
     Some(if path_like_executable(executable) {
         path_provider_ref(executable)
-    } else {
+    } else if is_external_provider_binary(executable) {
         binary_provider_ref(executable)
+    } else {
+        binary_provider_ref(&session_provider_binary_name(executable))
     })
+}
+
+fn is_external_provider_binary(executable: &str) -> bool {
+    executable_basename(executable).starts_with("agent-runner-")
+}
+
+fn session_provider_binary_name(executable: &str) -> String {
+    format!("agent-runner-{}", provider_family_token(executable))
+}
+
+fn provider_family_token(executable: &str) -> String {
+    let basename = executable_basename(executable);
+    let trimmed = basename
+        .trim_end_matches(|ch: char| ch.is_ascii_digit())
+        .trim_end_matches(['-', '_']);
+    if trimmed.is_empty() {
+        basename.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn executable_basename(executable: &str) -> &str {
+    executable.rsplit(['/', '\\']).next().unwrap_or(executable)
 }
 
 fn path_like_executable(executable: &str) -> bool {
