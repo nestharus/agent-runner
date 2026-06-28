@@ -11,9 +11,13 @@ use artifact_key::{ArtifactKey, artifact_key};
 use cache::DescribeCache;
 pub(crate) use describe::DescribeHostOptions;
 use describe::describe_provider;
-use oulipoly_config::{ModelConfig, provider_implementation_ref::ProviderImplementationRef};
+use oulipoly_config::{
+    ModelConfig, ProviderConfig, ProvidersConfig, derive_provider_name,
+    provider_implementation_ref::ProviderImplementationRef,
+};
 use oulipoly_provider::generated::DescribeResult;
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 pub use client_factory::ProviderClientFactory;
 pub use conversion::{ArtifactKind, RuntimeProviderArtifact};
@@ -47,6 +51,7 @@ pub use options::ProviderRegistryOptions;
 pub struct ProviderRegistry {
     artifacts: BTreeMap<ArtifactKey, RuntimeProviderArtifact>,
     model_artifacts: HashMap<String, ArtifactKey>,
+    model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
     cache: DescribeCache,
     client_factory: ProviderClientFactory,
     host_options: DescribeHostOptions,
@@ -56,7 +61,10 @@ pub struct ProviderRegistry {
 struct ArtifactInventory {
     artifacts: BTreeMap<ArtifactKey, RuntimeProviderArtifact>,
     model_artifacts: HashMap<String, ArtifactKey>,
+    model_provider_artifacts: HashMap<ModelProviderKey, ArtifactKey>,
 }
+
+type ModelProviderKey = (String, String);
 
 impl ProviderRegistry {
     pub fn from_model_configs(
@@ -67,10 +75,21 @@ impl ProviderRegistry {
         Ok(Self::from_inventory(inventory, options))
     }
 
+    pub fn from_model_configs_with_provider_config(
+        models: &[ModelConfig],
+        providers: &ProvidersConfig,
+        options: ProviderRegistryOptions,
+    ) -> Result<Self, ProviderRegistryError> {
+        let mut inventory = artifact_inventory(configured_provider_refs(models))?;
+        add_provider_instance_artifacts(&mut inventory, models, providers)?;
+        Ok(Self::from_inventory(inventory, options))
+    }
+
     fn from_inventory(inventory: ArtifactInventory, options: ProviderRegistryOptions) -> Self {
         Self {
             artifacts: inventory.artifacts,
             model_artifacts: inventory.model_artifacts,
+            model_provider_artifacts: inventory.model_provider_artifacts,
             cache: DescribeCache::default(),
             client_factory: ProviderClientFactory::new(options.client),
             host_options: DescribeHostOptions {
@@ -84,6 +103,7 @@ impl ProviderRegistry {
         Self {
             artifacts: BTreeMap::new(),
             model_artifacts: HashMap::new(),
+            model_provider_artifacts: HashMap::new(),
             cache: DescribeCache::default(),
             client_factory: ProviderClientFactory::new(options.client),
             host_options: DescribeHostOptions {
@@ -107,6 +127,17 @@ impl ProviderRegistry {
         self.model_artifacts.get(model_name).cloned()
     }
 
+    pub fn artifact_key_for_model_provider(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+    ) -> Option<ArtifactKey> {
+        self.model_provider_artifacts
+            .get(&model_provider_key(model_name, provider_name))
+            .cloned()
+            .or_else(|| self.artifact_key_for_model(model_name))
+    }
+
     pub fn configured_model_names(&self) -> Vec<String> {
         let mut names = self.model_artifacts.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -125,6 +156,19 @@ impl ProviderRegistry {
         self.describe_uncached_model_artifact(model_name, &key)
     }
 
+    pub fn describe_model_provider_instance(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+    ) -> Result<DescribeResult, ProviderRegistryError> {
+        let key = self.lookup_model_provider_artifact_key(model_name, provider_name)?;
+        if let Some(result) = self.cached_describe(&key) {
+            return Ok(result);
+        }
+
+        self.describe_uncached_model_artifact(model_name, &key)
+    }
+
     fn lookup_artifact_key(&self, model_name: &str) -> Result<ArtifactKey, ProviderRegistryError> {
         self.model_artifacts
             .get(model_name)
@@ -134,11 +178,39 @@ impl ProviderRegistry {
             })
     }
 
+    fn lookup_model_provider_artifact_key(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+    ) -> Result<ArtifactKey, ProviderRegistryError> {
+        self.artifact_key_for_model_provider(model_name, provider_name)
+            .ok_or_else(|| ProviderRegistryError::ModelProviderNotConfigured {
+                model_name: format!("{model_name}/{provider_name}"),
+            })
+    }
+
     pub(crate) fn enabled_artifact_for_model(
         &self,
         model_name: &str,
     ) -> Result<oulipoly_provider::resolver::ProviderArtifactRef, ProviderRegistryError> {
         let key = self.lookup_artifact_key(model_name)?;
+        match self.lookup_artifact(model_name, &key)? {
+            RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
+            RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
+                Err(ProviderRegistryError::RuntimeDisabledArtifact {
+                    kind: "runtime_disabled".to_string(),
+                    artifact,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn enabled_artifact_for_model_provider(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+    ) -> Result<oulipoly_provider::resolver::ProviderArtifactRef, ProviderRegistryError> {
+        let key = self.lookup_model_provider_artifact_key(model_name, provider_name)?;
         match self.lookup_artifact(model_name, &key)? {
             RuntimeProviderArtifact::Enabled(artifact) => Ok(artifact),
             RuntimeProviderArtifact::RuntimeDisabled(artifact) => {
@@ -226,5 +298,100 @@ fn artifact_inventory<'a>(
     Ok(ArtifactInventory {
         artifacts,
         model_artifacts,
+        model_provider_artifacts: HashMap::new(),
     })
+}
+
+fn add_provider_instance_artifacts(
+    inventory: &mut ArtifactInventory,
+    models: &[ModelConfig],
+    providers: &ProvidersConfig,
+) -> Result<(), ProviderRegistryError> {
+    for model in models {
+        if let Some(model_key) = inventory.model_artifacts.get(&model.name).cloned() {
+            add_model_provider_artifact_keys(inventory, model, model_key);
+            continue;
+        }
+        add_provider_config_artifacts(inventory, model, providers)?;
+    }
+    Ok(())
+}
+
+fn add_model_provider_artifact_keys(
+    inventory: &mut ArtifactInventory,
+    model: &ModelConfig,
+    artifact_key: ArtifactKey,
+) {
+    for provider in &model.providers {
+        inventory.model_provider_artifacts.insert(
+            model_provider_key(&model.name, &provider.name),
+            artifact_key.clone(),
+        );
+    }
+}
+
+fn add_provider_config_artifacts(
+    inventory: &mut ArtifactInventory,
+    model: &ModelConfig,
+    providers: &ProvidersConfig,
+) -> Result<(), ProviderRegistryError> {
+    for provider in &model.providers {
+        let Ok((effective, _)) = providers.effective_provider(provider) else {
+            continue;
+        };
+        let Some(provider_ref) = provider_ref_from_effective_provider(&effective) else {
+            continue;
+        };
+        let artifact = ProviderRegistry::convert_ref(&provider_ref)?;
+        let key = artifact_key(&artifact);
+        inventory.artifacts.entry(key.clone()).or_insert(artifact);
+        inventory
+            .model_provider_artifacts
+            .insert(model_provider_key(&model.name, &provider.name), key);
+    }
+    Ok(())
+}
+
+fn provider_ref_from_effective_provider(
+    provider: &ProviderConfig,
+) -> Option<ProviderImplementationRef> {
+    let executable = derive_provider_name(&provider.command, &provider.args);
+    let executable = executable.trim();
+    if executable.is_empty() {
+        return None;
+    }
+    Some(if path_like_executable(executable) {
+        path_provider_ref(executable)
+    } else {
+        binary_provider_ref(executable)
+    })
+}
+
+fn path_like_executable(executable: &str) -> bool {
+    let path = Path::new(executable);
+    path.is_absolute() || executable.contains('/') || executable.contains('\\')
+}
+
+fn path_provider_ref(path: &str) -> ProviderImplementationRef {
+    ProviderImplementationRef {
+        path: Some(path.to_string()),
+        crate_name: None,
+        version: None,
+        binary: None,
+        script: None,
+    }
+}
+
+fn binary_provider_ref(binary: &str) -> ProviderImplementationRef {
+    ProviderImplementationRef {
+        path: None,
+        crate_name: None,
+        version: None,
+        binary: Some(binary.to_string()),
+        script: None,
+    }
+}
+
+fn model_provider_key(model_name: &str, provider_name: &str) -> ModelProviderKey {
+    (model_name.to_string(), provider_name.to_string())
 }
