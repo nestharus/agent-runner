@@ -366,6 +366,22 @@ fn dispatch_session_subcommand(
 ) -> Result<i32, String> {
     match command {
         SessionSubcommands::List { json } => crate::commands::session_list::run_session_list(json),
+        SessionSubcommands::Import {
+            provider,
+            limit,
+            since_unix_ms,
+            backfill_turns,
+            json,
+        } => crate::commands::session_import::run_session_import(
+            crate::commands::session_import::SessionImportCliArgs {
+                provider: provider.as_deref(),
+                limit,
+                since_unix_ms,
+                backfill_turns,
+                json,
+            },
+            agent_runtime_services,
+        ),
         SessionSubcommands::Locate { session_id, json } => {
             dispatch_session_locate_subcommand(&session_id, json)
         }

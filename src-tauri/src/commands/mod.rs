@@ -10,6 +10,7 @@ pub(crate) mod pid_session;
 pub(crate) mod resume_list;
 pub(crate) mod schema_probe;
 pub(crate) mod session_external_provider_identity;
+pub(crate) mod session_import;
 pub(crate) mod session_import_replace;
 pub(crate) mod session_list;
 pub(crate) mod session_locate_export;
