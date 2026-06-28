@@ -135,6 +135,45 @@ pub(super) enum Focus {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TypingProtection {
+    active: bool,
+}
+
+impl TypingProtection {
+    fn active() -> Self {
+        Self { active: true }
+    }
+
+    fn inactive() -> Self {
+        Self { active: false }
+    }
+
+    fn for_focus(focus: Focus) -> Self {
+        if focus == Focus::Top {
+            Self::active()
+        } else {
+            Self::inactive()
+        }
+    }
+
+    fn top_min_rows(self) -> u16 {
+        if self.active {
+            INPUT_SAFE_TOP_PANE_MIN_ROWS
+        } else {
+            TOP_PANE_MIN_ROWS
+        }
+    }
+}
+
+fn typing_protection(focus: Focus, line_state: &InputLineState) -> TypingProtection {
+    if focus == Focus::Top || !line_state.input_empty() {
+        TypingProtection::active()
+    } else {
+        TypingProtection::inactive()
+    }
+}
+
 /// A bottom-pane (monitor) command decoded from keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MonitorCommand {
@@ -851,14 +890,18 @@ fn apply_top_scroll(current: usize, delta: i32) -> usize {
     (current as i64 + i64::from(delta)).max(0) as usize
 }
 
-fn pane_areas(area: Rect, pane: &MonitorPane) -> PaneAreas {
-    let bottom_rows = pane.bottom_rows(area.height);
+fn pane_areas(area: Rect, pane: &MonitorPane, protection: TypingProtection) -> PaneAreas {
+    let bottom_rows = pane.bottom_rows(area.height, protection);
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
     PaneAreas { top, bottom }
 }
 
-fn pane_areas_for_winsize(winsize: &libc::winsize, pane: &MonitorPane) -> PaneAreas {
+fn pane_areas_for_winsize(
+    winsize: &libc::winsize,
+    pane: &MonitorPane,
+    protection: TypingProtection,
+) -> PaneAreas {
     pane_areas(
         Rect {
             x: 0,
@@ -867,6 +910,7 @@ fn pane_areas_for_winsize(winsize: &libc::winsize, pane: &MonitorPane) -> PaneAr
             height: winsize.ws_row,
         },
         pane,
+        protection,
     )
 }
 
@@ -906,6 +950,8 @@ const DETAIL_REFRESH: Duration = Duration::from_millis(250);
 const EXPANDED_MIN_ROWS: u16 = 8;
 /// Rows always reserved for the interactive top pane.
 const TOP_PANE_MIN_ROWS: u16 = 5;
+/// Top-pane floor while real child input is active, preserving multi-line composers.
+const INPUT_SAFE_TOP_PANE_MIN_ROWS: u16 = 14;
 /// Scrollback rows retained for the interactive top pane so the operator can wheel
 /// back through the child's output (the child runs in the broker's alt-screen, which
 /// has no native scrollback of its own).
@@ -1363,12 +1409,12 @@ impl MonitorPane {
     }
 
     /// Rows the monitor occupies at the bottom for the given full terminal height.
-    fn bottom_rows(&self, full_rows: u16) -> u16 {
+    fn bottom_rows(&self, full_rows: u16, protection: TypingProtection) -> u16 {
         if self.collapsed {
             return COLLAPSED_MONITOR_ROWS;
         }
         let target = (u32::from(full_rows) * 35 / 100) as u16;
-        let ceiling = full_rows.saturating_sub(TOP_PANE_MIN_ROWS);
+        let ceiling = full_rows.saturating_sub(protection.top_min_rows());
         target
             .max(EXPANDED_MIN_ROWS)
             .min(ceiling)
@@ -2149,14 +2195,32 @@ struct RenderSnapshot {
     pane: MonitorPane,
     selection: Option<SelectionSpan>,
     mouse_request: MouseRequest,
+    typing_protection: TypingProtection,
 }
 
 impl RenderSnapshot {
+    #[cfg(test)]
     fn capture(
         screen: &vt100::Screen,
         focus: Focus,
         pane: &MonitorPane,
         selection: Option<SelectionSpan>,
+    ) -> Self {
+        Self::capture_with_typing_protection(
+            screen,
+            focus,
+            pane,
+            selection,
+            TypingProtection::for_focus(focus),
+        )
+    }
+
+    fn capture_with_typing_protection(
+        screen: &vt100::Screen,
+        focus: Focus,
+        pane: &MonitorPane,
+        selection: Option<SelectionSpan>,
+        typing_protection: TypingProtection,
     ) -> Self {
         Self {
             screen: ScreenRenderSnapshot::from_screen(screen),
@@ -2164,6 +2228,7 @@ impl RenderSnapshot {
             pane: pane.clone(),
             selection,
             mouse_request: effective_mouse_request(mouse_request_from_screen(screen)),
+            typing_protection,
         }
     }
 }
@@ -2202,15 +2267,44 @@ fn render_frame(
     render_snapshot_frame(frame, &snapshot);
 }
 
+#[cfg(test)]
+fn render_frame_with_typing_protection(
+    frame: &mut ratatui::Frame,
+    screen: &vt100::Screen,
+    focus: Focus,
+    pane: &MonitorPane,
+    selection: Option<SelectionSpan>,
+    typing_protection: TypingProtection,
+) {
+    let snapshot = RenderSnapshot::capture_with_typing_protection(
+        screen,
+        focus,
+        pane,
+        selection,
+        typing_protection,
+    );
+    render_snapshot_frame(frame, &snapshot);
+}
+
 fn render_snapshot_frame(frame: &mut ratatui::Frame, snapshot: &RenderSnapshot) {
     let area = frame.area();
     let screen = &snapshot.screen;
-    let bottom_rows = snapshot.pane.bottom_rows(area.height);
+    let bottom_rows = snapshot
+        .pane
+        .bottom_rows(area.height, snapshot.typing_protection);
+    let overlay_constrained =
+        overlay_constrained_for_typing(&snapshot.pane, area.height, snapshot.typing_protection);
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
     render_screen_snapshot(frame.buffer_mut(), top, screen, snapshot.selection);
     render_scrollback_indicator(frame.buffer_mut(), top, screen.scrollback);
-    render_monitor(frame.buffer_mut(), bottom, &snapshot.pane, snapshot.focus);
+    render_monitor(
+        frame.buffer_mut(),
+        bottom,
+        &snapshot.pane,
+        snapshot.focus,
+        overlay_constrained,
+    );
     // Suppress the child cursor while scrolled back or selecting — it belongs to the live
     // tail, not the history/selection the operator is reading.
     if snapshot.focus == Focus::Top
@@ -2223,6 +2317,17 @@ fn render_snapshot_frame(frame: &mut ratatui::Frame, snapshot: &RenderSnapshot) 
             frame.set_cursor_position(Position::new(top.x + ccol, top.y + crow));
         }
     }
+}
+
+fn overlay_constrained_for_typing(
+    pane: &MonitorPane,
+    full_rows: u16,
+    protection: TypingProtection,
+) -> bool {
+    !pane.collapsed
+        && protection.active
+        && pane.bottom_rows(full_rows, protection)
+            < pane.bottom_rows(full_rows, TypingProtection::inactive())
 }
 
 /// Badge in the top-right of the interactive pane while the operator is scrolled back,
@@ -2246,11 +2351,23 @@ fn render_scrollback_indicator(buf: &mut Buffer, area: Rect, scrollback: usize) 
 }
 
 /// Render the monitor: a status row always, plus the node list when expanded.
-fn render_monitor(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Focus) {
+fn render_monitor(
+    buf: &mut Buffer,
+    area: Rect,
+    pane: &MonitorPane,
+    focus: Focus,
+    overlay_constrained: bool,
+) {
     if area.height == 0 {
         return;
     }
-    render_status_row(buf, Rect { height: 1, ..area }, pane, focus);
+    render_status_row(
+        buf,
+        Rect { height: 1, ..area },
+        pane,
+        focus,
+        overlay_constrained,
+    );
     if pane.collapsed || area.height <= 1 {
         return;
     }
@@ -2439,8 +2556,14 @@ fn visible_inspect_rows(pane: &MonitorPane, body_height: u16) -> impl Iterator<I
 }
 
 /// The single status row (the whole monitor when collapsed; the header when open).
-fn render_status_row(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Focus) {
-    let hint = status_hint(pane, focus);
+fn render_status_row(
+    buf: &mut Buffer,
+    area: Rect,
+    pane: &MonitorPane,
+    focus: Focus,
+    overlay_constrained: bool,
+) {
+    let hint = status_hint(pane, focus, overlay_constrained);
     let label = pad_to_width(
         format!(
             " OBS  {} · {}  —  {hint}",
@@ -2457,24 +2580,34 @@ fn render_status_row(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: Fo
 }
 
 /// The status-row hint, reflecting focus and any armed/last cancel state.
-fn status_hint(pane: &MonitorPane, focus: Focus) -> String {
+fn status_hint(pane: &MonitorPane, focus: Focus, overlay_constrained: bool) -> String {
     match focus {
+        Focus::Top if overlay_constrained => "input viewport protected · Ctrl+O focus".to_string(),
         Focus::Top => "Ctrl+O focus".to_string(),
-        Focus::Bottom => bottom_status_hint(pane),
+        Focus::Bottom => bottom_status_hint(pane, overlay_constrained),
     }
 }
 
-fn bottom_status_hint(pane: &MonitorPane) -> String {
+fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
+    let protected_suffix = if overlay_constrained {
+        " · input viewport protected"
+    } else {
+        ""
+    };
     if pane.pending_cancel.is_some() {
-        return "confirm cancel: y = SIGTERM · n = abort".to_string();
+        return format!("confirm cancel: y = SIGTERM · n = abort{protected_suffix}");
     }
     match pane.cancel_feedback.as_deref() {
         Some(feedback) => {
             format!(
-                "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top  ({feedback})"
+                "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top  ({feedback}){protected_suffix}"
             )
         }
-        None => "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top".to_string(),
+        None => {
+            format!(
+                "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top{protected_suffix}"
+            )
+        }
     }
 }
 
@@ -3057,7 +3190,7 @@ pub(super) fn relay_until_exit_observed(
 
     let mut pane = MonitorPane::new();
     let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
-    let initial = child_pane_winsize(real_fd, &pane);
+    let initial = child_pane_winsize(real_fd, &pane, TypingProtection::for_focus(Focus::Top));
     let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
     let mut selection: Option<TopSelection> = None;
@@ -3070,17 +3203,26 @@ pub(super) fn relay_until_exit_observed(
     let mut pending_child_input = PendingChildInput::new();
     let mut recent_turns = RecentTurnPump::disabled(Instant::now());
     let mut status = None;
-    publish_render_snapshot(&publisher, &parser, router.focus, &pane, None);
+    publish_render_snapshot(
+        &publisher,
+        &parser,
+        router.focus,
+        &pane,
+        None,
+        typing_protection(router.focus, &line_state),
+    );
 
     while status.is_none() {
         publisher.check_error()?;
         let mut dirty = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
         dirty |= pane.refresh_detail_if_due(Instant::now());
+        let mut protection = typing_protection(router.focus, &line_state);
         dirty |= apply_sizing(
             real_fd,
             master_fd,
             child.id(),
             &pane,
+            protection,
             &mut parser,
             &mut applied,
         );
@@ -3196,6 +3338,16 @@ pub(super) fn relay_until_exit_observed(
         }
         // Re-assert the scrollback view each frame (clamped to retained history) so it
         // survives child output and resizes; reading it back keeps our offset honest.
+        protection = typing_protection(router.focus, &line_state);
+        dirty |= apply_sizing(
+            real_fd,
+            master_fd,
+            child.id(),
+            &pane,
+            protection,
+            &mut parser,
+            &mut applied,
+        );
         parser.screen_mut().set_scrollback(top_scrollback);
         top_scrollback = parser.screen().scrollback();
         if dirty {
@@ -3205,6 +3357,7 @@ pub(super) fn relay_until_exit_observed(
                 router.focus,
                 &pane,
                 current_render_selection(&selection, top_scrollback, parser.screen().size().0),
+                protection,
             );
         }
         publisher.check_error()?;
@@ -3214,16 +3367,27 @@ pub(super) fn relay_until_exit_observed(
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
     parser.screen_mut().set_scrollback(top_scrollback);
     let _ = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
-    publish_render_snapshot(&publisher, &parser, router.focus, &pane, None);
+    publish_render_snapshot(
+        &publisher,
+        &parser,
+        router.focus,
+        &pane,
+        None,
+        typing_protection(router.focus, &line_state),
+    );
     renderer.shutdown_and_join()?;
     snapshot_worker.shutdown_and_join()?;
     Ok(status.expect("status checked above"))
 }
 
 /// Initial child PTY size for the (collapsed) monitor at the current terminal size.
-fn child_pane_winsize(real_fd: RawFd, pane: &MonitorPane) -> libc::winsize {
+fn child_pane_winsize(
+    real_fd: RawFd,
+    pane: &MonitorPane,
+    protection: TypingProtection,
+) -> libc::winsize {
     let full = terminal_winsize_with_fallback(read_terminal_winsize(real_fd));
-    child_winsize_for_pane(&full, pane)
+    child_winsize_for_pane(&full, pane, protection)
 }
 
 fn terminal_winsize_with_fallback(winsize: Option<libc::winsize>) -> libc::winsize {
@@ -3239,8 +3403,12 @@ fn minimum_terminal_winsize() -> libc::winsize {
     }
 }
 
-fn child_winsize_for_pane(full: &libc::winsize, pane: &MonitorPane) -> libc::winsize {
-    child_winsize(full, pane.bottom_rows(full.ws_row))
+fn child_winsize_for_pane(
+    full: &libc::winsize,
+    pane: &MonitorPane,
+    protection: TypingProtection,
+) -> libc::winsize {
+    child_winsize(full, pane.bottom_rows(full.ws_row, protection))
 }
 
 /// On a change to the terminal size OR the monitor's reserved rows, resize the
@@ -3250,13 +3418,14 @@ fn apply_sizing(
     master_fd: RawFd,
     child_pid: u32,
     pane: &MonitorPane,
+    protection: TypingProtection,
     parser: &mut vt100::Parser,
     applied: &mut Option<(libc::winsize, u16)>,
 ) -> bool {
     let Some(full) = read_terminal_winsize(real_fd) else {
         return false;
     };
-    let bottom = pane.bottom_rows(full.ws_row);
+    let bottom = pane.bottom_rows(full.ws_row, protection);
     if !sizing_update_needed(applied, &full, bottom) {
         return false;
     }
@@ -3322,7 +3491,15 @@ fn forward_real_input(
         Ok(0) => Ok(RoutedInput::default()),
         Ok(n) => {
             let full = terminal_winsize_with_fallback(read_terminal_winsize(real_fd));
-            let routed = route_real_input(&buffer[..n], router, pane, mouse_request, &full);
+            let protection = typing_protection(router.focus, line_state);
+            let routed = route_real_input_with_protection(
+                &buffer[..n],
+                router,
+                pane,
+                mouse_request,
+                &full,
+                protection,
+            );
             enqueue_routed_child_input(line_state, pending_child_input, &routed);
             Ok(routed)
         }
@@ -3330,6 +3507,7 @@ fn forward_real_input(
     }
 }
 
+#[cfg(test)]
 fn route_real_input(
     bytes: &[u8],
     router: &mut InputRouter,
@@ -3337,11 +3515,23 @@ fn route_real_input(
     child_mouse: MouseRequest,
     winsize: &libc::winsize,
 ) -> RoutedInput {
+    let protection = TypingProtection::for_focus(router.focus);
+    route_real_input_with_protection(bytes, router, pane, child_mouse, winsize, protection)
+}
+
+fn route_real_input_with_protection(
+    bytes: &[u8],
+    router: &mut InputRouter,
+    pane: &MonitorPane,
+    child_mouse: MouseRequest,
+    winsize: &libc::winsize,
+    protection: TypingProtection,
+) -> RoutedInput {
     // The broker always captures the wheel on the real terminal (see
     // `effective_mouse_request`), so always parse mouse events: top-pane wheel scrolls
     // the scrollback, bottom-pane wheel scrolls the monitor, and non-wheel mouse is
     // forwarded only to a child that requested mouse input.
-    route_mouse_aware_input(bytes, router, pane, child_mouse, winsize)
+    route_mouse_aware_input(bytes, router, pane, child_mouse, winsize, protection)
 }
 
 fn route_mouse_aware_input(
@@ -3350,8 +3540,9 @@ fn route_mouse_aware_input(
     pane: &MonitorPane,
     mouse_request: MouseRequest,
     winsize: &libc::winsize,
+    protection: TypingProtection,
 ) -> RoutedInput {
-    let areas = pane_areas_for_winsize(winsize, pane);
+    let areas = pane_areas_for_winsize(winsize, pane, protection);
     let mut routed = RoutedInput::default();
     let mut i = 0;
     while i < bytes.len() {
@@ -3918,12 +4109,14 @@ fn publish_render_snapshot(
     focus: Focus,
     pane: &MonitorPane,
     selection: Option<SelectionSpan>,
+    typing_protection: TypingProtection,
 ) {
-    publisher.publish(RenderSnapshot::capture(
+    publisher.publish(RenderSnapshot::capture_with_typing_protection(
         parser.screen(),
         focus,
         pane,
         selection,
+        typing_protection,
     ));
 }
 
@@ -4660,6 +4853,7 @@ mod tests {
     #[test]
     fn bottom_visible_row_primary_click_selects_row_after_scroll_offset() {
         let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
         let pane = pane_with(snapshot_with_nodes(12), false, 9);
         let winsize = libc::winsize {
             ws_row: 20,
@@ -4730,6 +4924,7 @@ mod tests {
     #[test]
     fn mouse_wheel_scrolls_monitor_when_expanded_even_if_child_mouse_disabled() {
         let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
         let mut pane = MonitorPane::new();
         pane.expand();
         let winsize = libc::winsize {
@@ -5517,7 +5712,14 @@ mod tests {
         pane.expand();
         let mut parser = vt100::Parser::new(10, 80, 0);
         parser.process(b"responsive input echo");
-        publish_render_snapshot(&publisher, &parser, Focus::Bottom, &pane, None);
+        publish_render_snapshot(
+            &publisher,
+            &parser,
+            Focus::Bottom,
+            &pane,
+            None,
+            TypingProtection::for_focus(Focus::Bottom),
+        );
 
         let before = publisher.frame_count();
         let start = Instant::now();
@@ -5851,6 +6053,7 @@ mod tests {
             pty.master.as_raw_fd(),
             std::process::id(),
             &pane,
+            TypingProtection::inactive(),
             &mut parser,
             &mut applied,
         );
@@ -5868,13 +6071,15 @@ mod tests {
         // Expanding the monitor shrinks the top pane and the child PTY.
         let mut expanded = MonitorPane::new();
         expanded.expand();
-        let bottom = expanded.bottom_rows(30);
+        let protection = TypingProtection::inactive();
+        let bottom = expanded.bottom_rows(30, protection);
         let top_rows = 30 - bottom;
         let dirty = apply_sizing(
             outer.slave.as_raw_fd(),
             pty.master.as_raw_fd(),
             std::process::id(),
             &expanded,
+            protection,
             &mut parser,
             &mut applied,
         );
@@ -6096,12 +6301,167 @@ mod tests {
     #[test]
     fn collapsed_reserves_one_row_expanded_reserves_a_bounded_share() {
         let collapsed = MonitorPane::new();
-        assert_eq!(collapsed.bottom_rows(40), 1);
+        assert_eq!(collapsed.bottom_rows(40, TypingProtection::inactive()), 1);
         let mut expanded = MonitorPane::new();
         expanded.expand();
-        let rows = expanded.bottom_rows(40);
+        let rows = expanded.bottom_rows(40, TypingProtection::inactive());
         assert!(rows >= EXPANDED_MIN_ROWS, "rows={rows}");
         assert!(rows <= 40 - TOP_PANE_MIN_ROWS, "rows={rows}");
+    }
+
+    #[test]
+    fn input_safe_floor_reduces_expanded_bottom_rows_across_terminal_sizes() {
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        for full_rows in [15, 20, 40] {
+            let bottom = pane.bottom_rows(full_rows, TypingProtection::active());
+            let top = full_rows.saturating_sub(bottom);
+            assert!(
+                top >= INPUT_SAFE_TOP_PANE_MIN_ROWS || bottom == COLLAPSED_MONITOR_ROWS,
+                "full_rows={full_rows} top={top} bottom={bottom}"
+            );
+        }
+        assert_eq!(pane.bottom_rows(15, TypingProtection::active()), 1);
+        assert!(pane.bottom_rows(20, TypingProtection::active()) < EXPANDED_MIN_ROWS);
+        assert_eq!(pane.bottom_rows(40, TypingProtection::active()), 14);
+    }
+
+    #[test]
+    fn top_focus_applies_input_safe_floor_when_overlay_is_expanded() {
+        let full = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let mut line_state = InputLineState::default();
+        let protection = typing_protection(Focus::Top, &line_state);
+        let child = child_winsize_for_pane(&full, &pane, protection);
+        assert!(protection.active);
+        assert_eq!(child.ws_row, INPUT_SAFE_TOP_PANE_MIN_ROWS);
+
+        line_state.observe_user_input(b"\r");
+        let still_top = typing_protection(Focus::Top, &line_state);
+        assert!(
+            still_top.active,
+            "top focus keeps the real child composer protected"
+        );
+    }
+
+    #[test]
+    fn mid_line_state_applies_input_safe_floor_when_focus_is_bottom() {
+        let full = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"draft");
+
+        let protection = typing_protection(Focus::Bottom, &line_state);
+        let child = child_winsize_for_pane(&full, &pane, protection);
+
+        assert!(protection.active);
+        assert_eq!(child.ws_row, INPUT_SAFE_TOP_PANE_MIN_ROWS);
+    }
+
+    #[test]
+    fn safe_line_boundary_restores_normal_expanded_sizing() {
+        let full = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"draft");
+        let protected =
+            child_winsize_for_pane(&full, &pane, typing_protection(Focus::Bottom, &line_state));
+
+        line_state.observe_user_input(b"\r");
+        let normal =
+            child_winsize_for_pane(&full, &pane, typing_protection(Focus::Bottom, &line_state));
+
+        assert_eq!(protected.ws_row, INPUT_SAFE_TOP_PANE_MIN_ROWS);
+        assert_eq!(normal.ws_row, 20 - EXPANDED_MIN_ROWS);
+    }
+
+    #[test]
+    fn constrained_overlay_status_mentions_input_viewport_protection() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let parser = vt100::Parser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
+        terminal
+            .draw(|frame| {
+                render_frame_with_typing_protection(
+                    frame,
+                    parser.screen(),
+                    Focus::Top,
+                    &pane,
+                    None,
+                    TypingProtection::active(),
+                )
+            })
+            .unwrap();
+
+        let text = screen_text(terminal.backend().buffer(), 20, 80);
+        assert!(text.contains("input viewport protected"), "{text}");
+    }
+
+    #[test]
+    fn constrained_overlay_status_preserves_cancel_confirmation() {
+        let mut pane = MonitorPane::new();
+        pane.pending_cancel = Some("p".to_string());
+
+        let hint = status_hint(&pane, Focus::Bottom, true);
+
+        assert!(hint.starts_with("confirm cancel: y = SIGTERM · n = abort"));
+        assert!(hint.contains("input viewport protected"), "{hint}");
+    }
+
+    #[test]
+    fn synthetic_composer_render_stays_inside_protected_top_pane() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        let mut parser = vt100::Parser::new(INPUT_SAFE_TOP_PANE_MIN_ROWS, 80, 0);
+        parser.process(b"\x1b[12;1Hcomposer line one\x1b[13;1Hcomposer line two\x1b[14;19H");
+
+        terminal
+            .draw(|frame| {
+                render_frame_with_typing_protection(
+                    frame,
+                    parser.screen(),
+                    Focus::Top,
+                    &pane,
+                    None,
+                    TypingProtection::active(),
+                )
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        assert!(row_text(buf, 11, 80).contains("composer line one"));
+        assert!(row_text(buf, 12, 80).contains("composer line two"));
+        for y in INPUT_SAFE_TOP_PANE_MIN_ROWS..20 {
+            let row = row_text(buf, y, 80);
+            assert!(!row.contains("composer line"), "row {y}: {row:?}");
+        }
+        let cursor = terminal.backend().cursor_position();
+        assert!(
+            cursor.y < INPUT_SAFE_TOP_PANE_MIN_ROWS,
+            "cursor should stay in top pane: {cursor:?}"
+        );
     }
 
     #[test]
@@ -6355,6 +6715,7 @@ mod tests {
         pane.expand();
         pane.store_snapshot(Arc::new(snapshot));
         let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
         let winsize = libc::winsize {
             ws_row: 20,
             ws_col: 80,
@@ -6753,6 +7114,7 @@ mod tests {
         let mut pane = pane_with(snapshot, false, 0);
         pane.view_mode = MonitorViewMode::Tree;
         let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
         let winsize = libc::winsize {
             ws_row: 20,
             ws_col: 80,
