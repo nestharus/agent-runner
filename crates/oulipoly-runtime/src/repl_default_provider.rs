@@ -355,6 +355,13 @@ fn default_provider_session_ingest_user_warning(
 fn is_benign_default_provider_session_ingest_error(err: &ServiceError) -> bool {
     err.code()
         .is_some_and(is_benign_default_provider_session_ingest_token)
+        || default_provider_session_ingest_message_has_benign_token(&err.to_string())
+}
+
+fn default_provider_session_ingest_message_has_benign_token(message: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(is_benign_default_provider_session_ingest_token)
 }
 
 fn is_benign_default_provider_session_ingest_token(token: &str) -> bool {
@@ -811,13 +818,48 @@ interactive_args = ["ok"]
     }
 
     #[test]
+    fn benign_dependency_session_ingest_error_message_has_no_user_warning() {
+        let provider_name = provider_name_for_test(&["cla", "ude"]);
+
+        for message in [
+            "session.read_turns: ambiguous_session_transcript: provider client error",
+            "session.read_turns: provider client error: provider_capability",
+        ] {
+            let error = ServiceError::Dependency {
+                message: message.to_string(),
+            };
+
+            assert_eq!(
+                default_provider_session_ingest_user_warning(&provider_name, &error),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn benign_dependency_session_ingest_error_message_requires_token_boundary() {
+        let provider_name = provider_name_for_test(&["cla", "ude"]);
+        let error = ServiceError::Dependency {
+            message: "session.read_turns: ambiguous_session_transcript_suffix".to_string(),
+        };
+        let expected = format!(
+            "Warning: Session ingest failed for {provider_name}: session.read_turns: ambiguous_session_transcript_suffix"
+        );
+
+        assert_eq!(
+            default_provider_session_ingest_user_warning(&provider_name, &error).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
     fn unexpected_default_provider_session_ingest_error_keeps_warning() {
         let provider_name = provider_name_for_test(&["cla", "ude"]);
         let error = ServiceError::Dependency {
-            message: "state write failed".to_string(),
+            message: "database is locked".to_string(),
         };
         let expected =
-            format!("Warning: Session ingest failed for {provider_name}: state write failed");
+            format!("Warning: Session ingest failed for {provider_name}: database is locked");
 
         assert_eq!(
             default_provider_session_ingest_user_warning(&provider_name, &error).as_deref(),
