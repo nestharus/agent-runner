@@ -69,7 +69,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Rows reserved for the always-visible overlay at the bottom of the screen.
-const COLLAPSED_MONITOR_ROWS: u16 = STATUS_ROW_ROWS + PSEUDO_INPUT_ROWS + OUTBOUND_STATUS_ROWS;
+const COLLAPSED_MONITOR_ROWS: u16 = STATUS_ROW_ROWS + PSEUDO_INPUT_MIN_ROWS + OUTBOUND_STATUS_ROWS;
 /// Rows reserved for the overlay/status bar.
 const STATUS_ROW_ROWS: u16 = 1;
 /// Minimum terminal rows for the split to be usable.
@@ -917,7 +917,7 @@ fn apply_top_scroll(current: usize, delta: i32) -> usize {
 }
 
 fn pane_areas(area: Rect, pane: &MonitorPane, protection: TypingProtection) -> PaneAreas {
-    let bottom_rows = pane.bottom_rows(area.height, protection);
+    let bottom_rows = pane.bottom_rows(area.height, area.width, protection);
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
     PaneAreas { top, bottom }
@@ -984,8 +984,14 @@ const INPUT_SAFE_TOP_PANE_MIN_ROWS: u16 = 14;
 const TOP_PANE_SCROLLBACK_ROWS: usize = 10_000;
 /// Rows moved per wheel notch when scrolling the top-pane scrollback.
 const TOP_SCROLL_STEP: i32 = 3;
-/// Rows reserved for the always-visible pseudo input lane.
-const PSEUDO_INPUT_ROWS: u16 = 3;
+/// Minimum editable rows for the always-visible pseudo input lane.
+const MIN_INPUT_ROWS: u16 = 1;
+/// Maximum editable rows before the pseudo input scrolls.
+const MAX_INPUT_ROWS: u16 = 10;
+/// Persistent help row rendered beneath the pseudo input editor when space allows.
+const PSEUDO_INPUT_HELP_ROWS: u16 = 1;
+/// Minimum rows reserved by the pseudo input, including chrome/help.
+const PSEUDO_INPUT_MIN_ROWS: u16 = MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS;
 /// Rows reserved below the pseudo input for outbound message state.
 const OUTBOUND_STATUS_ROWS: u16 = 1;
 /// Broker-owned input messages larger than this fail before reaching the child.
@@ -1072,8 +1078,13 @@ impl PseudoInputState {
         Some(body)
     }
 
+    #[cfg(test)]
     fn cursor_line_col(&self) -> (usize, usize) {
         pseudo_input_cursor_line_col(&self.buffer, self.cursor)
+    }
+
+    fn desired_rows(&self, width: u16) -> u16 {
+        desired_pseudo_input_rows(&self.buffer, self.cursor, width)
     }
 }
 
@@ -1487,16 +1498,25 @@ impl MonitorPane {
     }
 
     /// Rows the monitor occupies at the bottom for the given full terminal height.
-    fn bottom_rows(&self, full_rows: u16, protection: TypingProtection) -> u16 {
+    fn bottom_rows(&self, full_rows: u16, full_cols: u16, protection: TypingProtection) -> u16 {
+        let desired_input_rows = self.pseudo_input.desired_rows(full_cols);
+        let desired_input_bottom = STATUS_ROW_ROWS + desired_input_rows + OUTBOUND_STATUS_ROWS;
+        let protected_ceiling = full_rows.saturating_sub(protection.top_min_rows());
+        let minimum_bottom = COLLAPSED_MONITOR_ROWS.min(full_rows);
+        let ceiling = if protected_ceiling >= minimum_bottom {
+            protected_ceiling
+        } else {
+            minimum_bottom
+        };
         if self.collapsed {
-            return COLLAPSED_MONITOR_ROWS;
+            return desired_input_bottom.min(ceiling).min(full_rows);
         }
         let target = (u32::from(full_rows) * 35 / 100) as u16;
-        let ceiling = full_rows.saturating_sub(protection.top_min_rows());
         target
             .max(EXPANDED_MIN_ROWS)
+            .max(desired_input_bottom)
             .min(ceiling)
-            .max(COLLAPSED_MONITOR_ROWS)
+            .min(full_rows)
     }
 
     fn expand(&mut self) {
@@ -2519,11 +2539,16 @@ fn render_frame_with_typing_protection(
 fn render_snapshot_frame(frame: &mut ratatui::Frame, snapshot: &RenderSnapshot) {
     let area = frame.area();
     let screen = &snapshot.screen;
-    let bottom_rows = snapshot
-        .pane
-        .bottom_rows(area.height, snapshot.typing_protection);
-    let overlay_constrained =
-        overlay_constrained_for_typing(&snapshot.pane, area.height, snapshot.typing_protection);
+    let bottom_rows =
+        snapshot
+            .pane
+            .bottom_rows(area.height, area.width, snapshot.typing_protection);
+    let overlay_constrained = overlay_constrained_for_typing(
+        &snapshot.pane,
+        area.height,
+        area.width,
+        snapshot.typing_protection,
+    );
     let [top, bottom] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(bottom_rows)]).areas(area);
     render_screen_snapshot(frame.buffer_mut(), top, screen, snapshot.selection);
@@ -2552,12 +2577,13 @@ fn render_snapshot_frame(frame: &mut ratatui::Frame, snapshot: &RenderSnapshot) 
 fn overlay_constrained_for_typing(
     pane: &MonitorPane,
     full_rows: u16,
+    full_cols: u16,
     protection: TypingProtection,
 ) -> bool {
     !pane.collapsed
         && protection.active
-        && pane.bottom_rows(full_rows, protection)
-            < pane.bottom_rows(full_rows, TypingProtection::inactive())
+        && pane.bottom_rows(full_rows, full_cols, protection)
+            < pane.bottom_rows(full_rows, full_cols, TypingProtection::inactive())
 }
 
 /// Badge in the top-right of the interactive pane while the operator is scrolled back,
@@ -2601,7 +2627,7 @@ fn render_monitor(
         return;
     }
     let body = bottom_body_area(area);
-    let layout = expanded_bottom_layout(body);
+    let layout = expanded_bottom_layout(body, pane);
     render_pseudo_input(buf, layout.input, pane, focus);
     render_outbound_status(buf, layout.outbound, pane);
     if !pane.collapsed {
@@ -2624,9 +2650,12 @@ fn bottom_body_area(area: Rect) -> Rect {
     }
 }
 
-fn expanded_bottom_layout(body: Rect) -> ExpandedBottomLayout {
+fn expanded_bottom_layout(body: Rect, pane: &MonitorPane) -> ExpandedBottomLayout {
     let outbound_rows = OUTBOUND_STATUS_ROWS.min(body.height);
-    let input_rows = PSEUDO_INPUT_ROWS.min(body.height.saturating_sub(outbound_rows));
+    let input_rows = pane
+        .pseudo_input
+        .desired_rows(body.width)
+        .min(body.height.saturating_sub(outbound_rows));
     let content_rows = body.height.saturating_sub(input_rows + outbound_rows);
     ExpandedBottomLayout {
         input: Rect {
@@ -2679,7 +2708,7 @@ fn render_pseudo_input(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: 
     };
     let help_rows = if area.height > 1 { 1 } else { 0 };
     let editor_rows = area.height.saturating_sub(help_rows);
-    for (line_index, line) in format_pseudo_input_rows(pane, editor_rows)
+    for (line_index, line) in format_pseudo_input_rows(pane, editor_rows, area.width)
         .into_iter()
         .enumerate()
     {
@@ -2701,42 +2730,132 @@ fn render_pseudo_input(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: 
     }
 }
 
-fn format_pseudo_input_rows(pane: &MonitorPane, visible_rows: u16) -> Vec<String> {
+fn format_pseudo_input_rows(pane: &MonitorPane, visible_rows: u16, width: u16) -> Vec<String> {
     if visible_rows == 0 {
         return Vec::new();
     }
-    let cursor = pane.pseudo_input.cursor_line_col();
-    let rows = pseudo_input_display_lines(&pane.pseudo_input.buffer, pane.pseudo_input.cursor);
-    let start = pseudo_input_scroll_start(cursor.0, rows.len(), visible_rows as usize);
-    rows.into_iter()
-        .enumerate()
-        .skip(start)
-        .take(visible_rows as usize)
-        .map(|(line_index, line)| format_pseudo_input_row(line_index, cursor, line))
-        .collect()
-}
-
-fn pseudo_input_display_lines(buffer: &str, cursor: usize) -> Vec<String> {
-    let mut rows: Vec<String> = split_pseudo_input_lines(buffer)
+    let display =
+        pseudo_input_display_rows(&pane.pseudo_input.buffer, pane.pseudo_input.cursor, width);
+    let start = pseudo_input_scroll_start(
+        display.cursor_row,
+        display.rows.len(),
+        visible_rows as usize,
+    );
+    let end = (start + visible_rows as usize).min(display.rows.len());
+    let has_above = start > 0;
+    let has_below = end < display.rows.len();
+    let mut rows: Vec<String> = display
+        .rows
         .into_iter()
-        .map(str::to_string)
+        .skip(start)
+        .take(end - start)
         .collect();
-    if rows.is_empty() {
-        rows.push(String::new());
+    if has_above && let Some(first) = rows.first_mut() {
+        first.push_str(" ↑");
     }
-    let cursor_position = pseudo_input_cursor_line_col(buffer, cursor);
-    if let Some(line) = rows.get_mut(cursor_position.0) {
-        let insert_at = byte_index_for_char_col(line, cursor_position.1);
-        line.insert(insert_at, '▌');
+    if has_below && let Some(last) = rows.last_mut() {
+        last.push_str(" ↓");
     }
+    rows.resize(visible_rows as usize, String::new());
     rows
 }
 
-fn split_pseudo_input_lines(buffer: &str) -> Vec<&str> {
+fn desired_pseudo_input_rows(buffer: &str, cursor: usize, width: u16) -> u16 {
+    desired_pseudo_input_editor_rows(buffer, cursor, width) + PSEUDO_INPUT_HELP_ROWS
+}
+
+fn desired_pseudo_input_editor_rows(buffer: &str, cursor: usize, width: u16) -> u16 {
+    let count = pseudo_input_display_rows(buffer, cursor, width)
+        .rows
+        .len()
+        .min(u16::MAX as usize) as u16;
+    count.clamp(MIN_INPUT_ROWS, MAX_INPUT_ROWS)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PseudoInputDisplayRows {
+    rows: Vec<String>,
+    cursor_row: usize,
+}
+
+fn pseudo_input_display_rows(buffer: &str, cursor: usize, width: u16) -> PseudoInputDisplayRows {
+    let cursor = pseudo_input_cursor_line_col(buffer, cursor);
+    let mut rows = Vec::new();
+    let mut cursor_row = 0;
+    for (line_index, line) in pseudo_input_logical_lines(buffer).into_iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = 0;
+        let mut segment_index = 0;
+        loop {
+            let row_index = rows.len();
+            let prefix = pseudo_input_row_prefix(row_index, line_index, segment_index, cursor);
+            let wrap_width = pseudo_input_wrap_width(width, &prefix);
+            let end = if chars.is_empty() {
+                0
+            } else {
+                (start + wrap_width).min(chars.len())
+            };
+            let is_last = end >= chars.len();
+            let mut segment: String = chars[start..end].iter().collect();
+            if pseudo_input_cursor_in_segment(cursor, line_index, start, end, is_last) {
+                let insert_at = cursor.1.saturating_sub(start).min(segment.chars().count());
+                let insert_at = byte_index_for_char_col(&segment, insert_at);
+                segment.insert(insert_at, '▌');
+                cursor_row = row_index;
+            }
+            rows.push(format!("{prefix}{segment}"));
+            if chars.is_empty() || is_last {
+                break;
+            }
+            start = end;
+            segment_index += 1;
+        }
+    }
+    PseudoInputDisplayRows { rows, cursor_row }
+}
+
+fn pseudo_input_logical_lines(buffer: &str) -> Vec<&str> {
     if buffer.is_empty() {
-        Vec::new()
+        vec![""]
     } else {
         buffer.split('\n').collect()
+    }
+}
+
+fn pseudo_input_row_prefix(
+    row_index: usize,
+    line_index: usize,
+    segment_index: usize,
+    cursor: (usize, usize),
+) -> String {
+    if row_index == 0 {
+        format!(" input[{}:{}] > ", cursor.0 + 1, cursor.1)
+    } else if segment_index == 0 {
+        format!(" input[{}]   | ", line_index + 1)
+    } else {
+        format!(" input[{}]   : ", line_index + 1)
+    }
+}
+
+fn pseudo_input_wrap_width(width: u16, prefix: &str) -> usize {
+    let available = (width as usize).saturating_sub(prefix.chars().count());
+    available.saturating_sub(1).max(1)
+}
+
+fn pseudo_input_cursor_in_segment(
+    cursor: (usize, usize),
+    line_index: usize,
+    start: usize,
+    end: usize,
+    is_last: bool,
+) -> bool {
+    if cursor.0 != line_index || cursor.1 < start {
+        return false;
+    }
+    if is_last {
+        cursor.1 <= end
+    } else {
+        cursor.1 < end
     }
 }
 
@@ -2747,14 +2866,6 @@ fn pseudo_input_scroll_start(cursor_line: usize, len: usize, visible_rows: usize
         cursor_line
             .saturating_sub(visible_rows - 1)
             .min(len - visible_rows)
-    }
-}
-
-fn format_pseudo_input_row(line_index: usize, cursor: (usize, usize), line: String) -> String {
-    if line_index == 0 {
-        format!(" input[{}:{}] > {}", cursor.0 + 1, cursor.1, line)
-    } else {
-        format!(" input[{}]   | {}", line_index + 1, line)
     }
 }
 
@@ -3862,7 +3973,7 @@ fn child_winsize_for_pane(
     pane: &MonitorPane,
     protection: TypingProtection,
 ) -> libc::winsize {
-    child_winsize(full, pane.bottom_rows(full.ws_row, protection))
+    child_winsize(full, pane.bottom_rows(full.ws_row, full.ws_col, protection))
 }
 
 /// On a change to the terminal size OR the monitor's reserved rows, resize the
@@ -3879,7 +3990,7 @@ fn apply_sizing(
     let Some(full) = read_terminal_winsize(real_fd) else {
         return false;
     };
-    let bottom = pane.bottom_rows(full.ws_row, protection);
+    let bottom = pane.bottom_rows(full.ws_row, full.ws_col, protection);
     if !sizing_update_needed(applied, &full, bottom) {
         return false;
     }
@@ -4387,7 +4498,7 @@ fn bottom_filter_tabs_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
     if pane.collapsed {
         return None;
     }
-    let content = expanded_bottom_layout(bottom_body_area(bottom)).content;
+    let content = expanded_bottom_layout(bottom_body_area(bottom), pane).content;
     (content.height > 0).then_some(filter_tabs_area(content))
 }
 
@@ -4424,7 +4535,7 @@ fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
     if pane.collapsed || bottom.height <= 1 {
         return None;
     }
-    let body = expanded_bottom_layout(bottom_body_area(bottom)).content;
+    let body = expanded_bottom_layout(bottom_body_area(bottom), pane).content;
     if body.height == 0 {
         return None;
     }
@@ -5374,9 +5485,12 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let bytes = sgr_press(0, 4, areas.bottom.y + 1);
 
         let routed = route_real_input(
-            b"\x1b[<0;4;6M",
+            &bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -5460,9 +5574,18 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let list = bottom_list_area(areas.bottom, &pane).expect("list area");
+        let bytes = sgr_press(0, list.x + 1, list.y + 2);
+        let snapshot = pane.snapshot.as_ref().expect("snapshot");
+        let projected = pane.projected_rows(snapshot);
+        let selected_position = selected_projected_position(&projected, pane.selected).unwrap_or(0);
+        let offset = scroll_offset(selected_position, projected.len(), list.height as usize);
+        let expected_index = projected[offset + 1].index;
 
         let routed = route_real_input(
-            b"\x1b[<0;4;19M",
+            &bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -5471,10 +5594,13 @@ mod tests {
 
         assert_eq!(router.focus, Focus::Bottom);
         assert!(routed.focus_bottom);
-        assert_eq!(routed.commands, vec![MonitorCommand::ToggleSelectIndex(8)]);
+        assert_eq!(
+            routed.commands,
+            vec![MonitorCommand::ToggleSelectIndex(expected_index)]
+        );
         let mut applied = pane.clone();
         applied.apply(routed.commands[0]);
-        assert_eq!(applied.selected, 8);
+        assert_eq!(applied.selected, expected_index);
     }
 
     #[test]
@@ -6075,6 +6201,10 @@ mod tests {
             row,
             released,
         }
+    }
+
+    fn sgr_press(button: u16, col: u16, row: u16) -> Vec<u8> {
+        encode_sgr_mouse_event(mouse(button, col, row, false))
     }
 
     #[test]
@@ -6829,7 +6959,7 @@ mod tests {
         let mut expanded = MonitorPane::new();
         expanded.expand();
         let protection = TypingProtection::inactive();
-        let bottom = expanded.bottom_rows(30, protection);
+        let bottom = expanded.bottom_rows(30, 100, protection);
         let top_rows = 30 - bottom;
         let dirty = apply_sizing(
             outer.slave.as_raw_fd(),
@@ -7073,12 +7203,12 @@ mod tests {
     fn collapsed_reserves_persistent_input_rows_expanded_reserves_a_bounded_share() {
         let collapsed = MonitorPane::new();
         assert_eq!(
-            collapsed.bottom_rows(40, TypingProtection::inactive()),
+            collapsed.bottom_rows(40, 80, TypingProtection::inactive()),
             COLLAPSED_MONITOR_ROWS
         );
         let mut expanded = MonitorPane::new();
         expanded.expand();
-        let rows = expanded.bottom_rows(40, TypingProtection::inactive());
+        let rows = expanded.bottom_rows(40, 80, TypingProtection::inactive());
         assert!(rows >= EXPANDED_MIN_ROWS, "rows={rows}");
         assert!(rows <= 40 - TOP_PANE_MIN_ROWS, "rows={rows}");
     }
@@ -7088,7 +7218,7 @@ mod tests {
         let mut pane = MonitorPane::new();
         pane.expand();
         for full_rows in [15, 20, 40] {
-            let bottom = pane.bottom_rows(full_rows, TypingProtection::active());
+            let bottom = pane.bottom_rows(full_rows, 80, TypingProtection::active());
             let top = full_rows.saturating_sub(bottom);
             assert!(
                 top >= INPUT_SAFE_TOP_PANE_MIN_ROWS || bottom == COLLAPSED_MONITOR_ROWS,
@@ -7096,11 +7226,11 @@ mod tests {
             );
         }
         assert_eq!(
-            pane.bottom_rows(15, TypingProtection::active()),
+            pane.bottom_rows(15, 80, TypingProtection::active()),
             COLLAPSED_MONITOR_ROWS
         );
-        assert!(pane.bottom_rows(20, TypingProtection::active()) < EXPANDED_MIN_ROWS);
-        assert_eq!(pane.bottom_rows(40, TypingProtection::active()), 14);
+        assert!(pane.bottom_rows(20, 80, TypingProtection::active()) < EXPANDED_MIN_ROWS);
+        assert_eq!(pane.bottom_rows(40, 80, TypingProtection::active()), 14);
     }
 
     #[test]
@@ -7432,10 +7562,126 @@ mod tests {
         let mut pane = pane_with(empty_snapshot(), true, 0);
         pane.pseudo_input.buffer = "alpha\nbravo".to_string();
         pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
-        let rows = format_pseudo_input_rows(&pane, 2);
+        let rows = format_pseudo_input_rows(&pane, 2, 80);
 
         assert!(rows[0].contains("alpha"), "{rows:?}");
         assert!(rows[1].contains("bravo▌"), "{rows:?}");
+    }
+
+    #[test]
+    fn insert_newline_splits_at_cursor() {
+        let mut input = PseudoInputState {
+            buffer: "abcd".to_string(),
+            cursor: 2,
+        };
+
+        input.apply(PseudoInputAction::InsertNewline);
+
+        assert_eq!(input.buffer, "ab\ncd");
+        assert_eq!(input.cursor_line_col(), (1, 0));
+    }
+
+    #[test]
+    fn pseudo_input_height_grows_caps_and_shrinks() {
+        let mut input = PseudoInputState::default();
+        assert_eq!(
+            input.desired_rows(80),
+            MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS
+        );
+
+        input.buffer = "one\ntwo\nthree".to_string();
+        input.cursor = input.buffer.len();
+        assert_eq!(
+            desired_pseudo_input_editor_rows(&input.buffer, input.cursor, 80),
+            3
+        );
+        assert_eq!(input.desired_rows(80), 3 + PSEUDO_INPUT_HELP_ROWS);
+
+        input.buffer = (0..12)
+            .map(|index| format!("line{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.cursor = input.buffer.len();
+        assert_eq!(
+            desired_pseudo_input_editor_rows(&input.buffer, input.cursor, 80),
+            MAX_INPUT_ROWS
+        );
+
+        input.clear();
+        assert_eq!(
+            input.desired_rows(80),
+            MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS
+        );
+    }
+
+    #[test]
+    fn long_single_line_counts_soft_wrapped_visual_rows() {
+        let buffer = "abcdefghijklmnopqrstuvwxyz";
+
+        assert!(
+            desired_pseudo_input_editor_rows(buffer, buffer.len(), 24) > MIN_INPUT_ROWS,
+            "long pasted lines should grow the input even without explicit newlines"
+        );
+    }
+
+    #[test]
+    fn pseudo_input_scroll_window_follows_cursor_visual_row() {
+        let mut pane = pane_with(empty_snapshot(), true, 0);
+        pane.pseudo_input.buffer = (0..12)
+            .map(|index| format!("line{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
+
+        let bottom_rows = format_pseudo_input_rows(&pane, MAX_INPUT_ROWS, 80);
+
+        assert!(bottom_rows[0].contains("input[3]"), "{bottom_rows:?}");
+        assert!(bottom_rows[0].contains('↑'), "{bottom_rows:?}");
+        assert!(bottom_rows[9].contains("line11▌"), "{bottom_rows:?}");
+
+        pane.pseudo_input.cursor = 0;
+        let top_rows = format_pseudo_input_rows(&pane, MAX_INPUT_ROWS, 80);
+
+        assert!(top_rows[0].contains("input[1:0]"), "{top_rows:?}");
+        assert!(top_rows[0].contains("line0"), "{top_rows:?}");
+        assert!(top_rows[9].contains('↓'), "{top_rows:?}");
+    }
+
+    #[test]
+    fn input_growth_changes_bottom_rows_and_child_size() {
+        let full = libc::winsize {
+            ws_row: 30,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let empty = MonitorPane::new();
+        let mut grown = MonitorPane::new();
+        grown.pseudo_input.buffer = "one\ntwo\nthree\nfour\nfive".to_string();
+        grown.pseudo_input.cursor = grown.pseudo_input.buffer.len();
+
+        let empty_bottom =
+            empty.bottom_rows(full.ws_row, full.ws_col, TypingProtection::inactive());
+        let grown_bottom =
+            grown.bottom_rows(full.ws_row, full.ws_col, TypingProtection::inactive());
+        let empty_child = child_winsize_for_pane(&full, &empty, TypingProtection::inactive());
+        let grown_child = child_winsize_for_pane(&full, &grown, TypingProtection::inactive());
+
+        assert_eq!(grown_bottom - empty_bottom, 4);
+        assert_eq!(empty_child.ws_row - grown_child.ws_row, 4);
+    }
+
+    #[test]
+    fn short_terminal_caps_input_before_starving_top_pane() {
+        let mut pane = MonitorPane::new();
+        pane.pseudo_input.buffer = (0..12)
+            .map(|index| format!("line{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
+        let bottom = pane.bottom_rows(20, 80, TypingProtection::active());
+
+        assert_eq!(20 - bottom, INPUT_SAFE_TOP_PANE_MIN_ROWS);
     }
 
     #[test]
@@ -7548,9 +7794,13 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let list = bottom_list_area(areas.bottom, &pane).expect("tree list area");
+        let bytes = sgr_press(0, list.x + 1, list.y + 2);
 
         let routed = route_real_input(
-            b"\x1b[<0;4;19M",
+            &bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -7605,9 +7855,12 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let expanded_areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let close_bytes = sgr_press(0, 4, expanded_areas.bottom.y + 1);
 
         let close = route_real_input(
-            b"\x1b[<0;4;12M",
+            &close_bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -7627,9 +7880,12 @@ mod tests {
         let collapsed_text = screen_text(terminal.backend().buffer(), 20, 80);
         assert!(collapsed_text.contains("input[1:0]"), "{collapsed_text}");
         assert!(!collapsed_text.contains("cargo test"), "{collapsed_text}");
+        let collapsed_areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let open_bytes = sgr_press(0, 4, collapsed_areas.bottom.y + 1);
 
         let open = route_real_input(
-            b"\x1b[<0;4;16M",
+            &open_bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -7982,9 +8238,18 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let tabs = bottom_filter_tabs_area(areas.bottom, &pane).expect("filter tabs");
+        let procs_col = tabs.x
+            + 1
+            + " filters: ".chars().count() as u16
+            + filter_tab_label_width(MonitorFilterCategory::Bash)
+            + 2;
+        let bytes = sgr_press(0, procs_col, tabs.y + 1);
 
         let routed = route_real_input(
-            b"\x1b[<0;21;17M",
+            &bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -8163,9 +8428,13 @@ mod tests {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        let areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let list = bottom_list_area(areas.bottom, &pane).expect("tree list area");
+        let bytes = sgr_press(0, list.x + 1, list.y + 2);
 
         let routed = route_real_input(
-            b"\x1b[<0;4;19M",
+            &bytes,
             &mut router,
             &pane,
             MouseRequest::disabled(),
