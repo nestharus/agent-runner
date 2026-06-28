@@ -9,27 +9,27 @@ pub(super) fn session_client(
     registry: &ProviderRegistry,
     identity: &SessionProviderIdentity,
 ) -> Result<ProviderClient, SessionProviderError> {
-    let describe = describe_session_provider(registry, &identity.model_name)?;
+    let describe = describe_session_provider(registry, identity)?;
     require_session_capability(&describe)?;
-    enabled_provider_client(registry, &identity.model_name)
+    enabled_provider_instance_client(registry, identity)
 }
 
 pub(super) fn session_enumerate_client(
     registry: &ProviderRegistry,
     identity: &SessionProviderIdentity,
 ) -> Result<ProviderClient, SessionProviderError> {
-    let describe = describe_session_provider(registry, &identity.model_name)?;
+    let describe = describe_session_provider(registry, identity)?;
     require_session_capability(&describe)?;
     require_session_enumerate_capability(&describe)?;
-    enabled_provider_client(registry, &identity.model_name)
+    enabled_provider_instance_client(registry, identity)
 }
 
 fn describe_session_provider(
     registry: &ProviderRegistry,
-    model_name: &str,
+    identity: &SessionProviderIdentity,
 ) -> Result<DescribeResult, SessionProviderError> {
     registry
-        .describe_model_provider(model_name)
+        .describe_model_provider_instance(&identity.model_name, &identity.provider_name)
         .map_err(map_registry_error)
 }
 
@@ -57,12 +57,12 @@ fn require_session_enumerate_capability(
     }
 }
 
-fn enabled_provider_client(
+fn enabled_provider_instance_client(
     registry: &ProviderRegistry,
-    model_name: &str,
+    identity: &SessionProviderIdentity,
 ) -> Result<ProviderClient, SessionProviderError> {
     let artifact = registry
-        .enabled_artifact_for_model(model_name)
+        .enabled_artifact_for_model_provider(&identity.model_name, &identity.provider_name)
         .map_err(map_registry_error)?;
     Ok(registry.client_factory().client_for(artifact))
 }
@@ -72,7 +72,7 @@ pub(super) fn provider_client(
     identity: &SessionProviderIdentity,
 ) -> Result<ProviderClient, SessionProviderError> {
     let artifact = registry
-        .enabled_artifact_for_model(&identity.model_name)
+        .enabled_artifact_for_model_provider(&identity.model_name, &identity.provider_name)
         .map_err(map_registry_error)?;
     Ok(registry.client_factory().client_for(artifact))
 }

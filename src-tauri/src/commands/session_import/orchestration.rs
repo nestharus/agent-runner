@@ -24,7 +24,7 @@ pub(crate) fn run_session_import(
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     let env = load_session_import_environment()?;
-    let targets = session_import_targets(&env.models, args.provider);
+    let targets = session_import_targets(&env.models, &env.provider_registry, args.provider);
     agent_runtime_services
         .provider_registry_handle
         .replace(Arc::new(env.provider_registry));
@@ -58,7 +58,8 @@ fn load_session_import_environment() -> Result<SessionImportEnvironment, String>
     let state = StateDb::open_default().map_err(format_session_import_state_error)?;
     let providers_cfg = load_default_session_import_providers(&config_root)?;
     let models = load_default_session_import_models(&providers_cfg)?;
-    let provider_registry = build_session_import_provider_registry(&models, config_root)?;
+    let provider_registry =
+        build_session_import_provider_registry(&models, &providers_cfg, config_root)?;
     Ok(SessionImportEnvironment {
         state,
         models,
@@ -84,10 +85,12 @@ fn load_default_session_import_models(
 
 fn build_session_import_provider_registry(
     models: &[ModelConfig],
+    providers_cfg: &ProvidersConfig,
     config_root: PathBuf,
 ) -> Result<ProviderRegistry, String> {
-    ProviderRegistry::from_model_configs(
+    ProviderRegistry::from_model_configs_with_provider_config(
         models,
+        providers_cfg,
         ProviderRegistryOptions::default()
             .with_path_entries_from_process_path()
             .with_config_root(config_root)
@@ -105,16 +108,22 @@ fn default_data_root() -> Result<PathBuf, String> {
 
 pub(super) fn session_import_targets(
     models: &[ModelConfig],
+    provider_registry: &ProviderRegistry,
     provider_filter: Option<&str>,
 ) -> Vec<SessionImportProviderTarget> {
     let mut seen = BTreeSet::new();
     let mut targets = Vec::new();
-    for model in models.iter().filter(|model| model.provider.is_some()) {
+    for model in models {
         for provider in &model.providers {
             if !provider_matches_filter(&model.name, &provider.name, provider_filter) {
                 continue;
             }
-            let key = (provider.name.clone(), provider.name.clone());
+            let Some(artifact_key) =
+                provider_registry.artifact_key_for_model_provider(&model.name, &provider.name)
+            else {
+                continue;
+            };
+            let key = (artifact_key, provider.name.clone());
             if !seen.insert(key) {
                 continue;
             }

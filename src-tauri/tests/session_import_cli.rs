@@ -102,10 +102,26 @@ impl Fixture {
         .unwrap();
     }
 
+    fn write_model_without_provider_ref(&self, name: &str, providers: &[&str]) {
+        fs::write(
+            self.models_dir.join(format!("{name}.toml")),
+            model_config_toml_without_provider_ref(providers),
+        )
+        .unwrap();
+    }
+
     fn write_providers(&self, providers: &[&str]) {
         fs::write(
             self.app_config_dir.join("providers.toml"),
             providers_config_toml(providers),
+        )
+        .unwrap();
+    }
+
+    fn write_providers_with_commands(&self, providers: &[(&str, &Path)]) {
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            providers_config_toml_with_commands(providers),
         )
         .unwrap();
     }
@@ -223,6 +239,91 @@ fn session_import_cli_reports_skipped_provider_when_enumerate_capability_is_miss
 }
 
 #[test]
+fn session_import_cli_targets_provider_instances_without_top_level_provider_ref() {
+    let fixture = Fixture::new();
+    let provider_script = fixture.write_provider_script("provider-instance-shim.py", true);
+    fixture.write_providers_with_commands(&[
+        (PROVIDER_A, &provider_script),
+        (PROVIDER_B, &provider_script),
+    ]);
+    fixture.write_model_without_provider_ref(MODEL, &[PROVIDER_A, PROVIDER_B]);
+
+    let output = fixture.run_session_import(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).is_empty(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(report["providers"][0]["provider_name"], PROVIDER_A);
+    assert_eq!(report["providers"][1]["provider_name"], PROVIDER_B);
+    assert_eq!(report["totals"]["providers_total"], 2);
+    assert_eq!(report["totals"]["imported"], 3);
+
+    let enumerate_settings = enumerate_settings(&fixture);
+    assert_eq!(enumerate_settings, vec![PROVIDER_A, PROVIDER_B]);
+}
+
+#[test]
+fn session_import_cli_provider_filter_matches_provider_instance_without_top_level_ref() {
+    let fixture = Fixture::new();
+    let provider_script = fixture.write_provider_script("opencode-shim.py", true);
+    fixture.write_providers_with_commands(&[("opencode", &provider_script)]);
+    fixture.write_model_without_provider_ref("opencode-test", &["opencode"]);
+
+    let output = fixture.run_session_import(&["--provider", "opencode", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).is_empty(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(report["providers"][0]["provider_name"], "opencode");
+    assert_eq!(report["providers"][0]["status"]["kind"], "succeeded");
+    assert_eq!(report["totals"]["providers_total"], 1);
+    assert_eq!(report["totals"]["imported"], 1);
+}
+
+#[test]
+fn session_import_cli_deduplicates_aliases_with_same_enumerated_source() {
+    let fixture = Fixture::new();
+    let provider_script = fixture.write_provider_script("shared-store-shim.py", true);
+    fixture.write_providers_with_commands(&[
+        ("shared-alias-a", &provider_script),
+        ("shared-alias-b", &provider_script),
+    ]);
+    fixture.write_model_without_provider_ref(MODEL, &["shared-alias-a", "shared-alias-b"]);
+
+    let output = fixture.run_session_import(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).is_empty(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(report["providers"][0]["provider_name"], "shared-alias-a");
+    assert_eq!(report["providers"][0]["status"]["kind"], "succeeded");
+    assert_eq!(report["providers"][0]["imported"], 1);
+    assert_eq!(report["providers"][1]["provider_name"], "shared-alias-b");
+    assert_eq!(report["providers"][1]["status"]["kind"], "skipped");
+    assert!(
+        report["providers"][1]["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate_enumerate_source"),
+        "{report}"
+    );
+    assert_eq!(report["totals"]["imported"], 1);
+
+    let list_output = fixture.run_session_list_json();
+    assert_eq!(list_output.status.code(), Some(0), "{list_output:?}");
+    let rows: Vec<Value> = serde_json::from_slice(&list_output.stdout).unwrap();
+    let shared_rows = rows
+        .iter()
+        .filter(|row| row["active_provider_session_id"] == "shared-native")
+        .collect::<Vec<_>>();
+    assert_eq!(shared_rows.len(), 1, "{rows:?}");
+    assert_eq!(shared_rows[0]["active_provider"], "shared-alias-a");
+}
+
+#[test]
 fn session_import_cli_empty_config_reports_no_targets() {
     let fixture = Fixture::new();
 
@@ -250,6 +351,21 @@ fn model_config_toml(provider_script: &Path, providers: &[&str]) -> String {
     body
 }
 
+fn model_config_toml_without_provider_ref(providers: &[&str]) -> String {
+    let mut body = "prompt_mode = \"arg\"\n".to_string();
+    append_model_providers(&mut body, providers);
+    body
+}
+
+fn append_model_providers(body: &mut String, providers: &[&str]) {
+    for provider in providers {
+        body.push_str(&format!(
+            "\n[[providers]]\nname = {}\nargs = []\n",
+            toml_string(provider)
+        ));
+    }
+}
+
 fn providers_config_toml(providers: &[&str]) -> String {
     providers
         .iter()
@@ -261,6 +377,29 @@ fn providers_config_toml(providers: &[&str]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn providers_config_toml_with_commands(providers: &[(&str, &Path)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, command)| {
+            format!(
+                "[{}]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
+                provider,
+                toml_string(&command.display().to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn enumerate_settings(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .read_records()
+        .into_iter()
+        .filter(|record| record["subcommand"] == "session.enumerate")
+        .map(|record| record["settings_id"].as_str().unwrap().to_string())
+        .collect()
 }
 
 fn fake_provider_script(
@@ -350,6 +489,8 @@ def session(session_id, title, updated_unix_ms, turn_count):
     }
 
 def sessions_for_settings():
+    if settings_id in ("shared-alias-a", "shared-alias-b"):
+        return [session("shared-native", "Shared native", 1782000004000, 2)]
     if settings_id == "provider-a":
         return [session("provider-a-native", "Provider A native", 1782000001000, 3)]
     if settings_id == "provider-b":

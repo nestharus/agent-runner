@@ -1,11 +1,14 @@
 use super::formatter::{format_provider_report_line, format_totals_line};
 use super::orchestration::session_import_targets;
 use oulipoly_config::{
-    ModelConfig, PromptMode, ProviderConfig, provider_implementation_ref::ProviderImplementationRef,
+    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig,
+    provider_implementation_ref::ProviderImplementationRef,
 };
+use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{
     SessionImportProviderReport, SessionImportProviderStatus, SessionImportTotals,
 };
+use std::collections::HashMap;
 
 #[test]
 fn target_resolution_deduplicates_provider_accounts_and_supports_provider_filter() {
@@ -14,17 +17,41 @@ fn target_resolution_deduplicates_provider_accounts_and_supports_provider_filter
         external_model("model-b", &["provider-a"]),
         builtin_model("builtin", &["provider-c"]),
     ];
+    let registry = registry_from_models(&models);
 
-    let all = session_import_targets(&models, None);
+    let all = session_import_targets(&models, &registry, None);
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].model_name, "model-a");
     assert_eq!(all[0].provider_name, "provider-a");
     assert_eq!(all[0].settings_id, "provider-a");
     assert_eq!(all[1].provider_name, "provider-b");
 
-    let filtered = session_import_targets(&models, Some("provider-b"));
+    let filtered = session_import_targets(&models, &registry, Some("provider-b"));
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].provider_name, "provider-b");
+}
+
+#[test]
+fn target_resolution_includes_models_without_top_level_provider_refs() {
+    let models = vec![builtin_model("opencode-test", &["opencode", "opencode2"])];
+    let registry = registry_from_models_and_provider_commands(
+        &models,
+        &[
+            ("opencode", "/tmp/agent-runner-opencode"),
+            ("opencode2", "/tmp/agent-runner-opencode"),
+        ],
+    );
+
+    let all = session_import_targets(&models, &registry, None);
+
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].model_name, "opencode-test");
+    assert_eq!(all[0].provider_name, "opencode");
+    assert_eq!(all[1].provider_name, "opencode2");
+
+    let filtered = session_import_targets(&models, &registry, Some("opencode"));
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].provider_name, "opencode");
 }
 
 #[test]
@@ -33,8 +60,9 @@ fn target_resolution_supports_model_filter() {
         external_model("model-a", &["provider-a"]),
         external_model("model-b", &["provider-b"]),
     ];
+    let registry = registry_from_models(&models);
 
-    let filtered = session_import_targets(&models, Some("model-b"));
+    let filtered = session_import_targets(&models, &registry, Some("model-b"));
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].model_name, "model-b");
     assert_eq!(filtered[0].provider_name, "provider-b");
@@ -100,5 +128,38 @@ fn builtin_model(name: &str, providers: &[&str]) -> ModelConfig {
             .collect(),
         inputs: Vec::new(),
         provider: None,
+    }
+}
+
+fn registry_from_models(models: &[ModelConfig]) -> ProviderRegistry {
+    ProviderRegistry::from_model_configs(models, ProviderRegistryOptions::default())
+        .expect("registry should construct")
+}
+
+fn registry_from_models_and_provider_commands(
+    models: &[ModelConfig],
+    commands: &[(&str, &str)],
+) -> ProviderRegistry {
+    let providers = providers_config(commands);
+    ProviderRegistry::from_model_configs_with_provider_config(
+        models,
+        &providers,
+        ProviderRegistryOptions::default(),
+    )
+    .expect("registry should construct from provider commands")
+}
+
+fn providers_config(commands: &[(&str, &str)]) -> ProvidersConfig {
+    ProvidersConfig {
+        entries: commands
+            .iter()
+            .map(|(name, command)| {
+                let entry = ProviderEntry {
+                    command: Some((*command).to_string()),
+                    ..Default::default()
+                };
+                ((*name).to_string(), entry)
+            })
+            .collect::<HashMap<_, _>>(),
     }
 }
