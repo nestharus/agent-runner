@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use oulipoly_runtime::executor::cli::pty_broker::{
-    PtyControlClientErrorKind, inject_control_envelope,
+    PtyControlClientErrorKind, append_notify_trace_record, inject_control_envelope,
+    notify_trace_decision, notify_trace_inject_status, trace_token,
 };
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
@@ -296,33 +297,41 @@ fn trace_notify_pty_attempt(
     session_id: &str,
     diagnostic: &PtyMailboxDeliveryDiagnostic,
 ) {
-    if !trace_notify_enabled() {
-        return;
-    }
-    eprintln!(
-        concat!(
-            "oulipoly_notify_trace trigger={} session_id={} attempted={} ",
-            "control_path_present={} decision={} inject_status={} submitted={} ",
-            "delivered_count={} remaining_pending={:?} message={:?} consumed=unknown"
-        ),
-        trigger,
-        session_id,
+    let base_decision = if diagnostic.submitted {
+        "inject"
+    } else {
+        "skip"
+    };
+    let inject_status = notify_trace_inject_status(base_decision, &diagnostic.status);
+    let record = format!(
+        "trigger={} session_id={} attempted={} input_empty=unknown at_boundary=unknown \
+         quiescent=unknown last_child_output_ms=unknown foreground=unknown \
+         control_path_present={} decision={} inject_status={} submitted={} \
+         delivered_count={} remaining_pending={} message={} consumed=unknown",
+        trace_token(trigger),
+        trace_token(session_id),
         diagnostic.attempted,
         diagnostic
             .control_path
             .as_deref()
             .is_some_and(|path| !path.is_empty()),
-        if diagnostic.submitted {
-            "inject"
-        } else {
-            "skip"
-        },
-        diagnostic.status,
+        notify_trace_decision(base_decision, &inject_status),
+        inject_status,
         diagnostic.submitted,
         diagnostic.delivered_seqs.len(),
-        diagnostic.remaining_pending,
-        diagnostic.message,
+        diagnostic
+            .remaining_pending
+            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        diagnostic
+            .message
+            .as_deref()
+            .map(trace_token)
+            .unwrap_or_else(|| "none".to_string()),
     );
+    append_notify_trace_record(&record);
+    if trace_notify_enabled() {
+        eprintln!("oulipoly_notify_trace {record}");
+    }
 }
 
 pub(crate) fn prepare_headless_resume_delivery(

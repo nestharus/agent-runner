@@ -18,6 +18,7 @@ use crate::observability::{
 };
 use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::{self, SessionProviderIdentity};
+use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
 use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeIdleUpdate};
 use sha2::{Digest, Sha256};
@@ -44,13 +45,17 @@ pub const CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_POLL_TIMEOUT_MS: i32 = 25;
 const INJECT_DEBOUNCE: Duration = Duration::from_millis(250);
-/// Required quiet period after the child's last output before proactive injection.
-/// Shorter reduces latency but risks writing into an active foreground program;
-/// longer is safer but leaves notifications pending until a later retry.
-const INJECT_CHILD_OUTPUT_QUIET: Duration = Duration::from_millis(800);
+/// Short child-output debounce before proactive injection.
+/// This is not an idle/quiescence requirement: redraw-oriented TUIs can emit
+/// periodic prompt/status bytes while idle, so this window only avoids writing
+/// into a rapid burst or between nearby terminal bytes.
+const INJECT_CHILD_OUTPUT_DEBOUNCE: Duration = Duration::from_millis(125);
 const INJECT_WAIT_LIMIT: Duration = Duration::from_millis(1500);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIX_SOCKET_PATH_LIMIT: usize = 100;
+const NOTIFY_TRACE_MAX_BYTES: u64 = 1024 * 1024;
+const NOTIFY_TRACE_FILE: &str = "notify-trace.log";
+const NOTIFY_TRACE_ROTATED_FILE: &str = "notify-trace.log.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyControlClientErrorKind {
@@ -1564,7 +1569,7 @@ impl ChildOutputState {
 
     fn is_quiescent(&self) -> bool {
         self.last_child_output_at
-            .map(|last| last.elapsed() >= INJECT_CHILD_OUTPUT_QUIET)
+            .map(|last| last.elapsed() >= INJECT_CHILD_OUTPUT_DEBOUNCE)
             .unwrap_or(true)
     }
 
@@ -1655,12 +1660,15 @@ impl InputLineState {
     }
 
     fn is_safe_to_inject(&self) -> bool {
-        self.at_line_boundary
-            && self.enter_escape_state == EnterEscapeState::None
+        self.input_empty()
             && self
                 .last_user_input_at
                 .map(|last| last.elapsed() >= INJECT_DEBOUNCE)
                 .unwrap_or(true)
+    }
+
+    fn input_empty(&self) -> bool {
+        self.at_line_boundary && self.enter_escape_state == EnterEscapeState::None
     }
 
     fn mark_submitted(&mut self) {
@@ -1782,9 +1790,9 @@ fn process_control_request_with_pending(
 ) -> Result<(), String> {
     validate_control_request_peer(stream)?;
     let payload = read_control_request_payload(stream)?;
-    // Safe proactive delivery means the user is at a clean prompt and the child
-    // has stopped producing output. Silent foreground jobs can still be opaque;
-    // the foreground process-group check catches shells that hand the PTY to a job.
+    // Safe proactive delivery means the user is at a clean prompt and the PTY
+    // foreground process group is still the agent. A short child-output debounce
+    // avoids rapid bursts but intentionally tolerates idle TUI redraws.
     wait_until_safe_to_inject(
         io.real_fd,
         io.master_fd,
@@ -1993,17 +2001,30 @@ fn safe_to_inject(
     line_state: &InputLineState,
     child_output_state: &ChildOutputState,
 ) -> Result<(), InjectionUnsafeReason> {
+    safe_to_inject_for_foreground(
+        foreground_owner_state(master_fd, child_pid),
+        line_state,
+        child_output_state,
+    )
+}
+
+fn safe_to_inject_for_foreground(
+    foreground: ForegroundOwnerState,
+    line_state: &InputLineState,
+    child_output_state: &ChildOutputState,
+) -> Result<(), InjectionUnsafeReason> {
     if !line_state.is_safe_to_inject() {
         return Err(InjectionUnsafeReason::MidLine);
+    }
+    match foreground {
+        ForegroundOwnerState::Owner => {}
+        ForegroundOwnerState::Other { .. } => return Err(InjectionUnsafeReason::ForegroundOther),
+        ForegroundOwnerState::Unknown => return Err(InjectionUnsafeReason::ForegroundUnknown),
     }
     if !child_output_state.is_quiescent() {
         return Err(InjectionUnsafeReason::ChildOutputActive);
     }
-    match foreground_owner_state(master_fd, child_pid) {
-        ForegroundOwnerState::Owner => Ok(()),
-        ForegroundOwnerState::Other { .. } => Err(InjectionUnsafeReason::ForegroundOther),
-        ForegroundOwnerState::Unknown => Err(InjectionUnsafeReason::ForegroundUnknown),
-    }
+    Ok(())
 }
 
 fn foreground_owner_state(master_fd: RawFd, child_pid: Option<u32>) -> ForegroundOwnerState {
@@ -2038,6 +2059,63 @@ fn trace_notify_enabled() -> bool {
     )
 }
 
+pub fn append_notify_trace_record(fields: &str) {
+    let Some(path) = notify_trace_path() else {
+        return;
+    };
+    let line = format!(
+        "{} {}\n",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        fields.trim()
+    );
+    let _ = append_notify_trace_line(&path, &line);
+}
+
+fn notify_trace_path() -> Option<PathBuf> {
+    Some(notify_trace_dir()?.join(NOTIFY_TRACE_FILE))
+}
+
+fn notify_trace_dir() -> Option<PathBuf> {
+    if let Some(state_home) = non_empty_env_path("XDG_STATE_HOME") {
+        return Some(state_home.join("oulipoly-agent-runner"));
+    }
+    Some(non_empty_env_path("HOME")?.join(".local/state/oulipoly-agent-runner"))
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn append_notify_trace_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    rotate_notify_trace_if_needed(path, line.len() as u64)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())
+}
+
+fn rotate_notify_trace_if_needed(path: &Path, next_len: u64) -> io::Result<()> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len().saturating_add(next_len) <= NOTIFY_TRACE_MAX_BYTES {
+        return Ok(());
+    }
+    let rotated = path.with_file_name(NOTIFY_TRACE_ROTATED_FILE);
+    match fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    fs::rename(path, rotated)
+}
+
 fn trace_notify_gate_decision(
     control: &ControlSocket,
     master_fd: RawFd,
@@ -2047,29 +2125,64 @@ fn trace_notify_gate_decision(
     decision: &str,
     status: &str,
 ) {
-    if !trace_notify_enabled() {
-        return;
-    }
     let foreground = foreground_owner_state(master_fd, child_pid);
-    eprintln!(
-        concat!(
-            "oulipoly_notify_trace trigger=pty-control ",
-            "session_id={} invocation_uuid={} input_empty={} at_boundary={} mid_escape={} ",
-            "last_user_input_ms={:?} quiescent={} last_child_output_ms={:?} ",
-            "foreground={:?} decision={} inject_status={} consumed=unknown"
-        ),
+    let inject_status = notify_trace_inject_status(decision, status);
+    let record = format!(
+        "trigger=pty-control \
+         session_id={} invocation_uuid={} input_empty={} at_boundary={} mid_escape={} \
+         last_user_input_ms={} quiescent={} last_child_output_ms={} \
+         foreground={} decision={} inject_status={} consumed=unknown",
         control.session_id(),
         control.invocation_uuid(),
-        line_state.is_safe_to_inject(),
+        line_state.input_empty(),
         line_state.at_line_boundary,
         line_state.mid_escape(),
-        line_state.millis_since_last_user_input(),
+        optional_millis_trace_value(line_state.millis_since_last_user_input()),
         child_output_state.is_quiescent(),
-        child_output_state.millis_since_last_child_output(),
-        foreground,
-        decision,
-        status,
+        optional_millis_trace_value(child_output_state.millis_since_last_child_output()),
+        foreground_trace_value(foreground),
+        notify_trace_decision(decision, &inject_status),
+        inject_status,
     );
+    append_notify_trace_record(&record);
+    if trace_notify_enabled() {
+        eprintln!("oulipoly_notify_trace {record}");
+    }
+}
+
+pub fn notify_trace_inject_status(decision: &str, status: &str) -> String {
+    match (decision, status) {
+        ("inject", "ok") => "acked".to_string(),
+        (_, "unsafe_foreground_process") => "foreground-not-child".to_string(),
+        (_, value) => trace_token(value),
+    }
+}
+
+pub fn notify_trace_decision(decision: &str, inject_status: &str) -> String {
+    if decision == "inject" {
+        "inject".to_string()
+    } else {
+        format!("skip-{inject_status}")
+    }
+}
+
+fn optional_millis_trace_value(value: Option<u128>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn foreground_trace_value(foreground: ForegroundOwnerState) -> String {
+    match foreground {
+        ForegroundOwnerState::Owner => "owner".to_string(),
+        ForegroundOwnerState::Other { foreground_pgid } => format!("other:{foreground_pgid}"),
+        ForegroundOwnerState::Unknown => "unknown".to_string(),
+    }
+}
+
+pub fn trace_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_whitespace() { '_' } else { ch })
+        .collect()
 }
 
 fn write_control_response(stream: &mut UnixStream, ack: bool, message: &str) -> io::Result<()> {
@@ -2196,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn child_output_state_requires_quiescence_before_injection() {
+    fn child_output_state_uses_short_redraw_tolerant_debounce() {
         let state = ChildOutputState {
             last_child_output_at: Some(Instant::now()),
         };
@@ -2204,10 +2317,70 @@ mod tests {
 
         let state = ChildOutputState {
             last_child_output_at: Some(
-                Instant::now() - INJECT_CHILD_OUTPUT_QUIET - Duration::from_millis(1),
+                Instant::now() - INJECT_CHILD_OUTPUT_DEBOUNCE - Duration::from_millis(1),
             ),
         };
         assert!(state.is_quiescent());
+        assert!(INJECT_CHILD_OUTPUT_DEBOUNCE < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn safe_to_inject_allows_idle_redraw_after_short_debounce() {
+        let line_state = InputLineState::default();
+        let output_state = ChildOutputState {
+            last_child_output_at: Some(
+                Instant::now() - INJECT_CHILD_OUTPUT_DEBOUNCE - Duration::from_millis(1),
+            ),
+        };
+
+        assert_eq!(
+            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_declines_during_short_output_debounce() {
+        let line_state = InputLineState::default();
+        let output_state = ChildOutputState {
+            last_child_output_at: Some(Instant::now()),
+        };
+
+        assert_eq!(
+            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
+            Err(InjectionUnsafeReason::ChildOutputActive)
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_keeps_foreground_process_group_guard() {
+        let line_state = InputLineState::default();
+        let output_state = ChildOutputState::default();
+
+        assert_eq!(
+            safe_to_inject_for_foreground(
+                ForegroundOwnerState::Other {
+                    foreground_pgid: 42
+                },
+                &line_state,
+                &output_state
+            ),
+            Err(InjectionUnsafeReason::ForegroundOther)
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_keeps_user_typing_guard() {
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"partial");
+        line_state.last_user_input_at =
+            Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
+        let output_state = ChildOutputState::default();
+
+        assert_eq!(
+            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
+            Err(InjectionUnsafeReason::MidLine)
+        );
     }
 
     #[test]
@@ -2350,6 +2523,61 @@ mod tests {
     }
 
     #[test]
+    fn control_request_idle_redraw_output_injects_once_after_short_debounce() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_inject_frame(&mut client, b"notify").unwrap();
+        let (real_fd, _real_peer) = socketpair_files();
+        let (master, child_peer) = socketpair_files();
+        let child_writer = child_peer.try_clone().unwrap();
+        let child_reader = child_peer;
+        let mut state = InputLineState::default();
+        let mut output_state = ChildOutputState::default();
+        output_state.observe_child_output();
+        let mut pending = PendingChildInput::new();
+        let mut buffer = [0_u8; 256];
+        let writer = thread::spawn(move || {
+            let mut child_writer = child_writer;
+            thread::sleep(INJECT_CHILD_OUTPUT_DEBOUNCE + Duration::from_millis(175));
+            for _ in 0..6 {
+                if child_writer.write_all(b"child output\n").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+        let started = Instant::now();
+
+        let result = {
+            let mut request_io = ControlRequestIo {
+                real_fd: real_fd.as_raw_fd(),
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut state,
+                child_output_state: &mut output_state,
+                pending_child_input: &mut pending,
+                buffer: &mut buffer,
+            };
+            process_control_request_with_pending(&mut server, &mut request_io)
+        };
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "idle redraws must not require the old long quiet window"
+        );
+        set_nonblocking(child_reader.as_raw_fd());
+        let mut injected = Vec::new();
+        flush_pending_child_input_to_completion(master.as_raw_fd(), &mut pending).unwrap();
+        drain_available(child_reader.as_raw_fd(), &mut injected).unwrap();
+        drop(master);
+        writer.join().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&injected).matches("notify").count(),
+            1
+        );
+    }
+
+    #[test]
     fn control_request_active_child_output_returns_err_without_injection() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
@@ -2395,6 +2623,34 @@ mod tests {
             !String::from_utf8_lossy(&injected).contains("notify"),
             "unsafe injection wrote: {injected:?}"
         );
+    }
+
+    #[test]
+    fn notify_trace_file_append_is_default_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(NOTIFY_TRACE_FILE);
+
+        append_notify_trace_line(
+            &path,
+            "2026-06-27T00:00:00.000Z trigger=pty-control decision=inject inject_status=acked\n",
+        )
+        .unwrap();
+
+        let trace = fs::read_to_string(&path).unwrap();
+        assert!(trace.contains("decision=inject"));
+        assert!(trace.contains("inject_status=acked"));
+    }
+
+    #[test]
+    fn notify_trace_file_rotates_when_size_cap_would_be_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(NOTIFY_TRACE_FILE);
+        fs::write(&path, vec![b'x'; NOTIFY_TRACE_MAX_BYTES as usize]).unwrap();
+
+        append_notify_trace_line(&path, "next\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "next\n");
+        assert!(dir.path().join(NOTIFY_TRACE_ROTATED_FILE).exists());
     }
 
     #[test]

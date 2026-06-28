@@ -4167,7 +4167,8 @@ fn inject_control_payload(
     validate_control_peer(stream)?;
     let payload = read_tui_control_payload(stream)?;
     // Match the non-TUI broker contract: only submit proactive control payloads
-    // after the input line is at a clean, debounced boundary.
+    // after the input line is at a clean boundary, the agent owns the foreground
+    // process group, and any child output burst has cleared the short debounce.
     wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload, bracketed_paste)?;
@@ -4266,8 +4267,8 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
     forward.to_vec()
 }
 
-/// Wait until the child input is at a safe line boundary, pumping output into the
-/// virtual terminal and routing real input meanwhile, bounded by the inject limit.
+/// Wait until proactive injection is safe, pumping output into the virtual
+/// terminal and routing real input meanwhile, bounded by the inject limit.
 fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let start = Instant::now();
     while injection_wait_should_pump(
