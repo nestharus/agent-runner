@@ -26,6 +26,7 @@
         "policy": { "type": "boolean" },
         "quota": { "type": "boolean" },
         "session": { "type": "boolean" },
+        "session_enumerate": { "type": "boolean" },
         "terminal": { "type": "boolean" },
         "rotation": { "type": "boolean" },
         "discovery": { "type": "boolean" },

@@ -14,8 +14,8 @@ use oulipoly_runtime::session_metadata::{
     LocatedTranscript, SessionStorageType, TranscriptLookupMode,
 };
 use oulipoly_runtime::session_provider::{
-    self, SessionProviderCaptureRequest, SessionProviderIdentity, SessionProviderLocateRequest,
-    SessionProviderReadTurnsRequest,
+    self, SessionProviderCaptureRequest, SessionProviderEnumerateRequest, SessionProviderIdentity,
+    SessionProviderLocateRequest, SessionProviderReadTurnsRequest,
 };
 use oulipoly_state::{InvocationStart, StateDb};
 use rusqlite::{Connection, params};
@@ -35,6 +35,7 @@ const PROVIDER_NAME: &str = "provider-a-account";
 const PROVIDER_INSTANCE_ID: &str = "provider-a-instance";
 const SETTINGS_ID: &str = "provider-a-test-settings";
 const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const NATIVE_SESSION_ID: &str = "native-session-opaque-id";
 const HOSTILE_SESSION_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const OPENCODE_SESSION_ID: &str = "ses_fixture";
 
@@ -277,6 +278,19 @@ fn capture_request<'a>(
     }
 }
 
+fn enumerate_request<'a>(registry: &'a ProviderRegistry) -> SessionProviderEnumerateRequest<'a> {
+    SessionProviderEnumerateRequest {
+        registry,
+        identity: provider_identity(),
+        limit: Some(100),
+        cursor: None,
+        include_cwd: true,
+        include_turn_count: false,
+        since_unix_ms: Some(1_782_000_000_000),
+        effective_cwd: None,
+    }
+}
+
 #[test]
 fn no_ref_dispatch_aware_lifecycle_path_preserves_session_capture_marker_and_sqlite_bytes() {
     let baseline = NoRefDispatchProofFixture::new();
@@ -479,6 +493,53 @@ fn external_provider_read_turns_maps_transport_into_owned_turn_interface_before_
         &fixture.request_records_for("session.read_turns"),
         "session.read_turns",
         Some(SESSION_ID),
+    );
+}
+
+#[test]
+fn external_provider_enumerate_maps_provider_native_sessions_without_mutating_sqlite() {
+    let fixture = Fixture::new();
+    fixture.set_mode("enumerate_success");
+    let registry = fixture.registry();
+    let before = fixture.snapshot();
+
+    let result = session_provider::enumerate_sessions(enumerate_request(&registry))
+        .expect("enumerate sessions");
+
+    assert_eq!(result.sessions.len(), 1);
+    let entry = &result.sessions[0];
+    assert_eq!(entry.provider_session_id, NATIVE_SESSION_ID);
+    assert_eq!(entry.title.as_deref(), Some("Native session"));
+    assert_eq!(entry.cwd.as_deref(), Some(fixture.dir.path()));
+    assert_eq!(entry.created_unix_ms, Some(1_782_000_000_000));
+    assert_eq!(entry.updated_unix_ms, Some(1_782_000_010_000));
+    assert_eq!(entry.turn_count, None);
+    assert_eq!(entry.source.kind, "provider_native_list");
+    assert_eq!(entry.source.detail.as_deref(), Some("fixture session list"));
+    assert!(result.complete);
+    assert_eq!(result.next_cursor, None);
+    assert_eq!(result.warnings, vec!["fixture warning".to_string()]);
+    assert_eq!(fixture.snapshot(), before);
+    assert_enumerate_request_shape(&fixture.request_records_for("session.enumerate"));
+    assert_eq!(fixture.request_records_for("describe").len(), 1);
+}
+
+#[test]
+fn external_provider_enumerate_without_capability_is_clear_unsupported_noop() {
+    let fixture = Fixture::new();
+    fixture.set_mode("locate_success");
+    let registry = fixture.registry();
+    let before = fixture.snapshot();
+
+    let err = session_provider::enumerate_sessions(enumerate_request(&registry))
+        .expect_err("enumerate should require fine-grained capability");
+
+    assert_error_token(&err, "session_enumerate_capability_missing");
+    assert_eq!(fixture.snapshot(), before);
+    assert_eq!(fixture.request_records_for("describe").len(), 1);
+    assert!(
+        fixture.request_records_for("session.enumerate").is_empty(),
+        "missing capability must not invoke the provider enumerate subcommand"
     );
 }
 
@@ -957,6 +1018,25 @@ fn assert_request_shape(records: &[Value], subcommand: &str, session_id: Option<
     );
 }
 
+fn assert_enumerate_request_shape(records: &[Value]) {
+    assert_eq!(
+        records.len(),
+        1,
+        "expected exactly one session.enumerate record, got {records:?}"
+    );
+    let request = &records[0]["request"];
+    assert_eq!(records[0]["subcommand"], "session.enumerate");
+    assert_eq!(request["provider_instance_id"], PROVIDER_INSTANCE_ID);
+    assert_eq!(request["params"]["settings_id"], SETTINGS_ID);
+    assert_eq!(request["params"]["limit"], 100);
+    assert_eq!(request["params"]["include_cwd"], true);
+    assert_eq!(request["params"]["include_turn_count"], false);
+    assert_eq!(request["params"]["since_unix_ms"], 1_782_000_000_000u64);
+    assert!(request["params"].get("session_id").is_none());
+    assert!(request["params"].get("model_name").is_none());
+    assert!(request["params"].get("provider_name").is_none());
+}
+
 fn sqlite_snapshot(conn: &Connection) -> SqliteSnapshot {
     SqliteSnapshot {
         invocations: invocation_snapshot_rows(conn),
@@ -1118,6 +1198,7 @@ def error(code):
 
 def describe():
     session_enabled = mode != "session_capability_disabled"
+    session_enumerate_enabled = mode.startswith("enumerate_")
     return envelope({{
         "provider_id": "provider-a",
         "display_name": "Provider A",
@@ -1128,6 +1209,7 @@ def describe():
             "policy": False,
             "quota": False,
             "session": session_enabled,
+            "session_enumerate": session_enumerate_enabled,
             "terminal": False,
             "rotation": False,
             "discovery": False,
@@ -1137,6 +1219,27 @@ def describe():
             "migration": False,
         }},
     }})
+
+def enumerate_sessions():
+    if mode == "enumerate_success":
+        return envelope({{
+            "sessions": [{{
+                "provider_session_id": "{native_session_id}",
+                "title": "Native session",
+                "cwd": {fixture_dir},
+                "created_unix_ms": 1782000000000,
+                "updated_unix_ms": 1782000010000,
+                "turn_count": None,
+                "source": {{
+                    "kind": "provider_native_list",
+                    "detail": "fixture session list",
+                }},
+            }}],
+            "complete": True,
+            "next_cursor": None,
+            "warnings": ["fixture warning"],
+        }})
+    return error("unexpected_enumerate_mode")
 
 def locate():
     if mode == "locate_success":
@@ -1330,6 +1433,8 @@ if subcommand == "describe":
     response = describe()
 elif subcommand == "session.locate_transcript":
     response = locate()
+elif subcommand == "session.enumerate":
+    response = enumerate_sessions()
 elif subcommand == "session.read_turns":
     response = turns()
 elif subcommand == "session.capture":
@@ -1341,7 +1446,9 @@ print(json.dumps(response))
         mode_path = json_string(mode_path),
         record_path = json_string(record_path),
         transcript_path = json_string(transcript_path),
+        fixture_dir = json_string(dir),
         session_id = SESSION_ID,
+        native_session_id = NATIVE_SESSION_ID,
         hostile_session_id = HOSTILE_SESSION_ID,
         hostile_markers = hostile_markers_json(dir),
     )

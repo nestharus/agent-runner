@@ -552,6 +552,7 @@ mod tests {
                 policy: true,
                 quota: true,
                 session: true,
+                session_enumerate: false,
                 terminal: true,
                 rotation: true,
                 discovery: true,

@@ -5,7 +5,7 @@ use oulipoly_provider::generated::Artifact;
 use oulipoly_state::StateDb;
 use serde_json::Value;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const S7A_NEUTRAL_SETTINGS_ID: &str = "s7a-neutral-settings";
 
@@ -54,6 +54,18 @@ pub struct SessionProviderCaptureRequest<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionProviderEnumerateRequest<'a> {
+    pub registry: &'a ProviderRegistry,
+    pub identity: SessionProviderIdentity,
+    pub limit: Option<u64>,
+    pub cursor: Option<&'a str>,
+    pub include_cwd: bool,
+    pub include_turn_count: bool,
+    pub since_unix_ms: Option<u64>,
+    pub effective_cwd: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionProviderLifecycleContext<'a> {
     pub registry: &'a ProviderRegistry,
     pub identity: SessionProviderIdentity,
@@ -88,6 +100,31 @@ pub struct SessionProviderCaptureResult {
     pub provider_session_id: Option<String>,
     pub state: Option<Value>,
     pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProviderEnumerateSource {
+    pub kind: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProviderEnumerateEntry {
+    pub provider_session_id: String,
+    pub title: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub created_unix_ms: Option<u64>,
+    pub updated_unix_ms: Option<u64>,
+    pub turn_count: Option<u64>,
+    pub source: SessionProviderEnumerateSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProviderEnumerateResult {
+    pub sessions: Vec<SessionProviderEnumerateEntry>,
+    pub complete: bool,
+    pub next_cursor: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

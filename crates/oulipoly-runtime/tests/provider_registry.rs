@@ -115,6 +115,7 @@ fn describe_result(provider_id: &str) -> DescribeResult {
             policy: false,
             quota: false,
             session: false,
+            session_enumerate: false,
             terminal: false,
             rotation: false,
             discovery: false,

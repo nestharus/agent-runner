@@ -8,6 +8,7 @@
 //! orchestration, accessor, validator, mapper, formatter, parser, filter, predicate
 
 mod dispatch;
+mod enumerate;
 mod host;
 mod lifecycle_proof;
 mod locate;
@@ -17,15 +18,16 @@ mod turns;
 mod types;
 
 pub use dispatch::{
-    capture, capture_for_lifecycle, locate_transcript, locate_transcript_with_raw_metadata,
-    read_turns, read_turns_for_lifecycle,
+    capture, capture_for_lifecycle, enumerate_sessions, locate_transcript,
+    locate_transcript_with_raw_metadata, read_turns, read_turns_for_lifecycle,
 };
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
 pub use turns::{assert_turn_count_diagnostic, ingest_owned_turns};
 pub use types::{
     NoRefProofOutput, NoRefProofRequest, S7A_NEUTRAL_SETTINGS_ID, SessionProviderCaptureRequest,
-    SessionProviderCaptureResult, SessionProviderError, SessionProviderIdentity,
-    SessionProviderLifecycleContext, SessionProviderLocateRequest,
+    SessionProviderCaptureResult, SessionProviderEnumerateEntry, SessionProviderEnumerateRequest,
+    SessionProviderEnumerateResult, SessionProviderEnumerateSource, SessionProviderError,
+    SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLocateRequest,
     SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest,
     SessionProviderReadTurnsResult, SessionProviderTurn,
 };

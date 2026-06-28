@@ -2,7 +2,7 @@
   "non_launch": {
     "describe": {
       "request": {"contract":"oulipoly.provider/v1","request_id":"req-describe","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner","working_directory":"/home/user/project"},"params":{}},
-      "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-describe","ok":true,"result":{"provider_id":"example","display_name":"Example Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{"launch":true,"policy":true,"quota":true,"session":true,"terminal":true,"rotation":true,"discovery":true,"settings":true,"setup_brain":false,"setup":true,"migration":true},"settings_schema_id":"example.settings/v1","concurrency":{"safe_for_parallel_invocation":true,"state_locking":"advisory_file_lock_and_atomic_rename"}}},
+      "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-describe","ok":true,"result":{"provider_id":"example","display_name":"Example Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{"launch":true,"policy":true,"quota":true,"session":true,"session_enumerate":true,"terminal":true,"rotation":true,"discovery":true,"settings":true,"setup_brain":false,"setup":true,"migration":true},"settings_schema_id":"example.settings/v1","concurrency":{"safe_for_parallel_invocation":true,"state_locking":"advisory_file_lock_and_atomic_rename"}}},
       "error_response": {"contract":"oulipoly.provider/v1","request_id":"req-describe","ok":false,"error":{"code":"unsupported","category":"unsupported","message":"capability is not implemented","retryable":false,"details":{"subcommand":"describe"}}}
     },
     "schema": {
@@ -74,6 +74,11 @@
       "request": {"contract":"oulipoly.provider/v1","request_id":"req-session-locate","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner"},"params":{"settings_id":"work","session_id":"sess-abc","lookup_mode":"require_existing","storage_hint":{"format_id":"example.transcript/v1","fields":{"path":"/home/user/.example/sessions/sess-abc.jsonl"}}}},
       "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-session-locate","ok":true,"result":{"located":true,"path":"/home/user/.example/sessions/sess-abc.jsonl","format_id":"example.transcript/v1","source_id":"provider_storage","require_existing_observed":true}},
       "error_response": {"contract":"oulipoly.provider/v1","request_id":"req-session-locate","ok":false,"error":{"code":"transcript_unavailable","category":"unavailable","message":"transcript storage is unavailable","retryable":false,"details":{"session_id":"sess-abc"}}}
+    },
+    "session.enumerate": {
+      "request": {"contract":"oulipoly.provider/v1","request_id":"req-session-enumerate","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner"},"params":{"settings_id":"work","limit":100,"include_cwd":true,"include_turn_count":false,"since_unix_ms":1782000000000}},
+      "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-session-enumerate","ok":true,"result":{"sessions":[{"provider_session_id":"opaque-native-id","title":"Optional title","cwd":"/home/user/project","created_unix_ms":1782000000000,"updated_unix_ms":1782000010000,"source":{"kind":"provider_native_list","detail":"example session list --format json"}}],"complete":false,"next_cursor":"cursor-2","warnings":["one session was skipped because metadata was unreadable"]}},
+      "error_response": {"contract":"oulipoly.provider/v1","request_id":"req-session-enumerate","ok":false,"error":{"code":"enumerate_failed","category":"failed","message":"session enumeration failed","retryable":false,"details":{}}}
     },
     "session.read_turns": {
       "request": {"contract":"oulipoly.provider/v1","request_id":"req-session-read","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner"},"params":{"settings_id":"work","session_id":"sess-abc","range":{"after_turn":2,"limit":10}}},

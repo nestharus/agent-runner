@@ -351,6 +351,11 @@ pub const SUBCOMMAND_SCHEMAS: &[SubcommandSchema] = &[
         "SessionLocateTranscript"
     ),
     row!(
+        "session.enumerate",
+        "session.schema.json",
+        "SessionEnumerate"
+    ),
+    row!(
         "session.read_turns",
         "session.schema.json",
         "SessionReadTurns"

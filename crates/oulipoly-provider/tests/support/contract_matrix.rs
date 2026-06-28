@@ -38,6 +38,7 @@ pub const EXPECTED_SUBCOMMANDS: &[&str] = &[
     "quota.source",
     "quota.probe",
     "quota.refresh_auth",
+    "session.enumerate",
     "session.locate_transcript",
     "session.read_turns",
     "session.capture",
@@ -124,6 +125,7 @@ pub const NON_LAUNCH_ROWS: &[ContractRow] = &[
         "session",
         "SessionLocateTranscript"
     ),
+    row!("session.enumerate", "session", "SessionEnumerate"),
     row!("session.read_turns", "session", "SessionReadTurns"),
     row!("session.capture", "session", "SessionCapture"),
     row!("session.export", "session", "SessionExport"),
