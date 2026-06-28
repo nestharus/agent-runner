@@ -55,6 +55,38 @@ fn target_resolution_includes_models_without_top_level_provider_refs() {
 }
 
 #[test]
+fn target_resolution_maps_binary_instance_slots_to_session_provider_binary() {
+    let models = vec![builtin_model("opencode-test", &["opencode", "opencode2"])];
+    let registry = registry_from_models_and_provider_commands(
+        &models,
+        &[("opencode", "opencode1"), ("opencode2", "opencode2")],
+    );
+
+    assert_eq!(
+        registry.artifact_key_for_model_provider("opencode-test", "opencode"),
+        Some("binary:agent-runner-opencode".to_string())
+    );
+    assert_eq!(
+        registry.artifact_key_for_model_provider("opencode-test", "opencode2"),
+        Some("binary:agent-runner-opencode".to_string())
+    );
+}
+
+#[test]
+fn target_resolution_preserves_path_like_instance_provider_commands() {
+    let models = vec![builtin_model("local-shim", &["provider-a"])];
+    let registry = registry_from_models_and_provider_commands(
+        &models,
+        &[("provider-a", "/tmp/provider-instance-shim")],
+    );
+
+    assert_eq!(
+        registry.artifact_key_for_model_provider("local-shim", "provider-a"),
+        Some("path:/tmp/provider-instance-shim".to_string())
+    );
+}
+
+#[test]
 fn target_resolution_supports_model_filter() {
     let models = vec![
         external_model("model-a", &["provider-a"]),

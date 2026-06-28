@@ -5,6 +5,7 @@
 
 use oulipoly_provider::generated::CONTRACT_VERSION;
 use serde_json::Value;
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -58,9 +59,19 @@ impl Fixture {
         cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("XDG_DATA_HOME", &self.data_home);
         cmd.env("HOME", &self.data_home);
+        cmd.env("PATH", self.path_with_scripts_first());
         cmd.env_remove("OULIPOLY_DATA_DIR");
         cmd.env_remove("OULIPOLY_PARENT_INVOCATION");
         cmd
+    }
+
+    fn path_with_scripts_first(&self) -> String {
+        let current = env::var_os("PATH").unwrap_or_default();
+        format!(
+            "{}:{}",
+            self.scripts_dir.display(),
+            current.to_string_lossy()
+        )
     }
 
     fn run_session_import(&self, args: &[&str]) -> Output {
@@ -88,6 +99,15 @@ impl Fixture {
             fake_provider_script(&self.record_path, &self.workspace, enumerate_capability),
         )
         .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    fn write_empty_stdout_command(&self, name: &str) -> PathBuf {
+        let path = self.scripts_dir.join(name);
+        fs::write(&path, "#!/usr/bin/env bash\nexit 0\n").unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
@@ -122,6 +142,14 @@ impl Fixture {
         fs::write(
             self.app_config_dir.join("providers.toml"),
             providers_config_toml_with_commands(providers),
+        )
+        .unwrap();
+    }
+
+    fn write_providers_with_command_names(&self, providers: &[(&str, &str)]) {
+        fs::write(
+            self.app_config_dir.join("providers.toml"),
+            providers_config_toml_with_command_names(providers),
         )
         .unwrap();
     }
@@ -283,6 +311,56 @@ fn session_import_cli_provider_filter_matches_provider_instance_without_top_leve
 }
 
 #[test]
+fn session_import_cli_instance_slot_command_uses_provider_shim_binary() {
+    let fixture = Fixture::new();
+    fixture.write_provider_script("agent-runner-opencode", true);
+    fixture.write_empty_stdout_command("opencode1");
+    fixture.write_providers_with_command_names(&[("opencode", "opencode1")]);
+    fixture.write_model_without_provider_ref("opencode-test", &["opencode"]);
+
+    let output = fixture.run_session_import(&["--provider", "opencode", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).is_empty(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(report["providers"][0]["provider_name"], "opencode");
+    assert_eq!(report["providers"][0]["status"]["kind"], "succeeded");
+    assert_eq!(report["totals"]["imported"], 1);
+    assert_eq!(enumerate_settings(&fixture), vec!["opencode"]);
+}
+
+#[test]
+fn session_import_cli_skips_non_session_provider_when_describe_transport_is_unavailable() {
+    let fixture = Fixture::new();
+    fixture.write_empty_stdout_command("media-cli");
+    fixture.write_providers_with_command_names(&[("media", "media-cli")]);
+    fixture.write_model_without_provider_ref("media-model", &["media"]);
+
+    let output = fixture.run_session_import(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).is_empty(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["providers"].as_array().unwrap().len(), 1);
+    assert_eq!(report["providers"][0]["provider_name"], "media");
+    assert_eq!(report["providers"][0]["status"]["kind"], "skipped");
+    assert!(
+        report["providers"][0]["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("session_provider_describe_unavailable"),
+        "{report}"
+    );
+    assert_eq!(report["totals"]["providers_skipped"], 1);
+    assert_eq!(report["totals"]["providers_failed"], 0);
+    assert!(
+        fixture.read_records().is_empty(),
+        "non-session provider should not be enumerated"
+    );
+}
+
+#[test]
 fn session_import_cli_deduplicates_aliases_with_same_enumerated_source() {
     let fixture = Fixture::new();
     let provider_script = fixture.write_provider_script("shared-store-shim.py", true);
@@ -321,6 +399,48 @@ fn session_import_cli_deduplicates_aliases_with_same_enumerated_source() {
         .collect::<Vec<_>>();
     assert_eq!(shared_rows.len(), 1, "{rows:?}");
     assert_eq!(shared_rows[0]["active_provider"], "shared-alias-a");
+}
+
+#[test]
+fn session_import_cli_deduplicates_opencode_instance_aliases_through_shared_shim() {
+    let fixture = Fixture::new();
+    fixture.write_provider_script("agent-runner-opencode", true);
+    fixture.write_empty_stdout_command("opencode1");
+    fixture.write_empty_stdout_command("opencode2");
+    fixture.write_providers_with_command_names(&[
+        ("opencode", "opencode1"),
+        ("opencode2", "opencode2"),
+    ]);
+    fixture.write_model_without_provider_ref("opencode-test", &["opencode", "opencode2"]);
+
+    let output = fixture.run_session_import(&["--json"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(stderr(&output).is_empty(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["providers"].as_array().unwrap().len(), 2);
+    assert_eq!(report["providers"][0]["provider_name"], "opencode");
+    assert_eq!(report["providers"][0]["status"]["kind"], "succeeded");
+    assert_eq!(report["providers"][1]["provider_name"], "opencode2");
+    assert_eq!(report["providers"][1]["status"]["kind"], "skipped");
+    assert!(
+        report["providers"][1]["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate_enumerate_source"),
+        "{report}"
+    );
+    assert_eq!(report["totals"]["imported"], 1);
+
+    let list_output = fixture.run_session_list_json();
+    assert_eq!(list_output.status.code(), Some(0), "{list_output:?}");
+    let rows: Vec<Value> = serde_json::from_slice(&list_output.stdout).unwrap();
+    let opencode_rows = rows
+        .iter()
+        .filter(|row| row["active_provider_session_id"] == "opencode-shared-native")
+        .collect::<Vec<_>>();
+    assert_eq!(opencode_rows.len(), 1, "{rows:?}");
+    assert_eq!(opencode_rows[0]["active_provider"], "opencode");
 }
 
 #[test]
@@ -387,6 +507,20 @@ fn providers_config_toml_with_commands(providers: &[(&str, &Path)]) -> String {
                 "[{}]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
                 provider,
                 toml_string(&command.display().to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn providers_config_toml_with_command_names(providers: &[(&str, &str)]) -> String {
+    providers
+        .iter()
+        .map(|(provider, command)| {
+            format!(
+                "[{}]\ncommand = {}\nargs = []\nprompt_mode = \"arg\"\n",
+                provider,
+                toml_string(command)
             )
         })
         .collect::<Vec<_>>()
@@ -489,6 +623,8 @@ def session(session_id, title, updated_unix_ms, turn_count):
     }
 
 def sessions_for_settings():
+    if settings_id in ("opencode", "opencode2", "opencode3", "opencode4", "opencode5"):
+        return [session("opencode-shared-native", "OpenCode shared native", 1782000005000, 4)]
     if settings_id in ("shared-alias-a", "shared-alias-b"):
         return [session("shared-native", "Shared native", 1782000004000, 2)]
     if settings_id == "provider-a":
