@@ -32,9 +32,8 @@ fn no_controlling_terminal_fallback_records_no_pty_control_path() {
     fs::create_dir_all(&state_home).unwrap();
     fs::create_dir_all(&home_dir).unwrap();
     fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let sidecar_path = data_home
-        .join("oulipoly-agent-runner")
-        .join("pid-identity.db");
+    let app_data_dir = data_home.join("oulipoly-agent-runner");
+    let sidecar_path = app_data_dir.join("pid-identity.db");
     let script = fixture_script(dir.path());
     let child_result = dir.path().join("child-result.txt");
 
@@ -47,7 +46,7 @@ fn no_controlling_terminal_fallback_records_no_pty_control_path() {
         .env(CHILD_RESULT_ENV, &child_result)
         .env("XDG_CONFIG_HOME", &config_home)
         .env("XDG_DATA_HOME", &data_home)
-        .env_remove("OULIPOLY_DATA_DIR")
+        .env("OULIPOLY_DATA_DIR", &app_data_dir)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("XDG_STATE_HOME", &state_home)
         .env("HOME", &home_dir)

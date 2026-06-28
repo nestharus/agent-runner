@@ -30,7 +30,7 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn new(config_home: &Path, data_home: &Path) -> Self {
+    fn new(config_home: &Path, data_home: &Path, data_root: &Path) -> Self {
         let guard = Self {
             old_config: std::env::var_os("XDG_CONFIG_HOME"),
             old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
@@ -38,7 +38,7 @@ impl EnvGuard {
             old_home: std::env::var_os("HOME"),
         };
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", data_root);
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
             std::env::set_var("HOME", data_home);
@@ -83,7 +83,7 @@ impl ExportFixture {
         let data_root = data_home.join("oulipoly-agent-runner");
         fs::create_dir_all(&models_dir).unwrap();
         fs::create_dir_all(&data_root).unwrap();
-        let env = EnvGuard::new(&config_home, &data_home);
+        let env = EnvGuard::new(&config_home, &data_home, &data_root);
         Self {
             _dir: dir,
             _env: env,

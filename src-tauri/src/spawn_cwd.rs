@@ -200,6 +200,10 @@ mod tests {
 
     #[test]
     fn effective_resume_spawn_cwd_prefers_workspace_from_cwd_script() {
+        // Serialize against other env/cwd-mutating tests; this test isolates the
+        // data dir to its temp dir so the production data-dir guard does not refuse
+        // (a refusal would short-circuit before the cwd-script and fall back to caller).
+        let _lock = cwd_lock().lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let provider_name = "provider6";
         let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
@@ -219,17 +223,26 @@ mod tests {
         );
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
 
-        let cwd = effective_resume_spawn_cwd(
+        let prev_data_dir = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, dir.path());
+        }
+        let result = effective_resume_spawn_cwd(
             &state,
             &models,
             &providers_cfg,
             &sessions_cfg,
             session_id,
             Some(&caller_cwd),
-        )
-        .unwrap();
+        );
+        unsafe {
+            match prev_data_dir {
+                Some(value) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value),
+                None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+            }
+        }
 
-        assert_eq!(cwd, workspace);
+        assert_eq!(result.unwrap(), workspace);
     }
 
     #[test]

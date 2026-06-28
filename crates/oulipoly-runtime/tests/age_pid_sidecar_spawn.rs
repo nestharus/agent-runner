@@ -25,21 +25,6 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn set_xdg_data_home(path: &Path) -> Self {
-        let lock = env_lock().lock().unwrap();
-        let old_oulipoly_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
-        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
-        unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
-            std::env::set_var("XDG_DATA_HOME", path);
-        }
-        Self {
-            _lock: lock,
-            old_oulipoly_data_dir,
-            old_xdg_data_home,
-        }
-    }
-
     fn set_xdg_data_home_and_oulipoly_data_dir(xdg_data_home: &Path, data_dir: &Path) -> Self {
         let lock = env_lock().lock().unwrap();
         let old_oulipoly_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
@@ -90,7 +75,7 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
     let invocation_env = invocation_env();
 
     {
-        let _guard = EnvGuard::set_xdg_data_home(&data_home);
+        let _guard = EnvGuard::set_xdg_data_home_and_oulipoly_data_dir(&data_home, &app_data_dir);
         let output = RuntimeExecutorService::default()
             .execute(ExecutorServiceRequest::Effective {
                 model: model.clone(),
@@ -147,7 +132,7 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
     let invocation_env = invocation_env();
 
     {
-        let _guard = EnvGuard::set_xdg_data_home(&data_home);
+        let _guard = EnvGuard::set_xdg_data_home_and_oulipoly_data_dir(&data_home, &app_data_dir);
         let output = RuntimeExecutorService::default()
             .execute(ExecutorServiceRequest::Effective {
                 model: model.clone(),
@@ -232,7 +217,7 @@ fn stdout_json_event_capture_without_spawn_identity_does_not_backfill_sidecar() 
     let model = fixture_model(provider.clone());
 
     {
-        let _guard = EnvGuard::set_xdg_data_home(&data_home);
+        let _guard = EnvGuard::set_xdg_data_home_and_oulipoly_data_dir(&data_home, &app_data_dir);
         let output = RuntimeExecutorService::default()
             .execute(ExecutorServiceRequest::Effective {
                 model: model.clone(),

@@ -1781,7 +1781,7 @@ fn move_to_quarantine(path: &Path, quarantine_dir: &Path) {
 mod tests {
     use super::*;
     use crate::session_export::RecordSource;
-    use crate::test_support::env_lock;
+    use crate::test_support::lock_env;
     use rusqlite::params;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1791,7 +1791,8 @@ mod tests {
     const MODEL: &str = "codex-high";
 
     fn with_homes<T>(config_home: &Path, data_home: &Path, test: impl FnOnce() -> T) -> T {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
+        let data_root = data_home.join(oulipoly_state::paths::APP_DATA_DIR_NAME);
         let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old_config = std::env::var_os("XDG_CONFIG_HOME");
         let old_data = std::env::var_os("XDG_DATA_HOME");
@@ -1808,7 +1809,7 @@ mod tests {
         )
         .unwrap();
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", &data_root);
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
             std::env::set_var("PATH", path);

@@ -560,7 +560,7 @@ fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::env_lock;
+    use crate::test_support::lock_env;
     use oulipoly_state::StateDb;
     use rusqlite::params;
 
@@ -568,11 +568,12 @@ mod tests {
     const PROVIDER: &str = "claude";
 
     fn with_data_home<T>(data_home: &Path, test: impl FnOnce() -> T) -> T {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
+        let data_root = data_home.join(oulipoly_state::paths::APP_DATA_DIR_NAME);
         let old_data_dir = std::env::var_os("OULIPOLY_DATA_DIR");
         let old = std::env::var_os("XDG_DATA_HOME");
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", &data_root);
             std::env::set_var("XDG_DATA_HOME", data_home);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(test));

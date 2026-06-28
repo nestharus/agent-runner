@@ -1177,7 +1177,7 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
     let _env = EnvScope::set_optional(&[
         ("XDG_DATA_HOME", Some(xdg_data.path.as_str())),
         ("AGENT_BASH_AGENT_RUNNER_BIN", Some(agent_runner_bin)),
-        ("OULIPOLY_DATA_DIR", None),
+        ("OULIPOLY_DATA_DIR", Some(expected_data_dir.as_str())),
         (
             "OPENAI_API_KEY",
             Some("ambient-openai-secret-do-not-propagate"),

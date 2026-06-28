@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::provider_registry::ProviderRegistryOptions;
+use crate::test_support::lock_env;
 use chrono::Utc;
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ResumeKind, ResumeStrategy,
@@ -57,6 +58,50 @@ fn state_with_session(provider_name: &str, session_id: &str) -> StateDb {
     db.mint_imported_chain_if_absent(provider_name, session_id, &Utc::now(), "<unknown>")
         .unwrap();
     db
+}
+
+struct IsolatedDataDir {
+    _dir: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+    old_data_dir: Option<std::ffi::OsString>,
+}
+
+impl IsolatedDataDir {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join(oulipoly_state::paths::APP_DATA_DIR_NAME);
+        let lock = lock_env();
+        let old_data_dir = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+        unsafe {
+            std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, &data_root);
+        }
+        Self {
+            _dir: dir,
+            _lock: lock,
+            old_data_dir,
+        }
+    }
+}
+
+impl Drop for IsolatedDataDir {
+    fn drop(&mut self) {
+        unsafe {
+            match self.old_data_dir.take() {
+                Some(value) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value),
+                None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+            }
+        }
+    }
+}
+
+fn resolve_resume_workspace_root_with_isolated_data_dir(
+    db: &StateDb,
+    models: &ModelStore,
+    providers_cfg: &ProvidersConfig,
+    input: &str,
+) -> Result<PathBuf, MetadataError> {
+    let _data_dir = IsolatedDataDir::new();
+    resolve_resume_workspace_root(db, models, providers_cfg, input)
 }
 
 fn state_with_model_session(model: &ModelConfig, provider_name: &str, session_id: &str) -> StateDb {
@@ -295,8 +340,13 @@ fn resolve_resume_workspace_root_uses_cwd_script_response() {
     let db = state_with_session(provider_name, session_id);
     let cfg = providers_cfg(provider_name, script.path.display().to_string());
 
-    let resolved =
-        resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap();
+    let resolved = resolve_resume_workspace_root_with_isolated_data_dir(
+        &db,
+        &ModelStore::new(),
+        &cfg,
+        session_id,
+    )
+    .unwrap();
 
     assert_eq!(resolved, workspace);
 }
@@ -316,7 +366,13 @@ fn resolve_resume_workspace_root_reports_cwd_script_not_found() {
     let db = state_with_session(provider_name, session_id);
     let cfg = providers_cfg(provider_name, script.path.display().to_string());
 
-    let err = resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
+    let err = resolve_resume_workspace_root_with_isolated_data_dir(
+        &db,
+        &ModelStore::new(),
+        &cfg,
+        session_id,
+    )
+    .unwrap_err();
 
     assert_reason_contains(&err, "cwd_script_not_found");
 }
@@ -329,7 +385,13 @@ fn resolve_resume_workspace_root_reports_malformed_cwd_script_json() {
     let db = state_with_session(provider_name, session_id);
     let cfg = providers_cfg(provider_name, script.path.display().to_string());
 
-    let err = resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err();
+    let err = resolve_resume_workspace_root_with_isolated_data_dir(
+        &db,
+        &ModelStore::new(),
+        &cfg,
+        session_id,
+    )
+    .unwrap_err();
 
     assert_reason_contains(&err, "cwd_script_malformed_json");
 }
@@ -345,8 +407,13 @@ fn resolve_resume_workspace_root_uses_imported_script_session_cwd_before_cwd_scr
     seed_provider_session_resolved_account(&db, provider_name, session_id, &workspace);
     let cfg = providers_cfg(provider_name, "/bin/false".to_string());
 
-    let resolved =
-        resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap();
+    let resolved = resolve_resume_workspace_root_with_isolated_data_dir(
+        &db,
+        &ModelStore::new(),
+        &cfg,
+        session_id,
+    )
+    .unwrap();
 
     assert_eq!(resolved, workspace);
 }
@@ -403,7 +470,8 @@ fn resolve_workspace_with_script(
     let script = fixture_script(script_body);
     let db = state_with_session(provider_name, session_id);
     let cfg = providers_cfg(provider_name, script.path.display().to_string());
-    resolve_resume_workspace_root(&db, &ModelStore::new(), &cfg, session_id).unwrap_err()
+    resolve_resume_workspace_root_with_isolated_data_dir(&db, &ModelStore::new(), &cfg, session_id)
+        .unwrap_err()
 }
 
 #[test]
