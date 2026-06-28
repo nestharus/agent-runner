@@ -669,10 +669,10 @@ fn invocation_count_for_session(fixture: &Fixture, session_id: &str) -> i64 {
 }
 
 #[test]
-fn headless_resume_malformed_id_fails_fast_without_state_db() {
+fn headless_resume_blank_id_fails_fast_without_state_db() {
     let fixture = Fixture::new();
     let output = fixture
-        .base_resume_command("gpt-high", "not-a-uuid")
+        .base_resume_command("gpt-high", " ")
         .arg("--prompt")
         .arg("answer text")
         .output()
@@ -680,10 +680,7 @@ fn headless_resume_malformed_id_fails_fast_without_state_db() {
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid session id: not-a-uuid"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("session id is required"), "{stderr}");
     assert!(!fixture.db_path().exists());
 }
 
@@ -2190,34 +2187,28 @@ subcommand = ["resume"]
 }
 
 #[test]
-fn repl_resume_malformed_id_fails_fast_without_state_db() {
+fn repl_resume_blank_id_fails_fast_without_state_db() {
     let fixture = Fixture::new();
 
-    let output = fixture.run_repl("claude-opus", Some("not-a-uuid"));
+    let output = fixture.run_repl("opaque-model", Some(" "));
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(
-        stderr.contains("invalid session id: not-a-uuid"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("session id is required"), "{stderr}");
     assert!(!fixture.db_path().exists());
 }
 
 #[test]
-fn top_level_resume_malformed_id_fails_fast_without_state_db_or_provider_config() {
+fn top_level_resume_blank_id_fails_fast_without_state_db_or_provider_config() {
     let fixture = Fixture::new();
     let output = fixture
-        .base_top_level_resume_without_model_command("not-a-uuid")
+        .base_top_level_resume_without_model_command(" ")
         .output()
         .unwrap();
 
     assert_ne!(output.status.code(), Some(0), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid session id: not-a-uuid"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("session id is required"), "{stderr}");
     assert!(!fixture.db_path().exists());
     assert!(
         !fixture

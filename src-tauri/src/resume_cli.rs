@@ -162,6 +162,7 @@ pub(super) fn format_resume_error(err: oulipoly_state::ResumeError) -> String {
     use oulipoly_state::ResumeError;
     match err {
         ResumeError::InvalidUuid { input } => format!("invalid session id: {input}"),
+        ResumeError::InvalidResumeInput { reason, .. } => reason,
         ResumeError::NoChainFound { input } => format!(
             "No session found matching {input}. Check that session ingestion is configured and that the provider still has resumable local state."
         ),

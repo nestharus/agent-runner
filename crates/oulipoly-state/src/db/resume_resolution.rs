@@ -20,8 +20,7 @@
 //!     role: intrinsic-surface
 //!     Domain: provider-session-id-grammar
 //!     Owns:
-//!       - StateDb resume input acceptance for UUIDs and OpenCode provider session IDs
-//!       - OpenCode `ses_` provider-session prefix strip and suffix validation
+//!       - StateDb provider-neutral bounded opaque resume input acceptance
 //!       - provider-session-id-to-chain resolution query path
 //!   - component: crates/oulipoly-state/src/db/resume_resolution.rs
 //!     role: intrinsic-surface
@@ -37,7 +36,6 @@
 
 use super::*;
 use oulipoly_config::ModelConfig;
-use uuid::Uuid;
 
 impl StateDb {
     pub fn resolve_resume(
@@ -62,35 +60,32 @@ impl StateDb {
         ))
     }
 
-    pub(super) fn validate_resume_input_id(input: &str) -> Result<(), ResumeError> {
-        if Self::resume_input_id_is_valid(input) {
-            return Ok(());
+    pub fn validate_resume_input_id(input: &str) -> Result<(), ResumeError> {
+        match Self::resume_input_validation_error(input) {
+            Some(reason) => Err(Self::invalid_resume_input_error(input, reason)),
+            None => Ok(()),
         }
-
-        Err(Self::invalid_resume_uuid_error(input))
     }
 
-    fn resume_input_id_is_valid(input: &str) -> bool {
-        Self::resume_input_id_is_uuid(input) || Self::is_opencode_provider_session_id(input)
+    fn resume_input_validation_error(input: &str) -> Option<String> {
+        if input.trim().is_empty() {
+            Some("session id is required".to_string())
+        } else if input.len() > RESUME_INPUT_MAX_LEN {
+            Some(format!(
+                "session id exceeds maximum length of {RESUME_INPUT_MAX_LEN} bytes"
+            ))
+        } else if input.chars().any(char::is_control) {
+            Some("session id contains control characters".to_string())
+        } else {
+            None
+        }
     }
 
-    fn resume_input_id_is_uuid(input: &str) -> bool {
-        Uuid::parse_str(input).is_ok()
-    }
-
-    fn invalid_resume_uuid_error(input: &str) -> ResumeError {
-        ResumeError::InvalidUuid {
+    fn invalid_resume_input_error(input: &str, reason: String) -> ResumeError {
+        ResumeError::InvalidResumeInput {
             input: input.to_string(),
+            reason,
         }
-    }
-
-    pub(super) fn is_opencode_provider_session_id(input: &str) -> bool {
-        let Some(suffix) = input.strip_prefix(OPENCODE_SESSION_PREFIX) else {
-            return false;
-        };
-
-        suffix.len() >= OPENCODE_SESSION_MIN_SUFFIX_LEN
-            && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
     }
 
     pub(super) fn reject_wrong_resume_id_kind(&self, input: &str) -> Result<(), ResumeError> {

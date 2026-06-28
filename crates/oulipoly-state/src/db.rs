@@ -169,11 +169,12 @@ use self::provider_schema_migration::ProviderColumn;
 pub use self::provider_session_binding::ProviderSessionBinding;
 pub use self::providers::ProviderRecord;
 pub use self::resume_types::{
-    ChainPreview, ModelStore, ResolvedResume, ResumeError, TurnPreview, WrongIdKindInput,
+    ChainPreview, ModelStore, RESUME_INPUT_MAX_LEN, ResolvedResume, ResumeError, TurnPreview,
+    WrongIdKindInput,
 };
 use self::resume_types::{
-    OPENCODE_SESSION_MIN_SUFFIX_LEN, OPENCODE_SESSION_PREFIX, ParsedTurnPreviewTimestamp,
-    RecentTurnRow, ResumeChainCandidate, WrongIdKindInvocationMatch, WrongIdKindInvocationRow,
+    ParsedTurnPreviewTimestamp, RecentTurnRow, ResumeChainCandidate, WrongIdKindInvocationMatch,
+    WrongIdKindInvocationRow,
 };
 use self::returned_artifacts_codec::{
     InvocationIdentity, ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError,

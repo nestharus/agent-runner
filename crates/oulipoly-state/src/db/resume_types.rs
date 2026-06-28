@@ -14,8 +14,7 @@
 //!     role: intrinsic-surface
 //!     Domain: provider-session-id-grammar
 //!     Owns:
-//!       - OpenCode provider session ID prefix `ses_`
-//!       - OpenCode provider session ID minimum alphanumeric suffix length accepted by StateDb resume input validation
+//!       - provider-neutral bounded opaque resume input validation
 //!       - StateDb opaque provider-session resume identity DTO boundary
 //!   - component: crates/oulipoly-state/src/db/resume_types.rs
 //!     role: intrinsic-surface
@@ -31,8 +30,11 @@
 use chrono::{DateTime, Utc};
 use oulipoly_config::ModelConfig;
 
-pub(super) const OPENCODE_SESSION_PREFIX: &str = "ses_";
-pub(super) const OPENCODE_SESSION_MIN_SUFFIX_LEN: usize = 3;
+/// Maximum accepted resume input length in bytes before DB lookup.
+///
+/// Provider-native session IDs are opaque, so validation is intentionally
+/// grammar-neutral while still bounding lookup-key size.
+pub const RESUME_INPUT_MAX_LEN: usize = 512;
 
 pub type ModelStore = std::collections::HashMap<String, ModelConfig>;
 
@@ -49,6 +51,10 @@ pub struct ResolvedResume {
 pub enum ResumeError {
     InvalidUuid {
         input: String,
+    },
+    InvalidResumeInput {
+        input: String,
+        reason: String,
     },
     NoChainFound {
         input: String,

@@ -38,6 +38,7 @@ fn resume_resolution_error_disposition_from_parts(
 fn resume_resolution_error_exit_code(err: &oulipoly_state::ResumeError) -> i32 {
     match err {
         oulipoly_state::ResumeError::InvalidUuid { .. } => 2,
+        oulipoly_state::ResumeError::InvalidResumeInput { .. } => 2,
         oulipoly_state::ResumeError::NoChainFound { .. } => 10,
         oulipoly_state::ResumeError::WrongIdKind { .. } => 10,
         oulipoly_state::ResumeError::Ambiguous { .. } => 11,
@@ -63,6 +64,10 @@ fn resume_resolution_error_payload(
         ResumeError::InvalidUuid { input } => ResumeResolutionErrorPayload::JsonError {
             code: "invalid-session-id",
             message: invalid_session_id_message(&input),
+        },
+        ResumeError::InvalidResumeInput { reason, .. } => ResumeResolutionErrorPayload::JsonError {
+            code: "invalid-session-id",
+            message: invalid_resume_input_message(&reason),
         },
         ResumeError::NoChainFound { input } => ResumeResolutionErrorPayload::JsonError {
             code: "session-not-found",
@@ -261,6 +266,10 @@ fn invalid_session_id_message(input: &str) -> String {
     format!("invalid session id: {input}")
 }
 
+fn invalid_resume_input_message(reason: &str) -> String {
+    reason.to_string()
+}
+
 fn no_chain_found_message(input: &str) -> String {
     format!("no session found matching {input}")
 }
@@ -330,6 +339,13 @@ mod tests {
         assert_eq!(
             emit_resume_resolution_error(oulipoly_state::ResumeError::InvalidUuid {
                 input: "bad".to_string(),
+            }),
+            2
+        );
+        assert_eq!(
+            emit_resume_resolution_error(oulipoly_state::ResumeError::InvalidResumeInput {
+                input: "".to_string(),
+                reason: "session id is required".to_string(),
             }),
             2
         );

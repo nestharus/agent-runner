@@ -26,6 +26,7 @@ pub(super) fn metadata_db_result<T>(result: Result<T, String>) -> Result<T, Meta
 pub(super) fn map_resume_error(err: ResumeError) -> MetadataError {
     match err {
         ResumeError::InvalidUuid { input } => MetadataError::InvalidSessionId { input },
+        ResumeError::InvalidResumeInput { input, .. } => MetadataError::InvalidSessionId { input },
         ResumeError::NoChainFound { input } => MetadataError::SessionNotFound { input },
         ResumeError::WrongIdKind { input, .. } => MetadataError::SessionNotFound { input },
         ResumeError::Ambiguous { input, .. } => MetadataError::AmbiguousSession { input },
