@@ -57,8 +57,8 @@ pub use db::{
     QuotaWindowInput,
 };
 pub use db::{
-    BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, ResolvedResume, ResumeError,
-    SessionMarkerPayload, TurnPreview, WrongIdKindInput,
+    BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, RESUME_INPUT_MAX_LEN,
+    ResolvedResume, ResumeError, SessionMarkerPayload, TurnPreview, WrongIdKindInput,
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};

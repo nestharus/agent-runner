@@ -29,13 +29,13 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
         test_db()
             .resolve_resume(&models, "not-a-uuid", None)
             .unwrap_err(),
-        ResumeError::InvalidUuid { .. }
+        ResumeError::NoChainFound { .. }
     ));
     assert!(matches!(
         test_db()
             .resolve_resume(&models, "ses_ab", None)
             .unwrap_err(),
-        ResumeError::InvalidUuid { .. }
+        ResumeError::NoChainFound { .. }
     ));
     assert!(matches!(
         test_db()
@@ -119,6 +119,56 @@ fn age132_resolve_resume_rejections_and_wrong_id_context_are_typed() {
         }
         other => panic!("expected wrong-id-kind rejection, got {other:?}"),
     }
+}
+
+#[test]
+fn resolve_resume_rejects_only_invalid_opaque_input_before_lookup() {
+    let models = resolver_model_store();
+
+    for input in ["", " ", "abc\n123", "abc\u{0}123"] {
+        assert!(matches!(
+            test_db().resolve_resume(&models, input, None).unwrap_err(),
+            ResumeError::InvalidResumeInput { .. }
+        ));
+    }
+
+    let too_long = "x".repeat(RESUME_INPUT_MAX_LEN + 1);
+    assert!(matches!(
+        test_db()
+            .resolve_resume(&models, &too_long, None)
+            .unwrap_err(),
+        ResumeError::InvalidResumeInput { .. }
+    ));
+}
+
+#[test]
+fn resolve_resume_accepts_provider_native_non_uuid_non_opencode_id() {
+    let db = test_db();
+    let models = model_store_from_toml(&[(
+        "external-high",
+        r#"
+[[providers]]
+name = "external"
+interactive_args = ["--resume"]
+"#,
+    )]);
+    seed_test_chain(
+        &db,
+        CHAIN_A,
+        "external",
+        "external-abc123xyz",
+        "external-high",
+        "2026-06-04T08:00:00Z",
+    );
+
+    let resolved = db
+        .resolve_resume(&models, "external-abc123xyz", None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_A);
+    assert_eq!(resolved.active_provider, "external");
+    assert_eq!(resolved.active_session_id, "external-abc123xyz");
+    assert_eq!(resolved.model_name.as_deref(), Some("external-high"));
 }
 
 #[test]
