@@ -56,7 +56,7 @@ struct EnvGuard {
 }
 
 impl EnvGuard {
-    fn new(config_home: &Path, data_home: &Path) -> Self {
+    fn new(config_home: &Path, data_home: &Path, data_root: &Path) -> Self {
         let guard = Self {
             old_config: std::env::var_os("XDG_CONFIG_HOME"),
             old_oulipoly_data_dir: std::env::var_os("OULIPOLY_DATA_DIR"),
@@ -70,7 +70,7 @@ impl EnvGuard {
         )))
         .expect("test PATH");
         unsafe {
-            std::env::remove_var("OULIPOLY_DATA_DIR");
+            std::env::set_var("OULIPOLY_DATA_DIR", data_root);
             std::env::set_var("XDG_CONFIG_HOME", config_home);
             std::env::set_var("XDG_DATA_HOME", data_home);
             std::env::set_var("HOME", data_home);
@@ -220,7 +220,7 @@ impl DispatchFixture {
         fs::create_dir_all(&models_dir).expect("models dir");
         fs::create_dir_all(&data_root).expect("data dir");
         fs::create_dir_all(&workspace_root).expect("workspace dir");
-        let env = EnvGuard::new(&config_home, &data_home);
+        let env = EnvGuard::new(&config_home, &data_home, &data_root);
         let transcript_path = data_root.join("provider-alpha-session.jsonl");
         let input_path = data_root.join("replacement-canonical.jsonl");
         let mode_path = dir.path().join("mode.txt");

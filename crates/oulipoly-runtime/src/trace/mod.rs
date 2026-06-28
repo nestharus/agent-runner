@@ -621,7 +621,7 @@ fn format_ascii_node(node: &TraceNode) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::test_support::env_lock;
+    use crate::test_support::lock_env;
     use chrono::{DateTime, Duration, Utc};
     use oulipoly_state::{SessionTurnIngest, StateDb};
     use rusqlite::{Connection, params};
@@ -779,6 +779,37 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
         path
+    }
+
+    struct IsolatedDataDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old_data_dir: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedDataDir {
+        fn new(data_home: &std::path::Path) -> Self {
+            let data_root = data_home.join(oulipoly_state::paths::APP_DATA_DIR_NAME);
+            let lock = lock_env();
+            let old_data_dir = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+            unsafe {
+                std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, data_root);
+            }
+            Self {
+                _lock: lock,
+                old_data_dir,
+            }
+        }
+    }
+
+    impl Drop for IsolatedDataDir {
+        fn drop(&mut self) {
+            unsafe {
+                match self.old_data_dir.take() {
+                    Some(value) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value),
+                    None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+                }
+            }
+        }
     }
 
     fn trace_options(max_depth: usize) -> TraceOptions {
@@ -1584,7 +1615,6 @@ transcript_locator = "{}"
 
     #[test]
     fn json_output_reports_available_transcript_when_locator_finds_existing_file() {
-        let _guard = env_lock().lock().unwrap();
         let fixture = TraceFixture::new(&base_rows());
         fixture.set_session_capture(
             1,
@@ -1596,6 +1626,7 @@ transcript_locator = "{}"
         let env_dir = tempfile::tempdir().unwrap();
         let transcript = env_dir.path().join("trace-session.jsonl");
         fs::write(&transcript, "{\"type\":\"system\"}\n").unwrap();
+        let _data_dir = IsolatedDataDir::new(env_dir.path());
         let locator = fixture_script(
             &env_dir,
             "locator.sh",
@@ -1689,7 +1720,6 @@ transcript_locator = "{}"
     /// "missing" from "available" rather than collapsing them.
     #[test]
     fn json_output_reports_missing_when_locator_path_does_not_exist() {
-        let _guard = env_lock().lock().unwrap();
         let fixture = TraceFixture::new(&base_rows());
         fixture.set_session_capture(
             1,
@@ -1699,6 +1729,7 @@ transcript_locator = "{}"
         let db = fixture.db();
 
         let env_dir = tempfile::tempdir().unwrap();
+        let _data_dir = IsolatedDataDir::new(env_dir.path());
         // Locator points at a path that does NOT exist on disk.
         let nonexistent = env_dir.path().join("does-not-exist.jsonl");
         let locator = fixture_script(

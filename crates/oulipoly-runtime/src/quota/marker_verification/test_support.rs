@@ -15,19 +15,12 @@
 //!       - Rust test synchronization contract (`Mutex`, `MutexGuard`, `OnceLock`)
 //! ```
 
+use crate::test_support::lock_env;
 use std::ffi::{OsStr, OsString};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::MutexGuard;
 
 type EnvMutation = (&'static str, Option<OsString>);
 type EnvSnapshot = (&'static str, Option<OsString>);
-
-/// Cargo runs `#[test]`s in parallel by default. Any test that mutates
-/// `OULIPOLY_DATA_HOME` (or any other process-wide env var the verifier
-/// reads) must hold this lock for its full duration.
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
 
 /// Scoped guard that sets env vars on construction and restores the prior
 /// values (or removes them) on drop.
@@ -76,9 +69,7 @@ fn env_remove_mutation(name: &'static str) -> EnvMutation {
 }
 
 fn acquire_env_lock() -> MutexGuard<'static, ()> {
-    env_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_env()
 }
 
 fn previous_env_values(vars: &[EnvMutation]) -> Vec<EnvSnapshot> {

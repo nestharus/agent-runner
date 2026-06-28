@@ -11,8 +11,11 @@ use oulipoly_state::deployment::{
     DbRole, DeploymentAwareOpener, DeploymentRoutingPort, ResolveError, ResolvedStateDb,
 };
 use oulipoly_state::repositories::{ProductionStateDbOpener, StateDbOpener};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
 
 // TI-05 / cli-default-open-matrix
 // component_slug: deployment-routing
@@ -20,6 +23,7 @@ use std::sync::{Arc, Mutex};
 // boundary and delegate to the same resolved state.db.vN path.
 #[test]
 fn production_cli_default_open_matrix_uses_same_resolved_primary_for_read_commands() {
+    let _data_dir = IsolatedDataDir::new();
     let fixture = pre_cutover_fixture();
     let expected_path = fixture.versioned_path(5);
     let resolved = ResolvedStateDb {
@@ -53,6 +57,7 @@ fn production_cli_default_open_matrix_uses_same_resolved_primary_for_read_comman
 
 #[test]
 fn default_opener_drop_does_not_clear_registered_deployment_aware_opener() {
+    let _data_dir = IsolatedDataDir::new();
     let expected_path = PathBuf::from("/tmp/age-62-default-drop-state.db.v5");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let production = production_opener_for_path(&expected_path, Arc::clone(&calls));
@@ -67,6 +72,7 @@ fn default_opener_drop_does_not_clear_registered_deployment_aware_opener() {
 
 #[test]
 fn dropping_older_registered_opener_does_not_clear_newer_registration() {
+    let _data_dir = IsolatedDataDir::new();
     let first_path = PathBuf::from("/tmp/age-62-first-state.db.v5");
     let second_path = PathBuf::from("/tmp/age-62-second-state.db.v6");
     let first_calls = Arc::new(Mutex::new(Vec::new()));
@@ -157,6 +163,59 @@ impl StateDbOpener for RecordingStateDbOpener {
     fn open_in_memory(&self) -> StateDb {
         StateDb::open(Path::new(":memory:")).unwrap()
     }
+}
+
+struct IsolatedDataDir {
+    _dir: tempfile::TempDir,
+    _env: EnvGuard,
+}
+
+impl IsolatedDataDir {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let env = EnvGuard::set(dir.path());
+        Self {
+            _dir: dir,
+            _env: env,
+        }
+    }
+}
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    old_oulipoly_data_dir: Option<OsString>,
+}
+
+impl EnvGuard {
+    fn set(oulipoly_data_dir: &Path) -> Self {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_oulipoly_data_dir = std::env::var_os(DATA_DIR_ENV);
+        unsafe {
+            std::env::set_var(DATA_DIR_ENV, oulipoly_data_dir);
+        }
+        Self {
+            _lock: lock,
+            old_oulipoly_data_dir,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.old_oulipoly_data_dir.take() {
+                Some(value) => std::env::set_var(DATA_DIR_ENV, value),
+                None => std::env::remove_var(DATA_DIR_ENV),
+            }
+        }
+    }
+}
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Clone)]
