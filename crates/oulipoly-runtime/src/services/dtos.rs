@@ -25,6 +25,7 @@ use crate::session_export::ExportError;
 use crate::session_lock::{Lease, LockError, ReleaseReceipt};
 use crate::session_replace::{ReplaceError, ReplaceReceipt, ReplaceSource};
 use crate::trace::{TraceOptions, TraceReport};
+use chrono::{DateTime, Utc};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProvidersConfig, SessionsConfig};
 use oulipoly_provider::generated::ProcessStatus;
 use oulipoly_state::{ResumeError, StateDb};
@@ -87,6 +88,70 @@ pub struct SessionLifecycleRequest<'a> {
     pub effective_cwd: Option<&'a Path>,
     pub mode: SessionLifecycleIngestMode,
     pub stderr: &'a mut dyn Write,
+}
+
+pub struct SessionImportServiceRequest<'a> {
+    pub state: &'a oulipoly_state::StateDb,
+    pub providers: &'a [SessionImportProviderTarget],
+    pub observed_at: DateTime<Utc>,
+    pub limit: Option<u64>,
+    pub since_unix_ms: Option<u64>,
+    pub effective_cwd: Option<&'a Path>,
+    pub backfill_turns: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionImportProviderTarget {
+    pub model_name: String,
+    pub provider_name: String,
+    pub provider_instance_id: Option<String>,
+    pub settings_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionImportServiceOutput {
+    pub report: SessionImportReport,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionImportReport {
+    pub providers: Vec<SessionImportProviderReport>,
+    pub totals: SessionImportTotals,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionImportTotals {
+    pub providers_total: u64,
+    pub providers_succeeded: u64,
+    pub providers_skipped: u64,
+    pub providers_failed: u64,
+    pub discovered: u64,
+    pub imported: u64,
+    pub skipped: u64,
+    pub errors: u64,
+    pub warnings: u64,
+    pub turns_backfilled: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionImportProviderReport {
+    pub model_name: String,
+    pub provider_name: String,
+    pub settings_id: String,
+    pub status: SessionImportProviderStatus,
+    pub discovered: u64,
+    pub imported: u64,
+    pub skipped: u64,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub turns_backfilled: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionImportProviderStatus {
+    Succeeded,
+    Skipped { reason: String },
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

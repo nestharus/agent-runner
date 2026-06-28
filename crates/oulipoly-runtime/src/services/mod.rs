@@ -12,6 +12,7 @@ mod lock;
 mod marker;
 mod migration;
 mod ports;
+mod session_import;
 mod session_lifecycle;
 mod session_warning;
 mod session_window;
@@ -19,8 +20,9 @@ mod trace_failure;
 
 pub use adapters::{
     ProductionInvocationLifecycleService, ProductionMigrationService, ProductionResumeService,
-    ProductionRoutingService, ProductionSessionExportService, ProductionSessionLifecycleService,
-    ProductionSessionLockService, ProductionSessionReplaceService, ProductionTraceService,
+    ProductionRoutingService, ProductionSessionExportService, ProductionSessionImportService,
+    ProductionSessionLifecycleService, ProductionSessionLockService,
+    ProductionSessionReplaceService, ProductionTraceService,
 };
 pub use dtos::*;
 pub use error::ServiceError;

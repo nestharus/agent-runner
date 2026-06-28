@@ -55,6 +55,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0009_age163_working_set_and_round_robin.sql"),
         post_sql_hook: Some(apply_v9_working_set_columns),
     },
+    Migration {
+        target_version: 10,
+        id: "0010_imported_session_display_metadata",
+        sql: include_str!("../migrations/0010_imported_session_display_metadata.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

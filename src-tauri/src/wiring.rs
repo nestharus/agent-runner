@@ -33,9 +33,10 @@ use oulipoly_runtime::quota::RuntimeQuotaService;
 use oulipoly_runtime::services::{
     DiagnosticsServicePort, ExecutorServicePort, MigrationServicePort,
     ProductionInvocationLifecycleService, ProductionMigrationService, ProductionResumeService,
-    ProductionRoutingService, ProductionSessionExportService, ProductionSessionLifecycleService,
-    ProductionSessionLockService, ProductionSessionReplaceService, ProductionTraceService,
-    QuotaServicePort, ResumeServicePort, SessionExportServicePort, SessionLifecycleServicePort,
+    ProductionRoutingService, ProductionSessionExportService, ProductionSessionImportService,
+    ProductionSessionLifecycleService, ProductionSessionLockService,
+    ProductionSessionReplaceService, ProductionTraceService, QuotaServicePort, ResumeServicePort,
+    SessionExportServicePort, SessionImportServicePort, SessionLifecycleServicePort,
     SessionLockServicePort, SessionReplaceServicePort, TraceServicePort,
 };
 use oulipoly_state::repositories::ProductionStateDbOpener;
@@ -75,6 +76,7 @@ pub struct AgentRuntimeServices {
     pub provider_registry_options: ProviderRegistryOptions,
     pub resume_service: Arc<dyn ResumeServicePort>,
     pub session_lifecycle_service: Arc<dyn SessionLifecycleServicePort>,
+    pub session_import_service: Arc<dyn SessionImportServicePort>,
     pub migration_service: Arc<dyn MigrationServicePort>,
     pub trace_service: Arc<dyn TraceServicePort>,
     pub session_export_service: Arc<dyn SessionExportServicePort>,
@@ -98,6 +100,9 @@ impl AgentRuntimeServices {
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
                 provider_registry_handle.clone(),
             ));
+        let session_import_service = Arc::new(
+            ProductionSessionImportService::with_registry_handle(provider_registry_handle.clone()),
+        );
         Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
             app_config: Arc::new(FilesystemAppConfigRepository),
@@ -126,6 +131,7 @@ impl AgentRuntimeServices {
             provider_registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service,
+            session_import_service,
             migration_service: Arc::new(ProductionMigrationService::with_registry_handle(
                 provider_registry_handle.clone(),
             )),
@@ -157,6 +163,9 @@ impl AgentRuntimeServices {
             Arc::new(ProductionSessionLifecycleService::with_registry_handle(
                 provider_registry_handle.clone(),
             ));
+        let session_import_service = Arc::new(
+            ProductionSessionImportService::with_registry_handle(provider_registry_handle.clone()),
+        );
 
         Ok(Self {
             state_db_opener: Arc::new(ProductionStateDbOpener),
@@ -186,6 +195,7 @@ impl AgentRuntimeServices {
             provider_registry_options: registry_options,
             resume_service: Arc::new(ProductionResumeService::new()),
             session_lifecycle_service,
+            session_import_service,
             migration_service: Arc::new(ProductionMigrationService::with_registry_handle(
                 provider_registry_handle.clone(),
             )),

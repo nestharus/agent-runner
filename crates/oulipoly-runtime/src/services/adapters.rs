@@ -69,6 +69,23 @@ impl ProductionSessionLifecycleService {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct ProductionSessionImportService {
+    provider_registry: Option<ProviderRegistryHandle>,
+}
+
+impl ProductionSessionImportService {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
+        Self {
+            provider_registry: Some(provider_registry),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ProductionMigrationService {
     provider_registry: Option<ProviderRegistryHandle>,
 }
@@ -224,6 +241,18 @@ impl SessionLifecycleServicePort for ProductionSessionLifecycleService {
         request: SessionLifecycleRequest<'_>,
     ) -> Result<SessionLifecycleOutput, ServiceError> {
         super::session_lifecycle::ingest_session_with_registry(
+            request,
+            self.provider_registry.as_ref(),
+        )
+    }
+}
+
+impl SessionImportServicePort for ProductionSessionImportService {
+    fn import_sessions(
+        &self,
+        request: SessionImportServiceRequest<'_>,
+    ) -> Result<SessionImportServiceOutput, ServiceError> {
+        super::session_import::import_sessions_with_registry(
             request,
             self.provider_registry.as_ref(),
         )
