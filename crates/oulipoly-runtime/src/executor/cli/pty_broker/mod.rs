@@ -44,18 +44,23 @@ const CONTROL_OP_INJECT: u8 = 1;
 pub const CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_POLL_TIMEOUT_MS: i32 = 25;
-const INJECT_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Short child-output debounce before proactive injection.
 /// This is not an idle/quiescence requirement: redraw-oriented TUIs can emit
 /// periodic prompt/status bytes while idle, so this window only avoids writing
 /// into a rapid burst or between nearby terminal bytes.
 const INJECT_CHILD_OUTPUT_DEBOUNCE: Duration = Duration::from_millis(125);
+pub const USER_INPUT_IDLE_INJECT_MS: u64 = 1500;
+/// User-input idle fallback for proactive injection when terminal Enter parsing
+/// missed a submit sequence. Lower values deliver faster but increase the risk
+/// of appending to a user's brief composing pause; higher values delay delivery.
+const USER_INPUT_IDLE_INJECT: Duration = Duration::from_millis(USER_INPUT_IDLE_INJECT_MS);
 const INJECT_WAIT_LIMIT: Duration = Duration::from_millis(1500);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIX_SOCKET_PATH_LIMIT: usize = 100;
 const NOTIFY_TRACE_MAX_BYTES: u64 = 1024 * 1024;
 const NOTIFY_TRACE_FILE: &str = "notify-trace.log";
 const NOTIFY_TRACE_ROTATED_FILE: &str = "notify-trace.log.1";
+const BOUNDARY_PROBE_MAX_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyControlClientErrorKind {
@@ -1527,6 +1532,18 @@ struct InputLineState {
     at_line_boundary: bool,
     last_user_input_at: Option<Instant>,
     enter_escape_state: EnterEscapeState,
+    boundary_probe: Vec<u8>,
+    last_submit_trace: Option<InputLineTraceSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct InputLineTraceSnapshot {
+    input_empty: bool,
+    at_boundary: bool,
+    mid_escape: bool,
+    last_user_input_ms: Option<u128>,
+    user_input_idle: bool,
+    boundary_probe: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1585,6 +1602,8 @@ impl Default for InputLineState {
             at_line_boundary: true,
             last_user_input_at: None,
             enter_escape_state: EnterEscapeState::None,
+            boundary_probe: Vec::new(),
+            last_submit_trace: None,
         }
     }
 }
@@ -1594,6 +1613,7 @@ impl InputLineState {
         if no_user_input(bytes) {
             return;
         }
+        self.last_submit_trace = None;
         self.last_user_input_at = Some(Instant::now());
         for byte in bytes.iter().copied() {
             self.observe_user_input_byte(byte);
@@ -1601,6 +1621,7 @@ impl InputLineState {
     }
 
     fn observe_user_input_byte(&mut self, byte: u8) {
+        self.record_boundary_probe_byte(byte);
         if self.enter_escape_state != EnterEscapeState::None {
             self.observe_enter_escape_byte(byte);
             return;
@@ -1626,16 +1647,19 @@ impl InputLineState {
             (EnterEscapeState::CsiThirteen, b'u') => {
                 self.enter_escape_state = EnterEscapeState::None;
                 self.at_line_boundary = true;
+                self.clear_boundary_probe();
                 return;
             }
             (EnterEscapeState::CsiThirteenModifierDigits, b'u') => {
                 self.enter_escape_state = EnterEscapeState::None;
                 self.at_line_boundary = true;
+                self.clear_boundary_probe();
                 return;
             }
             (EnterEscapeState::ApplicationKeypad, b'M') => {
                 self.enter_escape_state = EnterEscapeState::None;
                 self.at_line_boundary = true;
+                self.clear_boundary_probe();
                 return;
             }
             _ => None,
@@ -1656,15 +1680,14 @@ impl InputLineState {
             self.at_line_boundary = false;
         } else {
             self.at_line_boundary = line_boundary_after_input_byte(byte);
+            if self.at_line_boundary {
+                self.clear_boundary_probe();
+            }
         }
     }
 
     fn is_safe_to_inject(&self) -> bool {
-        self.input_empty()
-            && self
-                .last_user_input_at
-                .map(|last| last.elapsed() >= INJECT_DEBOUNCE)
-                .unwrap_or(true)
+        !self.mid_escape() && (self.at_line_boundary || self.user_input_idle())
     }
 
     fn input_empty(&self) -> bool {
@@ -1672,9 +1695,11 @@ impl InputLineState {
     }
 
     fn mark_submitted(&mut self) {
+        self.last_submit_trace = Some(self.trace_snapshot());
         self.at_line_boundary = true;
         self.last_user_input_at = None;
         self.enter_escape_state = EnterEscapeState::None;
+        self.clear_boundary_probe();
     }
 
     fn millis_since_last_user_input(&self) -> Option<u128> {
@@ -1685,6 +1710,60 @@ impl InputLineState {
     fn mid_escape(&self) -> bool {
         self.enter_escape_state != EnterEscapeState::None
     }
+
+    fn user_input_idle(&self) -> bool {
+        self.last_user_input_at
+            .map(|last| last.elapsed() >= USER_INPUT_IDLE_INJECT)
+            .unwrap_or(true)
+    }
+
+    fn record_boundary_probe_byte(&mut self, byte: u8) {
+        if self.boundary_probe.len() == BOUNDARY_PROBE_MAX_BYTES {
+            self.boundary_probe.remove(0);
+        }
+        self.boundary_probe.push(byte);
+    }
+
+    fn clear_boundary_probe(&mut self) {
+        self.boundary_probe.clear();
+    }
+
+    fn boundary_probe_trace_value(&self) -> String {
+        if self.boundary_probe.is_empty() {
+            return "none".to_string();
+        }
+        format!("hex:{}", bytes_to_lower_hex(&self.boundary_probe))
+    }
+
+    fn trace_snapshot(&self) -> InputLineTraceSnapshot {
+        InputLineTraceSnapshot {
+            input_empty: self.input_empty(),
+            at_boundary: self.at_line_boundary,
+            mid_escape: self.mid_escape(),
+            last_user_input_ms: self.millis_since_last_user_input(),
+            user_input_idle: self.user_input_idle(),
+            boundary_probe: self.boundary_probe_trace_value(),
+        }
+    }
+
+    fn trace_snapshot_for_decision(&self, decision: &str) -> InputLineTraceSnapshot {
+        if decision == "inject"
+            && let Some(snapshot) = &self.last_submit_trace
+        {
+            return snapshot.clone();
+        }
+        self.trace_snapshot()
+    }
+}
+
+fn bytes_to_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn no_user_input(bytes: &[u8]) -> bool {
@@ -1790,9 +1869,10 @@ fn process_control_request_with_pending(
 ) -> Result<(), String> {
     validate_control_request_peer(stream)?;
     let payload = read_control_request_payload(stream)?;
-    // Safe proactive delivery means the user is at a clean prompt and the PTY
-    // foreground process group is still the agent. A short child-output debounce
-    // avoids rapid bursts but intentionally tolerates idle TUI redraws.
+    // Safe proactive delivery means the PTY foreground process group is still
+    // the agent, child output has cleared the short debounce, and either the
+    // line parser saw a boundary or user input has been idle long enough to
+    // tolerate terminals whose Enter sequence is not recognized here.
     wait_until_safe_to_inject(
         io.real_fd,
         io.master_fd,
@@ -2013,7 +2093,7 @@ fn safe_to_inject_for_foreground(
     line_state: &InputLineState,
     child_output_state: &ChildOutputState,
 ) -> Result<(), InjectionUnsafeReason> {
-    if !line_state.is_safe_to_inject() {
+    if line_state.mid_escape() {
         return Err(InjectionUnsafeReason::MidLine);
     }
     match foreground {
@@ -2023,6 +2103,9 @@ fn safe_to_inject_for_foreground(
     }
     if !child_output_state.is_quiescent() {
         return Err(InjectionUnsafeReason::ChildOutputActive);
+    }
+    if !line_state.is_safe_to_inject() {
+        return Err(InjectionUnsafeReason::MidLine);
     }
     Ok(())
 }
@@ -2126,28 +2209,62 @@ fn trace_notify_gate_decision(
     status: &str,
 ) {
     let foreground = foreground_owner_state(master_fd, child_pid);
+    let line = line_state.trace_snapshot_for_decision(decision);
     let inject_status = notify_trace_inject_status(decision, status);
+    let reason = notify_trace_gate_reason(foreground, &line, child_output_state);
     let record = format!(
         "trigger=pty-control \
          session_id={} invocation_uuid={} input_empty={} at_boundary={} mid_escape={} \
-         last_user_input_ms={} quiescent={} last_child_output_ms={} \
-         foreground={} decision={} inject_status={} consumed=unknown",
+         last_user_input_ms={} user_input_idle_ms={} user_input_idle={} \
+         user_input_idle_threshold_ms={} boundary_probe={} quiescent={} \
+         last_child_output_ms={} foreground={} decision={} inject_status={} \
+         reason={} consumed=unknown",
         control.session_id(),
         control.invocation_uuid(),
-        line_state.input_empty(),
-        line_state.at_line_boundary,
-        line_state.mid_escape(),
-        optional_millis_trace_value(line_state.millis_since_last_user_input()),
+        line.input_empty,
+        line.at_boundary,
+        line.mid_escape,
+        optional_millis_trace_value(line.last_user_input_ms),
+        optional_millis_trace_value(line.last_user_input_ms),
+        line.user_input_idle,
+        USER_INPUT_IDLE_INJECT_MS,
+        line.boundary_probe,
         child_output_state.is_quiescent(),
         optional_millis_trace_value(child_output_state.millis_since_last_child_output()),
         foreground_trace_value(foreground),
         notify_trace_decision(decision, &inject_status),
         inject_status,
+        reason,
     );
     append_notify_trace_record(&record);
     if trace_notify_enabled() {
         eprintln!("oulipoly_notify_trace {record}");
     }
+}
+
+fn notify_trace_gate_reason(
+    foreground: ForegroundOwnerState,
+    line: &InputLineTraceSnapshot,
+    child_output_state: &ChildOutputState,
+) -> &'static str {
+    if line.mid_escape {
+        return "mid_escape";
+    }
+    match foreground {
+        ForegroundOwnerState::Owner => {}
+        ForegroundOwnerState::Other { .. } => return "foreground_process",
+        ForegroundOwnerState::Unknown => return "foreground_unknown",
+    }
+    if !child_output_state.is_quiescent() {
+        return "child_output_active";
+    }
+    if line.at_boundary {
+        return "line_boundary";
+    }
+    if line.user_input_idle {
+        return "user_input_idle";
+    }
+    "user_input_active"
 }
 
 pub fn notify_trace_inject_status(decision: &str, status: &str) -> String {
@@ -2248,7 +2365,7 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn input_line_state_tracks_boundary_and_debounce() {
+    fn input_line_state_tracks_boundary_and_idle_fallback() {
         let mut state = InputLineState::default();
         assert!(state.is_safe_to_inject());
 
@@ -2258,9 +2375,12 @@ mod tests {
 
         state.observe_user_input(b"\n");
         assert!(state.at_line_boundary);
-        assert!(!state.is_safe_to_inject());
+        assert!(state.is_safe_to_inject());
+
+        state.observe_user_input(b"stale-midline");
+        assert!(!state.at_line_boundary);
         state.last_user_input_at =
-            Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
         assert!(state.is_safe_to_inject());
     }
 
@@ -2290,7 +2410,7 @@ mod tests {
         assert!(!state.at_line_boundary);
         assert_eq!(state.enter_escape_state, EnterEscapeState::CsiOne);
         state.last_user_input_at =
-            Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
         assert!(!state.is_safe_to_inject());
 
         state.observe_user_input(b"3u");
@@ -2373,13 +2493,110 @@ mod tests {
     fn safe_to_inject_keeps_user_typing_guard() {
         let mut line_state = InputLineState::default();
         line_state.observe_user_input(b"partial");
-        line_state.last_user_input_at =
-            Some(Instant::now() - INJECT_DEBOUNCE - Duration::from_millis(1));
         let output_state = ChildOutputState::default();
 
         assert_eq!(
             safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
             Err(InjectionUnsafeReason::MidLine)
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_allows_idle_midline_when_owner_and_quiescent() {
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"submitted-but-parser-missed-boundary");
+        line_state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
+        let output_state = ChildOutputState::default();
+
+        assert_eq!(
+            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_blocks_idle_midline_when_foreground_is_not_owner() {
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"stale-midline");
+        line_state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
+        let output_state = ChildOutputState::default();
+
+        assert_eq!(
+            safe_to_inject_for_foreground(
+                ForegroundOwnerState::Other {
+                    foreground_pgid: 42
+                },
+                &line_state,
+                &output_state,
+            ),
+            Err(InjectionUnsafeReason::ForegroundOther)
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_keeps_mid_escape_as_hard_block_even_when_idle() {
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"\x1b[13;");
+        line_state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
+        let output_state = ChildOutputState::default();
+
+        assert_eq!(
+            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
+            Err(InjectionUnsafeReason::MidLine)
+        );
+    }
+
+    #[test]
+    fn safe_to_inject_blocks_idle_midline_during_child_output_burst() {
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"stale-midline");
+        line_state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
+        let mut output_state = ChildOutputState::default();
+        output_state.observe_child_output();
+
+        assert_eq!(
+            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
+            Err(InjectionUnsafeReason::ChildOutputActive)
+        );
+    }
+
+    #[test]
+    fn input_line_state_boundary_probe_is_bounded_hex_since_last_boundary() {
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"abcdefghijklmnopqrstuvwxyz");
+
+        assert_eq!(
+            state.boundary_probe_trace_value(),
+            "hex:6b6c6d6e6f707172737475767778797a"
+        );
+
+        state.observe_user_input(b"\n");
+
+        assert_eq!(state.boundary_probe_trace_value(), "none");
+    }
+
+    #[test]
+    fn inject_trace_snapshot_preserves_idle_reason_and_boundary_probe() {
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"missed-submit\x1b[13;9~");
+        state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
+
+        state.mark_submitted();
+
+        let line = state.trace_snapshot_for_decision("inject");
+        let output_state = ChildOutputState::default();
+        assert!(!line.input_empty);
+        assert!(!line.at_boundary);
+        assert!(line.user_input_idle);
+        assert_eq!(line.boundary_probe, "hex:65642d7375626d69741b5b31333b397e");
+        assert_eq!(
+            notify_trace_gate_reason(ForegroundOwnerState::Owner, &line, &output_state),
+            "user_input_idle"
         );
     }
 
@@ -2496,13 +2713,43 @@ mod tests {
     }
 
     #[test]
-    fn control_request_unsafe_midline_returns_err() {
+    fn control_request_idle_midline_injects_once_after_user_idle_threshold() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
         let (real_read_end, _real_write_end) = pipe_files();
         let (read_end, write_end) = pipe_files();
         let mut state = InputLineState::default();
-        state.observe_user_input(b"partial");
+        state.observe_user_input(b"submitted-but-parser-missed-boundary");
+        state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
+        let mut buffer = [0_u8; 256];
+
+        process_control_request(
+            &mut server,
+            real_read_end.as_raw_fd(),
+            write_end.as_raw_fd(),
+            &mut state,
+            &mut buffer,
+        )
+        .unwrap();
+
+        drop(write_end);
+        let mut read_end = read_end;
+        let mut received = String::new();
+        read_end.read_to_string(&mut received).unwrap();
+        assert_eq!(received, "notify\r");
+    }
+
+    #[test]
+    fn control_request_mid_escape_returns_err() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_inject_frame(&mut client, b"notify").unwrap();
+        let (real_read_end, _real_write_end) = pipe_files();
+        let (read_end, write_end) = pipe_files();
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"\x1b[13;");
+        state.last_user_input_at =
+            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
         let mut buffer = [0_u8; 256];
 
         let err = process_control_request(

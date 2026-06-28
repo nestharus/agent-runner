@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use oulipoly_runtime::executor::cli::pty_broker::{
-    PtyControlClientErrorKind, append_notify_trace_record, inject_control_envelope,
-    notify_trace_decision, notify_trace_inject_status, trace_token,
+    PtyControlClientErrorKind, USER_INPUT_IDLE_INJECT_MS, append_notify_trace_record,
+    inject_control_envelope, notify_trace_decision, notify_trace_inject_status, trace_token,
 };
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
@@ -303,14 +303,18 @@ fn trace_notify_pty_attempt(
         "skip"
     };
     let inject_status = notify_trace_inject_status(base_decision, &diagnostic.status);
+    let reason = notify_trace_summary_reason(&diagnostic.status);
     let record = format!(
         "trigger={} session_id={} attempted={} input_empty=unknown at_boundary=unknown \
+         mid_escape=unknown last_user_input_ms=unknown user_input_idle_ms=unknown \
+         user_input_idle=unknown user_input_idle_threshold_ms={} boundary_probe=unknown \
          quiescent=unknown last_child_output_ms=unknown foreground=unknown \
          control_path_present={} decision={} inject_status={} submitted={} \
-         delivered_count={} remaining_pending={} message={} consumed=unknown",
+         delivered_count={} remaining_pending={} message={} reason={} consumed=unknown",
         trace_token(trigger),
         trace_token(session_id),
         diagnostic.attempted,
+        USER_INPUT_IDLE_INJECT_MS,
         diagnostic
             .control_path
             .as_deref()
@@ -327,10 +331,25 @@ fn trace_notify_pty_attempt(
             .as_deref()
             .map(trace_token)
             .unwrap_or_else(|| "none".to_string()),
+        reason,
     );
     append_notify_trace_record(&record);
     if trace_notify_enabled() {
         eprintln!("oulipoly_notify_trace {record}");
+    }
+}
+
+fn notify_trace_summary_reason(status: &str) -> &'static str {
+    match status {
+        "acked" | "mark_delivered_error" => "control_ack",
+        "unsafe_mid_line" => "unsafe_mid_line",
+        "unsafe_child_output_active" => "child_output_active",
+        "unsafe_foreground_process" => "foreground_process",
+        "unsafe_foreground_unknown" => "foreground_unknown",
+        "connect_error" => "connect_error",
+        "no_runtime" => "no_runtime",
+        "not_pty_interactive" => "not_pty_interactive",
+        _ => "protocol_or_delivery_error",
     }
 }
 
