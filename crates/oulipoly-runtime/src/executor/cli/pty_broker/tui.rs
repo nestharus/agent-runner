@@ -4167,8 +4167,9 @@ fn inject_control_payload(
     validate_control_peer(stream)?;
     let payload = read_tui_control_payload(stream)?;
     // Match the non-TUI broker contract: only submit proactive control payloads
-    // after the input line is at a clean boundary, the agent owns the foreground
-    // process group, and any child output burst has cleared the short debounce.
+    // when the agent owns the foreground process group, child output has cleared
+    // the short debounce, and the line is either at a parsed boundary or user
+    // input has been idle long enough for the submit-parser fallback.
     wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload, bracketed_paste)?;
