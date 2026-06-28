@@ -68,14 +68,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Rows reserved for the collapsed monitor row at the bottom of the screen.
-const COLLAPSED_MONITOR_ROWS: u16 = 1;
+/// Rows reserved for the always-visible overlay at the bottom of the screen.
+const COLLAPSED_MONITOR_ROWS: u16 = STATUS_ROW_ROWS + PSEUDO_INPUT_ROWS + OUTBOUND_STATUS_ROWS;
+/// Rows reserved for the overlay/status bar.
+const STATUS_ROW_ROWS: u16 = 1;
 /// Minimum terminal rows for the split to be usable.
 const MIN_TERMINAL_ROWS: u16 = 10;
 /// Minimum terminal columns for the split to be usable.
 const MIN_TERMINAL_COLS: u16 = 40;
-/// Reserved focus-toggle byte: Ctrl+O.
-const FOCUS_TOGGLE_BYTE: u8 = 0x0f;
 /// Target render cadence while the monitor overlay owns focus.
 pub(super) const FOREGROUND_RENDER_FPS: u64 = 60;
 /// Target render cadence while the monitor overlay is collapsed/backgrounded.
@@ -108,7 +108,7 @@ const MOUSE_SGR_ENABLE: &[u8] = b"\x1b[?1006h";
 const MOUSE_SGR_DISABLE: &[u8] = b"\x1b[?1006l";
 
 /// Map the real terminal window size to the child PTY window size, reserving the
-/// collapsed monitor row so the provider believes its terminal is the top pane.
+/// persistent overlay rows so the provider believes its terminal is the top pane.
 pub(super) fn top_pane_winsize(full: &libc::winsize) -> libc::winsize {
     child_winsize(full, COLLAPSED_MONITOR_ROWS)
 }
@@ -195,10 +195,14 @@ fn typing_protection(focus: Focus, line_state: &InputLineState) -> TypingProtect
 enum MonitorCommand {
     SelectNext,
     SelectPrev,
-    SelectIndex(usize),
+    ToggleSelectIndex(usize),
+    SelectFilter(MonitorFilterCategory),
+    NextFilter,
+    PrevFilter,
     ToggleTreeMode,
     Refresh,
     Collapse,
+    ToggleList,
     ToggleInspect,
     RequestCancel,
     ConfirmCancel,
@@ -211,7 +215,7 @@ struct RoutedInput {
     forward: Vec<u8>,
     commands: Vec<MonitorCommand>,
     pseudo_input: Vec<PseudoInputAction>,
-    /// The operator toggled focus into the monitor (expand + focus bottom).
+    /// The operator clicked into the monitor/input area (focus bottom).
     focus_bottom: bool,
     /// Net wheel scroll for the top pane's scrollback: positive moves toward older
     /// output, negative toward the live tail. Applied by the relay loop.
@@ -300,15 +304,10 @@ impl TerminalMouseState {
     }
 }
 
-enum TopInputRoute {
-    FocusBottom,
-    Forward(u8),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BottomKey {
-    FocusToggle,
     Enter,
+    Newline,
     Backspace,
     Delete,
     LeftArrow,
@@ -318,6 +317,8 @@ enum BottomKey {
     MoveStart,
     MoveEnd,
     Clear,
+    NextFilter,
+    PrevFilter,
     TreeMode,
     Refresh,
     Collapse,
@@ -337,9 +338,7 @@ struct ParsedBottomKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BottomInputRoute {
-    FocusTop,
     Command(MonitorCommand),
-    CommandAndFocusTop(MonitorCommand),
     PseudoInput(PseudoInputAction),
     Consume,
 }
@@ -347,6 +346,7 @@ enum BottomInputRoute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PseudoInputAction {
     Insert(char),
+    InsertNewline,
     Backspace,
     Delete,
     MoveLeft,
@@ -378,8 +378,8 @@ enum TailFileReadError {
 }
 
 /// Routes real-terminal input by focus: in the top pane bytes pass through to the
-/// child verbatim except the reserved focus-toggle; in the bottom pane keys are
-/// decoded into monitor commands and never reach the child.
+/// child verbatim; in the bottom pane keys are decoded into monitor commands and
+/// never reach the child.
 #[derive(Debug)]
 struct InputRouter {
     focus: Focus,
@@ -412,10 +412,7 @@ impl InputRouter {
     }
 
     fn route_top_byte(&mut self, byte: u8, routed: &mut RoutedInput) -> usize {
-        match classify_top_input(byte) {
-            TopInputRoute::FocusBottom => self.focus_bottom(routed),
-            TopInputRoute::Forward(byte) => routed.forward.push(byte),
-        }
+        routed.forward.push(byte);
         1
     }
 
@@ -438,12 +435,7 @@ impl InputRouter {
         routed: &mut RoutedInput,
     ) -> usize {
         match route {
-            BottomInputRoute::FocusTop => self.focus_top(routed),
             BottomInputRoute::Command(command) => apply_monitor_command(routed, command),
-            BottomInputRoute::CommandAndFocusTop(command) => {
-                apply_monitor_command(routed, command);
-                self.focus_top(routed);
-            }
             BottomInputRoute::PseudoInput(action) => apply_pseudo_input_action(routed, action),
             BottomInputRoute::Consume => {}
         }
@@ -457,11 +449,13 @@ impl InputRouter {
 }
 
 fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
+    if let Some(consumed) = ctrl_enter_sequence_len(bytes) {
+        return ParsedBottomKey {
+            key: BottomKey::Newline,
+            consumed,
+        };
+    }
     match bytes {
-        [FOCUS_TOGGLE_BYTE, ..] => ParsedBottomKey {
-            key: BottomKey::FocusToggle,
-            consumed: 1,
-        },
         [b'\r', ..] | [b'\n', ..] => ParsedBottomKey {
             key: BottomKey::Enter,
             consumed: 1,
@@ -502,6 +496,14 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::Clear,
             consumed: 1,
         },
+        [0x06, ..] => ParsedBottomKey {
+            key: BottomKey::NextFilter,
+            consumed: 1,
+        },
+        [0x1b, b'[', b'Z', ..] => ParsedBottomKey {
+            key: BottomKey::PrevFilter,
+            consumed: 3,
+        },
         [0x14, ..] => ParsedBottomKey {
             key: BottomKey::TreeMode,
             consumed: 1,
@@ -541,10 +543,24 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
     }
 }
 
+fn ctrl_enter_sequence_len(bytes: &[u8]) -> Option<usize> {
+    for sequence in [
+        b"\x1b[13;5u".as_slice(),
+        b"\x1b[13;5~".as_slice(),
+        b"\x1b[13^".as_slice(),
+        b"\x1b[27;5;13~".as_slice(),
+    ] {
+        if bytes.starts_with(sequence) {
+            return Some(sequence.len());
+        }
+    }
+    None
+}
+
 fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
     match key {
-        BottomKey::FocusToggle => BottomInputRoute::FocusTop,
         BottomKey::Enter => BottomInputRoute::PseudoInput(PseudoInputAction::Submit),
+        BottomKey::Newline => BottomInputRoute::PseudoInput(PseudoInputAction::InsertNewline),
         BottomKey::Backspace => BottomInputRoute::PseudoInput(PseudoInputAction::Backspace),
         BottomKey::Delete => BottomInputRoute::PseudoInput(PseudoInputAction::Delete),
         BottomKey::LeftArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveLeft),
@@ -554,9 +570,11 @@ fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
         BottomKey::MoveStart => BottomInputRoute::PseudoInput(PseudoInputAction::MoveStart),
         BottomKey::MoveEnd => BottomInputRoute::PseudoInput(PseudoInputAction::MoveEnd),
         BottomKey::Clear => BottomInputRoute::PseudoInput(PseudoInputAction::Clear),
+        BottomKey::NextFilter => BottomInputRoute::Command(MonitorCommand::NextFilter),
+        BottomKey::PrevFilter => BottomInputRoute::Command(MonitorCommand::PrevFilter),
         BottomKey::TreeMode => BottomInputRoute::Command(MonitorCommand::ToggleTreeMode),
         BottomKey::Refresh => BottomInputRoute::Command(MonitorCommand::Refresh),
-        BottomKey::Collapse => BottomInputRoute::CommandAndFocusTop(MonitorCommand::Collapse),
+        BottomKey::Collapse => BottomInputRoute::Command(MonitorCommand::Collapse),
         BottomKey::Inspect => BottomInputRoute::Command(MonitorCommand::ToggleInspect),
         BottomKey::Cancel => BottomInputRoute::Command(MonitorCommand::RequestCancel),
         BottomKey::Confirm => BottomInputRoute::Command(MonitorCommand::ConfirmCancel),
@@ -574,14 +592,6 @@ fn apply_monitor_command(routed: &mut RoutedInput, command: MonitorCommand) {
 fn apply_pseudo_input_action(routed: &mut RoutedInput, action: PseudoInputAction) {
     routed.pseudo_input.push(action);
     routed.redraw = true;
-}
-
-fn classify_top_input(byte: u8) -> TopInputRoute {
-    if byte == FOCUS_TOGGLE_BYTE {
-        TopInputRoute::FocusBottom
-    } else {
-        TopInputRoute::Forward(byte)
-    }
 }
 
 fn mouse_request_from_screen(screen: &vt100::Screen) -> MouseRequest {
@@ -963,7 +973,7 @@ const EXPANDED_REFRESH: Duration = Duration::from_millis(500);
 /// snapshot refreshes so live output tails update without polling every source.
 const DETAIL_REFRESH: Duration = Duration::from_millis(250);
 /// Expanded monitor target share of terminal height, and its floor.
-const EXPANDED_MIN_ROWS: u16 = 8;
+const EXPANDED_MIN_ROWS: u16 = 9;
 /// Rows always reserved for the interactive top pane.
 const TOP_PANE_MIN_ROWS: u16 = 5;
 /// Top-pane floor while real child input is active, preserving multi-line composers.
@@ -974,8 +984,8 @@ const INPUT_SAFE_TOP_PANE_MIN_ROWS: u16 = 14;
 const TOP_PANE_SCROLLBACK_ROWS: usize = 10_000;
 /// Rows moved per wheel notch when scrolling the top-pane scrollback.
 const TOP_SCROLL_STEP: i32 = 3;
-/// Rows reserved at the bottom of the expanded overlay for the pseudo input lane.
-const PSEUDO_INPUT_ROWS: u16 = 2;
+/// Rows reserved for the always-visible pseudo input lane.
+const PSEUDO_INPUT_ROWS: u16 = 3;
 /// Rows reserved below the pseudo input for outbound message state.
 const OUTBOUND_STATUS_ROWS: u16 = 1;
 /// Broker-owned input messages larger than this fail before reaching the child.
@@ -995,6 +1005,7 @@ impl PseudoInputState {
     fn apply(&mut self, action: PseudoInputAction) -> Option<String> {
         match action {
             PseudoInputAction::Insert(ch) => self.insert(ch),
+            PseudoInputAction::InsertNewline => self.insert('\n'),
             PseudoInputAction::Backspace => self.backspace(),
             PseudoInputAction::Delete => self.delete(),
             PseudoInputAction::MoveLeft => self.move_left(),
@@ -1061,9 +1072,19 @@ impl PseudoInputState {
         Some(body)
     }
 
-    fn cursor_chars(&self) -> usize {
-        self.buffer[..self.cursor].chars().count()
+    fn cursor_line_col(&self) -> (usize, usize) {
+        pseudo_input_cursor_line_col(&self.buffer, self.cursor)
     }
+}
+
+fn pseudo_input_cursor_line_col(buffer: &str, cursor: usize) -> (usize, usize) {
+    let before = &buffer[..cursor];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count();
+    let col = before
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail.chars().count())
+        .unwrap_or_else(|| before.chars().count());
+    (line, col)
 }
 
 fn previous_char_boundary(value: &str, cursor: usize) -> Option<usize> {
@@ -1381,12 +1402,50 @@ impl MonitorViewMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorFilterCategory {
+    Bash,
+    Procs,
+    Mailbox,
+    All,
+}
+
+impl MonitorFilterCategory {
+    const ALL: [Self; 4] = [Self::Bash, Self::Procs, Self::Mailbox, Self::All];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Procs => "procs",
+            Self::Mailbox => "mailbox",
+            Self::All => "all",
+        }
+    }
+
+    fn next(self) -> Self {
+        self.offset(1)
+    }
+
+    fn prev(self) -> Self {
+        self.offset(Self::ALL.len() - 1)
+    }
+
+    fn offset(self, delta: usize) -> Self {
+        let current = Self::ALL
+            .iter()
+            .position(|category| *category == self)
+            .unwrap_or(0);
+        Self::ALL[(current + delta) % Self::ALL.len()]
+    }
+}
+
 /// Bottom-pane monitor state: collapse/expand, the latest read-only snapshot, and
 /// the current selection. Holds no terminal or IO handles.
 #[derive(Clone)]
 struct MonitorPane {
     collapsed: bool,
     view_mode: MonitorViewMode,
+    active_filter: MonitorFilterCategory,
     selected: usize,
     selected_node_id: Option<MonitorNodeId>,
     snapshot: Option<Arc<MonitorSnapshot>>,
@@ -1395,6 +1454,7 @@ struct MonitorPane {
     /// Manual detail override for nodes without an InspectRef. Nodes with an
     /// InspectRef show detail automatically while selected in the expanded pane.
     inspecting: bool,
+    closed_detail_node_id: Option<MonitorNodeId>,
     inspect: Vec<String>,
     last_inspect_refresh: Option<Instant>,
     /// The node id awaiting cancel confirmation, if the operator pressed `x`.
@@ -1410,12 +1470,14 @@ impl MonitorPane {
         Self {
             collapsed: true,
             view_mode: MonitorViewMode::Flat,
+            active_filter: MonitorFilterCategory::Bash,
             selected: 0,
             selected_node_id: None,
             snapshot: None,
             pseudo_input: PseudoInputState::default(),
             outbound: OutboundQueue::default(),
             inspecting: false,
+            closed_detail_node_id: None,
             inspect: Vec::new(),
             last_inspect_refresh: None,
             pending_cancel: None,
@@ -1468,6 +1530,7 @@ impl MonitorPane {
     fn store_snapshot(&mut self, snapshot: Arc<MonitorSnapshot>) {
         self.preserve_or_clamp_selection(&snapshot);
         self.snapshot = Some(snapshot);
+        self.clamp_selection_to_filter();
         self.sync_selected_node_id();
         self.update_inspect();
     }
@@ -1504,7 +1567,7 @@ impl MonitorPane {
 
     fn adjacent_selection(&self, delta: isize) -> Option<usize> {
         let snapshot = self.snapshot.as_ref()?;
-        let rows = projected_monitor_rows(snapshot, self.view_mode);
+        let rows = self.projected_rows(snapshot);
         let current = selected_projected_position(&rows, self.selected).unwrap_or(0);
         let next = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs())
@@ -1518,14 +1581,68 @@ impl MonitorPane {
 
     fn select_index(&mut self, index: usize) {
         if index < self.node_count() {
+            let changed = self.selected != index;
             self.selected = index;
+            if changed {
+                self.closed_detail_node_id = None;
+            }
             self.sync_selected_node_id();
         }
     }
 
+    fn toggle_select_index(&mut self, index: usize) {
+        if index >= self.node_count() {
+            return;
+        }
+        if self.selected == index && self.detail_visible() {
+            self.closed_detail_node_id = self.selected_node().map(node_id);
+            self.inspecting = false;
+            self.update_inspect();
+            return;
+        }
+        self.closed_detail_node_id = None;
+        self.select_index(index);
+        self.update_inspect();
+    }
+
     fn toggle_view_mode(&mut self) {
         self.view_mode = self.view_mode.toggled();
+        self.clamp_selection_to_filter();
         self.sync_selected_node_id();
+    }
+
+    fn set_filter(&mut self, filter: MonitorFilterCategory) {
+        if self.active_filter == filter {
+            return;
+        }
+        self.active_filter = filter;
+        self.closed_detail_node_id = None;
+        self.clamp_selection_to_filter();
+        self.sync_selected_node_id();
+        self.update_inspect();
+    }
+
+    fn cycle_filter_next(&mut self) {
+        self.set_filter(self.active_filter.next());
+    }
+
+    fn cycle_filter_prev(&mut self) {
+        self.set_filter(self.active_filter.prev());
+    }
+
+    fn clamp_selection_to_filter(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        let rows = self.projected_rows(snapshot);
+        if rows.is_empty() || rows.iter().any(|row| row.index == self.selected) {
+            return;
+        }
+        self.selected = rows[0].index;
+    }
+
+    fn projected_rows(&self, snapshot: &MonitorSnapshot) -> Vec<ProjectedMonitorRow> {
+        filtered_monitor_rows(snapshot, self.view_mode, self.active_filter)
     }
 
     /// Apply a decoded monitor command. Returns whether a forced refresh is wanted.
@@ -1541,9 +1658,20 @@ impl MonitorPane {
                 self.update_inspect();
                 false
             }
-            MonitorCommand::SelectIndex(index) => {
-                self.select_index(index);
-                self.update_inspect();
+            MonitorCommand::ToggleSelectIndex(index) => {
+                self.toggle_select_index(index);
+                false
+            }
+            MonitorCommand::SelectFilter(filter) => {
+                self.set_filter(filter);
+                false
+            }
+            MonitorCommand::NextFilter => {
+                self.cycle_filter_next();
+                false
+            }
+            MonitorCommand::PrevFilter => {
+                self.cycle_filter_prev();
                 false
             }
             MonitorCommand::ToggleTreeMode => {
@@ -1552,15 +1680,25 @@ impl MonitorPane {
             }
             MonitorCommand::Refresh => true,
             MonitorCommand::Collapse => {
-                self.collapsed = true;
-                self.inspecting = false;
-                self.inspect.clear();
-                self.last_inspect_refresh = None;
-                self.pending_cancel = None;
+                self.collapse_list();
+                false
+            }
+            MonitorCommand::ToggleList => {
+                if self.collapsed {
+                    self.expand();
+                } else {
+                    self.collapse_list();
+                }
                 false
             }
             MonitorCommand::ToggleInspect => {
-                self.inspecting = !self.inspecting;
+                if self.detail_visible() {
+                    self.closed_detail_node_id = self.selected_node().map(node_id);
+                    self.inspecting = false;
+                } else {
+                    self.closed_detail_node_id = None;
+                    self.inspecting = true;
+                }
                 self.update_inspect();
                 false
             }
@@ -1583,6 +1721,14 @@ impl MonitorPane {
         if let Some(body) = self.pseudo_input.apply(action) {
             self.outbound.enqueue(body, now);
         }
+    }
+
+    fn collapse_list(&mut self) {
+        self.collapsed = true;
+        self.inspecting = false;
+        self.inspect.clear();
+        self.last_inspect_refresh = None;
+        self.pending_cancel = None;
     }
 
     fn selected_node(&self) -> Option<&MonitorNode> {
@@ -1659,7 +1805,15 @@ impl MonitorPane {
     }
 
     fn detail_visible(&self) -> bool {
-        !self.collapsed && (self.inspecting || self.selected_node_has_inspect_ref())
+        !self.collapsed
+            && !self.selected_detail_closed()
+            && (self.inspecting || self.selected_node_has_inspect_ref())
+    }
+
+    fn selected_detail_closed(&self) -> bool {
+        self.closed_detail_node_id
+            .as_deref()
+            .is_some_and(|id| self.selected_node_id.as_deref() == Some(id))
     }
 
     fn detail_refresh_active(&self) -> bool {
@@ -1982,6 +2136,45 @@ fn projected_monitor_rows(
     match mode {
         MonitorViewMode::Flat => flat_monitor_rows(snapshot),
         MonitorViewMode::Tree => tree_monitor_rows(snapshot),
+    }
+}
+
+fn filtered_monitor_rows(
+    snapshot: &MonitorSnapshot,
+    mode: MonitorViewMode,
+    filter: MonitorFilterCategory,
+) -> Vec<ProjectedMonitorRow> {
+    projected_monitor_rows(snapshot, mode)
+        .into_iter()
+        .filter(|row| {
+            snapshot
+                .nodes
+                .get(row.index)
+                .is_some_and(|node| node_matches_filter(node, filter))
+        })
+        .collect()
+}
+
+fn node_matches_filter(node: &MonitorNode, filter: MonitorFilterCategory) -> bool {
+    match filter {
+        MonitorFilterCategory::Bash => {
+            node.kind == MonitorNodeKind::AgentBashWorkload
+                && matches!(
+                    node.status,
+                    MonitorStatus::Running | MonitorStatus::Cancelling
+                )
+        }
+        MonitorFilterCategory::Procs => matches!(
+            node.kind,
+            MonitorNodeKind::Session
+                | MonitorNodeKind::Invocation
+                | MonitorNodeKind::ProviderProcess
+        ),
+        MonitorFilterCategory::Mailbox => matches!(
+            node.kind,
+            MonitorNodeKind::MailboxNotification | MonitorNodeKind::WakeClaim
+        ),
+        MonitorFilterCategory::All => true,
     }
 }
 
@@ -2387,7 +2580,8 @@ fn render_scrollback_indicator(buf: &mut Buffer, area: Rect, scrollback: usize) 
     );
 }
 
-/// Render the monitor: a status row always, plus the node list when expanded.
+/// Render the monitor: a status row plus the always-visible pseudo input; the node
+/// list is the collapsible portion below it.
 fn render_monitor(
     buf: &mut Buffer,
     area: Rect,
@@ -2398,21 +2592,21 @@ fn render_monitor(
     if area.height == 0 {
         return;
     }
-    render_status_row(
-        buf,
-        Rect { height: 1, ..area },
-        pane,
-        focus,
-        overlay_constrained,
-    );
-    if pane.collapsed || area.height <= 1 {
+    let status = Rect {
+        height: STATUS_ROW_ROWS.min(area.height),
+        ..area
+    };
+    render_status_row(buf, status, pane, focus, overlay_constrained);
+    if area.height <= STATUS_ROW_ROWS {
         return;
     }
     let body = bottom_body_area(area);
     let layout = expanded_bottom_layout(body);
-    render_monitor_body(buf, layout.content, pane);
     render_pseudo_input(buf, layout.input, pane, focus);
     render_outbound_status(buf, layout.outbound, pane);
+    if !pane.collapsed {
+        render_monitor_body(buf, layout.content, pane);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2424,8 +2618,8 @@ struct ExpandedBottomLayout {
 
 fn bottom_body_area(area: Rect) -> Rect {
     Rect {
-        y: area.y + 1,
-        height: area.height - 1,
+        y: area.y + STATUS_ROW_ROWS,
+        height: area.height.saturating_sub(STATUS_ROW_ROWS),
         ..area
     }
 }
@@ -2435,18 +2629,18 @@ fn expanded_bottom_layout(body: Rect) -> ExpandedBottomLayout {
     let input_rows = PSEUDO_INPUT_ROWS.min(body.height.saturating_sub(outbound_rows));
     let content_rows = body.height.saturating_sub(input_rows + outbound_rows);
     ExpandedBottomLayout {
-        content: Rect {
-            height: content_rows,
-            ..body
-        },
         input: Rect {
-            y: body.y + content_rows,
             height: input_rows,
             ..body
         },
         outbound: Rect {
-            y: body.y + content_rows + input_rows,
+            y: body.y + input_rows,
             height: outbound_rows,
+            ..body
+        },
+        content: Rect {
+            y: body.y + input_rows + outbound_rows,
+            height: content_rows,
             ..body
         },
     }
@@ -2483,25 +2677,93 @@ fn render_pseudo_input(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: 
     } else {
         Style::default().fg(Color::Gray).bg(Color::Indexed(235))
     };
-    let draft = format_pseudo_input_line(pane);
-    buf.set_string(area.x, area.y, pad_to_width(draft, area.width), style);
-    if area.height > 1 {
-        let help = "Enter queue · arrows move list/cursor · Ctrl+O top · Ctrl+U clear";
+    let help_rows = if area.height > 1 { 1 } else { 0 };
+    let editor_rows = area.height.saturating_sub(help_rows);
+    for (line_index, line) in format_pseudo_input_rows(pane, editor_rows)
+        .into_iter()
+        .enumerate()
+    {
         buf.set_string(
             area.x,
-            area.y + 1,
+            area.y + line_index as u16,
+            pad_to_width(line, area.width),
+            style,
+        );
+    }
+    if help_rows > 0 {
+        let help = "Enter queue · Ctrl+Enter newline · Ctrl+F filter · Ctrl+U clear";
+        buf.set_string(
+            area.x,
+            area.y + editor_rows,
             pad_to_width(help.to_string(), area.width),
             style,
         );
     }
 }
 
-fn format_pseudo_input_line(pane: &MonitorPane) -> String {
-    let mut text = pane.pseudo_input.buffer.clone();
-    let cursor = pane.pseudo_input.cursor_chars();
-    let marker = if text.is_empty() { "" } else { " " };
-    text.insert(pane.pseudo_input.cursor, '▌');
-    format!(" input[{cursor}] >{marker}{text}")
+fn format_pseudo_input_rows(pane: &MonitorPane, visible_rows: u16) -> Vec<String> {
+    if visible_rows == 0 {
+        return Vec::new();
+    }
+    let cursor = pane.pseudo_input.cursor_line_col();
+    let rows = pseudo_input_display_lines(&pane.pseudo_input.buffer, pane.pseudo_input.cursor);
+    let start = pseudo_input_scroll_start(cursor.0, rows.len(), visible_rows as usize);
+    rows.into_iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows as usize)
+        .map(|(line_index, line)| format_pseudo_input_row(line_index, cursor, line))
+        .collect()
+}
+
+fn pseudo_input_display_lines(buffer: &str, cursor: usize) -> Vec<String> {
+    let mut rows: Vec<String> = split_pseudo_input_lines(buffer)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    let cursor_position = pseudo_input_cursor_line_col(buffer, cursor);
+    if let Some(line) = rows.get_mut(cursor_position.0) {
+        let insert_at = byte_index_for_char_col(line, cursor_position.1);
+        line.insert(insert_at, '▌');
+    }
+    rows
+}
+
+fn split_pseudo_input_lines(buffer: &str) -> Vec<&str> {
+    if buffer.is_empty() {
+        Vec::new()
+    } else {
+        buffer.split('\n').collect()
+    }
+}
+
+fn pseudo_input_scroll_start(cursor_line: usize, len: usize, visible_rows: usize) -> usize {
+    if visible_rows == 0 || len <= visible_rows {
+        0
+    } else {
+        cursor_line
+            .saturating_sub(visible_rows - 1)
+            .min(len - visible_rows)
+    }
+}
+
+fn format_pseudo_input_row(line_index: usize, cursor: (usize, usize), line: String) -> String {
+    if line_index == 0 {
+        format!(" input[{}:{}] > {}", cursor.0 + 1, cursor.1, line)
+    } else {
+        format!(" input[{}]   | {}", line_index + 1, line)
+    }
+}
+
+fn byte_index_for_char_col(value: &str, col: usize) -> usize {
+    value
+        .char_indices()
+        .nth(col)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
 }
 
 fn render_outbound_status(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
@@ -2605,7 +2867,7 @@ fn render_status_row(
         format!(
             " OBS  {} · {}  —  {hint}",
             monitor_summary_text(pane),
-            view_mode_word(pane.view_mode)
+            view_mode_word(pane.view_mode),
         ),
         area.width,
     );
@@ -2619,8 +2881,10 @@ fn render_status_row(
 /// The status-row hint, reflecting focus and any armed/last cancel state.
 fn status_hint(pane: &MonitorPane, focus: Focus, overlay_constrained: bool) -> String {
     match focus {
-        Focus::Top if overlay_constrained => "input viewport protected · Ctrl+O focus".to_string(),
-        Focus::Top => "Ctrl+O focus".to_string(),
+        Focus::Top if overlay_constrained => {
+            "input viewport protected · click input/bar".to_string()
+        }
+        Focus::Top => "click input/bar".to_string(),
         Focus::Bottom => bottom_status_hint(pane, overlay_constrained),
     }
 }
@@ -2637,12 +2901,12 @@ fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
     match pane.cancel_feedback.as_deref() {
         Some(feedback) => {
             format!(
-                "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top  ({feedback}){protected_suffix}"
+                "type draft · Enter queue · Ctrl+Enter newline · Ctrl+F filter · click bar list  ({feedback}){protected_suffix}"
             )
         }
         None => {
             format!(
-                "type to draft · Enter queue · ↑/↓ move · Ctrl+T tree · Ctrl+O top{protected_suffix}"
+                "type draft · Enter queue · Ctrl+Enter newline · Ctrl+F filter · click bar list{protected_suffix}"
             )
         }
     }
@@ -2672,14 +2936,26 @@ fn monitor_summary_text(pane: &MonitorPane) -> String {
 
 /// Render the bounded, selection-following node list when expanded.
 fn render_node_list(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
+    if area.height == 0 {
+        return;
+    }
+    render_filter_tabs(buf, filter_tabs_area(area), pane.active_filter);
+    let rows_area = node_rows_area(area);
+    if rows_area.height == 0 {
+        return;
+    }
     let Some(snapshot) = pane.snapshot.as_ref() else {
         return;
     };
-    if snapshot.nodes.is_empty() {
+    let projected = pane.projected_rows(snapshot);
+    if projected.is_empty() {
         buf.set_string(
-            area.x,
-            area.y,
-            pad_to_width(" (no active workloads)".to_string(), area.width),
+            rows_area.x,
+            rows_area.y,
+            pad_to_width(
+                format!(" (no {} items)", pane.active_filter.label()),
+                rows_area.width,
+            ),
             Style::default().fg(Color::DarkGray),
         );
         return;
@@ -2689,14 +2965,49 @@ fn render_node_list(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
         y,
         node,
         prefix,
-    } in visible_node_rows(pane, snapshot, area)
+    } in visible_node_rows(pane, snapshot, rows_area, &projected)
     {
         let row = Rect {
             y,
             height: 1,
-            ..area
+            ..rows_area
         };
         render_node_row(buf, row, node, &prefix, index == pane.selected);
+    }
+}
+
+fn render_filter_tabs(buf: &mut Buffer, area: Rect, active: MonitorFilterCategory) {
+    if area.height == 0 {
+        return;
+    }
+    let labels = MonitorFilterCategory::ALL.map(|category| {
+        if category == active {
+            format!("[{}]", category.label())
+        } else {
+            format!(" {} ", category.label())
+        }
+    });
+    let text = format!(" filters: {} ", labels.join(" "));
+    buf.set_string(
+        area.x,
+        area.y,
+        pad_to_width(text, area.width),
+        Style::default().fg(Color::Black).bg(Color::Indexed(250)),
+    );
+}
+
+fn filter_tabs_area(area: Rect) -> Rect {
+    Rect {
+        height: 1.min(area.height),
+        ..area
+    }
+}
+
+fn node_rows_area(area: Rect) -> Rect {
+    Rect {
+        y: area.y + 1.min(area.height),
+        height: area.height.saturating_sub(1),
+        ..area
     }
 }
 
@@ -2711,10 +3022,10 @@ fn visible_node_rows<'a>(
     pane: &'a MonitorPane,
     snapshot: &'a MonitorSnapshot,
     area: Rect,
+    projected: &[ProjectedMonitorRow],
 ) -> Vec<VisibleNodeRow<'a>> {
-    let projected = projected_monitor_rows(snapshot, pane.view_mode);
     let rows = area.height as usize;
-    let selected_position = selected_projected_position(&projected, pane.selected).unwrap_or(0);
+    let selected_position = selected_projected_position(projected, pane.selected).unwrap_or(0);
     let offset = scroll_offset(selected_position, projected.len(), rows);
     projected
         .iter()
@@ -4040,10 +4351,60 @@ fn route_bottom_mouse_event(
         apply_monitor_command(routed, command);
     } else if is_primary_press(event) {
         router.focus_bottom(routed);
+        if bottom_status_row_contains(bottom, event) {
+            apply_monitor_command(routed, MonitorCommand::ToggleList);
+            return;
+        }
+        if let Some(filter) = bottom_filter_tab_at(event, bottom, pane) {
+            apply_monitor_command(routed, MonitorCommand::SelectFilter(filter));
+            return;
+        }
         if let Some(index) = bottom_visible_row_index(event, bottom, pane) {
-            apply_monitor_command(routed, MonitorCommand::SelectIndex(index));
+            apply_monitor_command(routed, MonitorCommand::ToggleSelectIndex(index));
         }
     }
+}
+
+fn bottom_status_row_contains(bottom: Rect, event: MouseEvent) -> bool {
+    event.row == bottom.y.saturating_add(1)
+        && event.col > bottom.x
+        && event.col <= bottom.x.saturating_add(bottom.width)
+}
+
+fn bottom_filter_tab_at(
+    event: MouseEvent,
+    bottom: Rect,
+    pane: &MonitorPane,
+) -> Option<MonitorFilterCategory> {
+    let tabs = bottom_filter_tabs_area(bottom, pane)?;
+    if !rect_contains_mouse(tabs, event) {
+        return None;
+    }
+    filter_category_at_column(event.col.saturating_sub(tabs.x + 1))
+}
+
+fn bottom_filter_tabs_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
+    if pane.collapsed {
+        return None;
+    }
+    let content = expanded_bottom_layout(bottom_body_area(bottom)).content;
+    (content.height > 0).then_some(filter_tabs_area(content))
+}
+
+fn filter_category_at_column(col: u16) -> Option<MonitorFilterCategory> {
+    let mut offset = " filters: ".chars().count() as u16;
+    for category in MonitorFilterCategory::ALL {
+        let width = filter_tab_label_width(category);
+        if col >= offset && col < offset.saturating_add(width) {
+            return Some(category);
+        }
+        offset = offset.saturating_add(width + 1);
+    }
+    None
+}
+
+fn filter_tab_label_width(category: MonitorFilterCategory) -> u16 {
+    category.label().chars().count() as u16 + 2
 }
 
 fn bottom_visible_row_index(event: MouseEvent, bottom: Rect, pane: &MonitorPane) -> Option<usize> {
@@ -4053,7 +4414,7 @@ fn bottom_visible_row_index(event: MouseEvent, bottom: Rect, pane: &MonitorPane)
     }
     let snapshot = pane.snapshot.as_ref()?;
     let row = usize::from(event.row.saturating_sub(list.y.saturating_add(1)));
-    let projected = projected_monitor_rows(snapshot, pane.view_mode);
+    let projected = pane.projected_rows(snapshot);
     let selected_position = selected_projected_position(&projected, pane.selected).unwrap_or(0);
     let offset = scroll_offset(selected_position, projected.len(), list.height as usize);
     projected.get(offset + row).map(|row| row.index)
@@ -4068,12 +4429,12 @@ fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
         return None;
     }
     if pane.detail_visible() && body.height >= 4 {
-        Some(Rect {
+        Some(node_rows_area(Rect {
             height: (body.height / 2).max(2),
             ..body
-        })
+        }))
     } else {
-        Some(body)
+        Some(node_rows_area(body))
     }
 }
 
@@ -4113,9 +4474,6 @@ fn apply_routed_to_pane(
     routed: RoutedInput,
     snapshot_worker: &MonitorSnapshotWorker,
 ) -> bool {
-    if routed.focus_bottom {
-        pane.expand();
-    }
     apply_routed_pseudo_input(pane, &routed.pseudo_input);
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
@@ -4165,10 +4523,14 @@ fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
         command,
         MonitorCommand::SelectNext
             | MonitorCommand::SelectPrev
-            | MonitorCommand::SelectIndex(_)
+            | MonitorCommand::ToggleSelectIndex(_)
+            | MonitorCommand::SelectFilter(_)
+            | MonitorCommand::NextFilter
+            | MonitorCommand::PrevFilter
             | MonitorCommand::ToggleTreeMode
             | MonitorCommand::Refresh
             | MonitorCommand::Collapse
+            | MonitorCommand::ToggleList
             | MonitorCommand::ToggleInspect
             | MonitorCommand::RequestCancel
             | MonitorCommand::ConfirmCancel
@@ -4842,7 +5204,7 @@ mod tests {
     }
 
     #[test]
-    fn top_pane_reserves_the_monitor_row() {
+    fn top_pane_reserves_the_persistent_overlay_rows() {
         let full = libc::winsize {
             ws_row: 24,
             ws_col: 80,
@@ -4850,7 +5212,7 @@ mod tests {
             ws_ypixel: 0,
         };
         let top = top_pane_winsize(&full);
-        assert_eq!(top.ws_row, 23);
+        assert_eq!(top.ws_row, 24 - COLLAPSED_MONITOR_ROWS);
         assert_eq!(top.ws_col, 80);
     }
 
@@ -4886,23 +5248,18 @@ mod tests {
     }
 
     #[test]
-    fn top_focus_forwards_bytes_and_toggle_does_not() {
+    fn top_focus_forwards_ctrl_o_instead_of_toggling_overlay_focus() {
         let mut router = InputRouter::new();
-        let routed = router.route_input(b"abc");
-        assert_eq!(routed.forward, b"abc".to_vec());
+        let routed = router.route_input(&[b'a', 0x0f, b'b']);
+        assert_eq!(routed.forward, vec![b'a', 0x0f, b'b']);
         assert!(!routed.redraw);
         assert_eq!(router.focus, Focus::Top);
-
-        let routed = router.route_input(&[FOCUS_TOGGLE_BYTE]);
-        assert!(routed.forward.is_empty());
-        assert!(routed.redraw);
-        assert_eq!(router.focus, Focus::Bottom);
     }
 
     #[test]
-    fn bottom_focus_edits_draft_until_toggle_returns_to_top() {
+    fn bottom_focus_edits_draft_and_ctrl_o_is_not_a_focus_command() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         assert_eq!(router.focus, Focus::Bottom);
 
         let routed = router.route_input(b"jjkk");
@@ -4918,21 +5275,11 @@ mod tests {
         );
         assert_eq!(router.focus, Focus::Bottom);
 
-        let routed = router.route_input(&[FOCUS_TOGGLE_BYTE]);
-        assert!(routed.redraw);
-        assert_eq!(router.focus, Focus::Top);
-
-        let routed = router.route_input(b"x");
-        assert_eq!(routed.forward, b"x".to_vec());
-    }
-
-    #[test]
-    fn doubled_toggle_returns_to_top_without_forwarding() {
-        // Ctrl+O then Ctrl+O: Top -> Bottom -> Top, nothing forwarded.
-        let mut router = InputRouter::new();
-        let routed = router.route_input(&[FOCUS_TOGGLE_BYTE, FOCUS_TOGGLE_BYTE]);
+        let routed = router.route_input(&[0x0f]);
         assert!(routed.forward.is_empty());
-        assert_eq!(router.focus, Focus::Top);
+        assert!(routed.commands.is_empty());
+        assert!(routed.pseudo_input.is_empty());
+        assert_eq!(router.focus, Focus::Bottom);
     }
 
     #[test]
@@ -5018,7 +5365,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_status_row_primary_click_focuses_bottom_and_requests_expansion() {
+    fn bottom_status_row_primary_click_toggles_list() {
         let mut router = InputRouter::new();
         let pane = MonitorPane::new();
         let winsize = libc::winsize {
@@ -5029,7 +5376,7 @@ mod tests {
         };
 
         let routed = route_real_input(
-            b"\x1b[<0;4;10M",
+            b"\x1b[<0;4;6M",
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -5040,13 +5387,13 @@ mod tests {
         assert!(routed.focus_bottom);
         assert!(routed.redraw);
         assert!(routed.forward.is_empty());
-        assert!(routed.commands.is_empty());
+        assert_eq!(routed.commands, vec![MonitorCommand::ToggleList]);
     }
 
     #[test]
     fn top_pane_primary_click_restores_top_focus_from_bottom() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let mut pane = MonitorPane::new();
         pane.expand();
         let winsize = libc::winsize {
@@ -5080,7 +5427,7 @@ mod tests {
     #[test]
     fn top_pane_primary_click_restores_focus_and_forwards_when_child_mouse_enabled() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let mut pane = MonitorPane::new();
         pane.expand();
         let winsize = libc::winsize {
@@ -5105,7 +5452,7 @@ mod tests {
     #[test]
     fn bottom_visible_row_primary_click_selects_row_after_scroll_offset() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let pane = pane_with(snapshot_with_nodes(12), false, 9);
         let winsize = libc::winsize {
             ws_row: 20,
@@ -5115,7 +5462,7 @@ mod tests {
         };
 
         let routed = route_real_input(
-            b"\x1b[<0;4;14M",
+            b"\x1b[<0;4;19M",
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -5124,10 +5471,10 @@ mod tests {
 
         assert_eq!(router.focus, Focus::Bottom);
         assert!(routed.focus_bottom);
-        assert_eq!(routed.commands, vec![MonitorCommand::SelectIndex(6)]);
+        assert_eq!(routed.commands, vec![MonitorCommand::ToggleSelectIndex(8)]);
         let mut applied = pane.clone();
         applied.apply(routed.commands[0]);
-        assert_eq!(applied.selected, 6);
+        assert_eq!(applied.selected, 8);
     }
 
     #[test]
@@ -5145,7 +5492,7 @@ mod tests {
             encoding: vt100::MouseProtocolEncoding::Sgr,
         };
 
-        let routed = route_real_input(b"\x1b[<0;4;19M", &mut router, &pane, child, &winsize);
+        let routed = route_real_input(b"\x1b[<0;4;16M", &mut router, &pane, child, &winsize);
 
         assert_eq!(router.focus, Focus::Bottom);
         assert!(routed.focus_bottom);
@@ -5176,7 +5523,7 @@ mod tests {
     #[test]
     fn mouse_wheel_scrolls_monitor_when_expanded_even_if_child_mouse_disabled() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let mut pane = MonitorPane::new();
         pane.expand();
         let winsize = libc::winsize {
@@ -5364,7 +5711,7 @@ mod tests {
     #[test]
     fn pseudo_input_draft_bytes_do_not_forward_before_enter() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let mut pane = MonitorPane::new();
         let routed = router.route_input(b"draft only");
 
@@ -5903,10 +6250,10 @@ mod tests {
 
     #[test]
     fn frame_renders_child_output_in_top_and_monitor_in_bottom() {
-        let backend = TestBackend::new(20, 5);
+        let backend = TestBackend::new(20, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        // top pane is 4 rows (5 - 1 monitor row), 20 cols.
-        let mut parser = vt100::Parser::new(4, 20, 0);
+        // top pane is 5 rows (10 - persistent overlay rows), 20 cols.
+        let mut parser = vt100::Parser::new(5, 20, 0);
         parser.process(b"hello world");
         let screen_owner = parser;
         let screen = screen_owner.screen();
@@ -5918,8 +6265,8 @@ mod tests {
         let buf = terminal.backend().buffer();
         let top_row = row_text(buf, 0, 20);
         assert!(top_row.starts_with("hello world"), "top row: {top_row:?}");
-        let bottom_row = row_text(buf, 4, 20);
-        assert!(bottom_row.contains("OBS"), "bottom row: {bottom_row:?}");
+        let text = screen_text(buf, 10, 20);
+        assert!(text.contains("OBS"), "screen: {text:?}");
     }
 
     #[test]
@@ -5977,7 +6324,7 @@ mod tests {
     #[test]
     fn lower_pane_selection_change_is_interactive_render_priority() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
 
         let routed = router.route_input(&[0x1b, b'[', b'B']);
 
@@ -6436,7 +6783,7 @@ mod tests {
         );
     }
 
-    // The child PTY is resized to the TOP pane (one row reserved) on terminal
+    // The child PTY is resized to the TOP pane (persistent overlay rows reserved) on terminal
     // resize, and the virtual terminal grid is resized to match.
     #[test]
     fn resize_sizes_child_pty_and_virtual_terminal_to_top_pane() {
@@ -6452,7 +6799,7 @@ mod tests {
         let mut parser = vt100::Parser::new(10, 10, 0);
         let mut applied = None;
 
-        // Collapsed: child PTY reserves one monitor row (30 -> 29).
+        // Collapsed: child PTY reserves the persistent overlay rows (30 -> 25).
         let pane = MonitorPane::new();
         let dirty = apply_sizing(
             outer.slave.as_raw_fd(),
@@ -6466,13 +6813,17 @@ mod tests {
         assert!(dirty, "first observation of a size is a change");
         assert_eq!(
             parser.screen().size(),
-            (29, 100),
+            (30 - COLLAPSED_MONITOR_ROWS, 100),
             "collapsed virtual terminal"
         );
         let mut ws = unsafe { std::mem::zeroed::<libc::winsize>() };
         let rc = unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
         assert_eq!(rc, 0);
-        assert_eq!((ws.ws_row, ws.ws_col), (29, 100), "collapsed child PTY");
+        assert_eq!(
+            (ws.ws_row, ws.ws_col),
+            (30 - COLLAPSED_MONITOR_ROWS, 100),
+            "collapsed child PTY"
+        );
 
         // Expanding the monitor shrinks the top pane and the child PTY.
         let mut expanded = MonitorPane::new();
@@ -6590,6 +6941,18 @@ mod tests {
             .collect()
     }
 
+    fn filtered_labels(pane: &MonitorPane, snapshot: &MonitorSnapshot) -> Vec<String> {
+        pane.projected_rows(snapshot)
+            .into_iter()
+            .map(|row| snapshot.nodes[row.index].label.clone())
+            .collect()
+    }
+
+    fn filtered_labels_for_pane(pane: &MonitorPane) -> Vec<String> {
+        let snapshot = pane.snapshot.as_ref().expect("snapshot");
+        filtered_labels(pane, snapshot)
+    }
+
     struct FakeMonitor {
         snapshot: MonitorSnapshot,
     }
@@ -6629,12 +6992,14 @@ mod tests {
         MonitorPane {
             collapsed,
             view_mode: MonitorViewMode::Flat,
+            active_filter: MonitorFilterCategory::All,
             selected,
             selected_node_id,
             snapshot: Some(Arc::new(snapshot)),
             pseudo_input: PseudoInputState::default(),
             outbound: OutboundQueue::default(),
             inspecting: false,
+            closed_detail_node_id: None,
             inspect: Vec::new(),
             last_inspect_refresh: None,
             pending_cancel: None,
@@ -6705,9 +7070,12 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_reserves_one_row_expanded_reserves_a_bounded_share() {
+    fn collapsed_reserves_persistent_input_rows_expanded_reserves_a_bounded_share() {
         let collapsed = MonitorPane::new();
-        assert_eq!(collapsed.bottom_rows(40, TypingProtection::inactive()), 1);
+        assert_eq!(
+            collapsed.bottom_rows(40, TypingProtection::inactive()),
+            COLLAPSED_MONITOR_ROWS
+        );
         let mut expanded = MonitorPane::new();
         expanded.expand();
         let rows = expanded.bottom_rows(40, TypingProtection::inactive());
@@ -6727,7 +7095,10 @@ mod tests {
                 "full_rows={full_rows} top={top} bottom={bottom}"
             );
         }
-        assert_eq!(pane.bottom_rows(15, TypingProtection::active()), 1);
+        assert_eq!(
+            pane.bottom_rows(15, TypingProtection::active()),
+            COLLAPSED_MONITOR_ROWS
+        );
         assert!(pane.bottom_rows(20, TypingProtection::active()) < EXPANDED_MIN_ROWS);
         assert_eq!(pane.bottom_rows(40, TypingProtection::active()), 14);
     }
@@ -6881,16 +7252,19 @@ mod tests {
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
             .unwrap();
-        let row = row_text(terminal.backend().buffer(), 5, 80);
-        assert!(row.contains("OBS"), "status row: {row:?}");
-        assert!(row.contains("running"), "status row: {row:?}");
-        assert!(row.contains("3 mailbox pending"), "status row: {row:?}");
+        let text = screen_text(terminal.backend().buffer(), 6, 80);
+        assert!(text.contains("OBS"), "status screen: {text:?}");
+        assert!(text.contains("running"), "status screen: {text:?}");
+        assert!(
+            text.contains("3 mailbox pending"),
+            "status screen: {text:?}"
+        );
     }
 
     #[test]
     fn ctrl_t_routes_to_tree_mode_toggle_without_forwarding() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
 
         let routed = router.route_input(&[0x14]);
 
@@ -7008,7 +7382,7 @@ mod tests {
     #[test]
     fn pseudo_input_actions_apply_to_draft_and_queue() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let mut pane = pane_with(empty_snapshot(), false, 0);
         let routed = router.route_input(b"hi\x1b[D!\r");
 
@@ -7018,6 +7392,50 @@ mod tests {
         assert_eq!(pane.outbound.messages.len(), 1);
         assert_eq!(pane.outbound.messages[0].body, "h!i");
         assert_eq!(pane.outbound.messages[0].status, OutboundStatus::Queued);
+    }
+
+    #[test]
+    fn ctrl_enter_inserts_newline_and_plain_enter_queues_multiline_draft() {
+        let mut router = InputRouter::new();
+        router.focus = Focus::Bottom;
+        let mut pane = pane_with(empty_snapshot(), false, 0);
+        let routed = router.route_input(b"line1\x1b[13;5uline2\r");
+
+        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input);
+
+        assert!(routed.forward.is_empty());
+        assert_eq!(pane.pseudo_input.buffer, "");
+        assert_eq!(pane.outbound.messages.len(), 1);
+        assert_eq!(pane.outbound.messages[0].body, "line1\nline2");
+    }
+
+    #[test]
+    fn common_ctrl_enter_sequences_route_to_newline_not_submit() {
+        for sequence in [
+            b"\x1b[13;5u".as_slice(),
+            b"\x1b[13;5~".as_slice(),
+            b"\x1b[13^".as_slice(),
+            b"\x1b[27;5;13~".as_slice(),
+        ] {
+            let mut router = InputRouter::new();
+            router.focus = Focus::Bottom;
+
+            let routed = router.route_input(sequence);
+
+            assert_eq!(routed.pseudo_input, vec![PseudoInputAction::InsertNewline]);
+            assert!(routed.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn multiline_draft_renders_across_input_rows() {
+        let mut pane = pane_with(empty_snapshot(), true, 0);
+        pane.pseudo_input.buffer = "alpha\nbravo".to_string();
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
+        let rows = format_pseudo_input_rows(&pane, 2);
+
+        assert!(rows[0].contains("alpha"), "{rows:?}");
+        assert!(rows[1].contains("bravo▌"), "{rows:?}");
     }
 
     #[test]
@@ -7038,7 +7456,7 @@ mod tests {
 
     #[test]
     fn inspecting_pane_renders_header_and_buffered_output() {
-        let backend = TestBackend::new(60, 16);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut snapshot = empty_snapshot();
         snapshot.nodes = vec![node(
@@ -7053,11 +7471,11 @@ mod tests {
             "compiling crate".to_string(),
             "running 12 tests".to_string(),
         ];
-        let parser = vt100::Parser::new(5, 60, 0);
+        let parser = vt100::Parser::new(11, 60, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
-        let text = screen_text(terminal.backend().buffer(), 16, 60);
+        let text = screen_text(terminal.backend().buffer(), 20, 60);
         assert!(text.contains("detail"), "{text}");
         assert!(text.contains("running 12 tests"), "{text}");
     }
@@ -7120,8 +7538,10 @@ mod tests {
         let mut pane = MonitorPane::new();
         pane.expand();
         pane.store_snapshot(Arc::new(snapshot));
+        pane.closed_detail_node_id = Some("agent-bash:a".to_string());
+        pane.update_inspect();
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let winsize = libc::winsize {
             ws_row: 20,
             ws_col: 80,
@@ -7130,7 +7550,7 @@ mod tests {
         };
 
         let routed = route_real_input(
-            b"\x1b[<0;4;15M",
+            b"\x1b[<0;4;19M",
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -7146,6 +7566,79 @@ mod tests {
             "click selection should open selected detail: {:?}",
             pane.inspect
         );
+    }
+
+    #[test]
+    fn clicking_open_item_closes_detail_and_clicking_again_reopens() {
+        let (_dir, path) = write_inspect_log_fixture("live detail\n");
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node_with_log("agent-bash:h1", "cargo test", &path)];
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        pane.store_snapshot(Arc::new(snapshot));
+
+        assert!(pane.detail_visible());
+        pane.apply(MonitorCommand::ToggleSelectIndex(0));
+        assert!(!pane.detail_visible());
+        assert!(pane.inspect.is_empty());
+
+        pane.apply(MonitorCommand::ToggleSelectIndex(0));
+        assert!(pane.detail_visible());
+        assert!(pane.inspect.iter().any(|line| line == "live detail"));
+    }
+
+    #[test]
+    fn status_bar_click_collapses_and_reopens_list_while_input_remains_visible() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node(
+            "agent-bash:h1",
+            MonitorNodeKind::AgentBashWorkload,
+            MonitorStatus::Running,
+            "cargo test",
+        )];
+        let mut pane = pane_with(snapshot, false, 0);
+        let mut router = InputRouter::new();
+        router.focus = Focus::Bottom;
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let close = route_real_input(
+            b"\x1b[<0;4;12M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        for command in close.commands {
+            pane.apply(command);
+        }
+        assert!(pane.collapsed);
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let parser = vt100::Parser::new(15, 80, 0);
+        terminal
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
+            .unwrap();
+        let collapsed_text = screen_text(terminal.backend().buffer(), 20, 80);
+        assert!(collapsed_text.contains("input[1:0]"), "{collapsed_text}");
+        assert!(!collapsed_text.contains("cargo test"), "{collapsed_text}");
+
+        let open = route_real_input(
+            b"\x1b[<0;4;16M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        for command in open.commands {
+            pane.apply(command);
+        }
+        assert!(!pane.collapsed);
     }
 
     #[test]
@@ -7223,15 +7716,15 @@ mod tests {
         )];
         let mut pane = pane_with(snapshot, false, 0);
         pane.inspect = vec!["prepared detail sentinel".to_string()];
-        let backend = TestBackend::new(60, 16);
+        let backend = TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        let parser = vt100::Parser::new(5, 60, 0);
+        let parser = vt100::Parser::new(11, 60, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
 
-        let text = screen_text(terminal.backend().buffer(), 16, 60);
+        let text = screen_text(terminal.backend().buffer(), 20, 60);
         assert!(text.contains("prepared detail sentinel"), "{text}");
         assert!(
             !text.contains("cannot read log"),
@@ -7334,7 +7827,7 @@ mod tests {
 
     #[test]
     fn expanded_pane_lists_nodes_and_marks_selection() {
-        let backend = TestBackend::new(80, 12);
+        let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut snapshot = empty_snapshot();
         snapshot.summary = snapshot_summary(MonitorStatus::Running, 1, 1, 0, 0);
@@ -7353,11 +7846,11 @@ mod tests {
             ),
         ];
         let pane = pane_with(snapshot, false, 1);
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = vt100::Parser::new(11, 80, 0);
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
-        let text = screen_text(terminal.backend().buffer(), 12, 80);
+        let text = screen_text(terminal.backend().buffer(), 20, 80);
         assert!(text.contains("provider turn"), "{text}");
         assert!(text.contains("cargo test"), "{text}");
         assert!(
@@ -7368,8 +7861,151 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_overlay_still_renders_input_and_no_list() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node(
+            "agent-bash:h1",
+            MonitorNodeKind::AgentBashWorkload,
+            MonitorStatus::Running,
+            "cargo test",
+        )];
+        let pane = pane_with(snapshot, true, 0);
+        let parser = vt100::Parser::new(15, 80, 0);
+
+        terminal
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Top, &pane, None))
+            .unwrap();
+
+        let text = screen_text(terminal.backend().buffer(), 20, 80);
+        assert!(text.contains("input[1:0]"), "{text}");
+        assert!(text.contains("outbound: idle"), "{text}");
+        assert!(
+            !text.contains("cargo test"),
+            "collapsed list should stay hidden: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_overlay_renders_input_above_filter_tabs_and_list() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![node(
+            "agent-bash:h1",
+            MonitorNodeKind::AgentBashWorkload,
+            MonitorStatus::Running,
+            "cargo test",
+        )];
+        let pane = pane_with(snapshot, false, 0);
+        let parser = vt100::Parser::new(12, 80, 0);
+
+        terminal
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
+            .unwrap();
+
+        let buf = terminal.backend().buffer();
+        let input_row = (0..20)
+            .find(|row| row_text(buf, *row, 80).contains("input[1:0]"))
+            .expect("input row");
+        let tabs_row = (0..20)
+            .find(|row| row_text(buf, *row, 80).contains("filters:"))
+            .expect("tabs row");
+        let list_row = (0..20)
+            .find(|row| row_text(buf, *row, 80).contains("cargo test"))
+            .expect("list row");
+        assert!(input_row < tabs_row, "input={input_row} tabs={tabs_row}");
+        assert!(tabs_row < list_row, "tabs={tabs_row} list={list_row}");
+    }
+
+    #[test]
+    fn default_filter_is_running_bash_and_category_changes_filter_rows() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            node(
+                "invocation:i",
+                MonitorNodeKind::Invocation,
+                MonitorStatus::Running,
+                "agent invocation",
+            ),
+            node(
+                "agent-bash:h1",
+                MonitorNodeKind::AgentBashWorkload,
+                MonitorStatus::Running,
+                "cargo test",
+            ),
+            node(
+                "mailbox:m1",
+                MonitorNodeKind::MailboxNotification,
+                MonitorStatus::Pending,
+                "pending mailbox",
+            ),
+        ];
+        let mut pane = MonitorPane::new();
+        pane.expand();
+        pane.store_snapshot(Arc::new(snapshot));
+
+        assert_eq!(pane.active_filter, MonitorFilterCategory::Bash);
+        assert_eq!(filtered_labels_for_pane(&pane), vec!["cargo test"]);
+
+        pane.apply(MonitorCommand::SelectFilter(MonitorFilterCategory::Procs));
+        assert_eq!(filtered_labels_for_pane(&pane), vec!["agent invocation"]);
+
+        pane.apply(MonitorCommand::SelectFilter(MonitorFilterCategory::Mailbox));
+        assert_eq!(filtered_labels_for_pane(&pane), vec!["pending mailbox"]);
+    }
+
+    #[test]
+    fn filter_tabs_are_clickable_and_ctrl_f_cycles_tabs() {
+        let mut snapshot = empty_snapshot();
+        snapshot.nodes = vec![
+            node(
+                "agent-bash:h1",
+                MonitorNodeKind::AgentBashWorkload,
+                MonitorStatus::Running,
+                "cargo test",
+            ),
+            node(
+                "mailbox:m1",
+                MonitorNodeKind::MailboxNotification,
+                MonitorStatus::Pending,
+                "pending mailbox",
+            ),
+        ];
+        let pane = pane_with(snapshot, false, 0);
+        let mut router = InputRouter::new();
+        router.focus = Focus::Bottom;
+        let winsize = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<0;21;17M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+        assert_eq!(
+            routed.commands,
+            vec![MonitorCommand::SelectFilter(MonitorFilterCategory::Procs)]
+        );
+
+        let mut router = InputRouter::new();
+        router.focus = Focus::Bottom;
+        assert_eq!(
+            router.route_input(&[0x06]).commands,
+            vec![MonitorCommand::NextFilter]
+        );
+    }
+
+    #[test]
     fn tree_mode_renders_indented_parent_child_rows() {
-        let backend = TestBackend::new(80, 12);
+        let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut snapshot = empty_snapshot();
         snapshot.summary = snapshot_summary(MonitorStatus::Running, 3, 1, 0, 0);
@@ -7401,13 +8037,13 @@ mod tests {
         ];
         let mut pane = pane_with(snapshot, false, 0);
         pane.view_mode = MonitorViewMode::Tree;
-        let parser = vt100::Parser::new(5, 80, 0);
+        let parser = vt100::Parser::new(11, 80, 0);
 
         terminal
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
 
-        let text = screen_text(terminal.backend().buffer(), 12, 80);
+        let text = screen_text(terminal.backend().buffer(), 20, 80);
         assert!(
             text.contains("tree"),
             "status row should expose tree mode: {text}"
@@ -7520,7 +8156,7 @@ mod tests {
         let mut pane = pane_with(snapshot, false, 0);
         pane.view_mode = MonitorViewMode::Tree;
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         let winsize = libc::winsize {
             ws_row: 20,
             ws_col: 80,
@@ -7529,7 +8165,7 @@ mod tests {
         };
 
         let routed = route_real_input(
-            b"\x1b[<0;4;15M",
+            b"\x1b[<0;4;19M",
             &mut router,
             &pane,
             MouseRequest::disabled(),
@@ -7601,6 +8237,7 @@ mod tests {
 
         pane.store_snapshot(Arc::new(refreshed));
         let snapshot = pane.snapshot.as_ref().expect("snapshot");
+        let projected = pane.projected_rows(snapshot);
         let rows = visible_node_rows(
             &pane,
             snapshot,
@@ -7610,6 +8247,7 @@ mod tests {
                 width: 80,
                 height: 2,
             },
+            &projected,
         );
 
         assert_eq!(pane.selected_node_id.as_deref(), Some("agent-bash:h"));
@@ -7625,7 +8263,7 @@ mod tests {
     #[test]
     fn bottom_focus_arrows_decode_to_monitor_commands_and_printable_edits() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         assert_eq!(router.focus, Focus::Bottom);
 
         assert_eq!(
@@ -7773,7 +8411,7 @@ mod tests {
     #[test]
     fn cancel_keys_route_to_cancel_commands() {
         let mut router = InputRouter::new();
-        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+        router.focus = Focus::Bottom;
         assert_eq!(
             router.route_input(&[0x18]).commands,
             vec![MonitorCommand::RequestCancel]
