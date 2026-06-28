@@ -157,7 +157,7 @@ pub(super) fn execute_interactive_child(
 /// Launch the interactive child inside the split-pane observability TUI.
 ///
 /// Identical lifecycle to [`execute_interactive_child`] except the child PTY is
-/// sized to the TOP pane (one row reserved for the collapsed monitor) and child
+/// sized to the TOP pane (persistent overlay rows reserved) and child
 /// output is relayed into a virtual terminal rendered by the TUI rather than
 /// written straight to the real terminal.
 pub(super) fn execute_interactive_child_observed(
