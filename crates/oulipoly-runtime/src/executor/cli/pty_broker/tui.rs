@@ -80,6 +80,8 @@ const FOCUS_TOGGLE_BYTE: u8 = 0x0f;
 pub(super) const FOREGROUND_RENDER_FPS: u64 = 60;
 /// Target render cadence while the monitor overlay is collapsed/backgrounded.
 pub(super) const BACKGROUND_RENDER_FPS: u64 = 10;
+/// Bounded PTY reads folded into one relay iteration before publishing a frame.
+const MAX_COALESCED_PTY_READS: usize = 8;
 
 /// Bracketed-paste delimiters (DECSET 2004) the broker wraps an injected notification in
 /// when the child has advertised the mode, so the body is treated as pasted content and
@@ -133,6 +135,20 @@ pub(super) fn dimensions_sufficient(winsize: &libc::winsize) -> bool {
 pub(super) enum Focus {
     Top,
     Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RenderPriority {
+    Background,
+    Interactive,
+}
+
+impl RenderPriority {
+    fn escalate(&mut self, priority: Self) {
+        if priority > *self {
+            *self = priority;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2196,6 +2212,7 @@ struct RenderSnapshot {
     selection: Option<SelectionSpan>,
     mouse_request: MouseRequest,
     typing_protection: TypingProtection,
+    priority: RenderPriority,
 }
 
 impl RenderSnapshot {
@@ -2215,12 +2232,31 @@ impl RenderSnapshot {
         )
     }
 
+    #[cfg(test)]
     fn capture_with_typing_protection(
         screen: &vt100::Screen,
         focus: Focus,
         pane: &MonitorPane,
         selection: Option<SelectionSpan>,
         typing_protection: TypingProtection,
+    ) -> Self {
+        Self::capture_with_typing_protection_and_priority(
+            screen,
+            focus,
+            pane,
+            selection,
+            typing_protection,
+            RenderPriority::Background,
+        )
+    }
+
+    fn capture_with_typing_protection_and_priority(
+        screen: &vt100::Screen,
+        focus: Focus,
+        pane: &MonitorPane,
+        selection: Option<SelectionSpan>,
+        typing_protection: TypingProtection,
+        priority: RenderPriority,
     ) -> Self {
         Self {
             screen: ScreenRenderSnapshot::from_screen(screen),
@@ -2229,6 +2265,7 @@ impl RenderSnapshot {
             selection,
             mouse_request: effective_mouse_request(mouse_request_from_screen(screen)),
             typing_protection,
+            priority,
         }
     }
 }
@@ -2886,8 +2923,19 @@ fn format_interactive_child_poll_error(err: io::Error) -> String {
 }
 
 #[derive(Default)]
+struct RenderState {
+    snapshot: Option<Arc<RenderSnapshot>>,
+    generation: u64,
+}
+
+struct PublishedRenderSnapshot {
+    snapshot: Arc<RenderSnapshot>,
+    generation: u64,
+}
+
+#[derive(Default)]
 struct RenderShared {
-    snapshot: Mutex<Option<Arc<RenderSnapshot>>>,
+    state: Mutex<RenderState>,
     clipboard: Mutex<Vec<String>>,
     shutdown: AtomicBool,
     error: Mutex<Option<String>>,
@@ -2898,12 +2946,25 @@ struct RenderShared {
 
 impl RenderShared {
     fn publish(&self, snapshot: RenderSnapshot) {
-        *lock_or_recover(&self.snapshot) = Some(Arc::new(snapshot));
+        let mut state = lock_or_recover(&self.state);
+        state.generation = state.generation.wrapping_add(1);
+        state.snapshot = Some(Arc::new(snapshot));
         self.wake.notify_one();
     }
 
     fn latest_snapshot(&self) -> Option<Arc<RenderSnapshot>> {
-        lock_or_recover(&self.snapshot).clone()
+        lock_or_recover(&self.state).snapshot.clone()
+    }
+
+    fn latest_published(&self) -> Option<PublishedRenderSnapshot> {
+        let state = lock_or_recover(&self.state);
+        state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| PublishedRenderSnapshot {
+                snapshot: Arc::clone(snapshot),
+                generation: state.generation,
+            })
     }
 
     fn queue_clipboard_copy(&self, text: String) {
@@ -2947,7 +3008,7 @@ impl RenderShared {
         if now >= deadline {
             return;
         }
-        let guard = lock_or_recover(&self.snapshot);
+        let guard = lock_or_recover(&self.state);
         match self.wake.wait_timeout(guard, deadline - now) {
             Ok((guard, _)) => drop(guard),
             Err(poisoned) => drop(poisoned.into_inner()),
@@ -3095,23 +3156,42 @@ fn run_render_loop(
     alt: &mut AltScreenGuard,
 ) -> Result<(), String> {
     let mut next_frame = Instant::now();
+    let mut last_frame_at = None;
+    let mut last_rendered_generation = 0;
     loop {
         if shared.shutdown_requested() {
             render_latest_snapshot(shared, terminal, alt)?;
             return Ok(());
+        }
+        if let Some(published) = shared.latest_published()
+            && published.generation != last_rendered_generation
+        {
+            next_frame =
+                unrendered_publish_deadline(last_frame_at, &published.snapshot, Instant::now());
         }
         let now = Instant::now();
         if now < next_frame {
             shared.wait_until(next_frame);
             continue;
         }
-        let Some(snapshot) = shared.latest_snapshot() else {
+        let Some(published) = shared.latest_published() else {
             next_frame = Instant::now() + render_frame_interval(BACKGROUND_RENDER_FPS);
             continue;
         };
-        render_snapshot(shared, terminal, alt, &snapshot)?;
-        next_frame = Instant::now() + snapshot_frame_interval(&snapshot);
+        render_snapshot(shared, terminal, alt, &published.snapshot)?;
+        let rendered_at = Instant::now();
+        last_frame_at = Some(rendered_at);
+        last_rendered_generation = published.generation;
+        next_frame = rendered_at + snapshot_frame_interval(&published.snapshot);
     }
+}
+
+fn unrendered_publish_deadline(
+    last_frame_at: Option<Instant>,
+    snapshot: &RenderSnapshot,
+    now: Instant,
+) -> Instant {
+    last_frame_at.map_or(now, |last| last + snapshot_frame_interval(snapshot))
 }
 
 fn render_latest_snapshot(
@@ -3154,7 +3234,8 @@ fn snapshot_render_fps(snapshot: &RenderSnapshot) -> u64 {
 }
 
 fn snapshot_is_foreground(snapshot: &RenderSnapshot) -> bool {
-    snapshot.focus == Focus::Bottom && !snapshot.pane.collapsed
+    snapshot.priority == RenderPriority::Interactive
+        || (snapshot.focus == Focus::Bottom && !snapshot.pane.collapsed)
 }
 
 fn render_frame_interval(fps: u64) -> Duration {
@@ -3210,29 +3291,52 @@ pub(super) fn relay_until_exit_observed(
         &pane,
         None,
         typing_protection(router.focus, &line_state),
+        RenderPriority::Background,
     );
 
     while status.is_none() {
         publisher.check_error()?;
-        let mut dirty = pane.adopt_snapshot(snapshot_worker.latest_snapshot());
-        dirty |= pane.refresh_detail_if_due(Instant::now());
-        let mut protection = typing_protection(router.focus, &line_state);
-        dirty |= apply_sizing(
-            real_fd,
-            master_fd,
-            child.id(),
-            &pane,
-            protection,
-            &mut parser,
-            &mut applied,
+        let mut dirty = false;
+        let mut priority = RenderPriority::Background;
+        mark_render_dirty(
+            &mut dirty,
+            &mut priority,
+            pane.adopt_snapshot(snapshot_worker.latest_snapshot()),
+            RenderPriority::Background,
         );
-        dirty |= pump_outbound_queue(
-            &mut pane,
-            &mut pending_child_input,
-            &mut line_state,
-            parser.screen().bracketed_paste(),
-            &mut recent_turns,
-            Instant::now(),
+        mark_render_dirty(
+            &mut dirty,
+            &mut priority,
+            pane.refresh_detail_if_due(Instant::now()),
+            RenderPriority::Background,
+        );
+        let mut protection = typing_protection(router.focus, &line_state);
+        mark_render_dirty(
+            &mut dirty,
+            &mut priority,
+            apply_sizing(
+                real_fd,
+                master_fd,
+                child.id(),
+                &pane,
+                protection,
+                &mut parser,
+                &mut applied,
+            ),
+            RenderPriority::Background,
+        );
+        mark_render_dirty(
+            &mut dirty,
+            &mut priority,
+            pump_outbound_queue(
+                &mut pane,
+                &mut pending_child_input,
+                &mut line_state,
+                parser.screen().bracketed_paste(),
+                &mut recent_turns,
+                Instant::now(),
+            ),
+            RenderPriority::Interactive,
         );
         let ready = poll_relay_fds(
             real_fd,
@@ -3242,13 +3346,18 @@ pub(super) fn relay_until_exit_observed(
         )?;
         if ready.pty_writable {
             flush_pending_child_input(master_fd, &mut pending_child_input)?;
-            dirty |= pump_outbound_queue(
-                &mut pane,
-                &mut pending_child_input,
-                &mut line_state,
-                parser.screen().bracketed_paste(),
-                &mut recent_turns,
-                Instant::now(),
+            mark_render_dirty(
+                &mut dirty,
+                &mut priority,
+                pump_outbound_queue(
+                    &mut pane,
+                    &mut pending_child_input,
+                    &mut line_state,
+                    parser.screen().bracketed_paste(),
+                    &mut recent_turns,
+                    Instant::now(),
+                ),
+                RenderPriority::Interactive,
             );
         }
         if ready.real_input {
@@ -3267,14 +3376,31 @@ pub(super) fn relay_until_exit_observed(
             let typed_to_child = !routed.forward.is_empty();
             let right_click = routed.right_click;
             let gestures = std::mem::take(&mut routed.top_mouse);
-            dirty |= apply_routed_to_pane(&mut pane, routed, &snapshot_worker);
-            dirty |= pump_outbound_queue(
-                &mut pane,
-                &mut pending_child_input,
-                &mut line_state,
-                parser.screen().bracketed_paste(),
-                &mut recent_turns,
-                Instant::now(),
+            let input_priority = routed_input_render_priority(
+                &routed,
+                typed_to_child,
+                scroll_lines,
+                !gestures.is_empty(),
+                right_click.is_some(),
+            );
+            mark_render_dirty(
+                &mut dirty,
+                &mut priority,
+                apply_routed_to_pane(&mut pane, routed, &snapshot_worker),
+                input_priority,
+            );
+            mark_render_dirty(
+                &mut dirty,
+                &mut priority,
+                pump_outbound_queue(
+                    &mut pane,
+                    &mut pending_child_input,
+                    &mut line_state,
+                    parser.screen().bracketed_paste(),
+                    &mut recent_turns,
+                    Instant::now(),
+                ),
+                RenderPriority::Interactive,
             );
             if typed_to_child {
                 // Typing snaps to the live tail and drops the selection highlight.
@@ -3282,21 +3408,26 @@ pub(super) fn relay_until_exit_observed(
                 if top_scrollback != 0 {
                     top_scrollback = 0;
                 }
-                dirty = true;
+                mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
             } else if scroll_lines != 0 {
                 // Keep the selection — its highlight follows the content as we scroll.
                 top_scrollback = apply_top_scroll(top_scrollback, scroll_lines);
-                dirty = true;
+                mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
             }
             if !gestures.is_empty() {
-                dirty |= apply_selection_gestures(
-                    &mut selection,
-                    &gestures,
-                    parser.screen(),
-                    &publisher,
-                    top_scrollback,
-                    &mut clipboard,
-                )?;
+                mark_render_dirty(
+                    &mut dirty,
+                    &mut priority,
+                    apply_selection_gestures(
+                        &mut selection,
+                        &gestures,
+                        parser.screen(),
+                        &publisher,
+                        top_scrollback,
+                        &mut clipboard,
+                    )?,
+                    RenderPriority::Interactive,
+                );
             }
             if let Some(click) = right_click {
                 let mut io = MouseActionIo {
@@ -3305,18 +3436,23 @@ pub(super) fn relay_until_exit_observed(
                     line_state: &mut line_state,
                     pending_child_input: &mut pending_child_input,
                 };
-                dirty |= handle_top_right_click(
-                    &mut selection,
-                    click,
-                    parser.screen(),
-                    top_scrollback,
-                    &mut io,
-                )?;
+                mark_render_dirty(
+                    &mut dirty,
+                    &mut priority,
+                    handle_top_right_click(
+                        &mut selection,
+                        click,
+                        parser.screen(),
+                        top_scrollback,
+                        &mut io,
+                    )?,
+                    RenderPriority::Interactive,
+                );
             }
         }
-        if ready.pty_output && pump_pty_output(master_fd, &mut parser, &mut buffer)? {
+        if ready.pty_output && pump_pty_output_burst(master_fd, &mut parser, &mut buffer)? {
             child_output_state.observe_child_output();
-            dirty = true;
+            mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
         if ready.control
             && let Some(control) = control
@@ -3334,19 +3470,24 @@ pub(super) fn relay_until_exit_observed(
                 child_pid: Some(child.id()),
             };
             let _ = service_control(control, &mut control_io);
-            dirty = true;
+            mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
         // Re-assert the scrollback view each frame (clamped to retained history) so it
         // survives child output and resizes; reading it back keeps our offset honest.
         protection = typing_protection(router.focus, &line_state);
-        dirty |= apply_sizing(
-            real_fd,
-            master_fd,
-            child.id(),
-            &pane,
-            protection,
-            &mut parser,
-            &mut applied,
+        mark_render_dirty(
+            &mut dirty,
+            &mut priority,
+            apply_sizing(
+                real_fd,
+                master_fd,
+                child.id(),
+                &pane,
+                protection,
+                &mut parser,
+                &mut applied,
+            ),
+            RenderPriority::Background,
         );
         parser.screen_mut().set_scrollback(top_scrollback);
         top_scrollback = parser.screen().scrollback();
@@ -3358,6 +3499,7 @@ pub(super) fn relay_until_exit_observed(
                 &pane,
                 current_render_selection(&selection, top_scrollback, parser.screen().size().0),
                 protection,
+                priority,
             );
         }
         publisher.check_error()?;
@@ -3374,6 +3516,7 @@ pub(super) fn relay_until_exit_observed(
         &pane,
         None,
         typing_protection(router.focus, &line_state),
+        RenderPriority::Background,
     );
     renderer.shutdown_and_join()?;
     snapshot_worker.shutdown_and_join()?;
@@ -3983,6 +4126,56 @@ fn apply_routed_to_pane(
     routed.redraw
 }
 
+fn mark_render_dirty(
+    dirty: &mut bool,
+    priority: &mut RenderPriority,
+    changed: bool,
+    changed_priority: RenderPriority,
+) {
+    if changed {
+        *dirty = true;
+        priority.escalate(changed_priority);
+    }
+}
+
+fn routed_input_render_priority(
+    routed: &RoutedInput,
+    typed_to_child: bool,
+    scroll_lines: i32,
+    selection_gestures: bool,
+    right_click: bool,
+) -> RenderPriority {
+    if typed_to_child
+        || scroll_lines != 0
+        || selection_gestures
+        || right_click
+        || routed.focus_bottom
+        || routed.redraw
+        || !routed.pseudo_input.is_empty()
+        || routed.commands.iter().any(monitor_command_is_interactive)
+    {
+        RenderPriority::Interactive
+    } else {
+        RenderPriority::Background
+    }
+}
+
+fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
+    matches!(
+        command,
+        MonitorCommand::SelectNext
+            | MonitorCommand::SelectPrev
+            | MonitorCommand::SelectIndex(_)
+            | MonitorCommand::ToggleTreeMode
+            | MonitorCommand::Refresh
+            | MonitorCommand::Collapse
+            | MonitorCommand::ToggleInspect
+            | MonitorCommand::RequestCancel
+            | MonitorCommand::ConfirmCancel
+            | MonitorCommand::AbortCancel
+    )
+}
+
 fn apply_routed_pseudo_input(pane: &mut MonitorPane, actions: &[PseudoInputAction]) {
     let now = Instant::now();
     for action in actions {
@@ -4020,6 +4213,41 @@ fn pump_pty_output(
 ) -> Result<bool, String> {
     let output = read_pty_output(master_fd, buffer).map_err(format_pty_output_read_error)?;
     Ok(process_pty_output(parser, buffer, output))
+}
+
+fn pump_pty_output_burst(
+    master_fd: RawFd,
+    parser: &mut vt100::Parser,
+    buffer: &mut [u8],
+) -> Result<bool, String> {
+    let mut saw_output = false;
+    for read_index in 0..MAX_COALESCED_PTY_READS {
+        if read_index != 0 && !pty_output_ready_now(master_fd)? {
+            break;
+        }
+        if !pump_pty_output(master_fd, parser, buffer)? {
+            break;
+        }
+        saw_output = true;
+    }
+    Ok(saw_output)
+}
+
+fn pty_output_ready_now(master_fd: RawFd) -> Result<bool, String> {
+    let mut pollfd = poll_master_fd(master_fd, false);
+    let rc = unsafe { libc::poll(std::slice::from_mut(&mut pollfd).as_mut_ptr(), 1, 0) };
+    if rc >= 0 {
+        return Ok(readable(pollfd.revents));
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EINTR) {
+        return Ok(false);
+    }
+    Err(format_pty_output_coalesce_poll_error(err))
+}
+
+fn format_pty_output_coalesce_poll_error(err: io::Error) -> String {
+    format!("Failed to poll PTY output for coalescing: {err}")
 }
 
 /// Drain any buffered child output into the virtual terminal after exit.
@@ -4110,13 +4338,15 @@ fn publish_render_snapshot(
     pane: &MonitorPane,
     selection: Option<SelectionSpan>,
     typing_protection: TypingProtection,
+    priority: RenderPriority,
 ) {
-    publisher.publish(RenderSnapshot::capture_with_typing_protection(
+    publisher.publish(RenderSnapshot::capture_with_typing_protection_and_priority(
         parser.screen(),
         focus,
         pane,
         selection,
         typing_protection,
+        priority,
     ));
 }
 
@@ -4587,6 +4817,28 @@ mod tests {
         (0..width)
             .map(|x| buf[(x, area_y)].symbol().to_string())
             .collect()
+    }
+
+    fn screen_row_text(screen: &vt100::Screen, row: u16, width: u16) -> String {
+        (0..width)
+            .map(|col| {
+                screen
+                    .cell(row, col)
+                    .map(vt100::Cell::contents)
+                    .unwrap_or(" ")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn routed_priority(routed: &RoutedInput) -> RenderPriority {
+        routed_input_render_priority(
+            routed,
+            !routed.forward.is_empty(),
+            routed.top_scroll_lines,
+            !routed.top_mouse.is_empty(),
+            routed.right_click.is_some(),
+        )
     }
 
     #[test]
@@ -5684,6 +5936,159 @@ mod tests {
     }
 
     #[test]
+    fn top_focus_recent_input_is_interactive_render_priority() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(b"a", &mut router, &pane, MouseRequest::disabled(), &winsize);
+
+        assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
+    }
+
+    #[test]
+    fn top_scrollback_change_is_interactive_render_priority() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<64;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+
+        assert_eq!(routed.top_scroll_lines, TOP_SCROLL_STEP);
+        assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
+    }
+
+    #[test]
+    fn lower_pane_selection_change_is_interactive_render_priority() {
+        let mut router = InputRouter::new();
+        router.route_input(&[FOCUS_TOGGLE_BYTE]);
+
+        let routed = router.route_input(&[0x1b, b'[', b'B']);
+
+        assert_eq!(routed.commands, vec![MonitorCommand::SelectNext]);
+        assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
+    }
+
+    #[test]
+    fn child_output_priority_reaches_foreground_without_bottom_focus() {
+        let parser = vt100::Parser::new(5, 80, 0);
+        let snapshot = RenderSnapshot::capture_with_typing_protection_and_priority(
+            parser.screen(),
+            Focus::Top,
+            &MonitorPane::new(),
+            None,
+            TypingProtection::for_focus(Focus::Top),
+            RenderPriority::Interactive,
+        );
+
+        assert_eq!(snapshot_render_fps(&snapshot), FOREGROUND_RENDER_FPS);
+    }
+
+    #[test]
+    fn interactive_publish_deadline_preempts_stale_background_wait() {
+        let parser = vt100::Parser::new(5, 80, 0);
+        let pane = MonitorPane::new();
+        let background = RenderSnapshot::capture_with_typing_protection_and_priority(
+            parser.screen(),
+            Focus::Top,
+            &pane,
+            None,
+            TypingProtection::for_focus(Focus::Top),
+            RenderPriority::Background,
+        );
+        let interactive = RenderSnapshot::capture_with_typing_protection_and_priority(
+            parser.screen(),
+            Focus::Top,
+            &pane,
+            None,
+            TypingProtection::for_focus(Focus::Top),
+            RenderPriority::Interactive,
+        );
+        let last_frame = Instant::now();
+        let now = last_frame + Duration::from_millis(5);
+
+        let background_deadline = unrendered_publish_deadline(Some(last_frame), &background, now);
+        let interactive_deadline = unrendered_publish_deadline(Some(last_frame), &interactive, now);
+
+        assert_eq!(
+            background_deadline.duration_since(last_frame),
+            render_frame_interval(BACKGROUND_RENDER_FPS)
+        );
+        assert_eq!(
+            interactive_deadline.duration_since(last_frame),
+            render_frame_interval(FOREGROUND_RENDER_FPS)
+        );
+        assert!(interactive_deadline < background_deadline);
+    }
+
+    #[test]
+    fn background_publish_deadline_remains_throttled() {
+        let parser = vt100::Parser::new(5, 80, 0);
+        let snapshot =
+            RenderSnapshot::capture(parser.screen(), Focus::Top, &MonitorPane::new(), None);
+        let last_frame = Instant::now();
+        let now = last_frame + Duration::from_millis(5);
+
+        let deadline = unrendered_publish_deadline(Some(last_frame), &snapshot, now);
+
+        assert_eq!(
+            deadline.duration_since(last_frame),
+            render_frame_interval(BACKGROUND_RENDER_FPS)
+        );
+    }
+
+    #[test]
+    fn child_output_burst_coalescing_preserves_final_screen_state() {
+        let (read_end, mut write_end) = pipe_files();
+        write_end.write_all(b"abcdef").unwrap();
+        let mut parser = vt100::Parser::new(1, 20, 0);
+        let mut buffer = [0_u8; 2];
+
+        assert!(pump_pty_output_burst(read_end.as_raw_fd(), &mut parser, &mut buffer).unwrap());
+
+        assert_eq!(screen_row_text(parser.screen(), 0, 6), "abcdef");
+    }
+
+    #[test]
+    fn top_wheel_burst_coalesces_to_final_scroll_delta() {
+        let mut router = InputRouter::new();
+        let pane = MonitorPane::new();
+        let winsize = libc::winsize {
+            ws_row: 10,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+
+        let routed = route_real_input(
+            b"\x1b[<64;4;3M\x1b[<64;4;3M",
+            &mut router,
+            &pane,
+            MouseRequest::disabled(),
+            &winsize,
+        );
+
+        assert_eq!(routed.top_scroll_lines, TOP_SCROLL_STEP * 2);
+        assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
+    }
+
+    #[test]
     fn render_thread_keeps_drawing_while_processing_side_is_busy() {
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
@@ -5719,6 +6124,7 @@ mod tests {
             &pane,
             None,
             TypingProtection::for_focus(Focus::Bottom),
+            RenderPriority::Interactive,
         );
 
         let before = publisher.frame_count();
