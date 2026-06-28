@@ -1533,6 +1533,7 @@ struct InputLineState {
     last_user_input_at: Option<Instant>,
     enter_escape_state: EnterEscapeState,
     boundary_probe: Vec<u8>,
+    mouse_skipped_count: u64,
     last_submit_trace: Option<InputLineTraceSnapshot>,
 }
 
@@ -1544,6 +1545,7 @@ struct InputLineTraceSnapshot {
     last_user_input_ms: Option<u128>,
     user_input_idle: bool,
     boundary_probe: String,
+    mouse_skipped_count: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1576,6 +1578,12 @@ enum EnterEscapeState {
     CsiThirteen,
     CsiThirteenModifierStart,
     CsiThirteenModifierDigits,
+    CsiParams,
+    CsiMouseSgrStart,
+    CsiMouseSgrParams,
+    LegacyMouseByte1,
+    LegacyMouseByte2,
+    LegacyMouseByte3,
     ApplicationKeypad,
 }
 
@@ -1603,6 +1611,7 @@ impl Default for InputLineState {
             last_user_input_at: None,
             enter_escape_state: EnterEscapeState::None,
             boundary_probe: Vec::new(),
+            mouse_skipped_count: 0,
             last_submit_trace: None,
         }
     }
@@ -1614,76 +1623,115 @@ impl InputLineState {
             return;
         }
         self.last_submit_trace = None;
-        self.last_user_input_at = Some(Instant::now());
+        let now = Instant::now();
+        let mut saw_line_affecting_input = false;
         for byte in bytes.iter().copied() {
-            self.observe_user_input_byte(byte);
+            saw_line_affecting_input |= self.observe_user_input_byte(byte);
+        }
+        if saw_line_affecting_input {
+            self.last_user_input_at = Some(now);
         }
     }
 
-    fn observe_user_input_byte(&mut self, byte: u8) {
+    fn observe_user_input_byte(&mut self, byte: u8) -> bool {
         self.record_boundary_probe_byte(byte);
         if self.enter_escape_state != EnterEscapeState::None {
-            self.observe_enter_escape_byte(byte);
-            return;
+            return self.observe_enter_escape_byte(byte);
         }
-        self.observe_non_escape_byte(byte);
+        self.observe_non_escape_byte(byte)
     }
 
-    fn observe_enter_escape_byte(&mut self, byte: u8) {
+    fn observe_enter_escape_byte(&mut self, byte: u8) -> bool {
         let next = match (self.enter_escape_state, byte) {
             (EnterEscapeState::Esc, b'[') => Some(EnterEscapeState::Csi),
             (EnterEscapeState::Esc, b'O') => Some(EnterEscapeState::ApplicationKeypad),
+            (EnterEscapeState::Csi, b'<') => Some(EnterEscapeState::CsiMouseSgrStart),
+            (EnterEscapeState::Csi, b'M') => Some(EnterEscapeState::LegacyMouseByte1),
             (EnterEscapeState::Csi, b'1') => Some(EnterEscapeState::CsiOne),
+            (EnterEscapeState::Csi, b'0'..=b'9' | b';') => Some(EnterEscapeState::CsiParams),
             (EnterEscapeState::CsiOne, b'3') => Some(EnterEscapeState::CsiThirteen),
+            (EnterEscapeState::CsiOne, b'0'..=b'9' | b';') => Some(EnterEscapeState::CsiParams),
             (EnterEscapeState::CsiThirteen, b';') => {
                 Some(EnterEscapeState::CsiThirteenModifierStart)
             }
+            (EnterEscapeState::CsiThirteen, b'0'..=b'9') => Some(EnterEscapeState::CsiParams),
             (EnterEscapeState::CsiThirteenModifierStart, b'0'..=b'9') => {
                 Some(EnterEscapeState::CsiThirteenModifierDigits)
             }
+            (EnterEscapeState::CsiThirteenModifierStart, b';') => Some(EnterEscapeState::CsiParams),
             (EnterEscapeState::CsiThirteenModifierDigits, b'0'..=b'9') => {
                 Some(EnterEscapeState::CsiThirteenModifierDigits)
             }
+            (EnterEscapeState::CsiThirteenModifierDigits, b';') => {
+                Some(EnterEscapeState::CsiParams)
+            }
+            (EnterEscapeState::CsiParams, b'0'..=b'9' | b';') => Some(EnterEscapeState::CsiParams),
+            (EnterEscapeState::CsiMouseSgrStart, b'0'..=b'9' | b';') => {
+                Some(EnterEscapeState::CsiMouseSgrParams)
+            }
+            (EnterEscapeState::CsiMouseSgrParams, b'0'..=b'9' | b';') => {
+                Some(EnterEscapeState::CsiMouseSgrParams)
+            }
+            (EnterEscapeState::LegacyMouseByte1, _) => Some(EnterEscapeState::LegacyMouseByte2),
+            (EnterEscapeState::LegacyMouseByte2, _) => Some(EnterEscapeState::LegacyMouseByte3),
             (EnterEscapeState::CsiThirteen, b'u') => {
-                self.enter_escape_state = EnterEscapeState::None;
-                self.at_line_boundary = true;
-                self.clear_boundary_probe();
-                return;
+                self.complete_enter_escape();
+                return true;
             }
             (EnterEscapeState::CsiThirteenModifierDigits, b'u') => {
-                self.enter_escape_state = EnterEscapeState::None;
-                self.at_line_boundary = true;
-                self.clear_boundary_probe();
-                return;
+                self.complete_enter_escape();
+                return true;
             }
             (EnterEscapeState::ApplicationKeypad, b'M') => {
-                self.enter_escape_state = EnterEscapeState::None;
-                self.at_line_boundary = true;
-                self.clear_boundary_probe();
-                return;
+                self.complete_enter_escape();
+                return true;
+            }
+            (EnterEscapeState::CsiOne, b'M')
+            | (EnterEscapeState::CsiThirteen, b'M')
+            | (EnterEscapeState::CsiThirteenModifierStart, b'M')
+            | (EnterEscapeState::CsiThirteenModifierDigits, b'M')
+            | (EnterEscapeState::CsiParams, b'M')
+            | (EnterEscapeState::CsiMouseSgrStart, b'M' | b'm')
+            | (EnterEscapeState::CsiMouseSgrParams, b'M' | b'm')
+            | (EnterEscapeState::LegacyMouseByte3, _) => {
+                self.complete_mouse_sequence();
+                return false;
             }
             _ => None,
         };
 
         if let Some(next) = next {
             self.enter_escape_state = next;
-            self.at_line_boundary = false;
+            false
         } else {
             self.enter_escape_state = EnterEscapeState::None;
-            self.observe_non_escape_byte(byte);
+            let _ = self.observe_non_escape_byte(byte);
+            true
         }
     }
 
-    fn observe_non_escape_byte(&mut self, byte: u8) {
+    fn observe_non_escape_byte(&mut self, byte: u8) -> bool {
         if byte == 0x1b {
             self.enter_escape_state = EnterEscapeState::Esc;
-            self.at_line_boundary = false;
+            false
         } else {
             self.at_line_boundary = line_boundary_after_input_byte(byte);
             if self.at_line_boundary {
                 self.clear_boundary_probe();
             }
+            true
         }
+    }
+
+    fn complete_enter_escape(&mut self) {
+        self.enter_escape_state = EnterEscapeState::None;
+        self.at_line_boundary = true;
+        self.clear_boundary_probe();
+    }
+
+    fn complete_mouse_sequence(&mut self) {
+        self.enter_escape_state = EnterEscapeState::None;
+        self.mouse_skipped_count = self.mouse_skipped_count.saturating_add(1);
     }
 
     fn is_safe_to_inject(&self) -> bool {
@@ -1726,6 +1774,7 @@ impl InputLineState {
 
     fn clear_boundary_probe(&mut self) {
         self.boundary_probe.clear();
+        self.mouse_skipped_count = 0;
     }
 
     fn boundary_probe_trace_value(&self) -> String {
@@ -1743,6 +1792,7 @@ impl InputLineState {
             last_user_input_ms: self.millis_since_last_user_input(),
             user_input_idle: self.user_input_idle(),
             boundary_probe: self.boundary_probe_trace_value(),
+            mouse_skipped_count: self.mouse_skipped_count,
         }
     }
 
@@ -2216,7 +2266,7 @@ fn trace_notify_gate_decision(
         "trigger=pty-control \
          session_id={} invocation_uuid={} input_empty={} at_boundary={} mid_escape={} \
          last_user_input_ms={} user_input_idle_ms={} user_input_idle={} \
-         user_input_idle_threshold_ms={} boundary_probe={} quiescent={} \
+         user_input_idle_threshold_ms={} boundary_probe={} mouse_skipped={} quiescent={} \
          last_child_output_ms={} foreground={} decision={} inject_status={} \
          reason={} consumed=unknown",
         control.session_id(),
@@ -2229,6 +2279,7 @@ fn trace_notify_gate_decision(
         line.user_input_idle,
         USER_INPUT_IDLE_INJECT_MS,
         line.boundary_probe,
+        line.mouse_skipped_count,
         child_output_state.is_quiescent(),
         optional_millis_trace_value(child_output_state.millis_since_last_child_output()),
         foreground_trace_value(foreground),
@@ -2426,6 +2477,77 @@ mod tests {
         state.observe_user_input(b"5u");
         assert!(state.at_line_boundary);
         assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+    }
+
+    #[test]
+    fn input_line_state_skips_sgr_mouse_after_boundary_without_recent_user_input() {
+        let mut state = InputLineState::default();
+
+        state.observe_user_input(b"\x1b[<35;79;1M\x1b[<0;79;1m");
+
+        assert!(state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+        assert_eq!(state.last_user_input_at, None);
+        assert_eq!(state.mouse_skipped_count, 2);
+        assert!(state.is_safe_to_inject());
+        assert_eq!(state.trace_snapshot().mouse_skipped_count, 2);
+    }
+
+    #[test]
+    fn input_line_state_skips_mouse_sequences_interleaved_with_typing() {
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"a");
+        let typed_at = Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1);
+        state.last_user_input_at = Some(typed_at);
+
+        state.observe_user_input(b"\x1b[<35;79;1M");
+
+        assert!(!state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+        assert_eq!(state.last_user_input_at, Some(typed_at));
+        assert_eq!(state.mouse_skipped_count, 1);
+
+        state.observe_user_input(b"b");
+
+        assert!(!state.at_line_boundary);
+        assert_ne!(state.last_user_input_at, Some(typed_at));
+    }
+
+    #[test]
+    fn input_line_state_skips_legacy_and_urxvt_mouse_sequences() {
+        let mut state = InputLineState::default();
+
+        state.observe_user_input(b"\x1b[Mabc\x1b[35;79;1M");
+
+        assert!(state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+        assert_eq!(state.last_user_input_at, None);
+        assert_eq!(state.mouse_skipped_count, 2);
+        assert!(state.is_safe_to_inject());
+    }
+
+    #[test]
+    fn input_line_state_handles_split_sgr_mouse_sequence() {
+        let mut state = InputLineState::default();
+
+        state.observe_user_input(b"\x1b[<35");
+
+        assert!(state.at_line_boundary);
+        assert_eq!(
+            state.enter_escape_state,
+            EnterEscapeState::CsiMouseSgrParams
+        );
+        assert_eq!(state.last_user_input_at, None);
+        assert!(state.mid_escape());
+        assert!(!state.is_safe_to_inject());
+
+        state.observe_user_input(b";79;1M");
+
+        assert!(state.at_line_boundary);
+        assert_eq!(state.enter_escape_state, EnterEscapeState::None);
+        assert_eq!(state.last_user_input_at, None);
+        assert_eq!(state.mouse_skipped_count, 1);
+        assert!(state.is_safe_to_inject());
     }
 
     #[test]
@@ -2733,6 +2855,37 @@ mod tests {
         )
         .unwrap();
 
+        drop(write_end);
+        let mut read_end = read_end;
+        let mut received = String::new();
+        read_end.read_to_string(&mut received).unwrap();
+        assert_eq!(received, "notify\r");
+    }
+
+    #[test]
+    fn control_request_sgr_mouse_after_boundary_injects_without_idle_fallback() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_inject_frame(&mut client, b"notify").unwrap();
+        let (real_read_end, _real_write_end) = pipe_files();
+        let (read_end, write_end) = pipe_files();
+        let mut state = InputLineState::default();
+        state.observe_user_input(b"\x1b[<35;79;1M\x1b[<0;79;1m");
+        let mut buffer = [0_u8; 256];
+        let started = Instant::now();
+
+        process_control_request(
+            &mut server,
+            real_read_end.as_raw_fd(),
+            write_end.as_raw_fd(),
+            &mut state,
+            &mut buffer,
+        )
+        .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "mouse-only input should not wait for user-input idle fallback"
+        );
         drop(write_end);
         let mut read_end = read_end;
         let mut received = String::new();
