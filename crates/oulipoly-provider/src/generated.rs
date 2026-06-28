@@ -8,6 +8,10 @@ pub const CONTRACT_VERSION: &str = "oulipoly.provider/v1";
 
 pub type JsonObject = BTreeMap<String, Value>;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostContext {
     pub app: String,
@@ -309,6 +313,8 @@ pub struct DescribeCapabilities {
     pub policy: bool,
     pub quota: bool,
     pub session: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session_enumerate: bool,
     pub terminal: bool,
     pub rotation: bool,
     pub discovery: bool,
@@ -546,6 +552,53 @@ pub struct QuotaRefreshAuthResult {
     pub checked_at_unix_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEnumerateParams {
+    pub settings_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_cwd: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_turn_count: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEnumerateSource {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEnumerateEntry {
+    pub provider_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    pub source: SessionEnumerateSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEnumerateResult {
+    pub sessions: Vec<SessionEnumerateEntry>,
+    pub complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1025,6 +1078,9 @@ pub type QuotaProbeErrorResponse = ErrorResponseEnvelope;
 pub type QuotaRefreshAuthRequest = RequestEnvelope<QuotaRefreshAuthParams>;
 pub type QuotaRefreshAuthResponse = SuccessResponseEnvelope<QuotaRefreshAuthResult>;
 pub type QuotaRefreshAuthErrorResponse = ErrorResponseEnvelope;
+pub type SessionEnumerateRequest = RequestEnvelope<SessionEnumerateParams>;
+pub type SessionEnumerateResponse = SuccessResponseEnvelope<SessionEnumerateResult>;
+pub type SessionEnumerateErrorResponse = ErrorResponseEnvelope;
 pub type SessionLocateTranscriptRequest = RequestEnvelope<SessionBaseParams>;
 pub type SessionLocateTranscriptResponse = SuccessResponseEnvelope<SessionLocateTranscriptResult>;
 pub type SessionLocateTranscriptErrorResponse = ErrorResponseEnvelope;

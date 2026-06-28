@@ -13,6 +13,87 @@
       "required": ["settings_id"],
       "additionalProperties": true
     },
+    "SessionEnumerateParams": {
+      "type": "object",
+      "properties": {
+        "settings_id": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 1 },
+        "cursor": { "type": ["string", "null"] },
+        "include_cwd": { "type": "boolean" },
+        "include_turn_count": { "type": "boolean" },
+        "since_unix_ms": {
+          "anyOf": [
+            { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": ["settings_id"],
+      "additionalProperties": false
+    },
+    "SessionEnumerateRequest": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
+        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionEnumerateParams" } } }
+      ]
+    },
+    "SessionEnumerateSource": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "detail": { "type": ["string", "null"] }
+      },
+      "required": ["kind"],
+      "additionalProperties": false
+    },
+    "SessionEnumerateEntry": {
+      "type": "object",
+      "properties": {
+        "provider_session_id": { "type": "string", "minLength": 1 },
+        "title": { "type": ["string", "null"] },
+        "cwd": { "type": ["string", "null"] },
+        "created_unix_ms": {
+          "anyOf": [
+            { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+            { "type": "null" }
+          ]
+        },
+        "updated_unix_ms": {
+          "anyOf": [
+            { "$ref": "common.schema.json#/$defs/UnixMilliseconds" },
+            { "type": "null" }
+          ]
+        },
+        "turn_count": { "type": ["integer", "null"], "minimum": 0 },
+        "source": { "$ref": "#/$defs/SessionEnumerateSource" }
+      },
+      "required": ["provider_session_id", "source"],
+      "additionalProperties": false
+    },
+    "SessionEnumerateResult": {
+      "type": "object",
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SessionEnumerateEntry" }
+        },
+        "complete": { "type": "boolean" },
+        "next_cursor": { "type": ["string", "null"] },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["sessions", "complete", "warnings"],
+      "additionalProperties": false
+    },
+    "SessionEnumerateResponse": {
+      "allOf": [
+        { "$ref": "common.schema.json#/$defs/SuccessResponseEnvelope" },
+        { "type": "object", "properties": { "result": { "$ref": "#/$defs/SessionEnumerateResult" } } }
+      ]
+    },
+    "SessionEnumerateErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
     "SessionLocateTranscriptRequest": {
       "allOf": [
         { "$ref": "common.schema.json#/$defs/RequestEnvelope" },

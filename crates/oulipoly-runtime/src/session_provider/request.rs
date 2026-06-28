@@ -1,10 +1,11 @@
 use super::host::host_context;
 use super::types::{
-    SessionProviderError, SessionProviderIdentity, SessionProviderLifecycleContext,
+    SessionProviderEnumerateRequest, SessionProviderError, SessionProviderIdentity,
+    SessionProviderLifecycleContext,
 };
 use crate::session_metadata::TranscriptLookupMode;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, JsonObject, RequestEnvelope, SessionBaseParams,
+    CONTRACT_VERSION, JsonObject, RequestEnvelope, SessionBaseParams, SessionEnumerateParams,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -106,6 +107,28 @@ pub(super) fn capture_extra(invocation_uuid: &str) -> JsonObject {
         Value::String(invocation_uuid.to_string()),
     );
     extra
+}
+
+pub(super) fn enumerate_request(
+    request: &SessionProviderEnumerateRequest<'_>,
+) -> Result<Value, SessionProviderError> {
+    let envelope = RequestEnvelope {
+        contract: CONTRACT_VERSION.to_string(),
+        request_id: session_request_id("enumerate"),
+        provider_instance_id: Some(provider_instance_id(&request.identity)),
+        host: host_context(request.effective_cwd),
+        params: SessionEnumerateParams {
+            settings_id: request.identity.settings_id.clone(),
+            limit: request.limit,
+            cursor: request.cursor.map(str::to_string),
+            include_cwd: Some(request.include_cwd),
+            include_turn_count: Some(request.include_turn_count),
+            since_unix_ms: request.since_unix_ms,
+        },
+    };
+    serde_json::to_value(envelope).map_err(|err| {
+        SessionProviderError::new("session_request_serialize_failed", err.to_string())
+    })
 }
 
 pub(super) fn lifecycle_extra(context: &SessionProviderLifecycleContext<'_>) -> JsonObject {

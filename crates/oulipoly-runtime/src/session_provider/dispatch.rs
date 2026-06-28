@@ -1,19 +1,25 @@
+use super::enumerate;
 use super::locate;
-use super::provider_client::{invoke_session, provider_client, session_client};
+use super::provider_client::{
+    invoke_session, provider_client, session_client, session_enumerate_client,
+};
 use super::request::{
-    base_request, capture_extra, lifecycle_extra, locate_extra, read_session_id_for_lifecycle,
+    base_request, capture_extra, enumerate_request, lifecycle_extra, locate_extra,
+    read_session_id_for_lifecycle,
 };
 use super::turns;
 use super::types::{
-    SessionProviderCaptureRequest, SessionProviderCaptureResult, SessionProviderError,
-    SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLocateRequest,
+    SessionProviderCaptureRequest, SessionProviderCaptureResult, SessionProviderEnumerateRequest,
+    SessionProviderEnumerateResult, SessionProviderError, SessionProviderIdentity,
+    SessionProviderLifecycleContext, SessionProviderLocateRequest,
     SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest,
     SessionProviderReadTurnsResult,
 };
 use crate::session_metadata::LocatedTranscript;
 use oulipoly_provider::client::ProviderClient;
 use oulipoly_provider::generated::{
-    JsonObject, SessionCaptureResult as ProviderCaptureResult, SessionLocateTranscriptResult,
+    JsonObject, SessionCaptureResult as ProviderCaptureResult,
+    SessionEnumerateResult as ProviderEnumerateResult, SessionLocateTranscriptResult,
     SessionReadTurnsResult,
 };
 use std::path::Path;
@@ -73,6 +79,18 @@ pub fn capture(
         request.effective_cwd,
         capture_extra(request.invocation_uuid),
     )
+}
+
+pub fn enumerate_sessions(
+    request: SessionProviderEnumerateRequest<'_>,
+) -> Result<SessionProviderEnumerateResult, SessionProviderError> {
+    let client = session_enumerate_client(request.registry, &request.identity)?;
+    let result = invoke_session::<ProviderEnumerateResult>(
+        &client,
+        "session.enumerate",
+        enumerate_request(&request)?,
+    )?;
+    enumerate::map_enumerate_result(result)
 }
 
 pub fn read_turns_for_lifecycle(

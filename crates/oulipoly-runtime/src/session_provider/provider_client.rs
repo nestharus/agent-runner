@@ -14,6 +14,16 @@ pub(super) fn session_client(
     enabled_provider_client(registry, &identity.model_name)
 }
 
+pub(super) fn session_enumerate_client(
+    registry: &ProviderRegistry,
+    identity: &SessionProviderIdentity,
+) -> Result<ProviderClient, SessionProviderError> {
+    let describe = describe_session_provider(registry, &identity.model_name)?;
+    require_session_capability(&describe)?;
+    require_session_enumerate_capability(&describe)?;
+    enabled_provider_client(registry, &identity.model_name)
+}
+
 fn describe_session_provider(
     registry: &ProviderRegistry,
     model_name: &str,
@@ -30,6 +40,19 @@ fn require_session_capability(describe: &DescribeResult) -> Result<(), SessionPr
         Err(SessionProviderError::new(
             "session_capability_missing",
             "provider describe did not advertise session capability",
+        ))
+    }
+}
+
+fn require_session_enumerate_capability(
+    describe: &DescribeResult,
+) -> Result<(), SessionProviderError> {
+    if describe.capabilities.session_enumerate {
+        Ok(())
+    } else {
+        Err(SessionProviderError::new(
+            "session_enumerate_capability_missing",
+            "provider describe did not advertise session.enumerate capability",
         ))
     }
 }

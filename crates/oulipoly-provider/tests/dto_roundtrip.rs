@@ -14,7 +14,7 @@ use support::contract_matrix::{
 fn dto_roundtrip_covers_every_s2_contract_type() {
     let fixtures = fixtures();
 
-    assert_eq!(NON_LAUNCH_ROWS.len(), 29);
+    assert_eq!(NON_LAUNCH_ROWS.len(), 30);
     assert_non_launch_round_trip::<
         dto::DescribeRequest,
         dto::DescribeResult,
@@ -105,6 +105,12 @@ fn dto_roundtrip_covers_every_s2_contract_type() {
         dto::SessionLocateTranscriptResponse,
         dto::SessionLocateTranscriptErrorResponse,
     >(&fixtures, "session.locate_transcript");
+    assert_non_launch_round_trip::<
+        dto::SessionEnumerateRequest,
+        dto::SessionEnumerateResult,
+        dto::SessionEnumerateResponse,
+        dto::SessionEnumerateErrorResponse,
+    >(&fixtures, "session.enumerate");
     assert_non_launch_round_trip::<
         dto::SessionReadTurnsRequest,
         dto::SessionReadTurnsResult,
