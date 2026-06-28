@@ -61,6 +61,13 @@ pub trait SessionLifecycleServicePort: Send + Sync {
     ) -> Result<SessionLifecycleOutput, ServiceError>;
 }
 
+pub trait SessionImportServicePort: Send + Sync {
+    fn import_sessions(
+        &self,
+        request: SessionImportServiceRequest<'_>,
+    ) -> Result<SessionImportServiceOutput, ServiceError>;
+}
+
 pub trait ResumeServicePort: Send + Sync {
     fn resolve_resume(
         &self,

@@ -26,7 +26,7 @@ use fixtures::user_version;
 use oulipoly_state::deployment::row_version::checksum::payload_hash_for_columns;
 use oulipoly_state::deployment::row_version::registry::{REGISTRY, TableRegistration};
 use oulipoly_state::migrations;
-use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
+use oulipoly_state::{CURRENT_SCHEMA_VERSION, InvocationStart, ProviderSessionBinding, StateDb};
 use rusqlite::Connection;
 use rusqlite::types::Value;
 use std::path::Path;
@@ -44,7 +44,7 @@ fn fresh_schema_has_provider_session_resolved_account_on_invocations() {
     let db_path = dir.path().join("state.db");
     let db = StateDb::open(&db_path).unwrap();
 
-    assert_eq!(user_version(db.connection()), 9);
+    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
     let columns = invocation_columns(db.connection());
     let column = columns
         .iter()
@@ -67,7 +67,7 @@ fn migration_0007_adds_identity_column_and_preserves_rows() {
     drop(before_conn);
 
     let db = StateDb::open(&db_path).unwrap();
-    assert_eq!(user_version(db.connection()), 9);
+    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
     let after_rows = invocation_payload_snapshot(db.connection());
     assert_eq!(after_rows, before_rows);
 

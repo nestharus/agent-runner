@@ -71,6 +71,14 @@ impl StateDb {
         Ok(())
     }
 
+    pub fn session_chain_segment_exists_for_provider_session(
+        &self,
+        provider_name: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
+        Self::session_chain_segment_exists(&self.conn, provider_name, session_id)
+    }
+
     fn new_imported_chain_id() -> String {
         Uuid::new_v4().to_string()
     }

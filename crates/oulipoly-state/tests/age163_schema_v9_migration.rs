@@ -4,7 +4,7 @@
 mod fixtures;
 
 use fixtures::{create_full_state_schema, user_version};
-use oulipoly_state::StateDb;
+use oulipoly_state::{CURRENT_SCHEMA_VERSION, StateDb};
 use rusqlite::Connection;
 
 fn table_exists(conn: &Connection, table: &str) -> bool {
@@ -26,10 +26,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 #[test]
-fn fresh_open_has_schema_version_9() {
+fn fresh_open_has_current_schema_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-    assert_eq!(user_version(db.connection()), 9);
+    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn fresh_open_has_working_set_columns_on_provider_quotas() {
 }
 
 #[test]
-fn schema_v8_db_migrates_forward_to_v9() {
+fn schema_v8_db_migrates_forward_to_current() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
     let conn = Connection::open(&path).unwrap();
@@ -61,7 +61,7 @@ fn schema_v8_db_migrates_forward_to_v9() {
 
     let db = StateDb::open(&path).unwrap();
     let conn = db.connection();
-    assert_eq!(user_version(conn), 9);
+    assert_eq!(user_version(conn), CURRENT_SCHEMA_VERSION);
     assert!(table_exists(conn, "model_round_robin_cursor"));
     assert!(column_exists(conn, "provider_quotas", "next_available_at"));
     assert!(column_exists(conn, "provider_quotas", "last_refresh_at"));

@@ -54,6 +54,7 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             "0007_age_123_resume_provider_identity",
             "0008_owned_turn_events",
             "0009_age163_working_set_and_round_robin",
+            "0010_imported_session_display_metadata",
         ]
     );
 

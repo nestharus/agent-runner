@@ -62,6 +62,7 @@ pub use db::{
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
+pub use db::{ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert};
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};

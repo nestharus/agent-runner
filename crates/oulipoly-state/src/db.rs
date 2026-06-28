@@ -96,6 +96,7 @@ mod chain_segments_open;
 mod cli_providers;
 mod discovered_models;
 mod discovery_types;
+mod imported_session_display_metadata;
 mod invocation_artifacts;
 mod invocation_lifecycle_finalize;
 mod invocation_lifecycle_finalize_context;
@@ -150,6 +151,9 @@ pub use self::chain_segments_open::{
 pub use self::discovery_types::{
     AccountRecord, AuthMethod, AuthStatus, CliMapping, CliProviderRecord, DiscoveredModel,
     ModelParameter, ParamType,
+};
+pub use self::imported_session_display_metadata::{
+    ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert,
 };
 use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
