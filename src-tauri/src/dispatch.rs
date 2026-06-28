@@ -81,6 +81,14 @@ pub(crate) use predicate::{
 };
 
 pub(crate) fn run(cli: Cli) -> Result<i32, String> {
+    // Keep inspection-only listing ahead of startup recovery and provider dispatch.
+    if let Some(Subcommands::Session {
+        command: SessionSubcommands::List { json },
+    }) = &cli.command
+    {
+        return crate::commands::session_list::run_session_list(*json);
+    }
+
     if let Err(err) = recover_pending_session_replaces() {
         return Ok(handle_pending_session_replace_error(&err));
     }
@@ -357,6 +365,7 @@ fn dispatch_session_subcommand(
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     match command {
+        SessionSubcommands::List { json } => crate::commands::session_list::run_session_list(json),
         SessionSubcommands::Locate { session_id, json } => {
             dispatch_session_locate_subcommand(&session_id, json)
         }

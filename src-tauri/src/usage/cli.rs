@@ -335,6 +335,12 @@ pub(crate) enum MailboxSubcommands {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum SessionSubcommands {
+    /// List resumable provider sessions known to the local state DB.
+    List {
+        /// Emit structured JSON instead of a human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Locate transcript and workspace metadata for a session.
     Locate {
         /// Provider session UUID to locate.

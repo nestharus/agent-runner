@@ -64,6 +64,9 @@
 - `src-tauri/src/commands/resume_list/validator.rs`
 - `src-tauri/src/commands/resume_list/formatter.rs`
 - `src-tauri/src/commands/resume_list/parser.rs`
+- `src-tauri/src/commands/session_list/mod.rs`
+- `src-tauri/src/commands/session_list/orchestration.rs`
+- `src-tauri/src/commands/session_list/formatter.rs`
 - `src-tauri/src/commands/session_import_replace/`
 - `src-tauri/src/session_ingest_cli.rs`
 - `src-tauri/src/session_metadata_cli.rs`
@@ -91,6 +94,7 @@
 | `resume_cli.rs` invoked with a session id. | Resolve via session_lifecycle, attach to existing session, continue. |
 | `resume --list <UUID>` legacy syntax, or hidden `resume-list <UUID>`, invoked. | `main.rs` normalizes legacy argv via `normalize_resume_list_args`; `dispatch.rs` routes to `run_resume_list`, which validates the UUID, reads `StateDb::open_default().resume_previews(uuid)`, and prints one `chain_id=... last_used_at=... active_provider=... active_session_id=... turn_count=... recent_turns_count=...` line per chain. |
 | `resume --list <UUID>` / `resume-list <UUID>` invoked with no matching chains. | Print `No chains found for {uuid}` and exit successfully. |
+| `session list [--json]` invoked. | `dispatch.rs` routes to `run_session_list`, which opens `state.db` read-only when present, reads `imported_session_list()`, and prints either a tab-separated session table or the same rows as JSON. |
 | `session_ingest_cli.rs` invoked. | Import an externally-produced session transcript into the local state DB. |
 | `commands/session_import_replace/` invoked. | Replace an existing local session with an imported payload. |
 | `session_metadata_cli.rs` invoked. | Read or update metadata for a known session. |

@@ -97,6 +97,7 @@ mod cli_providers;
 mod discovered_models;
 mod discovery_types;
 mod imported_session_display_metadata;
+mod imported_session_list;
 mod invocation_artifacts;
 mod invocation_lifecycle_finalize;
 mod invocation_lifecycle_finalize_context;
@@ -155,6 +156,7 @@ pub use self::discovery_types::{
 pub use self::imported_session_display_metadata::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert,
 };
+pub use self::imported_session_list::ImportedSessionListRow;
 use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
     active_lifecycle_session_id, lifecycle_terminal_status,
