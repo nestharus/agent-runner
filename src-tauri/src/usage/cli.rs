@@ -341,6 +341,28 @@ pub(crate) enum SessionSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Discover and register existing provider-native sessions.
+    Import {
+        /// Limit import to one provider account or model name.
+        #[arg(long)]
+        provider: Option<String>,
+
+        /// Maximum provider-native sessions to enumerate per provider.
+        #[arg(long)]
+        limit: Option<u64>,
+
+        /// Only enumerate provider-native sessions updated since this Unix millisecond timestamp.
+        #[arg(long = "since-unix-ms")]
+        since_unix_ms: Option<u64>,
+
+        /// Read and ingest provider-native turns for imported sessions when supported.
+        #[arg(long = "backfill-turns")]
+        backfill_turns: bool,
+
+        /// Emit structured JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Locate transcript and workspace metadata for a session.
     Locate {
         /// Provider session UUID to locate.
