@@ -106,6 +106,14 @@ const MOUSE_UTF8_ENABLE: &[u8] = b"\x1b[?1005h";
 const MOUSE_UTF8_DISABLE: &[u8] = b"\x1b[?1005l";
 const MOUSE_SGR_ENABLE: &[u8] = b"\x1b[?1006h";
 const MOUSE_SGR_DISABLE: &[u8] = b"\x1b[?1006l";
+/// Kitty keyboard protocol push with disambiguate-escape-codes enabled.
+const KITTY_KEYBOARD_DISAMBIGUATE_PUSH: &[u8] = b"\x1b[>1u";
+/// Kitty keyboard protocol pop, restoring the prior keyboard enhancement flags.
+const KITTY_KEYBOARD_POP: &[u8] = b"\x1b[<u";
+/// xterm modifyOtherKeys level 2, used by Windows Terminal and xterm-family emulators.
+const XTERM_MODIFY_OTHER_KEYS_LEVEL_2: &[u8] = b"\x1b[>4;2m";
+/// xterm modifyOtherKeys reset to the default level.
+const XTERM_MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4;0m";
 
 /// Map the real terminal window size to the child PTY window size, reserving the
 /// persistent overlay rows so the provider believes its terminal is the top pane.
@@ -424,6 +432,7 @@ impl InputRouter {
 
     fn route_bottom_key(&mut self, bytes: &[u8], routed: &mut RoutedInput) -> usize {
         let parsed = parse_bottom_key(bytes);
+        trace_overlay_input_key(&bytes[..parsed.consumed.min(bytes.len())], parsed.key);
         let route = bottom_key_route(parsed.key);
         self.apply_bottom_route(route, parsed.consumed, routed)
     }
@@ -459,6 +468,10 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
         [b'\r', ..] | [b'\n', ..] => ParsedBottomKey {
             key: BottomKey::Enter,
             consumed: 1,
+        },
+        [0x1b, b'[', b'1', b'3', b'u', ..] => ParsedBottomKey {
+            key: BottomKey::Enter,
+            consumed: 5,
         },
         [0x7f, ..] | [0x08, ..] => ParsedBottomKey {
             key: BottomKey::Backspace,
@@ -555,6 +568,30 @@ fn ctrl_enter_sequence_len(bytes: &[u8]) -> Option<usize> {
         }
     }
     None
+}
+
+fn trace_overlay_input_key(bytes: &[u8], key: BottomKey) {
+    let raw_hex = input_bytes_hex(bytes);
+    super::append_overlay_input_trace_record(&raw_hex, overlay_input_classification(key));
+}
+
+fn overlay_input_classification(key: BottomKey) -> &'static str {
+    match key {
+        BottomKey::Newline => "ctrl_enter",
+        BottomKey::Enter => "enter-submit",
+        BottomKey::Printable(_) => "printable",
+        _ => "other",
+    }
+}
+
+fn input_bytes_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(*byte >> 4) as usize] as char);
+        value.push(HEX[(*byte & 0x0f) as usize] as char);
+    }
+    value
 }
 
 fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
@@ -710,6 +747,18 @@ fn terminal_mouse_restore_sequence() -> Vec<u8> {
         MOUSE_SGR_DISABLE,
     ]
     .concat()
+}
+
+fn terminal_keyboard_enable_sequence() -> Vec<u8> {
+    [
+        KITTY_KEYBOARD_DISAMBIGUATE_PUSH,
+        XTERM_MODIFY_OTHER_KEYS_LEVEL_2,
+    ]
+    .concat()
+}
+
+fn terminal_keyboard_restore_sequence() -> Vec<u8> {
+    [KITTY_KEYBOARD_POP, XTERM_MODIFY_OTHER_KEYS_RESET].concat()
 }
 
 fn parse_mouse_event(bytes: &[u8]) -> Option<ParsedMouseEvent> {
@@ -3283,10 +3332,19 @@ impl AltScreenGuard {
     fn enter(mut writer: File) -> Result<Self, String> {
         execute!(writer, EnterAlternateScreen)
             .map_err(|err| format!("Failed to enter alternate screen: {err}"))?;
-        Ok(Self {
+        let mut guard = Self {
             writer,
             mouse: TerminalMouseState::new(),
-        })
+        };
+        guard.enable_keyboard_protocol()?;
+        Ok(guard)
+    }
+
+    fn enable_keyboard_protocol(&mut self) -> Result<(), String> {
+        self.writer
+            .write_all(&terminal_keyboard_enable_sequence())
+            .and_then(|()| self.writer.flush())
+            .map_err(format_tui_keyboard_sync_error)
     }
 
     fn sync_mouse(&mut self, request: MouseRequest) -> Result<(), String> {
@@ -3311,9 +3369,14 @@ impl AltScreenGuard {
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
+        let _ = self.writer.write_all(&terminal_keyboard_restore_sequence());
         let _ = self.writer.write_all(&terminal_mouse_restore_sequence());
         let _ = execute!(self.writer, LeaveAlternateScreen);
     }
+}
+
+fn format_tui_keyboard_sync_error(err: io::Error) -> String {
+    format!("Failed to sync terminal keyboard protocol: {err}")
 }
 
 fn format_tui_mouse_sync_error(err: io::Error) -> String {
@@ -5278,7 +5341,7 @@ mod tests {
     use super::super::{PtyPair, configure_child_pty};
     use super::*;
     use ratatui::backend::TestBackend;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::FromRawFd;
     use std::process::Command;
     use std::sync::Arc;
@@ -5312,6 +5375,12 @@ mod tests {
             !routed.top_mouse.is_empty(),
             routed.right_click.is_some(),
         )
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 
     #[test]
@@ -5391,6 +5460,43 @@ mod tests {
         assert!(routed.commands.is_empty());
         assert!(routed.pseudo_input.is_empty());
         assert_eq!(router.focus, Focus::Bottom);
+    }
+
+    #[test]
+    fn terminal_keyboard_protocol_sequences_are_ordered() {
+        assert_eq!(
+            terminal_keyboard_enable_sequence().as_slice(),
+            b"\x1b[>1u\x1b[>4;2m"
+        );
+        assert_eq!(
+            terminal_keyboard_restore_sequence().as_slice(),
+            b"\x1b[<u\x1b[>4;0m"
+        );
+    }
+
+    #[test]
+    fn alt_screen_guard_enables_and_restores_keyboard_protocols_on_drop() {
+        let file = tempfile::tempfile().unwrap();
+        let mut reader = file.try_clone().unwrap();
+
+        {
+            let _guard = AltScreenGuard::enter(file).unwrap();
+        }
+
+        let mut written = Vec::new();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_to_end(&mut written).unwrap();
+
+        let enable = terminal_keyboard_enable_sequence();
+        let restore = terminal_keyboard_restore_sequence();
+        let enable_pos = find_bytes(&written, &enable).expect("keyboard enable sequence");
+        let restore_pos = find_bytes(&written, &restore).expect("keyboard restore sequence");
+        let leave_pos = find_bytes(&written, b"\x1b[?1049l").expect("leave alternate screen");
+        assert!(enable_pos < restore_pos, "restore should follow enable");
+        assert!(
+            restore_pos < leave_pos,
+            "restore should precede alternate-screen exit"
+        );
     }
 
     #[test]
@@ -7553,6 +7659,19 @@ mod tests {
             let routed = router.route_input(sequence);
 
             assert_eq!(routed.pseudo_input, vec![PseudoInputAction::InsertNewline]);
+            assert!(routed.commands.is_empty());
+        }
+    }
+
+    #[test]
+    fn plain_enter_sequences_route_to_submit_not_newline() {
+        for sequence in [b"\r".as_slice(), b"\n".as_slice(), b"\x1b[13u".as_slice()] {
+            let mut router = InputRouter::new();
+            router.focus = Focus::Bottom;
+
+            let routed = router.route_input(sequence);
+
+            assert_eq!(routed.pseudo_input, vec![PseudoInputAction::Submit]);
             assert!(routed.commands.is_empty());
         }
     }
