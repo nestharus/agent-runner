@@ -60,6 +60,9 @@ const UNIX_SOCKET_PATH_LIMIT: usize = 100;
 const NOTIFY_TRACE_MAX_BYTES: u64 = 1024 * 1024;
 const NOTIFY_TRACE_FILE: &str = "notify-trace.log";
 const NOTIFY_TRACE_ROTATED_FILE: &str = "notify-trace.log.1";
+const OVERLAY_INPUT_TRACE_MAX_BYTES: u64 = 1024 * 1024;
+const OVERLAY_INPUT_TRACE_FILE: &str = "overlay-input-trace.log";
+const OVERLAY_INPUT_TRACE_ROTATED_FILE: &str = "overlay-input-trace.log.1";
 const BOUNDARY_PROBE_MAX_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2208,6 +2211,35 @@ fn notify_trace_path() -> Option<PathBuf> {
     Some(notify_trace_dir()?.join(NOTIFY_TRACE_FILE))
 }
 
+pub(super) fn append_overlay_input_trace_record(bytes_hex: &str, classification: &str) {
+    #[cfg(test)]
+    {
+        let _ = (bytes_hex, classification);
+    }
+    #[cfg(not(test))]
+    {
+        let Some(path) = overlay_input_trace_path() else {
+            return;
+        };
+        let line = overlay_input_trace_line(bytes_hex, classification);
+        let _ = append_overlay_input_trace_line(&path, &line);
+    }
+}
+
+fn overlay_input_trace_line(bytes_hex: &str, classification: &str) -> String {
+    format!(
+        "{} trigger=overlay-input bytes_hex={} classification={}\n",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        trace_token(bytes_hex),
+        trace_token(classification)
+    )
+}
+
+#[cfg(not(test))]
+fn overlay_input_trace_path() -> Option<PathBuf> {
+    Some(notify_trace_dir()?.join(OVERLAY_INPUT_TRACE_FILE))
+}
+
 fn notify_trace_dir() -> Option<PathBuf> {
     if let Some(state_home) = non_empty_env_path("XDG_STATE_HOME") {
         return Some(state_home.join("oulipoly-agent-runner"));
@@ -2233,6 +2265,18 @@ fn append_notify_trace_line(path: &Path, line: &str) -> io::Result<()> {
         .write_all(line.as_bytes())
 }
 
+fn append_overlay_input_trace_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    rotate_overlay_input_trace_if_needed(path, line.len() as u64)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(line.as_bytes())
+}
+
 fn rotate_notify_trace_if_needed(path: &Path, next_len: u64) -> io::Result<()> {
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(());
@@ -2241,6 +2285,22 @@ fn rotate_notify_trace_if_needed(path: &Path, next_len: u64) -> io::Result<()> {
         return Ok(());
     }
     let rotated = path.with_file_name(NOTIFY_TRACE_ROTATED_FILE);
+    match fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    fs::rename(path, rotated)
+}
+
+fn rotate_overlay_input_trace_if_needed(path: &Path, next_len: u64) -> io::Result<()> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len().saturating_add(next_len) <= OVERLAY_INPUT_TRACE_MAX_BYTES {
+        return Ok(());
+    }
+    let rotated = path.with_file_name(OVERLAY_INPUT_TRACE_ROTATED_FILE);
     match fs::remove_file(&rotated) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -3051,6 +3111,32 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "next\n");
         assert!(dir.path().join(NOTIFY_TRACE_ROTATED_FILE).exists());
+    }
+
+    #[test]
+    fn overlay_input_trace_file_records_ctrl_enter_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(OVERLAY_INPUT_TRACE_FILE);
+        let line = overlay_input_trace_line("1b5b31333b3575", "ctrl_enter");
+
+        append_overlay_input_trace_line(&path, &line).unwrap();
+
+        let trace = fs::read_to_string(&path).unwrap();
+        assert!(trace.contains("trigger=overlay-input"));
+        assert!(trace.contains("bytes_hex=1b5b31333b3575"));
+        assert!(trace.contains("classification=ctrl_enter"));
+    }
+
+    #[test]
+    fn overlay_input_trace_file_rotates_when_size_cap_would_be_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(OVERLAY_INPUT_TRACE_FILE);
+        fs::write(&path, vec![b'x'; OVERLAY_INPUT_TRACE_MAX_BYTES as usize]).unwrap();
+
+        append_overlay_input_trace_line(&path, "next\n").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "next\n");
+        assert!(dir.path().join(OVERLAY_INPUT_TRACE_ROTATED_FILE).exists());
     }
 
     #[test]
