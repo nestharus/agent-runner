@@ -465,8 +465,16 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
         };
     }
     match bytes {
-        [b'\r', ..] | [b'\n', ..] => ParsedBottomKey {
+        // Plain Enter submits. Most terminals send CR (0x0d) for Enter and LF (0x0a,
+        // i.e. Ctrl+J) for Ctrl+Enter, so LF inserts a newline at the cursor (this also
+        // makes a pasted raw '\n' insert rather than submit). Terminals that emit a
+        // distinct CSI-u Ctrl+Enter are handled by ctrl_enter_sequence_len above.
+        [b'\r', ..] => ParsedBottomKey {
             key: BottomKey::Enter,
+            consumed: 1,
+        },
+        [b'\n', ..] => ParsedBottomKey {
+            key: BottomKey::Newline,
             consumed: 1,
         },
         [0x1b, b'[', b'1', b'3', b'u', ..] => ParsedBottomKey {
@@ -7665,7 +7673,7 @@ mod tests {
 
     #[test]
     fn plain_enter_sequences_route_to_submit_not_newline() {
-        for sequence in [b"\r".as_slice(), b"\n".as_slice(), b"\x1b[13u".as_slice()] {
+        for sequence in [b"\r".as_slice(), b"\x1b[13u".as_slice()] {
             let mut router = InputRouter::new();
             router.focus = Focus::Bottom;
 
@@ -7674,6 +7682,19 @@ mod tests {
             assert_eq!(routed.pseudo_input, vec![PseudoInputAction::Submit]);
             assert!(routed.commands.is_empty());
         }
+    }
+
+    #[test]
+    fn line_feed_routes_to_newline_for_ctrl_enter() {
+        // Terminals commonly send LF (0x0a, Ctrl+J) for Ctrl+Enter while plain Enter
+        // sends CR (0x0d); LF must insert a newline at the cursor, not submit.
+        let mut router = InputRouter::new();
+        router.focus = Focus::Bottom;
+
+        let routed = router.route_input(b"\n");
+
+        assert_eq!(routed.pseudo_input, vec![PseudoInputAction::InsertNewline]);
+        assert!(routed.commands.is_empty());
     }
 
     #[test]
