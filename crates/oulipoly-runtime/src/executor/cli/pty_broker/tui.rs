@@ -223,6 +223,7 @@ struct RoutedInput {
     forward: Vec<u8>,
     commands: Vec<MonitorCommand>,
     pseudo_input: Vec<PseudoInputAction>,
+    pseudo_input_width: Option<u16>,
     /// The operator clicked into the monitor/input area (focus bottom).
     focus_bottom: bool,
     /// Net wheel scroll for the top pane's scrollback: positive moves toward older
@@ -359,6 +360,8 @@ enum PseudoInputAction {
     Delete,
     MoveLeft,
     MoveRight,
+    MoveUp,
+    MoveDown,
     MoveStart,
     MoveEnd,
     Clear,
@@ -610,8 +613,8 @@ fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
         BottomKey::Delete => BottomInputRoute::PseudoInput(PseudoInputAction::Delete),
         BottomKey::LeftArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveLeft),
         BottomKey::RightArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveRight),
-        BottomKey::UpArrow => BottomInputRoute::Command(MonitorCommand::SelectPrev),
-        BottomKey::DownArrow => BottomInputRoute::Command(MonitorCommand::SelectNext),
+        BottomKey::UpArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveUp),
+        BottomKey::DownArrow => BottomInputRoute::PseudoInput(PseudoInputAction::MoveDown),
         BottomKey::MoveStart => BottomInputRoute::PseudoInput(PseudoInputAction::MoveStart),
         BottomKey::MoveEnd => BottomInputRoute::PseudoInput(PseudoInputAction::MoveEnd),
         BottomKey::Clear => BottomInputRoute::PseudoInput(PseudoInputAction::Clear),
@@ -1045,9 +1048,11 @@ const TOP_SCROLL_STEP: i32 = 3;
 const MIN_INPUT_ROWS: u16 = 1;
 /// Maximum editable rows before the pseudo input scrolls.
 const MAX_INPUT_ROWS: u16 = 10;
-/// Persistent help row rendered beneath the pseudo input editor when space allows.
-const PSEUDO_INPUT_HELP_ROWS: u16 = 1;
-/// Minimum rows reserved by the pseudo input, including chrome/help.
+/// Width fallback for keyboard-only tests that bypass the full pane router.
+const DEFAULT_PSEUDO_INPUT_WIDTH: u16 = 80;
+/// Persistent help rows rendered beneath the pseudo input editor.
+const PSEUDO_INPUT_HELP_ROWS: u16 = 0;
+/// Minimum rows reserved by the pseudo input.
 const PSEUDO_INPUT_MIN_ROWS: u16 = MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS;
 /// Rows reserved below the pseudo input for outbound message state.
 const OUTBOUND_STATUS_ROWS: u16 = 1;
@@ -1065,7 +1070,7 @@ struct PseudoInputState {
 }
 
 impl PseudoInputState {
-    fn apply(&mut self, action: PseudoInputAction) -> Option<String> {
+    fn apply(&mut self, action: PseudoInputAction, width: u16) -> Option<String> {
         match action {
             PseudoInputAction::Insert(ch) => self.insert(ch),
             PseudoInputAction::InsertNewline => self.insert('\n'),
@@ -1073,6 +1078,8 @@ impl PseudoInputState {
             PseudoInputAction::Delete => self.delete(),
             PseudoInputAction::MoveLeft => self.move_left(),
             PseudoInputAction::MoveRight => self.move_right(),
+            PseudoInputAction::MoveUp => self.move_up(width),
+            PseudoInputAction::MoveDown => self.move_down(width),
             PseudoInputAction::MoveStart => self.move_start(),
             PseudoInputAction::MoveEnd => self.move_end(),
             PseudoInputAction::Clear => self.clear(),
@@ -1111,6 +1118,41 @@ impl PseudoInputState {
         if let Some(next) = next_char_boundary(&self.buffer, self.cursor) {
             self.cursor = next;
         }
+    }
+
+    fn move_up(&mut self, width: u16) {
+        self.move_vertical(-1, width);
+    }
+
+    fn move_down(&mut self, width: u16) {
+        self.move_vertical(1, width);
+    }
+
+    fn move_vertical(&mut self, delta: isize, width: u16) {
+        let rows = pseudo_input_visual_rows(&self.buffer, width);
+        let Some((current_row, desired_col)) =
+            pseudo_input_cursor_visual_position(&self.buffer, self.cursor, width, &rows)
+        else {
+            return;
+        };
+        let target_row = if delta.is_negative() {
+            let Some(previous) = current_row.checked_sub(delta.unsigned_abs()) else {
+                self.cursor = 0;
+                return;
+            };
+            previous
+        } else {
+            let next = current_row.saturating_add(delta as usize);
+            if next >= rows.len() {
+                self.cursor = self.buffer.len();
+                return;
+            }
+            next
+        };
+        let target = rows[target_row];
+        let target_len = target.end_col.saturating_sub(target.start_col);
+        let target_col = target.start_col + desired_col.min(target_len);
+        self.cursor = byte_index_for_line_col(&self.buffer, target.line_index, target_col);
     }
 
     fn move_start(&mut self) {
@@ -1794,8 +1836,8 @@ impl MonitorPane {
         }
     }
 
-    fn apply_pseudo_input(&mut self, action: PseudoInputAction, now: Instant) {
-        if let Some(body) = self.pseudo_input.apply(action) {
+    fn apply_pseudo_input(&mut self, action: PseudoInputAction, width: u16, now: Instant) {
+        if let Some(body) = self.pseudo_input.apply(action, width) {
             self.outbound.enqueue(body, now);
         }
     }
@@ -2663,8 +2705,8 @@ fn render_scrollback_indicator(buf: &mut Buffer, area: Rect, scrollback: usize) 
     );
 }
 
-/// Render the monitor: a status row plus the always-visible pseudo input; the node
-/// list is the collapsible portion below it.
+/// Render the monitor: the always-visible pseudo input sits above the status row; the
+/// node list is the collapsible portion below it.
 fn render_monitor(
     buf: &mut Buffer,
     area: Rect,
@@ -2675,17 +2717,9 @@ fn render_monitor(
     if area.height == 0 {
         return;
     }
-    let status = Rect {
-        height: STATUS_ROW_ROWS.min(area.height),
-        ..area
-    };
-    render_status_row(buf, status, pane, focus, overlay_constrained);
-    if area.height <= STATUS_ROW_ROWS {
-        return;
-    }
-    let body = bottom_body_area(area);
-    let layout = expanded_bottom_layout(body, pane);
+    let layout = expanded_bottom_layout(area, pane);
     render_pseudo_input(buf, layout.input, pane, focus);
+    render_status_row(buf, layout.status, pane, focus, overlay_constrained);
     render_outbound_status(buf, layout.outbound, pane);
     if !pane.collapsed {
         render_monitor_body(buf, layout.content, pane);
@@ -2694,40 +2728,41 @@ fn render_monitor(
 
 #[derive(Debug, Clone, Copy)]
 struct ExpandedBottomLayout {
+    status: Rect,
     content: Rect,
     input: Rect,
     outbound: Rect,
 }
 
-fn bottom_body_area(area: Rect) -> Rect {
-    Rect {
-        y: area.y + STATUS_ROW_ROWS,
-        height: area.height.saturating_sub(STATUS_ROW_ROWS),
-        ..area
-    }
-}
-
-fn expanded_bottom_layout(body: Rect, pane: &MonitorPane) -> ExpandedBottomLayout {
-    let outbound_rows = OUTBOUND_STATUS_ROWS.min(body.height);
+fn expanded_bottom_layout(area: Rect, pane: &MonitorPane) -> ExpandedBottomLayout {
+    let status_rows = STATUS_ROW_ROWS.min(area.height);
+    let outbound_rows = OUTBOUND_STATUS_ROWS.min(area.height.saturating_sub(status_rows));
     let input_rows = pane
         .pseudo_input
-        .desired_rows(body.width)
-        .min(body.height.saturating_sub(outbound_rows));
-    let content_rows = body.height.saturating_sub(input_rows + outbound_rows);
+        .desired_rows(area.width)
+        .min(area.height.saturating_sub(status_rows + outbound_rows));
+    let content_rows = area
+        .height
+        .saturating_sub(input_rows + status_rows + outbound_rows);
     ExpandedBottomLayout {
         input: Rect {
             height: input_rows,
-            ..body
+            ..area
+        },
+        status: Rect {
+            y: area.y + input_rows,
+            height: status_rows,
+            ..area
         },
         outbound: Rect {
-            y: body.y + input_rows,
+            y: area.y + input_rows + status_rows,
             height: outbound_rows,
-            ..body
+            ..area
         },
         content: Rect {
-            y: body.y + input_rows + outbound_rows,
+            y: area.y + input_rows + status_rows + outbound_rows,
             height: content_rows,
-            ..body
+            ..area
         },
     }
 }
@@ -2763,9 +2798,15 @@ fn render_pseudo_input(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: 
     } else {
         Style::default().fg(Color::Gray).bg(Color::Indexed(235))
     };
-    let help_rows = if area.height > 1 { 1 } else { 0 };
-    let editor_rows = area.height.saturating_sub(help_rows);
-    for (line_index, line) in format_pseudo_input_rows(pane, editor_rows, area.width)
+    let editor_rows = area.height;
+    let display = pseudo_input_display_rows(
+        &pane.pseudo_input.buffer,
+        pane.pseudo_input.cursor,
+        area.width,
+    );
+    let start =
+        pseudo_input_scroll_start(display.cursor_row, display.rows.len(), editor_rows as usize);
+    for (line_index, line) in format_pseudo_input_rows_from_display(&display, start, editor_rows)
         .into_iter()
         .enumerate()
     {
@@ -2776,17 +2817,18 @@ fn render_pseudo_input(buf: &mut Buffer, area: Rect, pane: &MonitorPane, focus: 
             style,
         );
     }
-    if help_rows > 0 {
-        let help = "Enter queue · Ctrl+Enter newline · Ctrl+F filter · Ctrl+U clear";
-        buf.set_string(
-            area.x,
-            area.y + editor_rows,
-            pad_to_width(help.to_string(), area.width),
-            style,
-        );
+    if focus == Focus::Bottom
+        && area.width > 0
+        && display.cursor_row >= start
+        && display.cursor_row < start + editor_rows as usize
+    {
+        let cursor_x = area.x + (display.cursor_col as u16).min(area.width - 1);
+        let cursor_y = area.y + (display.cursor_row - start) as u16;
+        buf[(cursor_x, cursor_y)].set_style(style.add_modifier(Modifier::REVERSED));
     }
 }
 
+#[cfg(test)]
 fn format_pseudo_input_rows(pane: &MonitorPane, visible_rows: u16, width: u16) -> Vec<String> {
     if visible_rows == 0 {
         return Vec::new();
@@ -2798,14 +2840,23 @@ fn format_pseudo_input_rows(pane: &MonitorPane, visible_rows: u16, width: u16) -
         display.rows.len(),
         visible_rows as usize,
     );
+    format_pseudo_input_rows_from_display(&display, start, visible_rows)
+}
+
+fn format_pseudo_input_rows_from_display(
+    display: &PseudoInputDisplayRows,
+    start: usize,
+    visible_rows: u16,
+) -> Vec<String> {
     let end = (start + visible_rows as usize).min(display.rows.len());
     let has_above = start > 0;
     let has_below = end < display.rows.len();
     let mut rows: Vec<String> = display
         .rows
-        .into_iter()
+        .iter()
         .skip(start)
         .take(end - start)
+        .cloned()
         .collect();
     if has_above && let Some(first) = rows.first_mut() {
         first.push_str(" ↑");
@@ -2833,12 +2884,14 @@ fn desired_pseudo_input_editor_rows(buffer: &str, cursor: usize, width: u16) -> 
 struct PseudoInputDisplayRows {
     rows: Vec<String>,
     cursor_row: usize,
+    cursor_col: usize,
 }
 
 fn pseudo_input_display_rows(buffer: &str, cursor: usize, width: u16) -> PseudoInputDisplayRows {
     let cursor = pseudo_input_cursor_line_col(buffer, cursor);
     let mut rows = Vec::new();
     let mut cursor_row = 0;
+    let mut cursor_col = 0;
     for (line_index, line) in pseudo_input_logical_lines(buffer).into_iter().enumerate() {
         let chars: Vec<char> = line.chars().collect();
         let mut start = 0;
@@ -2853,14 +2906,25 @@ fn pseudo_input_display_rows(buffer: &str, cursor: usize, width: u16) -> PseudoI
                 (start + wrap_width).min(chars.len())
             };
             let is_last = end >= chars.len();
-            let mut segment: String = chars[start..end].iter().collect();
-            if pseudo_input_cursor_in_segment(cursor, line_index, start, end, is_last) {
-                let insert_at = cursor.1.saturating_sub(start).min(segment.chars().count());
-                let insert_at = byte_index_for_char_col(&segment, insert_at);
-                segment.insert(insert_at, '▌');
+            let segment: String = chars[start..end].iter().collect();
+            let cursor_at_full_line_end = !chars.is_empty()
+                && is_last
+                && cursor.0 == line_index
+                && cursor.1 == end
+                && cursor.1 == chars.len()
+                && segment.chars().count() >= wrap_width;
+            if pseudo_input_cursor_in_segment(cursor, line_index, start, end, is_last)
+                && !cursor_at_full_line_end
+            {
+                cursor_col = cursor.1.saturating_sub(start).min(segment.chars().count());
                 cursor_row = row_index;
             }
             rows.push(format!("{prefix}{segment}"));
+            if cursor_at_full_line_end {
+                cursor_col = 0;
+                cursor_row = rows.len();
+                rows.push(String::new());
+            }
             if chars.is_empty() || is_last {
                 break;
             }
@@ -2868,7 +2932,11 @@ fn pseudo_input_display_rows(buffer: &str, cursor: usize, width: u16) -> PseudoI
             segment_index += 1;
         }
     }
-    PseudoInputDisplayRows { rows, cursor_row }
+    PseudoInputDisplayRows {
+        rows,
+        cursor_row,
+        cursor_col,
+    }
 }
 
 fn pseudo_input_logical_lines(buffer: &str) -> Vec<&str> {
@@ -2880,23 +2948,16 @@ fn pseudo_input_logical_lines(buffer: &str) -> Vec<&str> {
 }
 
 fn pseudo_input_row_prefix(
-    row_index: usize,
-    line_index: usize,
-    segment_index: usize,
-    cursor: (usize, usize),
+    _row_index: usize,
+    _line_index: usize,
+    _segment_index: usize,
+    _cursor: (usize, usize),
 ) -> String {
-    if row_index == 0 {
-        format!(" input[{}:{}] > ", cursor.0 + 1, cursor.1)
-    } else if segment_index == 0 {
-        format!(" input[{}]   | ", line_index + 1)
-    } else {
-        format!(" input[{}]   : ", line_index + 1)
-    }
+    String::new()
 }
 
-fn pseudo_input_wrap_width(width: u16, prefix: &str) -> usize {
-    let available = (width as usize).saturating_sub(prefix.chars().count());
-    available.saturating_sub(1).max(1)
+fn pseudo_input_wrap_width(width: u16, _prefix: &str) -> usize {
+    (width as usize).max(1)
 }
 
 fn pseudo_input_cursor_in_segment(
@@ -2932,6 +2993,102 @@ fn byte_index_for_char_col(value: &str, col: usize) -> usize {
         .nth(col)
         .map(|(index, _)| index)
         .unwrap_or(value.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PseudoInputLogicalLineSpan {
+    start_byte: usize,
+    byte_len: usize,
+    char_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PseudoInputVisualRow {
+    line_index: usize,
+    start_col: usize,
+    end_col: usize,
+}
+
+fn pseudo_input_logical_line_spans(buffer: &str) -> Vec<PseudoInputLogicalLineSpan> {
+    if buffer.is_empty() {
+        return vec![PseudoInputLogicalLineSpan {
+            start_byte: 0,
+            byte_len: 0,
+            char_len: 0,
+        }];
+    }
+    let mut spans = Vec::new();
+    let mut start_byte = 0;
+    for line in buffer.split('\n') {
+        spans.push(PseudoInputLogicalLineSpan {
+            start_byte,
+            byte_len: line.len(),
+            char_len: line.chars().count(),
+        });
+        start_byte = start_byte.saturating_add(line.len()).saturating_add(1);
+    }
+    spans
+}
+
+fn pseudo_input_visual_rows(buffer: &str, width: u16) -> Vec<PseudoInputVisualRow> {
+    let wrap_width = pseudo_input_wrap_width(width, "");
+    let mut rows = Vec::new();
+    for (line_index, line) in pseudo_input_logical_line_spans(buffer)
+        .into_iter()
+        .enumerate()
+    {
+        if line.char_len == 0 {
+            rows.push(PseudoInputVisualRow {
+                line_index,
+                start_col: 0,
+                end_col: 0,
+            });
+            continue;
+        }
+        let mut start_col = 0;
+        while start_col < line.char_len {
+            let end_col = (start_col + wrap_width).min(line.char_len);
+            rows.push(PseudoInputVisualRow {
+                line_index,
+                start_col,
+                end_col,
+            });
+            start_col = end_col;
+        }
+    }
+    rows
+}
+
+fn pseudo_input_cursor_visual_position(
+    buffer: &str,
+    cursor: usize,
+    width: u16,
+    rows: &[PseudoInputVisualRow],
+) -> Option<(usize, usize)> {
+    let cursor = pseudo_input_cursor_line_col(buffer, cursor);
+    let wrap_width = pseudo_input_wrap_width(width, "");
+    for (index, row) in rows.iter().enumerate() {
+        if row.line_index != cursor.0 || cursor.1 < row.start_col {
+            continue;
+        }
+        let is_last_for_line = rows
+            .get(index + 1)
+            .is_none_or(|next| next.line_index != row.line_index);
+        if cursor.1 < row.end_col || (is_last_for_line && cursor.1 <= row.end_col) {
+            let col = cursor.1.saturating_sub(row.start_col).min(wrap_width);
+            return Some((index, col));
+        }
+    }
+    None
+}
+
+fn byte_index_for_line_col(buffer: &str, line_index: usize, col: usize) -> usize {
+    let spans = pseudo_input_logical_line_spans(buffer);
+    let Some(span) = spans.get(line_index) else {
+        return buffer.len();
+    };
+    let line = &buffer[span.start_byte..span.start_byte + span.byte_len];
+    span.start_byte + byte_index_for_char_col(line, col.min(span.char_len))
 }
 
 fn render_outbound_status(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
@@ -3031,14 +3188,16 @@ fn render_status_row(
     overlay_constrained: bool,
 ) {
     let hint = status_hint(pane, focus, overlay_constrained);
-    let label = pad_to_width(
-        format!(
-            " OBS  {} · {}  —  {hint}",
-            monitor_summary_text(pane),
-            view_mode_word(pane.view_mode),
-        ),
-        area.width,
+    let summary = format!(
+        " OBS  {} · {}",
+        monitor_summary_text(pane),
+        view_mode_word(pane.view_mode),
     );
+    let label = if hint.is_empty() {
+        pad_to_width(summary, area.width)
+    } else {
+        pad_to_width(format!("{summary}  —  {hint}"), area.width)
+    };
     let style = Style::default()
         .fg(Color::White)
         .bg(Color::Indexed(236))
@@ -3058,25 +3217,19 @@ fn status_hint(pane: &MonitorPane, focus: Focus, overlay_constrained: bool) -> S
 }
 
 fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
-    let protected_suffix = if overlay_constrained {
-        " · input viewport protected"
-    } else {
-        ""
-    };
+    let protected_suffix = overlay_constrained.then_some("input viewport protected");
     if pane.pending_cancel.is_some() {
+        let protected_suffix = protected_suffix
+            .map(|suffix| format!(" · {suffix}"))
+            .unwrap_or_default();
         return format!("confirm cancel: y = SIGTERM · n = abort{protected_suffix}");
     }
     match pane.cancel_feedback.as_deref() {
-        Some(feedback) => {
-            format!(
-                "type draft · Enter queue · Ctrl+Enter newline · Ctrl+F filter · click bar list  ({feedback}){protected_suffix}"
-            )
-        }
-        None => {
-            format!(
-                "type draft · Enter queue · Ctrl+Enter newline · Ctrl+F filter · click bar list{protected_suffix}"
-            )
-        }
+        Some(feedback) => match protected_suffix {
+            Some(suffix) => format!("{feedback} · {suffix}"),
+            None => feedback.to_string(),
+        },
+        None => protected_suffix.unwrap_or_default().to_string(),
     }
 }
 
@@ -4179,7 +4332,10 @@ fn route_mouse_aware_input(
     protection: TypingProtection,
 ) -> RoutedInput {
     let areas = pane_areas_for_winsize(winsize, pane, protection);
-    let mut routed = RoutedInput::default();
+    let mut routed = RoutedInput {
+        pseudo_input_width: Some(expanded_bottom_layout(areas.bottom, pane).input.width),
+        ..Default::default()
+    };
     let mut i = 0;
     while i < bytes.len() {
         if let Some(parsed) = parse_mouse_event(&bytes[i..]) {
@@ -4533,7 +4689,7 @@ fn route_bottom_mouse_event(
         apply_monitor_command(routed, command);
     } else if is_primary_press(event) {
         router.focus_bottom(routed);
-        if bottom_status_row_contains(bottom, event) {
+        if bottom_status_row_contains(bottom, pane, event) {
             apply_monitor_command(routed, MonitorCommand::ToggleList);
             return;
         }
@@ -4547,10 +4703,8 @@ fn route_bottom_mouse_event(
     }
 }
 
-fn bottom_status_row_contains(bottom: Rect, event: MouseEvent) -> bool {
-    event.row == bottom.y.saturating_add(1)
-        && event.col > bottom.x
-        && event.col <= bottom.x.saturating_add(bottom.width)
+fn bottom_status_row_contains(bottom: Rect, pane: &MonitorPane, event: MouseEvent) -> bool {
+    rect_contains_mouse(expanded_bottom_layout(bottom, pane).status, event)
 }
 
 fn bottom_filter_tab_at(
@@ -4569,7 +4723,7 @@ fn bottom_filter_tabs_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
     if pane.collapsed {
         return None;
     }
-    let content = expanded_bottom_layout(bottom_body_area(bottom), pane).content;
+    let content = expanded_bottom_layout(bottom, pane).content;
     (content.height > 0).then_some(filter_tabs_area(content))
 }
 
@@ -4606,7 +4760,7 @@ fn bottom_list_area(bottom: Rect, pane: &MonitorPane) -> Option<Rect> {
     if pane.collapsed || bottom.height <= 1 {
         return None;
     }
-    let body = expanded_bottom_layout(bottom_body_area(bottom), pane).content;
+    let body = expanded_bottom_layout(bottom, pane).content;
     if body.height == 0 {
         return None;
     }
@@ -4656,7 +4810,13 @@ fn apply_routed_to_pane(
     routed: RoutedInput,
     snapshot_worker: &MonitorSnapshotWorker,
 ) -> bool {
-    apply_routed_pseudo_input(pane, &routed.pseudo_input);
+    apply_routed_pseudo_input(
+        pane,
+        &routed.pseudo_input,
+        routed
+            .pseudo_input_width
+            .unwrap_or(DEFAULT_PSEUDO_INPUT_WIDTH),
+    );
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
     snapshot_worker.set_interval(pane.refresh_interval());
@@ -4720,10 +4880,10 @@ fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
     )
 }
 
-fn apply_routed_pseudo_input(pane: &mut MonitorPane, actions: &[PseudoInputAction]) {
+fn apply_routed_pseudo_input(pane: &mut MonitorPane, actions: &[PseudoInputAction], width: u16) {
     let now = Instant::now();
     for action in actions {
-        pane.apply_pseudo_input(*action, now);
+        pane.apply_pseudo_input(*action, width, now);
     }
 }
 
@@ -5601,7 +5761,8 @@ mod tests {
         };
         let areas =
             pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
-        let bytes = sgr_press(0, 4, areas.bottom.y + 1);
+        let status = expanded_bottom_layout(areas.bottom, &pane).status;
+        let bytes = sgr_press(0, 4, status.y + 1);
 
         let routed = route_real_input(
             &bytes,
@@ -5732,7 +5893,12 @@ mod tests {
             encoding: vt100::MouseProtocolEncoding::Sgr,
         };
 
-        let routed = route_real_input(b"\x1b[<0;4;16M", &mut router, &pane, child, &winsize);
+        let areas =
+            pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
+        let outbound = expanded_bottom_layout(areas.bottom, &pane).outbound;
+        let bytes = sgr_press(0, outbound.x + 1, outbound.y + 1);
+
+        let routed = route_real_input(&bytes, &mut router, &pane, child, &winsize);
 
         assert_eq!(router.focus, Focus::Bottom);
         assert!(routed.focus_bottom);
@@ -5956,7 +6122,7 @@ mod tests {
         let routed = router.route_input(b"draft only");
 
         assert!(routed.forward.is_empty());
-        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input);
+        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input, DEFAULT_PSEUDO_INPUT_WIDTH);
 
         assert_eq!(pane.pseudo_input.buffer, "draft only");
         assert!(pane.outbound.messages.is_empty());
@@ -5971,7 +6137,7 @@ mod tests {
             PseudoInputAction::Insert('i'),
             PseudoInputAction::Submit,
         ] {
-            pane.apply_pseudo_input(action, now);
+            pane.apply_pseudo_input(action, DEFAULT_PSEUDO_INPUT_WIDTH, now);
         }
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
@@ -6566,13 +6732,13 @@ mod tests {
     }
 
     #[test]
-    fn lower_pane_selection_change_is_interactive_render_priority() {
+    fn lower_pane_pseudo_input_move_is_interactive_render_priority() {
         let mut router = InputRouter::new();
         router.focus = Focus::Bottom;
 
         let routed = router.route_input(&[0x1b, b'[', b'B']);
 
-        assert_eq!(routed.commands, vec![MonitorCommand::SelectNext]);
+        assert_eq!(routed.pseudo_input, vec![PseudoInputAction::MoveDown]);
         assert_eq!(routed_priority(&routed), RenderPriority::Interactive);
     }
 
@@ -7630,7 +7796,7 @@ mod tests {
         let mut pane = pane_with(empty_snapshot(), false, 0);
         let routed = router.route_input(b"hi\x1b[D!\r");
 
-        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input);
+        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input, DEFAULT_PSEUDO_INPUT_WIDTH);
 
         assert_eq!(pane.pseudo_input.buffer, "");
         assert_eq!(pane.outbound.messages.len(), 1);
@@ -7645,7 +7811,7 @@ mod tests {
         let mut pane = pane_with(empty_snapshot(), false, 0);
         let routed = router.route_input(b"line1\x1b[13;5uline2\r");
 
-        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input);
+        apply_routed_pseudo_input(&mut pane, &routed.pseudo_input, DEFAULT_PSEUDO_INPUT_WIDTH);
 
         assert!(routed.forward.is_empty());
         assert_eq!(pane.pseudo_input.buffer, "");
@@ -7705,7 +7871,39 @@ mod tests {
         let rows = format_pseudo_input_rows(&pane, 2, 80);
 
         assert!(rows[0].contains("alpha"), "{rows:?}");
-        assert!(rows[1].contains("bravo▌"), "{rows:?}");
+        assert!(rows[1].contains("bravo"), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains('▌')), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("input[")), "{rows:?}");
+        assert!(!rows.iter().any(|row| row.starts_with('>')), "{rows:?}");
+    }
+
+    #[test]
+    fn pseudo_input_cursor_styles_cell_without_shifting_text() {
+        let mut pane = pane_with(empty_snapshot(), true, 0);
+        pane.pseudo_input.buffer = "abc".to_string();
+        pane.pseudo_input.cursor = 1;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 1,
+        };
+        let mut buf = Buffer::empty(area);
+
+        render_pseudo_input(&mut buf, area, &pane, Focus::Bottom);
+
+        assert_eq!(row_text(&buf, 0, 4), "abc ");
+        assert_eq!(buf[(1, 0)].symbol(), "b");
+        assert!(buf[(1, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
+        let mut end_buf = Buffer::empty(area);
+        render_pseudo_input(&mut end_buf, area, &pane, Focus::Bottom);
+
+        assert_eq!(row_text(&end_buf, 0, 4), "abc ");
+        assert_eq!(end_buf[(3, 0)].symbol(), " ");
+        assert!(end_buf[(3, 0)].modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -7715,19 +7913,38 @@ mod tests {
             cursor: 2,
         };
 
-        input.apply(PseudoInputAction::InsertNewline);
+        input.apply(PseudoInputAction::InsertNewline, DEFAULT_PSEUDO_INPUT_WIDTH);
 
         assert_eq!(input.buffer, "ab\ncd");
         assert_eq!(input.cursor_line_col(), (1, 0));
     }
 
     #[test]
+    fn up_down_move_cursor_between_input_lines() {
+        let mut input = PseudoInputState {
+            buffer: "alpha\nbravo".to_string(),
+            cursor: byte_index_for_line_col("alpha\nbravo", 1, 3),
+        };
+
+        input.apply(PseudoInputAction::MoveUp, DEFAULT_PSEUDO_INPUT_WIDTH);
+        assert_eq!(input.cursor_line_col(), (0, 3));
+
+        input.apply(PseudoInputAction::MoveDown, DEFAULT_PSEUDO_INPUT_WIDTH);
+        assert_eq!(input.cursor_line_col(), (1, 3));
+
+        input.cursor = byte_index_for_line_col(&input.buffer, 0, 2);
+        input.apply(PseudoInputAction::MoveUp, DEFAULT_PSEUDO_INPUT_WIDTH);
+        assert_eq!(input.cursor, 0);
+
+        input.cursor = byte_index_for_line_col(&input.buffer, 1, 2);
+        input.apply(PseudoInputAction::MoveDown, DEFAULT_PSEUDO_INPUT_WIDTH);
+        assert_eq!(input.cursor, input.buffer.len());
+    }
+
+    #[test]
     fn pseudo_input_height_grows_caps_and_shrinks() {
         let mut input = PseudoInputState::default();
-        assert_eq!(
-            input.desired_rows(80),
-            MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS
-        );
+        assert_eq!(input.desired_rows(80), MIN_INPUT_ROWS);
 
         input.buffer = "one\ntwo\nthree".to_string();
         input.cursor = input.buffer.len();
@@ -7735,7 +7952,7 @@ mod tests {
             desired_pseudo_input_editor_rows(&input.buffer, input.cursor, 80),
             3
         );
-        assert_eq!(input.desired_rows(80), 3 + PSEUDO_INPUT_HELP_ROWS);
+        assert_eq!(input.desired_rows(80), 3);
 
         input.buffer = (0..12)
             .map(|index| format!("line{index}"))
@@ -7748,10 +7965,7 @@ mod tests {
         );
 
         input.clear();
-        assert_eq!(
-            input.desired_rows(80),
-            MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS
-        );
+        assert_eq!(input.desired_rows(80), MIN_INPUT_ROWS);
     }
 
     #[test]
@@ -7775,14 +7989,17 @@ mod tests {
 
         let bottom_rows = format_pseudo_input_rows(&pane, MAX_INPUT_ROWS, 80);
 
-        assert!(bottom_rows[0].contains("input[3]"), "{bottom_rows:?}");
+        assert!(bottom_rows[0].contains("line2"), "{bottom_rows:?}");
         assert!(bottom_rows[0].contains('↑'), "{bottom_rows:?}");
-        assert!(bottom_rows[9].contains("line11▌"), "{bottom_rows:?}");
+        assert!(bottom_rows[9].contains("line11"), "{bottom_rows:?}");
+        assert!(
+            !bottom_rows.iter().any(|row| row.contains('▌')),
+            "{bottom_rows:?}"
+        );
 
         pane.pseudo_input.cursor = 0;
         let top_rows = format_pseudo_input_rows(&pane, MAX_INPUT_ROWS, 80);
 
-        assert!(top_rows[0].contains("input[1:0]"), "{top_rows:?}");
         assert!(top_rows[0].contains("line0"), "{top_rows:?}");
         assert!(top_rows[9].contains('↓'), "{top_rows:?}");
     }
@@ -7987,6 +8204,8 @@ mod tests {
             "cargo test",
         )];
         let mut pane = pane_with(snapshot, false, 0);
+        pane.pseudo_input.buffer = "draft".to_string();
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
         let mut router = InputRouter::new();
         router.focus = Focus::Bottom;
         let winsize = libc::winsize {
@@ -7997,7 +8216,8 @@ mod tests {
         };
         let expanded_areas =
             pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
-        let close_bytes = sgr_press(0, 4, expanded_areas.bottom.y + 1);
+        let expanded_status = expanded_bottom_layout(expanded_areas.bottom, &pane).status;
+        let close_bytes = sgr_press(0, 4, expanded_status.y + 1);
 
         let close = route_real_input(
             &close_bytes,
@@ -8018,11 +8238,13 @@ mod tests {
             .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
             .unwrap();
         let collapsed_text = screen_text(terminal.backend().buffer(), 20, 80);
-        assert!(collapsed_text.contains("input[1:0]"), "{collapsed_text}");
+        assert!(collapsed_text.contains("draft"), "{collapsed_text}");
+        assert!(!collapsed_text.contains("input["), "{collapsed_text}");
         assert!(!collapsed_text.contains("cargo test"), "{collapsed_text}");
         let collapsed_areas =
             pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
-        let open_bytes = sgr_press(0, 4, collapsed_areas.bottom.y + 1);
+        let collapsed_status = expanded_bottom_layout(collapsed_areas.bottom, &pane).status;
+        let open_bytes = sgr_press(0, 4, collapsed_status.y + 1);
 
         let open = route_real_input(
             &open_bytes,
@@ -8267,7 +8489,9 @@ mod tests {
             MonitorStatus::Running,
             "cargo test",
         )];
-        let pane = pane_with(snapshot, true, 0);
+        let mut pane = pane_with(snapshot, true, 0);
+        pane.pseudo_input.buffer = "draft".to_string();
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
         let parser = vt100::Parser::new(15, 80, 0);
 
         terminal
@@ -8275,7 +8499,8 @@ mod tests {
             .unwrap();
 
         let text = screen_text(terminal.backend().buffer(), 20, 80);
-        assert!(text.contains("input[1:0]"), "{text}");
+        assert!(text.contains("draft"), "{text}");
+        assert!(!text.contains("input["), "{text}");
         assert!(text.contains("outbound: idle"), "{text}");
         assert!(
             !text.contains("cargo test"),
@@ -8284,7 +8509,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_overlay_renders_input_above_filter_tabs_and_list() {
+    fn expanded_overlay_renders_input_above_status_filter_tabs_and_list() {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut snapshot = empty_snapshot();
@@ -8294,7 +8519,9 @@ mod tests {
             MonitorStatus::Running,
             "cargo test",
         )];
-        let pane = pane_with(snapshot, false, 0);
+        let mut pane = pane_with(snapshot, false, 0);
+        pane.pseudo_input.buffer = "draft".to_string();
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
         let parser = vt100::Parser::new(12, 80, 0);
 
         terminal
@@ -8303,16 +8530,75 @@ mod tests {
 
         let buf = terminal.backend().buffer();
         let input_row = (0..20)
-            .find(|row| row_text(buf, *row, 80).contains("input[1:0]"))
+            .find(|row| row_text(buf, *row, 80).contains("draft"))
             .expect("input row");
+        let status_row = (0..20)
+            .find(|row| row_text(buf, *row, 80).contains("OBS"))
+            .expect("status row");
         let tabs_row = (0..20)
             .find(|row| row_text(buf, *row, 80).contains("filters:"))
             .expect("tabs row");
         let list_row = (0..20)
             .find(|row| row_text(buf, *row, 80).contains("cargo test"))
             .expect("list row");
-        assert!(input_row < tabs_row, "input={input_row} tabs={tabs_row}");
+        assert!(
+            input_row < status_row,
+            "input={input_row} status={status_row}"
+        );
+        assert!(status_row < tabs_row, "status={status_row} tabs={tabs_row}");
         assert!(tabs_row < list_row, "tabs={tabs_row} list={list_row}");
+    }
+
+    #[test]
+    fn bottom_layout_rects_do_not_overlap_and_sum_to_pane_height() {
+        let mut pane = pane_with(snapshot_with_nodes(2), false, 0);
+        pane.pseudo_input.buffer = (0..12)
+            .map(|index| format!("line{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        pane.pseudo_input.cursor = pane.pseudo_input.buffer.len();
+        let bottom = Rect {
+            x: 0,
+            y: 10,
+            width: 80,
+            height: 14,
+        };
+
+        let layout = expanded_bottom_layout(bottom, &pane);
+
+        assert_eq!(layout.input.y, bottom.y);
+        assert_eq!(layout.status.y, layout.input.y + layout.input.height);
+        assert_eq!(layout.outbound.y, layout.status.y + layout.status.height);
+        assert_eq!(layout.content.y, layout.outbound.y + layout.outbound.height);
+        assert_eq!(
+            layout.content.y + layout.content.height,
+            bottom.y + bottom.height
+        );
+        assert!(layout.input.height <= MAX_INPUT_ROWS);
+        assert!(layout.input.y < layout.status.y);
+        assert!(layout.status.height <= STATUS_ROW_ROWS);
+    }
+
+    #[test]
+    fn bottom_status_drops_keyboard_hints_but_keeps_obs_counts() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot.summary = snapshot_summary(MonitorStatus::Running, 3, 2, 1, 0);
+        let pane = pane_with(snapshot, true, 0);
+        let parser = vt100::Parser::new(15, 80, 0);
+
+        terminal
+            .draw(|frame| render_frame(frame, parser.screen(), Focus::Bottom, &pane, None))
+            .unwrap();
+
+        let text = screen_text(terminal.backend().buffer(), 20, 80);
+        assert!(text.contains("OBS"), "{text}");
+        assert!(text.contains("running · 3 proc · 2 bash running"), "{text}");
+        assert!(!text.contains("Enter queue"), "{text}");
+        assert!(!text.contains("Ctrl+Enter"), "{text}");
+        assert!(!text.contains("Ctrl+F"), "{text}");
+        assert!(!text.contains("type draft"), "{text}");
     }
 
     #[test]
@@ -8670,7 +8956,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_focus_arrows_decode_to_monitor_commands_and_printable_edits() {
+    fn bottom_focus_arrows_move_pseudo_input_cursor_and_printable_edits() {
         let mut router = InputRouter::new();
         router.focus = Focus::Bottom;
         assert_eq!(router.focus, Focus::Bottom);
@@ -8684,12 +8970,12 @@ mod tests {
             vec![PseudoInputAction::Insert('k')]
         );
         assert_eq!(
-            router.route_input(&[0x1b, b'[', b'B']).commands,
-            vec![MonitorCommand::SelectNext]
+            router.route_input(&[0x1b, b'[', b'B']).pseudo_input,
+            vec![PseudoInputAction::MoveDown]
         );
         assert_eq!(
-            router.route_input(&[0x1b, b'[', b'A']).commands,
-            vec![MonitorCommand::SelectPrev]
+            router.route_input(&[0x1b, b'[', b'A']).pseudo_input,
+            vec![PseudoInputAction::MoveUp]
         );
 
         let routed = router.route_input(b"q");
