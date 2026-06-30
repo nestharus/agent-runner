@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -148,55 +148,38 @@ fn main() -> ExitCode {
 
 fn handle_init(args: InitArgs) -> ExitCode {
     run_cli(|| {
-        let already_current = Store::open(&args.db).is_ok();
+        let already_current = store_is_current(&args.db);
         Store::init(&args.db)?;
-        let status = if already_current {
-            "already_current"
-        } else {
-            "initialized"
-        };
-
-        if args.json {
-            print_json(&InitEnvelope {
-                db_path: args.db.display().to_string(),
-                schema_version: 1,
-                status,
-            })?;
-        } else {
-            writeln!(io::stdout(), "{status}: {}", args.db.display())?;
-        }
+        write_init_output(&args.db, init_status(already_current), args.json)?;
         Ok(())
     })
 }
 
 fn handle_put(args: PutArgs) -> ExitCode {
     run_cli(|| {
-        let content = read_content(args.content)?;
-        let store = Store::open(&args.db)?;
-        let receipt = store.put(PutRequest {
-            key: ArtifactKey {
-                workflow_run_id: args.workflow_run_id,
-                artifact_name: args.artifact_name,
-            },
-            producer_invocation_uuid: args.producer_uuid,
-            format_hint: args.format_hint,
-            verdict_line: args.verdict_line,
-            predecessor_version: args.predecessor_version,
+        let PutArgs {
+            db,
+            workflow_run_id,
+            artifact_name,
+            predecessor_version,
+            producer_uuid,
+            format_hint,
+            verdict_line,
+            content: content_input,
+            json,
+        } = args;
+        let content = read_content(content_input)?;
+        let store = Store::open(&db)?;
+        let receipt = store.put(put_request(
+            workflow_run_id,
+            artifact_name,
+            producer_uuid,
+            format_hint,
+            verdict_line,
+            predecessor_version,
             content,
-        })?;
-
-        if args.json {
-            print_json(&PutEnvelope::from_receipt(&receipt))?;
-        } else {
-            writeln!(
-                io::stdout(),
-                "{} {} v{} {}",
-                receipt.key.workflow_run_id,
-                receipt.key.artifact_name,
-                receipt.version,
-                receipt.sha256
-            )?;
-        }
+        ))?;
+        write_put_output(&receipt, json)?;
         Ok(())
     })
 }
@@ -204,22 +187,9 @@ fn handle_put(args: PutArgs) -> ExitCode {
 fn handle_get(args: GetArgs) -> ExitCode {
     run_cli(|| {
         let store = Store::open(&args.db)?;
-        let record = store.get(
-            &ArtifactKey {
-                workflow_run_id: args.workflow_run_id,
-                artifact_name: args.artifact_name,
-            },
-            args.version,
-        )?;
-
-        if let Some(path) = args.out {
-            fs::write(path, record.content)?;
-        } else {
-            let stdout = io::stdout();
-            let mut handle = stdout.lock();
-            handle.write_all(&record.content)?;
-            handle.flush()?;
-        }
+        let key = artifact_key(args.workflow_run_id, args.artifact_name);
+        let record = store.get(&key, args.version)?;
+        write_content_output(args.out, record.content)?;
         Ok(())
     })
 }
@@ -227,26 +197,9 @@ fn handle_get(args: GetArgs) -> ExitCode {
 fn handle_get_meta(args: GetMetaArgs) -> ExitCode {
     run_cli(|| {
         let store = Store::open(&args.db)?;
-        let meta = store.get_meta(
-            &ArtifactKey {
-                workflow_run_id: args.workflow_run_id,
-                artifact_name: args.artifact_name,
-            },
-            args.version,
-        )?;
-
-        if args.json {
-            print_json(&MetaEnvelope::from_meta(&meta))?;
-        } else {
-            writeln!(
-                io::stdout(),
-                "{} {} v{} {}",
-                meta.key.workflow_run_id,
-                meta.key.artifact_name,
-                meta.version,
-                meta.sha256
-            )?;
-        }
+        let key = artifact_key(args.workflow_run_id, args.artifact_name);
+        let meta = store.get_meta(&key, args.version)?;
+        write_meta_output(&meta, args.json)?;
         Ok(())
     })
 }
@@ -254,25 +207,9 @@ fn handle_get_meta(args: GetMetaArgs) -> ExitCode {
 fn handle_list(args: ListArgs) -> ExitCode {
     run_cli(|| {
         let store = Store::open(&args.db)?;
-        let rows = store.list(ListFilter {
-            workflow_run_id: args.workflow_run_id,
-            artifact_name: args.artifact_name,
-            include_tombstoned: args.include_tombstoned,
-        })?;
-
-        if args.json {
-            let envelopes: Vec<_> = rows.iter().map(MetaEnvelope::from_meta).collect();
-            print_json(&envelopes)?;
-        } else {
-            let mut stdout = io::stdout();
-            for row in rows {
-                writeln!(
-                    stdout,
-                    "{} {} v{} {}",
-                    row.key.workflow_run_id, row.key.artifact_name, row.version, row.sha256
-                )?;
-            }
-        }
+        let json = args.json;
+        let rows = store.list(list_filter(args))?;
+        write_list_output(&rows, json)?;
         Ok(())
     })
 }
@@ -280,30 +217,146 @@ fn handle_list(args: ListArgs) -> ExitCode {
 fn handle_tombstone(args: TombstoneArgs) -> ExitCode {
     run_cli(|| {
         let store = Store::open(&args.db)?;
-        let receipt = store.tombstone(
-            &ArtifactKey {
-                workflow_run_id: args.workflow_run_id,
-                artifact_name: args.artifact_name,
-            },
-            args.version,
-            &args.actor,
-            &args.reason,
-        )?;
-
-        if args.json {
-            print_json(&TombstoneEnvelope::from_receipt(&receipt))?;
-        } else {
-            writeln!(
-                io::stdout(),
-                "{}: {} {} v{}",
-                status_text(&receipt.status),
-                receipt.key.workflow_run_id,
-                receipt.key.artifact_name,
-                receipt.version
-            )?;
-        }
+        let key = artifact_key(args.workflow_run_id, args.artifact_name);
+        let receipt = store.tombstone(&key, args.version, &args.actor, &args.reason)?;
+        write_tombstone_output(&receipt, args.json)?;
         Ok(())
     })
+}
+
+fn store_is_current(db_path: &PathBuf) -> bool {
+    Store::open(db_path).is_ok()
+}
+
+fn init_status(already_current: bool) -> &'static str {
+    if already_current {
+        "already_current"
+    } else {
+        "initialized"
+    }
+}
+
+fn artifact_key(workflow_run_id: String, artifact_name: String) -> ArtifactKey {
+    ArtifactKey {
+        workflow_run_id,
+        artifact_name,
+    }
+}
+
+fn put_request(
+    workflow_run_id: String,
+    artifact_name: String,
+    producer_uuid: Option<uuid::Uuid>,
+    format_hint: Option<String>,
+    verdict_line: Option<String>,
+    predecessor_version: Option<u64>,
+    content: Vec<u8>,
+) -> PutRequest {
+    PutRequest {
+        key: artifact_key(workflow_run_id, artifact_name),
+        producer_invocation_uuid: producer_uuid,
+        format_hint,
+        verdict_line,
+        predecessor_version,
+        content,
+    }
+}
+
+fn list_filter(args: ListArgs) -> ListFilter {
+    ListFilter {
+        workflow_run_id: args.workflow_run_id,
+        artifact_name: args.artifact_name,
+        include_tombstoned: args.include_tombstoned,
+    }
+}
+
+fn write_init_output(db: &Path, status: &'static str, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&InitEnvelope {
+            db_path: db.display().to_string(),
+            schema_version: 1,
+            status,
+        })
+    } else {
+        writeln!(io::stdout(), "{status}: {}", db.display()).map_err(CliError::from)
+    }
+}
+
+fn write_put_output(receipt: &PutReceipt, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&PutEnvelope::from_receipt(receipt))
+    } else {
+        writeln!(
+            io::stdout(),
+            "{} {} v{} {}",
+            receipt.key.workflow_run_id,
+            receipt.key.artifact_name,
+            receipt.version,
+            receipt.sha256
+        )
+        .map_err(CliError::from)
+    }
+}
+
+fn write_content_output(out: Option<PathBuf>, content: Vec<u8>) -> Result<(), CliError> {
+    if let Some(path) = out {
+        return fs::write(path, content).map_err(CliError::from);
+    }
+
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(&content)?;
+    handle.flush()?;
+    Ok(())
+}
+
+fn write_meta_output(meta: &ArtifactMeta, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&MetaEnvelope::from_meta(meta))
+    } else {
+        writeln!(
+            io::stdout(),
+            "{} {} v{} {}",
+            meta.key.workflow_run_id,
+            meta.key.artifact_name,
+            meta.version,
+            meta.sha256
+        )
+        .map_err(CliError::from)
+    }
+}
+
+fn write_list_output(rows: &[ArtifactMeta], json: bool) -> Result<(), CliError> {
+    if json {
+        let envelopes: Vec<_> = rows.iter().map(MetaEnvelope::from_meta).collect();
+        return print_json(&envelopes);
+    }
+
+    let mut stdout = io::stdout();
+    for row in rows {
+        writeln!(
+            stdout,
+            "{} {} v{} {}",
+            row.key.workflow_run_id, row.key.artifact_name, row.version, row.sha256
+        )?;
+    }
+    Ok(())
+}
+
+fn write_tombstone_output(receipt: &TombstoneReceipt, json: bool) -> Result<(), CliError> {
+    if json {
+        print_json(&TombstoneEnvelope::from_receipt(receipt))
+    } else {
+        writeln!(
+            io::stdout(),
+            "{}: {} {} v{}",
+            status_text(&receipt.status),
+            receipt.key.workflow_run_id,
+            receipt.key.artifact_name,
+            receipt.version
+        )
+        .map_err(CliError::from)
+    }
 }
 
 #[derive(Debug)]
