@@ -80,7 +80,9 @@ impl ProviderResolver {
         match artifact {
             ProviderArtifactRef::Path { path } => self.resolve_path(path, config_dir),
             ProviderArtifactRef::Script { path } => self.resolve_path(path, config_dir),
-            ProviderArtifactRef::Binary { name } => self.resolve_binary(name),
+            ProviderArtifactRef::Binary { name } => {
+                self.resolve_binary(validate_binary_name(name)?)
+            }
         }
     }
 
@@ -100,8 +102,11 @@ impl ProviderResolver {
         ensure_executable(candidate)
     }
 
-    fn resolve_binary(&self, name: &str) -> Result<ResolvedProviderCommand, ProviderResolveError> {
-        let name = validate_binary_name(name)?;
+    fn resolve_binary(
+        &self,
+        name: ValidatedBinaryName<'_>,
+    ) -> Result<ResolvedProviderCommand, ProviderResolveError> {
+        let name = name.as_str();
         for root in binary_search_roots(&self.options, name) {
             if let Some(resolved) = resolve_binary_in_root(root, name)? {
                 return Ok(resolved);
@@ -137,7 +142,22 @@ fn is_packaged_binary_allowed(options: &ProviderResolveOptions, name: &str) -> b
     options.packaged_allowlist.contains(name)
 }
 
-fn validate_binary_name(name: &str) -> Result<&str, ProviderResolveError> {
+#[derive(Debug, Clone, Copy)]
+struct ValidatedBinaryName<'a> {
+    name: &'a str,
+}
+
+impl<'a> ValidatedBinaryName<'a> {
+    fn new(name: &'a str) -> Self {
+        Self { name }
+    }
+
+    fn as_str(self) -> &'a str {
+        self.name
+    }
+}
+
+fn validate_binary_name(name: &str) -> Result<ValidatedBinaryName<'_>, ProviderResolveError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
         return Err(ProviderResolveError::new(HostErrorKind::InvalidBinaryName));
     }
@@ -147,7 +167,9 @@ fn validate_binary_name(name: &str) -> Result<&str, ProviderResolveError> {
     }
     let mut components = path.components();
     match (components.next(), components.next()) {
-        (Some(Component::Normal(component)), None) if !component.is_empty() => Ok(name),
+        (Some(Component::Normal(component)), None) if !component.is_empty() => {
+            Ok(ValidatedBinaryName::new(name))
+        }
         _ => Err(ProviderResolveError::new(HostErrorKind::InvalidBinaryName)),
     }
 }
