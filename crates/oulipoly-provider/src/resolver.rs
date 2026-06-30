@@ -96,32 +96,45 @@ impl ProviderResolver {
         path: &Path,
         config_dir: Option<&Path>,
     ) -> Result<ResolvedProviderCommand, ProviderResolveError> {
-        let candidate = if path.is_absolute() {
-            path.to_path_buf()
-        } else if let Some(config_dir) = config_dir {
-            config_dir.join(path)
-        } else {
-            path.to_path_buf()
-        };
+        let candidate = map_provider_path_candidate(path, config_dir);
         ensure_executable(candidate)
     }
 
     fn resolve_binary(&self, name: &str) -> Result<ResolvedProviderCommand, ProviderResolveError> {
         let name = validate_binary_name(name)?;
-        for entry in &self.options.path_entries {
-            if let Some(resolved) = resolve_binary_in_root(entry, name)? {
+        for root in binary_search_roots(&self.options, name) {
+            if let Some(resolved) = resolve_binary_in_root(root, name)? {
                 return Ok(resolved);
-            }
-        }
-        if self.options.packaged_allowlist.contains(name) {
-            for root in &self.options.packaged_search_roots {
-                if let Some(resolved) = resolve_binary_in_root(root, name)? {
-                    return Ok(resolved);
-                }
             }
         }
         Err(ProviderResolveError::new(HostErrorKind::MissingArtifact))
     }
+}
+
+fn map_provider_path_candidate(path: &Path, config_dir: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(config_dir) = config_dir {
+        config_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn binary_search_roots<'a>(
+    options: &'a ProviderResolveOptions,
+    name: &'a str,
+) -> impl Iterator<Item = &'a PathBuf> + 'a {
+    options.path_entries.iter().chain(
+        options
+            .packaged_search_roots
+            .iter()
+            .filter(move |_| is_packaged_binary_allowed(options, name)),
+    )
+}
+
+fn is_packaged_binary_allowed(options: &ProviderResolveOptions, name: &str) -> bool {
+    options.packaged_allowlist.contains(name)
 }
 
 fn validate_binary_name(name: &str) -> Result<&str, ProviderResolveError> {
@@ -143,12 +156,20 @@ fn resolve_binary_in_root(
     root: &Path,
     name: &str,
 ) -> Result<Option<ResolvedProviderCommand>, ProviderResolveError> {
-    let candidate = root.join(name);
-    if !candidate.exists() {
+    let candidate = map_binary_candidate(root, name);
+    if !binary_candidate_exists(&candidate) {
         return Ok(None);
     }
     ensure_candidate_within_root(root, &candidate)?;
     ensure_executable(candidate).map(Some)
+}
+
+fn map_binary_candidate(root: &Path, name: &str) -> PathBuf {
+    root.join(name)
+}
+
+fn binary_candidate_exists(candidate: &Path) -> bool {
+    candidate.exists()
 }
 
 fn ensure_candidate_within_root(root: &Path, candidate: &Path) -> Result<(), ProviderResolveError> {
