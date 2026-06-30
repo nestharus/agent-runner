@@ -37,38 +37,18 @@ pub fn decide_migration(
     if !model_has_migration_alternative(model) {
         return Ok(MigrationDecision::Stay);
     }
-
     let Some(active_provider_index) = active_provider_index(model, resolved) else {
         return Ok(MigrationDecision::Stay);
     };
     let active = &model.providers[active_provider_index];
-
     if let Some(decision) = manual_migration_decision(model, active, manual_target) {
         return Ok(decision);
     }
-
     if !active_provider_supports_resume_migration(active) {
         return Ok(MigrationDecision::Stay);
     }
 
-    let active_exhausted = active_provider_is_exhausted(state, active)?;
-    let projections = compute_projections(model, state, None);
-
-    if active_exhausted {
-        return Ok(exhausted_migration_decision(
-            model,
-            &projections,
-            active,
-            active_provider_index,
-        ));
-    }
-
-    Ok(quota_threshold_migration_decision(
-        model,
-        &projections,
-        active,
-        active_provider_index,
-    ))
+    automatic_migration_decision(state, model, active, active_provider_index)
 }
 
 /// AGE-163 WU-A.5 typed manual-rotate decision. Translates the three
@@ -89,38 +69,76 @@ pub fn decide_manual_migration(
     manual_target: &str,
 ) -> Result<MigrationDecision, ManualMigrationRejection> {
     if !model_has_migration_alternative(model) {
-        let provider = model
-            .providers
-            .first()
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| resolved.active_provider.clone());
-        return Err(ManualMigrationRejection::SingleProviderPool { provider });
+        return Err(single_provider_pool_rejection(model, resolved));
     }
-    let Some(active_index) = active_provider_index(model, resolved) else {
-        return Err(ManualMigrationRejection::ActiveProviderNotInPool {
-            active: resolved.active_provider.clone(),
-        });
-    };
+    let active_index = active_provider_index_for_manual(model, resolved)?;
     let active = &model.providers[active_index];
-    let Some(target_index) = model
-        .providers
-        .iter()
-        .position(|provider| provider.name == manual_target)
-    else {
-        return Err(ManualMigrationRejection::TargetNotInPool {
-            target: manual_target.to_string(),
-            pool: model.providers.iter().map(|p| p.name.clone()).collect(),
-        });
-    };
-    if !is_resume_migratable_pair(active, &model.providers[target_index]) {
-        return Err(ManualMigrationRejection::NotMigratablePair {
-            source: active.name.clone(),
-            target: manual_target.to_string(),
-        });
-    }
+    let target_index = manual_target_index_for_rejection(model, manual_target)?;
+    ensure_manual_pair_is_migratable(active, &model.providers[target_index], manual_target)?;
     Ok(MigrationDecision::Migrate {
         target_provider_index: target_index,
         reason: TransitionReason::Manual,
+    })
+}
+
+fn single_provider_pool_rejection(
+    model: &ModelConfig,
+    resolved: &ResolvedResume,
+) -> ManualMigrationRejection {
+    let provider = model
+        .providers
+        .first()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| resolved.active_provider.clone());
+    ManualMigrationRejection::SingleProviderPool { provider }
+}
+
+fn active_provider_index_for_manual(
+    model: &ModelConfig,
+    resolved: &ResolvedResume,
+) -> Result<usize, ManualMigrationRejection> {
+    active_provider_index(model, resolved)
+        .ok_or_else(|| active_provider_not_in_pool_rejection(resolved))
+}
+
+fn active_provider_not_in_pool_rejection(resolved: &ResolvedResume) -> ManualMigrationRejection {
+    ManualMigrationRejection::ActiveProviderNotInPool {
+        active: resolved.active_provider.clone(),
+    }
+}
+
+fn manual_target_index_for_rejection(
+    model: &ModelConfig,
+    manual_target: &str,
+) -> Result<usize, ManualMigrationRejection> {
+    model
+        .providers
+        .iter()
+        .position(|provider| provider.name == manual_target)
+        .ok_or_else(|| target_not_in_pool_rejection(model, manual_target))
+}
+
+fn target_not_in_pool_rejection(
+    model: &ModelConfig,
+    manual_target: &str,
+) -> ManualMigrationRejection {
+    ManualMigrationRejection::TargetNotInPool {
+        target: manual_target.to_string(),
+        pool: model.providers.iter().map(|p| p.name.clone()).collect(),
+    }
+}
+
+fn ensure_manual_pair_is_migratable(
+    active: &ProviderConfig,
+    target: &ProviderConfig,
+    manual_target: &str,
+) -> Result<(), ManualMigrationRejection> {
+    if is_resume_migratable_pair(active, target) {
+        return Ok(());
+    }
+    Err(ManualMigrationRejection::NotMigratablePair {
+        source: active.name.clone(),
+        target: manual_target.to_string(),
     })
 }
 
@@ -140,11 +158,18 @@ fn manual_migration_decision(
     active: &ProviderConfig,
     manual_target: Option<&str>,
 ) -> Option<MigrationDecision> {
-    manual_target.map(|target| {
-        manual_target_provider_index(model, active, target)
-            .map(manual_migration_to)
-            .unwrap_or(MigrationDecision::Stay)
-    })
+    let target = manual_target?;
+    Some(manual_migration_decision_for_target(model, active, target))
+}
+
+fn manual_migration_decision_for_target(
+    model: &ModelConfig,
+    active: &ProviderConfig,
+    target: &str,
+) -> MigrationDecision {
+    manual_target_provider_index(model, active, target)
+        .map(manual_migration_to)
+        .unwrap_or(MigrationDecision::Stay)
 }
 
 fn manual_target_provider_index(
@@ -157,8 +182,16 @@ fn manual_target_provider_index(
         .iter()
         .position(|provider| provider.name == target)
         .filter(|target_provider_index| {
-            is_resume_migratable_pair(active, &model.providers[*target_provider_index])
+            manual_target_is_migratable(model, active, *target_provider_index)
         })
+}
+
+fn manual_target_is_migratable(
+    model: &ModelConfig,
+    active: &ProviderConfig,
+    target_provider_index: usize,
+) -> bool {
+    is_resume_migratable_pair(active, &model.providers[target_provider_index])
 }
 
 fn manual_migration_to(target_provider_index: usize) -> MigrationDecision {
@@ -204,6 +237,31 @@ fn quota_is_exhausted(quota: Option<&QuotaRecord>) -> bool {
     quota.exhausted_at.is_some() || quota.next_available_at.is_some_and(|ts| ts > Utc::now())
 }
 
+fn automatic_migration_decision(
+    state: &StateDb,
+    model: &ModelConfig,
+    active: &ProviderConfig,
+    active_provider_index: usize,
+) -> Result<MigrationDecision, MigrationError> {
+    let active_exhausted = active_provider_is_exhausted(state, active)?;
+    let projections = compute_projections(model, state, None);
+
+    if active_exhausted {
+        return Ok(exhausted_migration_decision(
+            model,
+            &projections,
+            active,
+            active_provider_index,
+        ));
+    }
+    Ok(quota_threshold_migration_decision(
+        model,
+        &projections,
+        active,
+        active_provider_index,
+    ))
+}
+
 fn exhausted_migration_decision(
     model: &ModelConfig,
     projections: &[ProviderProjection],
@@ -234,17 +292,32 @@ fn quota_threshold_migration_decision(
     // RotationFailed if the chosen sibling's source JSONL is missing. The
     // design contract's "no rotation without reason" intent is preserved by
     // requiring strict-better evidence.
-    let active_load = projections
-        .iter()
-        .find(|projection| projection.provider_index == active_provider_index)
-        .map(provider_load);
-    if let Some(active_load) = active_load
-        && provider_load(best) >= active_load
-    {
+    if best_sibling_load_is_not_strictly_lower(best, projections, active_provider_index) {
         return MigrationDecision::Stay;
     }
 
     migration_to(best.provider_index, TransitionReason::QuotaThreshold)
+}
+
+fn best_sibling_load_is_not_strictly_lower(
+    best: &ProviderProjection,
+    projections: &[ProviderProjection],
+    active_provider_index: usize,
+) -> bool {
+    let Some(active_load) = active_provider_load(projections, active_provider_index) else {
+        return false;
+    };
+    provider_load(best) >= active_load
+}
+
+fn active_provider_load(
+    projections: &[ProviderProjection],
+    active_provider_index: usize,
+) -> Option<f64> {
+    projections
+        .iter()
+        .find(|projection| projection.provider_index == active_provider_index)
+        .map(provider_load)
 }
 
 fn migration_to(target_provider_index: usize, reason: TransitionReason) -> MigrationDecision {
