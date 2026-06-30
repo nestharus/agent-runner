@@ -58,42 +58,158 @@ impl ModelConfigRepository for FilesystemModelConfigRepository {
     }
 
     fn save_model(&self, dir: &Path, model: &ModelConfig) -> Result<(), String> {
-        if model.name.is_empty() {
-            return Err("Model name cannot be empty".to_string());
-        }
-        if model.providers.is_empty() {
-            return Err("Model must have at least one provider".to_string());
-        }
-        fs::create_dir_all(dir).map_err(|e| format!("Failed to create models directory: {e}"))?;
-        fs::write(dir.join(format!("{}.toml", model.name)), model.to_toml())
-            .map_err(|e| format!("Failed to write model file: {e}"))
+        validate_model_for_save(model)?;
+        ensure_model_directory(dir)?;
+        let path = model_file_path(dir, model);
+        let toml = format_model_toml(model);
+        write_model_file(&path, &toml)
     }
 
     fn list_model_files(&self, dir: &Path) -> Result<Vec<PathBuf>, String> {
-        if !dir.is_dir() {
+        if is_missing_model_directory(dir) {
             return Ok(Vec::new());
         }
-        let entries =
-            fs::read_dir(dir).map_err(|e| format!("Failed to read models directory: {e}"))?;
-        let mut files = Vec::new();
-        for entry in entries {
-            let path = entry
-                .map_err(|e| format!("Failed to read directory entry: {e}"))?
-                .path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
-                files.push(path);
-            }
-        }
-        Ok(files)
+        let entries = read_model_directory(dir)?;
+        collect_model_toml_files(entries)
     }
 
     fn delete_model_file(&self, dir: &Path, name: &str) -> Result<(), String> {
-        let path = dir.join(format!("{name}.toml"));
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| format!("Failed to delete model file: {e}"))?;
-        }
-        Ok(())
+        let path = model_file_path_for_name(dir, name);
+        delete_file_if_present(&path)
     }
+}
+
+fn validate_model_for_save(model: &ModelConfig) -> Result<(), String> {
+    validate_model_name_for_save(model)?;
+    validate_model_providers_for_save(model)?;
+    Ok(())
+}
+
+fn validate_model_name_for_save(model: &ModelConfig) -> Result<(), String> {
+    if is_empty_model_name(model) {
+        return Err(format_empty_model_name_error());
+    }
+    Ok(())
+}
+
+fn is_empty_model_name(model: &ModelConfig) -> bool {
+    model.name.is_empty()
+}
+
+fn format_empty_model_name_error() -> String {
+    "Model name cannot be empty".to_string()
+}
+
+fn validate_model_providers_for_save(model: &ModelConfig) -> Result<(), String> {
+    if has_no_model_providers(model) {
+        return Err(format_empty_model_providers_error());
+    }
+    Ok(())
+}
+
+fn has_no_model_providers(model: &ModelConfig) -> bool {
+    model.providers.is_empty()
+}
+
+fn format_empty_model_providers_error() -> String {
+    "Model must have at least one provider".to_string()
+}
+
+fn ensure_model_directory(dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(format_model_directory_create_error)
+}
+
+fn format_model_directory_create_error(err: std::io::Error) -> String {
+    format!("Failed to create models directory: {err}")
+}
+
+fn model_file_path(dir: &Path, model: &ModelConfig) -> PathBuf {
+    model_file_path_for_name(dir, &model.name)
+}
+
+fn model_file_path_for_name(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format_model_file_name(name))
+}
+
+fn format_model_file_name(name: &str) -> String {
+    format!("{name}.toml")
+}
+
+fn format_model_toml(model: &ModelConfig) -> String {
+    model.to_toml()
+}
+
+fn write_model_file(path: &Path, toml: &str) -> Result<(), String> {
+    fs::write(path, toml).map_err(format_model_write_error)
+}
+
+fn format_model_write_error(err: std::io::Error) -> String {
+    format!("Failed to write model file: {err}")
+}
+
+fn is_missing_model_directory(dir: &Path) -> bool {
+    !dir.is_dir()
+}
+
+fn read_model_directory(dir: &Path) -> Result<fs::ReadDir, String> {
+    fs::read_dir(dir).map_err(format_model_directory_read_error)
+}
+
+fn format_model_directory_read_error(err: std::io::Error) -> String {
+    format!("Failed to read models directory: {err}")
+}
+
+fn collect_model_toml_files(entries: fs::ReadDir) -> Result<Vec<PathBuf>, String> {
+    let paths = entries
+        .map(read_directory_entry_path)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(filter_model_toml_paths(paths))
+}
+
+fn read_directory_entry_path(
+    entry: Result<fs::DirEntry, std::io::Error>,
+) -> Result<PathBuf, String> {
+    entry
+        .map(|entry| entry.path())
+        .map_err(format_directory_entry_read_error)
+}
+
+fn format_directory_entry_read_error(err: std::io::Error) -> String {
+    format!("Failed to read directory entry: {err}")
+}
+
+fn filter_model_toml_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter_map(filter_model_toml_path)
+        .collect()
+}
+
+fn filter_model_toml_path(path: PathBuf) -> Option<PathBuf> {
+    is_toml_path(&path).then_some(path)
+}
+
+fn is_toml_path(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("toml")
+}
+
+fn delete_file_if_present(path: &Path) -> Result<(), String> {
+    if is_missing_model_file(path) {
+        return Ok(());
+    }
+    remove_model_file(path)
+}
+
+fn is_missing_model_file(path: &Path) -> bool {
+    !path.exists()
+}
+
+fn remove_model_file(path: &Path) -> Result<(), String> {
+    fs::remove_file(path).map_err(format_model_delete_error)
+}
+
+fn format_model_delete_error(err: std::io::Error) -> String {
+    format!("Failed to delete model file: {err}")
 }
 
 /// Repository over `providers.toml` and provider resolution.

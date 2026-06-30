@@ -59,26 +59,12 @@ struct RawEntry {
 impl SessionsConfig {
     /// Parse a sessions.toml, returning an empty config if the file doesn't exist.
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
+        if is_missing_sessions_file(path) {
             return Ok(Self::default());
         }
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
-        let raw: HashMap<String, RawEntry> = toml::from_str(&content)
-            .map_err(|e| format!("TOML parse error in {}: {e}", path.display()))?;
-        let entries = raw
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k,
-                    SessionSourceEntry {
-                        turn_script: v.turn_script,
-                        transcript_locator: v.transcript_locator,
-                        state_dir: v.state_dir.map(|s| expand_tilde(&s)),
-                    },
-                )
-            })
-            .collect();
+        let content = read_sessions_file(path)?;
+        let raw = parse_sessions_toml(path, &content)?;
+        let entries = map_session_entries(raw);
         Ok(Self { entries })
     }
 
@@ -87,12 +73,65 @@ impl SessionsConfig {
     }
 }
 
-fn expand_tilde(input: &str) -> PathBuf {
-    if let Some(rest) = input.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
+fn is_missing_sessions_file(path: &Path) -> bool {
+    !path.exists()
+}
+
+fn read_sessions_file(path: &Path) -> Result<String, String> {
+    fs::read_to_string(path).map_err(|err| format_sessions_read_error(path, err))
+}
+
+fn format_sessions_read_error(path: &Path, err: std::io::Error) -> String {
+    format!("Failed to read {}: {err}", path.display())
+}
+
+fn parse_sessions_toml(path: &Path, content: &str) -> Result<HashMap<String, RawEntry>, String> {
+    toml::from_str(content).map_err(|err| format_sessions_parse_error(path, err))
+}
+
+fn format_sessions_parse_error(path: &Path, err: toml::de::Error) -> String {
+    format!("TOML parse error in {}: {err}", path.display())
+}
+
+fn map_session_entries(raw: HashMap<String, RawEntry>) -> HashMap<String, SessionSourceEntry> {
+    raw.into_iter().map(map_session_entry_pair).collect()
+}
+
+fn map_session_entry_pair((name, raw): (String, RawEntry)) -> (String, SessionSourceEntry) {
+    (name, map_session_entry(raw))
+}
+
+fn map_session_entry(raw: RawEntry) -> SessionSourceEntry {
+    SessionSourceEntry {
+        turn_script: raw.turn_script,
+        transcript_locator: raw.transcript_locator,
+        state_dir: map_session_state_dir(raw.state_dir),
     }
+}
+
+fn map_session_state_dir(state_dir: Option<String>) -> Option<PathBuf> {
+    state_dir.map(|path| expand_tilde(&path))
+}
+
+fn expand_tilde(input: &str) -> PathBuf {
+    expanded_tilde_path(input).unwrap_or_else(|| literal_path(input))
+}
+
+fn expanded_tilde_path(input: &str) -> Option<PathBuf> {
+    let rest = tilde_relative_path(input)?;
+    let home = home_dir()?;
+    Some(home.join(rest))
+}
+
+fn tilde_relative_path(input: &str) -> Option<&str> {
+    input.strip_prefix("~/")
+}
+
+fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+fn literal_path(input: &str) -> PathBuf {
     PathBuf::from(input)
 }
 
