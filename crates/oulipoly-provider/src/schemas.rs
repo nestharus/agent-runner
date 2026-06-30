@@ -389,10 +389,17 @@ fn schema_contents(schema_file: &'static str) -> Result<&'static str, SchemaVali
 }
 
 fn map_definition_wrapper(schema: &Value, definition: &'static str) -> Value {
-    let defs = schema
+    format_definition_wrapper(definition_wrapper_defs(schema), definition)
+}
+
+fn definition_wrapper_defs(schema: &Value) -> Value {
+    schema
         .get("$defs")
         .cloned()
-        .unwrap_or_else(empty_defs_object);
+        .unwrap_or_else(empty_defs_object)
+}
+
+fn format_definition_wrapper(defs: Value, definition: &'static str) -> Value {
     json!({
         "$schema": SCHEMA_DRAFT_2020_12,
         "$defs": defs,
@@ -425,12 +432,32 @@ fn compile_definition_validator(
 }
 
 fn format_validation_errors(validator: &jsonschema::Validator, instance: &Value) -> Vec<String> {
-    let mut errors = validator
-        .iter_errors(instance)
-        .map(|err| err.to_string())
-        .collect::<Vec<_>>();
-    errors.sort();
+    let errors = collect_validation_errors(validator, instance);
+    let mut messages = format_validation_error_messages(errors);
+    sort_validation_error_messages(&mut messages);
+    messages
+}
+
+fn collect_validation_errors<'a>(
+    validator: &'a jsonschema::Validator,
+    instance: &'a Value,
+) -> Vec<jsonschema::ValidationError<'a>> {
+    validator.iter_errors(instance).collect()
+}
+
+fn format_validation_error_messages(errors: Vec<jsonschema::ValidationError<'_>>) -> Vec<String> {
     errors
+        .into_iter()
+        .map(format_validation_error_message)
+        .collect()
+}
+
+fn format_validation_error_message(error: jsonschema::ValidationError<'_>) -> String {
+    error.to_string()
+}
+
+fn sort_validation_error_messages(errors: &mut [String]) {
+    errors.sort();
 }
 
 fn format_unknown_schema_file(schema_file: &'static str) -> SchemaValidationError {
@@ -466,12 +493,27 @@ fn empty_defs_object() -> Value {
 }
 
 fn normalize_schema_filename(filename: &str) -> String {
-    let bare = filename.strip_prefix("contract/v1/").unwrap_or(filename);
-    if bare.ends_with(".schema.json") {
-        bare.to_owned()
+    format_schema_filename(schema_filename_without_contract_prefix(filename))
+}
+
+fn schema_filename_without_contract_prefix(filename: &str) -> &str {
+    filename.strip_prefix("contract/v1/").unwrap_or(filename)
+}
+
+fn format_schema_filename(filename: &str) -> String {
+    if has_schema_filename_suffix(filename) {
+        filename.to_owned()
     } else {
-        format!("{bare}.schema.json")
+        format_schema_filename_with_suffix(filename)
     }
+}
+
+fn has_schema_filename_suffix(filename: &str) -> bool {
+    filename.ends_with(".schema.json")
+}
+
+fn format_schema_filename_with_suffix(filename: &str) -> String {
+    format!("{filename}.schema.json")
 }
 
 fn merge_common_defs_and_rewrite_refs(schema: &mut Value, common: &Value) {
@@ -511,27 +553,48 @@ fn merge_missing_schema_defs(
 
 fn rewrite_common_refs(value: &mut Value) {
     match value {
-        Value::Object(object) => {
-            if let Some(definition) = object
-                .get("$ref")
-                .and_then(Value::as_str)
-                .and_then(|reference| reference.strip_prefix("common.schema.json#/$defs/"))
-                .map(str::to_owned)
-            {
-                object.insert(
-                    "$ref".to_owned(),
-                    Value::String(format!("#/$defs/{definition}")),
-                );
-            }
-            for child in object.values_mut() {
-                rewrite_common_refs(child);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                rewrite_common_refs(child);
-            }
-        }
+        Value::Object(object) => rewrite_common_refs_in_object(object),
+        Value::Array(values) => rewrite_common_refs_in_array(values),
         _ => {}
+    }
+}
+
+fn rewrite_common_refs_in_object(object: &mut Map<String, Value>) {
+    rewrite_common_ref_field(object);
+    rewrite_common_refs_in_children(object.values_mut());
+}
+
+fn rewrite_common_ref_field(object: &mut Map<String, Value>) {
+    if let Some(replacement) = map_common_ref_replacement(object) {
+        object.insert("$ref".to_owned(), replacement);
+    }
+}
+
+fn map_common_ref_replacement(object: &Map<String, Value>) -> Option<Value> {
+    parse_common_ref_definition(object).map(format_local_definition_ref)
+}
+
+fn parse_common_ref_definition(object: &Map<String, Value>) -> Option<String> {
+    object
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("common.schema.json#/$defs/"))
+        .map(str::to_owned)
+}
+
+fn format_local_definition_ref(definition: String) -> Value {
+    Value::String(format!("#/$defs/{definition}"))
+}
+
+fn rewrite_common_refs_in_array(values: &mut [Value]) {
+    rewrite_common_refs_in_children(values.iter_mut());
+}
+
+fn rewrite_common_refs_in_children<'a, I>(values: I)
+where
+    I: IntoIterator<Item = &'a mut Value>,
+{
+    for child in values {
+        rewrite_common_refs(child);
     }
 }
