@@ -97,8 +97,7 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
                 })
             }
             DiagnosticsServiceRequest::ClassifyTerminal(request) => {
-                diagnose_terminal_classify_hook(self.provider_registry.as_ref(), request)
-                    .map(DiagnosticsServiceOutput::TerminalClassification)
+                diagnose_terminal_classify_request(self.provider_registry.as_ref(), request)
             }
             DiagnosticsServiceRequest::DiagnoseError {
                 diagnostics_model,
@@ -108,7 +107,7 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
                 exit_code,
                 stderr,
                 working_dir,
-            } => diagnose_error(
+            } => diagnose_error_request(
                 &diagnostics_model,
                 &effective_provider,
                 provider_index,
@@ -117,10 +116,44 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
                 &stderr,
                 working_dir.as_deref(),
             )
-            .map(|diagnosis| DiagnosticsServiceOutput::Diagnosis { diagnosis })
             .map_err(|message| ServiceError::Dependency { message }),
         }
     }
+}
+
+fn diagnose_terminal_classify_request(
+    provider_registry: Option<&ProviderRegistryHandle>,
+    request: TerminalClassifyServiceRequest,
+) -> Result<DiagnosticsServiceOutput, ServiceError> {
+    let classification = diagnose_terminal_classify_hook(provider_registry, request)?;
+    Ok(DiagnosticsServiceOutput::TerminalClassification(
+        classification,
+    ))
+}
+
+fn diagnose_error_request(
+    diagnostics_model: &ModelConfig,
+    effective_provider: &ProviderConfig,
+    provider_index: usize,
+    prompt_mode: PromptMode,
+    exit_code: i32,
+    stderr: &str,
+    working_dir: Option<&Path>,
+) -> Result<DiagnosticsServiceOutput, String> {
+    diagnose_error(
+        diagnostics_model,
+        effective_provider,
+        provider_index,
+        prompt_mode,
+        exit_code,
+        stderr,
+        working_dir,
+    )
+    .map(diagnostics_service_diagnosis_output)
+}
+
+fn diagnostics_service_diagnosis_output(diagnosis: Diagnosis) -> DiagnosticsServiceOutput {
+    DiagnosticsServiceOutput::Diagnosis { diagnosis }
 }
 
 pub fn classify_terminal_with_registry(
@@ -288,15 +321,25 @@ fn diagnosis_from_parsed_lines(
 
     let category = diagnosis_category_from_lines(lines);
 
-    if category == ErrorCategory::Unknown {
-        let heuristic = heuristic_diagnosis(stderr, exit_code);
-        if heuristic.category != ErrorCategory::Unknown {
-            return Ok(heuristic);
-        }
+    if let Some(heuristic) = heuristic_override_for_unknown_category(category, stderr, exit_code) {
+        return Ok(heuristic);
     }
 
     let summary = diagnosis_summary_text(lines);
     Ok(Diagnosis { category, summary })
+}
+
+fn heuristic_override_for_unknown_category(
+    category: ErrorCategory,
+    stderr: &str,
+    exit_code: i32,
+) -> Option<Diagnosis> {
+    if category != ErrorCategory::Unknown {
+        return None;
+    }
+
+    let heuristic = heuristic_diagnosis(stderr, exit_code);
+    (heuristic.category != ErrorCategory::Unknown).then_some(heuristic)
 }
 
 fn diagnosis_category_from_lines(lines: &[&str]) -> ErrorCategory {
@@ -308,28 +351,48 @@ fn normalize_stderr_for_heuristic(stderr: &str) -> String {
 }
 
 fn heuristic_error_category(lower: &str) -> ErrorCategory {
-    if quota_exhaustion_text(lower) {
+    if is_quota_exhaustion_heuristic(lower) {
         ErrorCategory::QuotaExhausted
-    } else if rate_limit_text(lower) {
+    } else if is_rate_limit_heuristic(lower) {
         ErrorCategory::RateLimit
-    } else if lower.contains("unauthorized") || lower.contains("token expired") {
+    } else if is_auth_expired_heuristic(lower) {
         ErrorCategory::AuthExpired
-    } else if lower.contains("no conversation found")
-        || lower.contains("no session found")
-        || lower.contains("no rollout found")
-        || lower.contains("thread/resume failed")
-    {
+    } else if is_resume_session_mismatch_heuristic(lower) {
         ErrorCategory::ResumeSessionMismatch
-    } else if lower.contains("not found")
-        || lower.contains("unknown flag")
-        || lower.contains("unrecognized")
-    {
+    } else if is_cli_version_mismatch_heuristic(lower) {
         ErrorCategory::CliVersionMismatch
-    } else if lower.contains("connection") || lower.contains("timeout") || lower.contains("dns") {
+    } else if is_network_error_heuristic(lower) {
         ErrorCategory::NetworkError
     } else {
         ErrorCategory::Unknown
     }
+}
+
+fn is_quota_exhaustion_heuristic(lower: &str) -> bool {
+    quota_exhaustion_text(lower)
+}
+
+fn is_rate_limit_heuristic(lower: &str) -> bool {
+    rate_limit_text(lower)
+}
+
+fn is_auth_expired_heuristic(lower: &str) -> bool {
+    lower.contains("unauthorized") || lower.contains("token expired")
+}
+
+fn is_resume_session_mismatch_heuristic(lower: &str) -> bool {
+    lower.contains("no conversation found")
+        || lower.contains("no session found")
+        || lower.contains("no rollout found")
+        || lower.contains("thread/resume failed")
+}
+
+fn is_cli_version_mismatch_heuristic(lower: &str) -> bool {
+    lower.contains("not found") || lower.contains("unknown flag") || lower.contains("unrecognized")
+}
+
+fn is_network_error_heuristic(lower: &str) -> bool {
+    lower.contains("connection") || lower.contains("timeout") || lower.contains("dns")
 }
 
 fn heuristic_diagnosis(stderr: &str, _exit_code: i32) -> Diagnosis {

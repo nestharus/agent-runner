@@ -8,6 +8,7 @@ use oulipoly_provider::generated::{
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn build_terminal_classify_request(
@@ -47,23 +48,30 @@ fn host_context(host_options: &DescribeHostOptions) -> HostContext {
         app_version: None,
         platform: Some(std::env::consts::OS.to_string()),
         working_directory: current_working_directory(),
-        config_root: host_options
-            .config_root
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        data_root: host_options
-            .data_root
-            .as_ref()
-            .map(|path| path.display().to_string()),
+        config_root: host_options_config_root(host_options),
+        data_root: host_options_data_root(host_options),
         env: BTreeMap::new(),
         deadline_unix_ms: None,
     }
 }
 
+fn host_options_config_root(host_options: &DescribeHostOptions) -> Option<String> {
+    let path = host_options.config_root.as_ref()?;
+    Some(display_path(path))
+}
+
+fn host_options_data_root(host_options: &DescribeHostOptions) -> Option<String> {
+    let path = host_options.data_root.as_ref()?;
+    Some(display_path(path))
+}
+
 fn current_working_directory() -> Option<String> {
-    std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string())
+    let path = std::env::current_dir().ok()?;
+    Some(display_path(&path))
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn request_id() -> String {
