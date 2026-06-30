@@ -2,6 +2,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -22,37 +23,27 @@ struct RawFrontmatter {
     output_format: Option<String>,
 }
 
+struct AgentFileParts<'a> {
+    frontmatter: &'a str,
+    instructions: &'a str,
+}
+
 static FRONTMATTER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?s)^---\n(.*?)\n---\n?(.*)").unwrap());
 
 pub fn parse_agent_file(name: &str, content: &str) -> Result<AgentConfig, String> {
-    let caps = FRONTMATTER_RE
-        .captures(content)
-        .ok_or_else(|| format!("Agent {name}: no YAML frontmatter found"))?;
+    let parts = validate_agent_file_parts(name, parse_agent_file_parts(content))?;
+    let raw = parse_agent_frontmatter(parts.frontmatter)
+        .map_err(|error| format_agent_yaml_parse_error(name, error))?;
 
-    let yaml_str = &caps[1];
-    let instructions = caps[2].to_string();
-
-    let raw: RawFrontmatter = serde_yml::from_str(yaml_str)
-        .map_err(|e| format!("Agent {name}: YAML parse error: {e}"))?;
-
-    Ok(AgentConfig {
-        name: name.to_string(),
-        description: raw.description.unwrap_or_default(),
-        model: raw.model.unwrap_or_default(),
-        output_format: raw.output_format.unwrap_or_default(),
-        instructions,
-    })
+    Ok(map_agent_config(name, raw, parts.instructions))
 }
 
 pub fn load_agent_file(path: &Path) -> Result<AgentConfig, String> {
-    let name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("Invalid agent filename: {}", path.display()))?;
+    let name = validate_agent_file_name(path, agent_file_name(path))?;
 
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read agent file {}: {e}", path.display()))?;
+    let content =
+        read_agent_file(path).map_err(|error| format_agent_file_read_error(path, error))?;
 
     parse_agent_file(name, &content)
 }
@@ -64,22 +55,109 @@ pub fn load_agents(agents_dir: &Path) -> Result<HashMap<String, AgentConfig>, St
         return Ok(agents);
     }
 
-    let entries =
-        fs::read_dir(agents_dir).map_err(|e| format!("Failed to read agents directory: {e}"))?;
+    let entries = read_agents_directory(agents_dir).map_err(format_agents_directory_read_error)?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let entry = validate_directory_entry(entry)?;
         let path = entry.path();
 
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+        if !is_agent_config_file(&path) {
             continue;
         }
 
-        let agent = load_agent_file(&path)?;
-        agents.insert(agent.name.clone(), agent);
+        let (name, agent) = map_agent_config_file(&path)?;
+        agents.insert(name, agent);
     }
 
     Ok(agents)
+}
+
+fn parse_agent_file_parts(content: &str) -> Option<AgentFileParts<'_>> {
+    FRONTMATTER_RE.captures(content).map(|caps| AgentFileParts {
+        frontmatter: caps
+            .get(1)
+            .map(|match_| match_.as_str())
+            .unwrap_or_default(),
+        instructions: caps
+            .get(2)
+            .map(|match_| match_.as_str())
+            .unwrap_or_default(),
+    })
+}
+
+fn validate_agent_file_parts<'a>(
+    name: &str,
+    parts: Option<AgentFileParts<'a>>,
+) -> Result<AgentFileParts<'a>, String> {
+    parts.ok_or_else(|| format_missing_frontmatter_error(name))
+}
+
+fn parse_agent_frontmatter(frontmatter: &str) -> Result<RawFrontmatter, serde_yml::Error> {
+    serde_yml::from_str(frontmatter)
+}
+
+fn map_agent_config(name: &str, raw: RawFrontmatter, instructions: &str) -> AgentConfig {
+    AgentConfig {
+        name: name.to_string(),
+        description: raw.description.unwrap_or_default(),
+        model: raw.model.unwrap_or_default(),
+        output_format: raw.output_format.unwrap_or_default(),
+        instructions: instructions.to_string(),
+    }
+}
+
+fn format_missing_frontmatter_error(name: &str) -> String {
+    format!("Agent {name}: no YAML frontmatter found")
+}
+
+fn format_agent_yaml_parse_error(name: &str, error: serde_yml::Error) -> String {
+    format!("Agent {name}: YAML parse error: {error}")
+}
+
+fn agent_file_name(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|stem| stem.to_str())
+}
+
+fn validate_agent_file_name<'a>(path: &Path, name: Option<&'a str>) -> Result<&'a str, String> {
+    name.ok_or_else(|| format_invalid_agent_filename_error(path))
+}
+
+fn read_agent_file(path: &Path) -> io::Result<String> {
+    fs::read_to_string(path)
+}
+
+fn format_invalid_agent_filename_error(path: &Path) -> String {
+    format!("Invalid agent filename: {}", path.display())
+}
+
+fn format_agent_file_read_error(path: &Path, error: io::Error) -> String {
+    format!("Failed to read agent file {}: {error}", path.display())
+}
+
+fn read_agents_directory(agents_dir: &Path) -> io::Result<fs::ReadDir> {
+    fs::read_dir(agents_dir)
+}
+
+fn validate_directory_entry(entry: io::Result<fs::DirEntry>) -> Result<fs::DirEntry, String> {
+    entry.map_err(format_directory_entry_read_error)
+}
+
+fn format_agents_directory_read_error(error: io::Error) -> String {
+    format!("Failed to read agents directory: {error}")
+}
+
+fn format_directory_entry_read_error(error: io::Error) -> String {
+    format!("Failed to read directory entry: {error}")
+}
+
+fn is_agent_config_file(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("md")
+}
+
+fn map_agent_config_file(path: &Path) -> Result<(String, AgentConfig), String> {
+    let agent = load_agent_file(path)?;
+
+    Ok((agent.name.clone(), agent))
 }
 
 #[cfg(test)]

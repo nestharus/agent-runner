@@ -22,68 +22,122 @@ pub struct SetupBrainConfig {
 
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let Ok(content) = std::fs::read_to_string(path) else {
+        let Some(content) = read_app_config_content(path) else {
             return Ok(Self::default());
         };
 
-        let table = content.parse::<toml::Table>().map_err(|error| {
-            format!("failed to parse app config at {}: {error}", path.display())
-        })?;
+        let table = parse_app_config_table(&content)
+            .map_err(|error| format_app_config_parse_error(path, error))?;
 
-        Ok(Self {
-            diagnostics_model: table
-                .get("diagnostics_model")
-                .and_then(|value| value.as_str())
-                .map(String::from),
-            default_provider: table
-                .get("default_provider")
-                .and_then(|value| value.as_str())
-                .map(String::from),
-            setup: parse_setup_config(&table)?,
-        })
+        map_app_config(&table)
     }
 }
 
+fn read_app_config_content(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+fn parse_app_config_table(content: &str) -> Result<toml::Table, toml::de::Error> {
+    content.parse::<toml::Table>()
+}
+
+fn format_app_config_parse_error(path: &Path, error: toml::de::Error) -> String {
+    format!("failed to parse app config at {}: {error}", path.display())
+}
+
+fn map_app_config(table: &toml::Table) -> Result<AppConfig, String> {
+    Ok(AppConfig {
+        diagnostics_model: optional_app_string(table, "diagnostics_model"),
+        default_provider: optional_app_string(table, "default_provider"),
+        setup: parse_setup_config(table)?,
+    })
+}
+
+fn optional_app_string(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(String::from)
+}
+
 fn parse_setup_config(table: &toml::Table) -> Result<SetupConfig, String> {
-    let Some(setup_value) = table.get("setup") else {
-        return Ok(SetupConfig::default());
-    };
-    let Some(setup_table) = setup_value.as_table() else {
-        return Err("setup config field `setup` must be a table".to_string());
-    };
+    let setup_table = validate_setup_table(setup_value(table))?;
+    let brain_table = validate_setup_brain_table(setup_table.and_then(setup_brain_value))?;
 
-    let brain = match setup_table.get("brain") {
-        Some(value) => {
-            let table = value
+    map_setup_config(brain_table)
+}
+
+fn setup_value(table: &toml::Table) -> Option<&toml::Value> {
+    table.get("setup")
+}
+
+fn validate_setup_table(value: Option<&toml::Value>) -> Result<Option<&toml::Table>, String> {
+    value
+        .map(|value| {
+            value
                 .as_table()
-                .ok_or_else(|| "setup config field `setup.brain` must be a table".to_string())?;
-            Some(parse_setup_brain_config(table)?)
-        }
-        None => None,
-    };
+                .ok_or_else(|| "setup config field `setup` must be a table".to_string())
+        })
+        .transpose()
+}
 
-    Ok(SetupConfig { brain })
+fn setup_brain_value(table: &toml::Table) -> Option<&toml::Value> {
+    table.get("brain")
+}
+
+fn validate_setup_brain_table(value: Option<&toml::Value>) -> Result<Option<&toml::Table>, String> {
+    value
+        .map(|value| {
+            value
+                .as_table()
+                .ok_or_else(|| "setup config field `setup.brain` must be a table".to_string())
+        })
+        .transpose()
+}
+
+fn map_setup_config(brain_table: Option<&toml::Table>) -> Result<SetupConfig, String> {
+    Ok(SetupConfig {
+        brain: brain_table.map(parse_setup_brain_config).transpose()?,
+    })
 }
 
 fn parse_setup_brain_config(table: &toml::Table) -> Result<SetupBrainConfig, String> {
     validate_setup_brain_fields(table)?;
-    let artifact = ProviderImplementationRef {
-        path: string_field(table, "path")?,
-        crate_name: string_field(table, "crate")?,
-        version: string_field(table, "version")?,
-        binary: string_field(table, "binary")?,
-        script: string_field(table, "script")?,
-    };
+    validate_setup_brain_artifact_string_fields(table)?;
+    let artifact = map_setup_brain_artifact(table);
+    validate_setup_brain_artifact(&artifact)?;
+    validate_setup_brain_settings_id_field(table)?;
 
+    Ok(map_setup_brain_config(table, artifact))
+}
+
+fn map_setup_brain_artifact(table: &toml::Table) -> ProviderImplementationRef {
+    ProviderImplementationRef {
+        path: setup_brain_string(table, "path"),
+        crate_name: setup_brain_string(table, "crate"),
+        version: setup_brain_string(table, "version"),
+        binary: setup_brain_string(table, "binary"),
+        script: setup_brain_string(table, "script"),
+    }
+}
+
+fn validate_setup_brain_artifact(artifact: &ProviderImplementationRef) -> Result<(), String> {
     artifact.validate().map_err(|err| err.to_string())?;
     if artifact.crate_name.is_some() {
         return Err("setup brain provider reference: `crate` artifacts are not supported until setup-brain provider packaging is available".to_string());
     }
 
-    Ok(SetupBrainConfig {
+    Ok(())
+}
+
+fn map_setup_brain_config(
+    table: &toml::Table,
+    artifact: ProviderImplementationRef,
+) -> SetupBrainConfig {
+    SetupBrainConfig {
         artifact,
-        settings_id: string_field(table, "settings_id")?,
-    })
+        settings_id: setup_brain_string(table, "settings_id"),
+    }
 }
 
 fn validate_setup_brain_fields(table: &toml::Table) -> Result<(), String> {
@@ -98,12 +152,31 @@ fn validate_setup_brain_fields(table: &toml::Table) -> Result<(), String> {
     Ok(())
 }
 
-fn string_field(table: &toml::Table, key: &str) -> Result<Option<String>, String> {
+fn validate_setup_brain_artifact_string_fields(table: &toml::Table) -> Result<(), String> {
+    validate_setup_brain_string_field(table, "path")?;
+    validate_setup_brain_string_field(table, "crate")?;
+    validate_setup_brain_string_field(table, "version")?;
+    validate_setup_brain_string_field(table, "binary")?;
+    validate_setup_brain_string_field(table, "script")
+}
+
+fn validate_setup_brain_settings_id_field(table: &toml::Table) -> Result<(), String> {
+    validate_setup_brain_string_field(table, "settings_id")
+}
+
+fn validate_setup_brain_string_field(table: &toml::Table, key: &str) -> Result<(), String> {
     let Some(value) = table.get(key) else {
-        return Ok(None);
+        return Ok(());
     };
     value
         .as_str()
-        .map(|value| Some(value.to_string()))
+        .map(|_| ())
         .ok_or_else(|| format!("setup brain field `{key}` must be a string"))
+}
+
+fn setup_brain_string(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(String::from)
 }
