@@ -143,6 +143,19 @@ pub enum ShowReturnedRequest {
     },
 }
 
+struct ReturnPayload {
+    content: Vec<u8>,
+    format_hint: Option<String>,
+    verdict_line: Option<String>,
+    source: ReturnedArtifactSource,
+}
+
+struct ReturnLookup {
+    db_path: PathBuf,
+    key: ArtifactKey,
+    version: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum MessengerError {
     InvalidInput(String),
@@ -275,48 +288,9 @@ impl From<oulipoly_agent_scratchpad::ScratchpadError> for MessengerError {
 }
 
 pub fn return_artifact(req: ReturnRequest) -> Result<ReturnedArtifact, MessengerError> {
-    let (content, format_hint, verdict_line, source) = match req.source {
-        ReturnSource::Scratchpad { name, version } => {
-            let scratchpad = Scratchpad::open(&req.db_path)?;
-            let record = scratchpad.read(ReadRequest {
-                scope: InvocationScope {
-                    invocation_uuid: req.invocation_uuid,
-                },
-                name: name.clone(),
-                version,
-            })?;
-            let resolved_version = record.meta.version;
-            (
-                record.content,
-                req.format_hint.or(record.meta.format_hint),
-                req.verdict_line.or(record.meta.verdict_line),
-                ReturnedArtifactSource::Scratchpad {
-                    name: name.as_str().to_string(),
-                    version: resolved_version,
-                },
-            )
-        }
-        ReturnSource::InlineBytes(bytes) => (
-            bytes,
-            req.format_hint,
-            req.verdict_line,
-            ReturnedArtifactSource::InlineBytes,
-        ),
-    };
-
-    let store = Store::open(&req.db_path)?;
-    let receipt = store.put(PutRequest {
-        key: ArtifactKey {
-            workflow_run_id: return_workflow(req.invocation_uuid),
-            artifact_name: req.name.as_str().to_string(),
-        },
-        producer_invocation_uuid: Some(req.invocation_uuid),
-        format_hint,
-        verdict_line,
-        predecessor_version: None,
-        content,
-    })?;
-    let returned = returned_from_put(receipt, req.invocation_uuid, source);
+    let payload = materialize_return_source(&req)?;
+    let receipt = put_return_payload(&req, payload)?;
+    let returned = returned_from_put(receipt.receipt, req.invocation_uuid, receipt.source);
     if let Some(path) = req.return_channel {
         append_return_channel(&path, &returned)?;
     }
@@ -328,48 +302,16 @@ pub fn list_returned(
 ) -> Result<Vec<ReturnedArtifactMeta>, MessengerError> {
     let store = Store::open(&req.db_path)?;
     store
-        .list(ListFilter {
-            workflow_run_id: Some(return_workflow(req.invocation_uuid)),
-            artifact_name: req.name.map(|name| name.as_str().to_string()),
-            include_tombstoned: false,
-        })?
+        .list(returned_list_filter(req.invocation_uuid, req.name))?
         .into_iter()
         .map(meta_from_store)
         .collect()
 }
 
 pub fn show_returned(req: ShowReturnedRequest) -> Result<ReturnedArtifactRecord, MessengerError> {
-    let (db_path, key, version) = match req {
-        ShowReturnedRequest::VersionId {
-            db_path,
-            version_id,
-        } => {
-            let (invocation_uuid, name, version) = parse_version_id(&version_id)?;
-            (
-                db_path,
-                ArtifactKey {
-                    workflow_run_id: return_workflow(invocation_uuid),
-                    artifact_name: name,
-                },
-                Some(version),
-            )
-        }
-        ShowReturnedRequest::Address {
-            db_path,
-            invocation_uuid,
-            name,
-            version,
-        } => (
-            db_path,
-            ArtifactKey {
-                workflow_run_id: return_workflow(invocation_uuid),
-                artifact_name: name.as_str().to_string(),
-            },
-            version,
-        ),
-    };
-    let store = Store::open(db_path)?;
-    let record = store.get(&key, version)?;
+    let lookup = return_lookup(req)?;
+    let store = Store::open(lookup.db_path)?;
+    let record = store.get(&lookup.key, lookup.version)?;
     record_from_store(record)
 }
 
@@ -377,8 +319,7 @@ pub fn append_return_channel(
     path: &Path,
     receipt: &ReturnedArtifact,
 ) -> Result<(), MessengerError> {
-    let mut line = serde_json::to_vec(receipt)?;
-    line.push(b'\n');
+    let line = return_channel_line(receipt)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -386,6 +327,159 @@ pub fn append_return_channel(
     file.write_all(&line)?;
     file.flush()?;
     Ok(())
+}
+
+struct StoredReturnPayload {
+    receipt: PutReceipt,
+    source: ReturnedArtifactSource,
+}
+
+fn materialize_return_source(req: &ReturnRequest) -> Result<ReturnPayload, MessengerError> {
+    match &req.source {
+        ReturnSource::Scratchpad { name, version } => {
+            scratchpad_return_payload(req, name, *version)
+        }
+        ReturnSource::InlineBytes(bytes) => Ok(inline_return_payload(
+            bytes.clone(),
+            req.format_hint.clone(),
+            req.verdict_line.clone(),
+        )),
+    }
+}
+
+fn scratchpad_return_payload(
+    req: &ReturnRequest,
+    name: &ScratchpadName,
+    version: Option<u64>,
+) -> Result<ReturnPayload, MessengerError> {
+    let record = read_return_scratchpad(&req.db_path, req.invocation_uuid, name.clone(), version)?;
+    Ok(ReturnPayload {
+        source: ReturnedArtifactSource::Scratchpad {
+            name: name.as_str().to_string(),
+            version: record.meta.version,
+        },
+        format_hint: req.format_hint.clone().or(record.meta.format_hint),
+        verdict_line: req.verdict_line.clone().or(record.meta.verdict_line),
+        content: record.content,
+    })
+}
+
+fn read_return_scratchpad(
+    db_path: &Path,
+    invocation_uuid: Uuid,
+    name: ScratchpadName,
+    version: Option<u64>,
+) -> Result<oulipoly_agent_scratchpad::ScratchpadRecord, MessengerError> {
+    let scratchpad = Scratchpad::open(db_path)?;
+    scratchpad
+        .read(ReadRequest {
+            scope: InvocationScope { invocation_uuid },
+            name,
+            version,
+        })
+        .map_err(MessengerError::from)
+}
+
+fn inline_return_payload(
+    content: Vec<u8>,
+    format_hint: Option<String>,
+    verdict_line: Option<String>,
+) -> ReturnPayload {
+    ReturnPayload {
+        content,
+        format_hint,
+        verdict_line,
+        source: ReturnedArtifactSource::InlineBytes,
+    }
+}
+
+fn put_return_payload(
+    req: &ReturnRequest,
+    payload: ReturnPayload,
+) -> Result<StoredReturnPayload, MessengerError> {
+    let source = payload.source.clone();
+    let store = Store::open(&req.db_path)?;
+    let receipt = store.put(return_put_request(req, payload))?;
+    Ok(StoredReturnPayload { receipt, source })
+}
+
+fn return_put_request(req: &ReturnRequest, payload: ReturnPayload) -> PutRequest {
+    PutRequest {
+        key: ArtifactKey {
+            workflow_run_id: return_workflow(req.invocation_uuid),
+            artifact_name: req.name.as_str().to_string(),
+        },
+        producer_invocation_uuid: Some(req.invocation_uuid),
+        format_hint: payload.format_hint,
+        verdict_line: payload.verdict_line,
+        predecessor_version: None,
+        content: payload.content,
+    }
+}
+
+fn returned_list_filter(invocation_uuid: Uuid, name: Option<ReturnName>) -> ListFilter {
+    ListFilter {
+        workflow_run_id: Some(return_workflow(invocation_uuid)),
+        artifact_name: name.map(|name| name.as_str().to_string()),
+        include_tombstoned: false,
+    }
+}
+
+fn return_lookup(req: ShowReturnedRequest) -> Result<ReturnLookup, MessengerError> {
+    match req {
+        ShowReturnedRequest::VersionId {
+            db_path,
+            version_id,
+        } => return_lookup_from_version_id(db_path, &version_id),
+        ShowReturnedRequest::Address {
+            db_path,
+            invocation_uuid,
+            name,
+            version,
+        } => Ok(return_lookup_from_address(
+            db_path,
+            invocation_uuid,
+            name,
+            version,
+        )),
+    }
+}
+
+fn return_lookup_from_version_id(
+    db_path: PathBuf,
+    version_id: &str,
+) -> Result<ReturnLookup, MessengerError> {
+    let (invocation_uuid, name, version) = parse_version_id(version_id)?;
+    Ok(ReturnLookup {
+        db_path,
+        key: ArtifactKey {
+            workflow_run_id: return_workflow(invocation_uuid),
+            artifact_name: name,
+        },
+        version: Some(version),
+    })
+}
+
+fn return_lookup_from_address(
+    db_path: PathBuf,
+    invocation_uuid: Uuid,
+    name: ReturnName,
+    version: Option<u64>,
+) -> ReturnLookup {
+    ReturnLookup {
+        db_path,
+        key: ArtifactKey {
+            workflow_run_id: return_workflow(invocation_uuid),
+            artifact_name: name.as_str().to_string(),
+        },
+        version,
+    }
+}
+
+fn return_channel_line(receipt: &ReturnedArtifact) -> Result<Vec<u8>, MessengerError> {
+    let mut line = serde_json::to_vec(receipt)?;
+    line.push(b'\n');
+    Ok(line)
 }
 
 fn return_workflow(invocation_uuid: Uuid) -> String {
@@ -631,20 +725,17 @@ pub mod cli {
             let source = resolve_return_source(&args)?;
             let name = ReturnName::new(args.name)?;
             let return_channel = resolve_return_channel(args.return_channel)?;
-            let receipt = return_artifact(ReturnRequest {
-                db_path: args.db,
+            let json = args.json;
+            let receipt = return_artifact(return_request(
+                args.db,
                 invocation_uuid,
                 name,
                 source,
-                format_hint: args.format_hint,
-                verdict_line: args.verdict_line,
-                return_channel: Some(return_channel),
-            })?;
-            if args.json {
-                print_json(&receipt)?;
-            } else {
-                writeln!(io::stdout(), "{} {}", receipt.version_id, receipt.sha256)?;
-            }
+                args.format_hint,
+                args.verdict_line,
+                return_channel,
+            ))?;
+            write_return_output(&receipt, json)?;
             Ok(())
         })
     }
@@ -657,102 +748,138 @@ pub mod cli {
                 invocation_uuid,
                 name: args.name.map(ReturnName::new).transpose()?,
             })?;
-            if args.json {
-                print_json(&rows)?;
-            } else {
-                let mut stdout = io::stdout();
-                for row in rows {
-                    writeln!(
-                        stdout,
-                        "{} v{} {}",
-                        row.name, row.store_address.version, row.sha256
-                    )?;
-                }
-            }
+            write_list_output(&rows, args.json)?;
             Ok(())
         })
     }
 
     fn handle_show(args: ShowArgs) -> i32 {
         run_cli(|| {
-            let req = match (args.version_id, args.name) {
-                (Some(version_id), None) => ShowReturnedRequest::VersionId {
-                    db_path: args.db,
-                    version_id,
-                },
-                (None, Some(name)) => ShowReturnedRequest::Address {
-                    db_path: args.db,
-                    invocation_uuid: resolve_invocation_uuid(args.invocation_uuid)?,
-                    name: ReturnName::new(name)?,
-                    version: args.version,
-                },
-                _ => {
-                    return Err(MessengerError::InvalidInput(
-                        "pass exactly one of --version-id or --name".to_string(),
-                    ));
-                }
-            };
+            let out = args.out.clone();
+            let req = show_request(args)?;
             let record = show_returned(req)?;
-            if let Some(path) = args.out {
-                fs::write(path, record.content)?;
-            } else {
-                let stdout = io::stdout();
-                let mut handle = stdout.lock();
-                handle.write_all(&record.content)?;
-                handle.flush()?;
-            }
+            write_record_content(out, record.content)?;
             Ok(())
         })
     }
 
     fn handle_version(args: VersionArgs) -> i32 {
         run_cli(|| {
-            #[derive(Serialize)]
-            struct VersionEnvelope<'a> {
-                package: &'a str,
-                version: &'a str,
-                receipt_schema_version: u32,
-            }
-            if args.json {
-                print_json(&VersionEnvelope {
-                    package: "oulipoly-agent-messenger",
-                    version: env!("CARGO_PKG_VERSION"),
-                    receipt_schema_version: 1,
-                })?;
-            } else {
-                writeln!(
-                    io::stdout(),
-                    "oulipoly-agent-messenger {}",
-                    env!("CARGO_PKG_VERSION")
-                )?;
-            }
+            write_version_output(args.json)?;
             Ok(())
         })
     }
 
+    fn return_request(
+        db_path: PathBuf,
+        invocation_uuid: Uuid,
+        name: ReturnName,
+        source: ReturnSource,
+        format_hint: Option<String>,
+        verdict_line: Option<String>,
+        return_channel: PathBuf,
+    ) -> ReturnRequest {
+        ReturnRequest {
+            db_path,
+            invocation_uuid,
+            name,
+            source,
+            format_hint,
+            verdict_line,
+            return_channel: Some(return_channel),
+        }
+    }
+
+    fn show_request(args: ShowArgs) -> Result<ShowReturnedRequest, MessengerError> {
+        match (args.version_id, args.name) {
+            (Some(version_id), None) => Ok(ShowReturnedRequest::VersionId {
+                db_path: args.db,
+                version_id,
+            }),
+            (None, Some(name)) => Ok(ShowReturnedRequest::Address {
+                db_path: args.db,
+                invocation_uuid: resolve_invocation_uuid(args.invocation_uuid)?,
+                name: ReturnName::new(name)?,
+                version: args.version,
+            }),
+            _ => Err(MessengerError::InvalidInput(
+                "pass exactly one of --version-id or --name".to_string(),
+            )),
+        }
+    }
+
+    fn write_return_output(receipt: &ReturnedArtifact, json: bool) -> Result<(), MessengerError> {
+        if json {
+            print_json(receipt)
+        } else {
+            writeln!(io::stdout(), "{} {}", receipt.version_id, receipt.sha256)?;
+            Ok(())
+        }
+    }
+
+    fn write_list_output(rows: &[ReturnedArtifactMeta], json: bool) -> Result<(), MessengerError> {
+        if json {
+            return print_json(&rows);
+        }
+
+        let mut stdout = io::stdout();
+        for row in rows {
+            writeln!(
+                stdout,
+                "{} v{} {}",
+                row.name, row.store_address.version, row.sha256
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_record_content(out: Option<PathBuf>, content: Vec<u8>) -> Result<(), MessengerError> {
+        if let Some(path) = out {
+            return fs::write(path, content).map_err(MessengerError::from);
+        }
+
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(&content)?;
+        handle.flush()?;
+        Ok(())
+    }
+
+    #[derive(Serialize)]
+    struct VersionEnvelope<'a> {
+        package: &'a str,
+        version: &'a str,
+        receipt_schema_version: u32,
+    }
+
+    fn version_envelope() -> VersionEnvelope<'static> {
+        VersionEnvelope {
+            package: "oulipoly-agent-messenger",
+            version: env!("CARGO_PKG_VERSION"),
+            receipt_schema_version: 1,
+        }
+    }
+
+    fn write_version_output(json: bool) -> Result<(), MessengerError> {
+        if json {
+            print_json(&version_envelope())
+        } else {
+            writeln!(
+                io::stdout(),
+                "oulipoly-agent-messenger {}",
+                env!("CARGO_PKG_VERSION")
+            )?;
+            Ok(())
+        }
+    }
+
     fn resolve_return_source(args: &ReturnArgs) -> Result<ReturnSource, MessengerError> {
-        let inline_count = usize::from(args.body.is_some())
-            + usize::from(args.content_file.is_some())
-            + usize::from(args.content_stdin);
-        match (&args.scratchpad, inline_count) {
+        match (&args.scratchpad, inline_source_count(args)) {
             (Some(_), 1..) => Err(MessengerError::InvalidInput(
                 "--scratchpad cannot be combined with inline content sources".to_string(),
             )),
-            (Some(name), 0) => Ok(ReturnSource::Scratchpad {
-                name: ScratchpadName::new(name.clone())?,
-                version: args.scratchpad_version,
-            }),
-            (None, 1) => {
-                if let Some(body) = &args.body {
-                    Ok(ReturnSource::InlineBytes(body.as_bytes().to_vec()))
-                } else if let Some(path) = &args.content_file {
-                    Ok(ReturnSource::InlineBytes(fs::read(path)?))
-                } else {
-                    let mut bytes = Vec::new();
-                    io::stdin().read_to_end(&mut bytes)?;
-                    Ok(ReturnSource::InlineBytes(bytes))
-                }
-            }
+            (Some(name), 0) => scratchpad_source(name, args.scratchpad_version),
+            (None, 1) => inline_source(args),
             (None, 0) => Err(MessengerError::InvalidInput(
                 "pass --scratchpad or exactly one of --body, --content-file, --content-stdin"
                     .to_string(),
@@ -763,38 +890,98 @@ pub mod cli {
         }
     }
 
+    fn inline_source_count(args: &ReturnArgs) -> usize {
+        usize::from(args.body.is_some())
+            + usize::from(args.content_file.is_some())
+            + usize::from(args.content_stdin)
+    }
+
+    fn scratchpad_source(name: &str, version: Option<u64>) -> Result<ReturnSource, MessengerError> {
+        Ok(ReturnSource::Scratchpad {
+            name: ScratchpadName::new(name.to_string())?,
+            version,
+        })
+    }
+
+    fn inline_source(args: &ReturnArgs) -> Result<ReturnSource, MessengerError> {
+        Ok(ReturnSource::InlineBytes(inline_bytes(args)?))
+    }
+
+    fn inline_bytes(args: &ReturnArgs) -> Result<Vec<u8>, MessengerError> {
+        if let Some(body) = &args.body {
+            return Ok(body.as_bytes().to_vec());
+        }
+        if let Some(path) = &args.content_file {
+            return fs::read(path).map_err(MessengerError::from);
+        }
+        read_stdin_bytes()
+    }
+
+    fn read_stdin_bytes() -> Result<Vec<u8>, MessengerError> {
+        let mut bytes = Vec::new();
+        io::stdin().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
     fn resolve_invocation_uuid(explicit: Option<String>) -> Result<Uuid, MessengerError> {
         if let Some(value) = explicit {
             return parse_uuid(&value);
         }
-        let env_value = std::env::var("OULIPOLY_PARENT_INVOCATION")
-            .map_err(|_| MessengerError::MissingInvocationScope)?;
-        if env_value.trim().is_empty() {
-            return Err(MessengerError::MissingInvocationScope);
-        }
-        let value: Value = serde_json::from_str(&env_value).map_err(|err| {
-            MessengerError::InvalidInvocationScope(format!(
-                "OULIPOLY_PARENT_INVOCATION is not valid JSON: {err}"
-            ))
-        })?;
-        let Some(id) = value.get("id").and_then(Value::as_str) else {
-            return Err(MessengerError::InvalidInvocationScope(
-                "OULIPOLY_PARENT_INVOCATION is missing id".to_string(),
-            ));
-        };
-        parse_uuid(id)
+        let env_value = parent_invocation_env()?;
+        let id = parent_invocation_id(&env_value)?;
+        parse_uuid(&id)
     }
 
     fn resolve_return_channel(explicit: Option<PathBuf>) -> Result<PathBuf, MessengerError> {
         if let Some(path) = explicit {
             return Ok(path);
         }
+        return_channel_from_env()
+    }
+
+    fn parent_invocation_env() -> Result<String, MessengerError> {
+        let env_value = std::env::var("OULIPOLY_PARENT_INVOCATION")
+            .map_err(|_| MessengerError::MissingInvocationScope)?;
+        require_parent_invocation_env(&env_value)?;
+        Ok(env_value)
+    }
+
+    fn require_parent_invocation_env(value: &str) -> Result<(), MessengerError> {
+        if value.trim().is_empty() {
+            return Err(MessengerError::MissingInvocationScope);
+        }
+        Ok(())
+    }
+
+    fn parent_invocation_id(env_value: &str) -> Result<String, MessengerError> {
+        let value: Value = serde_json::from_str(env_value).map_err(|err| {
+            MessengerError::InvalidInvocationScope(format!(
+                "OULIPOLY_PARENT_INVOCATION is not valid JSON: {err}"
+            ))
+        })?;
+        value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                MessengerError::InvalidInvocationScope(
+                    "OULIPOLY_PARENT_INVOCATION is missing id".to_string(),
+                )
+            })
+    }
+
+    fn return_channel_from_env() -> Result<PathBuf, MessengerError> {
         let value = std::env::var("OULIPOLY_RETURN_CHANNEL")
             .map_err(|_| MessengerError::MissingReturnChannel)?;
+        require_return_channel_env(&value)?;
+        Ok(PathBuf::from(value))
+    }
+
+    fn require_return_channel_env(value: &str) -> Result<(), MessengerError> {
         if value.trim().is_empty() {
             return Err(MessengerError::MissingReturnChannel);
         }
-        Ok(PathBuf::from(value))
+        Ok(())
     }
 
     fn parse_uuid(value: &str) -> Result<Uuid, MessengerError> {
