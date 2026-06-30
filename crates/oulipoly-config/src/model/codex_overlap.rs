@@ -75,27 +75,39 @@ fn parse_codex_arg_tokens(args: &[String]) -> Vec<CodexArgToken<'_>> {
     let mut tokens = Vec::new();
     let mut i = 0;
 
-    while i < args.len() {
-        let token = &args[i];
-        if is_codex_config_flag(token) {
-            let (parsed, advance) = parse_codex_config_arg_token(args, i);
-            tokens.push(parsed);
-            i += advance;
-            continue;
-        }
-
-        tokens.push(CodexArgToken::Standalone(token.as_str()));
-        i += 1;
+    while let Some(parsed) = parse_next_arg_token(args, &mut i) {
+        tokens.push(parsed);
     }
 
     tokens
 }
 
-fn is_codex_config_flag(token: &str) -> bool {
+fn parse_next_arg_token<'a>(args: &'a [String], index: &mut usize) -> Option<CodexArgToken<'a>> {
+    if is_arg_index_exhausted(args, *index) {
+        return None;
+    }
+    let (parsed, advance) = parse_arg_token_at(args, *index);
+    *index += advance;
+    Some(parsed)
+}
+
+fn is_arg_index_exhausted(args: &[String], index: usize) -> bool {
+    index >= args.len()
+}
+
+fn parse_arg_token_at(args: &[String], index: usize) -> (CodexArgToken<'_>, usize) {
+    let token = args[index].as_str();
+    if is_config_flag(token) {
+        return parse_config_arg_token(args, index);
+    }
+    (parse_standalone_arg_token(token), 1)
+}
+
+fn is_config_flag(token: &str) -> bool {
     matches!(token, "-c" | "--config")
 }
 
-fn parse_codex_config_arg_token(args: &[String], index: usize) -> (CodexArgToken<'_>, usize) {
+fn parse_config_arg_token(args: &[String], index: usize) -> (CodexArgToken<'_>, usize) {
     let flag = args[index].as_str();
     let Some(value) = args.get(index + 1) else {
         return (CodexArgToken::Standalone(flag), 1);
@@ -107,6 +119,10 @@ fn parse_codex_config_arg_token(args: &[String], index: usize) -> (CodexArgToken
         },
         2,
     )
+}
+
+fn parse_standalone_arg_token(token: &str) -> CodexArgToken<'_> {
+    CodexArgToken::Standalone(token)
 }
 
 fn map_codex_arg_token(token: CodexArgToken<'_>) -> CodexArgPart {
@@ -168,7 +184,7 @@ fn codex_model_config_pair_keys(args: &[String]) -> HashSet<String> {
         .collect()
 }
 
-fn codex_policy_config_pairs(root: &crate::providers::ProviderEntry) -> Option<&[String]> {
+fn policy_config_pair_slice_for_root(root: &crate::providers::ProviderEntry) -> Option<&[String]> {
     let restrictions = root_tool_restrictions(root)?;
     let codex_restrictions = filter_codex_tool_restrictions(restrictions)?;
     Some(policy_config_pairs(codex_restrictions))
@@ -229,15 +245,19 @@ fn codex_typed_policy_overlap(
     root: &crate::providers::ProviderEntry,
     model_args: &[String],
 ) -> Option<String> {
-    let policy_pairs = codex_policy_config_pairs(root)?;
-    if is_empty_policy_pairs(policy_pairs) {
-        return None;
-    }
-
+    let policy_pairs = non_empty_policy_config_pairs(root)?;
     let model_keys = codex_model_config_pair_keys(model_args);
     let policy_pairs = parse_policy_config_pairs(policy_pairs);
     let policy_pairs = filter_overlapping_policy_pairs(policy_pairs, &model_keys);
     first_overlapping_policy_pair(policy_pairs).map(map_policy_pair_display)
+}
+
+fn non_empty_policy_config_pairs(root: &crate::providers::ProviderEntry) -> Option<&[String]> {
+    filter_non_empty_policy_pairs(policy_config_pair_slice_for_root(root)?)
+}
+
+fn filter_non_empty_policy_pairs(policy_pairs: &[String]) -> Option<&[String]> {
+    (!is_empty_policy_pairs(policy_pairs)).then_some(policy_pairs)
 }
 
 pub(crate) fn validate_codex_model_arg_overlap(
@@ -271,12 +291,30 @@ fn model_provider_root_pairs<'a>(
     model
         .providers
         .iter()
-        .filter_map(|model_provider| {
-            providers
-                .get(&model_provider.name)
-                .map(|root_codex| (model_provider, root_codex))
-        })
+        .filter_map(|model_provider| model_provider_root_pair(model_provider, providers))
         .collect()
+}
+
+fn model_provider_root_pair<'a>(
+    model_provider: &'a ProviderConfig,
+    providers: &'a crate::providers::ProvidersConfig,
+) -> Option<(&'a ProviderConfig, &'a crate::providers::ProviderEntry)> {
+    let root = root_provider_entry(providers, &model_provider.name)?;
+    Some(map_model_provider_root_pair(model_provider, root))
+}
+
+fn root_provider_entry<'a>(
+    providers: &'a crate::providers::ProvidersConfig,
+    name: &str,
+) -> Option<&'a crate::providers::ProviderEntry> {
+    providers.get(name)
+}
+
+fn map_model_provider_root_pair<'a>(
+    model_provider: &'a ProviderConfig,
+    root: &'a crate::providers::ProviderEntry,
+) -> (&'a ProviderConfig, &'a crate::providers::ProviderEntry) {
+    (model_provider, root)
 }
 
 fn parse_codex_provider_families<'a>(
