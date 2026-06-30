@@ -154,42 +154,12 @@ impl SchemaRegistry {
         definition: &'static str,
         instance: &Value,
     ) -> Result<(), SchemaValidationError> {
-        let contents = schema_by_file(schema_file)
-            .ok_or_else(|| SchemaValidationError::UnknownSchemaFile(schema_file.to_owned()))?;
-        let mut schema = parse_schema(schema_file, contents)?;
+        let mut schema = parse_named_schema(schema_file)?;
         let common = parse_schema("common.schema.json", COMMON_SCHEMA)?;
         merge_common_defs_and_rewrite_refs(&mut schema, &common);
 
-        let defs = schema
-            .get("$defs")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Map::new()));
-        let wrapper = json!({
-            "$schema": SCHEMA_DRAFT_2020_12,
-            "$defs": defs,
-            "$ref": format!("#/$defs/{definition}")
-        });
-        let validator = jsonschema::validator_for(&wrapper).map_err(|err| {
-            SchemaValidationError::SchemaCompile {
-                schema_file,
-                definition,
-                message: err.to_string(),
-            }
-        })?;
-        let mut errors = validator
-            .iter_errors(instance)
-            .map(|err| err.to_string())
-            .collect::<Vec<_>>();
-        errors.sort();
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(SchemaValidationError::Validation {
-                schema_file,
-                definition,
-                errors,
-            })
-        }
+        let wrapper = map_definition_wrapper(&schema, definition);
+        validate_instance_with_wrapper(schema_file, definition, &wrapper, instance)
     }
 }
 
@@ -409,6 +379,92 @@ fn parse_schema(
     })
 }
 
+fn parse_named_schema(schema_file: &'static str) -> Result<Value, SchemaValidationError> {
+    let contents = schema_contents(schema_file)?;
+    parse_schema(schema_file, contents)
+}
+
+fn schema_contents(schema_file: &'static str) -> Result<&'static str, SchemaValidationError> {
+    schema_by_file(schema_file).ok_or_else(|| format_unknown_schema_file(schema_file))
+}
+
+fn map_definition_wrapper(schema: &Value, definition: &'static str) -> Value {
+    let defs = schema
+        .get("$defs")
+        .cloned()
+        .unwrap_or_else(empty_defs_object);
+    json!({
+        "$schema": SCHEMA_DRAFT_2020_12,
+        "$defs": defs,
+        "$ref": format!("#/$defs/{definition}")
+    })
+}
+
+fn validate_instance_with_wrapper(
+    schema_file: &'static str,
+    definition: &'static str,
+    wrapper: &Value,
+    instance: &Value,
+) -> Result<(), SchemaValidationError> {
+    let validator = compile_definition_validator(schema_file, definition, wrapper)?;
+    let errors = format_validation_errors(&validator, instance);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format_validation_failure(schema_file, definition, errors))
+    }
+}
+
+fn compile_definition_validator(
+    schema_file: &'static str,
+    definition: &'static str,
+    wrapper: &Value,
+) -> Result<jsonschema::Validator, SchemaValidationError> {
+    jsonschema::validator_for(wrapper)
+        .map_err(|err| format_schema_compile_error(schema_file, definition, err.to_string()))
+}
+
+fn format_validation_errors(validator: &jsonschema::Validator, instance: &Value) -> Vec<String> {
+    let mut errors = validator
+        .iter_errors(instance)
+        .map(|err| err.to_string())
+        .collect::<Vec<_>>();
+    errors.sort();
+    errors
+}
+
+fn format_unknown_schema_file(schema_file: &'static str) -> SchemaValidationError {
+    SchemaValidationError::UnknownSchemaFile(schema_file.to_owned())
+}
+
+fn format_schema_compile_error(
+    schema_file: &'static str,
+    definition: &'static str,
+    message: String,
+) -> SchemaValidationError {
+    SchemaValidationError::SchemaCompile {
+        schema_file,
+        definition,
+        message,
+    }
+}
+
+fn format_validation_failure(
+    schema_file: &'static str,
+    definition: &'static str,
+    errors: Vec<String>,
+) -> SchemaValidationError {
+    SchemaValidationError::Validation {
+        schema_file,
+        definition,
+        errors,
+    }
+}
+
+fn empty_defs_object() -> Value {
+    Value::Object(Map::new())
+}
+
 fn normalize_schema_filename(filename: &str) -> String {
     let bare = filename.strip_prefix("contract/v1/").unwrap_or(filename);
     if bare.ends_with(".schema.json") {
@@ -421,17 +477,31 @@ fn normalize_schema_filename(filename: &str) -> String {
 fn merge_common_defs_and_rewrite_refs(schema: &mut Value, common: &Value) {
     rewrite_common_refs(schema);
 
-    let Some(common_defs) = common.get("$defs").and_then(Value::as_object) else {
+    let Some(common_defs) = common_schema_defs(common) else {
         return;
     };
-    let schema_defs = schema
+    let schema_defs = validated_schema_defs_mut(schema);
+    merge_missing_schema_defs(schema_defs, common_defs);
+}
+
+fn common_schema_defs(common: &Value) -> Option<&Map<String, Value>> {
+    common.get("$defs").and_then(Value::as_object)
+}
+
+fn validated_schema_defs_mut(schema: &mut Value) -> &mut Map<String, Value> {
+    schema
         .as_object_mut()
         .expect("schema root must be a JSON object")
         .entry("$defs")
-        .or_insert_with(|| Value::Object(Map::new()))
+        .or_insert_with(empty_defs_object)
         .as_object_mut()
-        .expect("schema $defs must be a JSON object");
+        .expect("schema $defs must be a JSON object")
+}
 
+fn merge_missing_schema_defs(
+    schema_defs: &mut Map<String, Value>,
+    common_defs: &Map<String, Value>,
+) {
     for (name, definition) in common_defs {
         schema_defs
             .entry(name.clone())
