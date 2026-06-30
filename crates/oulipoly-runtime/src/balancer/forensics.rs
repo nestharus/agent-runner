@@ -71,9 +71,26 @@ pub fn apply_post_failure_forensics(
     failure_class: FailureClass,
     now: DateTime<Utc>,
 ) -> Result<(), MigrationError> {
+    touch_provider_refresh(state, provider_name, now)?;
+    record_provider_unavailable_if_persistent(state, provider_name, failure_class, now)
+}
+
+fn touch_provider_refresh(
+    state: &StateDb,
+    provider_name: &str,
+    now: DateTime<Utc>,
+) -> Result<(), MigrationError> {
     state
         .touch_provider_refresh(provider_name, now)
-        .map_err(|message| MigrationError::Db { message })?;
+        .map_err(|message| MigrationError::Db { message })
+}
+
+fn record_provider_unavailable_if_persistent(
+    state: &StateDb,
+    provider_name: &str,
+    failure_class: FailureClass,
+    now: DateTime<Utc>,
+) -> Result<(), MigrationError> {
     if let Some(offset) = failure_class.next_available_at_offset() {
         state
             .record_provider_unavailable(provider_name, Some(now + offset), failure_class.as_str())

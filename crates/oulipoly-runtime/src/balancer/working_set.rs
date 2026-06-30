@@ -12,9 +12,7 @@ use oulipoly_state::{QuotaRecord, StateDb};
 /// post-failure forensics writer sets this column to push a provider out of
 /// rotation for a typed cooldown window.
 pub fn working_set_member(quota: Option<&QuotaRecord>, now: DateTime<Utc>) -> bool {
-    quota
-        .and_then(|q| q.next_available_at)
-        .is_none_or(|ts| ts <= now)
+    next_available_at(quota).is_none_or(|ts| ts <= now)
 }
 
 /// AGE-163 WU-A.3 round-robin candidate selection. Walks the model's
@@ -33,32 +31,114 @@ pub fn select_next_working_candidate(
     if pool_len == 0 {
         return Ok(None);
     }
-    let cursor = state
+    let start = next_working_set_scan_start(state, model, pool_len)?;
+    first_working_candidate(state, model, now, exclude_provider_index, start, 0)
+}
+
+fn next_available_at(quota: Option<&QuotaRecord>) -> Option<DateTime<Utc>> {
+    quota.and_then(|q| q.next_available_at)
+}
+
+fn next_working_set_scan_start(
+    state: &StateDb,
+    model: &ModelConfig,
+    pool_len: usize,
+) -> Result<usize, MigrationError> {
+    let cursor = round_robin_cursor(state, model)?.unwrap_or(usize::MAX);
+    Ok(scan_start_for_cursor(cursor, pool_len))
+}
+
+fn round_robin_cursor(
+    state: &StateDb,
+    model: &ModelConfig,
+) -> Result<Option<usize>, MigrationError> {
+    state
         .next_round_robin_index_for_model(&model.name)
-        .map_err(|message| MigrationError::Db { message })?
-        .unwrap_or(usize::MAX);
-    let start = if cursor == usize::MAX {
-        0
-    } else {
-        (cursor + 1) % pool_len
-    };
-    for offset in 0..pool_len {
-        let candidate_index = (start + offset) % pool_len;
-        if Some(candidate_index) == exclude_provider_index {
-            continue;
-        }
-        let provider = &model.providers[candidate_index];
-        let quota = state
-            .get_quota(&provider.name)
-            .map_err(|message| MigrationError::Db { message })?;
-        if working_set_member(quota.as_ref(), now) {
-            state
-                .advance_round_robin_index(&model.name, candidate_index, now)
-                .map_err(|message| MigrationError::Db { message })?;
-            return Ok(Some(candidate_index));
-        }
+        .map_err(|message| MigrationError::Db { message })
+}
+
+fn scan_start_for_cursor(cursor: usize, pool_len: usize) -> usize {
+    if cursor == usize::MAX {
+        return 0;
     }
-    Ok(None)
+    (cursor + 1) % pool_len
+}
+
+fn first_working_candidate(
+    state: &StateDb,
+    model: &ModelConfig,
+    now: DateTime<Utc>,
+    exclude_provider_index: Option<usize>,
+    start: usize,
+    offset: usize,
+) -> Result<Option<usize>, MigrationError> {
+    if offset == model.providers.len() {
+        return Ok(None);
+    }
+    let candidate_index = candidate_index_at_offset(start, offset, model.providers.len());
+    let candidate =
+        select_working_candidate(state, model, candidate_index, exclude_provider_index, now)?;
+    if candidate.is_some() {
+        return Ok(candidate);
+    }
+    first_working_candidate(state, model, now, exclude_provider_index, start, offset + 1)
+}
+
+fn candidate_index_at_offset(start: usize, offset: usize, pool_len: usize) -> usize {
+    (start + offset) % pool_len
+}
+
+fn candidate_is_excluded(candidate_index: usize, exclude_provider_index: Option<usize>) -> bool {
+    Some(candidate_index) == exclude_provider_index
+}
+
+fn select_working_candidate(
+    state: &StateDb,
+    model: &ModelConfig,
+    candidate_index: usize,
+    exclude_provider_index: Option<usize>,
+    now: DateTime<Utc>,
+) -> Result<Option<usize>, MigrationError> {
+    if candidate_is_excluded(candidate_index, exclude_provider_index) {
+        return Ok(None);
+    }
+    if candidate_is_unavailable(state, model, candidate_index, now)? {
+        return Ok(None);
+    }
+    advance_working_set_cursor(state, model, candidate_index, now)?;
+    Ok(Some(candidate_index))
+}
+
+fn candidate_is_unavailable(
+    state: &StateDb,
+    model: &ModelConfig,
+    candidate_index: usize,
+    now: DateTime<Utc>,
+) -> Result<bool, MigrationError> {
+    let quota = candidate_quota(state, model, candidate_index)?;
+    Ok(!working_set_member(quota.as_ref(), now))
+}
+
+fn candidate_quota(
+    state: &StateDb,
+    model: &ModelConfig,
+    candidate_index: usize,
+) -> Result<Option<QuotaRecord>, MigrationError> {
+    let provider = &model.providers[candidate_index];
+    state
+        .get_quota(&provider.name)
+        .map_err(|message| MigrationError::Db { message })
+}
+
+fn advance_working_set_cursor(
+    state: &StateDb,
+    model: &ModelConfig,
+    candidate_index: usize,
+    now: DateTime<Utc>,
+) -> Result<(), MigrationError> {
+    state
+        .advance_round_robin_index(&model.name, candidate_index, now)
+        .map_err(|message| MigrationError::Db { message })
 }
 
 #[cfg(test)]
