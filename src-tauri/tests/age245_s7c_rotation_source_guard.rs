@@ -139,6 +139,7 @@ fn tracked_diff_output_since_baseline(root: &Path) -> Output {
             ":(exclude)planning/wu-e/**",
             ":(exclude)planning/opencode-contract/**",
             ":(exclude)planning/s10-moveout/**",
+            ":(exclude)planning/code-quality-sweep/**",
         ])
         .output()
         .expect("git diff must run for AGE-245 S7c provider-name invariant")
@@ -247,6 +248,7 @@ fn is_ignored_generated_path(relative: &str) -> bool {
         || relative.starts_with("planning/wu-e/")
         || relative.starts_with("planning/opencode-contract/")
         || relative.starts_with("planning/s10-moveout/")
+        || relative.starts_with("planning/code-quality-sweep/")
 }
 
 fn is_planning_gate_artifact(relative: &str) -> bool {
