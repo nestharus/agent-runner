@@ -2101,6 +2101,7 @@ fn grep_scope_args(base_ref: Option<&'static str>, include_untracked: bool) -> V
     args.extend([
         "--",
         ".",
+        ":(exclude)planning/code-quality-sweep/**",
         ":(exclude)planning/*-gate/**",
         ":(exclude)planning/s10-moveout/**",
         ":(exclude)planning/wu-e/**",
