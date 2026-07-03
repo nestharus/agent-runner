@@ -1,0 +1,2 @@
+Permission deny rule "TeamCreate" matches no known tool — check for typos.
+Permission deny rule "TeamDelete" matches no known tool — check for typos.
