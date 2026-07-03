@@ -811,9 +811,25 @@ fn control_socket_dir() -> Result<PathBuf, String> {
 }
 
 fn runtime_control_socket_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .map(|runtime| runtime.join("oulipoly-agent-runner/pty"))
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
+    runtime_control_socket_dir_for(runtime)
+}
+
+/// Resolve the runtime-tier control-socket directory for a given
+/// `XDG_RUNTIME_DIR` value, falling through when it is unusable.
+///
+/// `XDG_RUNTIME_DIR` is created and owned by the login session. If the variable
+/// still points at a directory that no longer exists — e.g. the runtime tmpfs
+/// (`/run/user/<uid>`) was torn down by a host/WSL crash and not recreated —
+/// then binding a control socket underneath it fails (the user cannot recreate
+/// `/run/user/<uid>`), which would turn every interactive spawn into a
+/// `spawn_error`. Returning `None` here lets `control_socket_dir` fall through
+/// to the state/data locations instead of hard-failing.
+fn runtime_control_socket_dir_for(runtime: PathBuf) -> Option<PathBuf> {
+    if !runtime.is_dir() {
+        return None;
+    }
+    Some(runtime.join("oulipoly-agent-runner/pty"))
 }
 
 fn state_control_socket_dir() -> Option<PathBuf> {
@@ -2835,6 +2851,26 @@ mod tests {
 
         assert!(path.as_os_str().as_bytes().len() < UNIX_SOCKET_PATH_LIMIT);
         assert!(path.starts_with(short_control_socket_dir()));
+    }
+
+    #[test]
+    fn runtime_control_socket_dir_falls_through_when_runtime_dir_missing() {
+        // A stale XDG_RUNTIME_DIR (e.g. /run/user/<uid> wiped by a host/WSL
+        // crash) must not be used — otherwise every interactive spawn fails to
+        // bind its control socket. Returning None lets control_socket_dir fall
+        // through to the state/data tiers.
+        let missing = PathBuf::from("/nonexistent-xdg-runtime-6b1e2226/does-not-exist");
+        assert!(!missing.is_dir(), "precondition: path must not exist");
+        assert_eq!(runtime_control_socket_dir_for(missing), None);
+    }
+
+    #[test]
+    fn runtime_control_socket_dir_used_when_runtime_dir_exists() {
+        let existing = std::env::temp_dir();
+        assert_eq!(
+            runtime_control_socket_dir_for(existing.clone()),
+            Some(existing.join("oulipoly-agent-runner/pty"))
+        );
     }
 
     #[test]
