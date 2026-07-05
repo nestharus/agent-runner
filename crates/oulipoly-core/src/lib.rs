@@ -13,11 +13,11 @@ pub enum TransitionReason {
 impl TransitionReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            TransitionReason::Initial => "initial",
-            TransitionReason::Manual => "manual",
-            TransitionReason::QuotaThreshold => "quota_threshold",
-            TransitionReason::Exhausted => "exhausted",
-            TransitionReason::Imported => "imported",
+            Self::Initial => "initial",
+            Self::Manual => "manual",
+            Self::QuotaThreshold => "quota_threshold",
+            Self::Exhausted => "exhausted",
+            Self::Imported => "imported",
         }
     }
 }
