@@ -6,16 +6,16 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
    e.g. opencode-turns ~/.local/share/opencode ses_abc123
 
 Session IDs and message content are read through the public OpenCode CLI.
-The command defaults to `opencode`, or to `opencodeN` when BASE_DIR contains
-`.opencodeN`; `OPENCODE_BIN` overrides this:
+The command is `opencode`, or `opencodeN` when BASE_DIR contains `.opencodeN`.
+Every child process is bound to BASE_DIR's parent through `XDG_DATA_HOME`:
   opencode session list --json
   opencode export <sessionID>
 
 When SESSION_ID arguments are supplied, they are used directly. If no
 SESSION_ID arguments are supplied, the SESSION_ID environment variable is used
-as the direct target list. BASE_DIR is accepted for compatibility with existing
-session source configuration; implicit discovery uses `opencode session list
---json`, not OpenCode's private storage layout.
+as the direct target list. BASE_DIR determines the OpenCode storage root used by
+both implicit discovery and direct export. Discovery uses `opencode session
+list --json`, not OpenCode's private storage layout.
 
 Implicit discovery is bounded to the recent quota-balancing window. If the
 session list does not expose timestamps, the adapter falls back to a small cap
@@ -34,7 +34,6 @@ selection.
 import json
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -550,26 +549,7 @@ def fallback_turn_id(default_session_id: str, index: int) -> str:
 
 
 def opencode_command() -> list[str]:
-    configured = configured_opencode_command()
-    if configured is None:
-        return default_opencode_command(sys.argv)
-    return command_tokens_or_default(configured_command_tokens(configured))
-
-
-def configured_opencode_command() -> str | None:
-    return os.environ.get("OPENCODE_BIN")
-
-
-def configured_command_tokens(configured: str) -> list[str]:
-    return shlex.split(configured)
-
-
-def command_tokens_or_default(tokens: list[str]) -> list[str]:
-    return tokens or ["opencode"]
-
-
-def default_opencode_command(argv: list[str]) -> list[str]:
-    return [opencode_command_name_from_base_dir(base_dir_arg(argv))]
+    return [opencode_command_name_from_base_dir(base_dir_arg(sys.argv))]
 
 
 def opencode_command_name_from_base_dir(base_dir: str) -> str:
@@ -587,6 +567,18 @@ def formatted_opencode_command_name(suffix: str | None) -> str:
     if suffix is None:
         return "opencode"
     return f"opencode{suffix}"
+
+
+def opencode_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("OPENCODE_BIN", None)
+    environment["XDG_DATA_HOME"] = opencode_data_home(base_dir_arg(sys.argv))
+    return environment
+
+
+def opencode_data_home(base_dir: str) -> str:
+    expanded_base_dir = os.path.normpath(os.path.expanduser(base_dir))
+    return os.path.dirname(expanded_base_dir)
 
 
 def run_opencode(
@@ -622,6 +614,7 @@ def spawn_opencode_process(args: list[str]) -> subprocess.Popen:
         stdin=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
+        env=opencode_environment(),
     )
 
 

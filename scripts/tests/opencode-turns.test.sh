@@ -456,6 +456,54 @@ write_command_derivation_mock() {
   write_executable_mock "$path" emit_command_derivation_mock_body
 }
 
+emit_root_binding_mock_body() {
+  cat <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+command_name="${0##*/}"
+printf '%s|%s|%s|%s\n' \
+  "$command_name" \
+  "${XDG_DATA_HOME:-}" \
+  "${OPENCODE_BIN-unset}" \
+  "$*" >>"$OPENCODE_TURNS_COMMAND_LOG"
+
+if [[ "$command_name" == "opencode" && "${XDG_DATA_HOME:-}" == "$DEFAULT_DATA_HOME" ]]; then
+  local_session_id="ses_default_root"
+elif [[ "$command_name" == "opencode3" && "${XDG_DATA_HOME:-}" == "$PROFILE3_DATA_HOME" ]]; then
+  local_session_id="ses_profile3_root"
+else
+  printf '[]\n'
+  exit 0
+fi
+
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+  printf '[{"id":"%s"}]\n' "$local_session_id"
+  exit 0
+fi
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  if [[ "$session_id" != "$local_session_id" ]]; then
+    printf '[]\n'
+    exit 0
+  fi
+  printf '[{"sessionID":"%s","messageID":"turn-%s","timestamp":"2099-01-01T00:00:00Z","role":"assistant","content":"%s"}]\n' \
+    "$session_id" "$session_id" "$session_id"
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+}
+
+write_root_binding_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_root_binding_mock_body
+}
+
 emit_current_export_mock_body() {
   cat <<'MOCK_OPENCODE'
 #!/usr/bin/env bash
@@ -582,6 +630,8 @@ write_session_id_env_mock() {
 run_opencode_turns() {
   local tmpdir="$1"
   local opencode_bin="$2"
+  local opencode_bin_dir
+  opencode_bin_dir="$(dirname "$opencode_bin")"
 
   RUN_STDOUT="$tmpdir/stdout.jsonl"
   RUN_STDERR="$tmpdir/stderr.txt"
@@ -590,7 +640,8 @@ run_opencode_turns() {
   : >"$OPENCODE_TURNS_EXPORT_LOG"
 
   set +e
-  OPENCODE_BIN="$opencode_bin" \
+  env -u OPENCODE_BIN \
+    PATH="$opencode_bin_dir:$PATH" \
     OPENCODE_TURNS_WINDOW_HOURS="${OPENCODE_TURNS_WINDOW_HOURS:-6}" \
     OPENCODE_TURNS_MAX_SESSIONS="${OPENCODE_TURNS_MAX_SESSIONS:-25}" \
     OPENCODE_TURNS_CALL_TIMEOUT="${OPENCODE_TURNS_CALL_TIMEOUT:-20}" \
@@ -621,6 +672,45 @@ run_opencode_turns_with_session_id_env_on_path() {
     "$SCRIPT" "$tmpdir/opencode-root" >"$RUN_STDOUT" 2>"$RUN_STDERR"
   RUN_STATUS=$?
   set -e
+}
+
+run_root_binding_adapter() {
+  local tmpdir="$1"
+  local base_dir="$2"
+  local ambient_data_home="$3"
+  local ambient_opencode_bin="$4"
+  shift 4
+
+  RUN_STDOUT="$tmpdir/stdout.jsonl"
+  RUN_STDERR="$tmpdir/stderr.txt"
+  OPENCODE_TURNS_COMMAND_LOG="$tmpdir/commands.log"
+  DEFAULT_DATA_HOME="$tmpdir/default-data"
+  PROFILE3_DATA_HOME="$tmpdir/.opencode3"
+  export OPENCODE_TURNS_COMMAND_LOG DEFAULT_DATA_HOME PROFILE3_DATA_HOME
+  : >"$OPENCODE_TURNS_COMMAND_LOG"
+
+  set +e
+  XDG_DATA_HOME="$ambient_data_home" \
+    OPENCODE_BIN="$ambient_opencode_bin" \
+    PATH="$tmpdir/bin:$PATH" \
+    OPENCODE_TURNS_WINDOW_HOURS=6 \
+    OPENCODE_TURNS_MAX_SESSIONS=25 \
+    OPENCODE_TURNS_CALL_TIMEOUT=20 \
+    OPENCODE_TURNS_DEADLINE=60 \
+    "$SCRIPT" "$base_dir" "$@" >"$RUN_STDOUT" 2>"$RUN_STDERR"
+  RUN_STATUS=$?
+  set -e
+}
+
+prepare_root_binding_fixture() {
+  local tmpdir="$1"
+
+  mkdir -p \
+    "$tmpdir/bin" \
+    "$tmpdir/default-data/opencode" \
+    "$tmpdir/.opencode3/opencode"
+  write_root_binding_mock "$tmpdir/bin/opencode"
+  write_root_binding_mock "$tmpdir/bin/opencode3"
 }
 
 test_timestampless_session_list_applies_max_sessions_cap() {
@@ -742,6 +832,92 @@ test_base_dir_suffix_selects_matching_opencode_command() {
   assert_stdout_contains '"role":"user"' "$FUNCNAME user record"
 }
 
+test_default_root_discovery_ignores_hostile_ambient_profile() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  prepare_root_binding_fixture "$tmpdir"
+
+  run_root_binding_adapter \
+    "$tmpdir" \
+    "$tmpdir/default-data/opencode" \
+    "$tmpdir/.opencode3" \
+    "opencode3"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq \
+    "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" \
+    $'opencode|'"$tmpdir"$'/default-data|unset|session list --json\nopencode|'"$tmpdir"$'/default-data|unset|export ses_default_root' \
+    "$FUNCNAME commands"
+  assert_stdout_contains '"session_id":"ses_default_root"' "$FUNCNAME default record"
+  assert_stdout_not_contains 'ses_profile3_root' "$FUNCNAME profile-3 excluded"
+}
+
+test_default_root_direct_export_ignores_hostile_ambient_profile() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  prepare_root_binding_fixture "$tmpdir"
+
+  run_root_binding_adapter \
+    "$tmpdir" \
+    "$tmpdir/default-data/opencode" \
+    "$tmpdir/.opencode3" \
+    "opencode3" \
+    "ses_default_root"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq \
+    "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" \
+    "opencode|$tmpdir/default-data|unset|export ses_default_root" \
+    "$FUNCNAME commands"
+  assert_stdout_contains '"session_id":"ses_default_root"' "$FUNCNAME default record"
+  assert_stdout_not_contains 'ses_profile3_root' "$FUNCNAME profile-3 excluded"
+}
+
+test_profile3_root_discovery_ignores_hostile_ambient_profile() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  prepare_root_binding_fixture "$tmpdir"
+
+  run_root_binding_adapter \
+    "$tmpdir" \
+    "$tmpdir/.opencode3/opencode" \
+    "$tmpdir/default-data" \
+    "opencode"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq \
+    "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" \
+    $'opencode3|'"$tmpdir"$'/.opencode3|unset|session list --json\nopencode3|'"$tmpdir"$'/.opencode3|unset|export ses_profile3_root' \
+    "$FUNCNAME commands"
+  assert_stdout_contains '"session_id":"ses_profile3_root"' "$FUNCNAME profile-3 record"
+  assert_stdout_not_contains 'ses_default_root' "$FUNCNAME default excluded"
+}
+
+test_profile3_root_direct_export_ignores_hostile_ambient_profile() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  prepare_root_binding_fixture "$tmpdir"
+
+  run_root_binding_adapter \
+    "$tmpdir" \
+    "$tmpdir/.opencode3/opencode" \
+    "$tmpdir/default-data" \
+    "opencode" \
+    "ses_profile3_root"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq \
+    "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" \
+    "opencode3|$tmpdir/.opencode3|unset|export ses_profile3_root" \
+    "$FUNCNAME commands"
+  assert_stdout_contains '"session_id":"ses_profile3_root"' "$FUNCNAME profile-3 record"
+  assert_stdout_not_contains 'ses_default_root' "$FUNCNAME default excluded"
+}
+
 test_current_export_info_metadata_emits_turns() {
   local tmpdir
   tmpdir="$(mktemp -d)"
@@ -777,6 +953,10 @@ test_exports_only_recent_window_sessions
 test_timeout_emits_degraded_best_effort_and_exits_zero
 test_timeout_kills_opencode_process_group_descendant
 test_base_dir_suffix_selects_matching_opencode_command
+test_default_root_discovery_ignores_hostile_ambient_profile
+test_default_root_direct_export_ignores_hostile_ambient_profile
+test_profile3_root_discovery_ignores_hostile_ambient_profile
+test_profile3_root_direct_export_ignores_hostile_ambient_profile
 test_current_export_info_metadata_emits_turns
 test_session_id_env_used_when_no_positional_sessions
 

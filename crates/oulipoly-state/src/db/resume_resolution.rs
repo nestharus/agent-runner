@@ -51,12 +51,12 @@ impl StateDb {
                 self.resolve_resume_chain(models, &chain_id, model_override)
             }
             ResumeInputMatch::NativeSession { candidates } => {
-                self.resolve_single_native_lineage(models, input, &candidates, model_override)
+                self.resolve_native_lineage(models, input, &candidates, model_override)
             }
         }
     }
 
-    fn resolve_single_native_lineage(
+    fn resolve_native_lineage(
         &self,
         models: &ModelStore,
         input: &str,
@@ -64,17 +64,13 @@ impl StateDb {
         model_override: Option<&str>,
     ) -> Result<ResolvedResume, ResumeError> {
         let chain_ids = Self::distinct_native_candidate_chain_ids(candidates);
-        let Some(chain_id) = Self::single_native_chain_id(&chain_ids) else {
+        let Some(chain_id) = self
+            .choose_resume_chain(input, chain_ids)
+            .map_err(|message| ResumeError::Db { message })?
+        else {
             return Err(self.ambiguous_resume_error(input)?);
         };
-        self.resolve_resume_chain(models, chain_id, model_override)
-    }
-
-    fn single_native_chain_id(chain_ids: &[String]) -> Option<&str> {
-        match chain_ids {
-            [chain_id] => Some(chain_id),
-            _ => None,
-        }
+        self.resolve_resume_chain(models, &chain_id, model_override)
     }
 
     pub fn classify_resume_input(&self, input: &str) -> Result<ResumeInputMatch, ResumeError> {

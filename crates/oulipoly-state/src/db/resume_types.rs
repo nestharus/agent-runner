@@ -154,3 +154,9 @@ pub(super) struct ParsedTurnPreviewTimestamp {
     pub(super) role: String,
     pub(super) timestamp: DateTime<Utc>,
 }
+pub(super) struct ResumeChainCandidate {
+    pub(super) chain_id: String,
+    pub(super) latest_successful_owner_finished_at: Option<DateTime<Utc>>,
+    pub(super) last_used_at: DateTime<Utc>,
+    pub(super) latest_segment_started_at: DateTime<Utc>,
+}
