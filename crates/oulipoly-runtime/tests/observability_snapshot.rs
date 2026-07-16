@@ -22,11 +22,25 @@ use oulipoly_state::{InvocationStart, StateDb};
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Child, Command};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const CHILD_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_ID: &str = "session-observe";
+#[cfg(target_os = "linux")]
+const LIVE_CHILD_UUID: &str = "33333333-3333-4333-8333-333333333333";
+#[cfg(target_os = "linux")]
+const DEAD_CHILD_UUID: &str = "44444444-4444-4444-8444-444444444444";
+#[cfg(target_os = "linux")]
+const MISSING_CHILD_UUID: &str = "55555555-5555-4555-8555-555555555555";
+#[cfg(target_os = "linux")]
+const MISMATCHED_CHILD_UUID: &str = "66666666-6666-4666-8666-666666666666";
+#[cfg(target_os = "linux")]
+const UNRELATED_UUID: &str = "77777777-7777-4777-8777-777777777777";
+#[cfg(target_os = "linux")]
+const TERMINAL_DESCENDANT_COUNT: usize = 201;
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -245,6 +259,39 @@ fn running_invocation_with_dead_pid_is_reconciled_to_stale_not_running() {
                 && node.status == MonitorStatus::Running),
         "dead-pid running invocation must not be counted as running"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn overlay_counts_live_logical_child_after_terminal_history_and_fails_closed() {
+    let scenario = overlay_logical_child_scenario();
+    assert!(TERMINAL_DESCENDANT_COUNT > SnapshotLimits::default().max_invocation_nodes);
+    assert_ne!(
+        process_parent_pid(scenario.logical_child_process.pid()),
+        scenario.root_process.pid(),
+        "the logical child launcher must not be a physical child of the root process"
+    );
+
+    let snapshot = scenario
+        .fixture
+        .service()
+        .snapshot(&scenario.fixture.root(), SnapshotLimits::default());
+
+    assert_eq!(
+        snapshot.summary.running_nodes, 4,
+        "the overlay count must include the root and detached logical child invocation/process pairs: {:#?}",
+        snapshot.nodes
+    );
+    assert_verified_running_process(&snapshot, ROOT_UUID, scenario.root_process.identity());
+    assert_verified_running_process(
+        &snapshot,
+        LIVE_CHILD_UUID,
+        scenario.logical_child_process.identity(),
+    );
+    assert_invocation_absent(&snapshot, DEAD_CHILD_UUID);
+    assert_invocation_absent(&snapshot, MISSING_CHILD_UUID);
+    assert_invocation_absent(&snapshot, MISMATCHED_CHILD_UUID);
+    assert_invocation_absent(&snapshot, UNRELATED_UUID);
 }
 
 #[test]
@@ -1369,6 +1416,175 @@ fn dead_identity() -> ProcessIdentity {
         os_boot_id: "boot-dead".to_string(),
         os_pid_starttime_ticks: 99,
     }
+}
+
+#[cfg(target_os = "linux")]
+struct TestProcess {
+    child: Child,
+    identity: ProcessIdentity,
+}
+
+#[cfg(target_os = "linux")]
+struct OverlayLogicalChildScenario {
+    fixture: Fixture,
+    root_process: TestProcess,
+    logical_child_process: TestProcess,
+    _mismatched_process: TestProcess,
+    _unrelated_process: TestProcess,
+}
+
+#[cfg(target_os = "linux")]
+fn overlay_logical_child_scenario() -> OverlayLogicalChildScenario {
+    let fixture = Fixture::new();
+    let root_process = TestProcess::spawn();
+    let logical_child_process = TestProcess::spawn();
+    let mismatched_process = TestProcess::spawn();
+    let unrelated_process = TestProcess::spawn();
+    seed_overlay_logical_child_state(&fixture);
+    seed_overlay_logical_child_identities(
+        &fixture,
+        &root_process,
+        &logical_child_process,
+        &mismatched_process,
+        &unrelated_process,
+    );
+    OverlayLogicalChildScenario {
+        fixture,
+        root_process,
+        logical_child_process,
+        _mismatched_process: mismatched_process,
+        _unrelated_process: unrelated_process,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn seed_overlay_logical_child_state(fixture: &Fixture) {
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    for index in 0..TERMINAL_DESCENDANT_COUNT {
+        let uuid = format!("10000000-0000-4000-8000-{index:012}");
+        let row_id = seed_invocation(&state, &uuid, Some(root_id));
+        state
+            .finalize_invocation(row_id, true, 0, None, Some("completed"))
+            .unwrap();
+    }
+    seed_invocation(&state, LIVE_CHILD_UUID, Some(root_id));
+    seed_invocation(&state, DEAD_CHILD_UUID, Some(root_id));
+    seed_invocation(&state, MISSING_CHILD_UUID, Some(root_id));
+    seed_invocation(&state, MISMATCHED_CHILD_UUID, Some(root_id));
+    seed_invocation(&state, UNRELATED_UUID, None);
+}
+
+#[cfg(target_os = "linux")]
+fn seed_overlay_logical_child_identities(
+    fixture: &Fixture,
+    root_process: &TestProcess,
+    logical_child_process: &TestProcess,
+    mismatched_process: &TestProcess,
+    unrelated_process: &TestProcess,
+) {
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), root_process.identity());
+    record_identity(
+        &pid,
+        LIVE_CHILD_UUID,
+        Some(SESSION_ID),
+        logical_child_process.identity(),
+    );
+    record_identity(&pid, DEAD_CHILD_UUID, Some(SESSION_ID), &dead_identity());
+    let mut mismatched_identity = mismatched_process.identity().clone();
+    mismatched_identity.os_pid_starttime_ticks += 1;
+    record_identity(
+        &pid,
+        MISMATCHED_CHILD_UUID,
+        Some(SESSION_ID),
+        &mismatched_identity,
+    );
+    record_identity(
+        &pid,
+        UNRELATED_UUID,
+        Some(SESSION_ID),
+        unrelated_process.identity(),
+    );
+}
+
+#[cfg(target_os = "linux")]
+impl TestProcess {
+    fn spawn() -> Self {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let identity =
+            oulipoly_state::pid_identity::read_live_process_identity(i64::from(child.id()))
+                .unwrap()
+                .unwrap();
+        Self { child, identity }
+    }
+
+    fn pid(&self) -> i64 {
+        self.identity.os_pid
+    }
+
+    fn identity(&self) -> &ProcessIdentity {
+        &self.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pid(pid: i64) -> i64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(") ")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_verified_running_process(
+    snapshot: &oulipoly_runtime::observability::MonitorSnapshot,
+    invocation_uuid: &str,
+    identity: &ProcessIdentity,
+) {
+    let process = node(
+        snapshot,
+        &format!("process:{invocation_uuid}:{}", identity.os_pid),
+    );
+    assert_eq!(process.kind, MonitorNodeKind::ProviderProcess);
+    assert_eq!(process.status, MonitorStatus::Running);
+    assert_eq!(process.liveness, LivenessStatus::VerifiedLive);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_invocation_absent(
+    snapshot: &oulipoly_runtime::observability::MonitorSnapshot,
+    invocation_uuid: &str,
+) {
+    assert!(
+        find_node(snapshot, &format!("invocation:{invocation_uuid}")).is_none(),
+        "invocation {invocation_uuid} must not be visible: {:#?}",
+        snapshot.nodes
+    );
+    assert!(
+        !snapshot
+            .nodes
+            .iter()
+            .any(|node| node.id.starts_with(&format!("process:{invocation_uuid}:"))),
+        "invocation {invocation_uuid} must not contribute a process node: {:#?}",
+        snapshot.nodes
+    );
 }
 
 fn record_identity(
