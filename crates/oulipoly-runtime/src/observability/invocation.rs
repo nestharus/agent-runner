@@ -3,6 +3,23 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 //!
 //! Invocation subtree projection for monitor snapshots.
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/observability/invocation.rs
+//!     role: adapter
+//!     Translates:
+//!       - observability monitor-node projection contract
+//!       - StateDb invocation-record read contract
+//!       - PidIdentity exact-process-identity contract
+//!       - Rust standard collection contract
+//! ```
+//!
+//! This module adapts durable invocation and process-identity records into the
+//! monitor-node projection. Candidate ordering never establishes liveness;
+//! exact process identity remains authoritative.
 
 use crate::observability::dto::{
     CancelRef, InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity,
@@ -173,7 +190,12 @@ fn build_invocation_node(
     if !should_read_invocation_children(depth, limits) {
         return;
     }
-    let Some(children) = invocation_children(state, record.id, &mut projection.diagnostics) else {
+    let Some(children) = invocation_children(
+        state,
+        record.id,
+        limits.include_terminal,
+        &mut projection.diagnostics,
+    ) else {
         return;
     };
     visit_invocation_children(
@@ -241,10 +263,14 @@ fn should_read_invocation_children(depth: usize, limits: SnapshotLimits) -> bool
 fn invocation_children(
     state: &StateDb,
     record_id: i64,
+    include_terminal: bool,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<Vec<InvocationRecord>> {
     match read_invocation_children(state, record_id) {
-        Ok(children) => Some(children),
+        Ok(mut children) => {
+            order_invocation_children(&mut children, include_terminal);
+            Some(children)
+        }
         Err(err) => {
             push_invocation_children_read_diagnostic(diagnostics, err);
             None
@@ -257,6 +283,17 @@ fn read_invocation_children(
     record_id: i64,
 ) -> Result<Vec<InvocationRecord>, String> {
     state.list_invocation_children(record_id)
+}
+
+fn order_invocation_children(children: &mut [InvocationRecord], include_terminal: bool) {
+    if include_terminal {
+        return;
+    }
+    prioritize_running_candidates(children);
+}
+
+fn prioritize_running_candidates(children: &mut [InvocationRecord]) {
+    children.sort_by_key(|record| record.status != InvocationStatus::Running);
 }
 
 fn push_invocation_children_read_diagnostic(
