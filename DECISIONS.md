@@ -5161,3 +5161,13 @@ New HEAD `bada04a4`; diff(main..bada04a4) sha256 `775c27eb3601b9c4ad52365f38a76e
   does NOT include `cargo fmt --check` and the main baseline is fmt-drifted, so this churn is unwanted
   scope pollution. Reverted all 10 via `git checkout --` to keep the PR diff confined to
   pty_broker/{mod,tui}.rs (the real change) + DECISIONS.md. Verified build/tests after revert.
+
+## D-2026-07-16-workflow-model-routing — standardize active workflows on gpt-high
+
+- **Decision:** Active workflow and orchestrator Markdown routes use `gpt-high`. New runs must not
+  select the escalation tier by default; model escalation requires a separate explicit decision.
+- **Scope:** Current routing policy in the shared AI and RFQ workflow repositories. Historical
+  decisions and retained runtime evidence in this repository remain unchanged as an audit record.
+- **Reason:** Repeated resume passes amplified one inbox pipeline to hundreds of dispatches and
+  exhausted provider quota. Standardizing the active route limits the immediate blast radius while
+  resume idempotency is restored and verified.
