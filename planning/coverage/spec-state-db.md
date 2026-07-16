@@ -5,6 +5,7 @@
 - `crates/oulipoly-core/src/lib.rs`
 - `crates/oulipoly-state/build.rs`
 - `crates/oulipoly-state/src/db.rs`
+- `crates/oulipoly-state/src/db/invocation_records.rs`
 - `crates/oulipoly-state/src/db/owned_turn_event.rs`
 - `crates/oulipoly-state/src/lib.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
@@ -65,6 +66,7 @@
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
+| A caller lists direct logical invocation children. | `list_invocation_children` returns only direct children in deterministic chronological `created_at, id` order; consumer-specific projections may reorder their already-loaded copy without changing this history contract. |
 
 ## Edge cases
 
@@ -98,6 +100,8 @@
   callers supply identities.
 - State DB does NOT classify terminal signals — that is the recognizer.
 - State DB does NOT execute provider processes — that is the executor.
+- State DB does NOT apply observability visibility or live-candidate
+  prioritization policy; it preserves chronological invocation history.
 - `oulipoly-core` re-exports a thin type surface used by state +
   runtime; it has no behavior to spec independently. Source-anchored
   here so PRs touching core resolve to this spec rather than NO_SPEC.
