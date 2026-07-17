@@ -117,9 +117,7 @@ fn pair_flag_width(arg: &str, next: Option<&String>) -> usize {
 }
 
 fn is_drop_bool_flag(arg: &str) -> bool {
-    CLAUDE_BOOL_FLAGS_TO_DROP_ON_NATIVE_RESUME
-        .iter()
-        .any(|flag| arg == *flag)
+    CLAUDE_BOOL_FLAGS_TO_DROP_ON_NATIVE_RESUME.contains(&arg)
 }
 
 fn append_resume_args(

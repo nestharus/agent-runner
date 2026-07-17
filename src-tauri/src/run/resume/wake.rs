@@ -105,7 +105,8 @@ fn mailbox_delivery_requires_turn_confirmation(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
 ) -> bool {
-    result.exit_code == 0
+    input.mailbox_delivery_requires_turn_confirmation
+        && result.exit_code == 0
         && !input.mailbox_delivery_seqs.is_empty()
         && input.answer.is_some_and(|answer| !answer.trim().is_empty())
 }

@@ -7,7 +7,7 @@
 //! against PID reuse.
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,14 @@ pub struct ProcessIdentity {
     pub os_pid: i64,
     pub os_boot_id: String,
     pub os_pid_starttime_ticks: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessIdentityObservation {
+    ExactLive(ProcessIdentity),
+    Dead,
+    Unsupported,
+    ReadError(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -216,6 +224,24 @@ pub fn read_live_process_identity(os_pid: i64) -> Result<Option<ProcessIdentity>
     read_live_process_identity_impl(os_pid)
 }
 
+pub fn observe_live_process_identity(os_pid: i64) -> ProcessIdentityObservation {
+    observe_live_process_identity_impl(os_pid)
+}
+
+#[cfg(target_os = "linux")]
+fn observe_live_process_identity_impl(os_pid: i64) -> ProcessIdentityObservation {
+    match read_live_process_identity_impl(os_pid) {
+        Ok(Some(identity)) => ProcessIdentityObservation::ExactLive(identity),
+        Ok(None) => ProcessIdentityObservation::Dead,
+        Err(err) => ProcessIdentityObservation::ReadError(err),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn observe_live_process_identity_impl(_os_pid: i64) -> ProcessIdentityObservation {
+    ProcessIdentityObservation::Unsupported
+}
+
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -245,6 +271,80 @@ pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
         );",
     )
     .map_err(|err| format!("Failed to ensure PID identity sidecar schema: {err}"))
+}
+
+pub(crate) fn bind_identity_on(
+    conn: &Connection,
+    record: PidIdentityRecord<'_>,
+) -> Result<bool, String> {
+    let existing = lookup_by_identity_on(conn, record.identity)?;
+    if let Some(existing) = existing
+        && (existing.invocation_uuid != record.invocation_uuid
+            || existing.session_id.as_deref().is_some_and(|session_id| {
+                record
+                    .session_id
+                    .is_some_and(|requested| requested != session_id)
+            }))
+    {
+        return Ok(false);
+    }
+    upsert_pid_identity_row(conn, record)?;
+    Ok(true)
+}
+
+pub(crate) fn attach_identity_session_on(
+    conn: &Connection,
+    identity: &ProcessIdentity,
+    session_id: &str,
+) -> Result<bool, String> {
+    let Some(existing) = lookup_by_identity_on(conn, identity)? else {
+        return Ok(false);
+    };
+    if existing
+        .session_id
+        .as_deref()
+        .is_some_and(|existing| existing != session_id)
+    {
+        return Ok(false);
+    }
+    conn.execute(
+        "UPDATE pid_identity
+         SET session_id = ?4
+         WHERE os_pid = ?1
+           AND os_boot_id = ?2
+           AND os_pid_starttime_ticks = ?3
+           AND (session_id IS NULL OR session_id = ?4)",
+        params![
+            identity.os_pid,
+            &identity.os_boot_id,
+            identity.os_pid_starttime_ticks,
+            session_id,
+        ],
+    )
+    .map_err(|err| format!("Failed to attach PID identity session_id: {err}"))?;
+    Ok(true)
+}
+
+fn lookup_by_identity_on(
+    conn: &Connection,
+    identity: &ProcessIdentity,
+) -> Result<Option<PidIdentityRow>, String> {
+    conn.query_row(
+        "SELECT os_pid, os_boot_id, os_pid_starttime_ticks, os_pgid,
+                invocation_uuid, session_id, provider_name, model_name, recorded_at
+         FROM pid_identity
+         WHERE os_pid = ?1
+           AND os_boot_id = ?2
+           AND os_pid_starttime_ticks = ?3",
+        params![
+            identity.os_pid,
+            &identity.os_boot_id,
+            identity.os_pid_starttime_ticks,
+        ],
+        map_pid_identity_row,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to query exact PID identity: {err}"))
 }
 
 fn map_pid_identity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PidIdentityRow> {

@@ -39,11 +39,13 @@ mod termination;
 use super::provider_identity::ProviderRecognizer;
 use super::session_capture::{CapturePlan, parse_stdout_json_event_session_id};
 use super::spawn_identity::{
-    SpawnIdentityContext, backfill_captured_session_id, record_child_identity,
+    RunningRuntimeGeneration, SpawnIdentityContext, backfill_captured_session_id,
+    mark_runtime_generation_exited, mark_runtime_generation_orderly_completed,
+    mark_runtime_generation_spawn_failed, record_child_identity,
+    register_runtime_generation_starting,
 };
 use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
 use oulipoly_config::{PromptMode, ProviderConfig};
-use oulipoly_state::pid_identity::ProcessIdentity;
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -128,8 +130,23 @@ fn execute_with_supervisor(
 ) -> Result<SupervisedOutput, String> {
     process::configure_supervised_command(&mut cmd, &config);
     process::configure_supervised_process_group(&mut cmd);
-    let mut child = process::spawn_supervised_child(cmd, provider_name)?;
-    let recorded_identity = record_child_identity(child.id(), spawn_identity);
+    register_runtime_generation_starting(spawn_identity)?;
+    let mut child = match process::spawn_supervised_child(cmd, provider_name) {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = mark_runtime_generation_spawn_failed(spawn_identity);
+            return Err(err);
+        }
+    };
+    let recorded_generation = match record_child_identity(child.id(), spawn_identity) {
+        Ok(generation) => generation,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = mark_runtime_generation_exited(spawn_identity, None);
+            return Err(err);
+        }
+    };
     let drains = drain::start_child_drains(&mut child)?;
     let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
     let mut stdout = Vec::new();
@@ -144,7 +161,7 @@ fn execute_with_supervisor(
             &stdout,
             &mut streamed_session_id,
             spawn_identity,
-            recorded_identity.as_ref(),
+            recorded_generation.as_ref(),
         );
 
         if let Some(status) = status::poll_child_status(&mut child)? {
@@ -177,7 +194,7 @@ fn execute_with_supervisor(
             &stdout,
             &mut streamed_session_id,
             spawn_identity,
-            recorded_identity.as_ref(),
+            recorded_generation.as_ref(),
         );
     };
 
@@ -187,7 +204,7 @@ fn execute_with_supervisor(
         &stdout,
         &mut streamed_session_id,
         spawn_identity,
-        recorded_identity.as_ref(),
+        recorded_generation.as_ref(),
     );
     let stdin_write_error = stdin::finish_stdin_writer(stdin_writer);
     let mut output = terminal_outcome::supervised_output_from_terminal(
@@ -200,6 +217,7 @@ fn execute_with_supervisor(
         real_status,
     );
     output.streamed_session_id = streamed_session_id;
+    mark_runtime_generation_orderly_completed(spawn_identity, Some(output.exit_code))?;
     if stdin_predicates::stdin_write_error_is_fatal(stdin_write_error.as_deref(), &output)
         && let Some(err) = stdin_write_error
     {
@@ -213,7 +231,7 @@ fn observe_streamed_session_id(
     stdout: &[u8],
     streamed_session_id: &mut Option<String>,
     spawn_identity: Option<&SpawnIdentityContext>,
-    recorded_identity: Option<&ProcessIdentity>,
+    recorded_generation: Option<&RunningRuntimeGeneration>,
 ) {
     if streamed_session_id.is_some() {
         return;
@@ -226,8 +244,9 @@ fn observe_streamed_session_id(
     else {
         return;
     };
-    if let Ok(session_id) = parse_stdout_json_event_session_id(stdout, event_type, event_id_path) {
-        backfill_captured_session_id(spawn_identity, recorded_identity, &session_id);
+    if let Ok(session_id) = parse_stdout_json_event_session_id(stdout, event_type, event_id_path)
+        && backfill_captured_session_id(spawn_identity, recorded_generation, &session_id).is_ok()
+    {
         *streamed_session_id = Some(session_id);
     }
 }

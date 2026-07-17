@@ -1,13 +1,17 @@
 #![cfg(unix)]
 
 use chrono::{DateTime, Utc};
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
+    RuntimeLifecycleState, RuntimeTerminalReason, SubmittedInputEnqueue,
+};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -248,6 +252,24 @@ impl Fixture {
         }))
     }
 
+    fn seed_submitted_input(
+        &self,
+        submission_token: &str,
+        target_kind: InboxTargetKind,
+        target_id: &str,
+        payload: &[u8],
+    ) -> MailboxRow {
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        inserted_row(db.enqueue_submitted_input(&SubmittedInputEnqueue {
+            submission_token,
+            target: InboxTarget {
+                kind: target_kind,
+                id: target_id,
+            },
+            input: payload,
+        }))
+    }
+
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         fs::write(
@@ -359,6 +381,24 @@ turn_script = {}
             "INSERT INTO session_chain_segments
                 (chain_id, provider_name, session_id, started_at, transition_reason)
              VALUES (?1, ?2, ?3, '2026-04-17T08:00:00Z', 'initial')",
+            params![chain_id, provider, session_id],
+        )
+        .unwrap();
+    }
+
+    fn replace_active_chain_segment(&self, chain_id: &str, provider: &str, session_id: &str) {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE session_chain_segments
+             SET ended_at = '2026-04-17T08:01:00Z'
+             WHERE chain_id = ?1 AND ended_at IS NULL",
+            params![chain_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, '2026-04-17T08:02:00Z', 'manual')",
             params![chain_id, provider, session_id],
         )
         .unwrap();
@@ -502,7 +542,78 @@ fn notify_idempotent_retried_handle() {
     let rows = fixture.mailbox_rows(SESSION_A, true);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].seq, first_json["seq"].as_i64().unwrap());
+    assert_eq!(
+        first_json["payload_file_path"],
+        rows[0].payload_file_path.as_deref().unwrap()
+    );
+    assert_eq!(
+        first_json["payload_sha256"],
+        rows[0].payload_sha256.as_deref().unwrap()
+    );
+    assert_eq!(
+        first_json["payload_byte_len"],
+        rows[0].payload_byte_len.unwrap()
+    );
+    let payload_path = Path::new(rows[0].payload_file_path.as_deref().unwrap());
+    assert_eq!(
+        fs::read_to_string(payload_path).unwrap(),
+        rows[0].payload_json
+    );
+    assert_eq!(
+        rows[0].payload_sha256.as_deref(),
+        Some(sha256_hex(rows[0].payload_json.as_bytes()).as_str())
+    );
+    assert_eq!(
+        rows[0].payload_byte_len,
+        Some(rows[0].payload_json.len() as i64)
+    );
+    assert_eq!(
+        rows[0].payload_retention_policy.as_deref(),
+        Some("until_terminal_disposition")
+    );
+    assert_eq!(
+        fs::metadata(payload_path).unwrap().permissions().mode() & 0o222,
+        0
+    );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn published_payload_without_metadata_commit_is_not_accepted() {
+    let fixture = Fixture::new();
+    let payload = r#"{"schema_version":1,"kind":"agent_bash_complete","body":"durable"}"#;
+    let sidecar_path = fixture.sidecar_path();
+    let mut db = MailboxDb::open(&sidecar_path).unwrap();
+    db.connection()
+        .execute_batch(
+            "CREATE TRIGGER reject_mailbox_acceptance
+             BEFORE INSERT ON mailbox
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced metadata failure');
+             END;",
+        )
+        .unwrap();
+    let input = AgentBashCompleteEnqueue {
+        session_id: SESSION_A,
+        handle: "h-metadata-failure",
+        payload_json: payload,
+        owner_invocation_uuid: Some(INVOCATION_A),
+        matched_os_pid: Some(9000),
+        matched_os_boot_id: Some("boot-mailbox"),
+        matched_os_pid_starttime_ticks: Some(1),
+        matched_chain_index: Some(0),
+        state_dir: "/tmp/state",
+        meta_path: "/tmp/state/meta.json",
+        log_path: "/tmp/state/log",
+        rc_path: "/tmp/state/rc",
+        rc: 0,
+    };
+
+    let error = db.enqueue_agent_bash_complete(&input).unwrap_err();
+
+    assert!(error.contains("forced metadata failure"), "{error}");
+    assert!(db.list_mailbox(SESSION_A, true).unwrap().is_empty());
+    assert!(expected_payload_path(&sidecar_path, payload.as_bytes()).exists());
 }
 
 #[test]
@@ -722,6 +833,94 @@ fn resume_without_mailbox_preserves_payload() {
 }
 
 #[test]
+fn tokenized_session_resume_persists_input_before_shared_delivery() {
+    let fixture = Fixture::new();
+    let prompt_dump = fixture.dir.path().join("prompt.txt");
+    let script = fixture.write_script(
+        "resume-tokenized-session.sh",
+        &dump_last_arg_script(&prompt_dump, None, 0),
+    );
+    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.seed_session_turn("fixture-provider", SESSION_A);
+
+    let mut cmd = fixture.base_resume_command("fixture-model", SESSION_A);
+    cmd.arg("--prompt")
+        .arg("durable session input")
+        .arg("--submission-token")
+        .arg("logical-session-submit-1");
+    let output = fixture.run(cmd);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(prompt.starts_with("[OULIPOLY INBOX]"), "{prompt}");
+    assert!(prompt.contains("durable session input"), "{prompt}");
+    let rows = fixture.mailbox_rows(SESSION_A, true);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, "input");
+    assert_eq!(
+        rows[0].submission_token.as_deref(),
+        Some("logical-session-submit-1")
+    );
+    assert_eq!(rows[0].target_kind.as_deref(), Some("session"));
+    assert_eq!(rows[0].target_id.as_deref(), Some(SESSION_A));
+    assert_eq!(
+        fs::read(rows[0].payload_file_path.as_deref().unwrap()).unwrap(),
+        b"durable session input"
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn chain_input_remains_reachable_after_active_segment_reselection() {
+    let fixture = Fixture::new();
+    let prompt_dump = fixture.dir.path().join("prompt.txt");
+    let script = fixture.write_script(
+        "resume-chain-reselected-input.sh",
+        &dump_last_arg_script(&prompt_dump, None, 0),
+    );
+    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.seed_active_chain(CHAIN_ID, "fixture-provider", SESSION_A, "fixture-model");
+    let accepted = fixture.seed_submitted_input(
+        "logical-chain-submit-1",
+        InboxTargetKind::Chain,
+        CHAIN_ID,
+        b"durable chain input",
+    );
+    fixture.replace_active_chain_segment(CHAIN_ID, "fixture-provider", SESSION_B);
+    fixture.seed_session_turn("fixture-provider", SESSION_B);
+
+    let output = fixture.run(fixture.base_chain_resume_command("fixture-model", CHAIN_ID));
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(prompt.starts_with("[OULIPOLY INBOX]"), "{prompt}");
+    assert!(prompt.contains("durable chain input"), "{prompt}");
+    let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let row = db
+        .list_pending_for_delivery(SESSION_B, Some(CHAIN_ID))
+        .unwrap();
+    assert!(row.is_empty());
+    let stored = db
+        .connection()
+        .query_row(
+            "SELECT delivered_at, target_kind, target_id FROM mailbox WHERE seq = ?1",
+            params![accepted.seq],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert!(stored.0.is_some());
+    assert_eq!(stored.1.as_deref(), Some("chain"));
+    assert_eq!(stored.2.as_deref(), Some(CHAIN_ID));
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn resume_without_mailbox_and_without_prompt_preserves_native_resume() {
     let fixture = Fixture::new();
     let argv_dump = fixture.dir.path().join("argv.txt");
@@ -785,7 +984,46 @@ fn resume_marks_delivered_after_exact_turn_confirmation() {
         delivered.delivered_by_invocation_uuid.as_deref(),
         Some(invocation.id.as_str())
     );
+    assert!(
+        Path::new(delivered.payload_file_path.as_deref().unwrap()).exists(),
+        "confirmed delivery must not remove payload before governed cleanup"
+    );
+    let history = MailboxDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .runtime_generation_history(SESSION_A)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].lifecycle_state, RuntimeLifecycleState::Exited);
+    assert_eq!(
+        history[0].terminal_reason,
+        Some(RuntimeTerminalReason::OrderlyCompletion)
+    );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn resume_fails_closed_when_immutable_payload_is_missing() {
+    let fixture = Fixture::new();
+    let prompt_dump = fixture.dir.path().join("prompt.txt");
+    let script = fixture.write_script(
+        "resume-missing-payload.sh",
+        &dump_last_arg_script(&prompt_dump, None, 0),
+    );
+    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.seed_session_turn("fixture-provider", SESSION_A);
+    let row = fixture.seed_mailbox(SESSION_A, "h-missing-payload", 0);
+    fs::remove_file(row.payload_file_path.as_deref().unwrap()).unwrap();
+
+    let output = fixture.run(fixture.base_resume_command("fixture-model", SESSION_A));
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        !prompt_dump.exists(),
+        "provider must not receive an unverified payload"
+    );
+    let pending = fixture.mailbox_rows(SESSION_A, true).remove(0);
+    assert!(pending.delivered_at.is_none());
+    assert_eq!(pending.delivery_attempts, 0);
 }
 
 #[test]
@@ -1135,4 +1373,23 @@ fn toml_string(value: &str) -> String {
 
 fn shell_path(path: &Path) -> String {
     format!("'{}'", path_string(path).replace('\'', "'\\''"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn expected_payload_path(sidecar_path: &Path, bytes: &[u8]) -> PathBuf {
+    let sha256 = sha256_hex(bytes);
+    sidecar_path
+        .parent()
+        .unwrap()
+        .join("inbox-payloads")
+        .join("v1")
+        .join("sha256")
+        .join(&sha256[..2])
+        .join(sha256)
 }

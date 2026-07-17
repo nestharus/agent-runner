@@ -14,9 +14,11 @@ pub(crate) fn run_resume(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
     manual_migrate: Option<&str>,
     prompt: Option<&str>,
     file: Option<&Path>,
+    submission_token: Option<&str>,
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
@@ -32,8 +34,10 @@ pub(crate) fn run_resume(
         agent_runtime_services,
         model_name,
         session_id,
+        target_kind,
         prompt,
         file,
+        submission_token,
         working_dir,
         models_dir_override,
     )? {
@@ -83,6 +87,9 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
             mailbox_session_id: &input.prepared.mailbox_session_id,
             mailbox_delivery_seqs: &input.prepared.mailbox_delivery_seqs,
             mailbox_delivery_nonce: input.prepared.mailbox_delivery_nonce.as_deref(),
+            mailbox_delivery_requires_turn_confirmation: input
+                .prepared
+                .mailbox_delivery_requires_turn_confirmation,
             manual_migrate: input.manual_migrate,
             session_id: input.session_id,
             working_dir: input.working_dir,
@@ -106,6 +113,7 @@ pub(super) struct ResumeAttemptInput<'a> {
     pub(super) mailbox_session_id: &'a str,
     pub(super) mailbox_delivery_seqs: &'a [i64],
     pub(super) mailbox_delivery_nonce: Option<&'a str>,
+    pub(super) mailbox_delivery_requires_turn_confirmation: bool,
     pub(super) manual_migrate: Option<&'a str>,
     pub(super) session_id: &'a str,
     pub(super) working_dir: Option<&'a Path>,

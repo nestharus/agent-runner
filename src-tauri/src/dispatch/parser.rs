@@ -19,3 +19,15 @@ pub(super) fn resume_target_arg<'a>(
         .or(session_id)
         .expect("clap group ensures one is set")
 }
+
+pub(super) fn resume_target_kind(
+    session_id: Option<&str>,
+    chain_id: Option<&str>,
+) -> oulipoly_state::InboxTargetKind {
+    if chain_id.is_some() {
+        oulipoly_state::InboxTargetKind::Chain
+    } else {
+        debug_assert!(session_id.is_some(), "clap group ensures one target is set");
+        oulipoly_state::InboxTargetKind::Session
+    }
+}

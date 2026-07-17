@@ -27,6 +27,7 @@ pub(super) struct PreparedHeadlessResumeExecution {
     pub(super) mailbox_session_id: String,
     pub(super) mailbox_delivery_seqs: Vec<i64>,
     pub(super) mailbox_delivery_nonce: Option<String>,
+    pub(super) mailbox_delivery_requires_turn_confirmation: bool,
     pub(super) env: ResumeExecutionEnvironment,
     pub(super) resolved: oulipoly_state::ResolvedResume,
     pub(super) effective_spawn_cwd: PathBuf,
@@ -49,12 +50,15 @@ pub(super) fn prepare_headless_resume_execution(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
     prompt: Option<&str>,
     file: Option<&Path>,
+    submission_token: Option<&str>,
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<Result<PreparedHeadlessResumeExecution, i32>, String> {
     let answer = resolve_resume_answer(prompt, file)?;
+    let answer = persist_tokenized_resume_input(answer, submission_token, target_kind, session_id)?;
     let env = load_resume_execution_environment(models_dir_override)?;
     refresh_resume_provider_registry(agent_runtime_services, &env)?;
     let resolved = match resolve_resume_for_headless_execution(
@@ -93,6 +97,36 @@ pub(super) fn prepare_headless_resume_execution(
         parent_invocation_id,
         max_attempts,
     )))
+}
+
+fn persist_tokenized_resume_input(
+    answer: Option<String>,
+    submission_token: Option<&str>,
+    target_kind: oulipoly_state::InboxTargetKind,
+    target_id: &str,
+) -> Result<Option<String>, String> {
+    let Some(submission_token) = submission_token else {
+        return Ok(answer);
+    };
+    let Some(answer) = answer else {
+        return Ok(None);
+    };
+    let mut mailbox = oulipoly_state::mailbox::MailboxDb::open_default()?;
+    match mailbox.enqueue_submitted_input(&oulipoly_state::SubmittedInputEnqueue {
+        submission_token,
+        target: oulipoly_state::InboxTarget {
+            kind: target_kind,
+            id: target_id,
+        },
+        input: answer.as_bytes(),
+    })? {
+        oulipoly_state::mailbox::EnqueueResult::Inserted(_)
+        | oulipoly_state::mailbox::EnqueueResult::AlreadyEnqueued(_) => Ok(None),
+        oulipoly_state::mailbox::EnqueueResult::Conflict { existing } => Err(format!(
+            "submission token conflicts with existing inbox item {}",
+            existing.seq
+        )),
+    }
 }
 
 fn refresh_resume_provider_registry(

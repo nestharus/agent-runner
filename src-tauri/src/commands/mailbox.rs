@@ -264,13 +264,22 @@ fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
 fn print_human_rows(rows: &[MailboxRow]) {
     for row in rows {
         println!(
-            "seq={} kind={} handle={} rc={} delivered={} error={}",
+            "seq={} kind={} handle={} target_kind={} target_id={} rc={} delivered={} error={} payload={} sha256={} bytes={} retention={}",
             row.seq,
             row.kind,
             row.handle,
+            row.target_kind.as_deref().unwrap_or("-"),
+            row.target_id.as_deref().unwrap_or("-"),
             row.rc,
             row.delivered_at.as_deref().unwrap_or("-"),
-            row.delivery_error.as_deref().unwrap_or("-")
+            row.delivery_error.as_deref().unwrap_or("-"),
+            row.payload_file_path.as_deref().unwrap_or("-"),
+            row.payload_sha256.as_deref().unwrap_or("-"),
+            row.payload_byte_len
+                .map(|length| length.to_string())
+                .as_deref()
+                .unwrap_or("-"),
+            row.payload_retention_policy.as_deref().unwrap_or("-"),
         );
     }
 }

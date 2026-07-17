@@ -42,7 +42,7 @@ use super::{
     ChildOutputState, ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput,
     RELAY_BUFFER_BYTES, acknowledge_control_payload, flush_pending_child_input, is_pty_eof_error,
     poll_fds, poll_master_fd, poll_relay_fds, poll_single_fd, prepare_control_payload,
-    queue_control_injection, read_control_request, read_fd, readable,
+    pty_delivery_ack_message, queue_control_injection, read_control_request, read_fd, readable,
     render_mailbox_notification_envelope, send_signal_to_child_group, set_pty_winsize,
     terminal_winsize, validate_peer_uid, winsize_eq, writable, write_control_response,
 };
@@ -6086,9 +6086,10 @@ fn format_control_accept_error(err: io::Error) -> String {
     format!("Failed to accept PTY control connection: {err}")
 }
 
-fn control_response_message(response: Result<(), String>) -> (bool, String) {
+fn control_response_message(response: Result<Option<String>, String>) -> (bool, String) {
     match response {
-        Ok(()) => (true, "ok".to_string()),
+        Ok(Some(delivery_nonce)) => (true, pty_delivery_ack_message(&delivery_nonce)),
+        Ok(None) => (true, "ok".to_string()),
         Err(message) => (false, message),
     }
 }
@@ -6105,14 +6106,15 @@ fn inject_control_payload(
     stream: &mut UnixStream,
     io: &mut ControlInjectionIo<'_>,
     control: &ControlSocket,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     validate_control_peer(stream)?;
     let payload = prepare_control_payload(
         read_tui_control_payload(stream)?,
         Some((control.session_id(), control.invocation_uuid())),
     )?;
     if payload.bytes.is_empty() {
-        return acknowledge_control_payload(&payload);
+        acknowledge_control_payload(&payload)?;
+        return Ok(payload.delivery_attempt_id);
     }
     validate_control_input_ready(
         io.parser.screen().bracketed_paste(),
@@ -6129,7 +6131,8 @@ fn inject_control_payload(
     wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload.bytes, bracketed_paste)?;
-    acknowledge_control_payload(&payload)
+    acknowledge_control_payload(&payload)?;
+    Ok(payload.delivery_attempt_id)
 }
 
 fn validate_control_input_ready(

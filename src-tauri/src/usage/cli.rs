@@ -62,6 +62,10 @@ pub struct Cli {
     #[arg(long = "resume")]
     pub(crate) resume: Option<String>,
 
+    /// Caller-stable token for idempotent durable submission of a resume payload.
+    #[arg(long = "submission-token", requires = "resume")]
+    pub(crate) submission_token: Option<String>,
+
     /// Launch a new sessionless provider-family REPL using default_provider.
     #[arg(short = 'n', long = "new", conflicts_with = "resume")]
     pub(crate) new: bool,
@@ -192,6 +196,10 @@ pub(crate) enum Subcommands {
         /// Read answer payload from file.
         #[arg(short, long, conflicts_with = "prompt")]
         file: Option<PathBuf>,
+
+        /// Caller-stable token for idempotent durable submission of the payload.
+        #[arg(long = "submission-token")]
+        submission_token: Option<String>,
 
         /// Working directory for the wrapped CLI.
         #[arg(short = 'p', long = "project")]

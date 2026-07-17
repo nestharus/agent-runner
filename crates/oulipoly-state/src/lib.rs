@@ -70,6 +70,10 @@ pub use db::{
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
+pub use mailbox::{
+    InboxTarget, InboxTargetKind, MAILBOX_PAYLOAD_RETENTION_POLICY, PublishedMailboxPayload,
+    SUBMITTED_INPUT_KIND, SubmittedInputEnqueue, submitted_input_handle,
+};
 pub use result_envelope::{
     ResultEnvelopeFailureIdentity, ResultEnvelopeInput, result_envelope_payload,
 };
