@@ -1888,6 +1888,37 @@ impl MailboxDb {
             .map_err(format_bounded_mailbox_rows_error)
     }
 
+    pub fn list_delivery_invocation_children(
+        &self,
+        owner_invocation_uuid: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT delivered_by_invocation_uuid
+                 FROM mailbox
+                 WHERE owner_invocation_uuid = ?1
+                   AND delivered_by_invocation_uuid IS NOT NULL
+                   AND delivered_by_invocation_uuid != owner_invocation_uuid
+                 GROUP BY delivered_by_invocation_uuid
+                 ORDER BY MIN(seq), delivered_by_invocation_uuid
+                 LIMIT ?2",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox delivery-child query: {err}"))?;
+        let rows = stmt
+            .query_map(
+                params![owner_invocation_uuid, bounded_mailbox_sql_limit(limit)],
+                |row| row.get(0),
+            )
+            .map_err(|err| format!("Failed to query mailbox delivery children: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to map mailbox delivery children: {err}"))
+    }
+
     fn bounded_mailbox_rows(
         &self,
         session_id: &str,
@@ -4991,6 +5022,7 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
     ensure_mailbox_columns(conn)?;
     ensure_mailbox_target_index(conn)?;
     ensure_mailbox_compaction_index(conn)?;
+    ensure_mailbox_delivery_owner_index(conn)?;
     ensure_session_runtime_columns(conn)?;
     ensure_runtime_generation_columns(conn)
 }
@@ -5037,6 +5069,15 @@ fn ensure_mailbox_compaction_index(conn: &Connection) -> Result<(), String> {
              ON mailbox(kind, payload_compacted_at, delivered_at, seq);",
     )
     .map_err(|err| format!("Failed to ensure mailbox compaction index: {err}"))
+}
+
+fn ensure_mailbox_delivery_owner_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_delivery_owner
+             ON mailbox(owner_invocation_uuid, delivered_by_invocation_uuid, seq)
+             WHERE delivered_by_invocation_uuid IS NOT NULL;",
+    )
+    .map_err(|err| format!("Failed to ensure mailbox delivery-owner index: {err}"))
 }
 
 fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {

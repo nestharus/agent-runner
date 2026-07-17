@@ -13,8 +13,8 @@ use oulipoly_runtime::observability::{
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
-    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, SessionRuntimeRunningUpdate,
+    SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
@@ -292,6 +292,73 @@ fn overlay_counts_live_logical_child_after_terminal_history_and_fails_closed() {
     assert_invocation_absent(&snapshot, MISSING_CHILD_UUID);
     assert_invocation_absent(&snapshot, MISMATCHED_CHILD_UUID);
     assert_invocation_absent(&snapshot, UNRELATED_UUID);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delivered_wake_edge_keeps_live_workload_under_original_root() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .unwrap();
+    let wake_id = seed_invocation(&state, LIVE_CHILD_UUID, None);
+    state
+        .finalize_invocation(wake_id, true, 0, None, Some("completed"))
+        .unwrap();
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+
+    let wake_identity = ProcessIdentity {
+        os_pid: 888_888_887,
+        os_boot_id: "boot-wake".to_string(),
+        os_pid_starttime_ticks: 87,
+    };
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &current_identity());
+    record_identity(&pid, LIVE_CHILD_UUID, Some(SESSION_ID), &wake_identity);
+    drop(pid);
+
+    let handle = "ab_2_100_0000000000000003";
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        handle,
+        &agent_bash_meta(handle, "RUNNING", &wake_identity, Some(777), None),
+        "wake workload running",
+    );
+    let mut mailbox = fixture.open_mailbox();
+    let row = match mailbox
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            owner_invocation_uuid: Some(CHILD_UUID),
+            ..mailbox_input("wake-edge", SESSION_ID)
+        })
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        result => panic!("unexpected enqueue result: {result:?}"),
+    };
+    mailbox
+        .mark_delivered(SESSION_ID, &[row.seq], LIVE_CHILD_UUID)
+        .unwrap();
+    drop(mailbox);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    let owner_node_id = format!("invocation:{CHILD_UUID}");
+    let wake_node_id = format!("invocation:{LIVE_CHILD_UUID}");
+    assert_eq!(
+        node(&snapshot, &wake_node_id).parent_id.as_deref(),
+        Some(owner_node_id.as_str())
+    );
+    let workload = node(&snapshot, &format!("agent-bash:{handle}"));
+    assert_eq!(workload.status, MonitorStatus::Running);
+    assert_eq!(workload.parent_id.as_deref(), Some(wake_node_id.as_str()));
 }
 
 #[test]

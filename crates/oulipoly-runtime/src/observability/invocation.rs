@@ -29,6 +29,7 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::pid_row_liveness;
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::{process_identity_ref, storage_diagnostic};
+use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow};
 use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
 use std::collections::HashSet;
@@ -45,6 +46,7 @@ pub(crate) struct InvocationProjection {
 pub(crate) fn project_invocations(
     state: Option<&StateDb>,
     pid: Option<&PidIdentityDb>,
+    mailbox: Option<&MailboxDb>,
     root: &ObservabilityRoot,
     limits: SnapshotLimits,
 ) -> InvocationProjection {
@@ -67,6 +69,7 @@ pub(crate) fn project_invocations(
         build_invocation_tree(
             state,
             pid,
+            mailbox,
             record,
             None,
             active_session_id,
@@ -138,9 +141,11 @@ pub(crate) fn resolved_invocation_session_id(record: &InvocationRecord) -> Optio
         .or_else(|| record.session_id.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_invocation_tree(
     state: &StateDb,
     pid: Option<&PidIdentityDb>,
+    mailbox: Option<&MailboxDb>,
     record: InvocationRecord,
     parent_uuid: Option<String>,
     active_session_id: Option<String>,
@@ -151,6 +156,7 @@ fn build_invocation_tree(
     build_invocation_node(
         state,
         pid,
+        mailbox,
         record,
         parent_uuid,
         active_session_id,
@@ -165,6 +171,7 @@ fn build_invocation_tree(
 fn build_invocation_node(
     state: &StateDb,
     pid: Option<&PidIdentityDb>,
+    mailbox: Option<&MailboxDb>,
     record: InvocationRecord,
     parent_uuid: Option<String>,
     active_session_id: Option<String>,
@@ -192,8 +199,12 @@ fn build_invocation_node(
     }
     let Some(children) = invocation_children(
         state,
-        record.id,
+        mailbox,
+        &record,
         limits.include_terminal,
+        limits
+            .max_invocation_nodes
+            .saturating_sub(projection.invocation_count),
         &mut projection.diagnostics,
     ) else {
         return;
@@ -201,6 +212,7 @@ fn build_invocation_node(
     visit_invocation_children(
         state,
         pid,
+        mailbox,
         record.invocation_uuid.clone(),
         active_session_id,
         depth,
@@ -262,18 +274,64 @@ fn should_read_invocation_children(depth: usize, limits: SnapshotLimits) -> bool
 
 fn invocation_children(
     state: &StateDb,
-    record_id: i64,
+    mailbox: Option<&MailboxDb>,
+    record: &InvocationRecord,
     include_terminal: bool,
+    remaining_nodes: usize,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<Vec<InvocationRecord>> {
-    match read_invocation_children(state, record_id) {
+    match read_invocation_children(state, record.id) {
         Ok(mut children) => {
+            append_delivery_invocation_children(
+                state,
+                mailbox,
+                record,
+                remaining_nodes,
+                &mut children,
+                diagnostics,
+            );
             order_invocation_children(&mut children, include_terminal);
             Some(children)
         }
         Err(err) => {
             push_invocation_children_read_diagnostic(diagnostics, err);
             None
+        }
+    }
+}
+
+fn append_delivery_invocation_children(
+    state: &StateDb,
+    mailbox: Option<&MailboxDb>,
+    record: &InvocationRecord,
+    limit: usize,
+    children: &mut Vec<InvocationRecord>,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) {
+    let Some(mailbox) = mailbox else {
+        return;
+    };
+    let child_uuids =
+        match mailbox.list_delivery_invocation_children(&record.invocation_uuid, limit) {
+            Ok(uuids) => uuids,
+            Err(err) => {
+                diagnostics.push(storage_diagnostic("invocation:delivery-children-read", err));
+                return;
+            }
+        };
+    let mut child_ids = children
+        .iter()
+        .map(|child| child.id)
+        .collect::<HashSet<_>>();
+    for uuid in child_uuids {
+        match state.get_invocation_by_uuid(&uuid) {
+            Ok(Some(child)) if child.id != record.id && child_ids.insert(child.id) => {
+                children.push(child);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                diagnostics.push(storage_diagnostic("invocation:delivery-child-read", err));
+            }
         }
     }
 }
@@ -307,6 +365,7 @@ fn push_invocation_children_read_diagnostic(
 fn visit_invocation_children(
     state: &StateDb,
     pid: Option<&PidIdentityDb>,
+    mailbox: Option<&MailboxDb>,
     parent_invocation_uuid: String,
     active_session_id: Option<String>,
     depth: usize,
@@ -324,6 +383,7 @@ fn visit_invocation_children(
         build_invocation_node(
             state,
             pid,
+            mailbox,
             child,
             Some(parent_invocation_uuid.clone()),
             active_session_id.clone(),

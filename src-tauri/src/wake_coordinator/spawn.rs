@@ -2,7 +2,7 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`
 
-use oulipoly_state::mailbox::SessionRuntimeRow;
+use oulipoly_state::{CompositeInvocationId, mailbox::SessionRuntimeRow};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
@@ -54,7 +54,7 @@ fn detached_resume_command(
 ) -> Command {
     let mut cmd = Command::new(exe);
     configure_resume_args(&mut cmd, session_id, runtime);
-    configure_wake_stdio_and_env(&mut cmd, session_id, claim_token, auto_wake_count);
+    configure_wake_stdio_and_env(&mut cmd, session_id, runtime, claim_token, auto_wake_count);
     configure_detached(&mut cmd);
     cmd
 }
@@ -87,6 +87,7 @@ fn append_arg(cmd: &mut Command, flag: &str, value: &str) {
 fn configure_wake_stdio_and_env(
     cmd: &mut Command,
     session_id: &str,
+    runtime: Option<&SessionRuntimeRow>,
     claim_token: &str,
     auto_wake_count: i64,
 ) {
@@ -96,8 +97,35 @@ fn configure_wake_stdio_and_env(
         .env(AUTO_WAKE_ENV, "1")
         .env(AUTO_WAKE_SESSION_ID_ENV, session_id)
         .env(AUTO_WAKE_TOKEN_ENV, claim_token)
-        .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string())
-        .env_remove(PARENT_INVOCATION_ENV);
+        .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string());
+    configure_parent_invocation(cmd, runtime);
+}
+
+fn configure_parent_invocation(cmd: &mut Command, runtime: Option<&SessionRuntimeRow>) {
+    match parent_invocation_env(runtime) {
+        Some(parent) => {
+            cmd.env(PARENT_INVOCATION_ENV, parent);
+        }
+        None => {
+            cmd.env_remove(PARENT_INVOCATION_ENV);
+        }
+    }
+}
+
+fn parent_invocation_env(runtime: Option<&SessionRuntimeRow>) -> Option<String> {
+    let runtime = runtime?;
+    let invocation_uuid = runtime.invocation_uuid.as_deref()?;
+    uuid::Uuid::parse_str(invocation_uuid).ok()?;
+    let source = runtime
+        .provider_name
+        .as_deref()
+        .filter(|source| !source.is_empty())
+        .unwrap_or("auto-wake");
+    serde_json::to_string(&CompositeInvocationId {
+        source: source.to_string(),
+        id: invocation_uuid.to_string(),
+    })
+    .ok()
 }
 
 #[cfg(unix)]

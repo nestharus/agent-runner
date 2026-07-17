@@ -58,6 +58,38 @@ impl Fixture {
         StateDb::open(&self.state_path()).unwrap()
     }
 
+    pub(crate) fn assert_delivery_invocation_is_child_of_owner(&self, session_id: &str) {
+        let rows = self.mailbox().list_mailbox(session_id, true).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.delivered_by_invocation_uuid.is_some())
+            .expect("delivered mailbox row");
+        let owner_uuid = row
+            .owner_invocation_uuid
+            .as_deref()
+            .expect("mailbox owner invocation");
+        let delivery_uuid = row
+            .delivered_by_invocation_uuid
+            .as_deref()
+            .expect("mailbox delivery invocation");
+        let conn = Connection::open(self.state_path()).unwrap();
+        let parent_uuid: Option<String> = conn
+            .query_row(
+                "SELECT parent.invocation_uuid
+                 FROM invocations AS delivery
+                 LEFT JOIN invocations AS parent ON parent.id = delivery.parent_invocation_id
+                 WHERE delivery.invocation_uuid = ?1",
+                rusqlite::params![delivery_uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent_uuid.as_deref(),
+            Some(owner_uuid),
+            "auto-wake delivery invocation must remain a logical child of the invocation whose work caused the wake"
+        );
+    }
+
     pub(crate) fn seed_session_turn(&self) {
         self.seed_session_turn_for(PROVIDER, SESSION, "turn-a");
     }

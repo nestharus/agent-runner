@@ -44,6 +44,7 @@ pub(crate) fn idle_wake_delivers() {
     wait_until("mailbox delivered", || {
         delivered_rows_without_claim(&fixture, &session_id, 1)
     });
+    fixture.assert_delivery_invocation_is_child_of_owner(&session_id);
     assert_pending_mailbox_empty(&fixture, &session_id);
     assert_session_runtime_idle(&fixture, &session_id);
     assert_no_wake_claim(&fixture, &session_id);

@@ -120,8 +120,13 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
     fn snapshot(&self, root: &ObservabilityRoot, limits: SnapshotLimits) -> MonitorSnapshot {
         let generated_at = SystemTime::now();
         let stores = SnapshotStores::open_default_read_only();
-        let invocation =
-            project_invocations(stores.state.as_ref(), stores.pid.as_ref(), root, limits);
+        let invocation = project_invocations(
+            stores.state.as_ref(),
+            stores.pid.as_ref(),
+            stores.mailbox.as_ref(),
+            root,
+            limits,
+        );
         let active_session_id =
             active_snapshot_session_id(invocation.active_session_id.clone(), root);
         let mailbox = project_mailbox(
