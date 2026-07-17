@@ -10,8 +10,8 @@ use crate::fixtures::Fixture;
 use crate::liveness::{wait_for_file, wait_until};
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
-    assert_capture_notify_wake_busy, assert_no_wake_claim, assert_pending_handle_without_error,
-    assert_pending_mailbox_count, assert_success, assert_xdg_isolated,
+    assert_capture_notify_wake_busy, assert_no_wake_claim, assert_pending_mailbox_count,
+    assert_success, assert_xdg_isolated,
 };
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -140,7 +140,11 @@ pub(crate) fn live_pty_repeated_nack_keeps_pending_without_claim() {
     assert_success(&output);
     wait_until("second PTY control nack", || control.accepted_count() == 2);
 
-    assert_pending_handle_without_error(&fixture, SESSION, "h-live-pty-repeat-nack");
+    let rows = fixture.mailbox().list_pending(SESSION).unwrap();
+    assert_eq!(rows.len(), 1, "mailbox rows: {rows:?}");
+    assert_eq!(rows[0].handle, "h-live-pty-repeat-nack");
+    assert_eq!(rows[0].delivery_attempts, 2);
+    assert_eq!(rows[0].delivery_error.as_deref(), Some("unsafe_mid_line"));
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }

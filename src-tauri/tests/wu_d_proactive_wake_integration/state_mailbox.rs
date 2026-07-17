@@ -11,7 +11,8 @@ use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb,
+    RuntimeGenerationFence, RuntimeGenerationId, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{SessionTurnIngest, StateDb};
@@ -147,6 +148,29 @@ impl Fixture {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
         let control_path = path_string(control_path);
+        let generation_id = RuntimeGenerationId::parse(INVOCATION).unwrap();
+        db.create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: INVOCATION,
+            session_id: Some(SESSION),
+            runtime_mode: "pty_interactive",
+            provider_name: PROVIDER,
+            model_name: Some(MODEL),
+            pty_control_path: Some(&control_path),
+            models_dir: Some(&models_dir),
+            effective_cwd: None,
+        })
+        .unwrap();
+        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: INVOCATION,
+            },
+            spawned_os_pid: identity.os_pid,
+            exact_process_identity: Some(&identity),
+            os_pgid: None,
+        })
+        .unwrap();
         db.mark_session_running(SessionRuntimeRunningUpdate {
             session_id: SESSION,
             mode: "pty_interactive",
