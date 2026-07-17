@@ -27,6 +27,7 @@ pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
+const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -433,6 +434,20 @@ pub struct PublishedMailboxPayload {
     pub retention_policy: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeliveredPayloadCompactionStats {
+    pub eligible_rows: usize,
+    pub inline_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeliveredPayloadCompactionReport {
+    pub scanned_rows: usize,
+    pub compacted_rows: usize,
+    pub retained_payload_bytes: u64,
+    pub inline_bytes_reclaimed: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MailboxRow {
     pub seq: i64,
@@ -459,6 +474,7 @@ pub struct MailboxRow {
     pub payload_sha256: Option<String>,
     pub payload_byte_len: Option<i64>,
     pub payload_retention_policy: Option<String>,
+    pub payload_compacted_at: Option<String>,
     pub submission_token: Option<String>,
     pub target_kind: Option<String>,
     pub target_id: Option<String>,
@@ -1597,12 +1613,14 @@ impl MailboxDb {
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
         let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction()
             .map_err(|err| format!("Failed to start mailbox enqueue transaction: {err}"))?;
-        let result = enqueue_agent_bash_complete_in_tx(&tx, input, &published, &now)?;
+        let result =
+            enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox enqueue transaction: {err}"))?;
         Ok(result)
@@ -1662,6 +1680,90 @@ impl MailboxDb {
         self.verify_published_payload(&payload)
     }
 
+    pub fn hydrate_agent_bash_payload_json(&self, row: &MailboxRow) -> Result<String, String> {
+        if row.kind != AGENT_BASH_COMPLETE_KIND || row.payload_compacted_at.is_none() {
+            return Ok(row.payload_json.clone());
+        }
+        self.verify_mailbox_row_payload(row)?;
+        let path = row
+            .payload_file_path
+            .as_deref()
+            .ok_or_else(|| format!("Mailbox row {} has no retained payload path", row.seq))?;
+        fs::read_to_string(path).map_err(|err| {
+            format!(
+                "Failed to read mailbox row {} retained payload: {err}",
+                row.seq
+            )
+        })
+    }
+
+    pub fn delivered_payload_compaction_stats(
+        &self,
+    ) -> Result<DeliveredPayloadCompactionStats, String> {
+        let (eligible_rows, inline_bytes) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0)
+                 FROM mailbox
+                 WHERE kind = ?1
+                   AND delivered_at IS NOT NULL
+                   AND payload_compacted_at IS NULL",
+                params![AGENT_BASH_COMPLETE_KIND],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|err| format!("Failed to read delivered payload compaction stats: {err}"))?;
+        Ok(DeliveredPayloadCompactionStats {
+            eligible_rows: usize::try_from(eligible_rows)
+                .map_err(|_| "Delivered payload row count does not fit usize".to_string())?,
+            inline_bytes: u64::try_from(inline_bytes)
+                .map_err(|_| "Delivered payload byte count must not be negative".to_string())?,
+        })
+    }
+
+    pub fn compact_delivered_payloads(
+        &mut self,
+        limit: usize,
+    ) -> Result<DeliveredPayloadCompactionReport, String> {
+        if limit == 0 {
+            return Ok(DeliveredPayloadCompactionReport::default());
+        }
+        let candidates = delivered_payload_compaction_candidates(&self.conn, limit)?;
+        let mut report = DeliveredPayloadCompactionReport {
+            scanned_rows: candidates.len(),
+            ..DeliveredPayloadCompactionReport::default()
+        };
+        for candidate in candidates {
+            let original_len = candidate.payload_json.len() as u64;
+            let published = self.retained_payload_for_compaction(&candidate)?;
+            let compacted_json = compacted_payload_json(&candidate.kind, &published)?;
+            let changed =
+                mark_payload_compacted(&self.conn, &candidate, &published, &compacted_json)?;
+            if changed {
+                report.compacted_rows += 1;
+                report.retained_payload_bytes = report
+                    .retained_payload_bytes
+                    .saturating_add(published.byte_len);
+                report.inline_bytes_reclaimed = report
+                    .inline_bytes_reclaimed
+                    .saturating_add(original_len.saturating_sub(compacted_json.len() as u64));
+            }
+        }
+        Ok(report)
+    }
+
+    fn retained_payload_for_compaction(
+        &self,
+        candidate: &DeliveredPayloadCompactionCandidate,
+    ) -> Result<PublishedMailboxPayload, String> {
+        match candidate.published_payload()? {
+            Some(payload) => {
+                self.verify_published_payload(&payload)?;
+                Ok(payload)
+            }
+            None => self.publish_immutable_payload(candidate.payload_json.as_bytes()),
+        }
+    }
+
     pub fn list_pending(&self, session_id: &str) -> Result<Vec<MailboxRow>, String> {
         self.list_pending_for_delivery(session_id, None)
     }
@@ -1680,7 +1782,8 @@ impl MailboxDb {
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
                         matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                         payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, submission_token, target_kind, target_id
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE delivered_at IS NULL
                    AND (
@@ -1799,7 +1902,8 @@ impl MailboxDb {
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
                         matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                         payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, submission_token, target_kind, target_id
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE session_id = ?1
                  ORDER BY CASE WHEN delivered_at IS NULL THEN 0 ELSE 1 END, seq DESC
@@ -2710,7 +2814,8 @@ impl MailboxDb {
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
                         matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                         payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, submission_token, target_kind, target_id
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE session_id = ?1
                  ORDER BY seq ASC",
@@ -2782,12 +2887,13 @@ impl MailboxDb {
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<(), String> {
         let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction()
             .map_err(|err| format!("Failed to start mailbox rollback test transaction: {err}"))?;
-        let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &published, &now)?;
+        let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         Err("forced rollback before commit".to_string())
     }
 
@@ -3348,6 +3454,55 @@ struct SubmittedInputPayloadReference<'a> {
     retention_policy: &'a str,
 }
 
+#[derive(Serialize)]
+struct CompactedMailboxPayloadMetadata<'a> {
+    schema_version: u8,
+    kind: &'a str,
+    payload: SubmittedInputPayloadReference<'a>,
+}
+
+struct DeliveredPayloadCompactionCandidate {
+    seq: i64,
+    kind: String,
+    payload_json: String,
+    payload_file_path: Option<String>,
+    payload_sha256: Option<String>,
+    payload_byte_len: Option<i64>,
+    payload_retention_policy: Option<String>,
+}
+
+impl DeliveredPayloadCompactionCandidate {
+    fn published_payload(&self) -> Result<Option<PublishedMailboxPayload>, String> {
+        match (
+            self.payload_file_path.as_deref(),
+            self.payload_sha256.as_deref(),
+            self.payload_byte_len,
+            self.payload_retention_policy.as_deref(),
+        ) {
+            (None, None, None, None) => Ok(None),
+            (Some(file_path), Some(sha256), Some(byte_len), Some(retention_policy)) => {
+                let byte_len = u64::try_from(byte_len).map_err(|_| {
+                    format!(
+                        "Mailbox row {} has a negative payload byte length",
+                        self.seq
+                    )
+                })?;
+                Ok(Some(PublishedMailboxPayload {
+                    address: payload_address(sha256),
+                    file_path: PathBuf::from(file_path),
+                    sha256: sha256.to_string(),
+                    byte_len,
+                    retention_policy: retention_policy.to_string(),
+                }))
+            }
+            _ => Err(format!(
+                "Mailbox row {} has incomplete retained payload metadata",
+                self.seq
+            )),
+        }
+    }
+}
+
 pub fn submitted_input_handle(
     submission_token: &str,
     target: InboxTarget<'_>,
@@ -3409,6 +3564,103 @@ fn submitted_input_payload_json(
         },
     })
     .map_err(|err| format!("Failed to encode submitted input metadata: {err}"))
+}
+
+fn compacted_payload_json(
+    kind: &str,
+    published: &PublishedMailboxPayload,
+) -> Result<String, String> {
+    serde_json::to_string(&CompactedMailboxPayloadMetadata {
+        schema_version: COMPACTED_PAYLOAD_SCHEMA_VERSION,
+        kind,
+        payload: SubmittedInputPayloadReference {
+            address: &published.address,
+            file_path: &published.file_path,
+            sha256: &published.sha256,
+            byte_len: published.byte_len,
+            retention_policy: &published.retention_policy,
+        },
+    })
+    .map_err(|err| format!("Failed to encode compacted mailbox payload metadata: {err}"))
+}
+
+fn delivered_payload_compaction_candidates(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<DeliveredPayloadCompactionCandidate>, String> {
+    let limit = i64::try_from(limit).map_err(|_| {
+        "Delivered payload compaction limit does not fit SQLite INTEGER".to_string()
+    })?;
+    let mut statement = conn
+        .prepare(
+            "SELECT seq, kind, payload_json, payload_file_path, payload_sha256,
+                    payload_byte_len, payload_retention_policy
+             FROM mailbox
+             WHERE kind = ?1
+               AND delivered_at IS NOT NULL
+               AND payload_compacted_at IS NULL
+             ORDER BY seq ASC
+             LIMIT ?2",
+        )
+        .map_err(|err| format!("Failed to prepare delivered payload compaction query: {err}"))?;
+    let rows = statement
+        .query_map(params![AGENT_BASH_COMPLETE_KIND, limit], |row| {
+            Ok(DeliveredPayloadCompactionCandidate {
+                seq: row.get(0)?,
+                kind: row.get(1)?,
+                payload_json: row.get(2)?,
+                payload_file_path: row.get(3)?,
+                payload_sha256: row.get(4)?,
+                payload_byte_len: row.get(5)?,
+                payload_retention_policy: row.get(6)?,
+            })
+        })
+        .map_err(|err| format!("Failed to query delivered payload compaction rows: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read delivered payload compaction row: {err}"))
+}
+
+fn mark_payload_compacted(
+    conn: &Connection,
+    candidate: &DeliveredPayloadCompactionCandidate,
+    published: &PublishedMailboxPayload,
+    compacted_json: &str,
+) -> Result<bool, String> {
+    let compacted_at = now_rfc3339();
+    let byte_len = i64::try_from(published.byte_len)
+        .map_err(|_| "Compacted payload length does not fit SQLite INTEGER".to_string())?;
+    conn.execute(
+        "UPDATE mailbox
+         SET payload_json = ?2,
+             payload_file_path = ?3,
+             payload_sha256 = ?4,
+             payload_byte_len = ?5,
+             payload_retention_policy = ?6,
+             payload_compacted_at = ?7
+         WHERE seq = ?1
+           AND kind = ?8
+           AND delivered_at IS NOT NULL
+           AND payload_compacted_at IS NULL
+           AND payload_json = ?9",
+        params![
+            candidate.seq,
+            compacted_json,
+            published.file_path.to_string_lossy().as_ref(),
+            &published.sha256,
+            byte_len,
+            &published.retention_policy,
+            compacted_at,
+            AGENT_BASH_COMPLETE_KIND,
+            &candidate.payload_json,
+        ],
+    )
+    .map(|changed| changed == 1)
+    .map_err(|err| {
+        format!(
+            "Failed to compact delivered mailbox row {}: {err}",
+            candidate.seq
+        )
+    })
 }
 
 fn enqueue_submitted_input_in_tx(
@@ -3503,10 +3755,11 @@ fn submitted_input_row_matches(
 fn enqueue_agent_bash_complete_in_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
+    payload_json: &str,
     published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<EnqueueResult, String> {
-    let changed = insert_agent_bash_complete_tx(tx, input, published, now)?;
+    let changed = insert_agent_bash_complete_tx(tx, input, payload_json, published, now)?;
     let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, input.handle)?
         .ok_or_else(|| "Mailbox row missing after enqueue conflict check".to_string())?;
     Ok(agent_bash_enqueue_result(changed, row, input, published))
@@ -3515,6 +3768,7 @@ fn enqueue_agent_bash_complete_in_tx(
 fn insert_agent_bash_complete_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
+    payload_json: &str,
     published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<usize, String> {
@@ -3538,13 +3792,14 @@ fn insert_agent_bash_complete_tx(
             payload_file_path,
             payload_sha256,
             payload_byte_len,
-            payload_retention_policy
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            payload_retention_policy,
+            payload_compacted_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?5)",
         params![
             input.session_id,
             AGENT_BASH_COMPLETE_KIND,
             input.handle,
-            input.payload_json,
+            payload_json,
             now,
             input.owner_invocation_uuid,
             input.matched_os_pid,
@@ -4519,7 +4774,8 @@ fn query_mailbox_by_kind_handle_tx(
                 matched_os_boot_id, matched_os_pid_starttime_ticks,
                 matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                 payload_file_path, payload_sha256, payload_byte_len,
-                payload_retention_policy, submission_token, target_kind, target_id
+                payload_retention_policy, payload_compacted_at,
+                submission_token, target_kind, target_id
          FROM mailbox
          WHERE kind = ?1 AND handle = ?2",
         params![kind, handle],
@@ -4572,6 +4828,7 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             payload_sha256               TEXT,
             payload_byte_len             INTEGER,
             payload_retention_policy     TEXT,
+            payload_compacted_at         TEXT,
             submission_token             TEXT,
             target_kind                  TEXT,
             target_id                    TEXT,
@@ -4733,6 +4990,7 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
     ensure_mailbox_columns(conn)?;
     ensure_mailbox_target_index(conn)?;
+    ensure_mailbox_compaction_index(conn)?;
     ensure_session_runtime_columns(conn)?;
     ensure_runtime_generation_columns(conn)
 }
@@ -4745,12 +5003,13 @@ fn ensure_mailbox_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn mailbox_column_additions() -> [(&'static str, &'static str); 7] {
+fn mailbox_column_additions() -> [(&'static str, &'static str); 8] {
     [
         ("payload_file_path", "TEXT"),
         ("payload_sha256", "TEXT"),
         ("payload_byte_len", "INTEGER"),
         ("payload_retention_policy", "TEXT"),
+        ("payload_compacted_at", "TEXT"),
         ("submission_token", "TEXT"),
         ("target_kind", "TEXT"),
         ("target_id", "TEXT"),
@@ -4770,6 +5029,14 @@ fn ensure_mailbox_target_index(conn: &Connection) -> Result<(), String> {
              ON mailbox(target_kind, target_id, delivered_at, seq);",
     )
     .map_err(|err| format!("Failed to ensure mailbox target index: {err}"))
+}
+
+fn ensure_mailbox_compaction_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_delivered_compaction
+             ON mailbox(kind, payload_compacted_at, delivered_at, seq);",
+    )
+    .map_err(|err| format!("Failed to ensure mailbox compaction index: {err}"))
 }
 
 fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
@@ -5025,9 +5292,10 @@ fn map_mailbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxRow> {
         payload_sha256: row.get(21)?,
         payload_byte_len: row.get(22)?,
         payload_retention_policy: row.get(23)?,
-        submission_token: row.get(24)?,
-        target_kind: row.get(25)?,
-        target_id: row.get(26)?,
+        payload_compacted_at: row.get(24)?,
+        submission_token: row.get(25)?,
+        target_kind: row.get(26)?,
+        target_id: row.get(27)?,
     })
 }
 
@@ -5881,6 +6149,147 @@ mod tests {
         assert_eq!(
             db.delivery_attempt_disposition("attempt-1").unwrap(),
             Some(MailboxDeliveryAttemptDisposition::Stale)
+        );
+    }
+
+    #[test]
+    fn delivered_payload_compaction_preserves_bytes_and_leaves_pending_rows_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let delivered_payload = format!(
+            r#"{{"schema_version":1,"kind":"agent_bash_complete","padding":"{}"}}"#,
+            "é".repeat(4096)
+        );
+        let delivered_input = AgentBashCompleteEnqueue {
+            payload_json: &delivered_payload,
+            ..input("handle-delivered", "session-a")
+        };
+        let delivered = inserted_row(db.enqueue_agent_bash_complete(&delivered_input));
+        let pending =
+            inserted_row(db.enqueue_agent_bash_complete(&input("handle-pending", "session-a")));
+        db.connection()
+            .execute(
+                "UPDATE mailbox
+                 SET payload_json = ?2, payload_compacted_at = NULL
+                 WHERE seq = ?1",
+                params![delivered.seq, &delivered_payload],
+            )
+            .unwrap();
+        db.mark_delivered("session-a", &[delivered.seq], "resume-1")
+            .unwrap();
+
+        let before = db.delivered_payload_compaction_stats().unwrap();
+        assert_eq!(before.eligible_rows, 1);
+        assert_eq!(before.inline_bytes, delivered_payload.len() as u64);
+
+        let report = db.compact_delivered_payloads(1).unwrap();
+        assert_eq!(report.scanned_rows, 1);
+        assert_eq!(report.compacted_rows, 1);
+        assert_eq!(
+            report.retained_payload_bytes,
+            delivered_payload.len() as u64
+        );
+        assert!(report.inline_bytes_reclaimed > 0);
+
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        let compacted = rows.iter().find(|row| row.seq == delivered.seq).unwrap();
+        assert_ne!(compacted.payload_json, delivered_payload);
+        assert!(compacted.payload_compacted_at.is_some());
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(compacted).unwrap(),
+            delivered_payload
+        );
+        let still_pending = rows.iter().find(|row| row.seq == pending.seq).unwrap();
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(still_pending).unwrap(),
+            input("x", "y").payload_json
+        );
+        assert!(still_pending.delivered_at.is_none());
+        assert!(
+            db.connection()
+                .query_row(
+                    "SELECT payload_compacted_at FROM mailbox WHERE seq = ?1",
+                    params![delivered.seq],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            db.delivered_payload_compaction_stats().unwrap(),
+            DeliveredPayloadCompactionStats::default()
+        );
+        assert_eq!(
+            db.compact_delivered_payloads(1).unwrap(),
+            DeliveredPayloadCompactionReport::default()
+        );
+    }
+
+    #[test]
+    fn delivered_payload_compaction_externalizes_legacy_inline_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let payload = format!(r#"{{"legacy":"{}"}}"#, "y".repeat(2048));
+        let enqueue = AgentBashCompleteEnqueue {
+            payload_json: &payload,
+            ..input("legacy-delivered", "session-a")
+        };
+        let row = inserted_row(db.enqueue_agent_bash_complete(&enqueue));
+        db.connection()
+            .execute(
+                "UPDATE mailbox
+                 SET payload_json = ?2,
+                     payload_compacted_at = NULL,
+                     payload_file_path = NULL,
+                     payload_sha256 = NULL,
+                     payload_byte_len = NULL,
+                     payload_retention_policy = NULL
+                 WHERE seq = ?1",
+                params![row.seq, &payload],
+            )
+            .unwrap();
+        db.mark_delivered("session-a", &[row.seq], "resume-1")
+            .unwrap();
+
+        let report = db.compact_delivered_payloads(1).unwrap();
+        assert_eq!(report.compacted_rows, 1);
+        let compacted = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(
+            fs::read_to_string(compacted.payload_file_path.as_deref().unwrap()).unwrap(),
+            payload
+        );
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(&compacted).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn legacy_inline_payload_hydration_does_not_require_retained_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let payload = r#"{"schema_version":1,"kind":"agent_bash_complete","legacy":true}"#;
+        let enqueue = AgentBashCompleteEnqueue {
+            payload_json: payload,
+            ..input("legacy-inline", "session-a")
+        };
+        let row = inserted_row(db.enqueue_agent_bash_complete(&enqueue));
+        db.connection()
+            .execute(
+                "UPDATE mailbox
+                 SET payload_json = ?2, payload_compacted_at = NULL
+                 WHERE seq = ?1",
+                params![row.seq, payload],
+            )
+            .unwrap();
+        fs::remove_file(row.payload_file_path.as_deref().unwrap()).unwrap();
+
+        let legacy = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(legacy.payload_compacted_at, None);
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(&legacy).unwrap(),
+            payload
         );
     }
 

@@ -21,12 +21,12 @@ use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentit
 use oulipoly_state::{CompositeInvocationId, StateDb};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WORKLOAD_INVOCATION_MARKER_MAX_BYTES: u64 = 4096;
 
@@ -497,30 +497,33 @@ fn candidate_dirs_from_entries(
 }
 
 fn candidate_dir(entry: std::fs::DirEntry) -> Option<CandidateDir> {
-    let metadata = candidate_dir_metadata(&entry).ok()?;
-    if !candidate_metadata_is_dir(&metadata) {
+    if !candidate_entry_is_dir(&entry) {
         return None;
     }
+    let modified_at = candidate_handle_created_at(&entry.file_name())
+        .or_else(|| candidate_dir_metadata(&entry).ok()?.modified().ok());
     Some(candidate_dir_from_parts(
         candidate_entry_path(&entry),
-        candidate_modified_at(&metadata),
+        modified_at,
     ))
+}
+
+fn candidate_entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+}
+
+fn candidate_handle_created_at(name: &OsStr) -> Option<SystemTime> {
+    let timestamp = name.to_str()?.strip_prefix("ab_")?.split('_').next()?;
+    let unix_ms = u64::from_str_radix(timestamp, 16).ok()?;
+    UNIX_EPOCH.checked_add(Duration::from_millis(unix_ms))
 }
 
 fn candidate_dir_metadata(entry: &std::fs::DirEntry) -> Result<std::fs::Metadata, std::io::Error> {
     entry.metadata()
 }
 
-fn candidate_metadata_is_dir(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_dir()
-}
-
 fn candidate_entry_path(entry: &std::fs::DirEntry) -> PathBuf {
     entry.path()
-}
-
-fn candidate_modified_at(metadata: &std::fs::Metadata) -> Option<SystemTime> {
-    metadata.modified().ok()
 }
 
 fn candidate_dir_from_parts(state_dir: PathBuf, modified_at: Option<SystemTime>) -> CandidateDir {

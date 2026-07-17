@@ -1016,6 +1016,55 @@ fn agent_bash_running_status_is_reconciled_against_exact_workload_identity() {
 }
 
 #[test]
+fn agent_bash_scan_orders_canonical_handles_without_directory_mtime() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let pid = fixture.open_pid();
+    let owner = current_identity();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
+    drop(pid);
+    let root = fixture.agent_bash_root();
+    let older_handle = "ab_1_100_0000000000000001";
+    let newer_handle = "ab_2_100_0000000000000002";
+    let older_dir = write_agent_bash_meta(
+        &root,
+        older_handle,
+        &agent_bash_meta(older_handle, "RUNNING", &owner, Some(700), None),
+        "older",
+    );
+    let newer_dir = write_agent_bash_meta(
+        &root,
+        newer_handle,
+        &agent_bash_meta(newer_handle, "RUNNING", &owner, Some(701), None),
+        "newer",
+    );
+    set_dir_mtime(&older_dir, 60);
+    set_dir_mtime(&newer_dir, 10);
+
+    let snapshot = fixture.service().snapshot(
+        &fixture.root(),
+        SnapshotLimits {
+            include_terminal: true,
+            agent_bash_scan_dirs: 1,
+            ..SnapshotLimits::default()
+        },
+    );
+
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .any(|node| node.id == format!("agent-bash:{newer_handle}"))
+    );
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| node.id != format!("agent-bash:{older_handle}"))
+    );
+}
+
+#[test]
 fn agent_bash_mailbox_referenced_state_dir_is_included_even_outside_scan_limit() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
