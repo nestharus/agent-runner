@@ -12,7 +12,7 @@ use crate::observability::invocation::{
     invocation_node_id, resolved_invocation_session_id, session_node_id,
 };
 use crate::observability::limits::SnapshotLimits;
-use crate::observability::liveness::unverified_pid_liveness;
+use crate::observability::liveness::{process_identity_liveness, unverified_pid_liveness};
 use crate::observability::mailbox::mailbox_state;
 use crate::observability::state_access::storage_diagnostic;
 use oulipoly_state::StateDb;
@@ -63,6 +63,7 @@ struct AgentBashMeta {
     caller_chain: Vec<CallerIdentity>,
     supervisor_pid: Option<i64>,
     workload_pid: Option<i64>,
+    workload_identity: WorkloadIdentityEvidence,
     workload_pgid: Option<i64>,
     argv: Vec<String>,
     cwd: Option<String>,
@@ -72,6 +73,13 @@ struct AgentBashMeta {
     signal: Option<i32>,
     cgroup: Option<String>,
     log_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum WorkloadIdentityEvidence {
+    Exact(ProcessIdentity),
+    Legacy,
+    Incomplete,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +268,10 @@ fn mailbox_workload_node(
     let meta_path = PathBuf::from(&row.meta_path);
     let meta = read_meta_for_node(cache, &state_dir, &meta_path, diagnostics);
     let log = mailbox_workload_log(row, meta.as_ref(), limits.log_tail_bytes);
+    let liveness = meta
+        .as_ref()
+        .map(meta_workload_liveness)
+        .unwrap_or(LivenessStatus::NotApplicable);
     MonitorNode {
         id: agent_bash_node_id(&row.handle),
         parent_id: workload_parent_id(
@@ -270,13 +282,10 @@ fn mailbox_workload_node(
         ),
         kind: MonitorNodeKind::AgentBashWorkload,
         label: workload_label(&row.handle, meta.as_ref(), None),
-        status: mailbox_workload_status(row, meta.as_ref()),
+        status: mailbox_workload_status(row, meta.as_ref(), liveness),
         pid: meta.as_ref().and_then(|meta| meta.workload_pid),
         pgid: meta.as_ref().and_then(|meta| meta.workload_pgid),
-        liveness: meta
-            .as_ref()
-            .map(|meta| unverified_pid_liveness(meta.workload_pid))
-            .unwrap_or(LivenessStatus::NotApplicable),
+        liveness,
         started_at: meta.as_ref().and_then(|meta| meta.ready_at.clone()),
         updated_at: meta.as_ref().and_then(|meta| meta.completed_at.clone()),
         completed_at: meta.as_ref().and_then(|meta| meta.completed_at.clone()),
@@ -386,6 +395,7 @@ fn meta_workload_node(
     limits: SnapshotLimits,
 ) -> MonitorNode {
     let log = meta_workload_log(state_dir, meta, limits.log_tail_bytes);
+    let liveness = meta_workload_liveness(meta);
     MonitorNode {
         id: agent_bash_node_id(&meta.handle),
         parent_id: workload_parent_id(
@@ -396,10 +406,10 @@ fn meta_workload_node(
         ),
         kind: MonitorNodeKind::AgentBashWorkload,
         label: workload_label(&meta.handle, Some(meta), Some(owner.matched_chain_index)),
-        status: meta_workload_status(meta),
+        status: meta_workload_status(meta, liveness),
         pid: meta.workload_pid,
         pgid: meta.workload_pgid,
-        liveness: unverified_pid_liveness(meta.workload_pid),
+        liveness,
         started_at: meta.ready_at.clone(),
         updated_at: meta.completed_at.clone(),
         completed_at: meta.completed_at.clone(),
@@ -702,12 +712,14 @@ fn agent_bash_meta(
     handle: String,
     caller_chain: Vec<CallerIdentity>,
 ) -> AgentBashMeta {
+    let workload_pid = optional_i64(value, &["workload_pid", "workloadPid"]);
     AgentBashMeta {
         handle,
         state: optional_string(value, &["state"]).unwrap_or_else(|| "UNKNOWN".to_string()),
         caller_chain,
         supervisor_pid: optional_i64(value, &["supervisor_pid", "supervisorPid"]),
-        workload_pid: optional_i64(value, &["workload_pid", "workloadPid"]),
+        workload_pid,
+        workload_identity: parse_workload_identity(value, workload_pid),
         workload_pgid: optional_i64(value, &["workload_pgid", "workloadPgid", "pgid"]),
         argv: optional_string_array(value, "argv"),
         cwd: optional_string(value, &["cwd"]),
@@ -717,6 +729,30 @@ fn agent_bash_meta(
         signal: optional_i64(value, &["signal"]).and_then(|value| i32::try_from(value).ok()),
         cgroup: optional_string(value, &["cgroup"]),
         log_path: optional_string(value, &["log_path", "logPath"]).map(PathBuf::from),
+    }
+}
+
+fn parse_workload_identity(value: &Value, workload_pid: Option<i64>) -> WorkloadIdentityEvidence {
+    let boot_id_names = ["process_boot_id", "processBootId"];
+    let starttime_names = ["workload_pid_starttime_ticks", "workloadPidStarttimeTicks"];
+    let has_boot_id = has_any_field(value, &boot_id_names);
+    let has_starttime = has_any_field(value, &starttime_names);
+    if !has_boot_id && !has_starttime {
+        return WorkloadIdentityEvidence::Legacy;
+    }
+    match (
+        workload_pid,
+        optional_string(value, &boot_id_names),
+        optional_i64(value, &starttime_names),
+    ) {
+        (Some(os_pid), Some(os_boot_id), Some(os_pid_starttime_ticks)) => {
+            WorkloadIdentityEvidence::Exact(ProcessIdentity {
+                os_pid,
+                os_boot_id,
+                os_pid_starttime_ticks,
+            })
+        }
+        _ => WorkloadIdentityEvidence::Incomplete,
     }
 }
 
@@ -932,13 +968,29 @@ fn workload_label(
     format!("agent-bash {handle} {state}: {argv}{cwd}{supervisor}{chain}{signal}{cgroup}")
 }
 
-fn mailbox_workload_status(row: &MailboxRow, meta: Option<&AgentBashMeta>) -> MonitorStatus {
-    meta.map(meta_workload_status)
-        .unwrap_or_else(|| rc_status(row.rc))
+fn mailbox_workload_status(
+    row: &MailboxRow,
+    meta: Option<&AgentBashMeta>,
+    liveness: LivenessStatus,
+) -> MonitorStatus {
+    match meta.map(|meta| meta_workload_status(meta, liveness)) {
+        Some(status) if is_terminal_meta_status(status) => status,
+        _ => rc_status(row.rc),
+    }
 }
 
-fn meta_workload_status(meta: &AgentBashMeta) -> MonitorStatus {
-    match meta.state.to_ascii_lowercase().as_str() {
+fn is_terminal_meta_status(status: MonitorStatus) -> bool {
+    matches!(
+        status,
+        MonitorStatus::Succeeded
+            | MonitorStatus::Failed
+            | MonitorStatus::Error
+            | MonitorStatus::Cancelled
+    )
+}
+
+fn meta_workload_status(meta: &AgentBashMeta, liveness: LivenessStatus) -> MonitorStatus {
+    let recorded_status = match meta.state.to_ascii_lowercase().as_str() {
         "running" | "ready" => MonitorStatus::Running,
         "pending" => MonitorStatus::Pending,
         "done" | "complete" | "completed" => {
@@ -949,6 +1001,22 @@ fn meta_workload_status(meta: &AgentBashMeta) -> MonitorStatus {
         "cancelling" => MonitorStatus::Cancelling,
         "cancelled" | "canceled" => MonitorStatus::Cancelled,
         _ => meta.rc.map(rc_status).unwrap_or(MonitorStatus::Unknown),
+    };
+    if recorded_status != MonitorStatus::Running {
+        return recorded_status;
+    }
+    match liveness {
+        LivenessStatus::VerifiedLive | LivenessStatus::UnverifiedLive => MonitorStatus::Running,
+        LivenessStatus::Dead | LivenessStatus::PidReused => MonitorStatus::Stale,
+        LivenessStatus::Unknown | LivenessStatus::NotApplicable => MonitorStatus::Unknown,
+    }
+}
+
+fn meta_workload_liveness(meta: &AgentBashMeta) -> LivenessStatus {
+    match &meta.workload_identity {
+        WorkloadIdentityEvidence::Exact(identity) => process_identity_liveness(identity),
+        WorkloadIdentityEvidence::Legacy => unverified_pid_liveness(meta.workload_pid),
+        WorkloadIdentityEvidence::Incomplete => LivenessStatus::Unknown,
     }
 }
 
@@ -1022,6 +1090,10 @@ fn optional_string(value: &Value, names: &[&str]) -> Option<String> {
     let value = optional_raw_string(value, names)?;
     let value = non_empty_string(value)?;
     Some(owned_string(value))
+}
+
+fn has_any_field(value: &Value, names: &[&str]) -> bool {
+    names.iter().any(|name| value.get(*name).is_some())
 }
 
 fn optional_raw_string<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
