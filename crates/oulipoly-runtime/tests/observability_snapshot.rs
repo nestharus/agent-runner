@@ -703,7 +703,7 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
     assert!(has_diagnostic(&snapshot, "agent-bash:meta-corrupt"));
     assert_eq!(
         node(&snapshot, "agent-bash:yy-running").status,
-        MonitorStatus::Running
+        MonitorStatus::Stale
     );
     assert_eq!(
         node(&snapshot, "agent-bash:xx-done").status,
@@ -731,6 +731,123 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
             .as_deref(),
         Some("running tail")
     );
+    assert_eq!(snapshot.summary.running_agent_bash_count, 0);
+}
+
+#[test]
+fn agent_bash_running_status_is_reconciled_against_exact_workload_identity() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let pid = fixture.open_pid();
+    let owner = current_identity();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
+    drop(pid);
+    let root = fixture.agent_bash_root();
+    let live = current_identity();
+    let dead = dead_identity();
+    let mut reused = current_identity();
+    reused.os_pid_starttime_ticks += 1;
+    write_agent_bash_meta(
+        &root,
+        "live-running",
+        &agent_bash_meta_with_workload_identity("live-running", &owner, &live),
+        "live tail",
+    );
+    write_agent_bash_meta(
+        &root,
+        "legacy-live-running",
+        &agent_bash_meta(
+            "legacy-live-running",
+            "RUNNING",
+            &owner,
+            Some(live.os_pid),
+            None,
+        ),
+        "legacy live tail",
+    );
+    write_agent_bash_meta(
+        &root,
+        "dead-running",
+        &agent_bash_meta_with_workload_identity("dead-running", &owner, &dead),
+        "dead tail",
+    );
+    write_agent_bash_meta(
+        &root,
+        "reused-running",
+        &agent_bash_meta_with_workload_identity("reused-running", &owner, &reused),
+        "reused tail",
+    );
+    write_agent_bash_meta(
+        &root,
+        "missing-pid-running",
+        &agent_bash_meta("missing-pid-running", "RUNNING", &owner, None, None),
+        "missing tail",
+    );
+    let mut missing_starttime = agent_bash_meta_json(
+        "missing-starttime",
+        "RUNNING",
+        &owner,
+        Some(live.os_pid),
+        None,
+    );
+    missing_starttime["process_boot_id"] = live.os_boot_id.clone().into();
+    write_agent_bash_meta(
+        &root,
+        "missing-starttime",
+        &missing_starttime.to_string(),
+        "missing starttime tail",
+    );
+    let mut empty_boot_id =
+        agent_bash_meta_json("empty-boot-id", "RUNNING", &owner, Some(live.os_pid), None);
+    empty_boot_id["process_boot_id"] = "".into();
+    empty_boot_id["workload_pid_starttime_ticks"] = live.os_pid_starttime_ticks.into();
+    write_agent_bash_meta(
+        &root,
+        "empty-boot-id",
+        &empty_boot_id.to_string(),
+        "empty boot ID tail",
+    );
+    let mut wrong_starttime = agent_bash_meta_json(
+        "wrong-starttime",
+        "RUNNING",
+        &owner,
+        Some(live.os_pid),
+        None,
+    );
+    wrong_starttime["process_boot_id"] = live.os_boot_id.clone().into();
+    wrong_starttime["workload_pid_starttime_ticks"] = "not-an-integer".into();
+    write_agent_bash_meta(
+        &root,
+        "wrong-starttime",
+        &wrong_starttime.to_string(),
+        "wrong starttime tail",
+    );
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+
+    let live_node = node(&snapshot, "agent-bash:live-running");
+    assert_eq!(live_node.status, MonitorStatus::Running);
+    assert_eq!(live_node.liveness, LivenessStatus::VerifiedLive);
+    let legacy_live_node = node(&snapshot, "agent-bash:legacy-live-running");
+    assert_eq!(legacy_live_node.status, MonitorStatus::Running);
+    assert_eq!(legacy_live_node.liveness, LivenessStatus::UnverifiedLive);
+    let dead_node = node(&snapshot, "agent-bash:dead-running");
+    assert_eq!(dead_node.status, MonitorStatus::Stale);
+    assert_eq!(dead_node.liveness, LivenessStatus::Dead);
+    let reused_node = node(&snapshot, "agent-bash:reused-running");
+    assert_eq!(reused_node.status, MonitorStatus::Stale);
+    assert_eq!(reused_node.liveness, LivenessStatus::PidReused);
+    let missing_node = node(&snapshot, "agent-bash:missing-pid-running");
+    assert_eq!(missing_node.status, MonitorStatus::Unknown);
+    assert_eq!(missing_node.liveness, LivenessStatus::NotApplicable);
+    for handle in ["missing-starttime", "empty-boot-id", "wrong-starttime"] {
+        let malformed_node = node(&snapshot, &format!("agent-bash:{handle}"));
+        assert_eq!(malformed_node.status, MonitorStatus::Unknown);
+        assert_eq!(malformed_node.liveness, LivenessStatus::Unknown);
+    }
+    assert_eq!(snapshot.summary.running_agent_bash_count, 2);
 }
 
 #[test]
@@ -780,6 +897,45 @@ fn agent_bash_mailbox_referenced_state_dir_is_included_even_outside_scan_limit()
         node(&snapshot, "agent-bash:aa-mailbox-old").status,
         MonitorStatus::Succeeded
     );
+}
+
+#[test]
+fn agent_bash_mailbox_completion_rc_overrides_nonterminal_metadata() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let pid = fixture.open_pid();
+    let owner = current_identity();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
+    drop(pid);
+    let state_dir = write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "completed-with-running-meta",
+        &agent_bash_meta_with_workload_identity(
+            "completed-with-running-meta",
+            &owner,
+            &dead_identity(),
+        ),
+        "completed tail",
+    );
+    let mut mailbox = fixture.open_mailbox();
+    mailbox
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            state_dir: state_dir.to_str().unwrap(),
+            meta_path: state_dir.join("meta.json").to_str().unwrap(),
+            log_path: state_dir.join("log").to_str().unwrap(),
+            rc_path: state_dir.join("rc").to_str().unwrap(),
+            ..mailbox_input("completed-with-running-meta", SESSION_ID)
+        })
+        .unwrap();
+    drop(mailbox);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+    let completed = node(&snapshot, "agent-bash:completed-with-running-meta");
+    assert_eq!(completed.status, MonitorStatus::Succeeded);
+    assert_eq!(completed.liveness, LivenessStatus::Dead);
+    assert_eq!(snapshot.summary.running_agent_bash_count, 0);
 }
 
 fn restore_env(name: &str, value: Option<OsString>) {
@@ -1529,6 +1685,17 @@ fn agent_bash_meta_json(
         "rc": rc,
         "log_path": null,
     })
+}
+
+fn agent_bash_meta_with_workload_identity(
+    handle: &str,
+    owner: &ProcessIdentity,
+    workload: &ProcessIdentity,
+) -> String {
+    let mut meta = agent_bash_meta_json(handle, "RUNNING", owner, Some(workload.os_pid), None);
+    meta["workload_pid_starttime_ticks"] = workload.os_pid_starttime_ticks.into();
+    meta["process_boot_id"] = workload.os_boot_id.clone().into();
+    meta.to_string()
 }
 
 fn has_diagnostic(snapshot: &oulipoly_runtime::observability::MonitorSnapshot, code: &str) -> bool {
