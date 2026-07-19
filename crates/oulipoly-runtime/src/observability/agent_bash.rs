@@ -15,9 +15,10 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::{process_identity_liveness, unverified_pid_liveness};
 use crate::observability::mailbox::mailbox_state;
 use crate::observability::state_access::storage_diagnostic;
-use oulipoly_state::StateDb;
+use oulipoly_state::invocation_marker::INVOCATION_MARKER_PREFIX;
 use oulipoly_state::mailbox::{AGENT_BASH_COMPLETE_KIND, MailboxRow};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
+use oulipoly_state::{CompositeInvocationId, StateDb};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -26,6 +27,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
+
+const WORKLOAD_INVOCATION_MARKER_MAX_BYTES: u64 = 4096;
 
 pub(crate) struct AgentBashProjection {
     pub(crate) nodes: Vec<MonitorNode>,
@@ -92,7 +95,7 @@ struct CallerIdentity {
 struct ResolvedOwner {
     session_id: Option<String>,
     invocation_uuid: String,
-    matched_chain_index: usize,
+    matched_chain_index: Option<usize>,
 }
 
 struct ProcessIdentityFields {
@@ -281,7 +284,12 @@ fn mailbox_workload_node(
             session_id,
         ),
         kind: MonitorNodeKind::AgentBashWorkload,
-        label: workload_label(&row.handle, meta.as_ref(), None),
+        label: workload_label(
+            &row.handle,
+            meta.as_ref(),
+            row.matched_chain_index
+                .and_then(|index| usize::try_from(index).ok()),
+        ),
         status: mailbox_workload_status(row, meta.as_ref(), liveness),
         pid: meta.as_ref().and_then(|meta| meta.workload_pid),
         pgid: meta.as_ref().and_then(|meta| meta.workload_pgid),
@@ -364,7 +372,8 @@ fn scanned_workload_node(
         return None;
     }
     remember_meta_handle(seen_handles, &meta);
-    let owner = resolve_owner(state, pid, &meta.caller_chain, diagnostics)?;
+    let owner = resolve_owner(state, pid, &meta.caller_chain, diagnostics)
+        .or_else(|| workload_marker_owner(state, state_dir, &meta, invocation_uuids))?;
     if !owner_matches_root(&owner, session_id, invocation_uuids) {
         return None;
     }
@@ -405,7 +414,7 @@ fn meta_workload_node(
             session_id,
         ),
         kind: MonitorNodeKind::AgentBashWorkload,
-        label: workload_label(&meta.handle, Some(meta), Some(owner.matched_chain_index)),
+        label: workload_label(&meta.handle, Some(meta), owner.matched_chain_index),
         status: meta_workload_status(meta, liveness),
         pid: meta.workload_pid,
         pgid: meta.workload_pgid,
@@ -870,8 +879,49 @@ fn resolved_owner_from_row(
     ResolvedOwner {
         session_id,
         invocation_uuid: row.invocation_uuid,
-        matched_chain_index,
+        matched_chain_index: Some(matched_chain_index),
     }
+}
+
+fn workload_marker_owner(
+    state: Option<&StateDb>,
+    state_dir: &Path,
+    meta: &AgentBashMeta,
+    invocation_uuids: &HashSet<String>,
+) -> Option<ResolvedOwner> {
+    let invocation_uuid = workload_marker_invocation_uuid(&meta_log_path(state_dir, meta))?;
+    if !invocation_uuids.contains(&invocation_uuid) {
+        return None;
+    }
+    Some(ResolvedOwner {
+        session_id: state_invocation_session(state, &invocation_uuid),
+        invocation_uuid,
+        matched_chain_index: None,
+    })
+}
+
+fn workload_marker_invocation_uuid(path: &Path) -> Option<String> {
+    let line = read_log_head_line(path)?;
+    let payload = line.strip_prefix(INVOCATION_MARKER_PREFIX)?;
+    serde_json::from_str::<Value>(payload).ok()?;
+    CompositeInvocationId::parse_marker_payload(payload)
+        .ok()
+        .map(|invocation| invocation.id)
+}
+
+fn read_log_head_line(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(WORKLOAD_INVOCATION_MARKER_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let line_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..line_end])
+        .ok()
+        .map(|line| line.trim_end_matches('\r').to_string())
 }
 
 fn owner_session_id(state: Option<&StateDb>, row: &PidIdentityRow) -> Option<String> {
@@ -944,18 +994,8 @@ fn workload_label(
         .and_then(|meta| meta.supervisor_pid)
         .map(|pid| format!(" supervisor={pid}"))
         .unwrap_or_default();
-    let chain = meta
-        .map(|meta| {
-            format!(
-                " chain_index={}",
-                matched_chain_index.unwrap_or_else(|| {
-                    meta.caller_chain
-                        .first()
-                        .map(|entry| entry.chain_index)
-                        .unwrap_or(0)
-                })
-            )
-        })
+    let chain = matched_chain_index
+        .map(|index| format!(" chain_index={index}"))
         .unwrap_or_default();
     let signal = meta
         .and_then(|meta| meta.signal)
