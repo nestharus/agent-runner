@@ -735,6 +735,66 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
 }
 
 #[test]
+fn agent_bash_scan_uses_workload_invocation_marker_when_caller_chain_has_no_owner() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let unregistered_caller = dead_identity();
+    let live_workload = current_identity();
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "manual-launch",
+        &agent_bash_meta_with_workload_identity(
+            "manual-launch",
+            &unregistered_caller,
+            &live_workload,
+        ),
+        &format!(
+            "OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{ROOT_UUID}\"}}\nreview output"
+        ),
+    );
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    let workload = node(&snapshot, "agent-bash:manual-launch");
+    assert_eq!(workload.status, MonitorStatus::Running);
+    assert_eq!(workload.liveness, LivenessStatus::VerifiedLive);
+    assert_eq!(
+        workload.parent_id.as_deref(),
+        Some(format!("invocation:{ROOT_UUID}").as_str())
+    );
+    assert!(!workload.label.contains("chain_index="));
+}
+
+#[test]
+fn agent_bash_scan_rejects_workload_marker_outside_active_invocation_subtree() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let unregistered_caller = dead_identity();
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "unrelated-manual-launch",
+        &agent_bash_meta(
+            "unrelated-manual-launch",
+            "DONE",
+            &unregistered_caller,
+            Some(778),
+            Some(0),
+        ),
+        &format!(
+            "OULIPOLY_INVOCATION={{\"source\":\"opencode\",\"id\":\"{CHILD_UUID}\"}}\nreview output"
+        ),
+    );
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+
+    assert!(find_node(&snapshot, "agent-bash:unrelated-manual-launch").is_none());
+}
+
+#[test]
 fn agent_bash_running_status_is_reconciled_against_exact_workload_identity() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
