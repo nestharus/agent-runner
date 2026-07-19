@@ -30,7 +30,6 @@
 //! ```
 
 use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
-use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -38,7 +37,6 @@ use std::process::{Command, Output};
 
 const INVOCATION_ID: &str = "09c25e88-5879-46d5-ae44-360516c48fd0";
 const PROVIDER_SESSION_ID: &str = "ses_1497e8a38ffed2xIQk3xxgOXRZ";
-const CHAIN_ID: &str = "853285ba-e1de-4f54-932c-5b73d7d21868";
 const MODEL: &str = "gpt-xhigh";
 const PROVIDER: &str = "fixture-provider";
 
@@ -111,8 +109,6 @@ impl Fixture {
         db.bind_invocation_provider_session_start(row_id, &incident_provider_binding())
             .unwrap();
         db.finalize_invocation(row_id, true, 0, None, None).unwrap();
-        drop(db);
-        seed_incident_chain(&self.db_path());
     }
 
     fn db_path(&self) -> PathBuf {
@@ -157,23 +153,6 @@ fn incident_provider_binding() -> ProviderSessionBinding {
         resume_input_id: None,
         provider_session_resolved_account: None,
     }
-}
-
-fn seed_incident_chain(db_path: &Path) {
-    let conn = Connection::open(db_path).unwrap();
-    conn.execute(
-        "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-         VALUES (?1, '2026-06-11T11:46:33Z', '2026-06-11T13:38:36Z', ?2)",
-        params![CHAIN_ID, MODEL],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO session_chain_segments
-            (chain_id, provider_name, session_id, started_at, transition_reason)
-         VALUES (?1, ?2, ?3, '2026-06-11T11:46:33Z', 'initial')",
-        params![CHAIN_ID, PROVIDER, PROVIDER_SESSION_ID],
-    )
-    .unwrap();
 }
 
 fn model_toml() -> String {

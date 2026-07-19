@@ -142,6 +142,7 @@ tests.
 - `crates/oulipoly-runtime/tests/migration_service_parity.rs`
 - `crates/oulipoly-runtime/tests/resume_service_parity.rs`
 - `crates/oulipoly-runtime/tests/session_lifecycle_service.rs`
+- `src-tauri/tests/age67_opencode_resume.rs`
 - `src-tauri/tests/age100_one_shot_quota_migration.rs`
 - `src-tauri/tests/age100_resume_quota_migration.rs`
 - `src-tauri/tests/age123_resume_provider_identity.rs`
