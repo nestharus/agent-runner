@@ -45,7 +45,7 @@ pub fn resolve_session_ownership(
         Ok(session_storage) => session_storage,
         Err(ownership) => return ownership,
     };
-    let stdout = match map_ownership_script_result(super::cwd::run_session_id_script(
+    let stdout = match map_ownership_script_result(super::cwd::run_session_id_script_strict(
         &session_storage.cwd_script(),
         session_id,
         "ownership_script",
@@ -217,6 +217,24 @@ mod tests {
                 SessionOwnership::Indeterminate(_)
             ));
         }
+    }
+
+    #[test]
+    fn session_ownership_rejects_invalid_utf8_output() {
+        let invalid_utf8 = SessionStorage::Script {
+            cwd_script: concat!(
+                "printf '%s' '{\"owned\":true,\"note\":\"'; ",
+                "printf '\\377'; printf '%s' '\"}'; :"
+            )
+            .to_string(),
+            transcript_script: None,
+            storage_type: None,
+        };
+
+        assert_eq!(
+            resolve_session_ownership(Some(&invalid_utf8), "ses_unknown"),
+            SessionOwnership::Indeterminate("ownership_script_invalid_utf8".to_string())
+        );
     }
 
     #[test]

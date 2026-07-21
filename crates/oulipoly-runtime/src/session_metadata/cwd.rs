@@ -162,11 +162,29 @@ pub(super) fn run_session_id_script(
     session_id: &str,
     script_kind: &str,
 ) -> Result<String, String> {
+    let output = run_session_id_script_output(script, session_id, script_kind)?;
+    Ok(decode_stdout(&output))
+}
+
+pub(super) fn run_session_id_script_strict(
+    script: &str,
+    session_id: &str,
+    script_kind: &str,
+) -> Result<String, String> {
+    let output = run_session_id_script_output(script, session_id, script_kind)?;
+    decode_stdout_strict(output, script_kind)
+}
+
+fn run_session_id_script_output(
+    script: &str,
+    session_id: &str,
+    script_kind: &str,
+) -> Result<Output, String> {
     let mut command = session_id_command(script, session_id);
     let output = process_output(&mut command)
         .map_err(|error| script_spawn_failed_reason(script_kind, error.to_string()))?;
     validate_script_status(&output, script_kind)?;
-    Ok(decode_stdout(&output))
+    Ok(output)
 }
 
 fn session_id_command(script: &str, session_id: &str) -> Command {
@@ -201,6 +219,10 @@ fn script_spawn_failed_reason(script_kind: &str, message: String) -> String {
     format!("{script_kind}_spawn_failed: {message}")
 }
 
+fn script_invalid_utf8_reason(script_kind: &str) -> String {
+    format!("{script_kind}_invalid_utf8")
+}
+
 fn script_exit_reason(script_kind: &str, output: &Output) -> String {
     format!(
         "{script_kind}_exit_{}: {}",
@@ -215,6 +237,10 @@ fn script_exit_code(output: &Output) -> i32 {
 
 fn decode_stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn decode_stdout_strict(output: Output, script_kind: &str) -> Result<String, String> {
+    String::from_utf8(output.stdout).map_err(|_| script_invalid_utf8_reason(script_kind))
 }
 
 fn decode_stderr(output: &Output) -> String {
