@@ -142,6 +142,7 @@ tests.
 - `crates/oulipoly-runtime/tests/age37_replace_service_parity.rs`
 - `crates/oulipoly-runtime/tests/migration_service_parity.rs`
 - `crates/oulipoly-runtime/tests/resume_service_parity.rs`
+- `crates/oulipoly-runtime/tests/session_ownership.rs` (public `session_metadata` ownership capability compile/use contract)
 - `crates/oulipoly-runtime/tests/session_lifecycle_service.rs`
 - `crates/oulipoly-runtime/src/session_metadata/ownership.rs` (colocated `session_ownership_*` membership, cwd-independence, conclusive-negative, malformed-output, missing-storage, and script-failure cases)
 - `src-tauri/tests/age67_opencode_resume.rs`

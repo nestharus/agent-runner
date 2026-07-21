@@ -5,7 +5,7 @@
 //! Provider-private session-storage membership probing.
 
 use oulipoly_config::SessionStorage;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionOwnership {
@@ -18,7 +18,23 @@ pub enum SessionOwnership {
 struct OwnershipResponse {
     owned: Option<bool>,
     #[serde(default)]
-    error: Option<String>,
+    error: OwnershipError,
+}
+
+#[derive(Debug, Default)]
+enum OwnershipError {
+    #[default]
+    Missing,
+    Present(Option<String>),
+}
+
+impl<'de> Deserialize<'de> for OwnershipError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer).map(Self::Present)
+    }
 }
 
 pub fn resolve_session_ownership(
@@ -56,11 +72,17 @@ fn map_ownership_script_result(result: Result<String, String>) -> Result<String,
 }
 
 fn parse_session_ownership(stdout: &str) -> SessionOwnership {
-    let response = match parse_ownership_response(stdout) {
+    let response = match map_ownership_parse_result(parse_ownership_response(stdout)) {
         Ok(response) => response,
-        Err(reason) => return SessionOwnership::Indeterminate(reason),
+        Err(ownership) => return ownership,
     };
     validate_ownership_response(&response)
+}
+
+fn map_ownership_parse_result(
+    result: Result<OwnershipResponse, String>,
+) -> Result<OwnershipResponse, SessionOwnership> {
+    result.map_err(SessionOwnership::Indeterminate)
 }
 
 fn parse_ownership_response(stdout: &str) -> Result<OwnershipResponse, String> {
@@ -84,24 +106,26 @@ fn parse_single_ownership_line(stdout: &str) -> Result<&str, String> {
 fn validate_ownership_response(response: &OwnershipResponse) -> SessionOwnership {
     match response.owned {
         Some(true) => SessionOwnership::Owned,
-        Some(false) => validate_negative_ownership(response.error.as_deref()),
-        None => validate_missing_ownership(response.error.as_deref()),
+        Some(false) => validate_negative_ownership(&response.error),
+        None => validate_missing_ownership(&response.error),
     }
 }
 
-fn validate_negative_ownership(error: Option<&str>) -> SessionOwnership {
+fn validate_negative_ownership(error: &OwnershipError) -> SessionOwnership {
     match error {
-        None => SessionOwnership::NotOwned,
-        Some(error) if error.trim().is_empty() => SessionOwnership::NotOwned,
-        Some(error) => {
+        OwnershipError::Missing => SessionOwnership::NotOwned,
+        OwnershipError::Present(Some(error)) if !error.trim().is_empty() => {
             SessionOwnership::Indeterminate(format!("ownership_script_error: {}", error.trim()))
+        }
+        OwnershipError::Present(_) => {
+            SessionOwnership::Indeterminate("ownership_script_error".to_string())
         }
     }
 }
 
-fn validate_missing_ownership(error: Option<&str>) -> SessionOwnership {
+fn validate_missing_ownership(error: &OwnershipError) -> SessionOwnership {
     match error {
-        Some(error) if !error.trim().is_empty() => {
+        OwnershipError::Present(Some(error)) if !error.trim().is_empty() => {
             SessionOwnership::Indeterminate(format!("ownership_not_reported: {}", error.trim()))
         }
         _ => SessionOwnership::Indeterminate("ownership_not_reported".to_string()),
@@ -146,14 +170,38 @@ mod tests {
             ),
             SessionOwnership::NotOwned
         );
+        for (response, expected_reason) in [
+            (
+                "{\"owned\":false,\"found\":false,\"error\":\"\"}\n",
+                "ownership_script_error",
+            ),
+            (
+                "{\"owned\":false,\"found\":false,\"error\":\"  \"}\n",
+                "ownership_script_error",
+            ),
+            (
+                "{\"owned\":false,\"found\":false,\"error\":null}\n",
+                "ownership_script_error",
+            ),
+            (
+                "{\"owned\":false,\"found\":false,\"error\":\"query failed\"}\n",
+                "ownership_script_error: query failed",
+            ),
+        ] {
+            assert!(matches!(
+                resolve_session_ownership(Some(&script(response)), "ses_unknown"),
+                SessionOwnership::Indeterminate(reason) if reason == expected_reason
+            ));
+        }
         assert!(matches!(
             resolve_session_ownership(
                 Some(&script(
-                    "{\"owned\":false,\"found\":false,\"error\":\"query failed\"}\n"
+                    "{\"owned\":false,\"found\":false,\"error\":false}\n"
                 )),
                 "ses_unknown"
             ),
-            SessionOwnership::Indeterminate(reason) if reason.contains("query failed")
+            SessionOwnership::Indeterminate(reason)
+                if reason.starts_with("ownership_script_malformed_json")
         ));
     }
 

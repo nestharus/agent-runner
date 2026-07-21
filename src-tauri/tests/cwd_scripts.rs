@@ -3,9 +3,10 @@
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -165,7 +166,17 @@ impl OpenCodeFixture {
 
 fn parse_response(output: &Output) -> Value {
     assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.stderr.is_empty(),
+        "adapter stderr must be empty: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_sensitive_output_absent(output: &Output, sentinel: &str) {
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(sentinel));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(sentinel));
 }
 
 fn assert_indeterminate(output: &Output, expected_error: &str) {
@@ -382,7 +393,14 @@ fn opencode_cwd_does_not_treat_unknown_exit_one_as_not_owned() {
     );
 
     assert_indeterminate(&output, "opencode_export_exit_failure");
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_FAILURE_SENTINEL"));
+    assert_sensitive_output_absent(&output, "PRIVATE_FAILURE_SENTINEL");
+
+    let mixed_output = fixture.run_fake(
+        &fake,
+        "printf '%s' 'PRIVATE_MIXED_OUTPUT_SENTINEL'\nprintf '%s\n' 'Session not found' >&2\nexit 1",
+    );
+    assert_indeterminate(&mixed_output, "opencode_export_exit_failure");
+    assert_sensitive_output_absent(&mixed_output, "PRIVATE_MIXED_OUTPUT_SENTINEL");
 }
 
 #[test]
@@ -633,23 +651,113 @@ wait
 #[test]
 fn opencode_cwd_rejects_oversized_export_without_leaking_content() {
     let fixture = OpenCodeFixture::new(None);
-    let fake = fixture.fake_bin_dir.join("oversized");
+    let fake = fixture.fake_bin_dir.join("oversized-stdout");
+    let child_pid_path = fixture._temp.path().join("stdout-child-pid");
+    let descendant_pid_path = fixture._temp.path().join("stdout-descendant-pid");
     write_fake_export(
         &fake,
-        r#"count=0
-while [ "$count" -lt 200 ]; do
+        r#"printf '%s' "$$" > "$CHILD_PID_FILE"
+/bin/sleep 30 &
+printf '%s' "$!" > "$DESCENDANT_PID_FILE"
+while :; do
   printf '%s' 'SENSITIVE_OVERSIZE_SENTINEL'
-  count=$((count + 1))
 done
 "#,
     );
+    let started = Instant::now();
     let output = fixture
         .command(Some(fake.as_os_str()))
         .env("OPENCODE_CWD_STDOUT_LIMIT_BYTES", "256")
+        .env("CHILD_PID_FILE", &child_pid_path)
+        .env("DESCENDANT_PID_FILE", &descendant_pid_path)
         .output()
         .unwrap();
 
+    assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
     fixture.assert_selected_xdg_observed();
     assert_indeterminate(&output, "opencode_export_stdout_limit");
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("SENSITIVE_OVERSIZE_SENTINEL"));
+    assert_sensitive_output_absent(&output, "SENSITIVE_OVERSIZE_SENTINEL");
+    let child_pid: u32 = fs::read_to_string(child_pid_path).unwrap().parse().unwrap();
+    let descendant_pid: u32 = fs::read_to_string(descendant_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until_process_is_gone(child_pid);
+    wait_until_process_is_gone(descendant_pid);
+}
+
+#[test]
+fn opencode_cwd_rejects_oversized_stderr_and_kills_descendants() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("oversized-stderr");
+    let child_pid_path = fixture._temp.path().join("stderr-child-pid");
+    let descendant_pid_path = fixture._temp.path().join("stderr-descendant-pid");
+    write_fake_export(
+        &fake,
+        r#"printf '%s' "$$" > "$CHILD_PID_FILE"
+/bin/sleep 30 &
+printf '%s' "$!" > "$DESCENDANT_PID_FILE"
+while :; do
+  printf '%s' 'SENSITIVE_STDERR_SENTINEL' >&2
+done
+"#,
+    );
+    let started = Instant::now();
+    let output = fixture
+        .command(Some(fake.as_os_str()))
+        .env("OPENCODE_CWD_STDERR_LIMIT_BYTES", "256")
+        .env("CHILD_PID_FILE", &child_pid_path)
+        .env("DESCENDANT_PID_FILE", &descendant_pid_path)
+        .output()
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
+    fixture.assert_selected_xdg_observed();
+    assert_indeterminate(&output, "opencode_export_stderr_limit");
+    assert_sensitive_output_absent(&output, "SENSITIVE_STDERR_SENTINEL");
+    let child_pid: u32 = fs::read_to_string(child_pid_path).unwrap().parse().unwrap();
+    let descendant_pid: u32 = fs::read_to_string(descendant_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until_process_is_gone(child_pid);
+    wait_until_process_is_gone(descendant_pid);
+}
+
+#[test]
+fn opencode_cwd_closes_producer_stdin() {
+    let fixture = OpenCodeFixture::new(None);
+    let workspace = fixture.home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let fake = fixture.fake_bin_dir.join("closed-stdin");
+    write_fake_export(
+        &fake,
+        &format!(
+            r#"if IFS= read -r inherited_input; then
+  printf '%s' "PRIVATE_STDIN_SENTINEL:$inherited_input" >&2
+  exit 99
+fi
+{}
+"#,
+            export_json_body(&json!({"info": {"id": SESSION_ID, "directory": workspace}}))
+        ),
+    );
+    let mut child = fixture
+        .command(Some(fake.as_os_str()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"MUST_NOT_REACH_PRODUCER\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    fixture.assert_selected_xdg_observed();
+    assert_eq!(parse_response(&output)["owned"], true);
+    assert_sensitive_output_absent(&output, "PRIVATE_STDIN_SENTINEL");
 }

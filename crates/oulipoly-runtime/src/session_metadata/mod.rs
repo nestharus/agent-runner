@@ -122,13 +122,21 @@ pub enum SessionStorageType {
 impl From<&Option<SessionStorage>> for SessionStorageType {
     fn from(storage: &Option<SessionStorage>) -> Self {
         match storage {
-            Some(SessionStorage::Script { storage_type, .. }) => match storage_type {
-                Some(ScriptSessionStorageType::ClaudeCode) => Self::ClaudeCode,
-                Some(ScriptSessionStorageType::CodexSession) => Self::CodexSession,
-                None => Self::Other,
-            },
+            Some(SessionStorage::Script { storage_type, .. }) => {
+                Self::from_script_storage_type(storage_type)
+            }
             Some(SessionStorage::ClaudeCode { .. }) => Self::ClaudeCode,
             Some(SessionStorage::Codex { .. }) => Self::CodexSession,
+            None => Self::Other,
+        }
+    }
+}
+
+impl SessionStorageType {
+    fn from_script_storage_type(storage_type: &Option<ScriptSessionStorageType>) -> Self {
+        match storage_type {
+            Some(ScriptSessionStorageType::ClaudeCode) => Self::ClaudeCode,
+            Some(ScriptSessionStorageType::CodexSession) => Self::CodexSession,
             None => Self::Other,
         }
     }
@@ -669,8 +677,17 @@ fn external_workspace_root(
     provider_name: &str,
     session_id: &str,
 ) -> PathBuf {
-    resolve_cwd_from_session_storage(session_storage, provider_name, session_id)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    match resolve_cwd_from_session_storage(session_storage, provider_name, session_id) {
+        Ok(workspace_root) => workspace_root,
+        Err(_) => ambient_workspace_root(),
+    }
+}
+
+fn ambient_workspace_root() -> PathBuf {
+    match std::env::current_dir() {
+        Ok(workspace_root) => workspace_root,
+        Err(_) => PathBuf::from("."),
+    }
 }
 
 fn session_provider_metadata_error(error: session_provider::SessionProviderError) -> MetadataError {
