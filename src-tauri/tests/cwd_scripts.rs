@@ -379,6 +379,15 @@ fn opencode_cwd_keeps_export_ownership_when_directory_is_unusable() {
             json!({"info": {"id": SESSION_ID, "directory": loop_a}}),
             "opencode_cwd_canonicalize_failed",
         ),
+        (
+            json!({
+                "info": {
+                    "id": SESSION_ID,
+                    "directory": "/tmp/PRIVATE_CWD_SENTINEL\0tail"
+                }
+            }),
+            "opencode_cwd_canonicalize_failed",
+        ),
     ];
 
     for (export, expected_error) in cases {
@@ -386,6 +395,7 @@ fn opencode_cwd_keeps_export_ownership_when_directory_is_unusable() {
         assert_owned_without_cwd(&output, expected_error);
         assert!(!String::from_utf8_lossy(&output.stdout).contains("missing-workspace"));
         assert!(!String::from_utf8_lossy(&output.stdout).contains("loop-a"));
+        assert_sensitive_output_absent(&output, "PRIVATE_CWD_SENTINEL");
     }
 }
 
@@ -436,6 +446,10 @@ fn opencode_cwd_classifies_export_process_failures_as_indeterminate() {
 fn opencode_cwd_requires_matching_export_info_identity() {
     let fixture = OpenCodeFixture::new(None);
     let fake = fixture.fake_bin_dir.join("identity");
+    let oversized_integer = format!(
+        "{{\"info\":{{\"id\":\"{SESSION_ID}\"}},\"count\":{}}}",
+        "9".repeat(5_000)
+    );
     let cases = [
         ("exit 0".to_string(), "opencode_export_malformed_json"),
         ("printf '\\377'".to_string(), "opencode_export_invalid_utf8"),
@@ -472,6 +486,10 @@ fn opencode_cwd_requires_matching_export_info_identity() {
                 "printf '%s\\n' {}",
                 shell_quote(&format!("{{\"info\":{{\"id\":\"{SESSION_ID}\"}}}}{{}}"))
             ),
+            "opencode_export_malformed_json",
+        ),
+        (
+            format!("printf '%s\\n' {}", shell_quote(&oversized_integer)),
             "opencode_export_malformed_json",
         ),
     ];

@@ -289,7 +289,7 @@ def classify_producer_result(status, stdout, stderr, raw_stdout):
 def parse_export(stdout):
     try:
         return json.loads(stdout), None
-    except (json.JSONDecodeError, TypeError):
+    except (TypeError, ValueError):
         return None, "opencode_export_malformed_json"
 
 
@@ -322,7 +322,7 @@ def validate_cwd(info):
         resolved = path.resolve(strict=True)
     except FileNotFoundError:
         return None, "opencode_cwd_missing"
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return None, "opencode_cwd_canonicalize_failed"
     if not resolved.is_dir():
         return None, "opencode_cwd_not_directory"
