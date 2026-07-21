@@ -667,6 +667,10 @@ impl ProductionStateDbOpenerState {
     pub fn with_deployment_aware_opener(opener: DeploymentAwareOpener) -> Self {
         let token = next_deployment_aware_opener_token();
         install_deployment_aware_opener(token, opener);
+        Self::with_deployment_aware_opener_registration(token)
+    }
+
+    fn with_deployment_aware_opener_registration(token: usize) -> Self {
         Self {
             registration: Some(deployment_aware_opener_registration(token)),
         }

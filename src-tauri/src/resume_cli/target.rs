@@ -296,19 +296,6 @@ fn is_resume_migration_provider(
             .is_some_and(|entry| entry.session_storage.is_some())
 }
 
-pub(crate) fn renderable_resume_execution_target(
-    resolved: &oulipoly_state::ResolvedResume,
-    providers_cfg: &ProvidersConfig,
-) -> Result<ResumeExecutionTarget, i32> {
-    match resume_execution_target(resolved, providers_cfg) {
-        Ok(target) => Ok(target),
-        Err(error) => {
-            crate::dispatch::render_resume_error(error);
-            Err(1)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,10 +11,12 @@
 //! It translates the diagnostics fallback category, state `ResumeError`, runtime
 //! `ResumeServiceRejection`, and model-pool mismatch diagnostics.
 
-use oulipoly_config::ModelConfig;
+use oulipoly_config::{ModelConfig, ProvidersConfig};
 use oulipoly_runtime::executor;
 use std::collections::HashMap;
 use std::path::Path;
+
+use super::target::{ResumeExecutionTarget, resume_execution_target};
 
 pub(crate) fn resume_result_error_category(
     agent_runtime_services: &crate::wiring::AgentRuntimeServices,
@@ -289,6 +291,19 @@ pub(crate) fn render_resume_model_pool_mismatch(
         "{}",
         resume_model_pool_mismatch_message(models, model_name, session_id, active_provider)
     );
+}
+
+pub(crate) fn renderable_resume_execution_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    providers_cfg: &ProvidersConfig,
+) -> Result<ResumeExecutionTarget, i32> {
+    match resume_execution_target(resolved, providers_cfg) {
+        Ok(target) => Ok(target),
+        Err(error) => {
+            crate::dispatch::render_resume_error(error);
+            Err(1)
+        }
+    }
 }
 
 #[cfg(test)]

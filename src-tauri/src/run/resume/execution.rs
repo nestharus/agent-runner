@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `orchestration`, `predicate`, `validator`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -99,9 +99,9 @@ fn refresh_resume_provider_registry(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     env: &ResumeExecutionEnvironment,
 ) -> Result<(), String> {
-    let models = env.models.values().cloned().collect::<Vec<_>>();
+    let models = mapper::resume_provider_models(&env.models);
     let registry = mapper::resume_provider_registry(&models, resume_provider_registry_options(env))
-        .map_err(|err| format!("failed to build resume provider registry: {err}"))?;
+        .map_err(formatter::resume_provider_registry_failure)?;
     agent_runtime_services
         .provider_registry_handle
         .replace(Arc::new(registry));

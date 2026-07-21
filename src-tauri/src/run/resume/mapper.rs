@@ -39,6 +39,24 @@ pub(super) fn resume_provider_registry(
         .map_err(|error| error.to_string())
 }
 
+pub(super) fn resume_provider_models(
+    models: &std::collections::HashMap<String, oulipoly_config::ModelConfig>,
+) -> Vec<oulipoly_config::ModelConfig> {
+    models.values().cloned().collect()
+}
+
+pub(super) fn apply_migrated_resume_segment(
+    resolved: &mut oulipoly_state::ResolvedResume,
+    target: &mut crate::resume_cli::ResumeExecutionTarget,
+    migrated: oulipoly_runtime::migration::MigratedSegment,
+    providers_cfg: &oulipoly_config::ProvidersConfig,
+) -> Result<(), i32> {
+    resolved.active_provider = migrated.target_provider;
+    resolved.active_session_id = migrated.target_session_id;
+    *target = crate::resume_cli::renderable_resume_execution_target(resolved, providers_cfg)?;
+    Ok(())
+}
+
 pub(super) fn legacy_resume_payload<'a>(
     session_id: &'a str,
     strategy: &'a oulipoly_config::ResumeStrategy,

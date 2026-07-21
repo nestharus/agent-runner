@@ -28,9 +28,13 @@ pub(super) fn release_current_auto_wake_claim(session_id: &str) {
 }
 
 pub(super) fn recheck_after_failed_auto_wake(session_id: &str, result: &Result<i32, String>) {
-    if crate::wake_coordinator::is_auto_wake_invocation() && !matches!(result, Ok(0)) {
+    if failed_auto_wake_needs_recheck(result) {
         let _ = crate::wake_coordinator::recheck_after_failed_auto_wake(session_id);
     }
+}
+
+fn failed_auto_wake_needs_recheck(result: &Result<i32, String>) -> bool {
+    crate::wake_coordinator::is_auto_wake_invocation() && !matches!(result, Ok(0))
 }
 
 pub(super) fn prepare_headless_resume_delivery(
@@ -58,10 +62,14 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
         &input.env.state,
         &input.resolved.active_session_id,
     );
-    for error in report.errors {
+    emit_session_ingest_warnings(&provider.name, &report.errors);
+}
+
+fn emit_session_ingest_warnings(provider_name: &str, errors: &[String]) {
+    for error in errors {
         formatter::emit_stderr(&format!(
             "Warning: Session ingest failed for {}: {error}",
-            provider.name
+            provider_name
         ));
     }
 }

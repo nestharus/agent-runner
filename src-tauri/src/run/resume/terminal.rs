@@ -28,6 +28,10 @@ pub(super) fn resume_attempts_exhausted(attempts: usize, max_attempts: usize) ->
 
 pub(super) fn resume_attempts_exhausted_exit_code(last_exit_code: i32) -> i32 {
     formatter::emit_stderr("BLOCKED:all-providers-exhausted");
+    nonzero_resume_exit_code(last_exit_code)
+}
+
+fn nonzero_resume_exit_code(last_exit_code: i32) -> i32 {
     if last_exit_code == 0 {
         1
     } else {

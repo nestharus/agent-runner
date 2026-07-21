@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `orchestration`, `predicate`
+//! `accessor`, `formatter`, `orchestration`, `predicate`
 
 use std::path::{Path, PathBuf};
 
@@ -93,11 +93,11 @@ fn selected_repl_resume_provider_tuple(
     resolved: &oulipoly_state::ResolvedResume,
 ) -> Result<Option<(usize, ProviderConfig, Option<String>)>, String> {
     let target = fallback_target.expect("resume target must be resolved before spawn");
-    let provider = target.provider.clone();
-    if provider.resume.is_none() {
-        emit_repl_missing_resume_block(&provider.name);
+    if repl_resume_target_missing_resume(Some(target)) {
+        emit_repl_missing_resume_block(&target.provider.name);
         return Ok(None);
     }
+    let provider = target.provider.clone();
     Ok(Some(mapper::selected_repl_provider_tuple(
         target.provider_index,
         provider,

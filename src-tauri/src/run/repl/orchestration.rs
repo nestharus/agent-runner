@@ -1,19 +1,20 @@
 //! ## Declared roles
 //!
-//! `orchestration`
+//! `accessor`, `orchestration`
 
 use std::path::{Path, PathBuf};
 
-use super::execution::{
-    StartSelectedReplInvocationInput, bind_repl_resume_session,
-    emit_repl_invocation_line_if_needed, prepare_repl_execution, repl_balance_context,
-    repl_in_flight, repl_parent_invocation_id, repl_stderr_is_terminal,
-    serialize_repl_invocation_env, start_selected_repl_invocation,
-};
-use super::migration::{ReplProviderSelectionInput, select_repl_provider};
+use oulipoly_config::{ModelConfig, ProviderConfig};
+
+use super::execution;
+use super::migration;
 use super::terminal::{ReplExecutionInput, execute_and_finalize_repl_attempt};
 use super::validator;
+use crate::migration_providers::ResumeExecutionEnvironment;
+use crate::resume_cli::ResumeExecutionTarget;
 use crate::wiring;
+
+type StartedReplInvocation<'state> = execution::ReplInvocationAttempt<'state>;
 
 pub(crate) fn run_repl(
     agent_runtime_services: &wiring::AgentRuntimeServices,
@@ -29,56 +30,48 @@ pub(crate) fn run_repl(
         crate::run::resume::validate_resume_input(session_id)?;
     }
 
-    let mut prepared = prepare_repl_execution(
+    let mut prepared = execution::prepare_repl_execution(
         agent_runtime_services,
         model_name,
         resume,
         models_dir_override,
     )?;
-    let in_flight = repl_in_flight();
-    let ctx = repl_balance_context(&prepared.env, &in_flight);
-    let parent_invocation_id = repl_parent_invocation_id(&prepared.env);
-    let stderr_is_terminal = repl_stderr_is_terminal();
+    let stderr_is_terminal = execution::repl_stderr_is_terminal();
     let mut resume_spawn_cwd: Option<PathBuf> = None;
-    let Some((provider_index, provider, resume_session_id)) =
-        select_repl_provider(ReplProviderSelectionInput {
-            agent_runtime_services,
-            env: &prepared.env,
-            model: &prepared.model,
-            ctx: &ctx,
-            resolved_resume: &mut prepared.resolved_resume,
-            fallback_target: &mut prepared.fallback_target,
-            resume,
-            manual_migrate,
-            working_dir,
-            stderr_is_terminal,
-            resume_spawn_cwd: &mut resume_spawn_cwd,
-        })?
+    let Some((provider_index, provider, resume_session_id)) = select_prepared_repl_provider(
+        agent_runtime_services,
+        &prepared.env,
+        &prepared.model,
+        &mut prepared.resolved_resume,
+        &mut prepared.fallback_target,
+        resume,
+        manual_migrate,
+        working_dir,
+        stderr_is_terminal,
+        &mut resume_spawn_cwd,
+    )?
     else {
         return Ok(1);
     };
     validator::validate_provider_repl_capability(&provider)?;
 
-    let mut attempt = start_selected_repl_invocation(StartSelectedReplInvocationInput {
+    let mut attempt = start_repl_invocation(
         agent_runtime_services,
-        env: &prepared.env,
-        resolved_resume: prepared.resolved_resume.as_ref(),
-        resume,
-        model: &prepared.model,
-        provider: &provider,
-        provider_index,
-        parent_invocation_id,
-    })?;
-    let invocation_env = serialize_repl_invocation_env(&attempt.invocation)?;
-
-    bind_repl_resume_session(
         &prepared.env,
-        attempt.invocation_row_id,
+        prepared.resolved_resume.as_ref(),
+        resume,
+        &prepared.model,
+        &provider,
+        provider_index,
+    )?;
+    let invocation_env = initialize_repl_invocation(
+        &prepared.env,
+        &attempt,
         resume,
         manual_migrate,
         resume_session_id.as_deref(),
     )?;
-    emit_repl_invocation_line_if_needed(stderr_is_terminal, &attempt.invocation);
+    emit_repl_invocation(stderr_is_terminal, &attempt.invocation);
 
     execute_and_finalize_repl_attempt(ReplExecutionInput {
         agent_runtime_services,
@@ -95,4 +88,81 @@ pub(crate) fn run_repl(
         resume_session_id: resume_session_id.as_deref(),
         invocation_env: &invocation_env,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_prepared_repl_provider(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    model: &ModelConfig,
+    resolved_resume: &mut Option<oulipoly_state::ResolvedResume>,
+    fallback_target: &mut Option<ResumeExecutionTarget>,
+    resume: Option<&str>,
+    manual_migrate: Option<&str>,
+    working_dir: Option<&Path>,
+    stderr_is_terminal: bool,
+    resume_spawn_cwd: &mut Option<PathBuf>,
+) -> Result<Option<(usize, ProviderConfig, Option<String>)>, String> {
+    let in_flight = execution::repl_in_flight();
+    let ctx = execution::repl_balance_context(env, &in_flight);
+    migration::select_repl_provider(migration::ReplProviderSelectionInput {
+        agent_runtime_services,
+        env,
+        model,
+        ctx: &ctx,
+        resolved_resume,
+        fallback_target,
+        resume,
+        manual_migrate,
+        working_dir,
+        stderr_is_terminal,
+        resume_spawn_cwd,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_repl_invocation<'state>(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &'state ResumeExecutionEnvironment,
+    resolved_resume: Option<&oulipoly_state::ResolvedResume>,
+    resume: Option<&str>,
+    model: &ModelConfig,
+    provider: &ProviderConfig,
+    provider_index: usize,
+) -> Result<StartedReplInvocation<'state>, String> {
+    execution::start_selected_repl_invocation(execution::StartSelectedReplInvocationInput {
+        agent_runtime_services,
+        env,
+        resolved_resume,
+        resume,
+        model,
+        provider,
+        provider_index,
+        parent_invocation_id: crate::dispatch::resolve_parent_invocation_id(&env.state),
+    })
+}
+
+fn initialize_repl_invocation(
+    env: &ResumeExecutionEnvironment,
+    attempt: &StartedReplInvocation<'_>,
+    resume: Option<&str>,
+    manual_migrate: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Result<String, String> {
+    let invocation_env = execution::serialize_repl_invocation_env(&attempt.invocation)?;
+    execution::bind_repl_resume_session(
+        env,
+        attempt.invocation_row_id,
+        resume,
+        manual_migrate,
+        resume_session_id,
+    )?;
+    Ok(invocation_env)
+}
+
+fn emit_repl_invocation(
+    stderr_is_terminal: bool,
+    invocation: &oulipoly_state::CompositeInvocationId,
+) {
+    execution::emit_repl_invocation_line_if_needed(stderr_is_terminal, invocation);
 }

@@ -13,9 +13,7 @@ use super::execution::{
 use super::{filter, formatter, mapper};
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::quota_zero_turn::filter_quota_exhausted_migration_candidates;
-use crate::resume_cli::{
-    ResumeExecutionTarget, renderable_resume_execution_target, resume_migration_pool,
-};
+use crate::resume_cli::{ResumeExecutionTarget, resume_migration_pool};
 use crate::wiring;
 
 pub(super) fn migrate_resume_target(
@@ -70,7 +68,7 @@ fn migration_model_for_attempt(
     attempts: usize,
 ) -> oulipoly_config::ModelConfig {
     let mut migration_model = resume_migration_pool(resolved, &env.providers_cfg);
-    if manual_migrate.is_none() || attempts > 1 {
+    if should_filter_migration_candidates(manual_migrate, attempts) {
         filter_quota_exhausted_migration_candidates(
             &env.state,
             &mut migration_model,
@@ -78,6 +76,10 @@ fn migration_model_for_attempt(
         );
     }
     migration_model
+}
+
+fn should_filter_migration_candidates(manual_migrate: Option<&str>, attempts: usize) -> bool {
+    manual_migrate.is_none() || attempts > 1
 }
 
 fn dispatch_resume_migration(
@@ -115,12 +117,7 @@ fn apply_resume_migration_result(
         Ok(MigrationServiceOutput::Migrated { segment: migrated })
         | Ok(MigrationServiceOutput::AutoRotated {
             segment: migrated, ..
-        }) => {
-            resolved.active_provider = migrated.target_provider;
-            resolved.active_session_id = migrated.target_session_id;
-            *target = renderable_resume_execution_target(resolved, &env.providers_cfg)?;
-            Ok(())
-        }
+        }) => mapper::apply_migrated_resume_segment(resolved, target, migrated, &env.providers_cfg),
         Ok(MigrationServiceOutput::Stay) => Ok(()),
         Ok(MigrationServiceOutput::RotationFailed { reason }) => {
             formatter::emit_stderr(&formatter::rotation_failed_reason(&reason));

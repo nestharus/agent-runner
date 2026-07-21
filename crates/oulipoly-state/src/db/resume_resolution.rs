@@ -83,13 +83,17 @@ impl StateDb {
         let exact_chain_id = self
             .exact_resume_chain_id(input)
             .map_err(|message| ResumeError::Db { message })?;
-        if exact_chain_id.is_some() {
+        if Self::has_exact_resume_chain_id(&exact_chain_id) {
             return Self::classify_resume_facts(input, exact_chain_id, Vec::new());
         }
         let native_candidates = self
             .native_resume_candidates(input)
             .map_err(|message| ResumeError::Db { message })?;
         Self::classify_resume_facts(input, None, native_candidates)
+    }
+
+    fn has_exact_resume_chain_id(exact_chain_id: &Option<String>) -> bool {
+        exact_chain_id.is_some()
     }
 
     fn classify_resume_facts(

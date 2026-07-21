@@ -2,7 +2,7 @@
 
 use std::fmt::Display;
 
-use oulipoly_runtime::services::RotationFailedReason;
+use oulipoly_runtime::services::{RotationFailedReason, ServiceError};
 
 pub(super) fn emit_stderr(message: &str) {
     eprintln!("{message}");
@@ -38,6 +38,14 @@ pub(super) fn emit_routing_retry(provider_name: &str) {
 
 pub(super) fn emit_diagnostics_category(category: &str) {
     eprintln!("[diagnostics: {category}]");
+}
+
+pub(super) fn resume_provider_registry_failure(error: String) -> String {
+    format!("failed to build resume provider registry: {error}")
+}
+
+pub(super) fn resume_acceptance_service_failure(error: ServiceError) -> String {
+    format!("resume acceptance service failed: {error}")
 }
 
 pub(super) fn rotation_failed_reason(reason: &RotationFailedReason) -> String {

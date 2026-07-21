@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `mapper`, `orchestration`
+//! `formatter`, `mapper`, `orchestration`, `predicate`
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 
@@ -104,13 +104,17 @@ fn bind_resume_attempt_session(
             Some(input.session_id.to_string()),
         ),
     )?;
-    if input.manual_migrate.is_some() {
+    if should_record_legacy_resume_input(input.manual_migrate) {
         input
             .env
             .state
             .record_legacy_resume_input_session_id(invocation_row_id, input.session_id)?;
     }
     Ok(())
+}
+
+fn should_record_legacy_resume_input(manual_migrate: Option<&str>) -> bool {
+    manual_migrate.is_some()
 }
 
 pub(super) fn finalize_resume_spawn_error(
@@ -149,7 +153,7 @@ pub(super) fn record_resume_acceptance_if_present(
             invocation_row_id,
             acceptance,
         ))
-        .map_err(|err| format!("resume acceptance service failed: {err}"))?;
+        .map_err(formatter::resume_acceptance_service_failure)?;
     Ok(())
 }
 

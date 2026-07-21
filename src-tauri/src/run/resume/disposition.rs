@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `predicate`, `formatter`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 

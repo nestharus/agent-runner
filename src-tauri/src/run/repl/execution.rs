@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `orchestration`, `predicate`, `validator`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -75,10 +75,6 @@ pub(super) fn repl_balance_context<'a>(
         sessions_cfg: &env.sessions_cfg,
         in_flight,
     }
-}
-
-pub(super) fn repl_parent_invocation_id(env: &ResumeExecutionEnvironment) -> Option<i64> {
-    crate::dispatch::resolve_parent_invocation_id(&env.state)
 }
 
 pub(super) fn repl_stderr_is_terminal() -> bool {
@@ -235,10 +231,14 @@ fn lookup_repl_model(
     models: &std::collections::HashMap<String, ModelConfig>,
     model_name: &str,
 ) -> Result<ModelConfig, String> {
-    models
-        .get(model_name)
-        .cloned()
-        .ok_or_else(|| format!("Unknown model: {model_name}"))
+    cloned_repl_model(models, model_name).ok_or_else(|| formatter::unknown_model_error(model_name))
+}
+
+fn cloned_repl_model(
+    models: &std::collections::HashMap<String, ModelConfig>,
+    model_name: &str,
+) -> Option<ModelConfig> {
+    models.get(model_name).cloned()
 }
 
 pub(super) fn select_repl_direct_provider(

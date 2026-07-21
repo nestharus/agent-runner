@@ -13,6 +13,10 @@ pub(super) fn repl_launch_failure_message(provider: &oulipoly_config::ProviderCo
     )
 }
 
+pub(super) fn unknown_model_error(model_name: &str) -> String {
+    format!("Unknown model: {model_name}")
+}
+
 pub(super) fn rotation_failed_reason(reason: &RotationFailedReason) -> String {
     match reason {
         RotationFailedReason::WorkingSetExhausted { candidates_tried } => format!(

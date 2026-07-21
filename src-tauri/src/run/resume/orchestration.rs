@@ -23,10 +23,9 @@ pub(crate) fn run_resume(
     if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
         return Ok(exit_code);
     }
-    if let Some(exit_code) = wake::validate_auto_wake_child(session_id)? {
+    if let Some(exit_code) = prepare_resume_wake(session_id)? {
         return Ok(exit_code);
     }
-    wake::reset_manual_resume_wake_claim(session_id)?;
     // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
 
     let mut prepared = match execution::prepare_headless_resume_execution(
@@ -125,13 +124,13 @@ pub(super) enum ResumeAttemptLoopControl {
 fn run_resume_attempt(
     mut input: ResumeAttemptInput<'_>,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let target = match execution::prepare_resume_attempt_target(&mut input)? {
+    let target = match prepare_resume_attempt_target(&mut input)? {
         Ok(target) => target,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
     let provider_index = target.provider_index;
     let provider = target.provider;
-    let strategy = match execution::resume_attempt_strategy_for_target(input.resolved, &provider) {
+    let strategy = match resolve_resume_attempt_strategy(input.resolved, &provider) {
         Ok(strategy) => strategy,
         Err(exit_code) => return Ok(ResumeAttemptLoopControl::Return(exit_code)),
     };
@@ -155,4 +154,25 @@ fn run_resume_attempt(
     };
 
     terminal::handle_resume_attempt_result(&mut input, &mut bound_attempt, &provider, &mut result)
+}
+
+fn prepare_resume_wake(session_id: &str) -> Result<Option<i32>, String> {
+    if let Some(exit_code) = wake::validate_auto_wake_child(session_id)? {
+        return Ok(Some(exit_code));
+    }
+    wake::reset_manual_resume_wake_claim(session_id)?;
+    Ok(None)
+}
+
+fn prepare_resume_attempt_target(
+    input: &mut ResumeAttemptInput<'_>,
+) -> Result<Result<crate::resume_cli::ResumeExecutionTarget, i32>, String> {
+    execution::prepare_resume_attempt_target(input)
+}
+
+fn resolve_resume_attempt_strategy<'a>(
+    resolved: &oulipoly_state::ResolvedResume,
+    provider: &'a oulipoly_config::ProviderConfig,
+) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
+    execution::resume_attempt_strategy_for_target(resolved, provider)
 }
