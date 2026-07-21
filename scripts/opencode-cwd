@@ -289,7 +289,7 @@ def classify_producer_result(status, stdout, stderr, raw_stdout):
 def parse_export(stdout):
     try:
         return json.loads(stdout), None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         return None, "opencode_export_malformed_json"
 
 

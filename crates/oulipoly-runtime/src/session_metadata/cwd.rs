@@ -1,5 +1,5 @@
 //! ## Declared roles
-//! accessor, formatter, mapper, orchestration, parser, validator
+//! accessor, filter, formatter, mapper, orchestration, parser, validator
 //!
 //! Workspace-root resolution from the configured session storage cwd script.
 //!

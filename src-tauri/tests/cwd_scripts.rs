@@ -187,9 +187,11 @@ fn assert_sensitive_output_absent(output: &Output, sentinel: &str) {
 
 fn assert_indeterminate(output: &Output, expected_error: &str) {
     let response = parse_response(output);
-    assert_eq!(response["found"], false, "{response}");
-    assert_eq!(response["error"], expected_error, "{response}");
-    assert!(response.get("owned").is_none(), "{response}");
+    assert_eq!(
+        response,
+        json!({"found": false, "error": expected_error}),
+        "{response}"
+    );
 }
 
 fn assert_owned_without_cwd(output: &Output, expected_error: &str) {
@@ -450,6 +452,11 @@ fn opencode_cwd_requires_matching_export_info_identity() {
         "{{\"info\":{{\"id\":\"{SESSION_ID}\"}},\"count\":{}}}",
         "9".repeat(5_000)
     );
+    let deeply_nested_json = format!(
+        "{{\"info\":{{\"id\":\"{SESSION_ID}\"}},\"extra\":{}0{}}}",
+        "[".repeat(10_000),
+        "]".repeat(10_000)
+    );
     let cases = [
         ("exit 0".to_string(), "opencode_export_malformed_json"),
         ("printf '\\377'".to_string(), "opencode_export_invalid_utf8"),
@@ -490,6 +497,10 @@ fn opencode_cwd_requires_matching_export_info_identity() {
         ),
         (
             format!("printf '%s\\n' {}", shell_quote(&oversized_integer)),
+            "opencode_export_malformed_json",
+        ),
+        (
+            format!("printf '%s\\n' {}", shell_quote(&deeply_nested_json)),
             "opencode_export_malformed_json",
         ),
     ];
