@@ -21,6 +21,9 @@ use oulipoly_state::pid_identity::{
 };
 use std::path::Path;
 
+const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
+const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnRuntimeMode {
     Headless,
@@ -92,6 +95,26 @@ pub(crate) fn context_from_parent_invocation_env(
         effective_cwd,
         models_dir,
     ))
+}
+
+pub(crate) fn provider_parent_invocation_env(current: Option<&str>) -> Option<String> {
+    let auto_wake = std::env::var(AUTO_WAKE_ENV).ok().as_deref() == Some("1");
+    let inherited = std::env::var(PARENT_INVOCATION_ENV).ok();
+    provider_parent_invocation_env_for(current, auto_wake, inherited.as_deref())
+}
+
+fn provider_parent_invocation_env_for(
+    current: Option<&str>,
+    auto_wake: bool,
+    inherited: Option<&str>,
+) -> Option<String> {
+    if auto_wake
+        && let Some(inherited) = inherited
+        && CompositeInvocationId::parse_env_value(inherited).is_ok()
+    {
+        return Some(inherited.to_string());
+    }
+    current.map(str::to_string)
 }
 
 fn parse_parent_invocation_env(
@@ -455,4 +478,36 @@ fn warn_mark_session_running_failed(context: &SpawnIdentityContext, session_id: 
 
 fn parse_invocation_env_silent(value: &str) -> Option<CompositeInvocationId> {
     CompositeInvocationId::parse_env_value(value).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provider_parent_invocation_env_for;
+
+    const CURRENT: &str = r#"{"source":"opencode3","id":"11111111-1111-4111-8111-111111111111"}"#;
+    const OWNER: &str = r#"{"source":"opencode3","id":"22222222-2222-4222-8222-222222222222"}"#;
+
+    #[test]
+    fn auto_wake_provider_keeps_inherited_semantic_owner() {
+        assert_eq!(
+            provider_parent_invocation_env_for(Some(CURRENT), true, Some(OWNER)).as_deref(),
+            Some(OWNER)
+        );
+    }
+
+    #[test]
+    fn ordinary_provider_uses_current_invocation() {
+        assert_eq!(
+            provider_parent_invocation_env_for(Some(CURRENT), false, Some(OWNER)).as_deref(),
+            Some(CURRENT)
+        );
+    }
+
+    #[test]
+    fn auto_wake_rejects_malformed_inherited_owner() {
+        assert_eq!(
+            provider_parent_invocation_env_for(Some(CURRENT), true, Some("not-json")).as_deref(),
+            Some(CURRENT)
+        );
+    }
 }

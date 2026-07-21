@@ -2507,7 +2507,7 @@ impl MailboxDb {
                  ON CONFLICT(session_id)
                  DO UPDATE SET
                     mode = excluded.mode,
-                    invocation_uuid = excluded.invocation_uuid,
+                    invocation_uuid = COALESCE(excluded.invocation_uuid, session_runtime.invocation_uuid),
                     provider_name = excluded.provider_name,
                     model_name = excluded.model_name,
                     pty_control_path = excluded.pty_control_path,
@@ -4333,7 +4333,16 @@ fn mark_session_running_row(
          ON CONFLICT(session_id)
          DO UPDATE SET
             mode = excluded.mode,
-            invocation_uuid = excluded.invocation_uuid,
+            invocation_uuid = CASE
+                WHEN session_runtime.invocation_uuid IS NOT NULL
+                 AND EXISTS (
+                    SELECT 1
+                    FROM session_wake_claim
+                    WHERE session_id = excluded.session_id
+                 )
+                THEN session_runtime.invocation_uuid
+                ELSE excluded.invocation_uuid
+            END,
             provider_name = excluded.provider_name,
             model_name = excluded.model_name,
             pty_control_path = excluded.pty_control_path,
@@ -6437,6 +6446,90 @@ mod tests {
         assert_eq!(row.effective_cwd.as_deref(), Some("/tmp/work"));
         assert!(row.turn_started_at.is_some());
         assert!(row.turn_ended_at.is_none());
+    }
+
+    #[test]
+    fn auto_wake_keeps_owner_separate_from_running_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let identity = current_identity();
+
+        db.mark_session_running(SessionRuntimeRunningUpdate {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: "owner-invocation",
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            identity: &identity,
+            pty_control_path: None,
+            turn_start_max_mailbox_seq: None,
+            models_dir: Some("/tmp/models"),
+            effective_cwd: Some("/tmp/work"),
+        })
+        .unwrap();
+        assert!(
+            db.mark_session_idle(SessionRuntimeIdleUpdate {
+                session_id: "session-a",
+                invocation_uuid: "owner-invocation",
+                last_exit_code: Some(0),
+            })
+            .unwrap()
+        );
+
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        assert!(matches!(
+            db.try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "wake-token",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap(),
+            WakeClaimAcquireResult::Acquired(_)
+        ));
+
+        db.mark_session_running(SessionRuntimeRunningUpdate {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: "wake-invocation",
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            identity: &identity,
+            pty_control_path: None,
+            turn_start_max_mailbox_seq: None,
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+
+        let running = db.session_runtime("session-a").unwrap().unwrap();
+        assert_eq!(running.invocation_uuid.as_deref(), Some("owner-invocation"));
+        assert_eq!(
+            running.running_invocation_uuid.as_deref(),
+            Some("wake-invocation")
+        );
+        assert!(
+            db.mark_session_idle(SessionRuntimeIdleUpdate {
+                session_id: "session-a",
+                invocation_uuid: "wake-invocation",
+                last_exit_code: Some(0),
+            })
+            .unwrap()
+        );
     }
 
     #[test]
