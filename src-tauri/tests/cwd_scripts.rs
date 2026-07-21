@@ -406,12 +406,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 fn opencode_cwd_reports_conclusive_export_not_found() {
     let fixture = OpenCodeFixture::new(None);
     let fake = fixture.fake_bin_dir.join("not-found");
-    let output = fixture.run_fake(&fake, "printf '%s\\n' '  Session not found  ' >&2\nexit 1");
-
-    assert_eq!(
-        parse_response(&output),
-        json!({"owned": false, "found": false})
-    );
+    for body in [
+        "printf '%s\\n' '  Session not found  ' >&2\nexit 1",
+        concat!(
+            "printf 'Exporting session: %s\\n",
+            "\\033[91m\\033[1mError: \\033[0mSession not found: %s\\n' ",
+            "\"$2\" \"$2\" >&2\nexit 1"
+        ),
+    ] {
+        let output = fixture.run_fake(&fake, body);
+        assert_eq!(
+            parse_response(&output),
+            json!({"owned": false, "found": false})
+        );
+    }
 }
 
 #[test]
@@ -483,6 +491,16 @@ fn opencode_cwd_does_not_treat_unknown_exit_one_as_not_owned() {
     );
     assert_indeterminate(&mixed_output, "opencode_export_exit_failure");
     assert_sensitive_output_absent(&mixed_output, "PRIVATE_MIXED_OUTPUT_SENTINEL");
+
+    let wrong_current_shape = fixture.run_fake(
+        &fake,
+        concat!(
+            "printf 'Exporting session: ses_other\\n",
+            "\\033[91m\\033[1mError: \\033[0mSession not found: ses_other\\n' >&2\n",
+            "exit 1"
+        ),
+    );
+    assert_indeterminate(&wrong_current_shape, "opencode_export_exit_failure");
 }
 
 #[test]

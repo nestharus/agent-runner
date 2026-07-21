@@ -302,8 +302,10 @@ migrated to `kind = "script"` with a synthetic `cwd_script` on load.
 
 The bundled OpenCode adapter is tested against this minimum producer shape:
 exit `0` with one JSON object containing matching string `info.id` and an
-`info.directory` value, or exit `1` with empty stdout and stderr whose trimmed
-value is exactly `Session not found`. `BASE` must be the selected account's
+`info.directory` value. Conclusive absence is exit `1` with empty stdout and
+either trimmed stderr exactly `Session not found` or OpenCode 1.18.3's exact
+ANSI-colored `Exporting session: ID` / `Error: Session not found: ID` stderr
+for the requested ID. `BASE` must be the selected account's
 `<XDG_DATA_HOME>/opencode` directory. Account wrappers selected through
 `OPENCODE_BIN` must preserve the adapter-supplied `XDG_DATA_HOME`; the override
 is parsed as an argv prefix and is never evaluated by a shell. On Linux, export

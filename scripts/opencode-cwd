@@ -353,10 +353,24 @@ def decode_execution(stdout, stderr):
     return decoded_stdout, decoded_stderr, error
 
 
-def classify_producer_result(status, stdout, stderr, raw_stdout):
+def current_not_found_stderr(session_id):
+    return (
+        f"Exporting session: {session_id}\n"
+        f"\033[91m\033[1mError: \033[0mSession not found: {session_id}\n"
+    )
+
+
+def producer_reports_not_found(status, raw_stdout, stderr, session_id):
+    return status == 1 and not raw_stdout and (
+        stderr.strip() == "Session not found"
+        or stderr == current_not_found_stderr(session_id)
+    )
+
+
+def classify_producer_result(status, stdout, stderr, raw_stdout, session_id):
     if status == 0:
         return "exported"
-    if status == 1 and not raw_stdout and stderr.strip() == "Session not found":
+    if producer_reports_not_found(status, raw_stdout, stderr, session_id):
         return "not_owned"
     if status is not None and status < 0:
         return "opencode_export_signal"
@@ -455,7 +469,7 @@ def resolve_response(argv, environ):
     if error is not None:
         return indeterminate_response(error)
     producer_result = classify_producer_result(
-        status, decoded_stdout, decoded_stderr, stdout
+        status, decoded_stdout, decoded_stderr, stdout, session_id
     )
     if producer_result == "not_owned":
         return not_owned_response()
