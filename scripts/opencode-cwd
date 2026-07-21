@@ -286,9 +286,13 @@ def classify_producer_result(status, stdout, stderr, raw_stdout):
     return "opencode_export_exit_failure"
 
 
+def reject_json_constant(_value):
+    raise ValueError("non-finite JSON constant")
+
+
 def parse_export(stdout):
     try:
-        return json.loads(stdout), None
+        return json.loads(stdout, parse_constant=reject_json_constant), None
     except (TypeError, ValueError, RecursionError):
         return None, "opencode_export_malformed_json"
 

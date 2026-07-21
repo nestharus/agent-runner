@@ -503,6 +503,15 @@ fn opencode_cwd_requires_matching_export_info_identity() {
             format!("printf '%s\\n' {}", shell_quote(&deeply_nested_json)),
             "opencode_export_malformed_json",
         ),
+        (
+            format!(
+                "printf '%s\\n' {}",
+                shell_quote(&format!(
+                    "{{\"info\":{{\"id\":\"{SESSION_ID}\"}},\"PRIVATE_NONFINITE_SENTINEL\":NaN}}"
+                ))
+            ),
+            "opencode_export_malformed_json",
+        ),
     ];
 
     for (body, expected_error) in cases {
