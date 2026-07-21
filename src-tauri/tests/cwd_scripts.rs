@@ -338,6 +338,70 @@ fn opencode_cwd_uses_public_export_without_private_sqlite_access() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn opencode_cwd_captures_large_export_in_bounded_anonymous_memory() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("large-export");
+    let producer = format!(
+        "{} - <<'PY'\n{}\nPY",
+        shell_quote(&python3().display().to_string()),
+        r#"import json
+import os
+import sys
+
+target = os.readlink("/proc/self/fd/1")
+if not target.startswith("/memfd:opencode-export"):
+    sys.exit(96)
+
+json.dump({
+    "info": {"id": os.environ["EXPECTED_SESSION_ID"], "directory": "/tmp"},
+    "padding": "x" * 131072,
+}, sys.stdout)"#
+    );
+
+    let output = fixture.run_fake(&fake, &producer);
+    let response = parse_response(&output);
+    assert_eq!(
+        response,
+        json!({"owned": true, "found": true, "cwd": "/tmp"})
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn opencode_cwd_falls_back_to_bounded_pipe_without_memfd() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("pipe-fallback");
+    write_fake_export(
+        &fake,
+        &export_json_body(&json!({"info": {"id": SESSION_ID, "directory": "/tmp"}})),
+    );
+    let harness = r#"import os
+import runpy
+import sys
+
+delattr(os, "memfd_create")
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"#;
+    let output = fixture
+        .isolated_python_command(Some(fake.as_os_str()))
+        .arg("-c")
+        .arg(harness)
+        .arg(scripts_dir().join("opencode-cwd"))
+        .arg(&fixture.base_dir)
+        .arg(SESSION_ID)
+        .output()
+        .unwrap();
+
+    fixture.assert_selected_xdg_observed();
+    assert_eq!(
+        parse_response(&output),
+        json!({"owned": true, "found": true, "cwd": "/tmp"})
+    );
+}
+
 #[test]
 fn opencode_cwd_reports_conclusive_export_not_found() {
     let fixture = OpenCodeFixture::new(None);

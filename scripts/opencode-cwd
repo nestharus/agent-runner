@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Resolve OpenCode storage membership and cwd through its public export CLI."""
 
+import fcntl
 import json
 import os
 import re
@@ -100,13 +101,27 @@ def child_environment(environ, data_home):
     return child_env
 
 
-def spawn_export(argv, child_env):
+def create_stdout_capture(stdout_limit):
+    file_descriptor = None
+    try:
+        flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        file_descriptor = os.memfd_create("opencode-export", flags)
+        os.ftruncate(file_descriptor, stdout_limit + READ_CHUNK_SIZE)
+        fcntl.fcntl(file_descriptor, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW)
+    except (AttributeError, OSError, ValueError):
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        return None
+    return file_descriptor
+
+
+def spawn_export(argv, child_env, stdout_capture):
     try:
         process = subprocess.Popen(
             argv,
             env=child_env,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
+            stdout=stdout_capture if stdout_capture is not None else subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
@@ -115,11 +130,13 @@ def spawn_export(argv, child_env):
     return process, None
 
 
-def map_capture_streams(process, stdout_limit, stderr_limit):
-    return {
-        process.stdout.fileno(): ("stdout", bytearray(), stdout_limit),
+def map_capture_streams(process, stdout_capture, stdout_limit, stderr_limit):
+    streams = {
         process.stderr.fileno(): ("stderr", bytearray(), stderr_limit),
     }
+    if stdout_capture is None:
+        streams[process.stdout.fileno()] = ("stdout", bytearray(), stdout_limit)
+    return streams
 
 
 def register_capture_streams(streams):
@@ -168,6 +185,33 @@ def append_stream_chunk(output, chunk):
     output.extend(chunk)
 
 
+def stdout_capture_exceeded(file_descriptor, stdout_limit):
+    if file_descriptor is None:
+        return False
+    return os.lseek(file_descriptor, 0, os.SEEK_CUR) > stdout_limit
+
+
+def read_stdout_capture(file_descriptor, stdout_limit):
+    length = os.lseek(file_descriptor, 0, os.SEEK_CUR)
+    if length > stdout_limit:
+        return None, "opencode_export_stdout_limit"
+    output = bytearray()
+    offset = 0
+    while offset < length:
+        chunk = os.pread(file_descriptor, min(READ_CHUNK_SIZE, length - offset), offset)
+        if not chunk:
+            return None, "opencode_export_capture_failed"
+        output.extend(chunk)
+        offset += len(chunk)
+    return bytes(output), None
+
+
+def captured_stdout(stdout_capture, stream_outputs, stdout_limit):
+    if stdout_capture is None:
+        return bytes(stream_outputs["stdout"]), None
+    return read_stdout_capture(stdout_capture, stdout_limit)
+
+
 def read_stream(selector, file_descriptor, state):
     stream_name, output, limit = state["streams"][file_descriptor]
     remaining = limit - len(output)
@@ -201,7 +245,7 @@ def map_failed_capture_state(state, reason):
     state["finished"] = True
 
 
-def capture_step(process, selector, state, deadline):
+def capture_step(process, selector, state, deadline, stdout_capture, stdout_limit):
     if time.monotonic() >= deadline:
         terminate_process_group(process)
         map_failed_capture_state(state, "opencode_export_timeout")
@@ -210,6 +254,10 @@ def capture_step(process, selector, state, deadline):
     events = selector.select(timeout=timeout)
     for key, _ in events:
         read_stream(selector, key.fd, state)
+    if stdout_capture_exceeded(stdout_capture, stdout_limit):
+        terminate_process_group(process)
+        map_failed_capture_state(state, "opencode_export_stdout_limit")
+        return
     if state["error"] is not None:
         terminate_process_group(process)
         map_failed_capture_state(state, state["error"])
@@ -219,28 +267,44 @@ def capture_step(process, selector, state, deadline):
         state["finished"] = True
 
 
-def capture_export(process, limits):
+def capture_export(process, limits, stdout_capture):
     timeout_ms, stdout_limit, stderr_limit = limits
-    streams = map_capture_streams(process, stdout_limit, stderr_limit)
+    streams = map_capture_streams(
+        process, stdout_capture, stdout_limit, stderr_limit
+    )
     selector = register_capture_streams(streams)
     state = map_capture_state(streams)
     stream_outputs = map_stream_outputs(streams)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
-        run_capture_loop(process, selector, state, deadline)
-        return map_capture_result(process, state, stream_outputs)
+        run_capture_loop(
+            process, selector, state, deadline, stdout_capture, stdout_limit
+        )
+        if state["error"] is not None:
+            return map_capture_result(process, state, stream_outputs, b"")
+        stdout, error = captured_stdout(
+            stdout_capture, stream_outputs, stdout_limit
+        )
+        if error is not None:
+            terminate_process_group(process)
+            return map_capture_failure(error)
+        return map_capture_result(process, state, stream_outputs, stdout)
     finally:
         selector.close()
 
 
-def run_capture_loop(process, selector, state, deadline):
+def run_capture_loop(
+    process, selector, state, deadline, stdout_capture, stdout_limit
+):
     while not state["finished"]:
-        capture_step(process, selector, state, deadline)
+        capture_step(
+            process, selector, state, deadline, stdout_capture, stdout_limit
+        )
 
 
-def capture_export_safely(process, limits):
+def capture_export_safely(process, limits, stdout_capture):
     try:
-        return capture_export(process, limits)
+        return capture_export(process, limits, stdout_capture)
     except (OSError, ValueError, KeyError):
         terminate_process_group(process)
         return map_capture_failure("opencode_export_capture_failed")
@@ -250,15 +314,28 @@ def map_capture_failure(reason):
     return reason, None, b"", b""
 
 
-def map_capture_result(process, state, stream_outputs):
+def map_capture_result(process, state, stream_outputs, stdout):
     if state["error"] is not None:
         return state["error"], None, b"", b""
     return (
         "completed",
         process.returncode,
-        bytes(stream_outputs["stdout"]),
+        stdout,
         bytes(stream_outputs["stderr"]),
     )
+
+
+def execute_export(argv, child_env, limits):
+    _, stdout_limit, _ = limits
+    stdout_capture = create_stdout_capture(stdout_limit)
+    try:
+        process, error = spawn_export(argv, child_env, stdout_capture)
+        if error is not None:
+            return map_capture_failure(error)
+        return capture_export_safely(process, limits, stdout_capture)
+    finally:
+        if stdout_capture is not None:
+            os.close(stdout_capture)
 
 
 def decode_output(output):
@@ -367,13 +444,10 @@ def resolve_response(argv, environ):
     if error is not None:
         return indeterminate_response(error)
     command = select_command(override, base_dir)
-    process, error = spawn_export(
-        export_argv(command, session_id), child_environment(environ, data_home)
-    )
-    if error is not None:
-        return indeterminate_response(error)
-    result, status, stdout, stderr = capture_export_safely(
-        process, parse_limits(environ)
+    result, status, stdout, stderr = execute_export(
+        export_argv(command, session_id),
+        child_environment(environ, data_home),
+        parse_limits(environ),
     )
     if result != "completed":
         return indeterminate_response(result)

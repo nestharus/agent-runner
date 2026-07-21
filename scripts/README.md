@@ -306,4 +306,8 @@ exit `0` with one JSON object containing matching string `info.id` and an
 value is exactly `Session not found`. `BASE` must be the selected account's
 `<XDG_DATA_HOME>/opencode` directory. Account wrappers selected through
 `OPENCODE_BIN` must preserve the adapter-supplied `XDG_DATA_HOME`; the override
-is parsed as an argv prefix and is never evaluated by a shell.
+is parsed as an argv prefix and is never evaluated by a shell. On Linux, export
+stdout is captured in a size-sealed anonymous `memfd` so upstream CLI runtimes
+flush large exports without writing transcript data to disk. Platforms without
+`memfd` retain the bounded pipe path and fail closed if upstream output is
+truncated.
