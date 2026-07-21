@@ -8,6 +8,12 @@ mod tests {
         concat!(
             include_str!("orchestration.rs"),
             "\n",
+            include_str!("execution.rs"),
+            "\n",
+            include_str!("migration.rs"),
+            "\n",
+            include_str!("terminal.rs"),
+            "\n",
             include_str!("resolution.rs"),
             "\n",
             include_str!("disposition.rs"),

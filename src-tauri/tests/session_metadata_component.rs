@@ -151,34 +151,38 @@ fn locate_ambiguous_recent_multi_chain_returns_ambiguous_session() {
     }
 }
 
-/// Risk: T2 — D1 strict recency mirrors resume resolver.
+/// Risk: T2 — D1 recency cannot select among distinct native lineages.
 /// Level: component.
 /// Source: contract §6 row T2; A2.
-/// Observable: resume metadata lookup selects the most recent matching chain.
+/// Observable: resume metadata lookup preserves multi-chain ambiguity.
 /// Residual: time-window edges bounded by deterministic fixture timestamps.
 #[test]
-fn locate_resume_recent_multi_chain_selects_most_recent_chain() {
+fn locate_resume_recent_multi_chain_returns_ambiguous_session() {
     let prepared = component_ambiguous_session_fixture();
 
-    let metadata = locate_for_resume(&prepared).unwrap();
-
-    assert_eq!(metadata.chain_id, prepared.chain_id);
-    assert_eq!(metadata.session_id, prepared.session_id);
+    match locate_for_resume(&prepared) {
+        Err(MetadataError::AmbiguousSession { input }) => {
+            assert_eq!(input, prepared.session_id);
+        }
+        other => panic!("expected AmbiguousSession, got {other:?}"),
+    }
 }
 
-/// Risk: T2 — D1 recency collapse does not become synthetic ambiguity.
+/// Risk: T2 — D1 stale sibling lineages remain distinct.
 /// Level: component.
 /// Source: contract §6 row T2; A2.
-/// Observable: recency-collapsed multi-chain input succeeds.
+/// Observable: age differences do not collapse multi-chain ambiguity.
 /// Residual: time-window edges bounded by deterministic fixture timestamps.
 #[test]
-fn locate_recency_collapsed_multi_chain_succeeds() {
+fn locate_stale_sibling_lineage_returns_ambiguous_session() {
     let prepared = component_recency_collapsed_fixture();
 
-    let metadata = locate(&prepared).unwrap();
-
-    assert_eq!(metadata.chain_id, prepared.chain_id);
-    assert_eq!(metadata.session_id, prepared.session_id);
+    match locate(&prepared) {
+        Err(MetadataError::AmbiguousSession { input }) => {
+            assert_eq!(input, prepared.session_id);
+        }
+        other => panic!("expected AmbiguousSession, got {other:?}"),
+    }
 }
 
 /// Risk: T3 — D2 storage mapping is stable at type level.

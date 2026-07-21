@@ -313,3 +313,9 @@ stdout is captured in a size-sealed anonymous `memfd` so upstream CLI runtimes
 flush large exports without writing transcript data to disk. Platforms without
 `memfd` retain the bounded pipe path and fail closed if upstream output is
 truncated.
+
+For resume selection, missing `owned` is indeterminate when one native session
+ID maps to multiple candidate chains and storage ownership must disambiguate
+them. Exact-chain input and a native session ID with only one distinct lineage
+remain state-only compatible and do not require ownership probing. Older
+runners ignore the additive `owned` field and continue to use the cwd result.

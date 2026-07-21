@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use oulipoly_config::ProvidersConfig;
 use oulipoly_runtime::session_metadata::{MetadataError, resolve_resume_workspace_root};
-use oulipoly_state::StateDb;
+use oulipoly_state::{ResolvedResume, StateDb};
 
 pub(crate) fn effective_spawn_cwd(working_dir: Option<&Path>) -> Result<PathBuf, String> {
     match working_dir {
@@ -36,15 +36,15 @@ fn format_current_dir_error(error: std::io::Error) -> String {
 
 pub(crate) fn effective_resume_spawn_cwd(
     state: &StateDb,
-    models: &oulipoly_state::ModelStore,
     providers_cfg: &ProvidersConfig,
     _sessions_cfg: &oulipoly_config::SessionsConfig,
+    resolved: &ResolvedResume,
     resume_input: &str,
     working_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let fallback = effective_spawn_cwd(working_dir)?;
     resolve_resume_spawn_cwd_or_fallback(
-        resume_workspace_root(state, models, providers_cfg, resume_input),
+        resume_workspace_root(state, providers_cfg, resolved),
         resume_input,
         fallback,
     )
@@ -52,11 +52,10 @@ pub(crate) fn effective_resume_spawn_cwd(
 
 fn resume_workspace_root(
     state: &StateDb,
-    models: &oulipoly_state::ModelStore,
     providers_cfg: &ProvidersConfig,
-    resume_input: &str,
+    resolved: &ResolvedResume,
 ) -> Result<PathBuf, MetadataError> {
-    resolve_resume_workspace_root(state, models, providers_cfg, resume_input)
+    resolve_resume_workspace_root(state, providers_cfg, resolved)
 }
 
 fn resume_spawn_cwd_fallback(
@@ -222,6 +221,7 @@ mod tests {
             ),
         );
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
+        let resolved = state.resolve_resume(&models, session_id, None).unwrap();
 
         let prev_data_dir = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
         unsafe {
@@ -229,9 +229,9 @@ mod tests {
         }
         let result = effective_resume_spawn_cwd(
             &state,
-            &models,
             &providers_cfg,
             &sessions_cfg,
+            &resolved,
             session_id,
             Some(&caller_cwd),
         );
@@ -258,12 +258,13 @@ mod tests {
         let providers_cfg =
             providers_cfg_with_cwd_script(provider_name, "printf '{\"found\":false}\\n'");
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
+        let resolved = state.resolve_resume(&models, session_id, None).unwrap();
 
         let cwd = effective_resume_spawn_cwd(
             &state,
-            &models,
             &providers_cfg,
             &sessions_cfg,
+            &resolved,
             session_id,
             Some(&fallback),
         )
@@ -284,12 +285,13 @@ mod tests {
         let models = oulipoly_state::ModelStore::new();
         let providers_cfg = providers_cfg_with_cwd_script(provider_name, "printf 'not-json\\n'");
         let sessions_cfg = oulipoly_config::SessionsConfig::default();
+        let resolved = state.resolve_resume(&models, session_id, None).unwrap();
 
         let cwd = effective_resume_spawn_cwd(
             &state,
-            &models,
             &providers_cfg,
             &sessions_cfg,
+            &resolved,
             session_id,
             Some(&fallback),
         )

@@ -21,7 +21,8 @@
 //!     Domain: resume-dto-boundary
 //!     Owns:
 //!       - ModelStore alias over std::collections::HashMap and ModelConfig
-//!       - ResolvedResume, ResumeError, ChainPreview, TurnPreview, and row DTO fields
+//!       - ResolvedResume, ResumeInputMatch, ResumeNativeCandidate, ResumeError,
+//!         ChainPreview, TurnPreview, and row DTO fields
 //!       - chrono DateTime/Utc timestamp fields carried by resume previews
 //!       - external contract symbols referenced by this concern via its `use`
 //!         declarations, intrinsic and subordinate to this persistence domain: DateTime, ModelConfig, Utc
@@ -45,6 +46,22 @@ pub struct ResolvedResume {
     pub model: Option<ModelConfig>,
     pub active_provider: String,
     pub active_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeNativeCandidate {
+    pub chain_id: String,
+    pub matching_provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeInputMatch {
+    ExactChain {
+        chain_id: String,
+    },
+    NativeSession {
+        candidates: Vec<ResumeNativeCandidate>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -136,10 +153,4 @@ pub(super) struct RecentTurnRow {
 pub(super) struct ParsedTurnPreviewTimestamp {
     pub(super) role: String,
     pub(super) timestamp: DateTime<Utc>,
-}
-
-pub(super) struct ResumeChainCandidate {
-    pub(super) chain_id: String,
-    pub(super) last_used_at: DateTime<Utc>,
-    pub(super) latest_segment_started_at: DateTime<Utc>,
 }

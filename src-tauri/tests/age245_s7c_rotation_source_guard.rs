@@ -43,12 +43,20 @@ fn s7c_production_wiring_passes_registry_handle_into_migration_service() {
 #[test]
 fn s7c_resume_and_repl_delegate_rotation_identity_to_runtime_service_only() {
     let resume = read_source("src-tauri/src/run/resume/orchestration.rs");
+    let resume_execution = read_source("src-tauri/src/run/resume/execution.rs");
+    let resume_migration = read_source("src-tauri/src/run/resume/migration.rs");
     let resume_mapper = read_source("src-tauri/src/run/resume/mapper.rs");
     let repl = read_source("src-tauri/src/run/repl/orchestration.rs");
+    let repl_mapper = read_source("src-tauri/src/run/repl/mapper.rs");
+    let repl_migration = read_source("src-tauri/src/run/repl/migration.rs");
     for (context, source) in [
         ("run/resume/orchestration.rs", resume.as_str()),
+        ("run/resume/execution.rs", resume_execution.as_str()),
+        ("run/resume/migration.rs", resume_migration.as_str()),
         ("run/resume/mapper.rs", resume_mapper.as_str()),
         ("run/repl/orchestration.rs", repl.as_str()),
+        ("run/repl/mapper.rs", repl_mapper.as_str()),
+        ("run/repl/migration.rs", repl_migration.as_str()),
     ] {
         assert_not_contains(context, source, "external_provider");
         assert_not_contains(
@@ -66,8 +74,8 @@ fn s7c_resume_and_repl_delegate_rotation_identity_to_runtime_service_only() {
         "MigrationServiceRequest",
     );
     assert_contains(
-        "run/repl/orchestration.rs",
-        &repl,
+        "run/repl/mapper.rs",
+        &repl_mapper,
         "MigrationServiceRequest",
     );
 }

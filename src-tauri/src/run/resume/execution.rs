@@ -1,0 +1,389 @@
+//! ## Declared roles
+//!
+//! `accessor`, `mapper`, `orchestration`, `predicate`, `validator`
+
+use std::collections::HashMap;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use oulipoly_runtime::executor;
+use oulipoly_runtime::provider_registry::ProviderRegistryOptions;
+use oulipoly_runtime::services::{ExecutorServiceRequest, ResumeServiceOutput};
+
+use super::orchestration::ResumeAttemptInput;
+use super::{formatter, mapper, migration, validator, wake};
+use crate::cli::inputs::resolve_resume_answer;
+use crate::migration_providers::{ResumeExecutionEnvironment, load_resume_execution_environment};
+use crate::resume_cli::{
+    ResumeExecutionTarget, format_resume_service_rejection, render_resume_model_pool_mismatch,
+    renderable_resume_execution_target,
+};
+use crate::spawn_cwd::effective_resume_spawn_cwd;
+use crate::wiring;
+
+pub(super) struct PreparedHeadlessResumeExecution {
+    pub(super) answer: Option<String>,
+    pub(super) mailbox_session_id: String,
+    pub(super) mailbox_delivery_seqs: Vec<i64>,
+    pub(super) mailbox_delivery_nonce: Option<String>,
+    pub(super) env: ResumeExecutionEnvironment,
+    pub(super) resolved: oulipoly_state::ResolvedResume,
+    pub(super) effective_spawn_cwd: PathBuf,
+    pub(super) parent_invocation_id: Option<i64>,
+    pub(super) max_attempts: usize,
+}
+
+pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
+    match validator::validate_resume_input(session_id) {
+        Ok(()) => None,
+        Err(message) => {
+            formatter::emit_stderr(&message);
+            Some(1)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_headless_resume_execution(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    session_id: &str,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<Result<PreparedHeadlessResumeExecution, i32>, String> {
+    let answer = resolve_resume_answer(prompt, file)?;
+    let env = load_resume_execution_environment(models_dir_override)?;
+    refresh_resume_provider_registry(agent_runtime_services, &env)?;
+    let resolved = match resolve_resume_for_headless_execution(
+        agent_runtime_services,
+        &env,
+        session_id,
+        model_name,
+    ) {
+        Ok(resolved) => resolved,
+        Err(exit_code) => return Ok(Err(exit_code)),
+    };
+    if let Err(exit_code) = prepare_initial_headless_resume_target(
+        &resolved,
+        &env.providers_cfg,
+        std::io::stderr().is_terminal(),
+    ) {
+        return Ok(Err(exit_code));
+    }
+    let effective_spawn_cwd = effective_resume_spawn_cwd(
+        &env.state,
+        &env.providers_cfg,
+        &env.sessions_cfg,
+        &resolved,
+        session_id,
+        working_dir,
+    )?;
+    let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(&env.state);
+    let max_attempts = headless_resume_retry_budget(&resolved);
+    let mailbox_delivery =
+        wake::prepare_headless_resume_delivery(&resolved, answer, Some(&env.models_dir))?;
+    Ok(Ok(mapper::prepared_headless_resume_execution(
+        mailbox_delivery,
+        env,
+        resolved,
+        effective_spawn_cwd,
+        parent_invocation_id,
+        max_attempts,
+    )))
+}
+
+fn refresh_resume_provider_registry(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+) -> Result<(), String> {
+    let models = env.models.values().cloned().collect::<Vec<_>>();
+    let registry = mapper::resume_provider_registry(&models, resume_provider_registry_options(env))
+        .map_err(|err| format!("failed to build resume provider registry: {err}"))?;
+    agent_runtime_services
+        .provider_registry_handle
+        .replace(Arc::new(registry));
+    Ok(())
+}
+
+fn resume_provider_registry_options(env: &ResumeExecutionEnvironment) -> ProviderRegistryOptions {
+    ProviderRegistryOptions::default()
+        .with_path_entries_from_process_path()
+        .with_config_root(env.config_root.clone())
+        .with_data_root(resume_provider_registry_data_root(env))
+}
+
+fn resume_provider_registry_data_root(env: &ResumeExecutionEnvironment) -> PathBuf {
+    oulipoly_state::paths::data_dir().unwrap_or_else(|_| env.config_root.clone())
+}
+
+fn headless_resume_retry_budget(resolved: &oulipoly_state::ResolvedResume) -> usize {
+    resolved
+        .model
+        .as_ref()
+        .map(|model| model.providers.len())
+        .unwrap_or(1)
+        .max(1)
+        + 1
+}
+
+pub(super) fn prepare_resume_attempt_target(
+    input: &mut ResumeAttemptInput<'_>,
+) -> Result<Result<ResumeExecutionTarget, i32>, String> {
+    let mut target =
+        match renderable_resume_execution_target(input.resolved, &input.env.providers_cfg) {
+            Ok(target) => target,
+            Err(exit_code) => return Ok(Err(exit_code)),
+        };
+    if let Err(exit_code) = migration::migrate_resume_target(
+        input.agent_runtime_services,
+        input.env,
+        input.resolved,
+        &mut target,
+        input.manual_migrate,
+        input.attempts,
+        input.effective_spawn_cwd,
+    ) {
+        return Ok(Err(exit_code));
+    }
+    Ok(Ok(target))
+}
+
+pub(super) fn resume_attempt_strategy_for_target<'a>(
+    resolved: &oulipoly_state::ResolvedResume,
+    provider: &'a oulipoly_config::ProviderConfig,
+) -> Result<Option<&'a oulipoly_config::ResumeStrategy>, i32> {
+    if resolved_uses_provider_ref(resolved) {
+        return Ok(None);
+    }
+    provider.resume.as_ref().map(Some).ok_or_else(|| {
+        formatter::emit_missing_resume_block(&provider.name);
+        1
+    })
+}
+
+pub(super) fn execute_resume_attempt_command(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+    prompt_mode: oulipoly_config::PromptMode,
+    invocation_env: &str,
+    strategy: Option<&oulipoly_config::ResumeStrategy>,
+) -> Result<executor::ExecutionResult, String> {
+    if let Some(request) = provider_ref_resume_executor_request(
+        input,
+        provider,
+        provider_index,
+        prompt_mode,
+        invocation_env,
+    ) {
+        return input
+            .agent_runtime_services
+            .executor_service
+            .execute(request)
+            .map(|output| output.result)
+            .map_err(|err| err.to_string());
+    }
+    let resume_payload = mapper::legacy_resume_payload(
+        &input.resolved.active_session_id,
+        strategy.expect("legacy resume target must have a resume strategy"),
+    );
+    executor::cli::execute_resume_optional_prompt_with_model_identity(
+        provider,
+        provider_index,
+        prompt_mode,
+        input.answer,
+        Some(input.effective_spawn_cwd),
+        Some(invocation_env),
+        resume_payload,
+        input.resolved.model_name.as_deref().unwrap_or("<unknown>"),
+        Some(&input.env.models_dir),
+    )
+}
+
+fn provider_ref_resume_executor_request(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    provider_index: usize,
+    prompt_mode: oulipoly_config::PromptMode,
+    invocation_env: &str,
+) -> Option<ExecutorServiceRequest> {
+    let model = input.resolved.model.as_ref()?;
+    model.provider.as_ref()?;
+    Some(
+        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+            model: model.clone(),
+            provider: provider.clone(),
+            provider_index,
+            prompt_mode,
+            prompt: input.answer.unwrap_or_default().to_string(),
+            working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
+            models_dir: Some(input.env.models_dir.clone()),
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: Some(invocation_env.to_string()),
+            start_known_provider_session_id: input.resolved.active_session_id.clone(),
+        },
+    )
+}
+
+fn resolve_resume_for_headless_execution(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &ResumeExecutionEnvironment,
+    session_id: &str,
+    model_name: Option<&str>,
+) -> Result<oulipoly_state::ResolvedResume, i32> {
+    let output = agent_runtime_services
+        .resume_service
+        .resolve_resume(mapper::resume_service_request(env, session_id, model_name))
+        .map_err(|err| err.to_string());
+    headless_resume_resolution_result(output, env, session_id, model_name)
+}
+
+fn headless_resume_resolution_result(
+    output: Result<ResumeServiceOutput, String>,
+    env: &ResumeExecutionEnvironment,
+    session_id: &str,
+    model_name: Option<&str>,
+) -> Result<oulipoly_state::ResolvedResume, i32> {
+    match map_headless_resume_resolution(output) {
+        HeadlessResumeResolution::Resolved(resolved) => Ok(resolved),
+        resolution => {
+            render_headless_resume_resolution_error(resolution, env, session_id, model_name);
+            Err(1)
+        }
+    }
+}
+
+enum HeadlessResumeResolution {
+    Resolved(oulipoly_state::ResolvedResume),
+    ProviderModelMismatch { active_provider: String },
+    Rejected(oulipoly_runtime::services::ResumeServiceRejection),
+    ServiceFailure(String),
+}
+
+fn map_headless_resume_resolution(
+    output: Result<ResumeServiceOutput, String>,
+) -> HeadlessResumeResolution {
+    match output {
+        Ok(ResumeServiceOutput::ResumeResolved { resolved }) => {
+            HeadlessResumeResolution::Resolved(resolved)
+        }
+        Ok(ResumeServiceOutput::ResumeRejected {
+            error:
+                oulipoly_runtime::services::ResumeServiceRejection::State(
+                    oulipoly_state::ResumeError::ProviderModelMismatch {
+                        active_provider, ..
+                    },
+                ),
+        }) => HeadlessResumeResolution::ProviderModelMismatch { active_provider },
+        Ok(ResumeServiceOutput::ResumeRejected { error }) => {
+            HeadlessResumeResolution::Rejected(error)
+        }
+        Err(err) => HeadlessResumeResolution::ServiceFailure(err),
+    }
+}
+
+fn render_headless_resume_resolution_error(
+    resolution: HeadlessResumeResolution,
+    env: &ResumeExecutionEnvironment,
+    session_id: &str,
+    model_name: Option<&str>,
+) {
+    match resolution {
+        HeadlessResumeResolution::ProviderModelMismatch { active_provider } => {
+            render_resume_model_pool_mismatch(
+                &env.models,
+                model_name.unwrap_or("<unknown>"),
+                session_id,
+                &active_provider,
+            );
+        }
+        HeadlessResumeResolution::Rejected(error) => {
+            formatter::emit_stderr(&format_resume_service_rejection(error));
+        }
+        HeadlessResumeResolution::ServiceFailure(err) => {
+            formatter::emit_stderr(&format!("resume service failed: {err}"));
+        }
+        HeadlessResumeResolution::Resolved(_) => {}
+    }
+}
+
+fn prepare_initial_headless_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    providers_cfg: &oulipoly_config::ProvidersConfig,
+    stderr_is_terminal: bool,
+) -> Result<(), i32> {
+    let target = renderable_resume_execution_target(resolved, providers_cfg)?;
+    if crate::dispatch::should_emit_resume_short_line(stderr_is_terminal) {
+        formatter::emit_resume_short_line(&resolved.active_provider);
+    }
+    validate_headless_resume_target(resolved, &target, &resolved.active_provider)
+}
+
+fn validate_headless_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    target: &ResumeExecutionTarget,
+    selected_provider: &str,
+) -> Result<(), i32> {
+    if resolved_uses_provider_ref(resolved) {
+        return validate_provider_ref_headless_resume_target(resolved, target, selected_provider)
+            .map_err(|message| provider_ref_resume_block_exit_code(&message));
+    }
+    if target.provider.resume.is_some() {
+        Ok(())
+    } else {
+        formatter::emit_missing_resume_block(selected_provider);
+        Err(1)
+    }
+}
+
+pub(super) fn validate_provider_ref_headless_resume_target(
+    resolved: &oulipoly_state::ResolvedResume,
+    target: &ResumeExecutionTarget,
+    selected_provider: &str,
+) -> Result<(), String> {
+    let model = resolved.model.as_ref().ok_or_else(|| {
+        format!("provider-ref resume target {selected_provider} has no model config")
+    })?;
+    if model.provider.is_none() {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} has no provider implementation"
+        ));
+    }
+    let target_member_name = model
+        .providers
+        .get(target.provider_index)
+        .map(|provider| provider.name.as_str())
+        .ok_or_else(|| {
+            format!(
+                "provider-ref resume target {selected_provider} has invalid provider index {}",
+                target.provider_index
+            )
+        })?;
+    if target_member_name != selected_provider {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} resolved provider {target_member_name}"
+        ));
+    }
+    if target.provider.name != selected_provider {
+        return Err(format!(
+            "provider-ref resume target {selected_provider} loaded provider {}",
+            target.provider.name
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn provider_ref_resume_block_exit_code(message: &str) -> i32 {
+    formatter::emit_stderr(message);
+    1
+}
+
+pub(super) fn resolved_uses_provider_ref(resolved: &oulipoly_state::ResolvedResume) -> bool {
+    resolved
+        .model
+        .as_ref()
+        .is_some_and(|model| model.provider.is_some())
+}

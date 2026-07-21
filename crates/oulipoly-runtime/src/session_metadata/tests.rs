@@ -101,7 +101,8 @@ fn resolve_resume_workspace_root_with_isolated_data_dir(
     input: &str,
 ) -> Result<PathBuf, MetadataError> {
     let _data_dir = IsolatedDataDir::new();
-    resolve_resume_workspace_root(db, models, providers_cfg, input)
+    let resolved = db.resolve_resume(models, input, None).unwrap();
+    resolve_resume_workspace_root(db, providers_cfg, &resolved)
 }
 
 fn state_with_model_session(model: &ModelConfig, provider_name: &str, session_id: &str) -> StateDb {

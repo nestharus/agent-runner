@@ -53,8 +53,37 @@ service_dto!(
 pub struct ResumeServiceRequest<'a> {
     pub state: &'a oulipoly_state::StateDb,
     pub models: &'a oulipoly_state::ModelStore,
+    pub providers_cfg: &'a ProvidersConfig,
     pub input: &'a str,
     pub model_override: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeStorageFailure {
+    pub provider_name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ResumeServiceRejection {
+    State(oulipoly_state::ResumeError),
+    StorageOwnerNotFound {
+        input: String,
+        candidates: Vec<oulipoly_state::ResumeNativeCandidate>,
+    },
+    StorageOwnershipAmbiguous {
+        input: String,
+        owners: Vec<oulipoly_state::ResumeNativeCandidate>,
+    },
+    StorageOwnershipIndeterminate {
+        input: String,
+        failures: Vec<ResumeStorageFailure>,
+    },
+    StorageOwnerChainAmbiguous {
+        input: String,
+        provider_name: String,
+        chain_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -63,7 +92,7 @@ pub enum ResumeServiceOutput {
         resolved: oulipoly_state::ResolvedResume,
     },
     ResumeRejected {
-        error: oulipoly_state::ResumeError,
+        error: ResumeServiceRejection,
     },
 }
 

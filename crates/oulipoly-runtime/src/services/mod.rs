@@ -12,6 +12,7 @@ mod lock;
 mod marker;
 mod migration;
 mod ports;
+mod resume;
 mod session_import;
 mod session_lifecycle;
 mod session_warning;

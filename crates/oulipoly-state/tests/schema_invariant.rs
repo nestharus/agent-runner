@@ -341,9 +341,27 @@ fn declaration_carriers_present_in_source() {
             "src-tauri/src/usage/cli.rs",
             &["parser", "validator", "mapper"][..],
         ),
+        ("src-tauri/src/resume_cli.rs", &["accessor"][..]),
         (
-            "src-tauri/src/resume_cli.rs",
-            &["orchestration", "mapper", "predicate"][..],
+            "src-tauri/src/resume_cli/diagnostics.rs",
+            &[
+                "orchestration",
+                "mapper",
+                "predicate",
+                "filter",
+                "formatter",
+            ][..],
+        ),
+        (
+            "src-tauri/src/resume_cli/target.rs",
+            &[
+                "orchestration",
+                "mapper",
+                "predicate",
+                "filter",
+                "validator",
+                "accessor",
+            ][..],
         ),
         (
             "crates/oulipoly-runtime/src/sessions/mod.rs",
@@ -495,7 +513,7 @@ fn declaration_carriers_present_in_source() {
             ][..],
         ),
         (
-            "src-tauri/src/resume_cli.rs",
+            "src-tauri/src/resume_cli/diagnostics.rs",
             &[
                 "resume acceptance result",
                 "typed terminal outcome category",

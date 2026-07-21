@@ -21,8 +21,6 @@ use super::dtos::*;
 use super::error::ServiceError;
 use super::ports::*;
 use crate::provider_registry::ProviderRegistryHandle;
-use oulipoly_state::StateDb;
-use oulipoly_state::repositories::ResumeRepository;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProductionRoutingService;
@@ -163,17 +161,11 @@ impl RoutingServicePort for ProductionRoutingService {
         &self,
         request: RoutingServiceRequest<'_>,
     ) -> Result<RoutingServiceOutput, ServiceError> {
-        Ok(RoutingServiceOutput {
-            provider_index: crate::balancer::select_provider(
-                request.model,
-                request.state,
-                request.ctx,
-            )
-            .map_err(|error| ServiceError::Unavailable {
-                message: error.to_string(),
-                code: None,
-            })?,
-        })
+        map_routing_service_result(crate::balancer::select_provider(
+            request.model,
+            request.state,
+            request.ctx,
+        ))
     }
 }
 
@@ -182,28 +174,20 @@ impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
         &self,
         request: InvocationLifecycleStartRequest<'_>,
     ) -> Result<InvocationLifecycleStartOutput, ServiceError> {
-        request
-            .state
-            .start_invocation(request.start)
-            .map(|invocation_row_id| InvocationLifecycleStartOutput { invocation_row_id })
-            .map_err(|message| ServiceError::Dependency { message })
+        map_invocation_start_result(request.state.start_invocation(request.start))
     }
 
     fn finalize_invocation(
         &self,
         request: InvocationLifecycleFinalizeRequest<'_>,
     ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
-        request
-            .state
-            .finalize_invocation(
-                request.invocation_row_id,
-                request.success,
-                request.exit_code,
-                request.error_category,
-                request.terminal_reason,
-            )
-            .map(|_| InvocationLifecycleFinalizeOutput)
-            .map_err(|message| ServiceError::Dependency { message })
+        map_invocation_finalize_result(request.state.finalize_invocation(
+            request.invocation_row_id,
+            request.success,
+            request.exit_code,
+            request.error_category,
+            request.terminal_reason,
+        ))
     }
 }
 
@@ -212,26 +196,18 @@ impl ResumeServicePort for ProductionResumeService {
         &self,
         request: ResumeServiceRequest<'_>,
     ) -> Result<ResumeServiceOutput, ServiceError> {
-        match <StateDb as ResumeRepository>::resolve_resume(
-            request.state,
-            request.models,
-            request.input,
-            request.model_override,
-        ) {
-            Ok(resolved) => Ok(ResumeServiceOutput::ResumeResolved { resolved }),
-            Err(error) => Ok(ResumeServiceOutput::ResumeRejected { error }),
-        }
+        Ok(super::resume::resolve_resume(request))
     }
 
     fn record_acceptance(
         &self,
         request: ResumeAcceptanceRequest<'_>,
     ) -> Result<ResumeAcceptanceOutput, ServiceError> {
-        request
-            .state
-            .update_resume_acceptance(request.invocation_row_id, request.status, request.evidence)
-            .map(|_| ResumeAcceptanceOutput)
-            .map_err(|message| ServiceError::Dependency { message })
+        map_resume_acceptance_result(request.state.update_resume_acceptance(
+            request.invocation_row_id,
+            request.status,
+            request.evidence,
+        ))
     }
 }
 
@@ -279,21 +255,19 @@ impl SessionExportServicePort for ProductionSessionExportService {
         &self,
         request: SessionExportServiceRequest,
     ) -> Result<SessionExportServiceOutput, ServiceError> {
-        if let Some(identity) = request.external_provider {
-            let result = crate::session_external_provider::export_session(
+        let SessionExportServiceRequest {
+            session_id,
+            external_provider,
+        } = request;
+        let result = match external_provider {
+            Some(identity) => crate::session_external_provider::export_session(
                 self.provider_registry.as_ref(),
                 identity,
-                &request.session_id,
-            );
-            return Ok(SessionExportServiceOutput { result });
-        }
-
-        let result = crate::session_export::resolve_export_session_metadata(&request.session_id)
-            .and_then(|metadata| {
-                crate::session_export::read_canonical_transcript(&metadata)
-                    .and_then(|records| crate::session_export::canonical_jsonl_bytes(&records))
-            });
-        Ok(SessionExportServiceOutput { result })
+                &session_id,
+            ),
+            None => export_builtin_session(&session_id),
+        };
+        Ok(map_session_export_output(result))
     }
 }
 
@@ -302,28 +276,90 @@ impl SessionReplaceServicePort for ProductionSessionReplaceService {
         &self,
         request: SessionReplaceServiceRequest,
     ) -> Result<SessionReplaceServiceOutput, ServiceError> {
-        if let Some(identity) = request.external_provider {
-            let result = crate::session_external_provider::replace_session(
+        let SessionReplaceServiceRequest {
+            session_id,
+            source,
+            preimage_sha256,
+            external_provider,
+        } = request;
+        let result = match external_provider {
+            Some(identity) => crate::session_external_provider::replace_session(
                 self.provider_registry.as_ref(),
                 identity,
-                &request.session_id,
-                &request.source,
-                request.preimage_sha256.as_deref(),
-            );
-            return Ok(SessionReplaceServiceOutput { result });
-        }
-
-        let input_path = match &request.source {
-            crate::session_replace::ReplaceSource::File(path) => Some(path.as_path()),
-            crate::session_replace::ReplaceSource::Stdin => None,
+                &session_id,
+                &source,
+                preimage_sha256.as_deref(),
+            ),
+            None => crate::session_replace::run_import_replace(
+                &session_id,
+                replace_source_input_path(&source),
+                preimage_sha256.as_deref(),
+            ),
         };
-        let result = crate::session_replace::run_import_replace(
-            &request.session_id,
-            input_path,
-            request.preimage_sha256.as_deref(),
-        );
-        Ok(SessionReplaceServiceOutput { result })
+        Ok(map_session_replace_output(result))
     }
+}
+
+fn map_routing_service_result(
+    result: Result<usize, crate::balancer::RoutingError>,
+) -> Result<RoutingServiceOutput, ServiceError> {
+    result
+        .map(|provider_index| RoutingServiceOutput { provider_index })
+        .map_err(|error| ServiceError::Unavailable {
+            message: error.to_string(),
+            code: None,
+        })
+}
+
+fn map_invocation_start_result(
+    result: Result<i64, String>,
+) -> Result<InvocationLifecycleStartOutput, ServiceError> {
+    result
+        .map(|invocation_row_id| InvocationLifecycleStartOutput { invocation_row_id })
+        .map_err(|message| ServiceError::Dependency { message })
+}
+
+fn map_invocation_finalize_result(
+    result: Result<(), String>,
+) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
+    result
+        .map(|_| InvocationLifecycleFinalizeOutput)
+        .map_err(|message| ServiceError::Dependency { message })
+}
+
+fn map_resume_acceptance_result(
+    result: Result<(), String>,
+) -> Result<ResumeAcceptanceOutput, ServiceError> {
+    result
+        .map(|_| ResumeAcceptanceOutput)
+        .map_err(|message| ServiceError::Dependency { message })
+}
+
+fn export_builtin_session(session_id: &str) -> Result<Vec<u8>, crate::session_export::ExportError> {
+    let metadata = crate::session_export::resolve_export_session_metadata(session_id)?;
+    let records = crate::session_export::read_canonical_transcript(&metadata)?;
+    crate::session_export::canonical_jsonl_bytes(&records)
+}
+
+fn map_session_export_output(
+    result: Result<Vec<u8>, crate::session_export::ExportError>,
+) -> SessionExportServiceOutput {
+    SessionExportServiceOutput { result }
+}
+
+fn replace_source_input_path(
+    source: &crate::session_replace::ReplaceSource,
+) -> Option<&std::path::Path> {
+    match source {
+        crate::session_replace::ReplaceSource::File(path) => Some(path.as_path()),
+        crate::session_replace::ReplaceSource::Stdin => None,
+    }
+}
+
+fn map_session_replace_output(
+    result: Result<crate::session_replace::ReplaceReceipt, crate::session_replace::ReplaceError>,
+) -> SessionReplaceServiceOutput {
+    SessionReplaceServiceOutput { result }
 }
 
 impl SessionLockServicePort for ProductionSessionLockService {

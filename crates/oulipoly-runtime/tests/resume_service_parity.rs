@@ -17,10 +17,13 @@
 //!       - model and model_store mappers
 //!       - start_invocation accessor
 
-use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_config::{
+    ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig, ResumeKind,
+    ResumeStrategy, SessionStorage,
+};
 use oulipoly_runtime::services::{
     ProductionResumeService, ResumeAcceptanceOutput, ResumeAcceptanceRequest, ResumeServiceOutput,
-    ResumeServicePort, ResumeServiceRequest,
+    ResumeServicePort, ResumeServiceRejection, ResumeServiceRequest,
 };
 use oulipoly_state::repositories::ResumeRepository;
 use oulipoly_state::{InvocationStart, ModelStore, ResolvedResume, ResumeError, StateDb};
@@ -30,6 +33,8 @@ use std::path::PathBuf;
 const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const SESSION_B: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
 const CHAIN_A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const CHAIN_B: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CHAIN_C: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -68,6 +73,68 @@ impl Fixture {
         )
         .unwrap();
     }
+
+    fn seed_migrated_chain(
+        &self,
+        chain_id: &str,
+        matching_provider: &str,
+        input_session_id: &str,
+        active_provider: &str,
+        active_session_id: &str,
+        model: &str,
+    ) {
+        self.seed_active_chain(chain_id, matching_provider, input_session_id, model);
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE session_chain_segments SET ended_at = '2026-04-17T09:00:00Z'
+             WHERE chain_id = ?1 AND provider_name = ?2 AND session_id = ?3",
+            params![chain_id, matching_provider, input_session_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES (?1, ?2, ?3, '2026-04-17T09:00:01Z', 'quota_threshold')",
+            params![chain_id, active_provider, active_session_id],
+        )
+        .unwrap();
+    }
+}
+
+fn providers_config(entries: &[(&str, &str)]) -> ProvidersConfig {
+    let mut config = ProvidersConfig::default();
+    for (provider_name, response) in entries {
+        insert_provider(
+            &mut config,
+            provider_name,
+            format!("printf %s {}; :", shell_quote(response)),
+        );
+    }
+    config
+}
+
+fn insert_provider(config: &mut ProvidersConfig, provider_name: &str, cwd_script: String) {
+    config.entries.insert(
+        provider_name.to_string(),
+        ProviderEntry {
+            command: Some(provider_name.to_string()),
+            resume: Some(ResumeStrategy {
+                kind: ResumeKind::Flag,
+                flag: Some("--session".to_string()),
+                subcommand: None,
+            }),
+            session_storage: Some(SessionStorage::Script {
+                cwd_script,
+                transcript_script: None,
+                storage_type: None,
+            }),
+            ..ProviderEntry::default()
+        },
+    );
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn model(name: &str, providers: &[&str]) -> ModelConfig {
@@ -148,11 +215,13 @@ fn resume_service_resolve_resume_preserves_typed_rejections() {
         model("codex-low", &["codex"]),
     ]);
     let service = ProductionResumeService::new();
+    let providers_cfg = ProvidersConfig::default();
 
     let output = service
         .resolve_resume(ResumeServiceRequest {
             state: &db,
             models: &models,
+            providers_cfg: &providers_cfg,
             input: SESSION_A,
             model_override: Some("codex-low"),
         })
@@ -161,11 +230,11 @@ fn resume_service_resolve_resume_preserves_typed_rejections() {
     match output {
         ResumeServiceOutput::ResumeRejected {
             error:
-                ResumeError::ProviderModelMismatch {
+                ResumeServiceRejection::State(ResumeError::ProviderModelMismatch {
                     model_name,
                     active_provider,
                     suggestions,
-                },
+                }),
         } => {
             assert_eq!(model_name, "codex-low");
             assert_eq!(active_provider, "claude-a");
@@ -184,11 +253,13 @@ fn resume_service_resolve_resume_matches_repository_resolve_resume() {
     let expected =
         <StateDb as ResumeRepository>::resolve_resume(&db, &models, SESSION_A, None).unwrap();
     let service = ProductionResumeService::new();
+    let providers_cfg = ProvidersConfig::default();
 
     let output = service
         .resolve_resume(ResumeServiceRequest {
             state: &db,
             models: &models,
+            providers_cfg: &providers_cfg,
             input: SESSION_A,
             model_override: None,
         })
@@ -224,10 +295,12 @@ fn resume_service_resolve_resume_remains_expected_segment_only() {
     assert_resolved_same(&repository, &direct);
 
     let service = ProductionResumeService::new();
+    let providers_cfg = ProvidersConfig::default();
     let output = service
         .resolve_resume(ResumeServiceRequest {
             state: &db,
             models: &models,
+            providers_cfg: &providers_cfg,
             input: SESSION_A,
             model_override: Some("claude-opus"),
         })
@@ -248,6 +321,294 @@ fn resume_service_resolve_resume_remains_expected_segment_only() {
         }
         other => panic!("expected resolved resume, got {other:?}"),
     }
+}
+
+#[test]
+fn resume_service_bypasses_ownership_for_exact_and_single_native_inputs() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain(CHAIN_A, "provider-a", SESSION_A, "shared");
+    let db = fixture.open_db();
+    let models = model_store(vec![model("shared", &["provider-a"])]);
+    let mut providers_cfg = ProvidersConfig::default();
+    insert_provider(&mut providers_cfg, "provider-a", "exit 93".to_string());
+    let service = ProductionResumeService::new();
+
+    for input in [CHAIN_A, SESSION_A] {
+        let output = service
+            .resolve_resume(ResumeServiceRequest {
+                state: &db,
+                models: &models,
+                providers_cfg: &providers_cfg,
+                input,
+                model_override: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(output, ResumeServiceOutput::ResumeResolved { ref resolved } if resolved.chain_id == CHAIN_A),
+            "exact and single-native inputs must not execute the failing ownership script: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn resume_service_selects_unique_storage_owner_using_original_native_id() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain(CHAIN_A, "provider-a", SESSION_A, "shared");
+    fixture.seed_active_chain(CHAIN_B, "provider-b", SESSION_A, "shared");
+    let db = fixture.open_db();
+    let models = model_store(vec![model("shared", &["provider-a", "provider-b"])]);
+    let record = fixture._dir.path().join("ownership-probes.txt");
+    let mut providers_cfg = ProvidersConfig::default();
+    insert_provider(
+        &mut providers_cfg,
+        "provider-a",
+        format!(
+            "printf '%s\\n' \"$1\" >> {}; printf '%s\\n' '{{\"owned\":false}}'; :",
+            shell_quote(&record.display().to_string())
+        ),
+    );
+    insert_provider(
+        &mut providers_cfg,
+        "provider-b",
+        format!(
+            "printf '%s\\n' \"$1\" >> {}; printf '%s\\n' '{{\"owned\":true}}'; :",
+            shell_quote(&record.display().to_string())
+        ),
+    );
+
+    let output = ProductionResumeService::new()
+        .resolve_resume(ResumeServiceRequest {
+            state: &db,
+            models: &models,
+            providers_cfg: &providers_cfg,
+            input: SESSION_A,
+            model_override: None,
+        })
+        .unwrap();
+
+    assert!(
+        matches!(output, ResumeServiceOutput::ResumeResolved { resolved } if resolved.chain_id == CHAIN_B && resolved.active_provider == "provider-b")
+    );
+    assert_eq!(
+        std::fs::read_to_string(record).unwrap(),
+        format!("{SESSION_A}\n{SESSION_A}\n")
+    );
+}
+
+#[test]
+fn resume_service_owner_on_old_segment_finalizes_current_active_segment() {
+    let fixture = Fixture::new();
+    fixture.seed_migrated_chain(
+        CHAIN_A,
+        "provider-a",
+        SESSION_A,
+        "provider-c",
+        SESSION_B,
+        "shared",
+    );
+    fixture.seed_active_chain(CHAIN_B, "provider-b", SESSION_A, "shared");
+    let db = fixture.open_db();
+    let models = model_store(vec![model(
+        "shared",
+        &["provider-a", "provider-b", "provider-c"],
+    )]);
+    let providers_cfg = providers_config(&[
+        ("provider-a", "{\"owned\":true}\n"),
+        ("provider-b", "{\"owned\":false}\n"),
+    ]);
+
+    let output = ProductionResumeService::new()
+        .resolve_resume(ResumeServiceRequest {
+            state: &db,
+            models: &models,
+            providers_cfg: &providers_cfg,
+            input: SESSION_A,
+            model_override: None,
+        })
+        .unwrap();
+
+    assert!(matches!(
+        output,
+        ResumeServiceOutput::ResumeResolved { resolved }
+            if resolved.chain_id == CHAIN_A
+                && resolved.active_provider == "provider-c"
+                && resolved.active_session_id == SESSION_B
+    ));
+}
+
+#[test]
+fn resume_service_distinguishes_ownership_rejections() {
+    for (name, a, b, expected) in [
+        (
+            "no owner",
+            "{\"owned\":false}\n",
+            "{\"owned\":false}\n",
+            "not-found",
+        ),
+        (
+            "multiple owners",
+            "{\"owned\":true}\n",
+            "{\"owned\":true}\n",
+            "ambiguous",
+        ),
+        (
+            "positive and indeterminate",
+            "{\"owned\":true}\n",
+            "{\"found\":false}\n",
+            "indeterminate",
+        ),
+        (
+            "zero positive and indeterminate",
+            "{\"owned\":false}\n",
+            "{\"found\":false}\n",
+            "indeterminate",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.seed_active_chain(CHAIN_A, "provider-a", SESSION_A, "shared");
+        fixture.seed_active_chain(CHAIN_B, "provider-b", SESSION_A, "shared");
+        let db = fixture.open_db();
+        let models = model_store(vec![model("shared", &["provider-a", "provider-b"])]);
+        let providers_cfg = providers_config(&[("provider-a", a), ("provider-b", b)]);
+        let output = ProductionResumeService::new()
+            .resolve_resume(ResumeServiceRequest {
+                state: &db,
+                models: &models,
+                providers_cfg: &providers_cfg,
+                input: SESSION_A,
+                model_override: None,
+            })
+            .unwrap();
+
+        let matched = matches!(
+            (&output, expected),
+            (
+                ResumeServiceOutput::ResumeRejected {
+                    error: ResumeServiceRejection::StorageOwnerNotFound { .. }
+                },
+                "not-found"
+            ) | (
+                ResumeServiceOutput::ResumeRejected {
+                    error: ResumeServiceRejection::StorageOwnershipAmbiguous { .. }
+                },
+                "ambiguous"
+            ) | (
+                ResumeServiceOutput::ResumeRejected {
+                    error: ResumeServiceRejection::StorageOwnershipIndeterminate { .. }
+                },
+                "indeterminate"
+            )
+        );
+        assert!(matched, "{name}: unexpected output {output:?}");
+    }
+}
+
+#[test]
+fn resume_service_multiple_known_owners_win_over_additional_probe_failure() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain(CHAIN_A, "provider-a", SESSION_A, "shared");
+    fixture.seed_active_chain(CHAIN_B, "provider-b", SESSION_A, "shared");
+    fixture.seed_active_chain(CHAIN_C, "provider-c", SESSION_A, "shared");
+    let db = fixture.open_db();
+    let models = model_store(vec![model(
+        "shared",
+        &["provider-a", "provider-b", "provider-c"],
+    )]);
+    let providers_cfg = providers_config(&[
+        ("provider-a", "{\"owned\":true}\n"),
+        ("provider-b", "{\"owned\":true}\n"),
+        ("provider-c", "{\"found\":false}\n"),
+    ]);
+
+    let output = ProductionResumeService::new()
+        .resolve_resume(ResumeServiceRequest {
+            state: &db,
+            models: &models,
+            providers_cfg: &providers_cfg,
+            input: SESSION_A,
+            model_override: None,
+        })
+        .unwrap();
+
+    assert!(matches!(
+        output,
+        ResumeServiceOutput::ResumeRejected {
+            error: ResumeServiceRejection::StorageOwnershipAmbiguous { owners, .. }
+        } if owners.len() == 2
+            && owners.iter().any(|owner| owner.matching_provider == "provider-a")
+            && owners.iter().any(|owner| owner.matching_provider == "provider-b")
+    ));
+}
+
+#[test]
+fn resume_service_rejects_one_owner_associated_with_multiple_chains() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain(CHAIN_A, "provider-a", SESSION_A, "shared");
+    fixture.seed_active_chain(CHAIN_B, "provider-a", SESSION_A, "shared");
+    fixture.seed_active_chain(CHAIN_C, "provider-b", SESSION_A, "shared");
+    let db = fixture.open_db();
+    let models = model_store(vec![model("shared", &["provider-a", "provider-b"])]);
+    let providers_cfg = providers_config(&[
+        ("provider-a", "{\"owned\":true}\n"),
+        ("provider-b", "{\"owned\":false}\n"),
+    ]);
+
+    let output = ProductionResumeService::new()
+        .resolve_resume(ResumeServiceRequest {
+            state: &db,
+            models: &models,
+            providers_cfg: &providers_cfg,
+            input: SESSION_A,
+            model_override: None,
+        })
+        .unwrap();
+
+    assert!(matches!(
+        output,
+        ResumeServiceOutput::ResumeRejected {
+            error: ResumeServiceRejection::StorageOwnerChainAmbiguous {
+                provider_name,
+                chain_ids,
+                ..
+            }
+        } if provider_name == "provider-a" && chain_ids == vec![CHAIN_A.to_string(), CHAIN_B.to_string()]
+    ));
+}
+
+#[test]
+fn resume_service_validates_model_only_after_owner_selection() {
+    let fixture = Fixture::new();
+    fixture.seed_active_chain(CHAIN_A, "provider-a", SESSION_A, "shared");
+    fixture.seed_active_chain(CHAIN_B, "provider-b", SESSION_A, "shared");
+    let db = fixture.open_db();
+    let models = model_store(vec![
+        model("shared", &["provider-a", "provider-b"]),
+        model("provider-b-only", &["provider-b"]),
+    ]);
+    let providers_cfg = providers_config(&[
+        ("provider-a", "{\"owned\":true}\n"),
+        ("provider-b", "{\"owned\":false}\n"),
+    ]);
+
+    let output = ProductionResumeService::new()
+        .resolve_resume(ResumeServiceRequest {
+            state: &db,
+            models: &models,
+            providers_cfg: &providers_cfg,
+            input: SESSION_A,
+            model_override: Some("provider-b-only"),
+        })
+        .unwrap();
+
+    assert!(matches!(
+        output,
+        ResumeServiceOutput::ResumeRejected {
+            error: ResumeServiceRejection::State(ResumeError::ProviderModelMismatch {
+                active_provider,
+                ..
+            })
+        } if active_provider == "provider-a"
+    ));
 }
 
 #[test]
@@ -305,10 +666,12 @@ fn resume_service_repository_parity_matches_state_db_resolve_resume() {
     assert_resolved_same(&repository, &direct);
 
     let service = ProductionResumeService::new();
+    let providers_cfg = ProvidersConfig::default();
     let output = service
         .resolve_resume(ResumeServiceRequest {
             state: &db,
             models: &models,
+            providers_cfg: &providers_cfg,
             input: SESSION_B,
             model_override: Some("claude-opus"),
         })

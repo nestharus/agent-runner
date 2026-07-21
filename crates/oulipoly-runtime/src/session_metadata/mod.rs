@@ -698,16 +698,12 @@ fn session_provider_metadata_error(error: session_provider::SessionProviderError
 
 pub fn resolve_resume_workspace_root(
     state: &StateDb,
-    models: &ModelStore,
     providers_cfg: &ProvidersConfig,
-    input: &str,
+    resolved: &ResolvedResume,
 ) -> Result<PathBuf, MetadataError> {
-    let resolved = state
-        .resolve_resume(models, input, None)
-        .map_err(map_resume_error)?;
-    let provider = effective_provider_for_resolved(&resolved, providers_cfg)?;
-    if resolved_uses_external_provider(&resolved)
-        && let Some(workspace_root) = session_runtime_workspace_root(&resolved)?
+    let provider = effective_provider_for_resolved(resolved, providers_cfg)?;
+    if resolved_uses_external_provider(resolved)
+        && let Some(workspace_root) = session_runtime_workspace_root(resolved)?
     {
         return Ok(workspace_root);
     }
@@ -716,11 +712,11 @@ pub fn resolve_resume_workspace_root(
     // id, so it is the durable fallback unless a live external-provider runtime
     // row has already claimed authority above.
     if let Some(workspace_root) =
-        invocation_resolved_workspace_root(state, provider.session_storage.as_ref(), &resolved)?
+        invocation_resolved_workspace_root(state, provider.session_storage.as_ref(), resolved)?
     {
         return Ok(workspace_root);
     }
-    if let Some(workspace_root) = session_runtime_workspace_root(&resolved)? {
+    if let Some(workspace_root) = session_runtime_workspace_root(resolved)? {
         return Ok(workspace_root);
     }
     resolve_cwd_from_session_storage(

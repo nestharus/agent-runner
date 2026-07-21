@@ -59,6 +59,25 @@
 - `src-tauri/src/repl_cli.rs`
 - `src-tauri/src/resume_acceptance_adapter.rs`
 - `src-tauri/src/resume_cli.rs`
+- `src-tauri/src/resume_cli/diagnostics.rs`
+- `src-tauri/src/resume_cli/target.rs`
+- `src-tauri/src/run/repl/mod.rs`
+- `src-tauri/src/run/repl/orchestration.rs`
+- `src-tauri/src/run/repl/resolution.rs`
+- `src-tauri/src/run/repl/execution.rs`
+- `src-tauri/src/run/repl/migration.rs`
+- `src-tauri/src/run/repl/terminal.rs`
+- `src-tauri/src/run/repl/mapper.rs`
+- `src-tauri/src/run/repl/formatter.rs`
+- `src-tauri/src/run/resume/mod.rs`
+- `src-tauri/src/run/resume/orchestration.rs`
+- `src-tauri/src/run/resume/execution.rs`
+- `src-tauri/src/run/resume/lifecycle.rs`
+- `src-tauri/src/run/resume/migration.rs`
+- `src-tauri/src/run/resume/terminal.rs`
+- `src-tauri/src/run/resume/wake.rs`
+- `src-tauri/src/run/resume/mapper.rs`
+- `src-tauri/src/run/resume/predicate.rs`
 - `src-tauri/src/commands/resume_list/mod.rs`
 - `src-tauri/src/commands/resume_list/orchestration.rs`
 - `src-tauri/src/commands/resume_list/validator.rs`
@@ -200,6 +219,16 @@ wiring smoke tests, adapter contract tests, workspace-layout invariants.
 - `src-tauri/tests/empty_bodies_ref_rca/rc2_ingest_body_payload.rs`
 - `src-tauri/tests/empty_bodies_ref_rca/rc4_trace_inline_transcript.rs`
 - `src-tauri/tests/routing_fanout_rca/age158_characterization.rs`
+- `src-tauri/tests/opencode_resume_storage_migration_rca.rs`
+  (nine production-built ownership-selection, fail-closed, exact-chain, and
+  single-native compatibility cases using isolated public-export fakes)
+- `src-tauri/src/run/repl/source_guard.rs` and
+  `src-tauri/src/run/resume/source_guard.rs` (colocated module-split source
+  guards)
+- `src-tauri/tests/marker_producer_format.rs`,
+  `src-tauri/tests/age245_s7c_rotation_source_guard.rs`, and
+  `src-tauri/tests/age153_support/mod.rs` (existing source-aggregation tests and
+  shared support updated only to follow the approved module split)
 
 ## Cross-references
 

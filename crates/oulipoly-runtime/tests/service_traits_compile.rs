@@ -1,4 +1,4 @@
-use oulipoly_config::{ModelConfig, PromptMode, SessionsConfig};
+use oulipoly_config::{ModelConfig, PromptMode, ProvidersConfig, SessionsConfig};
 use oulipoly_runtime::services::error::ServiceError;
 use oulipoly_runtime::services::*;
 use oulipoly_runtime::trace::TraceOptions;
@@ -265,6 +265,7 @@ fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos()
     let mut models = ModelStore::new();
     models.insert(model.name.clone(), model.clone());
     let sessions_cfg = SessionsConfig::default();
+    let providers_cfg = ProvidersConfig::default();
     let resolved = ResolvedResume {
         chain_id: "11111111-1111-4111-8111-111111111111".to_string(),
         model_name: Some(model.name.clone()),
@@ -286,6 +287,7 @@ fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos()
     let resume_request = ResumeServiceRequest {
         state: &db,
         models: &models,
+        providers_cfg: &providers_cfg,
         input: "33333333-3333-4333-8333-333333333333",
         model_override: Some(&model.name),
     };

@@ -14,6 +14,7 @@
 - `crates/oulipoly-runtime/src/services/migration.rs`
 - `crates/oulipoly-runtime/src/services/mod.rs`
 - `crates/oulipoly-runtime/src/services/ports.rs`
+- `crates/oulipoly-runtime/src/services/resume.rs`
 - `crates/oulipoly-runtime/src/services/session_lifecycle.rs`
 - `crates/oulipoly-runtime/src/services/session_warning.rs`
 - `crates/oulipoly-runtime/src/services/session_window.rs`
@@ -95,6 +96,7 @@ tests on the ports surface, fixture tests on the trace envelope schema.
 - `crates/oulipoly-runtime/tests/ports_contract.rs`
 - `crates/oulipoly-runtime/tests/observability_snapshot.rs`
 - `crates/oulipoly-runtime/tests/service_traits_compile.rs`
+- `crates/oulipoly-runtime/tests/resume_service_parity.rs`
 - `src-tauri/tests/age27_diagnostics_effective_provider.rs`
 - `src-tauri/tests/age_54_trace_row_preservation.rs`
 - `src-tauri/tests/pr_b_trace_integration.rs`

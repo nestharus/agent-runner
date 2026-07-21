@@ -21,7 +21,8 @@
 //!       - the crate root-public DB compatibility facade: every `pub use db::...`
 //!         re-export (StateDb, DbError, LegacyProviderNames, ProviderRecord,
 //!         InvocationRecord/Start/Status, QuotaRecord/Window, SessionTurn*,
-//!         ReadOnlyOpenError, and the remaining db concern surface) is the
+//!         ResumeInputMatch, ResumeNativeCandidate, ReadOnlyOpenError, and the
+//!         remaining db concern surface) is the
 //!         documented stable consumer API this root carrier owns and re-exports
 //!         unchanged from the decomposed `db` module tree
 //! ```
@@ -58,7 +59,8 @@ pub use db::{
 };
 pub use db::{
     BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, RESUME_INPUT_MAX_LEN,
-    ResolvedResume, ResumeError, SessionMarkerPayload, TurnPreview, WrongIdKindInput,
+    ResolvedResume, ResumeError, ResumeInputMatch, ResumeNativeCandidate, SessionMarkerPayload,
+    TurnPreview, WrongIdKindInput,
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
@@ -143,6 +145,8 @@ mod age160_root_reexport_tests {
             std::any::type_name::<crate::ProviderSessionBinding>(),
             std::any::type_name::<crate::ResolvedResume>(),
             std::any::type_name::<crate::ResumeError>(),
+            std::any::type_name::<crate::ResumeInputMatch>(),
+            std::any::type_name::<crate::ResumeNativeCandidate>(),
             std::any::type_name::<crate::SessionMarkerPayload>(),
             std::any::type_name::<crate::TurnPreview>(),
             std::any::type_name::<crate::AccountRecord>(),

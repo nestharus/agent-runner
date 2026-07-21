@@ -10,6 +10,88 @@ use uuid::Uuid;
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::terminal_outcome_adapter::TerminalSignalContext;
 
+pub(super) fn prepared_headless_resume_execution(
+    mailbox_delivery: crate::mailbox_delivery::PreparedMailboxDelivery,
+    env: ResumeExecutionEnvironment,
+    resolved: oulipoly_state::ResolvedResume,
+    effective_spawn_cwd: std::path::PathBuf,
+    parent_invocation_id: Option<i64>,
+    max_attempts: usize,
+) -> super::execution::PreparedHeadlessResumeExecution {
+    super::execution::PreparedHeadlessResumeExecution {
+        answer: mailbox_delivery.answer,
+        mailbox_session_id: mailbox_delivery.session_id,
+        mailbox_delivery_seqs: mailbox_delivery.seqs,
+        mailbox_delivery_nonce: mailbox_delivery.delivery_nonce,
+        env,
+        resolved,
+        effective_spawn_cwd,
+        parent_invocation_id,
+        max_attempts,
+    }
+}
+
+pub(super) fn resume_provider_registry(
+    models: &[oulipoly_config::ModelConfig],
+    options: oulipoly_runtime::provider_registry::ProviderRegistryOptions,
+) -> Result<oulipoly_runtime::provider_registry::ProviderRegistry, String> {
+    oulipoly_runtime::provider_registry::ProviderRegistry::from_model_configs(models, options)
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn legacy_resume_payload<'a>(
+    session_id: &'a str,
+    strategy: &'a oulipoly_config::ResumeStrategy,
+) -> oulipoly_runtime::executor::cli::ResumePayload<'a> {
+    oulipoly_runtime::executor::cli::ResumePayload {
+        session_id,
+        strategy,
+    }
+}
+
+pub(super) fn resume_invocation_attempt<'state>(
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: crate::invocation::finalize::FinalizerGuard<'state>,
+) -> super::lifecycle::ResumeInvocationAttempt<'state> {
+    super::lifecycle::ResumeInvocationAttempt {
+        invocation,
+        invocation_row_id,
+        guard,
+    }
+}
+
+pub(super) fn bound_resume_attempt<'state>(
+    attempt: super::lifecycle::ResumeInvocationAttempt<'state>,
+    provider_session_id: String,
+    zero_turn_baseline: crate::zero_turn_orchestration::ZeroTurnBaseline,
+    invocation_env: String,
+) -> super::lifecycle::BoundResumeAttempt<'state> {
+    super::lifecycle::BoundResumeAttempt {
+        attempt,
+        provider_session_id,
+        zero_turn_baseline,
+        invocation_env,
+    }
+}
+
+pub(super) fn resume_terminal_disposition_outcome(
+    control: super::disposition::ResumeLoopControl,
+    exit_code: i32,
+) -> super::terminal::ResumeTerminalDispositionOutcome {
+    match control {
+        super::disposition::ResumeLoopControl::Continue => {
+            super::terminal::ResumeTerminalDispositionOutcome::Continue(exit_code)
+        }
+        super::disposition::ResumeLoopControl::Return(exit_code) => {
+            super::terminal::ResumeTerminalDispositionOutcome::Return(exit_code)
+        }
+        super::disposition::ResumeLoopControl::CompletedAttempt => {
+            super::terminal::ResumeTerminalDispositionOutcome::CompletedAttempt
+        }
+    }
+}
+
 pub(super) fn resume_service_request<'a>(
     env: &'a ResumeExecutionEnvironment,
     session_id: &'a str,
@@ -18,12 +100,13 @@ pub(super) fn resume_service_request<'a>(
     ResumeServiceRequest {
         state: &env.state,
         models: &env.models,
+        providers_cfg: &env.providers_cfg,
         input: session_id,
         model_override: model_name,
     }
 }
 
-pub(super) struct ResumeMigrationRequestInput<'a, 'stderr> {
+pub(super) struct ResumeMigrationRequestInput<'a> {
     pub(super) env: &'a ResumeExecutionEnvironment,
     pub(super) resolved: &'a oulipoly_state::ResolvedResume,
     pub(super) manual_target: Option<&'a str>,
@@ -31,11 +114,10 @@ pub(super) struct ResumeMigrationRequestInput<'a, 'stderr> {
     pub(super) effective_cwd: &'a std::path::Path,
     pub(super) stderr: &'a mut std::io::Stderr,
     pub(super) active_exhausted: bool,
-    pub(super) _stderr_lifetime: std::marker::PhantomData<&'stderr ()>,
 }
 
 pub(super) fn migration_service_request<'a>(
-    input: ResumeMigrationRequestInput<'a, '_>,
+    input: ResumeMigrationRequestInput<'a>,
 ) -> MigrationServiceRequest<'a> {
     MigrationServiceRequest {
         state: &input.env.state,

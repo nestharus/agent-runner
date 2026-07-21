@@ -21,6 +21,8 @@
 //!     Domain: provider-session-id-grammar
 //!     Owns:
 //!       - StateDb provider-neutral bounded opaque resume input acceptance
+//!       - exact-chain-first classification before provider-native candidate handling
+//!       - ResumeInputMatch and ResumeNativeCandidate lineage-cardinality resolution
 //!       - provider-session-id-to-chain resolution query path
 //!   - component: crates/oulipoly-state/src/db/resume_resolution.rs
 //!     role: intrinsic-surface
@@ -44,20 +46,102 @@ impl StateDb {
         input: &str,
         model_override: Option<&str>,
     ) -> Result<ResolvedResume, ResumeError> {
+        match self.classify_resume_input(input)? {
+            ResumeInputMatch::ExactChain { chain_id } => {
+                self.resolve_resume_chain(models, &chain_id, model_override)
+            }
+            ResumeInputMatch::NativeSession { candidates } => {
+                self.resolve_single_native_lineage(models, input, &candidates, model_override)
+            }
+        }
+    }
+
+    fn resolve_single_native_lineage(
+        &self,
+        models: &ModelStore,
+        input: &str,
+        candidates: &[ResumeNativeCandidate],
+        model_override: Option<&str>,
+    ) -> Result<ResolvedResume, ResumeError> {
+        let chain_ids = Self::distinct_native_candidate_chain_ids(candidates);
+        let Some(chain_id) = Self::single_native_chain_id(&chain_ids) else {
+            return Err(self.ambiguous_resume_error(input)?);
+        };
+        self.resolve_resume_chain(models, chain_id, model_override)
+    }
+
+    fn single_native_chain_id(chain_ids: &[String]) -> Option<&str> {
+        match chain_ids {
+            [chain_id] => Some(chain_id),
+            _ => None,
+        }
+    }
+
+    pub fn classify_resume_input(&self, input: &str) -> Result<ResumeInputMatch, ResumeError> {
         Self::validate_resume_input_id(input)?;
         self.reject_wrong_resume_id_kind(input)?;
-        let chain_id = self.resolve_resume_chain_id(input)?;
-        let (active_provider, active_session_id) = self.require_active_segment(&chain_id)?;
-        let model_name = self.resolve_resume_model_name(&chain_id, model_override)?;
+        let exact_chain_id = self
+            .exact_resume_chain_id(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        if exact_chain_id.is_some() {
+            return Self::classify_resume_facts(input, exact_chain_id, Vec::new());
+        }
+        let native_candidates = self
+            .native_resume_candidates(input)
+            .map_err(|message| ResumeError::Db { message })?;
+        Self::classify_resume_facts(input, None, native_candidates)
+    }
+
+    fn classify_resume_facts(
+        input: &str,
+        exact_chain_id: Option<String>,
+        native_candidates: Vec<ResumeNativeCandidate>,
+    ) -> Result<ResumeInputMatch, ResumeError> {
+        if let Some(chain_id) = exact_chain_id {
+            return Ok(ResumeInputMatch::ExactChain { chain_id });
+        }
+        if native_candidates.is_empty() {
+            return Err(Self::no_resume_chain_found_error(input));
+        }
+        Ok(ResumeInputMatch::NativeSession {
+            candidates: native_candidates,
+        })
+    }
+
+    pub fn resolve_resume_chain(
+        &self,
+        models: &ModelStore,
+        chain_id: &str,
+        model_override: Option<&str>,
+    ) -> Result<ResolvedResume, ResumeError> {
+        let (active_provider, active_session_id) = self.require_active_segment(chain_id)?;
+        let model_name = self.resolve_resume_model_name(chain_id, model_override)?;
         let model =
             Self::resolve_resume_model_config(models, model_name.as_ref(), &active_provider)?;
         Ok(Self::assemble_resolved_resume(
-            chain_id,
+            chain_id.to_string(),
             model_name,
             model,
             active_provider,
             active_session_id,
         ))
+    }
+
+    fn distinct_native_candidate_chain_ids(candidates: &[ResumeNativeCandidate]) -> Vec<String> {
+        Self::sort_and_deduplicate_chain_ids(Self::native_candidate_chain_ids(candidates))
+    }
+
+    fn native_candidate_chain_ids(candidates: &[ResumeNativeCandidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|candidate| candidate.chain_id.clone())
+            .collect()
+    }
+
+    fn sort_and_deduplicate_chain_ids(mut chain_ids: Vec<String>) -> Vec<String> {
+        chain_ids.sort();
+        chain_ids.dedup();
+        chain_ids
     }
 
     pub fn validate_resume_input_id(input: &str) -> Result<(), ResumeError> {
@@ -110,35 +194,6 @@ impl StateDb {
             chain_id: wrong_id.chain_id,
             provider_name: wrong_id.provider_name,
         }
-    }
-
-    pub(super) fn resolve_resume_chain_id(&self, input: &str) -> Result<String, ResumeError> {
-        let chain_ids = self
-            .candidate_chain_ids(input)
-            .map_err(|message| ResumeError::Db { message })?;
-        Self::validate_resume_chain_candidates(input, &chain_ids)?;
-        match self
-            .choose_resume_chain(input, chain_ids)
-            .map_err(|message| ResumeError::Db { message })?
-        {
-            Some(chain_id) => Ok(chain_id),
-            None => Err(self.ambiguous_resume_error(input)?),
-        }
-    }
-
-    pub(super) fn validate_resume_chain_candidates(
-        input: &str,
-        chain_ids: &[String],
-    ) -> Result<(), ResumeError> {
-        if Self::resume_chain_candidates_exist(chain_ids) {
-            Ok(())
-        } else {
-            Err(Self::no_resume_chain_found_error(input))
-        }
-    }
-
-    fn resume_chain_candidates_exist(chain_ids: &[String]) -> bool {
-        !chain_ids.is_empty()
     }
 
     fn no_resume_chain_found_error(input: &str) -> ResumeError {

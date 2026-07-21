@@ -267,4 +267,15 @@ fn wrong_id_suggestion_resumes_with_native_session_arg() {
         !resumed_stderr.contains(&format!("invalid session id: {PROVIDER_SESSION_ID}")),
         "suggested provider session id must be accepted by resume metadata resolution; stderr={resumed_stderr}"
     );
+    for diagnostic in [
+        "storage-owner-not-found",
+        "storage-ownership-ambiguous",
+        "storage-ownership-indeterminate",
+        "storage-owner-chain-ambiguous",
+    ] {
+        assert!(
+            !resumed_stderr.contains(diagnostic),
+            "single native lineage must not require ownership disambiguation; stderr={resumed_stderr}"
+        );
+    }
 }

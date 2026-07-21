@@ -3,12 +3,70 @@
 use oulipoly_config::{ModelConfig, PromptMode};
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::{
-    InvocationLifecycleFinalizeRequest, InvocationLifecycleStartRequest,
+    InvocationLifecycleFinalizeRequest, InvocationLifecycleStartRequest, MigrationServiceRequest,
 };
 use oulipoly_state::{CompositeInvocationId, InvocationStart, ProviderSessionBinding, StateDb};
 use uuid::Uuid;
 
 use crate::session_ingest_cli::ResumeIngestMode;
+
+pub(super) fn prepared_repl_execution(
+    env: crate::migration_providers::ResumeExecutionEnvironment,
+    resolved_resume: Option<oulipoly_state::ResolvedResume>,
+    fallback_target: Option<crate::resume_cli::ResumeExecutionTarget>,
+    model: ModelConfig,
+) -> super::execution::PreparedReplExecution {
+    super::execution::PreparedReplExecution {
+        env,
+        resolved_resume,
+        fallback_target,
+        model,
+    }
+}
+
+pub(super) fn repl_invocation_attempt<'state>(
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: crate::invocation::finalize::FinalizerGuard<'state>,
+) -> super::execution::ReplInvocationAttempt<'state> {
+    super::execution::ReplInvocationAttempt {
+        invocation,
+        invocation_row_id,
+        guard,
+    }
+}
+
+pub(super) fn selected_repl_provider_tuple(
+    provider_index: usize,
+    provider: oulipoly_config::ProviderConfig,
+    resume_session_id: Option<String>,
+) -> (usize, oulipoly_config::ProviderConfig, Option<String>) {
+    (provider_index, provider, resume_session_id)
+}
+
+pub(super) struct ReplMigrationRequestInput<'a> {
+    pub(super) env: &'a crate::migration_providers::ResumeExecutionEnvironment,
+    pub(super) resolved: &'a oulipoly_state::ResolvedResume,
+    pub(super) manual_target: Option<&'a str>,
+    pub(super) migration_model: &'a ModelConfig,
+    pub(super) effective_cwd: &'a std::path::Path,
+    pub(super) stderr: &'a mut std::io::Stderr,
+}
+
+pub(super) fn migration_service_request<'a>(
+    input: ReplMigrationRequestInput<'a>,
+) -> MigrationServiceRequest<'a> {
+    MigrationServiceRequest {
+        state: &input.env.state,
+        sessions_cfg: &input.env.sessions_cfg,
+        resolved: input.resolved,
+        manual_target: input.manual_target,
+        active_exhausted: false,
+        migration_model: input.migration_model,
+        effective_cwd: input.effective_cwd,
+        stderr: input.stderr,
+    }
+}
 
 pub(super) fn provider_default_model() -> ModelConfig {
     ModelConfig {

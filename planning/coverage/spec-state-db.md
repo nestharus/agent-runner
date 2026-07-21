@@ -6,6 +6,9 @@
 - `crates/oulipoly-state/build.rs`
 - `crates/oulipoly-state/src/db.rs`
 - `crates/oulipoly-state/src/db/invocation_records.rs`
+- `crates/oulipoly-state/src/db/resume_lookup.rs`
+- `crates/oulipoly-state/src/db/resume_resolution.rs`
+- `crates/oulipoly-state/src/db/resume_types.rs`
 - `crates/oulipoly-state/src/db/owned_turn_event.rs`
 - `crates/oulipoly-state/src/lib.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
@@ -129,6 +132,9 @@ table tests, repositories contract.
 - `crates/oulipoly-state/tests/age_62_readonly_schema_probe.rs`
 - `crates/oulipoly-state/tests/age_62_resolver_routing.rs`
 - `crates/oulipoly-state/tests/repositories_contract.rs`
+- `crates/oulipoly-state/src/db/tests/resume_resolution_tests_1.rs`
+  (exact-chain precedence, provider-scoped native candidate preservation,
+  one-lineage deduplication, and multi-lineage ambiguity)
 - `src-tauri/tests/age_32_state_db_migrations.rs`
 - `src-tauri/tests/age149_owned_turn_event_schema.rs`
 - `src-tauri/tests/empty_bodies_ref_rca/rc1_schema_contract.rs`

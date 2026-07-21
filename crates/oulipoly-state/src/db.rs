@@ -175,12 +175,11 @@ use self::provider_schema_migration::ProviderColumn;
 pub use self::provider_session_binding::ProviderSessionBinding;
 pub use self::providers::ProviderRecord;
 pub use self::resume_types::{
-    ChainPreview, ModelStore, RESUME_INPUT_MAX_LEN, ResolvedResume, ResumeError, TurnPreview,
-    WrongIdKindInput,
+    ChainPreview, ModelStore, RESUME_INPUT_MAX_LEN, ResolvedResume, ResumeError, ResumeInputMatch,
+    ResumeNativeCandidate, TurnPreview, WrongIdKindInput,
 };
 use self::resume_types::{
-    ParsedTurnPreviewTimestamp, RecentTurnRow, ResumeChainCandidate, WrongIdKindInvocationMatch,
-    WrongIdKindInvocationRow,
+    ParsedTurnPreviewTimestamp, RecentTurnRow, WrongIdKindInvocationMatch, WrongIdKindInvocationRow,
 };
 use self::returned_artifacts_codec::{
     InvocationIdentity, ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError,

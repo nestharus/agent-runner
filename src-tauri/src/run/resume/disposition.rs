@@ -4,7 +4,7 @@
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 
-use super::{formatter, mapper, predicate};
+use super::{formatter, mapper};
 use crate::invocation::finalize::FinalizerGuard;
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::terminal_outcome_adapter::{TerminalSignalDisposition, terminal_signal_error_category};
@@ -207,11 +207,4 @@ fn maybe_quota_finalize_request<'a>(
         error_category,
         Some(terminal_reason),
     )
-}
-
-pub(super) fn confirmed_zero_turn_maybe_quota(
-    zero_turn_action: ZeroTurnAction,
-    terminal_signal: &Option<oulipoly_runtime::executor::TerminalSignal>,
-) -> bool {
-    predicate::confirmed_zero_turn_maybe_quota(zero_turn_action, terminal_signal)
 }

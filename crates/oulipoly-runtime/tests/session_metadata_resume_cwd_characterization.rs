@@ -172,8 +172,10 @@ fn historical_no_ref_direct_storage_runs_cwd_command_with_session_env_and_uses_r
     let models = model_store(vec![model_config(MODEL_LOCAL, false)]);
     let providers = direct_storage_providers_config(&projects_dir);
 
-    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_FALLBACK)
-        .expect("direct cwd");
+    let resolved = state
+        .resolve_resume(&models, SESSION_FALLBACK, None)
+        .unwrap();
+    let actual = resolve_resume_workspace_root(&state, &providers, &resolved).expect("direct cwd");
 
     assert_eq!(actual, script_cwd);
     assert_ne!(actual, std::env::current_dir().unwrap());
@@ -224,8 +226,11 @@ fn imported_script_session_cwd_precedes_stale_mailbox_and_failing_script() {
         .unwrap();
     drop(mailbox);
 
-    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_IMPORTED)
-        .expect("imported cwd");
+    let resolved = state
+        .resolve_resume(&models, SESSION_IMPORTED, None)
+        .unwrap();
+    let actual =
+        resolve_resume_workspace_root(&state, &providers, &resolved).expect("imported cwd");
 
     assert_eq!(actual, imported_cwd);
     assert!(!marker.exists());
@@ -273,8 +278,11 @@ fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
         .unwrap();
     drop(mailbox);
 
-    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_LIVE_RUNTIME)
-        .expect("live runtime cwd");
+    let resolved = state
+        .resolve_resume(&models, SESSION_LIVE_RUNTIME, None)
+        .unwrap();
+    let actual =
+        resolve_resume_workspace_root(&state, &providers, &resolved).expect("live runtime cwd");
 
     assert_eq!(actual, live_runtime_cwd);
     assert_ne!(actual, recorded_cwd);
@@ -314,8 +322,10 @@ fn mailbox_precedence_scenario() {
         .unwrap();
     drop(mailbox);
 
-    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_MAILBOX)
-        .expect("mailbox cwd");
+    let resolved = state
+        .resolve_resume(&models, SESSION_MAILBOX, None)
+        .unwrap();
+    let actual = resolve_resume_workspace_root(&state, &providers, &resolved).expect("mailbox cwd");
 
     assert_eq!(actual, mailbox_cwd);
     assert!(!marker.exists());
@@ -345,8 +355,10 @@ fn script_fallback_scenario() {
     let models = model_store(vec![model_config(MODEL_LOCAL, false)]);
     let providers = providers_config(&script);
 
-    let actual = resolve_resume_workspace_root(&state, &models, &providers, SESSION_FALLBACK)
-        .expect("script cwd");
+    let resolved = state
+        .resolve_resume(&models, SESSION_FALLBACK, None)
+        .unwrap();
+    let actual = resolve_resume_workspace_root(&state, &providers, &resolved).expect("script cwd");
 
     assert_eq!(actual, script_cwd);
     assert_ne!(actual, std::env::current_dir().unwrap());

@@ -54,13 +54,13 @@ fn resolve_resume_returns_active_segment_for_single_chain() {
 }
 
 #[test]
-fn resolve_resume_chooses_most_recent_chain_when_two_chains_share_session_id() {
+fn resolve_resume_classification_prefers_exact_chain_over_native_match() {
     let db = test_db();
     seed_test_chain(
         &db,
-        CHAIN_A,
-        "provider-a",
         SESSION_A,
+        "provider-a",
+        SESSION_B,
         "provider-a-opus",
         "2026-04-17T08:00:00Z",
     );
@@ -72,15 +72,104 @@ fn resolve_resume_chooses_most_recent_chain_when_two_chains_share_session_id() {
         "provider-a-opus",
         "2026-04-17T09:00:00Z",
     );
-    let models = resolver_model_store();
+    let classified = db.classify_resume_input(SESSION_A).unwrap();
 
-    let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
-
-    assert_eq!(resolved.chain_id, CHAIN_B);
+    assert_eq!(
+        classified,
+        ResumeInputMatch::ExactChain {
+            chain_id: SESSION_A.to_string()
+        }
+    );
 }
 
 #[test]
-fn resolve_resume_chooses_most_recent_chain_without_ambiguous_halt() {
+fn resolve_resume_classification_preserves_provider_scoped_native_candidates() {
+    let db = test_db();
+    seed_chain_row(&db, CHAIN_A, "provider-a-opus", "2026-04-17T08:00:00Z");
+    seed_segment_row(
+        &db,
+        CHAIN_A,
+        "provider-a",
+        SESSION_A,
+        "2026-04-17T08:00:00Z",
+        Some("2026-04-17T08:30:00Z"),
+        "initial",
+    );
+    seed_segment_row(
+        &db,
+        CHAIN_A,
+        "provider-a2",
+        SESSION_A,
+        "2026-04-17T08:31:00Z",
+        None,
+        "quota_threshold",
+    );
+    seed_test_chain(
+        &db,
+        CHAIN_B,
+        "provider-a2",
+        SESSION_A,
+        "provider-a-opus",
+        "2026-04-17T09:00:00Z",
+    );
+
+    let classified = db.classify_resume_input(SESSION_A).unwrap();
+
+    assert_eq!(
+        classified,
+        ResumeInputMatch::NativeSession {
+            candidates: vec![
+                ResumeNativeCandidate {
+                    chain_id: CHAIN_A.to_string(),
+                    matching_provider: "provider-a".to_string(),
+                },
+                ResumeNativeCandidate {
+                    chain_id: CHAIN_A.to_string(),
+                    matching_provider: "provider-a2".to_string(),
+                },
+                ResumeNativeCandidate {
+                    chain_id: CHAIN_B.to_string(),
+                    matching_provider: "provider-a2".to_string(),
+                },
+            ]
+        }
+    );
+}
+
+#[test]
+fn resolve_resume_treats_multiple_matching_segments_in_one_chain_as_one_lineage() {
+    let db = test_db();
+    seed_chain_row(&db, CHAIN_A, "provider-a-opus", "2026-04-17T09:00:00Z");
+    seed_segment_row(
+        &db,
+        CHAIN_A,
+        "provider-a",
+        SESSION_A,
+        "2026-04-17T08:00:00Z",
+        Some("2026-04-17T08:30:00Z"),
+        "initial",
+    );
+    seed_segment_row(
+        &db,
+        CHAIN_A,
+        "provider-a2",
+        SESSION_A,
+        "2026-04-17T08:31:00Z",
+        None,
+        "quota_threshold",
+    );
+
+    let resolved = db
+        .resolve_resume(&resolver_model_store(), SESSION_A, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_A);
+    assert_eq!(resolved.active_provider, "provider-a2");
+    assert_eq!(resolved.active_session_id, SESSION_A);
+}
+
+#[test]
+fn resolve_resume_rejects_multiple_native_chains_without_ordering_them() {
     let db = test_db();
     seed_test_chain(
         &db,
@@ -94,54 +183,23 @@ fn resolve_resume_chooses_most_recent_chain_without_ambiguous_halt() {
         &db,
         CHAIN_B,
         "provider-a2",
-        SESSION_A,
-        "provider-a-opus",
-        "2026-04-17T09:00:00Z",
-    );
-    seed_test_chain(
-        &db,
-        CHAIN_C,
-        "provider-a",
         SESSION_A,
         "provider-a-opus",
         "2026-04-17T10:00:00Z",
     );
     let models = resolver_model_store();
 
-    let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
+    let error = db.resolve_resume(&models, SESSION_A, None).unwrap_err();
 
-    assert_eq!(resolved.chain_id, CHAIN_C);
-}
-
-#[test]
-fn resolve_resume_breaks_equal_last_used_tie_by_latest_segment_start() {
-    let db = test_db();
-    let last_used_at = "2026-04-17T10:00:00Z";
-    seed_chain_row(&db, CHAIN_A, "provider-a-opus", last_used_at);
-    seed_segment_row(
-        &db,
-        CHAIN_A,
-        "provider-a",
-        SESSION_A,
-        "2026-04-17T08:00:00Z",
-        None,
-        "initial",
-    );
-    seed_chain_row(&db, CHAIN_B, "provider-a-opus", last_used_at);
-    seed_segment_row(
-        &db,
-        CHAIN_B,
-        "provider-a2",
-        SESSION_A,
-        "2026-04-17T09:00:00Z",
-        None,
-        "initial",
-    );
-    let models = resolver_model_store();
-
-    let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
-
-    assert_eq!(resolved.chain_id, CHAIN_B);
+    match error {
+        ResumeError::Ambiguous { input, previews } => {
+            assert_eq!(input, SESSION_A);
+            assert_eq!(previews.len(), 2);
+            assert!(previews.iter().any(|preview| preview.chain_id == CHAIN_A));
+            assert!(previews.iter().any(|preview| preview.chain_id == CHAIN_B));
+        }
+        other => panic!("expected ambiguous native resume, got {other:?}"),
+    }
 }
 
 #[test]

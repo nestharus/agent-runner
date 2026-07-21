@@ -141,7 +141,10 @@ tests.
 - `crates/oulipoly-runtime/tests/age37_lock_service_parity.rs`
 - `crates/oulipoly-runtime/tests/age37_replace_service_parity.rs`
 - `crates/oulipoly-runtime/tests/migration_service_parity.rs`
-- `crates/oulipoly-runtime/tests/resume_service_parity.rs`
+- `crates/oulipoly-runtime/tests/resume_service_parity.rs` (exact/single
+  compatibility, provider-scoped probes, ownership folding, and post-owner
+  model validation)
+- `crates/oulipoly-runtime/tests/session_metadata_resume_cwd_characterization.rs`
 - `crates/oulipoly-runtime/tests/session_ownership.rs` (public `session_metadata` ownership capability compile/use contract)
 - `crates/oulipoly-runtime/tests/session_lifecycle_service.rs`
 - `crates/oulipoly-runtime/src/session_metadata/ownership.rs` (colocated `session_ownership_*` membership, cwd-independence, conclusive-negative, malformed-output, missing-storage, and script-failure cases)
@@ -165,6 +168,7 @@ tests.
 - `src-tauri/tests/s11_m2_session_ownership_migration.rs`
 - `src-tauri/tests/session_lock_cross_platform.rs`
 - `src-tauri/tests/session_metadata_component.rs`
+- `src-tauri/tests/opencode_resume_storage_migration_rca.rs`
 - `src-tauri/tests/session_migration_rca/rc1_cwd_project_dir_mismatch.rs`
 - `src-tauri/tests/structural_segmentation.rs`
 

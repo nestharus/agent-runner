@@ -1,6 +1,6 @@
 //! formatter
 
-use oulipoly_runtime::services::RotationFailedReason;
+use oulipoly_runtime::services::{RotationFailedReason, ServiceError};
 
 pub(super) fn emit_stderr(message: &str) {
     eprintln!("{message}");
@@ -33,4 +33,16 @@ pub(super) fn rotation_failed_reason(reason: &RotationFailedReason) -> String {
             format!("cannot rotate: session-active provider \"{active}\" is not in the model pool")
         }
     }
+}
+
+pub(super) fn migration_dependency_failure(message: &str) -> String {
+    format!("migration failed: {message}")
+}
+
+pub(super) fn migration_service_failure(error: &ServiceError) -> String {
+    format!("migration service failed: {error}")
+}
+
+pub(super) fn resume_service_failure(error: &str) -> String {
+    format!("resume service failed: {error}")
 }

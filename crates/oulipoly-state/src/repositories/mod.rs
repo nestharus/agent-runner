@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `mapper`, `validator`, `orchestration`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 //!
 //! ## Intrinsic-surface declarations
 //!
@@ -21,8 +21,8 @@ use crate::schema_probe::{self, SchemaProbeReport};
 use crate::{
     AccountRecord, ChainPreview, CliProviderRecord, DbError, DiscoveredModel, InvocationRecord,
     InvocationStart, InvocationStatus, ModelParameter, ModelStore, ProviderRecord, QuotaRecord,
-    QuotaWindow, QuotaWindowInput, ResolvedResume, ResumeError, SessionTurnCounts,
-    SessionTurnIngest, StateDb,
+    QuotaWindow, QuotaWindowInput, ResolvedResume, ResumeError, ResumeInputMatch,
+    SessionTurnCounts, SessionTurnIngest, StateDb,
 };
 use chrono::{DateTime, Utc};
 use oulipoly_core::TransitionReason;
@@ -83,12 +83,8 @@ pub trait InvocationRepository {
 impl InvocationRepository for StateDb {
     fn start_invocation(&self, start: InvocationStart) -> Result<InvocationRecord, String> {
         StateDb::start_invocation(self, &start)?;
-        StateDb::get_invocation_by_uuid(self, &start.invocation_uuid)?.ok_or_else(|| {
-            format!(
-                "Invocation {} not found after insert",
-                start.invocation_uuid
-            )
-        })
+        StateDb::get_invocation_by_uuid(self, &start.invocation_uuid)?
+            .ok_or_else(|| format_invocation_missing_after_insert(&start.invocation_uuid))
     }
 
     fn finalize_invocation(
@@ -99,18 +95,9 @@ impl InvocationRepository for StateDb {
         error_category: Option<&str>,
         terminal_reason: Option<&str>,
     ) -> Result<(), String> {
-        let record = StateDb::get_invocation_by_uuid(self, invocation_uuid)?
-            .ok_or_else(|| format!("Invocation {invocation_uuid} not found"))?;
-        let success = match status {
-            InvocationStatus::Succeeded => true,
-            InvocationStatus::Failed => false,
-            InvocationStatus::Running | InvocationStatus::Legacy => {
-                return Err(format!(
-                    "Invocation {invocation_uuid} cannot be finalized with status {}",
-                    status.as_str()
-                ));
-            }
-        };
+        let record = require_invocation(self, invocation_uuid)?;
+        validate_terminal_invocation_status(invocation_uuid, status)?;
+        let success = map_terminal_invocation_success(status);
         StateDb::finalize_invocation(
             self,
             record.id,
@@ -127,8 +114,7 @@ impl InvocationRepository for StateDb {
         session_id: Option<&str>,
         method: &str,
     ) -> Result<(), String> {
-        let record = StateDb::get_invocation_by_uuid(self, invocation_uuid)?
-            .ok_or_else(|| format!("Invocation {invocation_uuid} not found"))?;
+        let record = require_invocation(self, invocation_uuid)?;
         StateDb::update_session_capture(self, record.id, session_id, method)
     }
 
@@ -138,8 +124,7 @@ impl InvocationRepository for StateDb {
         status: &str,
         evidence: Option<&str>,
     ) -> Result<(), String> {
-        let record = StateDb::get_invocation_by_uuid(self, invocation_uuid)?
-            .ok_or_else(|| format!("Invocation {invocation_uuid} not found"))?;
+        let record = require_invocation(self, invocation_uuid)?;
         StateDb::update_resume_acceptance(self, record.id, status, evidence)
     }
 
@@ -148,10 +133,39 @@ impl InvocationRepository for StateDb {
     }
 
     fn list_invocation_children(&self, parent_uuid: &str) -> Result<Vec<InvocationRecord>, String> {
-        let parent = StateDb::get_invocation_by_uuid(self, parent_uuid)?
-            .ok_or_else(|| format!("Invocation {parent_uuid} not found"))?;
+        let parent = require_invocation(self, parent_uuid)?;
         StateDb::list_invocation_children(self, parent.id)
     }
+}
+
+fn format_invocation_missing_after_insert(invocation_uuid: &str) -> String {
+    format!("Invocation {invocation_uuid} not found after insert")
+}
+
+fn format_invocation_not_found(invocation_uuid: &str) -> String {
+    format!("Invocation {invocation_uuid} not found")
+}
+
+fn require_invocation(db: &StateDb, invocation_uuid: &str) -> Result<InvocationRecord, String> {
+    StateDb::get_invocation_by_uuid(db, invocation_uuid)?
+        .ok_or_else(|| format_invocation_not_found(invocation_uuid))
+}
+
+fn validate_terminal_invocation_status(
+    invocation_uuid: &str,
+    status: InvocationStatus,
+) -> Result<(), String> {
+    match status {
+        InvocationStatus::Succeeded | InvocationStatus::Failed => Ok(()),
+        InvocationStatus::Running | InvocationStatus::Legacy => Err(format!(
+            "Invocation {invocation_uuid} cannot be finalized with status {}",
+            status.as_str()
+        )),
+    }
+}
+
+fn map_terminal_invocation_success(status: InvocationStatus) -> bool {
+    matches!(status, InvocationStatus::Succeeded)
 }
 
 /// Read-only provider facts consumed by routing.
@@ -472,6 +486,13 @@ impl SessionChainRepository for StateDb {
 
 /// Resume resolution read repository.
 pub trait ResumeRepository {
+    fn classify_resume_input(&self, input: &str) -> Result<ResumeInputMatch, ResumeError>;
+    fn resolve_resume_chain(
+        &self,
+        models: &ModelStore,
+        chain_id: &str,
+        model_override: Option<&str>,
+    ) -> Result<ResolvedResume, ResumeError>;
     fn resolve_resume(
         &self,
         models: &ModelStore,
@@ -487,6 +508,19 @@ pub trait ResumeRepository {
 }
 
 impl ResumeRepository for StateDb {
+    fn classify_resume_input(&self, input: &str) -> Result<ResumeInputMatch, ResumeError> {
+        StateDb::classify_resume_input(self, input)
+    }
+
+    fn resolve_resume_chain(
+        &self,
+        models: &ModelStore,
+        chain_id: &str,
+        model_override: Option<&str>,
+    ) -> Result<ResolvedResume, ResumeError> {
+        StateDb::resolve_resume_chain(self, models, chain_id, model_override)
+    }
+
     fn resolve_resume(
         &self,
         models: &ModelStore,
@@ -631,17 +665,46 @@ impl ProductionStateDbOpenerState {
     }
 
     pub fn with_deployment_aware_opener(opener: DeploymentAwareOpener) -> Self {
-        let token = NEXT_DEPLOYMENT_AWARE_OPENER_TOKEN
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("deployment-aware opener token counter exhausted");
-        DEPLOYMENT_AWARE_OPENER.with(|slot| {
-            *slot.borrow_mut() = Some(DeploymentAwareOpenerSlot { token, opener });
-        });
+        let token = next_deployment_aware_opener_token();
+        install_deployment_aware_opener(token, opener);
         Self {
-            registration: Some(Arc::new(DeploymentAwareOpenerRegistration { token })),
+            registration: Some(deployment_aware_opener_registration(token)),
         }
+    }
+}
+
+fn next_deployment_aware_opener_token() -> usize {
+    NEXT_DEPLOYMENT_AWARE_OPENER_TOKEN
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("deployment-aware opener token counter exhausted")
+}
+
+fn install_deployment_aware_opener(token: usize, opener: DeploymentAwareOpener) {
+    DEPLOYMENT_AWARE_OPENER.with(|slot| {
+        *slot.borrow_mut() = Some(DeploymentAwareOpenerSlot { token, opener });
+    });
+}
+
+fn deployment_aware_opener_registration(token: usize) -> Arc<DeploymentAwareOpenerRegistration> {
+    Arc::new(DeploymentAwareOpenerRegistration { token })
+}
+
+fn deployment_aware_opener_cleanup_is_eligible(
+    registration: &Arc<DeploymentAwareOpenerRegistration>,
+    slot: Option<&DeploymentAwareOpenerSlot>,
+) -> bool {
+    Arc::strong_count(registration) == 1
+        && slot.is_some_and(|current| current.token == registration.token)
+}
+
+fn clear_deployment_aware_opener_if_eligible(
+    slot: &mut Option<DeploymentAwareOpenerSlot>,
+    registration: &Arc<DeploymentAwareOpenerRegistration>,
+) {
+    if deployment_aware_opener_cleanup_is_eligible(registration, slot.as_ref()) {
+        *slot = None;
     }
 }
 
@@ -651,18 +714,9 @@ impl Drop for ProductionStateDbOpenerState {
             return;
         };
 
-        if Arc::strong_count(registration) > 1 {
-            return;
-        }
-
         DEPLOYMENT_AWARE_OPENER.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if slot
-                .as_ref()
-                .is_some_and(|current| current.token == registration.token)
-            {
-                *slot = None;
-            }
+            clear_deployment_aware_opener_if_eligible(&mut slot, registration);
         });
     }
 }
