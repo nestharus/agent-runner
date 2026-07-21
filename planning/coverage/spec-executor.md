@@ -165,7 +165,7 @@ SIGINT/SIGTERM paths, stdout/stderr capture tests.
 - `src-tauri/tests/scripts/claude_code_turns_body.rs`
 - `src-tauri/tests/scripts/codex_turns_body.rs`
 - `src-tauri/tests/scripts.rs`
-- `src-tauri/tests/cwd_scripts.rs` (`opencode_cwd_*` public-export selection, identity, XDG/stdin isolation, classification, timeout, stdout/stderr bounds, sensitive-output suppression, and descendant-cleanup cases)
+- `src-tauri/tests/cwd_scripts.rs` (`opencode_cwd_*` public-export selection, identity, XDG/stdin isolation, classification, timeout, selector-failure cleanup, stdout/stderr bounds, sensitive-output suppression, and descendant-cleanup cases)
 
 ## Cross-references
 

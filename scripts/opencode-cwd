@@ -61,8 +61,10 @@ def select_command(override, base_dir):
 
 
 def parse_integer(value, default):
+    if value is None:
+        return default
     try:
-        return int(value) if value is not None else default
+        return int(value)
     except ValueError:
         return default
 
@@ -122,10 +124,18 @@ def map_capture_streams(process, stdout_limit, stderr_limit):
 
 def register_capture_streams(streams):
     selector = selectors.DefaultSelector()
+    try:
+        register_capture_stream_entries(selector, streams)
+    except (OSError, ValueError, KeyError):
+        selector.close()
+        raise
+    return selector
+
+
+def register_capture_stream_entries(selector, streams):
     for file_descriptor in streams:
         os.set_blocking(file_descriptor, False)
         selector.register(file_descriptor, selectors.EVENT_READ)
-    return selector
 
 
 def map_capture_state(streams):
@@ -216,10 +226,28 @@ def capture_export(process, limits):
     state = map_capture_state(streams)
     stream_outputs = map_stream_outputs(streams)
     deadline = time.monotonic() + timeout_ms / 1000
+    try:
+        run_capture_loop(process, selector, state, deadline)
+        return map_capture_result(process, state, stream_outputs)
+    finally:
+        selector.close()
+
+
+def run_capture_loop(process, selector, state, deadline):
     while not state["finished"]:
         capture_step(process, selector, state, deadline)
-    selector.close()
-    return map_capture_result(process, state, stream_outputs)
+
+
+def capture_export_safely(process, limits):
+    try:
+        return capture_export(process, limits)
+    except (OSError, ValueError, KeyError):
+        terminate_process_group(process)
+        return map_capture_failure("opencode_export_capture_failed")
+
+
+def map_capture_failure(reason):
+    return reason, None, b"", b""
 
 
 def map_capture_result(process, state, stream_outputs):
@@ -340,7 +368,9 @@ def resolve_response(argv, environ):
     )
     if error is not None:
         return indeterminate_response(error)
-    result, status, stdout, stderr = capture_export(process, parse_limits(environ))
+    result, status, stdout, stderr = capture_export_safely(
+        process, parse_limits(environ)
+    )
     if result != "completed":
         return indeterminate_response(result)
     decoded_stdout, decoded_stderr, error = decode_execution(stdout, stderr)

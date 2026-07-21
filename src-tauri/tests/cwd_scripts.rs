@@ -127,12 +127,9 @@ impl OpenCodeFixture {
         }
     }
 
-    fn command(&self, opencode_bin: Option<&OsStr>) -> Command {
+    fn isolated_python_command(&self, opencode_bin: Option<&OsStr>) -> Command {
         let mut command = Command::new(python3());
         command
-            .arg(scripts_dir().join("opencode-cwd"))
-            .arg(&self.base_dir)
-            .arg(SESSION_ID)
             .env_clear()
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
@@ -145,6 +142,15 @@ impl OpenCodeFixture {
         if let Some(opencode_bin) = opencode_bin {
             command.env("OPENCODE_BIN", opencode_bin);
         }
+        command
+    }
+
+    fn command(&self, opencode_bin: Option<&OsStr>) -> Command {
+        let mut command = self.isolated_python_command(opencode_bin);
+        command
+            .arg(scripts_dir().join("opencode-cwd"))
+            .arg(&self.base_dir)
+            .arg(SESSION_ID);
         command
     }
 
@@ -639,6 +645,72 @@ wait
     assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
     fixture.assert_selected_xdg_observed();
     assert_indeterminate(&output, "opencode_export_timeout");
+    let child_pid: u32 = fs::read_to_string(child_pid_path).unwrap().parse().unwrap();
+    let descendant_pid: u32 = fs::read_to_string(descendant_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until_process_is_gone(child_pid);
+    wait_until_process_is_gone(descendant_pid);
+}
+
+#[test]
+fn opencode_cwd_capture_failure_closes_selector_and_kills_descendants() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("capture-failure");
+    let child_pid_path = fixture._temp.path().join("capture-child-pid");
+    let descendant_pid_path = fixture._temp.path().join("capture-descendant-pid");
+    let selector_closed_path = fixture._temp.path().join("selector-closed");
+    write_fake_export(
+        &fake,
+        r#"printf '%s' "$$" > "$CHILD_PID_FILE"
+/bin/sleep 30 &
+printf '%s' "$!" > "$DESCENDANT_PID_FILE"
+wait
+"#,
+    );
+    let harness = r#"
+import os
+import runpy
+import selectors
+import sys
+import time
+
+class FailingSelector:
+    def register(self, *_args):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if os.path.exists(os.environ["CHILD_PID_FILE"]) and os.path.exists(os.environ["DESCENDANT_PID_FILE"]):
+                break
+            time.sleep(0.01)
+        raise OSError("injected selector failure")
+
+    def close(self):
+        with open(os.environ["SELECTOR_CLOSED_FILE"], "w", encoding="utf-8") as marker:
+            marker.write("closed")
+
+selectors.DefaultSelector = FailingSelector
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"#;
+    let started = Instant::now();
+    let output = fixture
+        .isolated_python_command(Some(fake.as_os_str()))
+        .arg("-c")
+        .arg(harness)
+        .arg(scripts_dir().join("opencode-cwd"))
+        .arg(&fixture.base_dir)
+        .arg(SESSION_ID)
+        .env("CHILD_PID_FILE", &child_pid_path)
+        .env("DESCENDANT_PID_FILE", &descendant_pid_path)
+        .env("SELECTOR_CLOSED_FILE", &selector_closed_path)
+        .output()
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
+    fixture.assert_selected_xdg_observed();
+    assert_indeterminate(&output, "opencode_export_capture_failed");
+    assert_eq!(fs::read_to_string(selector_closed_path).unwrap(), "closed");
     let child_pid: u32 = fs::read_to_string(child_pid_path).unwrap().parse().unwrap();
     let descendant_pid: u32 = fs::read_to_string(descendant_pid_path)
         .unwrap()
