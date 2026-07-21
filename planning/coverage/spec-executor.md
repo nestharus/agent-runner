@@ -87,6 +87,7 @@
 - `crates/oulipoly-runtime/src/executor/providers/codex.rs`
 - `crates/oulipoly-runtime/src/executor/providers/mod.rs`
 - `crates/oulipoly-runtime/src/executor/providers/openai_compat.rs`
+- `scripts/opencode-cwd`
 
 ## Preconditions
 
@@ -164,7 +165,7 @@ SIGINT/SIGTERM paths, stdout/stderr capture tests.
 - `src-tauri/tests/scripts/claude_code_turns_body.rs`
 - `src-tauri/tests/scripts/codex_turns_body.rs`
 - `src-tauri/tests/scripts.rs`
-- `src-tauri/tests/cwd_scripts.rs`
+- `src-tauri/tests/cwd_scripts.rs` (`opencode_cwd_*` public-export selection, identity, isolation, classification, timeout, descendant-cleanup, and output-bound cases)
 
 ## Cross-references
 

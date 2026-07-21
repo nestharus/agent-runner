@@ -1,62 +1,372 @@
 #!/usr/bin/env python3
-"""Resolve an OpenCode session id to its original cwd from opencode.db."""
+"""Resolve OpenCode storage membership and cwd through its public export CLI."""
 
 import json
-import sqlite3
+import os
+import re
+import selectors
+import shlex
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 
-def emit(value: dict) -> int:
-    print(json.dumps(value, separators=(",", ":")))
+DEFAULT_TIMEOUT_MS = 10_000
+DEFAULT_STDOUT_LIMIT = 16 * 1024 * 1024
+DEFAULT_STDERR_LIMIT = 64 * 1024
+READ_CHUNK_SIZE = 64 * 1024
+
+
+def validate_argv(argv):
+    if len(argv) != 3:
+        return "opencode_invalid_request"
+    if not argv[1].strip() or not argv[2]:
+        return "opencode_invalid_request"
+    return None
+
+
+def map_request(argv):
+    base_dir = Path(os.path.abspath(os.path.expanduser(argv[1])))
+    return base_dir, argv[2], str(base_dir.parent)
+
+
+def parse_override(value):
+    if value is None or not value.strip():
+        return None, None
+    try:
+        command = shlex.split(value)
+    except ValueError:
+        return None, "opencode_bin_invalid"
+    if not command:
+        return None, "opencode_bin_invalid"
+    return command, None
+
+
+def map_numbered_component(component, current):
+    match = re.fullmatch(r"\.opencode([0-9]+)", component)
+    return f"opencode{match.group(1)}" if match else current
+
+
+def default_command(base_dir):
+    executable = "opencode"
+    for component in base_dir.parts:
+        executable = map_numbered_component(component, executable)
+    return [executable]
+
+
+def select_command(override, base_dir):
+    return override if override is not None else default_command(base_dir)
+
+
+def parse_integer(value, default):
+    try:
+        return int(value) if value is not None else default
+    except ValueError:
+        return default
+
+
+def validate_limit(value, default, minimum):
+    return max(minimum, min(value, default))
+
+
+def parse_bounded_integer(value, default, minimum):
+    return validate_limit(parse_integer(value, default), default, minimum)
+
+
+def parse_limits(environ):
+    timeout_ms = parse_bounded_integer(
+        environ.get("OPENCODE_CWD_TIMEOUT_MS"), DEFAULT_TIMEOUT_MS, 50
+    )
+    stdout_limit = parse_bounded_integer(
+        environ.get("OPENCODE_CWD_STDOUT_LIMIT_BYTES"), DEFAULT_STDOUT_LIMIT, 256
+    )
+    stderr_limit = parse_bounded_integer(
+        environ.get("OPENCODE_CWD_STDERR_LIMIT_BYTES"), DEFAULT_STDERR_LIMIT, 256
+    )
+    return timeout_ms, stdout_limit, stderr_limit
+
+
+def export_argv(command, session_id):
+    return [*command, "export", session_id]
+
+
+def child_environment(environ, data_home):
+    child_env = dict(environ)
+    child_env["XDG_DATA_HOME"] = data_home
+    return child_env
+
+
+def spawn_export(argv, child_env):
+    try:
+        process = subprocess.Popen(
+            argv,
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return None, "opencode_export_spawn_failed"
+    return process, None
+
+
+def map_capture_streams(process, stdout_limit, stderr_limit):
+    return {
+        process.stdout.fileno(): ("stdout", bytearray(), stdout_limit),
+        process.stderr.fileno(): ("stderr", bytearray(), stderr_limit),
+    }
+
+
+def register_capture_streams(streams):
+    selector = selectors.DefaultSelector()
+    for file_descriptor in streams:
+        os.set_blocking(file_descriptor, False)
+        selector.register(file_descriptor, selectors.EVENT_READ)
+    return selector
+
+
+def map_capture_state(streams):
+    return {"streams": streams, "error": None, "finished": False}
+
+
+def map_stream_outputs(streams):
+    return {name: output for name, output, _ in streams.values()}
+
+
+def read_stream_chunk(file_descriptor, remaining):
+    try:
+        return os.read(file_descriptor, min(READ_CHUNK_SIZE, remaining + 1))
+    except BlockingIOError:
+        return None
+
+
+def close_capture_stream(selector, file_descriptor, state):
+    selector.unregister(file_descriptor)
+    del state["streams"][file_descriptor]
+
+
+def validate_stream_chunk(stream_name, remaining, chunk):
+    if len(chunk) > remaining:
+        return f"opencode_export_{stream_name}_limit"
+    return None
+
+
+def append_stream_chunk(output, chunk):
+    output.extend(chunk)
+
+
+def read_stream(selector, file_descriptor, state):
+    stream_name, output, limit = state["streams"][file_descriptor]
+    remaining = limit - len(output)
+    chunk = read_stream_chunk(file_descriptor, remaining)
+    if chunk is None:
+        return
+    if not chunk:
+        close_capture_stream(selector, file_descriptor, state)
+        return
+    error = validate_stream_chunk(stream_name, remaining, chunk)
+    if error is not None:
+        state["error"] = error
+        return
+    append_stream_chunk(output, chunk)
+
+
+def terminate_process_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def map_failed_capture_state(state, reason):
+    state["error"] = reason
+    state["finished"] = True
+
+
+def capture_step(process, selector, state, deadline):
+    if time.monotonic() >= deadline:
+        terminate_process_group(process)
+        map_failed_capture_state(state, "opencode_export_timeout")
+        return
+    timeout = max(0, min(0.05, deadline - time.monotonic()))
+    events = selector.select(timeout=timeout)
+    for key, _ in events:
+        read_stream(selector, key.fd, state)
+    if state["error"] is not None:
+        terminate_process_group(process)
+        map_failed_capture_state(state, state["error"])
+        return
+    if process.poll() is not None and not state["streams"]:
+        process.wait()
+        state["finished"] = True
+
+
+def capture_export(process, limits):
+    timeout_ms, stdout_limit, stderr_limit = limits
+    streams = map_capture_streams(process, stdout_limit, stderr_limit)
+    selector = register_capture_streams(streams)
+    state = map_capture_state(streams)
+    stream_outputs = map_stream_outputs(streams)
+    deadline = time.monotonic() + timeout_ms / 1000
+    while not state["finished"]:
+        capture_step(process, selector, state, deadline)
+    selector.close()
+    return map_capture_result(process, state, stream_outputs)
+
+
+def map_capture_result(process, state, stream_outputs):
+    if state["error"] is not None:
+        return state["error"], None, b"", b""
+    return (
+        "completed",
+        process.returncode,
+        bytes(stream_outputs["stdout"]),
+        bytes(stream_outputs["stderr"]),
+    )
+
+
+def decode_output(output):
+    try:
+        return output.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "opencode_export_invalid_utf8"
+
+
+def decode_execution(stdout, stderr):
+    decoded_stdout, error = decode_output(stdout)
+    if error is not None:
+        return None, None, error
+    decoded_stderr, error = decode_output(stderr)
+    return decoded_stdout, decoded_stderr, error
+
+
+def classify_producer_result(status, stdout, stderr, raw_stdout):
+    if status == 0:
+        return "exported"
+    if status == 1 and not raw_stdout and stderr.strip() == "Session not found":
+        return "not_owned"
+    if status is not None and status < 0:
+        return "opencode_export_signal"
+    return "opencode_export_exit_failure"
+
+
+def parse_export(stdout):
+    try:
+        return json.loads(stdout), None
+    except (json.JSONDecodeError, TypeError):
+        return None, "opencode_export_malformed_json"
+
+
+def validate_export_identity(export, session_id):
+    if not isinstance(export, dict):
+        return None, "opencode_export_invalid_shape"
+    info = export.get("info")
+    if not isinstance(info, dict):
+        return None, "opencode_export_invalid_info"
+    exported_id = info.get("id")
+    if not isinstance(exported_id, str):
+        return None, "opencode_export_invalid_identity"
+    if exported_id != session_id:
+        return None, "opencode_export_identity_mismatch"
+    return info, None
+
+
+def validate_cwd(info):
+    if "directory" not in info:
+        return None, "opencode_missing_cwd"
+    cwd = info["directory"]
+    if not isinstance(cwd, str):
+        return None, "opencode_cwd_not_string"
+    if not cwd:
+        return None, "opencode_missing_cwd"
+    path = Path(cwd)
+    if not path.is_absolute():
+        return None, "opencode_cwd_not_absolute"
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        return None, "opencode_cwd_missing"
+    except (OSError, RuntimeError):
+        return None, "opencode_cwd_canonicalize_failed"
+    if not resolved.is_dir():
+        return None, "opencode_cwd_not_directory"
+    return str(resolved), None
+
+
+def indeterminate_response(error):
+    return {"found": False, "error": error}
+
+
+def not_owned_response():
+    return {"owned": False, "found": False}
+
+
+def owned_without_cwd_response(error):
+    return {"owned": True, "found": False, "error": error}
+
+
+def owned_cwd_response(cwd):
+    return {"owned": True, "found": True, "cwd": cwd}
+
+
+def format_response(response):
+    return json.dumps(response, separators=(",", ":"))
+
+
+def emit_response(response):
+    print(format_response(response))
     return 0
 
 
-def main() -> int:
-    if len(sys.argv) != 3:
-        return emit({"found": False, "error": "usage: opencode-cwd BASE_DIR SESSION_ID"})
+def resolve_response(argv, environ):
+    error = validate_argv(argv)
+    if error is not None:
+        return indeterminate_response(error)
+    base_dir, session_id, data_home = map_request(argv)
+    override, error = parse_override(environ.get("OPENCODE_BIN"))
+    if error is not None:
+        return indeterminate_response(error)
+    command = select_command(override, base_dir)
+    process, error = spawn_export(
+        export_argv(command, session_id), child_environment(environ, data_home)
+    )
+    if error is not None:
+        return indeterminate_response(error)
+    result, status, stdout, stderr = capture_export(process, parse_limits(environ))
+    if result != "completed":
+        return indeterminate_response(result)
+    decoded_stdout, decoded_stderr, error = decode_execution(stdout, stderr)
+    if error is not None:
+        return indeterminate_response(error)
+    producer_result = classify_producer_result(
+        status, decoded_stdout, decoded_stderr, stdout
+    )
+    if producer_result == "not_owned":
+        return not_owned_response()
+    if producer_result != "exported":
+        return indeterminate_response(producer_result)
+    export, error = parse_export(decoded_stdout)
+    if error is not None:
+        return indeterminate_response(error)
+    info, error = validate_export_identity(export, session_id)
+    if error is not None:
+        return indeterminate_response(error)
+    cwd, error = validate_cwd(info)
+    if error is not None:
+        return owned_without_cwd_response(error)
+    return owned_cwd_response(cwd)
 
-    base = Path(sys.argv[1]).expanduser()
-    session_id = sys.argv[2]
-    db_path = base / "opencode.db"
-    if not db_path.is_file():
-        return emit({"found": False})
 
-    try:
-        directory = session_directory(db_path, session_id)
-    except sqlite3.Error as exc:
-        return emit({"found": False, "error": f"opencode_db_query_failed: {exc}"})
-
-    if directory is None:
-        return emit({"found": False})
-    return emit_valid_cwd(directory)
-
-
-def session_directory(db_path: Path, session_id: str) -> str | None:
-    uri = db_path.resolve(strict=False).as_uri() + "?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
-        row = conn.execute(
-            "SELECT directory FROM session WHERE id = ? LIMIT 1",
-            (session_id,),
-        ).fetchone()
-    if row is None:
-        return None
-    return row[0]
-
-
-def emit_valid_cwd(cwd: str) -> int:
-    if not isinstance(cwd, str) or not cwd:
-        return emit({"found": False, "error": "opencode_missing_cwd"})
-    path = Path(cwd)
-    if not path.is_absolute():
-        return emit({"found": False, "error": f"opencode_cwd_not_absolute: {cwd}"})
-    if not path.exists():
-        return emit({"found": False, "error": f"opencode_cwd_missing: {cwd}"})
-    try:
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        return emit({"found": False, "error": f"opencode_cwd_canonicalize_failed: {cwd}: {exc}"})
-    return emit({"found": True, "cwd": str(resolved)})
+def main():
+    return emit_response(resolve_response(sys.argv, os.environ))
 
 
 if __name__ == "__main__":

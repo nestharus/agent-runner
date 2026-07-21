@@ -1,5 +1,5 @@
 //! ## Declared roles
-//! accessor, formatter, mapper, parser, validator
+//! accessor, formatter, mapper, orchestration, parser, validator
 //!
 //! Workspace-root resolution from the configured session storage cwd script.
 //!
@@ -58,8 +58,7 @@ fn cwd_script(session_storage: &SessionStorage) -> String {
 fn single_cwd_stdout_line(stdout: &str) -> Result<&str, String> {
     let trimmed = trim_stdout_lines(stdout);
     let lines = nonempty_lines(trimmed);
-    validate_single_cwd_line_count(&lines)?;
-    Ok(lines[0])
+    validate_single_cwd_line_count(&lines)
 }
 
 fn trim_stdout_lines(stdout: &str) -> Vec<&str> {
@@ -70,10 +69,10 @@ fn nonempty_lines(lines: Vec<&str>) -> Vec<&str> {
     lines.into_iter().filter(|line| !line.is_empty()).collect()
 }
 
-fn validate_single_cwd_line_count(lines: &[&str]) -> Result<(), String> {
+fn validate_single_cwd_line_count<'a>(lines: &[&'a str]) -> Result<&'a str, String> {
     match lines {
         [] => Err(cwd_empty_stdout_reason()),
-        [_] => Ok(()),
+        [line] => Ok(line),
         _ => Err(cwd_multiline_stdout_reason()),
     }
 }
@@ -158,7 +157,7 @@ fn run_cwd_script(script: &str, session_id: &str) -> Result<String, String> {
     run_session_id_script(script, session_id, "cwd_script")
 }
 
-fn run_session_id_script(
+pub(super) fn run_session_id_script(
     script: &str,
     session_id: &str,
     script_kind: &str,

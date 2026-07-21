@@ -51,6 +51,7 @@ mod ids;
 mod locator;
 mod metadata_shape;
 mod mutability;
+mod ownership;
 mod registry;
 mod resume;
 #[cfg(test)]
@@ -64,6 +65,7 @@ pub use locator::{
     TranscriptRequest, TranscriptScriptLocator, UnsupportedStorageReason, locator_error_to_stem,
     unsupported_storage_reason_to_stem,
 };
+pub use ownership::{SessionOwnership, resolve_session_ownership};
 pub use registry::{
     TranscriptLocatorEntry, TranscriptLocatorRegistry, discover_transcript_locator_registry,
     hydrate_transcript_locator_registry,

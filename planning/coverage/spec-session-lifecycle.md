@@ -16,6 +16,7 @@
 - `crates/oulipoly-runtime/src/session_metadata/locator/codex.rs`
 - `crates/oulipoly-runtime/src/session_metadata/metadata_shape.rs`
 - `crates/oulipoly-runtime/src/session_metadata/mutability.rs`
+- `crates/oulipoly-runtime/src/session_metadata/ownership.rs`
 - `crates/oulipoly-runtime/src/session_metadata/registry.rs`
 - `crates/oulipoly-runtime/src/session_metadata/resume.rs`
 - `crates/oulipoly-runtime/src/session_metadata/tests.rs`
@@ -142,6 +143,7 @@ tests.
 - `crates/oulipoly-runtime/tests/migration_service_parity.rs`
 - `crates/oulipoly-runtime/tests/resume_service_parity.rs`
 - `crates/oulipoly-runtime/tests/session_lifecycle_service.rs`
+- `crates/oulipoly-runtime/src/session_metadata/ownership.rs` (colocated `session_ownership_*` membership, cwd-independence, conclusive-negative, malformed-output, missing-storage, and script-failure cases)
 - `src-tauri/tests/age67_opencode_resume.rs`
 - `src-tauri/tests/age100_one_shot_quota_migration.rs`
 - `src-tauri/tests/age100_resume_quota_migration.rs`

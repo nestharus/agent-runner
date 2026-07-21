@@ -267,6 +267,11 @@ knowledge.
   ```json
   {"found":false,"error":"<message>"}
   ```
+- Storage adapters may additionally emit `"owned": true|false`. This field
+  answers whether the provider storage contains the session ID and is
+  independent of cwd usability: `owned:true` can accompany `found:false` and a
+  cwd-specific error. `owned:false` is conclusive only when no error is
+  present. Missing `owned` remains valid for cwd lookup.
 - Returns 0 when it emitted a contract response. Non-zero exit is treated as
   adapter failure and the runner falls back to the caller cwd.
 
@@ -293,3 +298,12 @@ migrated to `kind = "script"` with a synthetic `cwd_script` on load.
 |---|---|
 | `claude-code-cwd BASE` | Finds `<session_id>.jsonl` under `BASE` project dirs and decodes the project directory name by replacing `-` with `/` |
 | `codex-cwd BASE` | Finds `rollout-*-<session_id>.jsonl` and reads `payload.cwd` from the first JSONL line |
+| `opencode-cwd BASE` | Runs the producer-owned `opencode export <session-id>` command with `XDG_DATA_HOME` set to the parent of `BASE`; validates matching `info.id` before reporting ownership, then validates `info.directory` for cwd use |
+
+The bundled OpenCode adapter is tested against this minimum producer shape:
+exit `0` with one JSON object containing matching string `info.id` and an
+`info.directory` value, or exit `1` with empty stdout and stderr whose trimmed
+value is exactly `Session not found`. `BASE` must be the selected account's
+`<XDG_DATA_HOME>/opencode` directory. Account wrappers selected through
+`OPENCODE_BIN` must preserve the adapter-supplied `XDG_DATA_HOME`; the override
+is parsed as an argv prefix and is never evaluated by a shell.
