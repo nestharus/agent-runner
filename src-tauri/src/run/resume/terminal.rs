@@ -52,6 +52,8 @@ pub(super) fn handle_resume_attempt_result(
         &bound_attempt.zero_turn_baseline,
         result,
     );
+    let submitted_turn_confirmation = wake::validate_submitted_user_turn(input, result);
+    wake::project_validated_submitted_turn_acceptance(result, submitted_turn_confirmation);
     record_resume_acceptance_if_present(input, bound_attempt.attempt.invocation_row_id, result)?;
     emit_captured_child_marker_lines(&result.captured_child_invocations);
     handle_resume_attempt_terminal_signal(
@@ -62,6 +64,7 @@ pub(super) fn handle_resume_attempt_result(
         result,
         zero_turn_action,
         recovered_generic_nonzero,
+        submitted_turn_confirmation,
     )
 }
 
@@ -102,6 +105,7 @@ fn handle_resume_attempt_terminal_signal(
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
     recovered_generic_nonzero: bool,
+    submitted_turn_confirmation: Option<wake::ValidatedSubmittedUserTurn>,
 ) -> Result<ResumeAttemptLoopControl, String> {
     let terminal_signal_disposition = terminal_signal_disposition_for_result(
         &input.env.state,
@@ -141,6 +145,7 @@ fn handle_resume_attempt_terminal_signal(
         result,
         zero_turn_action,
         recovered_generic_nonzero,
+        submitted_turn_confirmation,
     );
     if let Some(control) = wake::handle_unconfirmed_mailbox_delivery_if_needed(
         input,
@@ -150,6 +155,7 @@ fn handle_resume_attempt_terminal_signal(
         result,
         zero_turn_action,
         recovered_generic_nonzero,
+        submitted_turn_confirmation,
     )? {
         return Ok(control);
     }

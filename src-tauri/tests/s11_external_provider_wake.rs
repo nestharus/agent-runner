@@ -126,6 +126,23 @@ impl Fixture {
         self.run(cmd)
     }
 
+    fn run_resume_with_env(&self, prompt: &str, envs: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(runner_bin());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.arg("resume")
+            .arg("--models-dir")
+            .arg(&self.models_dir)
+            .arg("--model")
+            .arg(MODEL)
+            .arg("--session-id")
+            .arg(SESSION)
+            .arg("--prompt")
+            .arg(prompt);
+        self.run(cmd)
+    }
+
     fn write_external_provider(&self) {
         let provider_path = self.write_external_provider_script();
         let turn_script_path = self.write_turn_script();
@@ -204,6 +221,21 @@ turn_script = {}
                 "SELECT COUNT(*) FROM invocations WHERE finished_at IS NOT NULL",
                 [],
                 |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn latest_resume_acceptance(&self) -> (Option<String>, Option<String>) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT resume_acceptance_status, resume_acceptance_evidence
+                 FROM invocations
+                 WHERE session_capture_method = 'resumed'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap()
     }
@@ -339,6 +371,7 @@ fn external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes() {
         Some(expected_models_dir.as_str()),
         "detached wake must reload the same models directory as the original external launch"
     );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -441,6 +474,7 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
         !fixture.prompt_file("external-wake-resumed.txt").exists(),
         "drop mode must not write the payload-bearing resume file"
     );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -500,6 +534,7 @@ fn external_provider_wake_confirms_delivery_from_host_observed_assistant_respons
                 && db.wake_claim(SESSION).unwrap().is_none()
         },
     );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -533,41 +568,98 @@ fn external_provider_wake_confirms_delivery_from_submitted_turn_marker() {
             && rows[0].delivery_error.is_none()
             && db.wake_claim(SESSION).unwrap().is_none()
     });
+    let (status, evidence) = fixture.latest_resume_acceptance();
+    assert_eq!(status.as_deref(), Some("accepted"));
+    assert!(
+        evidence
+            .as_deref()
+            .is_some_and(|value| value.contains("exact session and delivery nonce")),
+        "{evidence:?}"
+    );
     fixture.assert_xdg_isolated();
 }
 
 #[test]
-fn external_provider_wake_ignores_submitted_turn_marker_for_different_payload() {
+fn external_provider_wake_rejects_wrong_session_or_delivery_nonce_markers() {
+    for mismatch in [
+        "S11_MARKER_SESSION_MISMATCH",
+        "S11_MARKER_DELIVERY_NONCE_MISMATCH",
+    ] {
+        let fixture = Fixture::new();
+        fixture.write_external_provider();
+
+        let output = fixture.run_agent_with_env(
+            "dispatch external provider wake mismatched marker",
+            &[
+                ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+                ("S11_SKIP_SCAN_WAKE_TURN", "1"),
+                ("OULIPOLY_AUTO_WAKE_MAX", "1"),
+                (mismatch, "1"),
+            ],
+        );
+        assert_success(&output);
+
+        let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+        assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+        wait_until(
+            "mismatched submitted-turn marker leaves mailbox pending",
+            || {
+                let db = fixture.mailbox();
+                let rows = db.list_mailbox(SESSION, true).unwrap();
+                rows.len() == 1
+                    && rows[0].delivered_at.is_none()
+                    && rows[0].delivery_attempts == 1
+                    && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+                    && db.wake_claim(SESSION).unwrap().is_none()
+            },
+        );
+        assert_eq!(
+            fixture.latest_resume_acceptance(),
+            (None, None),
+            "{mismatch}"
+        );
+        fixture.assert_xdg_isolated();
+    }
+}
+
+#[test]
+fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_delivery_nonce() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env("seed manual resume", &[("S11_NO_NOTIFY", "1")]));
 
-    let output = fixture.run_agent_with_env(
-        "dispatch external provider wake mismatched marker",
+    let output = fixture.run_resume_with_env(
+        "manual exact payload",
+        &[("S11_EMIT_SUBMITTED_TURN_MARKER", "1")],
+    );
+
+    assert_success(&output);
+    let (status, evidence) = fixture.latest_resume_acceptance();
+    assert_eq!(status.as_deref(), Some("accepted"));
+    assert!(
+        evidence
+            .as_deref()
+            .is_some_and(|value| value.contains("exact session and prompt SHA-256")),
+        "{evidence:?}"
+    );
+
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env("seed hash mismatch", &[("S11_NO_NOTIFY", "1")]));
+    let output = fixture.run_resume_with_env(
+        "manual hash mismatch",
         &[
             ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
-            ("S11_MARKER_DELIVERY_NONCE_MISMATCH", "1"),
-            ("S11_SKIP_SCAN_WAKE_TURN", "1"),
-            ("OULIPOLY_AUTO_WAKE_MAX", "1"),
         ],
     );
-    assert_success(&output);
 
-    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
-    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
-    wait_until(
-        "mismatched submitted-turn marker leaves mailbox pending",
-        || {
-            let db = fixture.mailbox();
-            let rows = db.list_mailbox(SESSION, true).unwrap();
-            rows.len() == 1
-                && rows[0].delivered_at.is_none()
-                && rows[0].delivery_attempts == 1
-                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
-                && db.wake_claim(SESSION).unwrap().is_none()
-        },
+    assert_success(&output);
+    assert_eq!(
+        fixture.latest_resume_acceptance(),
+        (None, None),
+        "prompt hash mismatch without a nonce"
     );
-    fixture.assert_xdg_isolated();
 }
 
 #[test]
@@ -870,7 +962,7 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
     if os.environ.get("S11_MARKER_DELIVERY_NONCE_MISMATCH") == "1":
         nonce = "different-delivery-nonce"
     value = {
-        "provider_session_id": session_id,
+        "provider_session_id": "ses-wrong" if os.environ.get("S11_MARKER_SESSION_MISMATCH") == "1" else session_id,
         "prompt_sha256": prompt_sha,
         "source": "s11.fixture",
         "message_id": "msg-s11-submitted",
