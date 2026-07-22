@@ -458,17 +458,24 @@ fn persist_imported_chains(
     report: &mut ScanReport,
     new_turns: u64,
 ) {
-    report.new_turns = new_turns;
+    let mut errors = Vec::new();
     for turn in batch {
-        if let Err(error) = db.mint_imported_chain_if_absent(
-            provider_name,
-            &turn.session_id,
-            &turn.timestamp,
-            "<unknown>",
-        ) {
-            report.errors.push(error);
-        }
+        errors.extend(
+            db.mint_imported_chain_if_absent(
+                provider_name,
+                &turn.session_id,
+                &turn.timestamp,
+                "<unknown>",
+            )
+            .err(),
+        );
     }
+    apply_imported_chain_report(report, new_turns, errors);
+}
+
+fn apply_imported_chain_report(report: &mut ScanReport, new_turns: u64, errors: Vec<String>) {
+    report.new_turns = new_turns;
+    report.errors.extend(errors);
 }
 
 /// Scan every provider listed in `sessions_cfg`. Failures in one provider
@@ -479,8 +486,12 @@ pub fn scan_all(sessions_cfg: &SessionsConfig, db: &StateDb) -> Vec<(String, Sca
         let report = scan_provider(name, sessions_cfg, db);
         out.push((name.clone(), report));
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    sort_provider_scan_reports(out)
+}
+
+fn sort_provider_scan_reports(mut reports: Vec<(String, ScanReport)>) -> Vec<(String, ScanReport)> {
+    reports.sort_by(|a, b| a.0.cmp(&b.0));
+    reports
 }
 
 fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf {
@@ -885,6 +896,49 @@ mod tests {
             },
         );
         SessionsConfig { entries }
+    }
+
+    #[test]
+    fn imported_chain_report_mapping_preserves_existing_and_ordered_errors() {
+        let mut report = ScanReport {
+            new_turns: 1,
+            errors: vec!["ingest error".to_string()],
+            ..ScanReport::default()
+        };
+
+        apply_imported_chain_report(
+            &mut report,
+            3,
+            vec![
+                "first mint error".to_string(),
+                "second mint error".to_string(),
+            ],
+        );
+
+        assert_eq!(report.new_turns, 3);
+        assert_eq!(
+            report.errors,
+            vec!["ingest error", "first mint error", "second mint error"]
+        );
+    }
+
+    #[test]
+    fn provider_scan_report_mapping_sorts_by_provider_name() {
+        let reports = vec![
+            ("provider-z".to_string(), ScanReport::default()),
+            ("provider-a".to_string(), ScanReport::default()),
+            ("provider-m".to_string(), ScanReport::default()),
+        ];
+
+        let sorted = sort_provider_scan_reports(reports);
+
+        assert_eq!(
+            sorted
+                .into_iter()
+                .map(|(provider, _report)| provider)
+                .collect::<Vec<_>>(),
+            vec!["provider-a", "provider-m", "provider-z"]
+        );
     }
 
     fn stored_turn_body(
