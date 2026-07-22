@@ -746,13 +746,7 @@ impl MailboxDb {
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
         })?;
-        let result = if changed == 1 {
-            GenerationMutation::Applied(row)
-        } else if runtime_generation_create_matches(&row, &request) {
-            GenerationMutation::AlreadyApplied(row)
-        } else {
-            GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
-        };
+        let result = map_runtime_generation_create(changed, row, &request);
         tx.commit().map_err(generation_storage_error(
             "commit generation creation transaction",
         ))?;
@@ -777,55 +771,32 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_binding_fence(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected generation binding transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
         if before.lifecycle_state == RuntimeLifecycleState::Running {
-            let result = if runtime_generation_binding_matches(&before, &request) {
-                GenerationMutation::AlreadyApplied(before)
-            } else {
-                GenerationMutation::Rejected(GenerationRejection::ProcessIdentityConflict)
-            };
+            let result = map_running_generation_binding_replay(before, &request);
             tx.commit().map_err(generation_storage_error(
                 "commit replayed generation binding transaction",
             ))?;
             return Ok(result);
         }
-        if before.lifecycle_state != RuntimeLifecycleState::Starting {
-            let actual = before.lifecycle_state;
+        if let Err(rejection) = validate_generation_binding_predecessor(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal generation binding transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Starting,
-                    actual,
-                },
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
-        if let Some(identity) = request.exact_process_identity {
-            let record = pid_identity::PidIdentityRecord {
-                identity,
-                os_pgid: request.os_pgid,
-                invocation_uuid: request.fence.spawn_invocation_uuid,
-                session_id: before.session_id.as_deref(),
-                provider_name: Some(&before.provider_name),
-                model_name: before.model_name.as_deref(),
-                recorded_at: &now,
-            };
-            if !pid_identity::bind_identity_on(&tx, record).map_err(GenerationStorageError::new)? {
-                tx.commit().map_err(generation_storage_error(
-                    "commit conflicting process identity binding transaction",
-                ))?;
-                return Ok(GenerationMutation::Rejected(
-                    GenerationRejection::ProcessIdentityConflict,
-                ));
-            }
+        if !bind_generation_process_identity(&tx, &before, &request, &now)? {
+            tx.commit().map_err(generation_storage_error(
+                "commit conflicting process identity binding transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::ProcessIdentityConflict,
+            ));
         }
         let identity = request.exact_process_identity;
         let changed = tx
@@ -871,11 +842,7 @@ impl MailboxDb {
         &mut self,
         request: AttachRuntimeGenerationSession<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
-        if request.session_id.is_empty() {
-            return Err(GenerationStorageError::new(
-                "Runtime generation session_id must not be empty".to_string(),
-            ));
-        }
+        validate_generation_attachment_session_id(&request)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -888,20 +855,14 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_attachment_fence(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected session attachment transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
-        if let Some(existing) = before.session_id.as_deref() {
-            let result = if existing == request.session_id {
-                GenerationMutation::AlreadyApplied(before)
-            } else {
-                GenerationMutation::Rejected(GenerationRejection::SessionConflict)
-            };
+        if before.session_id.is_some() {
+            let result = map_generation_attachment_replay(before, &request);
             tx.commit().map_err(generation_storage_error(
                 "commit replayed session attachment transaction",
             ))?;
@@ -1017,30 +978,33 @@ impl MailboxDb {
                 GenerationRejection::NotFound,
             ));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_fence(&before, request.fence) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected delivery claim transaction",
             ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+        }
+        let has_existing_claim = before.active_delivery_claim_id.is_some();
+        if has_existing_claim && validate_existing_delivery_claim(&before).is_err() {
+            tx.commit().map_err(generation_storage_error(
+                "commit invalid existing delivery claim transaction",
+            ))?;
             return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::FenceMismatch,
+                GenerationRejection::InvariantViolation,
             ));
         }
-        if before.active_delivery_claim_id.is_some() {
-            if before.active_delivery_seqs.is_empty() || before.active_delivery_claimed_at.is_none()
-            {
-                tx.commit().map_err(generation_storage_error(
-                    "commit invalid existing delivery claim transaction",
-                ))?;
-                return Ok(DeliveryClaimAcquireResult::Rejected(
-                    GenerationRejection::InvariantViolation,
-                ));
-            }
-            if !runtime_delivery_claim_is_stale(&before, request.stale_after_seconds) {
-                tx.commit().map_err(generation_storage_error(
-                    "commit in-flight delivery claim transaction",
-                ))?;
-                return Ok(DeliveryClaimAcquireResult::AlreadyInFlight(before));
-            }
+        let existing_claim_stale =
+            runtime_delivery_claim_is_stale(&before, request.stale_after_seconds);
+        if has_existing_claim
+            && map_existing_delivery_claim(&before, existing_claim_stale)
+                == ExistingDeliveryClaimDisposition::AlreadyInFlight
+        {
+            tx.commit().map_err(generation_storage_error(
+                "commit in-flight delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::AlreadyInFlight(before));
+        }
+        if has_existing_claim {
             tx.execute(
                 "UPDATE runtime_generation
                  SET active_delivery_claimed_at = ?3
@@ -1069,35 +1033,35 @@ impl MailboxDb {
             ))?;
             return Ok(DeliveryClaimAcquireResult::Recovered(row));
         }
-        if before.lifecycle_state != RuntimeLifecycleState::Running {
-            let actual = before.lifecycle_state;
-            tx.commit().map_err(generation_storage_error(
-                "commit illegal delivery claim transaction",
-            ))?;
-            return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+        match validate_new_delivery_claim(&before, true, false) {
+            Ok(()) => {}
+            Err(rejection @ GenerationRejection::IllegalPredecessor { .. }) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit illegal delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
+            Err(rejection @ GenerationRejection::DrainRequestConflict) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit drain-blocked delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit invalid delivery claim batch transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
         }
-        if before.drain_request_id.is_some() {
-            tx.commit().map_err(generation_storage_error(
-                "commit drain-blocked delivery claim transaction",
-            ))?;
-            return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::DrainRequestConflict,
-            ));
-        }
-        if !mailbox_seqs_are_pending_on(&tx, request.seqs)?
-            || active_delivery_claim_overlaps_on(&tx, request.fence.generation_id, request.seqs)?
-        {
+        let rows_pending = mailbox_seqs_are_pending_on(&tx, request.seqs)?;
+        let overlaps =
+            active_delivery_claim_overlaps_on(&tx, request.fence.generation_id, request.seqs)?;
+        if let Err(rejection) = validate_new_delivery_claim(&before, rows_pending, overlaps) {
             tx.commit().map_err(generation_storage_error(
                 "commit invalid delivery claim batch transaction",
             ))?;
-            return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::InvariantViolation,
-            ));
+            return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
         }
         let seqs_json = serialize_delivery_seqs(request.seqs)?;
         let changed = tx
@@ -1139,7 +1103,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit acquired delivery claim transaction",
         ))?;
-        Ok(DeliveryClaimAcquireResult::Acquired(row))
+        Ok(map_acquired_delivery_claim(row))
     }
 
     pub fn confirm_runtime_generation_delivery(
@@ -1154,31 +1118,24 @@ impl MailboxDb {
             .map_err(generation_storage_error(
                 "start runtime generation delivery confirmation transaction",
             ))?;
-        let before = match validated_active_delivery_claim_on(
-            &tx,
+        let before = runtime_generation_by_id_on(&tx, request.fence.generation_id)?;
+        if let Err(rejection) = validate_active_delivery_claim(
+            before.as_ref(),
             request.fence,
             request.claim_id,
             request.seqs,
-        )? {
-            Ok(row) => row,
-            Err(rejection) => {
-                tx.commit().map_err(generation_storage_error(
-                    "commit rejected delivery confirmation transaction",
-                ))?;
-                return Ok(GenerationMutation::Rejected(rejection));
-            }
-        };
-        if before.lifecycle_state != RuntimeLifecycleState::Running {
-            let actual = before.lifecycle_state;
+        ) {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected delivery confirmation transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(rejection));
+        }
+        let before = before.expect("validated active claim requires a generation row");
+        if let Err(rejection) = validate_running_delivery_confirmation(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit non-running delivery confirmation transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
         for seq in request.seqs {
             let changed = tx
@@ -1195,11 +1152,7 @@ impl MailboxDb {
                 .map_err(generation_storage_error(
                     "confirm claimed mailbox row delivery",
                 ))?;
-            if changed != 1 {
-                return Err(GenerationStorageError::new(format!(
-                    "Claimed mailbox row {seq} was not pending at confirmation"
-                )));
-            }
+            validate_confirmed_mailbox_row_change(*seq, changed)?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -1211,7 +1164,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit delivery confirmation transaction",
         ))?;
-        Ok(GenerationMutation::Applied(row))
+        Ok(map_applied_generation(row))
     }
 
     pub fn fail_runtime_generation_delivery(
@@ -1225,9 +1178,13 @@ impl MailboxDb {
             .map_err(generation_storage_error(
                 "start runtime generation delivery failure transaction",
             ))?;
-        if let Err(rejection) =
-            validated_active_delivery_claim_on(&tx, request.fence, request.claim_id, request.seqs)?
-        {
+        let before = runtime_generation_by_id_on(&tx, request.fence.generation_id)?;
+        if let Err(rejection) = validate_active_delivery_claim(
+            before.as_ref(),
+            request.fence,
+            request.claim_id,
+            request.seqs,
+        ) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected delivery failure transaction",
             ))?;
@@ -1256,18 +1213,14 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit delivery failure transaction",
         ))?;
-        Ok(GenerationMutation::Applied(row))
+        Ok(map_failed_delivery_generation(row))
     }
 
     pub fn exit_runtime_generation_non_orderly(
         &mut self,
         request: ExitRuntimeGenerationNonOrderly<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
-        if request.reason == RuntimeTerminalReason::OrderlyCompletion {
-            return Err(GenerationStorageError::new(
-                "Orderly completion must pass through draining".to_string(),
-            ));
-        }
+        validate_non_orderly_reason(&request)?;
         let now = now_rfc3339();
         let tx = self
             .conn
@@ -1281,44 +1234,23 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_fence(&before, request.fence) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected generation exit transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
-        if before.lifecycle_state == RuntimeLifecycleState::Exited {
-            let result = if before.terminal_reason == Some(request.reason)
-                && before.exit_code == request.exit_code
-            {
-                GenerationMutation::AlreadyApplied(before)
-            } else {
-                GenerationMutation::Rejected(GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual: RuntimeLifecycleState::Exited,
-                })
-            };
+        if let Some(result) = map_non_orderly_exit_replay(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit replayed generation exit transaction",
             ))?;
             return Ok(result);
         }
-        if !matches!(
-            before.lifecycle_state,
-            RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
-        ) {
-            let actual = before.lifecycle_state;
+        if let Err(rejection) = validate_non_orderly_predecessor(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal generation exit transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1347,7 +1279,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit non-orderly generation exit transaction",
         ))?;
-        Ok(GenerationMutation::Applied(row))
+        Ok(map_applied_generation(row))
     }
 
     pub fn request_runtime_generation_drain(
@@ -1367,37 +1299,23 @@ impl MailboxDb {
             ))?;
             return Ok(DrainRequestResult::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_drain_request_fence(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected drain request transaction",
             ))?;
-            return Ok(DrainRequestResult::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(DrainRequestResult::Rejected(rejection));
         }
-        if let Some(existing) = before.drain_request_id.as_ref() {
-            let handoff = drain_handoff(&before);
-            let result = if existing == request.drain_request_id {
-                DrainRequestResult::AlreadyInstalled(before, handoff)
-            } else {
-                DrainRequestResult::Rejected(GenerationRejection::DrainRequestConflict)
-            };
+        if let Some(result) = map_drain_request_replay(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit replayed drain request transaction",
             ))?;
             return Ok(result);
         }
-        if before.lifecycle_state != RuntimeLifecycleState::Running {
-            let actual = before.lifecycle_state;
+        if let Err(rejection) = validate_drain_request_predecessor(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal drain request transaction",
             ))?;
-            return Ok(DrainRequestResult::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+            return Ok(DrainRequestResult::Rejected(rejection));
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1424,11 +1342,10 @@ impl MailboxDb {
                     "Runtime generation missing after drain request".to_string(),
                 )
             })?;
-        let handoff = drain_handoff(&row);
         tx.commit().map_err(generation_storage_error(
             "commit generation drain request transaction",
         ))?;
-        Ok(DrainRequestResult::Installed(row, handoff))
+        Ok(map_installed_drain_request(row))
     }
 
     pub fn advance_runtime_generation_drain(
@@ -1448,53 +1365,50 @@ impl MailboxDb {
             ))?;
             return Ok(DrainAdvanceResult::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
-            tx.commit().map_err(generation_storage_error(
-                "commit rejected drain advance transaction",
-            ))?;
-            return Ok(DrainAdvanceResult::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+        match validate_drain_advance_identity(&before, &request) {
+            Ok(()) => {}
+            Err(GenerationRejection::FenceMismatch) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit rejected drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::Rejected(
+                    GenerationRejection::FenceMismatch,
+                ));
+            }
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit mismatched drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::Rejected(rejection));
+            }
         }
-        if before.drain_request_id.as_ref() != Some(request.drain_request_id) {
-            tx.commit().map_err(generation_storage_error(
-                "commit mismatched drain advance transaction",
-            ))?;
-            return Ok(DrainAdvanceResult::Rejected(
-                GenerationRejection::DrainRequestConflict,
-            ));
-        }
-        if let Some(claim_id) = before.active_delivery_claim_id.clone() {
-            tx.commit().map_err(generation_storage_error(
-                "commit waiting drain advance transaction",
-            ))?;
-            return Ok(DrainAdvanceResult::WaitingOnClaim(claim_id));
-        }
-        match before.lifecycle_state {
-            RuntimeLifecycleState::Draining => {
+        match map_drain_advance_blocker(&before) {
+            None => {}
+            Some(DrainAdvanceResult::WaitingOnClaim(claim_id)) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit waiting drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::WaitingOnClaim(claim_id));
+            }
+            Some(DrainAdvanceResult::AlreadyDraining(row)) => {
                 tx.commit().map_err(generation_storage_error(
                     "commit replayed drain advance transaction",
                 ))?;
-                return Ok(DrainAdvanceResult::AlreadyDraining(before));
+                return Ok(DrainAdvanceResult::AlreadyDraining(row));
             }
-            RuntimeLifecycleState::Exited => {
+            Some(DrainAdvanceResult::AlreadyExited(row)) => {
                 tx.commit().map_err(generation_storage_error(
                     "commit exited drain advance transaction",
                 ))?;
-                return Ok(DrainAdvanceResult::AlreadyExited(before));
+                return Ok(DrainAdvanceResult::AlreadyExited(row));
             }
-            RuntimeLifecycleState::Running => {}
-            actual => {
+            Some(DrainAdvanceResult::Rejected(rejection)) => {
                 tx.commit().map_err(generation_storage_error(
                     "commit illegal drain advance transaction",
                 ))?;
-                return Ok(DrainAdvanceResult::Rejected(
-                    GenerationRejection::IllegalPredecessor {
-                        expected: RuntimeLifecycleState::Running,
-                        actual,
-                    },
-                ));
+                return Ok(DrainAdvanceResult::Rejected(rejection));
             }
+            Some(DrainAdvanceResult::Advanced(_)) => unreachable!("advanced rows are not blockers"),
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1521,7 +1435,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit generation drain advance transaction",
         ))?;
-        Ok(DrainAdvanceResult::Advanced(row))
+        Ok(map_advanced_drain(row))
     }
 
     pub fn finish_runtime_generation_drain(
@@ -1541,42 +1455,44 @@ impl MailboxDb {
             ))?;
             return Ok(DrainFinishResult::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
-            tx.commit().map_err(generation_storage_error(
-                "commit rejected drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+        match validate_drain_finish_identity(&before, &request) {
+            Ok(()) => {}
+            Err(GenerationRejection::FenceMismatch) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit rejected drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::Rejected(
+                    GenerationRejection::FenceMismatch,
+                ));
+            }
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit mismatched drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::Rejected(rejection));
+            }
         }
-        if before.drain_request_id.as_ref() != Some(request.drain_request_id) {
-            tx.commit().map_err(generation_storage_error(
-                "commit mismatched drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::DrainRequestConflict,
-            ));
+        match map_drain_finish_predecessor(&before) {
+            None => {}
+            Some(DrainFinishResult::AlreadyExited(row)) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit replayed drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::AlreadyExited(row));
+            }
+            Some(DrainFinishResult::NotDraining(actual)) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit premature drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::NotDraining(actual));
+            }
+            Some(_) => unreachable!("only predecessor dispositions are mapped"),
         }
-        if before.lifecycle_state == RuntimeLifecycleState::Exited {
-            tx.commit().map_err(generation_storage_error(
-                "commit replayed drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::AlreadyExited(before));
-        }
-        if before.lifecycle_state != RuntimeLifecycleState::Draining {
-            let actual = before.lifecycle_state;
-            tx.commit().map_err(generation_storage_error(
-                "commit premature drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::NotDraining(actual));
-        }
-        if before.active_delivery_claim_id.is_some() {
+        if let Err(rejection) = validate_drain_finish_claim(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit withheld drain finish transaction",
             ))?;
-            return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::InvariantViolation,
-            ));
+            return Ok(DrainFinishResult::Rejected(rejection));
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1605,7 +1521,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit generation drain finish transaction",
         ))?;
-        Ok(DrainFinishResult::Finished(row))
+        Ok(map_finished_drain(row))
     }
 
     pub fn enqueue_agent_bash_complete(
@@ -3953,6 +3869,367 @@ fn runtime_generation_binding_matches(
         }
 }
 
+fn map_runtime_generation_create(
+    changed: usize,
+    row: RuntimeGenerationRow,
+    request: &CreateRuntimeGeneration<'_>,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    if changed == 1 {
+        return GenerationMutation::Applied(row);
+    }
+    if runtime_generation_create_matches(&row, request) {
+        GenerationMutation::AlreadyApplied(row)
+    } else {
+        GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
+    }
+}
+
+fn validate_generation_binding_fence(
+    before: &RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)
+}
+
+fn validate_generation_binding_predecessor(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if before.lifecycle_state == RuntimeLifecycleState::Starting {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Starting,
+        actual: before.lifecycle_state,
+    })
+}
+
+fn map_running_generation_binding_replay(
+    before: RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    if runtime_generation_binding_matches(&before, request) {
+        GenerationMutation::AlreadyApplied(before)
+    } else {
+        GenerationMutation::Rejected(GenerationRejection::ProcessIdentityConflict)
+    }
+}
+
+fn bind_generation_process_identity(
+    conn: &Connection,
+    before: &RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+    recorded_at: &str,
+) -> Result<bool, GenerationStorageError> {
+    let Some(identity) = request.exact_process_identity else {
+        return Ok(true);
+    };
+    pid_identity::bind_identity_on(
+        conn,
+        pid_identity::PidIdentityRecord {
+            identity,
+            os_pgid: request.os_pgid,
+            invocation_uuid: request.fence.spawn_invocation_uuid,
+            session_id: before.session_id.as_deref(),
+            provider_name: Some(&before.provider_name),
+            model_name: before.model_name.as_deref(),
+            recorded_at,
+        },
+    )
+    .map_err(GenerationStorageError::new)
+}
+
+fn validate_generation_attachment_session_id(
+    request: &AttachRuntimeGenerationSession<'_>,
+) -> Result<(), GenerationStorageError> {
+    if !request.session_id.is_empty() {
+        return Ok(());
+    }
+    Err(GenerationStorageError::new(
+        "Runtime generation session_id must not be empty".to_string(),
+    ))
+}
+
+fn validate_generation_attachment_fence(
+    before: &RuntimeGenerationRow,
+    request: &AttachRuntimeGenerationSession<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)
+}
+
+fn map_generation_attachment_replay(
+    before: RuntimeGenerationRow,
+    request: &AttachRuntimeGenerationSession<'_>,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    if before.session_id.as_deref() == Some(request.session_id) {
+        GenerationMutation::AlreadyApplied(before)
+    } else {
+        GenerationMutation::Rejected(GenerationRejection::SessionConflict)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingDeliveryClaimDisposition {
+    AlreadyInFlight,
+    Recover,
+}
+
+fn validate_existing_delivery_claim(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if !before.active_delivery_seqs.is_empty() && before.active_delivery_claimed_at.is_some() {
+        return Ok(());
+    }
+    Err(GenerationRejection::InvariantViolation)
+}
+
+fn map_existing_delivery_claim(
+    _before: &RuntimeGenerationRow,
+    stale: bool,
+) -> ExistingDeliveryClaimDisposition {
+    if stale {
+        ExistingDeliveryClaimDisposition::Recover
+    } else {
+        ExistingDeliveryClaimDisposition::AlreadyInFlight
+    }
+}
+
+fn validate_new_delivery_claim(
+    before: &RuntimeGenerationRow,
+    rows_pending: bool,
+    overlaps: bool,
+) -> Result<(), GenerationRejection> {
+    if before.lifecycle_state != RuntimeLifecycleState::Running {
+        return Err(GenerationRejection::IllegalPredecessor {
+            expected: RuntimeLifecycleState::Running,
+            actual: before.lifecycle_state,
+        });
+    }
+    if before.drain_request_id.is_some() {
+        return Err(GenerationRejection::DrainRequestConflict);
+    }
+    if !rows_pending || overlaps {
+        return Err(GenerationRejection::InvariantViolation);
+    }
+    Ok(())
+}
+
+fn map_acquired_delivery_claim(row: RuntimeGenerationRow) -> DeliveryClaimAcquireResult {
+    DeliveryClaimAcquireResult::Acquired(row)
+}
+
+fn validate_active_delivery_claim(
+    row: Option<&RuntimeGenerationRow>,
+    fence: RuntimeGenerationFence<'_>,
+    claim_id: &DeliveryClaimId,
+    seqs: &[i64],
+) -> Result<(), GenerationRejection> {
+    let Some(row) = row else {
+        return Err(GenerationRejection::NotFound);
+    };
+    validate_generation_fence(row, fence)?;
+    if row.active_delivery_claim_id.as_ref() != Some(claim_id)
+        || row.active_delivery_seqs != seqs
+        || row.active_delivery_claimed_at.is_none()
+    {
+        return Err(GenerationRejection::InvariantViolation);
+    }
+    Ok(())
+}
+
+fn validate_running_delivery_confirmation(
+    row: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if row.lifecycle_state == RuntimeLifecycleState::Running {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Running,
+        actual: row.lifecycle_state,
+    })
+}
+
+fn validate_confirmed_mailbox_row_change(
+    seq: i64,
+    changed: usize,
+) -> Result<(), GenerationStorageError> {
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(GenerationStorageError::new(format!(
+        "Claimed mailbox row {seq} was not pending at confirmation"
+    )))
+}
+
+fn map_applied_generation(row: RuntimeGenerationRow) -> GenerationMutation<RuntimeGenerationRow> {
+    GenerationMutation::Applied(row)
+}
+
+fn map_failed_delivery_generation(
+    row: RuntimeGenerationRow,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    GenerationMutation::Applied(row)
+}
+
+fn validate_non_orderly_reason(
+    request: &ExitRuntimeGenerationNonOrderly<'_>,
+) -> Result<(), GenerationStorageError> {
+    if request.reason != RuntimeTerminalReason::OrderlyCompletion {
+        return Ok(());
+    }
+    Err(GenerationStorageError::new(
+        "Orderly completion must pass through draining".to_string(),
+    ))
+}
+
+fn validate_generation_fence(
+    before: &RuntimeGenerationRow,
+    fence: RuntimeGenerationFence<'_>,
+) -> Result<(), GenerationRejection> {
+    if before.spawn_invocation_uuid == fence.spawn_invocation_uuid {
+        return Ok(());
+    }
+    Err(GenerationRejection::FenceMismatch)
+}
+
+fn validate_non_orderly_predecessor(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if matches!(
+        before.lifecycle_state,
+        RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
+    ) {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Running,
+        actual: before.lifecycle_state,
+    })
+}
+
+fn map_non_orderly_exit_replay(
+    before: &RuntimeGenerationRow,
+    request: &ExitRuntimeGenerationNonOrderly<'_>,
+) -> Option<GenerationMutation<RuntimeGenerationRow>> {
+    if before.lifecycle_state != RuntimeLifecycleState::Exited {
+        return None;
+    }
+    if before.terminal_reason == Some(request.reason) && before.exit_code == request.exit_code {
+        Some(GenerationMutation::AlreadyApplied(before.clone()))
+    } else {
+        Some(GenerationMutation::Rejected(
+            GenerationRejection::IllegalPredecessor {
+                expected: RuntimeLifecycleState::Running,
+                actual: RuntimeLifecycleState::Exited,
+            },
+        ))
+    }
+}
+
+fn validate_drain_request_fence(
+    before: &RuntimeGenerationRow,
+    request: &RequestRuntimeGenerationDrain<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)
+}
+
+fn validate_drain_request_predecessor(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if before.lifecycle_state == RuntimeLifecycleState::Running {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Running,
+        actual: before.lifecycle_state,
+    })
+}
+
+fn map_drain_request_replay(
+    before: &RuntimeGenerationRow,
+    request: &RequestRuntimeGenerationDrain<'_>,
+) -> Option<DrainRequestResult> {
+    let existing = before.drain_request_id.as_ref()?;
+    if existing == request.drain_request_id {
+        Some(DrainRequestResult::AlreadyInstalled(
+            before.clone(),
+            drain_handoff(before),
+        ))
+    } else {
+        Some(DrainRequestResult::Rejected(
+            GenerationRejection::DrainRequestConflict,
+        ))
+    }
+}
+
+fn map_installed_drain_request(row: RuntimeGenerationRow) -> DrainRequestResult {
+    let handoff = drain_handoff(&row);
+    DrainRequestResult::Installed(row, handoff)
+}
+
+fn validate_drain_advance_identity(
+    before: &RuntimeGenerationRow,
+    request: &AdvanceRuntimeGenerationDrain<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)?;
+    if before.drain_request_id.as_ref() == Some(request.drain_request_id) {
+        return Ok(());
+    }
+    Err(GenerationRejection::DrainRequestConflict)
+}
+
+fn map_drain_advance_blocker(before: &RuntimeGenerationRow) -> Option<DrainAdvanceResult> {
+    if let Some(claim_id) = before.active_delivery_claim_id.clone() {
+        return Some(DrainAdvanceResult::WaitingOnClaim(claim_id));
+    }
+    match before.lifecycle_state {
+        RuntimeLifecycleState::Running => None,
+        RuntimeLifecycleState::Draining => {
+            Some(DrainAdvanceResult::AlreadyDraining(before.clone()))
+        }
+        RuntimeLifecycleState::Exited => Some(DrainAdvanceResult::AlreadyExited(before.clone())),
+        actual => Some(DrainAdvanceResult::Rejected(
+            GenerationRejection::IllegalPredecessor {
+                expected: RuntimeLifecycleState::Running,
+                actual,
+            },
+        )),
+    }
+}
+
+fn map_advanced_drain(row: RuntimeGenerationRow) -> DrainAdvanceResult {
+    DrainAdvanceResult::Advanced(row)
+}
+
+fn validate_drain_finish_identity(
+    before: &RuntimeGenerationRow,
+    request: &FinishRuntimeGenerationDrain<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)?;
+    if before.drain_request_id.as_ref() == Some(request.drain_request_id) {
+        return Ok(());
+    }
+    Err(GenerationRejection::DrainRequestConflict)
+}
+
+fn validate_drain_finish_claim(before: &RuntimeGenerationRow) -> Result<(), GenerationRejection> {
+    if before.active_delivery_claim_id.is_none() {
+        return Ok(());
+    }
+    Err(GenerationRejection::InvariantViolation)
+}
+
+fn map_drain_finish_predecessor(before: &RuntimeGenerationRow) -> Option<DrainFinishResult> {
+    match before.lifecycle_state {
+        RuntimeLifecycleState::Draining => None,
+        RuntimeLifecycleState::Exited => Some(DrainFinishResult::AlreadyExited(before.clone())),
+        actual => Some(DrainFinishResult::NotDraining(actual)),
+    }
+}
+
+fn map_finished_drain(row: RuntimeGenerationRow) -> DrainFinishResult {
+    DrainFinishResult::Finished(row)
+}
+
 fn generation_storage_error(
     action: &'static str,
 ) -> impl FnOnce(rusqlite::Error) -> GenerationStorageError {
@@ -4249,27 +4526,6 @@ fn active_delivery_claim_overlaps_on(
         }
     }
     Ok(false)
-}
-
-fn validated_active_delivery_claim_on(
-    conn: &Connection,
-    fence: RuntimeGenerationFence<'_>,
-    claim_id: &DeliveryClaimId,
-    seqs: &[i64],
-) -> Result<Result<RuntimeGenerationRow, GenerationRejection>, GenerationStorageError> {
-    let Some(row) = runtime_generation_by_id_on(conn, fence.generation_id)? else {
-        return Ok(Err(GenerationRejection::NotFound));
-    };
-    if row.spawn_invocation_uuid != fence.spawn_invocation_uuid {
-        return Ok(Err(GenerationRejection::FenceMismatch));
-    }
-    if row.active_delivery_claim_id.as_ref() != Some(claim_id)
-        || row.active_delivery_seqs != seqs
-        || row.active_delivery_claimed_at.is_none()
-    {
-        return Ok(Err(GenerationRejection::InvariantViolation));
-    }
-    Ok(Ok(row))
 }
 
 fn clear_runtime_delivery_claim_on(
