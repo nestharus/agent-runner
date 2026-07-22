@@ -123,7 +123,38 @@ expected = [
         "turn_id": "msg_assistant_current",
         "timestamp": "2023-11-14T22:13:25Z",
         "role": "assistant",
+        "completion_outcome": "stop",
         "body": [{"type": "text", "text": "confirmed"}],
+    },
+    {
+        "session_id": "ses_current_info",
+        "turn_id": "msg_assistant_missing",
+        "timestamp": "2023-11-14T22:13:26Z",
+        "role": "assistant",
+        "body": [{"type": "text", "text": "missing finish"}],
+    },
+    {
+        "session_id": "ses_current_info",
+        "turn_id": "msg_assistant_empty",
+        "timestamp": "2023-11-14T22:13:27Z",
+        "role": "assistant",
+        "body": [{"type": "text", "text": "empty finish"}],
+    },
+    {
+        "session_id": "ses_current_info",
+        "turn_id": "msg_assistant_partial",
+        "timestamp": "2023-11-14T22:13:28Z",
+        "role": "assistant",
+        "completion_outcome": "tool-calls",
+        "body": [{"type": "text", "text": "partial"}],
+    },
+    {
+        "session_id": "ses_current_info",
+        "turn_id": "msg_assistant_error",
+        "timestamp": "2023-11-14T22:13:29Z",
+        "role": "assistant",
+        "completion_outcome": "error",
+        "body": [{"type": "text", "text": "error"}],
     },
 ]
 
@@ -531,6 +562,7 @@ if [[ "$1" == "export" ]]; then
     {
       "info": {
         "role": "user",
+        "finish": "stop",
         "time": {"created": 1700000000000},
         "id": "msg_user_current",
         "sessionID": "ses_current_info"
@@ -545,11 +577,51 @@ if [[ "$1" == "export" ]]; then
     {
       "info": {
         "role": "assistant",
+        "finish": "stop",
         "time": {"created": 1700000005000},
         "id": "msg_assistant_current",
         "sessionID": "ses_current_info"
       },
       "parts": [{"type": "text", "text": "confirmed"}]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {"created": 1700000006000},
+        "id": "msg_assistant_missing",
+        "sessionID": "ses_current_info"
+      },
+      "parts": [{"type": "text", "text": "missing finish"}]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "finish": "",
+        "time": {"created": 1700000007000},
+        "id": "msg_assistant_empty",
+        "sessionID": "ses_current_info"
+      },
+      "parts": [{"type": "text", "text": "empty finish"}]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "finish": "tool-calls",
+        "time": {"created": 1700000008000},
+        "id": "msg_assistant_partial",
+        "sessionID": "ses_current_info"
+      },
+      "parts": [{"type": "text", "text": "partial"}]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "finish": "error",
+        "time": {"created": 1700000009000},
+        "id": "msg_assistant_error",
+        "sessionID": "ses_current_info"
+      },
+      "parts": [{"type": "text", "text": "error"}]
     }
   ]
 }

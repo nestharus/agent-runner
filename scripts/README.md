@@ -26,7 +26,8 @@ A turn script:
     "session_id":     "...",
     "turn_id":        "...",
     "timestamp":      "<RFC 3339>",
-    "role":           "user|assistant",
+    "role":           "assistant",
+    "completion_outcome": "stop",
     "parent_turn_id": "<turn_id|null>",
     "is_sidechain":   true,
     "body":           [{"type": "text", "text": "..."}]
@@ -40,6 +41,18 @@ A turn script:
   canonical content shape: an array of chunks such as
   `{"type":"text","text":"..."}`. Omit `body` when the adapter cannot extract
   turn content; do not emit `null`.
+- `completion_outcome` is an optional string member of the
+  `runner-normalized-turn-script-jsonl-contract`. The OpenCode adapter emits it
+  only on assistant turns when public `info.finish` is a non-empty string,
+  preserving every non-empty value verbatim (including `stop`, `tool-calls`, and
+  `error`). User turns and assistant turns with a missing or empty outcome omit
+  the member; adapters must not emit JSON `null`. Runtime ingestion retains the
+  value only as scan-local completion evidence and does not persist it in
+  `session_turns` or decide acceptance. Only the pure classifier accepts exact
+  `stop`, and only with a usable pre-scan baseline, an error-free post-scan, a
+  positive non-regressing assistant delta, exact-session equality, and a newer
+  cursor. Text, role, exit code, count delta alone, missing/empty outcomes, and
+  other non-empty outcomes never prove acceptance.
 - Returns 0 on success. Non-zero with diagnostic on stderr on failure.
 - Is **idempotent**: re-running with no source changes outputs nothing.
   (The runner's `session_turns` table has `UNIQUE(provider, session_id, turn_id)`,
