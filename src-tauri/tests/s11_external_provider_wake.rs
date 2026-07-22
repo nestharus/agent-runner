@@ -208,6 +208,15 @@ turn_script = {}
             .unwrap()
     }
 
+    fn set_auto_wake_count(&self, count: i64) {
+        self.sidecar_conn()
+            .execute(
+                "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",
+                params![SESSION, count],
+            )
+            .unwrap();
+    }
+
     fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> Option<String> {
         self.sidecar_conn()
             .query_row(
@@ -555,10 +564,13 @@ fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
         "dispatch external provider wake first dropped payload",
         &[
             ("S11_DROP_FIRST_RESUME_PAYLOAD", "1"),
-            ("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS", "1000"),
+            ("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS", "1"),
+            ("OULIPOLY_AUTO_WAKE_MAX", "32"),
+            ("S11_NOTIFY_DELAY_SECONDS", "4"),
         ],
     );
     assert_success(&output);
+    fixture.set_auto_wake_count(5);
 
     let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
     wait_until("first failed wake released claim", || {
@@ -582,6 +594,39 @@ fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
             && rows[0].delivery_error.is_none()
             && db.wake_claim(SESSION).unwrap().is_none()
     });
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.selected_auto_wake_max, Some(32));
+    assert!(runtime.auto_wake_count >= 7, "{runtime:?}");
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_persists_selected_max_across_environment_empty_notifier_and_detached_resume() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider persisted wake policy",
+        &[("OULIPOLY_AUTO_WAKE_MAX", "32")],
+    );
+    assert_success(&output);
+
+    let (_, notify_env) =
+        wait_for_json_file(&fixture.work_dir.join(HANDLE).join("notify-env.json"));
+    assert_eq!(
+        notify_env
+            .get("oulipoly_auto_wake_max")
+            .and_then(Value::as_str),
+        None,
+        "notifier fixture must explicitly remove ambient wake max"
+    );
+    let _prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert_eq!(
+        wait_for_file(&fixture.prompt_file("external-wake-max.txt")),
+        "32"
+    );
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.selected_auto_wake_max, Some(32));
     fixture.assert_xdg_isolated();
 }
 
@@ -883,6 +928,9 @@ def launch(request):
             return
         target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-resumed.txt"
         target.write_text(prompt, encoding="utf-8")
+        (pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-max.txt").write_text(
+            os.environ.get("OULIPOLY_AUTO_WAKE_MAX", "missing"), encoding="utf-8"
+        )
         emit(stdout_event(request, 1, "resumed\n"))
         seq = 2
         if os.environ.get("S11_EMIT_ASSISTANT_RESPONSE_MARKER") == "1":
@@ -973,12 +1021,14 @@ def notify_helper():
     runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
     child_env = os.environ.copy()
     child_env["OULIPOLY_DATA_DIR"] = str(pathlib.Path(os.environ["XDG_DATA_HOME"]) / "oulipoly-agent-runner")
+    child_env.pop("OULIPOLY_AUTO_WAKE_MAX", None)
     child_env.pop("XDG_CONFIG_HOME", None)
     child_env.pop("XDG_DATA_HOME", None)
     (state / "notify-env.json").write_text(json.dumps({
         "xdg_config_home": child_env.get("XDG_CONFIG_HOME"),
         "xdg_data_home": child_env.get("XDG_DATA_HOME"),
         "oulipoly_data_dir": child_env.get("OULIPOLY_DATA_DIR"),
+        "oulipoly_auto_wake_max": child_env.get("OULIPOLY_AUTO_WAKE_MAX"),
     }, separators=(",", ":")), encoding="utf-8")
     with (state / "notify.json").open("w", encoding="utf-8") as out, \
          (state / "notify.err").open("w", encoding="utf-8") as err:

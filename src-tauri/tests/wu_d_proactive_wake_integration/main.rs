@@ -80,6 +80,11 @@ fn manual_resume_race_is_safe() {
 }
 
 #[test]
+fn persisted_wake_max_drives_environment_empty_notify_and_turn_end_recheck() {
+    cases_basic::persisted_wake_max_drives_environment_empty_notify_and_turn_end_recheck();
+}
+
+#[test]
 fn opencode_notify_idle_wakes_resume_with_ses_session() {
     cases_opencode::opencode_notify_idle_wakes_resume_with_ses_session();
 }
@@ -132,6 +137,16 @@ fn wake_sweep_does_not_rewake_consumed_pending_mailbox() {
 #[test]
 fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
     cases_batch_sweep::wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox();
+}
+
+#[test]
+fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
+    cases_batch_sweep::environment_empty_sweep_uses_persisted_wake_max_beyond_five();
+}
+
+#[test]
+fn persisted_wake_max_caps_sweep_at_selected_value() {
+    cases_batch_sweep::persisted_wake_max_caps_sweep_at_selected_value();
 }
 
 #[test]

@@ -514,6 +514,7 @@ pub struct SessionRuntimeUpsert<'a> {
     pub pty_control_path: Option<&'a str>,
     pub models_dir: Option<&'a str>,
     pub effective_cwd: Option<&'a str>,
+    pub selected_auto_wake_max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -558,6 +559,7 @@ pub struct SessionRuntimeRow {
     pub models_dir: Option<String>,
     pub effective_cwd: Option<String>,
     pub auto_wake_count: i64,
+    pub selected_auto_wake_max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2420,8 +2422,9 @@ impl MailboxDb {
                     pty_control_path,
                     updated_at,
                     models_dir,
-                    effective_cwd
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    effective_cwd,
+                    selected_auto_wake_max
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(session_id)
                  DO UPDATE SET
                     mode = excluded.mode,
@@ -2431,7 +2434,11 @@ impl MailboxDb {
                     pty_control_path = excluded.pty_control_path,
                     updated_at = excluded.updated_at,
                     models_dir = COALESCE(excluded.models_dir, session_runtime.models_dir),
-                    effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd)",
+                    effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd),
+                    selected_auto_wake_max = COALESCE(
+                        session_runtime.selected_auto_wake_max,
+                        excluded.selected_auto_wake_max
+                    )",
                 params![
                     input.session_id,
                     input.mode,
@@ -2442,6 +2449,7 @@ impl MailboxDb {
                     &now,
                     input.models_dir,
                     input.effective_cwd,
+                    input.selected_auto_wake_max,
                 ],
             )
             .map_err(|err| format!("Failed to upsert session runtime row: {err}"))?;
@@ -4820,7 +4828,8 @@ fn session_runtime_row(
                 pty_control_path, updated_at, run_state, running_invocation_uuid,
                 running_os_pid, running_os_boot_id, running_os_pid_starttime_ticks,
                 turn_started_at, turn_ended_at, turn_start_max_mailbox_seq,
-                last_exit_code, models_dir, effective_cwd, auto_wake_count
+                last_exit_code, models_dir, effective_cwd, auto_wake_count,
+                selected_auto_wake_max
          FROM session_runtime
          WHERE session_id = ?1",
         params![session_id],
@@ -5400,7 +5409,8 @@ fn mailbox_schema_definition() -> &'static str {
             last_exit_code                   INTEGER,
             models_dir                       TEXT,
             effective_cwd                    TEXT,
-            auto_wake_count                  INTEGER NOT NULL DEFAULT 0
+            auto_wake_count                  INTEGER NOT NULL DEFAULT 0,
+            selected_auto_wake_max           INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS session_wake_claim (
@@ -5516,7 +5526,7 @@ fn missing_runtime_generation_columns(columns: &[String]) -> Vec<(&'static str, 
         .collect()
 }
 
-fn session_runtime_column_additions() -> [(&'static str, &'static str); 12] {
+fn session_runtime_column_additions() -> [(&'static str, &'static str); 13] {
     [
         ("run_state", "TEXT NOT NULL DEFAULT 'idle'"),
         ("running_invocation_uuid", "TEXT"),
@@ -5530,6 +5540,7 @@ fn session_runtime_column_additions() -> [(&'static str, &'static str); 12] {
         ("models_dir", "TEXT"),
         ("effective_cwd", "TEXT"),
         ("auto_wake_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("selected_auto_wake_max", "INTEGER"),
     ]
 }
 
@@ -5700,6 +5711,7 @@ fn map_session_runtime_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         models_dir: row.get(16)?,
         effective_cwd: row.get(17)?,
         auto_wake_count: row.get(18)?,
+        selected_auto_wake_max: row.get(19)?,
     })
 }
 
@@ -6933,6 +6945,109 @@ mod tests {
     }
 
     #[test]
+    fn session_runtime_selected_auto_wake_max_round_trips_and_is_write_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-max",
+            mode: "headless",
+            invocation_uuid: Some("owner-invocation"),
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: Some(32),
+        })
+        .unwrap();
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-max",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: Some(99),
+        })
+        .unwrap();
+
+        let row = db.session_runtime("session-max").unwrap().unwrap();
+        assert_eq!(row.selected_auto_wake_max, Some(32));
+        assert_eq!(row.invocation_uuid.as_deref(), Some("owner-invocation"));
+    }
+
+    #[test]
+    fn session_runtime_legacy_null_accepts_first_selected_auto_wake_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-legacy",
+            mode: "headless",
+            invocation_uuid: Some("owner-invocation"),
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.session_runtime("session-legacy")
+                .unwrap()
+                .unwrap()
+                .selected_auto_wake_max,
+            None
+        );
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-legacy",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: Some(32),
+        })
+        .unwrap();
+        assert_eq!(
+            db.session_runtime("session-legacy")
+                .unwrap()
+                .unwrap()
+                .selected_auto_wake_max,
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn session_runtime_sidecar_repair_declares_selected_auto_wake_max() {
+        let legacy_columns = session_runtime_column_additions()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .filter(|name| name != "selected_auto_wake_max")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            missing_session_runtime_columns(&legacy_columns),
+            vec![("selected_auto_wake_max", "INTEGER")]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let sql = format_table_columns_pragma("session_runtime");
+        assert!(
+            table_columns(&db.conn, "session_runtime", &sql)
+                .unwrap()
+                .contains(&"selected_auto_wake_max".to_string())
+        );
+    }
+
+    #[test]
     fn runtime_mark_running_records_pid_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -7012,6 +7127,7 @@ mod tests {
             pty_control_path: None,
             models_dir: None,
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
@@ -7241,6 +7357,7 @@ mod tests {
             pty_control_path: None,
             models_dir: Some("/tmp/models"),
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))

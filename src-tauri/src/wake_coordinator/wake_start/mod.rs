@@ -11,7 +11,9 @@ use oulipoly_state::mailbox::{
 };
 use uuid::Uuid;
 
-use super::auto_wake_env::{auto_wake_cap_reached, auto_wake_max, emit_auto_wake_cap_reached};
+use super::auto_wake_env::{
+    auto_wake_cap_reached, auto_wake_max_for_runtime, emit_auto_wake_cap_reached,
+};
 use super::diagnostics::{
     WakeDiagnostic, already_in_flight_diagnostic, auto_wake_cap_diagnostic, spawn_error_diagnostic,
     spawned_wake_diagnostic, storage_error_diagnostic,
@@ -31,6 +33,7 @@ struct WakeStartContext<'a> {
     db: MailboxDb,
     runtime: Option<SessionRuntimeRow>,
     claim: WakeClaimRow,
+    auto_wake_max: i64,
 }
 
 pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
@@ -57,6 +60,7 @@ pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         context.runtime.as_ref(),
         &context.claim.claim_token,
         context.input.auto_wake_count,
+        context.auto_wake_max,
     );
     wake_spawn_diagnostic(
         &mut context.db,
@@ -79,14 +83,15 @@ fn prepare_wake_start_context<'a>(
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
     validate_wake_has_deliverable_pending(input.session_id)?;
-    validate_start_wake_cap(input)?;
+    let auto_wake_max = auto_wake_max_for_runtime(runtime.as_ref());
+    validate_start_wake_cap(input, auto_wake_max)?;
     let liveness = wake_runtime_liveness(&mut db, input.session_id, runtime.as_ref())?;
     cleanup_idle_runtime(runtime.as_ref(), liveness);
     if wake_liveness_busy(liveness) {
         return Err(busy_diagnostic());
     }
     let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
-    Ok(wake_start_context(input, db, runtime, claim))
+    Ok(wake_start_context(input, db, runtime, claim, auto_wake_max))
 }
 
 fn validate_wake_has_deliverable_pending(session_id: &str) -> Result<(), WakeDiagnostic> {
@@ -111,12 +116,14 @@ fn wake_start_context<'a>(
     db: MailboxDb,
     runtime: Option<SessionRuntimeRow>,
     claim: WakeClaimRow,
+    auto_wake_max: i64,
 ) -> WakeStartContext<'a> {
     WakeStartContext {
         input,
         db,
         runtime,
         claim,
+        auto_wake_max,
     }
 }
 
@@ -133,20 +140,31 @@ fn normalize_start_wake_input<'a>(
     }
 }
 
-fn start_wake_input_reached_cap(input: StartWakeInput<'_>) -> bool {
-    auto_wake_cap_reached(input.auto_wake_count.saturating_sub(1), auto_wake_max())
+fn start_wake_input_reached_cap(input: StartWakeInput<'_>, auto_wake_max: i64) -> bool {
+    auto_wake_cap_reached(input.auto_wake_count.saturating_sub(1), auto_wake_max)
 }
 
-fn validate_start_wake_cap(input: StartWakeInput<'_>) -> Result<(), WakeDiagnostic> {
-    if !start_wake_input_reached_cap(input) {
+fn validate_start_wake_cap(
+    input: StartWakeInput<'_>,
+    auto_wake_max: i64,
+) -> Result<(), WakeDiagnostic> {
+    if !start_wake_input_reached_cap(input, auto_wake_max) {
         return Ok(());
     }
     let current_count = input.auto_wake_count.saturating_sub(1);
-    Err(start_wake_cap_diagnostic(input.session_id, current_count))
+    Err(start_wake_cap_diagnostic(
+        input.session_id,
+        current_count,
+        auto_wake_max,
+    ))
 }
 
-fn start_wake_cap_diagnostic(session_id: &str, current_count: i64) -> WakeDiagnostic {
-    emit_auto_wake_cap_reached(session_id, current_count, auto_wake_max());
+fn start_wake_cap_diagnostic(
+    session_id: &str,
+    current_count: i64,
+    auto_wake_max: i64,
+) -> WakeDiagnostic {
+    emit_auto_wake_cap_reached(session_id, current_count, auto_wake_max);
     auto_wake_cap_diagnostic(current_count)
 }
 

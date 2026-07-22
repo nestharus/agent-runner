@@ -156,6 +156,7 @@ impl Fixture {
             pty_control_path: None,
             models_dir: Some(&models_dir),
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
     }
@@ -171,8 +172,37 @@ impl Fixture {
             pty_control_path: None,
             models_dir: None,
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
+    }
+
+    pub(crate) fn seed_idle_runtime_with_wake_policy(
+        &self,
+        session_id: &str,
+        selected_auto_wake_max: i64,
+        auto_wake_count: i64,
+    ) {
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let models_dir = path_string(&self.models_dir);
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id,
+            mode: "headless",
+            invocation_uuid: Some(INVOCATION),
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL),
+            pty_control_path: None,
+            models_dir: Some(&models_dir),
+            effective_cwd: None,
+            selected_auto_wake_max: Some(selected_auto_wake_max),
+        })
+        .unwrap();
+        self.sidecar_conn()
+            .execute(
+                "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",
+                rusqlite::params![session_id, auto_wake_count],
+            )
+            .unwrap();
     }
 
     pub(crate) fn seed_live_pty_runtime(&self, control_path: &Path) -> ProcessIdentity {

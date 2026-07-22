@@ -646,6 +646,7 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
             pty_control_path: Some("/tmp/oulipoly-observe.sock"),
             models_dir: None,
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
     mailbox

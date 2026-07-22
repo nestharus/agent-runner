@@ -10,8 +10,8 @@ use std::process::{Child, Command, Stdio};
 use std::os::unix::process::CommandExt;
 
 use super::constants::{
-    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_SESSION_ID_ENV, AUTO_WAKE_TOKEN_ENV,
-    PARENT_INVOCATION_ENV,
+    AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_MAX_ENV, AUTO_WAKE_SESSION_ID_ENV,
+    AUTO_WAKE_TOKEN_ENV, PARENT_INVOCATION_ENV,
 };
 
 pub(super) fn spawn_detached_resume(
@@ -19,9 +19,17 @@ pub(super) fn spawn_detached_resume(
     runtime: Option<&SessionRuntimeRow>,
     claim_token: &str,
     auto_wake_count: i64,
+    auto_wake_max: i64,
 ) -> Result<i64, String> {
     let exe = current_agents_exe()?;
-    let cmd = detached_resume_command(exe, session_id, runtime, claim_token, auto_wake_count);
+    let cmd = detached_resume_command(
+        exe,
+        session_id,
+        runtime,
+        claim_token,
+        auto_wake_count,
+        auto_wake_max,
+    );
     spawn_detached_child(cmd)
 }
 
@@ -51,10 +59,18 @@ fn detached_resume_command(
     runtime: Option<&SessionRuntimeRow>,
     claim_token: &str,
     auto_wake_count: i64,
+    auto_wake_max: i64,
 ) -> Command {
     let mut cmd = Command::new(exe);
     configure_resume_args(&mut cmd, session_id, runtime);
-    configure_wake_stdio_and_env(&mut cmd, session_id, runtime, claim_token, auto_wake_count);
+    configure_wake_stdio_and_env(
+        &mut cmd,
+        session_id,
+        runtime,
+        claim_token,
+        auto_wake_count,
+        auto_wake_max,
+    );
     configure_detached(&mut cmd);
     cmd
 }
@@ -90,6 +106,7 @@ fn configure_wake_stdio_and_env(
     runtime: Option<&SessionRuntimeRow>,
     claim_token: &str,
     auto_wake_count: i64,
+    auto_wake_max: i64,
 ) {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -97,7 +114,8 @@ fn configure_wake_stdio_and_env(
         .env(AUTO_WAKE_ENV, "1")
         .env(AUTO_WAKE_SESSION_ID_ENV, session_id)
         .env(AUTO_WAKE_TOKEN_ENV, claim_token)
-        .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string());
+        .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string())
+        .env(AUTO_WAKE_MAX_ENV, auto_wake_max.to_string());
     configure_parent_invocation(cmd, runtime);
 }
 
@@ -186,6 +204,7 @@ mod tests {
             models_dir: None,
             effective_cwd: None,
             auto_wake_count: 0,
+            selected_auto_wake_max: None,
         }
     }
 

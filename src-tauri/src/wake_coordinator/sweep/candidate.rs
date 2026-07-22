@@ -10,7 +10,7 @@ use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
 use super::{WakeSweepDisposition, consumed};
 use crate::wake_coordinator::auto_wake_env::{
-    auto_wake_cap_reached, auto_wake_max, emit_auto_wake_cap_reached,
+    auto_wake_cap_reached, auto_wake_max_for_runtime, emit_auto_wake_cap_reached,
 };
 
 pub(super) fn wake_sweep_candidate_disposition(
@@ -30,8 +30,8 @@ pub(super) fn wake_sweep_candidate_disposition(
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
         return abandoned_transient_disposition(db, state, candidate);
     }
-    if wake_sweep_candidate_is_resumable(db, state, candidate)? {
-        return Ok(resumable_disposition_with_cap_emit(candidate));
+    if let Some(runtime) = wake_sweep_candidate_resumable_runtime(db, state, candidate)? {
+        return Ok(resumable_disposition_with_cap_emit(candidate, &runtime));
     }
     if wake_sweep_candidate_has_live_owner(db, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
@@ -79,19 +79,26 @@ fn runtime_has_produced_turns(evidence: Option<(bool, u64)>) -> bool {
         .unwrap_or(false)
 }
 
-fn resumable_disposition_with_cap_emit(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
-    emit_cap_reached_if_capped(candidate);
-    resumable_wake_sweep_disposition(candidate)
+fn resumable_disposition_with_cap_emit(
+    candidate: &WakeSweepCandidate,
+    runtime: &SessionRuntimeRow,
+) -> WakeSweepDisposition {
+    let auto_wake_max = auto_wake_max_for_runtime(Some(runtime));
+    emit_cap_reached_if_capped(candidate, auto_wake_max);
+    resumable_wake_sweep_disposition(candidate, auto_wake_max)
 }
 
-fn emit_cap_reached_if_capped(candidate: &WakeSweepCandidate) {
-    if wake_sweep_candidate_reached_cap(candidate) {
-        emit_wake_sweep_candidate_cap_reached(&candidate.session_id, candidate);
+fn emit_cap_reached_if_capped(candidate: &WakeSweepCandidate, auto_wake_max: i64) {
+    if wake_sweep_candidate_reached_cap(candidate, auto_wake_max) {
+        emit_wake_sweep_candidate_cap_reached(&candidate.session_id, candidate, auto_wake_max);
     }
 }
 
-fn resumable_wake_sweep_disposition(candidate: &WakeSweepCandidate) -> WakeSweepDisposition {
-    if wake_sweep_candidate_reached_cap(candidate) {
+fn resumable_wake_sweep_disposition(
+    candidate: &WakeSweepCandidate,
+    auto_wake_max: i64,
+) -> WakeSweepDisposition {
+    if wake_sweep_candidate_reached_cap(candidate, auto_wake_max) {
         return WakeSweepDisposition::Skip;
     }
     if !wake_sweep_candidate_has_deliverable_pending(&candidate.session_id) {
@@ -114,22 +121,26 @@ fn option_is_present<T>(value: Option<T>) -> bool {
     value.is_some()
 }
 
-fn wake_sweep_candidate_is_resumable(
+fn wake_sweep_candidate_resumable_runtime(
     db: &MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<bool, String> {
+) -> Result<Option<SessionRuntimeRow>, String> {
     if !matches!(
         db.session_generation_projection(&candidate.session_id)
             .map_err(|err| err.to_string())?,
         SessionGenerationProjection::None
     ) {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    wake_sweep_runtime_is_resumable(state, &runtime)
+    if wake_sweep_runtime_is_resumable(state, &runtime)? {
+        Ok(Some(runtime))
+    } else {
+        Ok(None)
+    }
 }
 
 fn wake_sweep_candidate_runtime(
@@ -286,15 +297,19 @@ fn mailbox_row_owner_identity(row: &MailboxRow) -> Option<ProcessIdentity> {
     })
 }
 
-fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate) -> bool {
-    auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max())
+fn wake_sweep_candidate_reached_cap(candidate: &WakeSweepCandidate, auto_wake_max: i64) -> bool {
+    auto_wake_cap_reached(candidate.auto_wake_count.saturating_sub(1), auto_wake_max)
 }
 
-fn emit_wake_sweep_candidate_cap_reached(session_id: &str, candidate: &WakeSweepCandidate) {
+fn emit_wake_sweep_candidate_cap_reached(
+    session_id: &str,
+    candidate: &WakeSweepCandidate,
+    auto_wake_max: i64,
+) {
     emit_auto_wake_cap_reached(
         session_id,
         candidate.auto_wake_count.saturating_sub(1),
-        auto_wake_max(),
+        auto_wake_max,
     );
 }
 

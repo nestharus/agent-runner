@@ -186,3 +186,47 @@ pub(crate) fn manual_resume_race_is_safe() {
     });
     assert_xdg_isolated(&fixture);
 }
+
+pub(crate) fn persisted_wake_max_drives_environment_empty_notify_and_turn_end_recheck() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&provider_script(
+        "",
+        r#"count="${OULIPOLY_AUTO_WAKE_COUNT:?missing count}"
+printf '%s' "${OULIPOLY_AUTO_WAKE_MAX:-missing}" > "$work/persisted-max-${count}.txt"
+if [ "$count" = "6" ]; then
+  notify_handle h-persisted-followup 0
+fi"#,
+        "persisted-${OULIPOLY_AUTO_WAKE_COUNT:-missing}.txt",
+    ));
+    fixture.seed_session_turn();
+    fixture.seed_idle_runtime_with_wake_policy(SESSION, 32, 5);
+    let identity = identity(9_300, "boot-persisted-max", 321);
+    fixture.record_identity(&identity);
+
+    let output = notify_command(&fixture, "h-persisted-start", &identity)
+        .output()
+        .unwrap();
+    assert_notify_success(&output);
+
+    let sixth = wait_for_file(&fixture.prompt_file("persisted-6.txt"));
+    let seventh = wait_for_file(&fixture.prompt_file("persisted-7.txt"));
+    assert_prompt_contains_handle(&sixth, "h-persisted-start");
+    assert_prompt_contains_handle(&seventh, "h-persisted-followup");
+    assert_eq!(
+        wait_for_file(&fixture.prompt_file("persisted-max-6.txt")),
+        "32"
+    );
+    assert_eq!(
+        wait_for_file(&fixture.prompt_file("persisted-max-7.txt")),
+        "32"
+    );
+    wait_until("persisted wake policy deliveries settle", || {
+        delivered_rows_without_claim(&fixture, SESSION, 2)
+    });
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.selected_auto_wake_max, Some(32));
+    assert!(runtime.auto_wake_count >= 7, "{runtime:?}");
+    assert_eq!(runtime.invocation_uuid.as_deref(), Some(crate::INVOCATION));
+    assert_xdg_isolated(&fixture);
+}

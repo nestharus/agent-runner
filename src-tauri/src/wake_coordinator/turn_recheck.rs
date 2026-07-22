@@ -3,9 +3,9 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
 use super::auto_wake_env::{
-    AutoWakeEnv, auto_wake_cap_reached, auto_wake_max, current_auto_wake, current_auto_wake_count,
-    emit_auto_wake_cap_reached, pending_count, release_current_auto_wake_claim,
-    sleep_before_failed_auto_wake_retry,
+    AutoWakeEnv, auto_wake_cap_reached, auto_wake_max_for_session, current_auto_wake,
+    current_auto_wake_count, emit_auto_wake_cap_reached, pending_count,
+    release_current_auto_wake_claim, sleep_before_failed_auto_wake_retry,
 };
 use super::diagnostics::{WakeDiagnostic, auto_wake_cap_diagnostic, storage_error_diagnostic};
 use super::idle::mark_session_idle_after_turn;
@@ -38,10 +38,14 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
         Err(err) => return storage_error_diagnostic(err),
     };
     let auto_wake = current_auto_wake();
+    let auto_wake_max = match auto_wake_max_for_session(session_id) {
+        Ok(value) => value,
+        Err(err) => return storage_error_diagnostic(err),
+    };
     apply_turn_end_recheck_decision(
         session_id,
         auto_wake.as_ref(),
-        turn_end_recheck_decision(session_id, pending_count, auto_wake.as_ref()),
+        turn_end_recheck_decision(session_id, pending_count, auto_wake.as_ref(), auto_wake_max),
     )
 }
 
@@ -50,10 +54,14 @@ fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDi
         Ok(count) => count,
         Err(err) => return storage_error_diagnostic(err),
     };
+    let auto_wake_max = match auto_wake_max_for_session(session_id) {
+        Ok(value) => value,
+        Err(err) => return storage_error_diagnostic(err),
+    };
     apply_failed_auto_wake_recheck_decision(
         session_id,
         auto_wake,
-        failed_auto_wake_recheck_decision(session_id, pending_count, auto_wake),
+        failed_auto_wake_recheck_decision(session_id, pending_count, auto_wake, auto_wake_max),
     )
 }
 
@@ -67,12 +75,13 @@ fn turn_end_recheck_decision<'a>(
     session_id: &'a str,
     pending_count: usize,
     auto_wake: Option<&'a AutoWakeEnv>,
+    auto_wake_max: i64,
 ) -> TurnEndRecheckDecision<'a> {
     if no_pending(pending_count) {
         return TurnEndRecheckDecision::NoPending;
     }
     let current_count = current_auto_wake_count(auto_wake);
-    let max_count = auto_wake_max();
+    let max_count = auto_wake_max;
     if auto_wake_cap_reached(current_count, max_count) {
         return TurnEndRecheckDecision::CapReached {
             current_count,
@@ -130,11 +139,12 @@ fn failed_auto_wake_recheck_decision<'a>(
     session_id: &'a str,
     pending_count: usize,
     auto_wake: &'a AutoWakeEnv,
+    auto_wake_max: i64,
 ) -> FailedAutoWakeRecheckDecision<'a> {
     if no_pending(pending_count) {
         return FailedAutoWakeRecheckDecision::NoPending;
     }
-    let max_count = auto_wake_max();
+    let max_count = auto_wake_max;
     if auto_wake_cap_reached(auto_wake.count, max_count) {
         return FailedAutoWakeRecheckDecision::CapReached {
             current_count: auto_wake.count,
