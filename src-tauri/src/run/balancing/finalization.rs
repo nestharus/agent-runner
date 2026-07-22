@@ -47,6 +47,7 @@ pub(super) struct CompletedAttemptInput<'a, 'state, 'ctx> {
     pub(super) zero_turn_provider_session_id: Option<&'a str>,
     pub(super) attempts: usize,
     pub(super) max_attempts: usize,
+    pub(super) recovered_generic_nonzero: bool,
 }
 
 pub(super) fn finalize_completed_attempt(
@@ -97,9 +98,27 @@ pub(super) fn finalize_completed_attempt(
 fn apply_terminal_signal_outcome_for_completed_attempt(
     input: &mut CompletedAttemptInput<'_, '_, '_>,
 ) {
+    if input.recovered_generic_nonzero {
+        emit_recovered_terminal_signal_marker(input);
+        return;
+    }
     let terminal_signal_disposition =
         apply_terminal_signal_outcome(input.terminal_signal, input.terminal_signal_ctx);
     validator::expect_completed_attempt_disposition(terminal_signal_disposition);
+}
+
+fn emit_recovered_terminal_signal_marker(input: &mut CompletedAttemptInput<'_, '_, '_>) {
+    let Some(signal) = input.terminal_signal else {
+        return;
+    };
+    if let Err(err) = crate::terminal_outcome_adapter::emit_terminal_signal_marker(
+        signal,
+        input.terminal_signal_ctx.invocation_id,
+        input.terminal_signal_ctx.session_id,
+        &mut input.terminal_signal_ctx.stderr,
+    ) {
+        tracing::warn!("Failed to emit recovered terminal signal marker: {err}");
+    }
 }
 
 struct CompletedAttemptClassification {
@@ -111,13 +130,17 @@ struct CompletedAttemptClassification {
 fn classify_completed_attempt_with_balanced_result_error_category(
     input: &CompletedAttemptInput<'_, '_, '_>,
 ) -> CompletedAttemptClassification {
-    let success = execution_succeeded(input.result);
-    let error_category = balanced_result_error_category(
-        input.agent_runtime_services,
-        input.result,
-        input.all_models,
-        input.working_dir,
-    );
+    let success = input.recovered_generic_nonzero || execution_succeeded(input.result);
+    let error_category = (!input.recovered_generic_nonzero)
+        .then(|| {
+            balanced_result_error_category(
+                input.agent_runtime_services,
+                input.result,
+                input.all_models,
+                input.working_dir,
+            )
+        })
+        .flatten();
     let quota_exhausted = error_category_is_quota_exhausted(error_category.as_deref());
     CompletedAttemptClassification {
         success,
@@ -212,7 +235,11 @@ fn emit_completed_attempt_success(
         input.result.terminal_reason.as_deref(),
         &input.result.stdout,
     );
-    BalancedLoopControl::Return(Ok(input.result.exit_code))
+    BalancedLoopControl::Return(Ok(if input.recovered_generic_nonzero {
+        0
+    } else {
+        input.result.exit_code
+    }))
 }
 
 fn quota_exhausted_retry_control(

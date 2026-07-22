@@ -16,10 +16,14 @@ pub(in crate::run::balancing) enum TerminalSignalBranch {
 
 pub(in crate::run::balancing) fn terminal_signal_branch(
     signal: &Option<executor::TerminalSignal>,
+    recovered_generic_nonzero: bool,
 ) -> TerminalSignalBranch {
     let Some(signal) = signal else {
         return TerminalSignalBranch::CompletedAttempt;
     };
+    if recovered_generic_nonzero && signal.kind == TerminalSignalKind::NonzeroExit {
+        return TerminalSignalBranch::CompletedAttempt;
+    }
     match signal.kind {
         TerminalSignalKind::QuotaExhaustedInband => TerminalSignalBranch::QuotaExhaustedRetry,
         TerminalSignalKind::ProviderStorageContention => TerminalSignalBranch::QuotaExhaustedRetry,

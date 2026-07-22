@@ -8,7 +8,7 @@ use super::finalization::{
     CompletedAttemptControl, CompletedAttemptInput, finalize_completed_attempt,
 };
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
-use super::{formatter, mapper, predicate, wake};
+use super::{formatter, mapper, wake};
 use crate::invocation::finalize::FinalizerGuard;
 use crate::quota_zero_turn::zero_turn_record_baseline;
 
@@ -163,6 +163,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &oulipoly_runtime::executor::ExecutionResult,
+    recovered_generic_nonzero: bool,
 ) -> Result<ResumeAttemptLoopControl, String> {
     match finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
@@ -180,15 +181,18 @@ pub(super) fn finalize_completed_attempt_for_resume(
         effective_spawn_cwd: input.effective_spawn_cwd,
         attempts: input.attempts,
         max_attempts: input.max_attempts,
+        recovered_generic_nonzero,
     })? {
         CompletedAttemptControl::Continue => {
             finalize_retrying_resume(input, attempt, provider_session_id, result)
         }
-        CompletedAttemptControl::Return(exit_code)
-            if predicate::completed_attempt_success(result) =>
-        {
-            finalize_successful_resume(input, attempt, provider_session_id, exit_code)
-        }
+        CompletedAttemptControl::Return(exit_code) if exit_code == 0 => finalize_successful_resume(
+            input,
+            attempt,
+            provider_session_id,
+            exit_code,
+            result.exit_code,
+        ),
         CompletedAttemptControl::Return(exit_code) => {
             finalize_failed_resume(input, attempt, provider_session_id, result, exit_code)
         }
@@ -218,12 +222,13 @@ fn finalize_successful_resume(
     attempt: &ResumeInvocationAttempt<'_>,
     provider_session_id: &str,
     exit_code: i32,
+    physical_exit_code: i32,
 ) -> Result<ResumeAttemptLoopControl, String> {
     wake::complete_successful_mailbox_delivery(
         input,
         provider_session_id,
         &attempt.invocation.id,
-        exit_code,
+        physical_exit_code,
     )?;
     Ok(ResumeAttemptLoopControl::Return(exit_code))
 }

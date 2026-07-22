@@ -50,8 +50,9 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
 ) {
-    if !mailbox_delivery_requires_turn_confirmation(input, result)
+    if !mailbox_delivery_requires_turn_confirmation(input, result, recovered_generic_nonzero)
         || mailbox_delivery_turn_confirmed(input, &provider.name, result, zero_turn_action)
     {
         return;
@@ -81,8 +82,15 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
 ) -> Result<Option<ResumeAttemptLoopControl>, String> {
-    if !mailbox_delivery_unconfirmed(input, &provider.name, result, zero_turn_action) {
+    if !mailbox_delivery_unconfirmed(
+        input,
+        &provider.name,
+        result,
+        zero_turn_action,
+        recovered_generic_nonzero,
+    ) {
         return Ok(None);
     }
     record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
@@ -96,17 +104,19 @@ fn mailbox_delivery_unconfirmed(
     provider_name: &str,
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
 ) -> bool {
-    mailbox_delivery_requires_turn_confirmation(input, result)
+    mailbox_delivery_requires_turn_confirmation(input, result, recovered_generic_nonzero)
         && !mailbox_delivery_turn_confirmed(input, provider_name, result, zero_turn_action)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
+    recovered_generic_nonzero: bool,
 ) -> bool {
     input.mailbox_delivery_requires_turn_confirmation
-        && result.exit_code == 0
+        && (result.exit_code == 0 || recovered_generic_nonzero)
         && !input.mailbox_delivery_seqs.is_empty()
         && input.answer.is_some_and(|answer| !answer.trim().is_empty())
 }

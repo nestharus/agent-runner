@@ -14,7 +14,7 @@ use super::{formatter, mapper, wake};
 use crate::captured_child::emit_captured_child_marker_lines;
 use crate::quota_zero_turn::{
     apply_zero_turn_classification_to_result, host_observed_completion_from_result,
-    zero_turn_classification_for_action, zero_turn_classify_after_completion,
+    zero_turn_classification_for_action, zero_turn_classify_after_completion_with_recovery,
 };
 use crate::terminal_outcome_adapter::{
     TerminalSignalDisposition, apply_age153_terminal_signal_fixture_override,
@@ -45,7 +45,7 @@ pub(super) fn handle_resume_attempt_result(
     provider: &oulipoly_config::ProviderConfig,
     result: &mut executor::ExecutionResult,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let zero_turn_action = apply_resume_attempt_classification(
+    let (zero_turn_action, recovered_generic_nonzero) = apply_resume_attempt_classification(
         input,
         &provider.name,
         &bound_attempt.provider_session_id,
@@ -61,6 +61,7 @@ pub(super) fn handle_resume_attempt_result(
         &bound_attempt.provider_session_id,
         result,
         zero_turn_action,
+        recovered_generic_nonzero,
     )
 }
 
@@ -70,16 +71,18 @@ fn apply_resume_attempt_classification(
     provider_session_id: &str,
     zero_turn_baseline: &crate::zero_turn_orchestration::ZeroTurnBaseline,
     result: &mut executor::ExecutionResult,
-) -> ZeroTurnAction {
+) -> (ZeroTurnAction, bool) {
     apply_age153_terminal_signal_fixture_override(result);
-    let zero_turn_classification = zero_turn_classify_after_completion(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        zero_turn_baseline,
-        host_observed_completion_from_result(result),
-    );
+    let (zero_turn_classification, recovered_generic_nonzero) =
+        zero_turn_classify_after_completion_with_recovery(
+            &input.env.state,
+            &input.env.sessions_cfg,
+            zero_turn_baseline,
+            host_observed_completion_from_result(result),
+            result,
+        );
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
-    next_action(
+    let action = next_action(
         input.zero_turn_confirmation,
         zero_turn_classification_for_action(
             zero_turn_classification,
@@ -87,7 +90,8 @@ fn apply_resume_attempt_classification(
             provider_name,
             Some(provider_session_id),
         ),
-    )
+    );
+    (action, recovered_generic_nonzero)
 }
 
 fn handle_resume_attempt_terminal_signal(
@@ -97,6 +101,7 @@ fn handle_resume_attempt_terminal_signal(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
 ) -> Result<ResumeAttemptLoopControl, String> {
     let terminal_signal_disposition = terminal_signal_disposition_for_result(
         &input.env.state,
@@ -105,6 +110,7 @@ fn handle_resume_attempt_terminal_signal(
         provider_session_id,
         result,
         zero_turn_action,
+        recovered_generic_nonzero,
     );
     let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
         agent_runtime_services: input.agent_runtime_services,
@@ -114,6 +120,7 @@ fn handle_resume_attempt_terminal_signal(
         result,
         terminal_signal_disposition,
         zero_turn_action,
+        recovered_generic_nonzero,
     })?;
     let outcome =
         mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
@@ -133,6 +140,7 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         result,
         zero_turn_action,
+        recovered_generic_nonzero,
     );
     if let Some(control) = wake::handle_unconfirmed_mailbox_delivery_if_needed(
         input,
@@ -141,10 +149,18 @@ fn handle_resume_attempt_terminal_signal(
         provider_session_id,
         result,
         zero_turn_action,
+        recovered_generic_nonzero,
     )? {
         return Ok(control);
     }
-    finalize_completed_attempt_for_resume(input, attempt, provider, provider_session_id, result)
+    finalize_completed_attempt_for_resume(
+        input,
+        attempt,
+        provider,
+        provider_session_id,
+        result,
+        recovered_generic_nonzero,
+    )
 }
 
 pub(super) enum ResumeTerminalDispositionOutcome {
@@ -193,6 +209,7 @@ fn terminal_signal_disposition_for_result(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
 ) -> TerminalSignalDisposition {
     let context_ids = mapper::terminal_signal_context_ids(invocation_id, Some(provider_session_id));
     let mut terminal_signal_stderr = std::io::stderr();
@@ -202,6 +219,10 @@ fn terminal_signal_disposition_for_result(
         state_db,
         &mut terminal_signal_stderr,
     );
+    if recovered_generic_nonzero {
+        emit_recovered_resume_terminal_signal_marker(result, &mut terminal_signal_ctx);
+        return TerminalSignalDisposition::InteractiveFail;
+    }
     let terminal_signal = resume_terminal_signal_for_outcome(&result.terminal_signal);
     if super::predicate::confirmed_zero_turn_maybe_quota(zero_turn_action, &terminal_signal) {
         if let Some(signal) = terminal_signal.as_ref() {
@@ -214,4 +235,23 @@ fn terminal_signal_disposition_for_result(
             &mut terminal_signal_ctx,
         )
     }
+}
+
+fn emit_recovered_resume_terminal_signal_marker(
+    result: &executor::ExecutionResult,
+    terminal_signal_ctx: &mut crate::terminal_outcome_adapter::TerminalSignalContext<
+        '_,
+        std::io::Stderr,
+    >,
+) {
+    let signal = result
+        .terminal_signal
+        .as_ref()
+        .expect("recovered generic nonzero requires terminal evidence");
+    let _ = crate::terminal_outcome_adapter::emit_terminal_signal_marker(
+        signal,
+        terminal_signal_ctx.invocation_id,
+        terminal_signal_ctx.session_id,
+        &mut terminal_signal_ctx.stderr,
+    );
 }

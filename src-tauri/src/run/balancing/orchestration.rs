@@ -48,7 +48,7 @@ use crate::error_emit::effective_model_for_execution;
 use crate::invocation::finalize::FinalizerGuard;
 use crate::quota_zero_turn::{
     apply_zero_turn_classification_to_result, host_observed_completion_from_result,
-    zero_turn_classification_for_action, zero_turn_classify_after_completion,
+    zero_turn_classification_for_action, zero_turn_classify_after_completion_with_recovery,
     zero_turn_late_bind_baseline, zero_turn_record_baseline,
 };
 use crate::terminal_outcome_adapter::{
@@ -173,8 +173,11 @@ fn run_with_balancing_environment(
             &mut terminal_signal_stderr,
         );
         let should_defer_generic_exit = should_defer_generic_exit(all_models, &result);
-        let balanced_terminal_signal =
-            balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit);
+        let balanced_terminal_signal = if zero_turn.recovered_generic_nonzero {
+            result.terminal_signal.clone()
+        } else {
+            balanced_terminal_signal_for_outcome(&result, should_defer_generic_exit)
+        };
 
         let control = dispatch_balanced_terminal_branch(BalancedTerminalDispatchInput {
             agent_runtime_services,
@@ -194,6 +197,7 @@ fn run_with_balancing_environment(
             attempts,
             max_attempts,
             zero_turn_action: zero_turn.action,
+            recovered_generic_nonzero: zero_turn.recovered_generic_nonzero,
             pending_same_provider_verification: &mut pending_same_provider_verification,
         });
 
@@ -465,6 +469,7 @@ struct BalancedZeroTurnInput<'a> {
 struct BalancedZeroTurnOutcome {
     provider_session_id: Option<String>,
     action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
 }
 
 fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> BalancedZeroTurnOutcome {
@@ -479,12 +484,14 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
         provider_session_id.as_deref(),
         input.zero_turn_baseline,
     );
-    let zero_turn_classification = zero_turn_classify_after_completion(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        input.zero_turn_baseline,
-        host_observed_completion_from_result(input.result),
-    );
+    let (zero_turn_classification, recovered_generic_nonzero) =
+        zero_turn_classify_after_completion_with_recovery(
+            &input.env.state,
+            &input.env.sessions_cfg,
+            input.zero_turn_baseline,
+            host_observed_completion_from_result(input.result),
+            input.result,
+        );
     apply_zero_turn_classification_to_result(
         input.result,
         input.provider_name,
@@ -502,6 +509,7 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
     BalancedZeroTurnOutcome {
         provider_session_id,
         action,
+        recovered_generic_nonzero,
     }
 }
 
@@ -537,6 +545,7 @@ struct BalancedTerminalDispatchInput<'a, 'state, 'ctx> {
     attempts: usize,
     max_attempts: usize,
     zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
     pending_same_provider_verification: &'a mut Option<(usize, Option<String>)>,
 }
 
@@ -546,7 +555,7 @@ fn dispatch_balanced_terminal_branch(
     if confirmed_zero_turn_exhaustion(input.zero_turn_action, input.terminal_signal) {
         return handle_confirmed_zero_turn_exhaustion_branch(input);
     }
-    let branch = terminal_signal_branch(input.terminal_signal);
+    let branch = terminal_signal_branch(input.terminal_signal, input.recovered_generic_nonzero);
     match branch {
         TerminalSignalBranch::QuotaExhaustedRetry => {
             handle_quota_exhausted_retry(typed_disposition_input_from_balanced_dispatch(input))
@@ -651,6 +660,7 @@ fn completed_attempt_input_from_balanced_dispatch<'a, 'state, 'ctx>(
         ),
         (input.model, input.all_models, input.working_dir),
         (input.attempts, input.max_attempts),
+        input.recovered_generic_nonzero,
     )
 }
 

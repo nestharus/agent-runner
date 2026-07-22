@@ -208,6 +208,21 @@ turn_script = {}
             .unwrap()
     }
 
+    fn latest_resumed_terminal(&self) -> (String, i64, Option<String>) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT status, exit_code, terminal_reason
+                 FROM invocations
+                 WHERE session_capture_method = 'resumed'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
     fn set_auto_wake_count(&self, count: i64) {
         self.sidecar_conn()
             .execute(
@@ -631,6 +646,34 @@ fn external_provider_persists_selected_max_across_environment_empty_notifier_and
 }
 
 #[test]
+fn resumed_physical_nonzero_with_new_stop_is_logically_successful_and_delivers_mailbox() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch recovered external provider wake",
+        &[("S11_NONZERO_RESUME_AFTER_STOP", "1")],
+    );
+    assert_success(&output);
+
+    let _prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    wait_until("recovered resumed attempt delivered mailbox", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    assert_eq!(
+        fixture.latest_resumed_terminal(),
+        ("succeeded".to_string(), 1, Some("exit_nonzero".to_string()))
+    );
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.last_exit_code, Some(1));
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn external_provider_rate_limited_wake_records_error_and_retries_pending_mailbox() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -855,17 +898,18 @@ def produced_assistant_response_marker_event(request, seq):
         "value": True,
     }
 
-def exit_event(request, seq, session_id):
+def exit_event(request, seq, session_id, is_resume=False):
+    recovered_nonzero = is_resume and os.environ.get("S11_NONZERO_RESUME_AFTER_STOP") == "1"
     event = {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
         "time_unix_ms": 1000 + seq,
         "kind": "exit",
-        "status": {"kind": "exited", "code": 0},
+        "status": {"kind": "exited", "code": 1 if recovered_nonzero else 0},
         "terminal_signal": {
-            "kind": "clean_exit",
-            "evidence": "fixture clean exit",
+            "kind": "nonzero_exit" if recovered_nonzero else "clean_exit",
+            "evidence": "fixture retained physical nonzero" if recovered_nonzero else "fixture clean exit",
             "observed_at_unix_ms": 1000 + seq,
         },
     }
@@ -941,7 +985,7 @@ def launch(request):
         if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
             emit(submitted_turn_marker_event(request, seq, known, prompt))
             seq += 1
-        emit(exit_event(request, seq, known))
+        emit(exit_event(request, seq, known, True))
         return
     session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
     seq = 1
@@ -1099,6 +1143,7 @@ def emit(turn_id, text):
         "turn_id": turn_id,
         "timestamp": "2026-06-06T00:00:00Z",
         "role": "assistant",
+        "completion_outcome": "stop",
         "body": [{"type": "text", "text": text}],
     }, separators=(",", ":")))
 
