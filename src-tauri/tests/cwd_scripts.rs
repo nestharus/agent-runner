@@ -879,6 +879,203 @@ done
 }
 
 #[test]
+fn opencode_cwd_accepts_bounded_info_proof_before_oversized_transcript() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("oversized-transcript");
+    let child_pid_path = fixture._temp.path().join("proof-child-pid");
+    let descendant_pid_path = fixture._temp.path().join("proof-descendant-pid");
+    write_fake_export(
+        &fake,
+        r#"printf '%s' "$$" > "$CHILD_PID_FILE"
+/bin/sleep 30 &
+printf '%s' "$!" > "$DESCENDANT_PID_FILE"
+printf '%s' '{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},"messages":["'
+while :; do
+  printf '%s' 'SENSITIVE_TRANSCRIPT_SENTINEL'
+done
+"#,
+    );
+    let started = Instant::now();
+    let output = fixture
+        .command(Some(fake.as_os_str()))
+        .env("OPENCODE_CWD_STDOUT_LIMIT_BYTES", "256")
+        .env("CHILD_PID_FILE", &child_pid_path)
+        .env("DESCENDANT_PID_FILE", &descendant_pid_path)
+        .output()
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
+    fixture.assert_selected_xdg_observed();
+    assert_eq!(
+        parse_response(&output),
+        json!({"owned": true, "found": true, "cwd": "/tmp"})
+    );
+    assert_sensitive_output_absent(&output, "SENSITIVE_TRANSCRIPT_SENTINEL");
+    let child_pid: u32 = fs::read_to_string(child_pid_path).unwrap().parse().unwrap();
+    let descendant_pid: u32 = fs::read_to_string(descendant_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until_process_is_gone(child_pid);
+    wait_until_process_is_gone(descendant_pid);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn opencode_cwd_pipe_fallback_accepts_bounded_info_proof() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("pipe-proof");
+    let child_pid_path = fixture._temp.path().join("pipe-proof-child-pid");
+    let descendant_pid_path = fixture._temp.path().join("pipe-proof-descendant-pid");
+    write_fake_export(
+        &fake,
+        r#"printf '%s' "$$" > "$CHILD_PID_FILE"
+/bin/sleep 30 &
+printf '%s' "$!" > "$DESCENDANT_PID_FILE"
+printf '%s' '{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},"messages":["'
+while :; do
+  printf '%s' 'SENSITIVE_PIPE_TRANSCRIPT_SENTINEL'
+done
+"#,
+    );
+    let harness = r#"import os
+import runpy
+import sys
+
+delattr(os, "memfd_create")
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"#;
+    let started = Instant::now();
+    let output = fixture
+        .isolated_python_command(Some(fake.as_os_str()))
+        .arg("-c")
+        .arg(harness)
+        .arg(scripts_dir().join("opencode-cwd"))
+        .arg(&fixture.base_dir)
+        .arg(SESSION_ID)
+        .env("OPENCODE_CWD_STDOUT_LIMIT_BYTES", "256")
+        .env("CHILD_PID_FILE", &child_pid_path)
+        .env("DESCENDANT_PID_FILE", &descendant_pid_path)
+        .output()
+        .unwrap();
+
+    assert!(started.elapsed() < Duration::from_secs(3), "{output:?}");
+    fixture.assert_selected_xdg_observed();
+    assert_eq!(
+        parse_response(&output),
+        json!({"owned": true, "found": true, "cwd": "/tmp"})
+    );
+    assert_sensitive_output_absent(&output, "SENSITIVE_PIPE_TRANSCRIPT_SENTINEL");
+    let child_pid: u32 = fs::read_to_string(child_pid_path).unwrap().parse().unwrap();
+    let descendant_pid: u32 = fs::read_to_string(descendant_pid_path)
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_until_process_is_gone(child_pid);
+    wait_until_process_is_gone(descendant_pid);
+}
+
+#[test]
+fn opencode_cwd_does_not_override_stderr_limit_with_info_proof() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("proof-with-oversized-stderr");
+    write_fake_export(
+        &fake,
+        r#"printf '%s' '{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},"messages":["'
+while :; do
+  printf '%s' 'SENSITIVE_TRANSCRIPT_SENTINEL'
+done &
+while :; do
+  printf '%s' 'SENSITIVE_STDERR_SENTINEL' >&2
+done
+"#,
+    );
+    let output = fixture
+        .command(Some(fake.as_os_str()))
+        .env("OPENCODE_CWD_STDOUT_LIMIT_BYTES", "256")
+        .env("OPENCODE_CWD_STDERR_LIMIT_BYTES", "64")
+        .output()
+        .unwrap();
+
+    fixture.assert_selected_xdg_observed();
+    assert_indeterminate(&output, "opencode_export_stderr_limit");
+    assert_sensitive_output_absent(&output, "SENSITIVE_TRANSCRIPT_SENTINEL");
+    assert_sensitive_output_absent(&output, "SENSITIVE_STDERR_SENTINEL");
+}
+
+#[test]
+fn opencode_cwd_rejects_malformed_bounded_info_envelopes() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("malformed-proof");
+    let prefixes = [
+        r#"{"messages":["#,
+        r#"{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp""#,
+        r#"{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"}}NOT_JSON"#,
+        r#"{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},NOT_JSON"#,
+        r#"{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},"info":{"id":"ses_other","directory":"/tmp"},"messages":["#,
+    ];
+
+    for prefix in prefixes {
+        write_fake_export(
+            &fake,
+            &format!(
+                "printf '%s' {}\nwhile :; do printf '%s' 'SENSITIVE_MALFORMED_SENTINEL'; done",
+                shell_quote(prefix)
+            ),
+        );
+        let output = fixture
+            .command(Some(fake.as_os_str()))
+            .env("OPENCODE_CWD_STDOUT_LIMIT_BYTES", "256")
+            .output()
+            .unwrap();
+
+        assert_indeterminate(&output, "opencode_export_stdout_limit");
+        assert_sensitive_output_absent(&output, "SENSITIVE_MALFORMED_SENTINEL");
+    }
+}
+
+#[test]
+fn opencode_cwd_applies_identity_and_cwd_validation_to_bounded_info_proof() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("invalid-proof-fields");
+    let cases = [
+        (
+            r#"{"info":{"id":"ses_other","directory":"/tmp"},"messages":["#,
+            "opencode_export_identity_mismatch",
+            false,
+        ),
+        (
+            r#"{"info":{"id":"ses_public_export_fixture_01","directory":"relative/path"},"messages":["#,
+            "opencode_cwd_not_absolute",
+            true,
+        ),
+    ];
+
+    for (prefix, expected_error, owned) in cases {
+        write_fake_export(
+            &fake,
+            &format!(
+                "printf '%s' {}\nwhile :; do printf '%s' 'SENSITIVE_INVALID_FIELD_SENTINEL'; done",
+                shell_quote(prefix)
+            ),
+        );
+        let output = fixture
+            .command(Some(fake.as_os_str()))
+            .env("OPENCODE_CWD_STDOUT_LIMIT_BYTES", "256")
+            .output()
+            .unwrap();
+
+        if owned {
+            assert_owned_without_cwd(&output, expected_error);
+        } else {
+            assert_indeterminate(&output, expected_error);
+        }
+        assert_sensitive_output_absent(&output, "SENSITIVE_INVALID_FIELD_SENTINEL");
+    }
+}
+
+#[test]
 fn opencode_cwd_rejects_oversized_stderr_and_kills_descendants() {
     let fixture = OpenCodeFixture::new(None);
     let fake = fixture.fake_bin_dir.join("oversized-stderr");

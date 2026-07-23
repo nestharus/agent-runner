@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Resolve OpenCode storage membership and cwd through its public export CLI."""
 
+import codecs
 import fcntl
 import json
 import os
@@ -18,6 +19,7 @@ DEFAULT_TIMEOUT_MS = 10_000
 DEFAULT_STDOUT_LIMIT = 16 * 1024 * 1024
 DEFAULT_STDERR_LIMIT = 64 * 1024
 READ_CHUNK_SIZE = 64 * 1024
+INFO_PROOF_LIMIT = 1024 * 1024
 
 
 def validate_argv(argv):
@@ -156,7 +158,12 @@ def register_capture_stream_entries(selector, streams):
 
 
 def map_capture_state(streams):
-    return {"streams": streams, "error": None, "finished": False}
+    return {
+        "streams": streams,
+        "error": None,
+        "finished": False,
+        "info_proof": None,
+    }
 
 
 def map_stream_outputs(streams):
@@ -183,6 +190,10 @@ def validate_stream_chunk(stream_name, remaining, chunk):
 
 def append_stream_chunk(output, chunk):
     output.extend(chunk)
+
+
+def append_bounded_stream_chunk(output, chunk, remaining):
+    append_stream_chunk(output, chunk[: max(0, remaining)])
 
 
 def stdout_capture_exceeded(file_descriptor, stdout_limit):
@@ -223,6 +234,7 @@ def read_stream(selector, file_descriptor, state):
         return
     error = validate_stream_chunk(stream_name, remaining, chunk)
     if error is not None:
+        append_bounded_stream_chunk(output, chunk, remaining)
         state["error"] = error
         return
     append_stream_chunk(output, chunk)
@@ -245,6 +257,96 @@ def map_failed_capture_state(state, reason):
     state["finished"] = True
 
 
+def skip_json_whitespace(text, index):
+    while index < len(text) and text[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def decode_json_prefix(raw_prefix):
+    try:
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        return decoder.decode(raw_prefix, final=False)
+    except UnicodeDecodeError:
+        return None
+
+
+def parse_export_info_prefix(raw_prefix):
+    text = decode_json_prefix(raw_prefix)
+    if text is None:
+        return None
+    decoder = json.JSONDecoder(parse_constant=reject_json_constant)
+    index = skip_json_whitespace(text, 0)
+    if index >= len(text) or text[index] != "{":
+        return None
+    index = skip_json_whitespace(text, index + 1)
+    try:
+        key, index = decoder.raw_decode(text, index)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if key != "info":
+        return None
+    index = skip_json_whitespace(text, index)
+    if index >= len(text) or text[index] != ":":
+        return None
+    index = skip_json_whitespace(text, index + 1)
+    try:
+        info, index = decoder.raw_decode(text, index)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    index = skip_json_whitespace(text, index)
+    if index >= len(text) or text[index] != ",":
+        return None
+    index = skip_json_whitespace(text, index + 1)
+    try:
+        messages_key, index = decoder.raw_decode(text, index)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if messages_key != "messages":
+        return None
+    index = skip_json_whitespace(text, index)
+    if index >= len(text) or text[index] != ":":
+        return None
+    index = skip_json_whitespace(text, index + 1)
+    if index >= len(text) or text[index] != "[":
+        return None
+    try:
+        return json.dumps(
+            {"info": info}, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def read_stdout_prefix(file_descriptor, limit):
+    length = os.lseek(file_descriptor, 0, os.SEEK_CUR)
+    return os.pread(file_descriptor, min(length, limit), 0)
+
+
+def buffered_stdout_prefix(state, limit):
+    for stream_name, output, _ in state["streams"].values():
+        if stream_name == "stdout":
+            return bytes(output[:limit])
+    return b""
+
+
+def captured_stdout_prefix(stdout_capture, state):
+    if stdout_capture is not None:
+        return read_stdout_prefix(stdout_capture, INFO_PROOF_LIMIT)
+    return buffered_stdout_prefix(state, INFO_PROOF_LIMIT)
+
+
+def complete_from_info_proof(process, state, stdout_capture):
+    proof = parse_export_info_prefix(captured_stdout_prefix(stdout_capture, state))
+    if proof is None:
+        return False
+    terminate_process_group(process)
+    state["error"] = None
+    state["info_proof"] = proof
+    state["finished"] = True
+    return True
+
+
 def capture_step(process, selector, state, deadline, stdout_capture, stdout_limit):
     if time.monotonic() >= deadline:
         terminate_process_group(process)
@@ -254,7 +356,16 @@ def capture_step(process, selector, state, deadline, stdout_capture, stdout_limi
     events = selector.select(timeout=timeout)
     for key, _ in events:
         read_stream(selector, key.fd, state)
-    if stdout_capture_exceeded(stdout_capture, stdout_limit):
+    if state["error"] not in (None, "opencode_export_stdout_limit"):
+        terminate_process_group(process)
+        map_failed_capture_state(state, state["error"])
+        return
+    stdout_limited = stdout_capture_exceeded(stdout_capture, stdout_limit) or (
+        state["error"] == "opencode_export_stdout_limit"
+    )
+    if stdout_limited and complete_from_info_proof(process, state, stdout_capture):
+        return
+    if stdout_limited:
         terminate_process_group(process)
         map_failed_capture_state(state, "opencode_export_stdout_limit")
         return
@@ -281,6 +392,8 @@ def capture_export(process, limits, stdout_capture):
             process, selector, state, deadline, stdout_capture, stdout_limit
         )
         if state["error"] is not None:
+            return map_capture_result(process, state, stream_outputs, b"")
+        if state["info_proof"] is not None:
             return map_capture_result(process, state, stream_outputs, b"")
         stdout, error = captured_stdout(
             stdout_capture, stream_outputs, stdout_limit
@@ -317,6 +430,8 @@ def map_capture_failure(reason):
 def map_capture_result(process, state, stream_outputs, stdout):
     if state["error"] is not None:
         return state["error"], None, b"", b""
+    if state["info_proof"] is not None:
+        return "completed", 0, state["info_proof"], bytes(stream_outputs["stderr"])
     return (
         "completed",
         process.returncode,
