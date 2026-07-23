@@ -20,6 +20,7 @@
 //!     Domain: provider-entry-runtime-shape
 //!     Owns:
 //!       - ProviderEntry public account schema and runtime ProviderConfig construction
+//!       - Provider account child-environment additions and removals
 //!       - provider command/argument family detection subordinate to account validation
 //!       - tool restriction duplicate detection for provider account command surfaces
 //! ```
@@ -28,6 +29,7 @@ use crate::model::{
     InvocationMode, PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeStrategy,
     SessionCapture, SessionStorage, ToolRestrictionKind, ToolRestrictions,
 };
+use std::collections::BTreeMap;
 
 /// One entry in `providers.toml`, keyed by the provider name.
 #[derive(Debug, Clone)]
@@ -46,6 +48,8 @@ pub struct ProviderEntry {
     /// appended from the selected model TOML at spawn time.
     pub command: Option<String>,
     pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub unset_environment: Vec<String>,
     pub interactive_args: Option<Vec<String>>,
     pub prompt_mode: PromptMode,
     pub resume: Option<ResumeStrategy>,
@@ -64,6 +68,8 @@ impl Default for ProviderEntry {
             auth_refresh_command: None,
             command: None,
             args: Vec::new(),
+            environment: BTreeMap::new(),
+            unset_environment: Vec::new(),
             interactive_args: None,
             prompt_mode: PromptMode::Stdin,
             resume: None,
@@ -274,6 +280,8 @@ fn map_provider_entry_to_provider_config(
         name: name.to_string(),
         command,
         args: map_effective_args(&entry.args, model_provider),
+        environment: entry.environment.clone(),
+        unset_environment: entry.unset_environment.clone(),
         interactive_args: map_effective_interactive_args(
             entry.interactive_args.as_deref(),
             model_provider,

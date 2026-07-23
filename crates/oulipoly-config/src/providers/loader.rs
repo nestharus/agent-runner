@@ -124,6 +124,8 @@ pub(super) fn raw_entry_to_entry(raw: &RawEntry, invocation_mode: InvocationMode
         auth_refresh_command: raw.auth_refresh_command.clone(),
         command: raw.command.clone(),
         args: raw.args.clone(),
+        environment: raw.environment.clone(),
+        unset_environment: raw.unset_environment.clone(),
         interactive_args: raw.interactive_args.clone(),
         prompt_mode: raw
             .prompt_mode

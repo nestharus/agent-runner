@@ -14,11 +14,13 @@
 //!     Domain: model-provider-config
 //!     Owns:
 //!       - ProviderConfig account reference and model-level provider arguments
+//!       - Provider account child-environment additions and removals
 //!       - InvocationMode CLI launch mode marker subordinate to provider config
 //!       - Resume/session/tool restriction carriers attached to a model provider entry
 //! ```
 //!
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use super::provider_name::derive_provider_name;
 use super::resume::{ResumeAcceptanceRules, ResumeStrategy};
@@ -43,6 +45,12 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub command: String,
     pub args: Vec<String>,
+    /// Values added to or replaced in the inherited child environment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    /// Inherited names removed before `environment` values are applied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unset_environment: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +78,8 @@ impl ProviderConfig {
             name,
             command,
             args,
+            environment: BTreeMap::new(),
+            unset_environment: Vec::new(),
             interactive_args: None,
             resume: None,
             session_capture: None,
@@ -86,6 +96,8 @@ impl ProviderConfig {
             name: name.into(),
             command: String::new(),
             args,
+            environment: BTreeMap::new(),
+            unset_environment: Vec::new(),
             interactive_args: None,
             resume: None,
             session_capture: None,

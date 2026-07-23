@@ -254,6 +254,8 @@ fn assemble_symlink_workspace(paths: SymlinkWorkspace) -> SymlinkWorkspace {
 
 fn claude_provider(name: &str, projects_dir: &Path) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: name.to_string(),
         args: Vec::new(),

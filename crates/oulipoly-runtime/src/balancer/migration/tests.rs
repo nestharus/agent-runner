@@ -124,6 +124,8 @@ fn migratable_model(provider_names: &[(&str, &str)]) -> ModelConfig {
 
 fn migratable_provider(name: &str, storage_kind: &str) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: name.to_string(),
         args: Vec::new(),

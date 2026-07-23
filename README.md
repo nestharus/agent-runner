@@ -294,6 +294,8 @@ quota_script         = "anthropic-usage ~/.claude/.credentials.json"
 auth_refresh_command = "claude auth status"
 command              = "claude"
 args                 = ["-p"]
+environment          = { CLAUDE_CONFIG_DIR = "/home/example/.claude" }
+unset_environment    = ["CLAUDECODE"]
 interactive_args     = []
 prompt_mode          = "stdin"
 
@@ -350,6 +352,8 @@ quota_script = "zai-usage ~/.config/opencode/auth.json"
 ```
 
 `args` and `interactive_args` are provider/account defaults only. Do not put model flags there; model flags live in model TOMLs and are appended at spawn time.
+
+`environment` adds or replaces child-process environment values for the account, while `unset_environment` removes inherited names. Removals run before additions, so an `environment` value wins when a name appears in both fields. Runner-owned linkage values such as `OULIPOLY_DATA_DIR`, `OULIPOLY_PARENT_INVOCATION`, and `OULIPOLY_RETURN_CHANNEL` remain authoritative.
 
 Required reading before adding `--tools` or `--allowedTools` flags to a Claude provider entry: [`docs/architecture/claude-proxy-mcp-launch-shape.md`](docs/architecture/claude-proxy-mcp-launch-shape.md). Interactive PTY MCP replacement launches must use `--allowedTools mcp__<server>__<tool>,...` or no filter, never `--tools mcp__<server>__<tool>,...`.
 

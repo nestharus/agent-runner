@@ -131,6 +131,8 @@ fn toml_array(values: &[&str]) -> String {
 fn interactive_execution_uses_provider_interactive_args_for_child_argv() {
     let (_dir, script_path, argv_dump) = argv_dump_script();
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "interactive-fixture".to_string(),
         command: script_path.to_string_lossy().into_owned(),
         args: vec!["one-shot-only".to_string()],
@@ -160,6 +162,8 @@ fn interactive_execution_uses_provider_interactive_args_for_child_argv() {
 fn interactive_execution_applies_provider_policy_to_argv() {
     let (_dir, script_path, argv_dump) = argv_dump_script();
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "claude-interactive".to_string(),
         command: script_path.to_string_lossy().into_owned(),
         args: Vec::new(),
@@ -195,6 +199,8 @@ fn interactive_execution_applies_provider_policy_to_argv() {
 fn cn1_interactive_execution_emits_full_ordered_policy_argv() {
     let (_dir, script_path, argv_dump) = argv_dump_script();
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: format!("{}-interactive", primary_policy_token()),
         command: script_path.to_string_lossy().into_owned(),
         args: Vec::new(),
@@ -235,6 +241,8 @@ fn cn1_interactive_execution_emits_full_ordered_policy_argv() {
 fn cn2_interactive_execution_emits_inferred_override_without_restrictions() {
     let (_dir, script_path, argv_dump) = argv_dump_script();
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: primary_policy_token(),
         command: script_path.to_string_lossy().into_owned(),
         args: Vec::new(),
@@ -270,6 +278,8 @@ fn interactive_execution_preserves_invocation_mode_in_provider() {
     for mode in [InvocationMode::Headless, InvocationMode::Proxy] {
         let _ = std::fs::write(&argv_dump, "");
         let provider = ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "invocation-mode-fixture".to_string(),
             command: script_path.to_string_lossy().into_owned(),
             args: Vec::new(),
@@ -307,6 +317,8 @@ fn interactive_execution_propagates_parent_invocation_env() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&script_path, perms).unwrap();
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "env-fixture".to_string(),
         command: "bash".to_string(),
         args: Vec::new(),
@@ -340,6 +352,8 @@ fn resume_execution_clears_session_capture_and_preserves_invocation_mode() {
     std::fs::set_permissions(&script_path, perms).unwrap();
 
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "resume-proxy-fixture".to_string(),
         command: script_path.to_string_lossy().into_owned(),
         args: Vec::new(),
@@ -393,6 +407,8 @@ fn resume_execution_clears_session_capture_and_preserves_invocation_mode() {
 fn resume_execution_appends_resume_args_to_provider_argv() {
     let (_dir, script_path, argv_dump) = argv_dump_script();
     let provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "resume-tail-fixture".to_string(),
         command: script_path.to_string_lossy().into_owned(),
         args: vec!["--model".to_string(), "opus".to_string()],

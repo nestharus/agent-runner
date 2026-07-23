@@ -127,6 +127,8 @@ fn model_for(script: &FixtureScript) -> ModelConfig {
         name: "fixture-model".to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "fixture-provider".to_string(),
             command: script.path.to_string_lossy().into_owned(),
             args: Vec::new(),

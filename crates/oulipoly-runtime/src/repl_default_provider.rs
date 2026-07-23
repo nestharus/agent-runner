@@ -155,6 +155,8 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
     let selected_provider_name = provider.name.clone();
     let launch_provider = ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: carrier_model.name,
         ..provider
     };
@@ -624,6 +626,8 @@ interactive_args = ["ok"]
     #[cfg(unix)]
     fn runtime_launcher_test_provider(path: &Path) -> ProviderConfig {
         ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "runtime-launcher-test".to_string(),
             command: path.to_string_lossy().into_owned(),
             args: vec!["one-shot-only".to_string()],

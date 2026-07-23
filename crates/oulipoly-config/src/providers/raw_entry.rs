@@ -14,6 +14,7 @@
 //!     Owns:
 //!       - raw providers.toml HashMap carrier and deserialization-only provider entry schema
 //!       - serde field defaults for provider account TOML ingestion
+//!       - raw provider account child-environment additions and removals
 //!       - model-derived raw field carriers subordinate to provider account parsing
 //! ```
 //!
@@ -21,7 +22,7 @@ use crate::model::{
     ResumeAcceptanceRules, ResumeStrategy, SessionCapture, SessionStorage, ToolRestrictions,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub(crate) type RawProvidersToml = HashMap<String, RawEntry>;
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +35,10 @@ pub(crate) struct RawEntry {
     pub(crate) command: Option<String>,
     #[serde(default)]
     pub(crate) args: Vec<String>,
+    #[serde(default)]
+    pub(crate) environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub(crate) unset_environment: Vec<String>,
     #[serde(default)]
     pub(crate) interactive_args: Option<Vec<String>>,
     #[serde(default)]

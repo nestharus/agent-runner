@@ -172,6 +172,8 @@ mod tests {
 
     fn age141_provider(script: &FixtureScript) -> ProviderConfig {
         ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "claude".to_string(),
             command: script.path.to_string_lossy().into_owned(),
             args: Vec::new(),
@@ -292,6 +294,8 @@ mod tests {
     #[test]
     fn t10_terminal_signal_spawn_error_preserves_public_error() {
         let provider = ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "claude".to_string(),
             command: "/definitely/not/a/real/age-141-command".to_string(),
             args: Vec::new(),

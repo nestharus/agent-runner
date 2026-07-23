@@ -35,6 +35,8 @@ fn model_for(script: &FixtureScript) -> ModelConfig {
         name: "fixture-model".to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "model-provider".to_string(),
             command: script.path.to_string_lossy().into_owned(),
             args: Vec::new(),
@@ -54,6 +56,8 @@ fn model_for(script: &FixtureScript) -> ModelConfig {
 
 fn effective_provider(script: &FixtureScript) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "effective-provider".to_string(),
         command: script.path.to_string_lossy().into_owned(),
         args: Vec::new(),
