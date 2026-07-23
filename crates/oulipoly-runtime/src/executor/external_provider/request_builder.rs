@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 const HOME_ENV: &str = "HOME";
 const AGENT_BASH_AGENT_RUNNER_BIN_ENV: &str = "AGENT_BASH_AGENT_RUNNER_BIN";
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
+const JIRA_API_KEY_REALLY_ENV: &str = "JIRA_API_KEY_REALLY";
 const OPENCODE_ACCOUNT_PREFIX: &str = "opencode";
 const PATH_ENV: &str = "PATH";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
@@ -64,6 +65,7 @@ fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<St
     insert_ambient_env(&mut env, PATH_ENV);
     insert_ambient_env(&mut env, HOME_ENV);
     insert_ambient_env(&mut env, AGENT_BASH_AGENT_RUNNER_BIN_ENV);
+    insert_ambient_env(&mut env, JIRA_API_KEY_REALLY_ENV);
     insert_pinned_agent_data_dir(&mut env);
     insert_selected_opencode_auth_env(&mut env, context);
     if let Some(parent) = &context.parent_invocation_env {

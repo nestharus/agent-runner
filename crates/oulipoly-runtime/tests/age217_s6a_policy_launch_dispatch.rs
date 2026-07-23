@@ -1215,6 +1215,47 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
     );
 }
 
+#[test]
+fn external_provider_launch_env_forwards_jira_api_key_really() {
+    const JIRA_ENV: &str = "JIRA_API_KEY_REALLY";
+    const JIRA_VALUE: &str = "synthetic-jira-api-key-really";
+    const SENTINEL_ENV: &str = "UNRELATED_AMBIENT_SENTINEL";
+    const SENTINEL_VALUE: &str = "synthetic-unrelated-ambient-value";
+
+    let _lock = env_lock();
+    let _env = EnvScope::set_optional(&[
+        (JIRA_ENV, Some(JIRA_VALUE)),
+        (SENTINEL_ENV, Some(SENTINEL_VALUE)),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), None)
+        .expect("external dispatch should forward the declared Jira credential");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in provider_launch_envs(&policy, &launch) {
+        assert_env_value(
+            env,
+            JIRA_ENV,
+            JIRA_VALUE,
+            "policy and launch env must carry the exact authorized Jira key",
+        );
+        assert_env_key_absent(
+            env,
+            SENTINEL_ENV,
+            "unrelated ambient env must remain outside the declared boundary",
+        );
+    }
+}
+
 fn assert_host_linkage_envs(
     policy: &Value,
     launch: &Value,
