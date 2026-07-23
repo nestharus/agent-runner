@@ -129,6 +129,12 @@ impl Fixture {
         self.run(cmd)
     }
 
+    fn run_mailbox(&self, args: &[String]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("mailbox").args(args);
+        self.run(cmd)
+    }
+
     fn base_resume_command(&self, model_name: &str, session_id: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("resume")
@@ -536,6 +542,113 @@ fn mailbox_isolation() {
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(row_handles(&stdout_json(&output)), vec!["h-a"]);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn mailbox_recovery_commands_search_show_and_ack_bounded_range() {
+    let fixture = Fixture::new();
+    let first = fixture.seed_mailbox(SESSION_A, "h-recovery-a", 0);
+    let second = fixture.seed_mailbox(SESSION_A, "h-recovery-b", 7);
+    let third = fixture.seed_mailbox(SESSION_A, "h-recovery-c", 0);
+
+    let search = fixture.run_mailbox(&[
+        "search".to_string(),
+        "--session-id".to_string(),
+        SESSION_A.to_string(),
+        "recovery-b".to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(search.status.success(), "{search:?}");
+    assert_eq!(row_handles(&stdout_json(&search)), vec!["h-recovery-b"]);
+
+    let show = fixture.run_mailbox(&[
+        "show".to_string(),
+        "--session-id".to_string(),
+        SESSION_A.to_string(),
+        "--seq".to_string(),
+        second.seq.to_string(),
+        "--include-artifacts".to_string(),
+        "--max-bytes".to_string(),
+        "5".to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(show.status.success(), "{show:?}");
+    let shown = stdout_json(&show);
+    assert_eq!(shown["row"]["handle"], "h-recovery-b");
+    for artifact in ["meta", "log", "rc"] {
+        assert!(shown["artifacts"][artifact].as_str().unwrap().len() <= 5 + "\n[truncated]".len());
+    }
+    assert!(
+        shown["artifacts"]["meta"]
+            .as_str()
+            .unwrap()
+            .ends_with("[truncated]")
+    );
+
+    let ack = fixture.run_mailbox(&[
+        "ack".to_string(),
+        "--session-id".to_string(),
+        SESSION_A.to_string(),
+        "--from-seq".to_string(),
+        first.seq.to_string(),
+        "--to-seq".to_string(),
+        second.seq.to_string(),
+        "--delivered-by".to_string(),
+        "recovery-test".to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(ack.status.success(), "{ack:?}");
+    let acknowledged = stdout_json(&ack);
+    assert_eq!(acknowledged["acknowledged_count"], 2);
+    assert_eq!(acknowledged["remaining_pending"], 1);
+    let pending = fixture.mailbox_rows(SESSION_A, false);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].seq, third.seq);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn mailbox_pause_suppresses_notify_delivery_and_wake_until_resume() {
+    let fixture = Fixture::new();
+    let caller = identity(9072, "boot-pause", 102);
+    fixture.record_identity(&caller, INVOCATION_A, Some(SESSION_A));
+    let pause = fixture.run_mailbox(&[
+        "pause".to_string(),
+        "--session-id".to_string(),
+        SESSION_A.to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(pause.status.success(), "{pause:?}");
+    assert_eq!(stdout_json(&pause)["paused"], true);
+
+    let notify = fixture.run_notify("h-paused", caller_chain(&[&caller]));
+
+    assert!(notify.status.success(), "{notify:?}");
+    let notified = stdout_json(&notify);
+    assert_eq!(notified["pty_delivery"]["status"], "paused");
+    assert!(notified["wake"].is_null());
+    let paused_status = fixture.run_mailbox(&[
+        "status".to_string(),
+        "--session-id".to_string(),
+        SESSION_A.to_string(),
+        "--json".to_string(),
+    ]);
+    let paused = stdout_json(&paused_status);
+    assert_eq!(paused["pending_count"], 1);
+    assert_eq!(paused["deliverable_count"], 0);
+
+    let resume = fixture.run_mailbox(&[
+        "resume".to_string(),
+        "--session-id".to_string(),
+        SESSION_A.to_string(),
+        "--json".to_string(),
+    ]);
+    assert!(resume.status.success(), "{resume:?}");
+    let resumed = stdout_json(&resume);
+    assert_eq!(resumed["paused"], false);
+    assert_eq!(resumed["pending_count"], 1);
+    assert_eq!(resumed["deliverable_count"], 1, "{resumed}");
     fixture.assert_default_user_paths_untouched();
 }
 

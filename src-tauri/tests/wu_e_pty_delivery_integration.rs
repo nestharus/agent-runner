@@ -1,7 +1,12 @@
 #![cfg(unix)]
 
+use oulipoly_runtime::executor::cli::pty_broker::{
+    inject_control_envelope, render_mailbox_notification_envelope,
+};
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRunningUpdate};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow, SessionRuntimeRunningUpdate,
+};
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
 };
@@ -204,6 +209,32 @@ impl Fixture {
 
     fn mailbox(&self) -> MailboxDb {
         MailboxDb::open(&self.sidecar_path()).unwrap()
+    }
+
+    fn seed_mailbox(&self, handle: &str) -> MailboxRow {
+        let artifacts = self.write_notify_artifacts(handle, json!({"caller_chain": []}), 0);
+        let mut db = self.mailbox();
+        match db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: SESSION_A,
+                handle,
+                payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+                owner_invocation_uuid: Some(INVOCATION_A),
+                matched_os_pid: Some(9000),
+                matched_os_boot_id: Some("boot-mailbox"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: &path_string(&artifacts.state_dir),
+                meta_path: &path_string(&artifacts.meta),
+                log_path: &path_string(&artifacts.log),
+                rc_path: &path_string(&artifacts.rc),
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("expected inserted mailbox row, got {other:?}"),
+        }
     }
 
     fn socket_path(&self, name: &str) -> PathBuf {
@@ -495,6 +526,164 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
     fixture.assert_default_user_paths_untouched();
 }
 
+#[test]
+fn live_broker_acks_duplicate_attempt_and_injects_only_overlap_suffix() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("overlap-received.log");
+    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-overlap", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-overlap",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-overlap", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let control_path = running_control_path(&fixture);
+    let rows = (1..=6)
+        .map(|index| fixture.seed_mailbox(&format!("h-overlap-{index}")))
+        .collect::<Vec<_>>();
+    let first_seqs = rows[..3].iter().map(|row| row.seq).collect::<Vec<_>>();
+    let all_seqs = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+    let mut mailbox = fixture.mailbox();
+    mailbox
+        .register_delivery_attempt(
+            "overlap-attempt-1",
+            SESSION_A,
+            &invocation_uuid,
+            &first_seqs,
+            3,
+        )
+        .unwrap();
+    mailbox
+        .register_delivery_attempt(
+            "overlap-attempt-2",
+            SESSION_A,
+            &invocation_uuid,
+            &all_seqs,
+            0,
+        )
+        .unwrap();
+    mailbox
+        .acknowledge_delivery_attempt("overlap-attempt-1")
+        .unwrap();
+    drop(mailbox);
+
+    let duplicate = render_mailbox_notification_envelope(&rows[..3], 3, "overlap-attempt-1");
+    let duplicate_response = inject_control_envelope(&control_path, &duplicate).unwrap();
+    assert!(duplicate_response.ack, "{duplicate_response:?}");
+    let duplicate_output = read_until(
+        pty.master.as_raw_fd(),
+        "GOT_NOTIFY",
+        Duration::from_millis(250),
+    );
+    assert!(
+        !duplicate_output.contains("GOT_NOTIFY"),
+        "resolved duplicate was injected: {duplicate_output:?}"
+    );
+
+    let overlap = render_mailbox_notification_envelope(&rows, 0, "overlap-attempt-2");
+    let overlap_response = inject_control_envelope(&control_path, &overlap).unwrap();
+    assert!(overlap_response.ack, "{overlap_response:?}");
+    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+    assert!(repl.wait().unwrap().success());
+
+    let received = fs::read_to_string(&received_log).unwrap();
+    for index in 1..=3 {
+        assert!(
+            !received.contains(&format!("handle: h-overlap-{index}")),
+            "{received}"
+        );
+    }
+    for index in 4..=6 {
+        assert!(
+            received.contains(&format!("handle: h-overlap-{index}")),
+            "{received}"
+        );
+    }
+    assert!(
+        fixture
+            .mailbox()
+            .list_pending(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn live_broker_persists_delivery_when_socket_ack_is_not_read() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("lost-ack-received.log");
+    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-lost-ack", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-lost-ack",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-lost-ack", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let control_path = running_control_path(&fixture);
+    let row = fixture.seed_mailbox("h-lost-ack");
+    let mut mailbox = fixture.mailbox();
+    mailbox
+        .register_delivery_attempt(
+            "lost-ack-attempt",
+            SESSION_A,
+            &invocation_uuid,
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+    drop(mailbox);
+    let envelope = render_mailbox_notification_envelope(&[row], 0, "lost-ack-attempt");
+
+    let mut stream = UnixStream::connect(&control_path).unwrap();
+    write_inject_request(&mut stream, envelope.as_bytes());
+    drop(stream);
+
+    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+    assert!(repl.wait().unwrap().success());
+    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered_at.is_some());
+    assert_eq!(
+        rows[0].delivered_by_invocation_uuid.as_deref(),
+        Some(invocation_uuid.as_str())
+    );
+    assert!(
+        fs::read_to_string(&received_log)
+            .unwrap()
+            .contains("handle: h-lost-ack")
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
 fn spawn_control_server(
     path: &Path,
     ack: bool,
@@ -663,6 +852,16 @@ fn wait_for_running_invocation(fixture: &Fixture) -> String {
     panic!("timed out waiting for running invocation");
 }
 
+fn running_control_path(fixture: &Fixture) -> String {
+    fixture
+        .mailbox()
+        .session_runtime(SESSION_A)
+        .unwrap()
+        .expect("running session runtime")
+        .pty_control_path
+        .expect("PTY control path")
+}
+
 fn wait_for_child_identity(fixture: &Fixture, invocation_uuid: &str) -> ProcessIdentity {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -697,6 +896,16 @@ fn write_response(stream: &mut UnixStream, ack: bool, message: &str) {
     header[8..12].copy_from_slice(&(message.len() as u32).to_be_bytes());
     stream.write_all(&header).unwrap();
     stream.write_all(message.as_bytes()).unwrap();
+}
+
+fn write_inject_request(stream: &mut UnixStream, payload: &[u8]) {
+    let mut header = [0_u8; 12];
+    header[..4].copy_from_slice(b"OPTY");
+    header[4] = 1;
+    header[5] = 1;
+    header[8..12].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream.write_all(&header).unwrap();
+    stream.write_all(payload).unwrap();
 }
 
 fn caller_chain(identity: &ProcessIdentity) -> Value {

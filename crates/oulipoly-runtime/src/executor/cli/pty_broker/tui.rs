@@ -36,10 +36,11 @@ use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::transcript_view::project_transcript_tail;
 use super::{
     ChildOutputState, ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput,
-    RELAY_BUFFER_BYTES, flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd,
-    poll_relay_fds, poll_single_fd, queue_control_injection, read_control_request, read_fd,
-    readable, send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid,
-    winsize_eq, writable, write_control_response,
+    RELAY_BUFFER_BYTES, acknowledge_control_payload, flush_pending_child_input, is_pty_eof_error,
+    poll_fds, poll_master_fd, poll_relay_fds, poll_single_fd, prepare_control_payload,
+    queue_control_injection, read_control_request, read_fd, readable, send_signal_to_child_group,
+    set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq, writable,
+    write_control_response,
 };
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
@@ -5249,7 +5250,12 @@ struct ControlInjectionIo<'a> {
 /// into the virtual terminal (never to the real terminal) during the wait.
 fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
-    let response = inject_control_payload(&mut stream, io);
+    let response = inject_control_payload(
+        &mut stream,
+        io,
+        control.session_id(),
+        control.invocation_uuid(),
+    );
     let (ack, message) = control_response_message(response);
     super::trace_notify_gate_decision(
         control,
@@ -5290,17 +5296,25 @@ fn format_control_response_write_error(err: io::Error) -> String {
 fn inject_control_payload(
     stream: &mut UnixStream,
     io: &mut ControlInjectionIo<'_>,
+    session_id: &str,
+    invocation_uuid: &str,
 ) -> Result<(), String> {
     validate_control_peer(stream)?;
-    let payload = read_tui_control_payload(stream)?;
+    let payload = prepare_control_payload(
+        read_tui_control_payload(stream)?,
+        Some((session_id, invocation_uuid)),
+    )?;
+    if payload.bytes.is_empty() {
+        return acknowledge_control_payload(&payload);
+    }
     // Match the non-TUI broker contract: only submit proactive control payloads
     // when the agent owns the foreground process group, child output has cleared
     // the short debounce, and the line is either at a parsed boundary or user
     // input has been idle long enough for the submit-parser fallback.
     wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
-    submit_control_payload(io, &payload, bracketed_paste)?;
-    Ok(())
+    submit_control_payload(io, &payload.bytes, bracketed_paste)?;
+    acknowledge_control_payload(&payload)
 }
 
 fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {

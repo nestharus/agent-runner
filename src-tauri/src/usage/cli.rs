@@ -331,6 +331,106 @@ pub(crate) enum MailboxSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Search notification metadata for a session.
+    Search {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Case-insensitive text matched against sequence, kind, handle, payload, and paths.
+        query: String,
+
+        /// Include delivered rows.
+        #[arg(long)]
+        all: bool,
+
+        /// Maximum matching rows.
+        #[arg(long, default_value = "100")]
+        limit: usize,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one notification and optionally read its retained artifacts.
+    #[command(group = clap::ArgGroup::new("mailbox_item").args(["seq", "handle"]).required(true).multiple(false))]
+    Show {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Mailbox sequence number.
+        #[arg(long)]
+        seq: Option<i64>,
+
+        /// Agent-bash workload handle.
+        #[arg(long)]
+        handle: Option<String>,
+
+        /// Include bounded meta, log, and rc file contents.
+        #[arg(long = "include-artifacts")]
+        include_artifacts: bool,
+
+        /// Maximum bytes read from each artifact.
+        #[arg(long = "max-bytes", default_value = "65536")]
+        max_bytes: usize,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show pause state and pending sequence bounds for a session.
+    Status {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pause proactive notification delivery while continuing to enqueue rows.
+    Pause {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume proactive notification delivery for a session.
+    Resume {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Acknowledge pending notifications in an inclusive sequence range.
+    Ack {
+        /// Provider session id.
+        #[arg(long = "session-id")]
+        session_id: String,
+
+        /// First sequence to acknowledge.
+        #[arg(long = "from-seq")]
+        from_seq: i64,
+
+        /// Last sequence to acknowledge; newer rows remain pending.
+        #[arg(long = "to-seq")]
+        to_seq: i64,
+
+        /// Audit label stored with the acknowledged rows.
+        #[arg(long = "delivered-by", default_value = "manual-mailbox-ack")]
+        delivered_by: String,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]

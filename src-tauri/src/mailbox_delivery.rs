@@ -12,15 +12,14 @@ use uuid::Uuid;
 #[cfg(unix)]
 use oulipoly_runtime::executor::cli::pty_broker::{
     PtyControlClientErrorKind, USER_INPUT_IDLE_INJECT_MS, append_notify_trace_record,
-    inject_control_envelope, notify_trace_decision, notify_trace_inject_status, trace_token,
+    inject_control_envelope, notify_trace_decision, notify_trace_inject_status,
+    render_mailbox_notification_envelope, trace_token,
 };
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
 const MAILBOX_DELIVERY_UNCONFIRMED: &str = "mailbox_delivery_unconfirmed";
 const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
-const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
-const DELIVERY_NONCE_SUFFIX: &str = "]";
 const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
@@ -33,6 +32,7 @@ pub(crate) struct PreparedMailboxDelivery {
 pub(crate) struct PreparedPtyMailboxDelivery {
     pub envelope: String,
     pub seqs: Vec<i64>,
+    pub attempt_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +62,16 @@ fn attempt_pty_mailbox_delivery_inner(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> PtyMailboxDeliveryDiagnostic {
+    if matches!(mailbox.notifications_paused(session_id), Ok(true)) {
+        return pty_status(
+            false,
+            "paused",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        );
+    }
     let runtime = match mailbox.session_runtime(session_id) {
         Ok(Some(runtime)) => runtime,
         Ok(None) => {
@@ -96,19 +106,31 @@ fn attempt_pty_mailbox_delivery_inner(
             None,
         );
     };
-    let Some(prepared) = (match prepare_pty_mailbox_delivery(mailbox, session_id) {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            return pty_status(
-                false,
-                "protocol_error",
-                Some(control_path),
-                Vec::new(),
-                None,
-                Some(err),
-            );
-        }
-    }) else {
+    let Some(delivery_invocation_uuid) = runtime.running_invocation_uuid.as_deref() else {
+        return pty_status(
+            false,
+            "protocol_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("running invocation missing".to_string()),
+        );
+    };
+    let Some(prepared) =
+        (match prepare_pty_mailbox_delivery(mailbox, session_id, delivery_invocation_uuid) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return pty_status(
+                    false,
+                    "protocol_error",
+                    Some(control_path),
+                    Vec::new(),
+                    None,
+                    Some(err),
+                );
+            }
+        })
+    else {
         return pty_status(
             false,
             "no_pending",
@@ -129,9 +151,13 @@ fn attempt_pty_mailbox_delivery_inner(
         );
     }
     match inject_control_envelope(&control_path, &prepared.envelope) {
-        Ok(response) if response.ack => {
-            mark_pty_batch_delivered(mailbox, session_id, &runtime, &prepared.seqs, control_path)
-        }
+        Ok(response) if response.ack => mark_pty_batch_delivered(
+            mailbox,
+            session_id,
+            &prepared.seqs,
+            &prepared.attempt_id,
+            control_path,
+        ),
         Ok(response) => {
             let status = pty_nack_status(&response.message).to_string();
             pty_status(
@@ -159,8 +185,9 @@ pub(crate) fn attempt_pty_mailbox_delivery_with_trigger(
 }
 
 pub(crate) fn prepare_pty_mailbox_delivery(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
     session_id: &str,
+    delivery_invocation_uuid: &str,
 ) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
     let pending = pending_mailbox_rows(db, session_id)?;
     if !has_pending_rows(&pending) {
@@ -168,9 +195,28 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     }
     let batch = select_batch(&pending);
     let seqs = batch_seqs(&batch);
-    let envelope =
-        render_notification_prefix(&batch.rows, batch.remaining_count, &new_delivery_nonce());
-    Ok(Some(PreparedPtyMailboxDelivery { envelope, seqs }))
+    let attempt_id = new_delivery_nonce();
+    db.register_delivery_attempt(
+        &attempt_id,
+        session_id,
+        delivery_invocation_uuid,
+        &seqs,
+        batch.remaining_count,
+    )?;
+    let window = db
+        .delivery_attempt_window(&attempt_id)?
+        .ok_or_else(|| format!("Mailbox delivery attempt {attempt_id} disappeared"))?;
+    if window.rows.is_empty() {
+        db.acknowledge_delivery_attempt(&attempt_id)?;
+        return Ok(None);
+    }
+    let seqs = window.rows.iter().map(|row| row.seq).collect();
+    let envelope = render_notification_prefix(&window.rows, window.remaining_count, &attempt_id);
+    Ok(Some(PreparedPtyMailboxDelivery {
+        envelope,
+        seqs,
+        attempt_id,
+    }))
 }
 
 pub(crate) fn mailbox_prefix_max_bytes() -> usize {
@@ -190,28 +236,26 @@ fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
 fn mark_pty_batch_delivered(
     mailbox: &mut MailboxDb,
     session_id: &str,
-    runtime: &SessionRuntimeRow,
     seqs: &[i64],
+    attempt_id: &str,
     control_path: String,
 ) -> PtyMailboxDeliveryDiagnostic {
-    let Some(invocation_uuid) = runtime.running_invocation_uuid.as_deref() else {
-        return pty_status(
-            true,
-            "mark_delivered_error",
-            Some(control_path),
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            Some("running invocation missing".to_string()),
-        );
-    };
-    match mailbox.mark_delivered(session_id, seqs, invocation_uuid) {
-        Ok(()) => pty_status(
+    match mailbox.acknowledge_delivery_attempt(attempt_id) {
+        Ok(true) => pty_status(
             true,
             "acked",
             Some(control_path),
             seqs.to_vec(),
             pending_count(mailbox, session_id),
             Some("ok".to_string()),
+        ),
+        Ok(false) => pty_status(
+            true,
+            "mark_delivered_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some(format!("delivery attempt {attempt_id} is not registered")),
         ),
         Err(err) => pty_status(
             true,
@@ -363,6 +407,9 @@ pub(crate) fn prepare_headless_resume_delivery(
         return Ok(empty_delivery(answer, session_id));
     };
     record_headless_session_runtime(&mut db, resolved, models_dir)?;
+    if db.notifications_paused(&session_id)? {
+        return Ok(empty_delivery(answer, session_id));
+    }
     let pending = pending_mailbox_rows(&db, &session_id)?;
     Ok(delivery_for_pending(session_id, pending, answer))
 }
@@ -371,6 +418,9 @@ pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, Strin
     let Some(db) = open_mailbox_sidecar()? else {
         return Ok(0);
     };
+    if db.notifications_paused(session_id)? {
+        return Ok(0);
+    }
     pending_mailbox_rows(&db, session_id).map(|rows| rows.len())
 }
 
@@ -577,36 +627,7 @@ fn render_notification_prefix(
     remaining_count: usize,
     delivery_nonce: &str,
 ) -> String {
-    let mut rendered = String::new();
-    rendered.push_str("[OULIPOLY NOTIFICATIONS]\n");
-    rendered.push_str(
-        "The following background agent-bash workloads completed while this session was inactive.\n\n",
-    );
-    for (index, row) in rows.iter().enumerate() {
-        rendered.push_str(&format!(
-            "{}. kind: {}\n   handle: {}\n   rc: {}\n   state_dir: {}\n   meta: {}\n   log: {}\n   rc_file: {}\n\n",
-            index + 1,
-            sanitize(&row.kind),
-            sanitize(&row.handle),
-            row.rc,
-            quote_path(&row.state_dir),
-            quote_path(&row.meta_path),
-            quote_path(&row.log_path),
-            quote_path(&row.rc_path),
-        ));
-    }
-    if remaining_count > 0 {
-        rendered.push_str(&format!(
-            "{remaining_count} additional notification(s) remain queued for the next resume.\n\n"
-        ));
-    }
-    rendered.push_str("Use the paths above if you need details. Do not assume log content unless you inspect it.\n");
-    rendered.push_str(DELIVERY_NONCE_PREFIX);
-    rendered.push_str(delivery_nonce);
-    rendered.push_str(DELIVERY_NONCE_SUFFIX);
-    rendered.push('\n');
-    rendered.push_str("[END OULIPOLY NOTIFICATIONS]");
-    rendered
+    render_mailbox_notification_envelope(rows, remaining_count, delivery_nonce)
 }
 
 fn new_delivery_nonce() -> String {
@@ -618,14 +639,6 @@ fn compose_answer(prefix: String, answer: Option<String>) -> String {
         Some(answer) => format!("{prefix}\n\n[USER RESUME PAYLOAD]\n{answer}"),
         None => prefix,
     }
-}
-
-fn quote_path(path: &str) -> String {
-    format!("\"{}\"", sanitize(path))
-}
-
-fn sanitize(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
 #[cfg(test)]
