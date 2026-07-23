@@ -137,6 +137,8 @@ fn external_model(script: &ScriptFixture) -> ModelConfig {
         name: MODEL_NAME.to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: PROVIDER_NAME.to_string(),
             command: "neutral-provider-command".to_string(),
             args: Vec::new(),

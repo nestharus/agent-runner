@@ -832,6 +832,8 @@ mod tests {
         target_projects: &std::path::Path,
     ) -> ModelConfig {
         let provider = |name: &str, projects_dir: PathBuf| ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: name.to_string(),
             command: name.to_string(),
             args: Vec::new(),
@@ -865,6 +867,8 @@ mod tests {
         target_projects: &std::path::Path,
     ) -> ModelConfig {
         let provider = |name: &str, projects_dir: &std::path::Path| ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: name.to_string(),
             command: name.to_string(),
             args: Vec::new(),

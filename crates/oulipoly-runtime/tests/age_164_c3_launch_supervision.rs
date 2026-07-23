@@ -140,6 +140,8 @@ fn empty_command_rejected_with_canonical_error() {
         name: "empty-command-model".to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "empty".to_string(),
             command: String::new(),
             args: Vec::new(),

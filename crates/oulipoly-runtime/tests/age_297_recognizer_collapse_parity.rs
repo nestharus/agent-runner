@@ -31,6 +31,8 @@ fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
 
 fn interactive_provider(name: &str, command: &Path) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: command.to_string_lossy().into_owned(),
         args: Vec::new(),

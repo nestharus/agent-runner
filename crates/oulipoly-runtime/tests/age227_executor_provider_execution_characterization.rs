@@ -51,6 +51,8 @@ fn fixture_script(body: &str) -> FixtureScript {
 
 fn provider_for(script: &FixtureScript) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "age-227-provider".to_string(),
         command: script.path.to_string_lossy().into_owned(),
         args: Vec::new(),

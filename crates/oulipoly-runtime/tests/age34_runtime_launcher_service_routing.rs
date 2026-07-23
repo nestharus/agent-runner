@@ -31,6 +31,8 @@ fn fixture_script(body: &str) -> FixtureScript {
 
 fn interactive_provider(script: &FixtureScript) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "interactive-provider".to_string(),
         command: script.path.to_string_lossy().into_owned(),
         args: vec!["one-shot-only".to_string()],

@@ -451,6 +451,8 @@ mod tests {
     #[cfg(unix)]
     fn effective_diagnostic_provider(script_path: PathBuf) -> ProviderConfig {
         ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "diagnostic-provider".to_string(),
             command: script_path.to_string_lossy().into_owned(),
             args: vec!["--effective-provider-arg".to_string()],

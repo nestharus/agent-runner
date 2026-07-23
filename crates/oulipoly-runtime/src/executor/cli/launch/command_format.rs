@@ -16,12 +16,15 @@
 //!       - cli-ipc-return-channel-contract
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
 pub(super) fn command_from_parts(
     parts: &[String],
     provider_args: &[String],
+    environment: &BTreeMap<String, String>,
+    unset_environment: &[String],
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     return_channel: Option<&Path>,
@@ -33,6 +36,10 @@ pub(super) fn command_from_parts(
     for arg in provider_args {
         cmd.arg(arg);
     }
+    for name in unset_environment {
+        cmd.env_remove(name);
+    }
+    cmd.envs(environment);
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -45,15 +52,12 @@ pub(super) fn command_from_parts(
     } else {
         cmd.env_remove("OULIPOLY_RETURN_CHANNEL");
     }
-    pin_agent_data_dir_if_unset(&mut cmd);
+    pin_agent_data_dir(&mut cmd);
 
     cmd
 }
 
-fn pin_agent_data_dir_if_unset(cmd: &mut Command) {
-    if std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV).is_some() {
-        return;
-    }
+fn pin_agent_data_dir(cmd: &mut Command) {
     if let Ok(data_dir) = oulipoly_state::paths::data_dir() {
         cmd.env(oulipoly_state::paths::DATA_DIR_ENV, data_dir);
     }

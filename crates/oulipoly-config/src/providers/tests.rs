@@ -150,6 +150,8 @@ projects_dir = "/tmp/claude2/projects"
         name: "claude2".to_string(),
         command: String::new(),
         args: vec!["--model".to_string(), "opus".to_string()],
+        environment: Default::default(),
+        unset_environment: Default::default(),
         interactive_args: Some(vec!["--model".to_string(), "opus".to_string()]),
         resume: None,
         session_capture: None,
@@ -284,6 +286,8 @@ fn effective_provider_carries_runtime_fields() {
 [provider]
 command = "/bin/echo"
 args = ["--provider"]
+environment = {{ CONFIGURED_ENV = "configured", OVERLAPPING_ENV = "configured-wins" }}
+unset_environment = ["REMOVED_ENV", "OVERLAPPING_ENV"]
 interactive_args = ["interactive"]
 prompt_mode = "arg"
 
@@ -310,6 +314,8 @@ cwd_script = "codex-cwd /tmp/codex-sessions"
         name: "provider".to_string(),
         command: String::new(),
         args: vec!["--model".to_string()],
+        environment: Default::default(),
+        unset_environment: Default::default(),
         interactive_args: Some(vec!["interactive-model".to_string()]),
         resume: None,
         session_capture: None,
@@ -326,6 +332,24 @@ cwd_script = "codex-cwd /tmp/codex-sessions"
     assert_eq!(provider.name, "provider");
     assert_eq!(provider.command, "/bin/echo");
     assert_eq!(provider.args, ["--provider", "--model"]);
+    assert_eq!(
+        provider
+            .environment
+            .get("CONFIGURED_ENV")
+            .map(String::as_str),
+        Some("configured")
+    );
+    assert_eq!(
+        provider
+            .environment
+            .get("OVERLAPPING_ENV")
+            .map(String::as_str),
+        Some("configured-wins")
+    );
+    assert_eq!(
+        provider.unset_environment,
+        ["REMOVED_ENV", "OVERLAPPING_ENV"]
+    );
     assert_eq!(
         provider.interactive_args.as_deref(),
         Some(&["interactive".to_string(), "interactive-model".to_string()][..])
@@ -1182,6 +1206,8 @@ fn apply_defaults_to_raw_providers_sets_headless_for_absent_mode() {
             auth_refresh_command: None,
             command: Some("claude".to_string()),
             args: vec![],
+            environment: Default::default(),
+            unset_environment: Default::default(),
             interactive_args: None,
             prompt_mode: None,
             resume: None,

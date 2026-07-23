@@ -296,6 +296,8 @@ fn raw_provider_to_config(raw: RawProvider) -> ProviderConfig {
         name,
         command: String::new(),
         args,
+        environment: Default::default(),
+        unset_environment: Default::default(),
         interactive_args: raw.interactive_args,
         resume: None,
         session_capture: None,

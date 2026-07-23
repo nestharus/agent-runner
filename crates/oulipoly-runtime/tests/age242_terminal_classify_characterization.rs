@@ -91,6 +91,8 @@ fn builtin_model_for_provider_command(provider_name: &str, command: &str) -> Mod
         name: "neutral-built-in-terminal-model".to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: provider_name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
@@ -117,6 +119,8 @@ fn unrelated_external_model(script: &ScriptFixture) -> ModelConfig {
         name: UNRELATED_MODEL.to_string(),
         prompt_mode: PromptMode::Arg,
         providers: vec![ProviderConfig {
+            environment: Default::default(),
+            unset_environment: Default::default(),
             name: "neutral-unrelated-provider-account".to_string(),
             command: "neutral-unrelated-command".to_string(),
             args: Vec::new(),

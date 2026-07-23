@@ -36,6 +36,8 @@ pub(in crate::executor::cli) fn build_command(
     Ok(command_from_parts(
         &parts,
         provider_args,
+        &provider.environment,
+        &provider.unset_environment,
         working_dir,
         parent_invocation_env,
         return_channel,

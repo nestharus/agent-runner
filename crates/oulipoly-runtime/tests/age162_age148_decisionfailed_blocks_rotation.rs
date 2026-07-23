@@ -134,6 +134,8 @@ impl Fixture {
 
 fn provider_config(name: &str, projects_dir: PathBuf) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: name.to_string(),
         args: Vec::new(),

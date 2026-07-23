@@ -128,6 +128,8 @@ fn fixture_script(dir: &Path) -> PathBuf {
 
 fn fixture_provider(script: &Path) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: "fixture-provider".to_string(),
         command: script.to_string_lossy().into_owned(),
         args: Vec::new(),

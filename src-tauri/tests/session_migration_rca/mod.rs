@@ -225,6 +225,8 @@ pub fn claude_project_dir_name(path: &Path) -> String {
 
 fn claude_provider(name: &str, command: &Path, projects_dir: &Path) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: command.to_string_lossy().into_owned(),
         args: Vec::new(),

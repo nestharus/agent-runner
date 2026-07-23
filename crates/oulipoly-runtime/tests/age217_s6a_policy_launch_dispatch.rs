@@ -17,7 +17,7 @@ use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -225,6 +225,8 @@ fn model_with_provider_ref(
             name: "provider-a-account".to_string(),
             command: command.to_string(),
             args: vec!["--provider-arg".to_string(), "from-pool".to_string()],
+            environment: BTreeMap::new(),
+            unset_environment: Vec::new(),
             interactive_args: None,
             resume: None,
             session_capture: None,
@@ -381,6 +383,15 @@ fn execute_external_fixture_effective(
     parent_invocation_env: Option<String>,
 ) -> Result<executor::ExecutionResult, ServiceError> {
     let model = external_model(fixture);
+    execute_external_model_effective(model, working_dir, extra_inputs, parent_invocation_env)
+}
+
+fn execute_external_model_effective(
+    model: ModelConfig,
+    working_dir: Option<PathBuf>,
+    extra_inputs: HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<String>,
+) -> Result<executor::ExecutionResult, ServiceError> {
     let provider = model.providers[0].clone();
     let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
     execute_dispatch_aware_result(
@@ -1247,6 +1258,56 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
             SENTINEL_ENV,
             SENTINEL_VALUE,
             "unrelated ambient entries must cross the generic provider boundary",
+        );
+    }
+}
+
+#[test]
+fn external_provider_launch_env_applies_configured_removals_then_overlays() {
+    const REMOVED_ENV: &str = "CONFIG_REMOVED_ENV";
+    const OVERLAID_ENV: &str = "CONFIG_OVERLAID_ENV";
+
+    let _lock = env_lock();
+    let _env = EnvScope::set_optional(&[
+        (REMOVED_ENV, Some("ambient-remove-me")),
+        (OVERLAID_ENV, Some("ambient-value")),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let mut model = external_model(&fixture);
+    model.providers[0].unset_environment = vec![REMOVED_ENV.to_string(), OVERLAID_ENV.to_string()];
+    model.providers[0].environment = BTreeMap::from([
+        (OVERLAID_ENV.to_string(), "configured-value".to_string()),
+        ("CONFIG_ADDED_ENV".to_string(), "added-value".to_string()),
+    ]);
+
+    execute_external_model_effective(model, None, HashMap::new(), None)
+        .expect("external dispatch should apply provider environment configuration");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in provider_launch_envs(&policy, &launch) {
+        assert!(
+            env.get(REMOVED_ENV).is_none(),
+            "configured removals must delete inherited entries"
+        );
+        assert_env_value(
+            env,
+            OVERLAID_ENV,
+            "configured-value",
+            "configured values must replace inherited entries after removals",
+        );
+        assert_env_value(
+            env,
+            "CONFIG_ADDED_ENV",
+            "added-value",
+            "configured values must add entries absent from the parent",
         );
     }
 }

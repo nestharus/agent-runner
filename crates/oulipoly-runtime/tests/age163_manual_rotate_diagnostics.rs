@@ -22,6 +22,8 @@ const SESSION_ID: &str = "8a3f1e7e-2a1b-4a8c-9876-1234567890ab";
 
 fn provider_claude(name: &str, projects_dir: PathBuf) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: name.to_string(),
         args: Vec::new(),
@@ -42,6 +44,8 @@ fn provider_claude(name: &str, projects_dir: PathBuf) -> ProviderConfig {
 
 fn provider_no_storage(name: &str) -> ProviderConfig {
     ProviderConfig {
+        environment: Default::default(),
+        unset_environment: Default::default(),
         name: name.to_string(),
         command: name.to_string(),
         args: Vec::new(),

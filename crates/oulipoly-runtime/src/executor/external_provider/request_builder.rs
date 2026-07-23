@@ -56,11 +56,19 @@ pub(crate) fn build_launch_candidate(
 
 fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<String, String> {
     let mut env = inherited_launch_env();
+    remove_configured_launch_env(&mut env, &context.provider.unset_environment);
+    env.extend(context.provider.environment.clone());
     insert_pinned_agent_data_dir(&mut env);
     if let Some(parent) = &context.parent_invocation_env {
         env.insert(PARENT_INVOCATION_ENV.to_string(), parent.clone());
     }
     env
+}
+
+fn remove_configured_launch_env(env: &mut BTreeMap<String, String>, names: &[String]) {
+    for name in names {
+        env.remove(name);
+    }
 }
 
 fn inherited_launch_env() -> BTreeMap<String, String> {
