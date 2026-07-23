@@ -52,7 +52,7 @@ This is the exact diff produced against a copy of the live config. No `opencode6
 -cwd_script = "/bin/false"
 +cwd_script = "opencode-cwd ~/.local/share/opencode"
  transcript_script = "/bin/false"
- 
+
  [opencode2]
 @@ -512,7 +512,7 @@
  [opencode3.session_storage]
@@ -61,7 +61,7 @@ This is the exact diff produced against a copy of the live config. No `opencode6
 -cwd_script = "/bin/false"
 +cwd_script = "opencode-cwd ~/.opencode3/opencode"
  transcript_script = "/bin/false"
- 
+
  [opencode4]
 @@ -533,7 +533,7 @@
  [opencode4.session_storage]
@@ -70,7 +70,7 @@ This is the exact diff produced against a copy of the live config. No `opencode6
 -cwd_script = "/bin/false"
 +cwd_script = "opencode-cwd ~/.opencode4/opencode"
  transcript_script = "/bin/false"
- 
+
  [opencode5]
 @@ -554,7 +554,7 @@
  [opencode5.session_storage]
@@ -79,7 +79,7 @@ This is the exact diff produced against a copy of the live config. No `opencode6
 -cwd_script = "/bin/false"
 +cwd_script = "opencode-cwd ~/.opencode5/opencode"
  transcript_script = "/bin/false"
- 
+
  [opencode.session_capture]
 ```
 
