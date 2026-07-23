@@ -24,16 +24,10 @@ use oulipoly_provider::generated::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-const HOME_ENV: &str = "HOME";
-const AGENT_BASH_AGENT_RUNNER_BIN_ENV: &str = "AGENT_BASH_AGENT_RUNNER_BIN";
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
-const JIRA_API_KEY_REALLY_ENV: &str = "JIRA_API_KEY_REALLY";
-const OPENCODE_ACCOUNT_PREFIX: &str = "opencode";
-const PATH_ENV: &str = "PATH";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
-const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchCandidate {
@@ -61,27 +55,18 @@ pub(crate) fn build_launch_candidate(
 }
 
 fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    insert_ambient_env(&mut env, PATH_ENV);
-    insert_ambient_env(&mut env, HOME_ENV);
-    insert_ambient_env(&mut env, AGENT_BASH_AGENT_RUNNER_BIN_ENV);
-    insert_ambient_env(&mut env, JIRA_API_KEY_REALLY_ENV);
+    let mut env = inherited_launch_env();
     insert_pinned_agent_data_dir(&mut env);
-    insert_selected_opencode_auth_env(&mut env, context);
     if let Some(parent) = &context.parent_invocation_env {
         env.insert(PARENT_INVOCATION_ENV.to_string(), parent.clone());
     }
     env
 }
 
-fn insert_ambient_env(env: &mut BTreeMap<String, String>, key: &str) {
-    if let Some(value) = ambient_env_value(key) {
-        insert_launch_env(env, key, value);
-    }
-}
-
-fn ambient_env_value(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+fn inherited_launch_env() -> BTreeMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 fn insert_pinned_agent_data_dir(env: &mut BTreeMap<String, String>) {
@@ -98,86 +83,6 @@ fn pinned_agent_data_dir() -> Option<String> {
 
 fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: String) {
     env.insert(key.to_string(), value);
-}
-
-fn insert_selected_opencode_auth_env(
-    env: &mut BTreeMap<String, String>,
-    context: &ExternalProviderDispatchContext,
-) {
-    let Some(index) = selected_opencode_account_index(context) else {
-        return;
-    };
-    if !requires_scoped_opencode_auth_env(index) {
-        return;
-    }
-    if let Some(data_home) = selected_opencode_xdg_data_home(env.get(HOME_ENV), index) {
-        insert_launch_env(env, XDG_DATA_HOME_ENV, data_home);
-    }
-}
-
-fn requires_scoped_opencode_auth_env(index: u8) -> bool {
-    index != 1
-}
-
-fn selected_opencode_xdg_data_home(home: Option<&String>, index: u8) -> Option<String> {
-    home.map(|home| opencode_account_data_home(home, index))
-}
-
-fn opencode_account_data_home(home: &str, index: u8) -> String {
-    Path::new(home)
-        .join(format!(".{OPENCODE_ACCOUNT_PREFIX}{index}"))
-        .display()
-        .to_string()
-}
-
-fn selected_opencode_account_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
-    selected_opencode_name_index(context).or_else(|| selected_opencode_command_index(context))
-}
-
-fn selected_opencode_name_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
-    opencode_account_index(&context.provider.name)
-}
-
-fn selected_opencode_command_index(context: &ExternalProviderDispatchContext) -> Option<u8> {
-    opencode_account_index_from_command(&context.provider.command)
-}
-
-fn opencode_account_index_from_command(command: &str) -> Option<u8> {
-    let tokens = command_tokens(command);
-    opencode_account_index_from_tokens(&tokens)
-}
-
-fn command_tokens(command: &str) -> Vec<String> {
-    shell_split(command)
-}
-
-fn opencode_account_index_from_tokens(tokens: &[String]) -> Option<u8> {
-    tokens
-        .iter()
-        .rev()
-        .find_map(|part| opencode_account_index(part))
-}
-
-fn opencode_account_index(value: &str) -> Option<u8> {
-    opencode_account_name_index(basename_or_value(value))
-}
-
-fn basename_or_value(value: &str) -> &str {
-    Path::new(value)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(value)
-}
-
-fn opencode_account_name_index(name: &str) -> Option<u8> {
-    match name {
-        "opencode" | "opencode1" => Some(1),
-        "opencode2" => Some(2),
-        "opencode3" => Some(3),
-        "opencode4" => Some(4),
-        "opencode5" => Some(5),
-        _ => None,
-    }
 }
 
 pub(crate) fn build_policy_request(

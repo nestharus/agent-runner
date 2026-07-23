@@ -26,6 +26,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-account";
+const GENERIC_PARENT_ENV_VALUE: &str = "unicode-\u{2603}";
+const OPENAI_KEY_VALUE: &str = "ambient-openai-secret-for-provider-policy";
+const OPENAI_BASE_URL_VALUE: &str = "https://ambient-openai.example.invalid";
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct ScriptFixture {
@@ -1070,13 +1073,6 @@ fn runner_data_dir_from_xdg(xdg_data: &str) -> String {
         .to_string()
 }
 
-fn selected_opencode_xdg(home: &str, account: &str) -> String {
-    Path::new(home)
-        .join(format!(".{account}"))
-        .display()
-        .to_string()
-}
-
 fn external_model_for_provider(
     fixture: &ExternalFixture,
     provider_name: &str,
@@ -1168,7 +1164,7 @@ fn assert_no_arg_mode_stdin(launch: &Value) {
 }
 
 #[test]
-fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
+fn external_provider_launch_env_inherits_parent_environment_with_runner_overrides() {
     let _lock = env_lock();
     let xdg_data = tempdir_path("xdg data tempdir");
     let expected_data_dir = runner_data_dir_from_xdg(&xdg_data.path);
@@ -1179,13 +1175,11 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
         ("AGENT_BASH_AGENT_RUNNER_BIN", Some(agent_runner_bin)),
         ("OULIPOLY_DATA_DIR", Some(expected_data_dir.as_str())),
         (
-            "OPENAI_API_KEY",
-            Some("ambient-openai-secret-do-not-propagate"),
+            "GENERIC_PARENT_ENV_SENTINEL",
+            Some(GENERIC_PARENT_ENV_VALUE),
         ),
-        (
-            "OPENAI_BASE_URL",
-            Some("https://ambient-openai.example.invalid"),
-        ),
+        ("OPENAI_API_KEY", Some(OPENAI_KEY_VALUE)),
+        ("OPENAI_BASE_URL", Some(OPENAI_BASE_URL_VALUE)),
     ]);
     let fixture = make_external_fixture(
         Capabilities {
@@ -1216,7 +1210,7 @@ fn external_provider_launch_env_carries_host_linkage_without_openai_keys() {
 }
 
 #[test]
-fn external_provider_launch_env_forwards_jira_api_key_really() {
+fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
     const JIRA_ENV: &str = "JIRA_API_KEY_REALLY";
     const JIRA_VALUE: &str = "synthetic-jira-api-key-really";
     const SENTINEL_ENV: &str = "UNRELATED_AMBIENT_SENTINEL";
@@ -1237,7 +1231,7 @@ fn external_provider_launch_env_forwards_jira_api_key_really() {
     );
 
     execute_external_fixture_effective(&fixture, None, HashMap::new(), None)
-        .expect("external dispatch should forward the declared Jira credential");
+        .expect("external dispatch should inherit Unicode parent environment entries");
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
@@ -1246,12 +1240,13 @@ fn external_provider_launch_env_forwards_jira_api_key_really() {
             env,
             JIRA_ENV,
             JIRA_VALUE,
-            "policy and launch env must carry the exact authorized Jira key",
+            "policy and launch env must carry application-specific entries generically",
         );
-        assert_env_key_absent(
+        assert_env_value(
             env,
             SENTINEL_ENV,
-            "unrelated ambient env must remain outside the declared boundary",
+            SENTINEL_VALUE,
+            "unrelated ambient entries must cross the generic provider boundary",
         );
     }
 }
@@ -1282,17 +1277,32 @@ fn assert_host_linkage_envs(
             agent_runner_bin,
             "external launch params.env must let provider-spawned agent-bash notify via the same runner binary",
         );
-        assert_no_openai_env_keys(env);
-        assert_no_ambient_openai_secret(env);
+        assert_env_value(
+            env,
+            "GENERIC_PARENT_ENV_SENTINEL",
+            GENERIC_PARENT_ENV_VALUE,
+            "external launch params.env must preserve Unicode parent values",
+        );
+        assert_env_value(
+            env,
+            "OPENAI_API_KEY",
+            OPENAI_KEY_VALUE,
+            "generic runner transport must leave credential policy to the provider",
+        );
+        assert_env_value(
+            env,
+            "OPENAI_BASE_URL",
+            OPENAI_BASE_URL_VALUE,
+            "generic runner transport must leave endpoint policy to the provider",
+        );
     }
 }
 
 #[test]
-fn external_provider_launch_env_uses_selected_opencode_auth_context_without_openai_keys() {
+fn external_provider_launch_env_does_not_apply_opencode_account_policy() {
     let _lock = env_lock();
     let home = tempdir_path("home tempdir");
     let ambient_xdg = tempdir_path("ambient xdg tempdir");
-    let expected_xdg = selected_opencode_xdg(&home.path, "opencode2");
     let _env = EnvScope::set(&[
         ("HOME", home.path.as_str()),
         ("XDG_DATA_HOME", ambient_xdg.path.as_str()),
@@ -1326,38 +1336,40 @@ fn external_provider_launch_env_uses_selected_opencode_auth_context_without_open
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
-    assert_selected_opencode_auth_envs(
-        &policy,
-        &launch,
-        &home.path,
-        &expected_xdg,
-        &ambient_xdg.path,
-    );
+    assert_provider_neutral_parent_envs(&policy, &launch, &home.path, &ambient_xdg.path);
 }
 
-fn assert_selected_opencode_auth_envs(
+fn assert_provider_neutral_parent_envs(
     policy: &Value,
     launch: &Value,
     home: &str,
-    expected_xdg: &str,
     ambient_xdg: &str,
 ) {
     for env in provider_launch_envs(policy, launch) {
-        assert_env_value(env, "HOME", home, "selected account HOME should be passed");
+        assert_env_value(env, "HOME", home, "parent HOME should be inherited");
         assert_env_value(
             env,
             "XDG_DATA_HOME",
-            expected_xdg,
-            "selected opencode2 account must override the runner's ambient XDG_DATA_HOME",
+            ambient_xdg,
+            "generic runner transport must not rewrite provider account state",
         );
-        assert_env_value_not(env, "XDG_DATA_HOME", ambient_xdg);
-        assert_no_openai_env_keys(env);
-        assert_no_ambient_openai_secret(env);
+        assert_env_value(
+            env,
+            "OPENAI_API_KEY",
+            "ambient-openai-secret-do-not-propagate",
+            "provider policy owns credential filtering",
+        );
+        assert_env_value(
+            env,
+            "OPENAI_BASE_URL",
+            "https://ambient-openai.example.invalid",
+            "provider policy owns endpoint filtering",
+        );
     }
 }
 
 #[test]
-fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_context() {
+fn external_provider_launch_env_preserves_ambient_xdg_for_provider_policy() {
     let _lock = env_lock();
     let ambient_xdg = tempdir_path("ambient xdg tempdir");
     let _env = EnvScope::set(&[
@@ -1391,18 +1403,23 @@ fn external_provider_launch_env_omits_ambient_xdg_for_default_opencode_auth_cont
 
     let policy = read_json(&fixture.policy_record_path);
     let launch = read_json(&fixture.launch_record_path);
-    assert_default_opencode_auth_envs(&policy, &launch);
+    assert_default_provider_parent_envs(&policy, &launch, &ambient_xdg.path);
 }
 
-fn assert_default_opencode_auth_envs(policy: &Value, launch: &Value) {
+fn assert_default_provider_parent_envs(policy: &Value, launch: &Value, ambient_xdg: &str) {
     for env in provider_launch_envs(policy, launch) {
-        assert_env_key_absent(
+        assert_env_value(
             env,
             "XDG_DATA_HOME",
-            "default opencode auth must use the default XDG data dir, not the runner's ambient XDG_DATA_HOME",
+            ambient_xdg,
+            "generic runner transport must preserve ambient XDG_DATA_HOME",
         );
-        assert_no_openai_api_key(env);
-        assert_no_ambient_openai_secret(env);
+        assert_env_value(
+            env,
+            "OPENAI_API_KEY",
+            "ambient-openai-secret-do-not-propagate",
+            "provider policy owns OpenAI credential filtering",
+        );
     }
 }
 
@@ -1429,53 +1446,8 @@ fn assert_env_value(
     assert_eq!(env_string(env, key), Some(expected), "{message}");
 }
 
-fn assert_env_value_not(env: &serde_json::Map<String, Value>, key: &str, unexpected: &str) {
-    assert_ne!(
-        env_string(env, key),
-        Some(unexpected),
-        "ambient runner XDG_DATA_HOME must not leak into opencode child auth context"
-    );
-}
-
 fn env_string<'a>(env: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
     env.get(key).and_then(|value| value.as_str())
-}
-
-fn assert_env_key_absent(env: &serde_json::Map<String, Value>, key: &str, message: &str) {
-    assert!(!env.contains_key(key), "{message}: {env:?}");
-}
-
-fn assert_no_openai_env_keys(env: &serde_json::Map<String, Value>) {
-    assert!(
-        env.keys().all(|key| openai_env_key_is_absent(key)),
-        "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-    );
-}
-
-fn assert_no_openai_api_key(env: &serde_json::Map<String, Value>) {
-    assert!(
-        env.keys().all(|key| openai_api_key_is_absent(key)),
-        "OpenAI env keys must not cross the external-provider params.env boundary: {env:?}"
-    );
-}
-
-fn openai_env_key_is_absent(key: &str) -> bool {
-    !key.starts_with("OPENAI_API_KEY") && !key.starts_with("OPENAI_BASE_URL")
-}
-
-fn openai_api_key_is_absent(key: &str) -> bool {
-    !key.starts_with("OPENAI_API_KEY")
-}
-
-fn assert_no_ambient_openai_secret(env: &serde_json::Map<String, Value>) {
-    assert!(
-        !env_json(env).contains("ambient-openai-secret-do-not-propagate"),
-        "OpenAI env values must not cross the external-provider params.env boundary: {env:?}"
-    );
-}
-
-fn env_json(env: &serde_json::Map<String, Value>) -> String {
-    serde_json::to_string(env).expect("env serializes")
 }
 
 #[test]
@@ -1567,7 +1539,7 @@ fn external_provider_policy_rejection_skips_launch() {
 }
 
 #[test]
-fn external_provider_policy_request_canonicalizes_opencode_account_one_settings_id() {
+fn external_provider_policy_request_preserves_provider_owned_settings_id() {
     let fixture = make_external_fixture(
         Capabilities {
             policy: true,
@@ -1611,11 +1583,11 @@ fn external_provider_policy_request_canonicalizes_opencode_account_one_settings_
             parent_invocation_env: None,
         },
     )
-    .expect("external dispatch should accept canonicalized account-one policy request");
+    .expect("external dispatch should preserve the provider-owned settings identity");
 
     let request = read_json(&fixture.policy_record_path);
     assert_eq!(request["provider_instance_id"], "opencode");
-    assert_eq!(request["params"]["settings_id"], "opencode1");
+    assert_eq!(request["params"]["settings_id"], "opencode");
     assert_eq!(request["params"]["launch"]["command"], "opencode1");
     assert_eq!(
         request["params"]["launch"]["argv"][0],
