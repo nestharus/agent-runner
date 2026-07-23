@@ -152,7 +152,6 @@ pub(crate) fn session_external_provider_identity(
 
 struct ExternalProviderSessionDescribe {
     provider_instance_id: Option<String>,
-    settings_id: String,
 }
 
 fn describe_external_provider_for_session(
@@ -191,12 +190,7 @@ fn external_provider_session_describe(
 ) -> ExternalProviderSessionDescribe {
     ExternalProviderSessionDescribe {
         provider_instance_id: provider_instance_id_from_describe(describe),
-        settings_id: session_settings_id(describe),
     }
-}
-
-fn session_settings_id(describe: Option<&oulipoly_provider::generated::DescribeResult>) -> String {
-    settings_id_from_describe(describe)
 }
 
 fn provider_instance_id_from_describe(
@@ -209,18 +203,6 @@ fn format_provider_instance_id(provider_id: &str) -> String {
     format!("{provider_id}-instance")
 }
 
-fn settings_id_from_describe(
-    describe: Option<&oulipoly_provider::generated::DescribeResult>,
-) -> String {
-    describe
-        .and_then(|result| result.settings_schema_id.clone())
-        .unwrap_or_else(default_session_settings_id)
-}
-
-fn default_session_settings_id() -> String {
-    oulipoly_runtime::session_provider::S7A_NEUTRAL_SETTINGS_ID.to_string()
-}
-
 fn session_service_external_provider_identity(
     model: &ModelConfig,
     provider_name: &str,
@@ -230,7 +212,7 @@ fn session_service_external_provider_identity(
         model_name: model.name.clone(),
         provider_name: provider_name.to_string(),
         provider_instance_id: describe.provider_instance_id,
-        settings_id: describe.settings_id,
+        settings_id: provider_name.to_string(),
     }
 }
 
@@ -385,6 +367,10 @@ mod tests {
             fixture.provider_subcommands(),
             vec!["describe", "session.read_turns", "session.capture"]
         );
+        assert_eq!(
+            fixture.session_request_settings_ids(),
+            vec![PROVIDER, PROVIDER]
+        );
         assert_eq!(fixture.session_turn_count(), 1);
     }
 
@@ -403,17 +389,6 @@ mod tests {
         assert_eq!(
             session_external_provider_identity(&services, Some(&builtin), PROVIDER),
             None
-        );
-    }
-
-    #[test]
-    fn production_session_settings_id_uses_provider_described_schema_id() {
-        let describe = describe_with_settings_schema("opencode.settings/v1");
-
-        assert_eq!(session_settings_id(Some(&describe)), "opencode.settings/v1");
-        assert_eq!(
-            session_settings_id(None),
-            oulipoly_runtime::session_provider::S7A_NEUTRAL_SETTINGS_ID
         );
     }
 
@@ -484,6 +459,16 @@ mod tests {
             )))
         }
 
+        fn session_request_settings_ids(&self) -> Vec<String> {
+            let records = provider_records_text(&self.record_path);
+            provider_record_lines(&records)
+                .into_iter()
+                .map(parse_provider_record)
+                .filter(|record| provider_record_subcommand(record) != "describe")
+                .map(|record| provider_record_settings_id(&record))
+                .collect()
+        }
+
         fn session_turn_count(&self) -> i64 {
             rusqlite::Connection::open(&self.state_path)
                 .expect("sqlite")
@@ -523,6 +508,13 @@ mod tests {
         record["subcommand"].as_str().unwrap().to_string()
     }
 
+    fn provider_record_settings_id(record: &serde_json::Value) -> String {
+        record["request"]["params"]["settings_id"]
+            .as_str()
+            .expect("session provider request settings_id")
+            .to_string()
+    }
+
     fn external_model(provider_path: &Path) -> ModelConfig {
         ModelConfig {
             name: MODEL.to_string(),
@@ -536,33 +528,6 @@ mod tests {
                 binary: None,
                 script: None,
             }),
-        }
-    }
-
-    fn describe_with_settings_schema(
-        schema_id: &str,
-    ) -> oulipoly_provider::generated::DescribeResult {
-        oulipoly_provider::generated::DescribeResult {
-            provider_id: "opencode".to_string(),
-            display_name: "OpenCode".to_string(),
-            contract_versions: vec![oulipoly_provider::generated::CONTRACT_VERSION.to_string()],
-            preferred_contract: oulipoly_provider::generated::CONTRACT_VERSION.to_string(),
-            capabilities: oulipoly_provider::generated::DescribeCapabilities {
-                launch: true,
-                policy: true,
-                quota: true,
-                session: true,
-                session_enumerate: false,
-                terminal: true,
-                rotation: true,
-                discovery: true,
-                settings: true,
-                setup_brain: false,
-                setup: true,
-                migration: true,
-            },
-            settings_schema_id: Some(schema_id.to_string()),
-            concurrency: None,
         }
     }
 
