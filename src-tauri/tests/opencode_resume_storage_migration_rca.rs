@@ -323,27 +323,51 @@ fn write_fake_export(
             shell_quote(PRIVATE_EXPORT_SENTINEL)
         ),
     };
+    let db_state_body = match state {
+        StorageState::OwnedUsable => db_success_body(original_cwd),
+        StorageState::OwnedUnusable => db_success_body(&root.join("missing-owned-workspace")),
+        StorageState::Miss => "printf '%s\\n' '[]'".to_string(),
+        StorageState::IndeterminateExport => format!(
+            "printf '%s' {} >&2\nexit 2",
+            shell_quote(PRIVATE_EXPORT_SENTINEL)
+        ),
+    };
     write_executable(
         path,
         &format!(
             r#"#!/bin/sh
 set -eu
 printf '%s|%s|%s|%s\n' {provider} "${{XDG_DATA_HOME-}}" "${{1-}}" "${{2-}}" >> {record}
-if [ "$#" -ne 2 ] || [ "$1" != 'export' ] || [ "$2" != {session_id} ]; then
-  printf '%s' 'wrong export argv' >&2
-  exit 98
-fi
 if [ "${{XDG_DATA_HOME-}}" != {expected_xdg} ]; then
   printf '%s' 'wrong isolated data root' >&2
   exit 97
 fi
-{state_body}
+if [ "$#" -eq 4 ] && [ "$1" = 'db' ] && [ "$2" = '--format' ] && [ "$3" = 'json' ]; then
+  {db_state_body}
+  exit 0
+fi
+if [ "$#" -eq 2 ] && [ "$1" = 'export' ] && [ "$2" = {session_id} ]; then
+  {state_body}
+fi
+printf '%s' 'wrong opencode argv' >&2
+exit 98
 "#,
             provider = shell_quote(provider),
             record = shell_quote(&record.display().to_string()),
             session_id = shell_quote(SESSION_ID),
             expected_xdg = shell_quote(&expected_xdg_data_home.display().to_string()),
         ),
+    )
+}
+
+fn db_success_body(cwd: &Path) -> String {
+    let rows = json!([{
+        "id": SESSION_ID,
+        "directory": cwd.display().to_string(),
+    }]);
+    format!(
+        "printf '%s\\n' {}",
+        shell_quote(&serde_json::to_string(&rows).unwrap())
     )
 }
 
@@ -462,12 +486,15 @@ fn toml_string(value: &str) -> String {
 
 fn assert_export_record(path: &Path, provider: &str, expected_xdg: &Path, expected_count: usize) {
     let records = fs::read_to_string(path).unwrap_or_default();
-    let expected_line = format!("{provider}|{}|export|{SESSION_ID}", expected_xdg.display());
+    let expected_db = format!("{provider}|{}|db|--format", expected_xdg.display());
+    let expected_export = format!("{provider}|{}|export|{SESSION_ID}", expected_xdg.display());
     let lines = records.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), expected_count, "records={records:?}");
     assert!(
-        lines.iter().all(|line| *line == expected_line),
-        "records={records:?} expected={expected_line:?}"
+        lines
+            .iter()
+            .all(|line| *line == expected_db || *line == expected_export),
+        "records={records:?} expected={expected_db:?} or {expected_export:?}"
     );
 }
 
@@ -683,7 +710,7 @@ fn native_resume_rejects_indeterminate_candidate_ownership() {
         !evidence.stderr.contains("storage-owner-not-found"),
         "{context}"
     );
-    fixture.assert_export_calls(1, 1);
+    fixture.assert_export_calls(2, 1);
 }
 
 #[test]

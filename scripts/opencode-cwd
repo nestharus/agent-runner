@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve OpenCode storage membership and cwd through its public export CLI."""
+"""Resolve OpenCode storage membership and cwd through its public CLI."""
 
 import codecs
 import fcntl
@@ -95,6 +95,18 @@ def parse_limits(environ):
 
 def export_argv(command, session_id):
     return [*command, "export", session_id]
+
+
+def sql_string_literal(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def db_lookup_argv(command, session_id):
+    query = (
+        "SELECT id, directory FROM session WHERE id = "
+        + sql_string_literal(session_id)
+    )
+    return [*command, "db", "--format", "json", query]
 
 
 def child_environment(environ, data_home):
@@ -503,6 +515,23 @@ def parse_export(stdout):
         return None, "opencode_export_malformed_json"
 
 
+def parse_db_lookup(stdout, session_id):
+    rows, error = parse_export(stdout)
+    if error is not None or not isinstance(rows, list):
+        return None
+    if not rows:
+        return not_owned_response()
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        return None
+    info, error = validate_export_identity({"info": rows[0]}, session_id)
+    if error is not None:
+        return None
+    cwd, error = validate_cwd(info)
+    if error is not None:
+        return owned_without_cwd_response(error)
+    return owned_cwd_response(cwd)
+
+
 def validate_export_identity(export, session_id):
     if not isinstance(export, dict):
         return None, "opencode_export_invalid_shape"
@@ -564,6 +593,18 @@ def emit_response(response):
     return 0
 
 
+def resolve_db_response(command, session_id, child_env, limits):
+    result, status, stdout, stderr = execute_export(
+        db_lookup_argv(command, session_id), child_env, limits
+    )
+    if result != "completed" or status != 0:
+        return None
+    decoded_stdout, _decoded_stderr, error = decode_execution(stdout, stderr)
+    if error is not None:
+        return None
+    return parse_db_lookup(decoded_stdout, session_id)
+
+
 def resolve_response(argv, environ):
     error = validate_argv(argv)
     if error is not None:
@@ -573,10 +614,15 @@ def resolve_response(argv, environ):
     if error is not None:
         return indeterminate_response(error)
     command = select_command(override, base_dir)
+    child_env = child_environment(environ, data_home)
+    limits = parse_limits(environ)
+    db_response = resolve_db_response(command, session_id, child_env, limits)
+    if db_response is not None:
+        return db_response
     result, status, stdout, stderr = execute_export(
         export_argv(command, session_id),
-        child_environment(environ, data_home),
-        parse_limits(environ),
+        child_env,
+        limits,
     )
     if result != "completed":
         return indeterminate_response(result)

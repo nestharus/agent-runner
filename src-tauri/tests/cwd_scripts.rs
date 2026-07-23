@@ -146,11 +146,15 @@ impl OpenCodeFixture {
     }
 
     fn command(&self, opencode_bin: Option<&OsStr>) -> Command {
+        self.command_for_session(opencode_bin, SESSION_ID)
+    }
+
+    fn command_for_session(&self, opencode_bin: Option<&OsStr>, session_id: &str) -> Command {
         let mut command = self.isolated_python_command(opencode_bin);
         command
             .arg(scripts_dir().join("opencode-cwd"))
             .arg(&self.base_dir)
-            .arg(SESSION_ID);
+            .arg(session_id);
         command
     }
 
@@ -285,7 +289,7 @@ fn codex_cwd_reads_payload_cwd_from_rollout_first_line() {
 }
 
 #[test]
-fn opencode_cwd_uses_public_export_without_private_sqlite_access() {
+fn opencode_cwd_uses_public_cli_without_direct_private_sqlite_access() {
     let fixture = OpenCodeFixture::new(None);
     let workspace = fixture.home.join("workspace");
     fs::create_dir_all(&workspace).unwrap();
@@ -325,17 +329,81 @@ fn opencode_cwd_uses_public_export_without_private_sqlite_access() {
     assert_eq!(fs::read(&poison).unwrap(), poison_contents);
 
     let source = fs::read_to_string(scripts_dir().join("opencode-cwd")).unwrap();
-    for forbidden in [
-        "import sqlite3",
-        "opencode.db",
-        "SELECT directory",
-        "FROM session",
-    ] {
+    for forbidden in ["import sqlite3", "opencode.db"] {
         assert!(
             !source.contains(forbidden),
             "forbidden private token: {forbidden}"
         );
     }
+}
+
+#[test]
+fn opencode_cwd_uses_bounded_public_db_lookup_before_export() {
+    let fixture = OpenCodeFixture::new(None);
+    let workspace = fixture.home.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let fake = fixture.fake_bin_dir.join("public-db");
+    let query_file = fixture._temp.path().join("query");
+    let export_marker = fixture._temp.path().join("export-ran");
+    let session_id = "ses_quote_'_fixture";
+    write_fake(
+        &fake,
+        &format!(
+            r#"if [ "$#" -eq 4 ] && [ "$1" = 'db' ] && [ "$2" = '--format' ] && [ "$3" = 'json' ]; then
+  printf '%s' "$4" > "$QUERY_FILE"
+  {}
+  exit 0
+fi
+printf ran > "$EXPORT_MARKER"
+exit 98
+"#,
+            export_json_body(&json!([{"id": session_id, "directory": workspace}]))
+        ),
+    );
+    let output = fixture
+        .command_for_session(Some(fake.as_os_str()), session_id)
+        .env("QUERY_FILE", &query_file)
+        .env("EXPORT_MARKER", &export_marker)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        parse_response(&output),
+        json!({"owned": true, "found": true, "cwd": workspace})
+    );
+    assert_eq!(
+        fs::read_to_string(query_file).unwrap(),
+        "SELECT id, directory FROM session WHERE id = 'ses_quote_''_fixture'"
+    );
+    assert!(!export_marker.exists());
+}
+
+#[test]
+fn opencode_cwd_treats_empty_public_db_lookup_as_not_owned() {
+    let fixture = OpenCodeFixture::new(None);
+    let fake = fixture.fake_bin_dir.join("public-db-miss");
+    let export_marker = fixture._temp.path().join("export-ran");
+    write_fake(
+        &fake,
+        r#"if [ "$#" -eq 4 ] && [ "$1" = 'db' ] && [ "$2" = '--format' ] && [ "$3" = 'json' ]; then
+  printf '%s\n' '[]'
+  exit 0
+fi
+printf ran > "$EXPORT_MARKER"
+exit 98
+"#,
+    );
+    let output = fixture
+        .command(Some(fake.as_os_str()))
+        .env("EXPORT_MARKER", &export_marker)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        parse_response(&output),
+        json!({"owned": false, "found": false})
+    );
+    assert!(!export_marker.exists());
 }
 
 #[cfg(target_os = "linux")]
