@@ -315,6 +315,44 @@ fn dispatch_mailbox_subcommand(command: MailboxSubcommands) -> Result<i32, Strin
             all,
             json,
         } => crate::commands::mailbox::run_list(&session_id, all, json),
+        MailboxSubcommands::Search {
+            session_id,
+            query,
+            all,
+            limit,
+            json,
+        } => crate::commands::mailbox::run_search(&session_id, &query, all, limit, json),
+        MailboxSubcommands::Show {
+            session_id,
+            seq,
+            handle,
+            include_artifacts,
+            max_bytes,
+            json,
+        } => crate::commands::mailbox::run_show(
+            &session_id,
+            seq,
+            handle.as_deref(),
+            include_artifacts,
+            max_bytes,
+            json,
+        ),
+        MailboxSubcommands::Status { session_id, json } => {
+            crate::commands::mailbox::run_status(&session_id, json)
+        }
+        MailboxSubcommands::Pause { session_id, json } => {
+            crate::commands::mailbox::run_pause(&session_id, true, json)
+        }
+        MailboxSubcommands::Resume { session_id, json } => {
+            crate::commands::mailbox::run_pause(&session_id, false, json)
+        }
+        MailboxSubcommands::Ack {
+            session_id,
+            from_seq,
+            to_seq,
+            delivered_by,
+            json,
+        } => crate::commands::mailbox::run_ack(&session_id, from_seq, to_seq, &delivered_by, json),
     }
 }
 

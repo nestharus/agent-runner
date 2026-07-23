@@ -216,7 +216,7 @@ fn delivery_and_wake_after_enqueue(
         session_id,
         "notify-time",
     );
-    let wake = if pty_delivery.delivered_seqs.is_empty() {
+    let wake = if pty_delivery.delivered_seqs.is_empty() && pty_delivery.status != "paused" {
         Some(crate::wake_coordinator::trigger_notify_wake(session_id))
     } else {
         None

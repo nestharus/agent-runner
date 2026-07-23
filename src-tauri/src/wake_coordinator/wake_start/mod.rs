@@ -74,6 +74,7 @@ fn prepare_wake_start_context<'a>(
     let runtime =
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
+    validate_wake_has_deliverable_pending(input.session_id)?;
     validate_start_wake_cap(input)?;
     let liveness = wake_runtime_liveness(&mut db, input.session_id, runtime.as_ref())?;
     cleanup_idle_runtime(runtime.as_ref(), liveness);
@@ -82,6 +83,14 @@ fn prepare_wake_start_context<'a>(
     }
     let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
     Ok(wake_start_context(input, db, runtime, claim))
+}
+
+fn validate_wake_has_deliverable_pending(session_id: &str) -> Result<(), WakeDiagnostic> {
+    match crate::mailbox_delivery::deliverable_pending_count(session_id) {
+        Ok(0) => Err(WakeDiagnostic::status("no_pending")),
+        Ok(_) => Ok(()),
+        Err(err) => Err(storage_error_diagnostic(err)),
+    }
 }
 
 fn wake_start_context<'a>(

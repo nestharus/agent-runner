@@ -20,7 +20,7 @@ use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::{self, SessionProviderIdentity};
 use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeIdleUpdate};
+use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeIdleUpdate};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -56,6 +56,8 @@ pub const USER_INPUT_IDLE_INJECT_MS: u64 = 1500;
 const USER_INPUT_IDLE_INJECT: Duration = Duration::from_millis(USER_INPUT_IDLE_INJECT_MS);
 const INJECT_WAIT_LIMIT: Duration = Duration::from_millis(1500);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const DELIVERY_ATTEMPT_PREFIX: &str = "[OULIPOLY-DELIVERY ";
+const DELIVERY_ATTEMPT_SUFFIX: char = ']';
 const UNIX_SOCKET_PATH_LIMIT: usize = 100;
 const NOTIFY_TRACE_MAX_BYTES: u64 = 1024 * 1024;
 const NOTIFY_TRACE_FILE: &str = "notify-trace.log";
@@ -110,6 +112,53 @@ pub fn inject_control_envelope(
         .map_err(protocol_error)?;
     write_inject_frame(&mut stream, bytes).map_err(protocol_error)?;
     read_control_response(&mut stream)
+}
+
+pub fn render_mailbox_notification_envelope(
+    rows: &[MailboxRow],
+    remaining_count: usize,
+    attempt_id: &str,
+) -> String {
+    let mut rendered = String::new();
+    rendered.push_str("[OULIPOLY NOTIFICATIONS]\n");
+    rendered.push_str(
+        "The following background agent-bash workloads completed while this session was inactive.\n\n",
+    );
+    for (index, row) in rows.iter().enumerate() {
+        rendered.push_str(&format!(
+            "{}. kind: {}\n   handle: {}\n   rc: {}\n   state_dir: {}\n   meta: {}\n   log: {}\n   rc_file: {}\n\n",
+            index + 1,
+            sanitize_mailbox_value(&row.kind),
+            sanitize_mailbox_value(&row.handle),
+            row.rc,
+            quote_mailbox_path(&row.state_dir),
+            quote_mailbox_path(&row.meta_path),
+            quote_mailbox_path(&row.log_path),
+            quote_mailbox_path(&row.rc_path),
+        ));
+    }
+    if remaining_count > 0 {
+        rendered.push_str(&format!(
+            "{remaining_count} additional notification(s) remain queued for the next resume.\n\n"
+        ));
+    }
+    rendered.push_str(
+        "Use the paths above if you need details. Do not assume log content unless you inspect it.\n",
+    );
+    rendered.push_str(DELIVERY_ATTEMPT_PREFIX);
+    rendered.push_str(attempt_id);
+    rendered.push(DELIVERY_ATTEMPT_SUFFIX);
+    rendered.push('\n');
+    rendered.push_str("[END OULIPOLY NOTIFICATIONS]");
+    rendered
+}
+
+fn quote_mailbox_path(path: &str) -> String {
+    format!("\"{}\"", sanitize_mailbox_value(path))
+}
+
+fn sanitize_mailbox_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
 pub fn control_socket_accepts_connection(path: impl AsRef<Path>) -> bool {
@@ -1853,6 +1902,11 @@ struct ControlRequestIo<'a> {
     buffer: &'a mut [u8],
 }
 
+struct PreparedControlPayload {
+    bytes: Vec<u8>,
+    delivery_attempt_id: Option<String>,
+}
+
 fn handle_control_request(
     control: &ControlSocket,
     io: &mut ControlRequestIo<'_>,
@@ -1867,7 +1921,11 @@ fn handle_control_request(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(format_control_write_timeout_error)?;
-    let response = process_control_request_with_pending(&mut stream, io);
+    let response = process_control_request_with_pending(
+        &mut stream,
+        io,
+        Some((control.session_id(), control.invocation_uuid())),
+    );
     let (ack, message) = control_response_parts(response);
     trace_notify_gate_decision(
         control,
@@ -1924,7 +1982,7 @@ fn process_control_request(
             pending_child_input: &mut pending_child_input,
             buffer,
         };
-        process_control_request_with_pending(stream, &mut request_io)
+        process_control_request_with_pending(stream, &mut request_io, None)
     };
     if result.is_ok() {
         flush_pending_child_input_to_completion(master_fd, &mut pending_child_input)?;
@@ -1935,9 +1993,13 @@ fn process_control_request(
 fn process_control_request_with_pending(
     stream: &mut UnixStream,
     io: &mut ControlRequestIo<'_>,
+    expected_target: Option<(&str, &str)>,
 ) -> Result<(), String> {
     validate_control_request_peer(stream)?;
-    let payload = read_control_request_payload(stream)?;
+    let payload = prepare_control_payload(read_control_request_payload(stream)?, expected_target)?;
+    if payload.bytes.is_empty() {
+        return acknowledge_control_payload(&payload);
+    }
     // Safe proactive delivery means the PTY foreground process group is still
     // the agent, child output has cleared the short debounce, and either the
     // line parser saw a boundary or user input has been idle long enough to
@@ -1951,9 +2013,73 @@ fn process_control_request_with_pending(
         io.pending_child_input,
         io.buffer,
     )?;
-    submit_control_request_payload(io.pending_child_input, &payload);
+    submit_control_request_payload(io.pending_child_input, &payload.bytes);
     io.line_state.mark_submitted();
-    Ok(())
+    acknowledge_control_payload(&payload)
+}
+
+fn prepare_control_payload(
+    payload: Vec<u8>,
+    expected_target: Option<(&str, &str)>,
+) -> Result<PreparedControlPayload, String> {
+    let Some(attempt_id) = delivery_attempt_id(&payload) else {
+        return Ok(PreparedControlPayload {
+            bytes: payload,
+            delivery_attempt_id: None,
+        });
+    };
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(PreparedControlPayload {
+            bytes: payload,
+            delivery_attempt_id: None,
+        });
+    };
+    let Some(window) = db.delivery_attempt_window(&attempt_id)? else {
+        return Ok(PreparedControlPayload {
+            bytes: payload,
+            delivery_attempt_id: None,
+        });
+    };
+    if let Some((session_id, invocation_uuid)) = expected_target
+        && (window.session_id != session_id || window.delivery_invocation_uuid != invocation_uuid)
+    {
+        return Err("mailbox_delivery_target_mismatch".to_string());
+    }
+    let bytes = if window.rows.is_empty() {
+        Vec::new()
+    } else {
+        render_mailbox_notification_envelope(&window.rows, window.remaining_count, &attempt_id)
+            .into_bytes()
+    };
+    Ok(PreparedControlPayload {
+        bytes,
+        delivery_attempt_id: Some(attempt_id),
+    })
+}
+
+fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), String> {
+    let Some(attempt_id) = payload.delivery_attempt_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return Err("Mailbox sidecar disappeared while acknowledging delivery".to_string());
+    };
+    if db.acknowledge_delivery_attempt(attempt_id)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "Mailbox delivery attempt {attempt_id} is no longer registered"
+        ))
+    }
+}
+
+fn delivery_attempt_id(payload: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let marker_start = text.rfind(DELIVERY_ATTEMPT_PREFIX)? + DELIVERY_ATTEMPT_PREFIX.len();
+    let marker_tail = &text[marker_start..];
+    let marker_end = marker_tail.find(DELIVERY_ATTEMPT_SUFFIX)?;
+    let attempt_id = &marker_tail[..marker_end];
+    (!attempt_id.is_empty()).then(|| attempt_id.to_string())
 }
 
 fn validate_control_request_peer(stream: &UnixStream) -> Result<(), String> {
@@ -3053,7 +3179,7 @@ mod tests {
                 pending_child_input: &mut pending,
                 buffer: &mut buffer,
             };
-            process_control_request_with_pending(&mut server, &mut request_io)
+            process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
         assert_eq!(result, Ok(()));
@@ -3106,7 +3232,7 @@ mod tests {
                 pending_child_input: &mut pending,
                 buffer: &mut buffer,
             };
-            process_control_request_with_pending(&mut server, &mut request_io).unwrap_err()
+            process_control_request_with_pending(&mut server, &mut request_io, None).unwrap_err()
         };
 
         writer.join().unwrap();

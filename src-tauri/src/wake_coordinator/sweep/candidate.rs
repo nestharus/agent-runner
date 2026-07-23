@@ -19,6 +19,9 @@ pub(super) fn wake_sweep_candidate_disposition(
     // Recoverable means either an idle headless runtime with durable resume
     // evidence, or a live owner PID identity that must not be reaped. Missing
     // runtime/history with no live owner is abandoned debris, not resumable work.
+    if db.notifications_paused(&candidate.session_id)? {
+        return Ok(WakeSweepDisposition::Skip);
+    }
     if consumed::pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
         return Ok(WakeSweepDisposition::Skip);
     }

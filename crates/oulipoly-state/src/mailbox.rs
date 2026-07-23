@@ -8,7 +8,7 @@
 //! the versioned `state.db` schema.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -185,6 +185,21 @@ pub struct WakeSweepCandidate {
     pub max_pending_seq: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxDeliveryAttemptDisposition {
+    Pending,
+    Resolved,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxDeliveryWindow {
+    pub session_id: String,
+    pub delivery_invocation_uuid: String,
+    pub rows: Vec<MailboxRow>,
+    pub remaining_count: usize,
+}
+
 struct WakeSweepSessionState {
     session_id: String,
     min_pending_seq: i64,
@@ -294,6 +309,74 @@ impl MailboxDb {
         }
     }
 
+    pub fn notifications_paused(&self, session_id: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT paused FROM mailbox_notification_control WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map(|paused| paused.unwrap_or(false))
+            .map_err(|err| format!("Failed to query mailbox notification control: {err}"))
+    }
+
+    pub fn set_notifications_paused(
+        &mut self,
+        session_id: &str,
+        paused: bool,
+    ) -> Result<(), String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO mailbox_notification_control (session_id, paused, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    paused = excluded.paused,
+                    updated_at = excluded.updated_at",
+                params![session_id, paused, &now],
+            )
+            .map(|_| ())
+            .map_err(|err| format!("Failed to update mailbox notification control: {err}"))
+    }
+
+    pub fn acknowledge_range(
+        &mut self,
+        session_id: &str,
+        from_seq: i64,
+        to_seq: i64,
+        delivered_by: &str,
+    ) -> Result<usize, String> {
+        if from_seq > to_seq {
+            return Err(format!(
+                "Mailbox acknowledgement range is reversed: {from_seq} > {to_seq}"
+            ));
+        }
+        let now = now_rfc3339();
+        let tx = self.conn.transaction().map_err(|err| {
+            format!("Failed to start mailbox range acknowledgement transaction: {err}")
+        })?;
+        let changed = tx
+            .execute(
+                "UPDATE mailbox
+                 SET delivered_at = ?4,
+                     delivered_by_invocation_uuid = ?5,
+                     delivery_attempts = delivery_attempts + 1,
+                     delivery_error = NULL
+                 WHERE session_id = ?1
+                   AND seq >= ?2
+                   AND seq <= ?3
+                   AND delivered_at IS NULL",
+                params![session_id, from_seq, to_seq, &now, delivered_by],
+            )
+            .map_err(|err| format!("Failed to acknowledge mailbox range: {err}"))?;
+        resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
+        tx.commit().map_err(|err| {
+            format!("Failed to commit mailbox range acknowledgement transaction: {err}")
+        })?;
+        Ok(changed)
+    }
+
     pub fn list_mailbox_bounded(
         &self,
         session_id: &str,
@@ -360,8 +443,211 @@ impl MailboxDb {
             )
             .map_err(|err| format!("Failed to mark mailbox row delivered: {err}"))?;
         }
+        resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))
+    }
+
+    pub fn register_delivery_attempt(
+        &mut self,
+        attempt_id: &str,
+        session_id: &str,
+        delivery_invocation_uuid: &str,
+        seqs: &[i64],
+        remaining_count: usize,
+    ) -> Result<(), String> {
+        if seqs.is_empty() {
+            return Err("Cannot register an empty mailbox delivery attempt".to_string());
+        }
+        let now = now_rfc3339();
+        let tx = self.conn.transaction().map_err(|err| {
+            format!("Failed to start mailbox delivery attempt transaction: {err}")
+        })?;
+        tx.execute(
+            "INSERT INTO mailbox_delivery_attempts (
+                attempt_id, session_id, delivery_invocation_uuid, created_at,
+                prepared_remaining_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                attempt_id,
+                session_id,
+                delivery_invocation_uuid,
+                &now,
+                remaining_count as i64
+            ],
+        )
+        .map_err(|err| format!("Failed to insert mailbox delivery attempt: {err}"))?;
+        for seq in seqs {
+            let belongs_to_session = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM mailbox
+                        WHERE seq = ?1 AND session_id = ?2
+                     )",
+                    params![seq, session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|err| format!("Failed to validate mailbox delivery item: {err}"))?;
+            if !belongs_to_session {
+                return Err(format!(
+                    "Mailbox delivery item {seq} does not belong to session {session_id}"
+                ));
+            }
+            tx.execute(
+                "INSERT INTO mailbox_delivery_attempt_items (attempt_id, mailbox_seq)
+                 VALUES (?1, ?2)",
+                params![attempt_id, seq],
+            )
+            .map_err(|err| format!("Failed to insert mailbox delivery attempt item: {err}"))?;
+        }
+        resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit mailbox delivery attempt: {err}"))
+    }
+
+    pub fn delivery_attempt_disposition(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<MailboxDeliveryAttemptDisposition>, String> {
+        let Some((total, pending)) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN mailbox.delivered_at IS NULL THEN 1 ELSE 0 END)
+                 FROM mailbox_delivery_attempts AS attempts
+                 JOIN mailbox_delivery_attempt_items AS items
+                   ON items.attempt_id = attempts.attempt_id
+                 JOIN mailbox ON mailbox.seq = items.mailbox_seq
+                 WHERE attempts.attempt_id = ?1
+                 GROUP BY attempts.attempt_id",
+                params![attempt_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to query mailbox delivery attempt: {err}"))?
+        else {
+            return Ok(None);
+        };
+        let disposition = if pending == 0 {
+            MailboxDeliveryAttemptDisposition::Resolved
+        } else if pending == total {
+            MailboxDeliveryAttemptDisposition::Pending
+        } else {
+            MailboxDeliveryAttemptDisposition::Stale
+        };
+        Ok(Some(disposition))
+    }
+
+    pub fn delivery_attempt_window(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<MailboxDeliveryWindow>, String> {
+        let Some((session_id, delivery_invocation_uuid)) = self
+            .conn
+            .query_row(
+                "SELECT session_id, delivery_invocation_uuid
+                 FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
+                params![attempt_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to query mailbox delivery window owner: {err}"))?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mailbox.seq, mailbox.session_id, mailbox.kind, mailbox.handle,
+                        mailbox.payload_json, mailbox.enqueued_at, mailbox.delivered_at,
+                        mailbox.delivered_by_invocation_uuid, mailbox.delivery_attempts,
+                        mailbox.delivery_error, mailbox.owner_invocation_uuid,
+                        mailbox.matched_os_pid, mailbox.matched_os_boot_id,
+                        mailbox.matched_os_pid_starttime_ticks, mailbox.matched_chain_index,
+                        mailbox.state_dir, mailbox.meta_path, mailbox.log_path,
+                        mailbox.rc_path, mailbox.rc
+                 FROM mailbox_delivery_attempt_items AS items
+                 JOIN mailbox ON mailbox.seq = items.mailbox_seq
+                 WHERE items.attempt_id = ?1 AND mailbox.delivered_at IS NULL
+                 ORDER BY mailbox.seq",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox delivery window query: {err}"))?;
+        let rows = stmt
+            .query_map(params![attempt_id], map_mailbox_row)
+            .map_err(|err| format!("Failed to query mailbox delivery window: {err}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read mailbox delivery window: {err}"))?;
+        let pending_count = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox
+                 WHERE session_id = ?1 AND delivered_at IS NULL",
+                params![&session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|err| format!("Failed to count mailbox delivery window remainder: {err}"))?;
+        Ok(Some(MailboxDeliveryWindow {
+            session_id,
+            delivery_invocation_uuid,
+            remaining_count: (pending_count as usize).saturating_sub(rows.len()),
+            rows,
+        }))
+    }
+
+    pub fn acknowledge_delivery_attempt(&mut self, attempt_id: &str) -> Result<bool, String> {
+        let now = now_rfc3339();
+        let tx = self.conn.transaction().map_err(|err| {
+            format!("Failed to start mailbox delivery acknowledgement transaction: {err}")
+        })?;
+        let Some((session_id, delivery_invocation_uuid)) = tx
+            .query_row(
+                "SELECT session_id, delivery_invocation_uuid
+                 FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
+                params![attempt_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to query mailbox delivery attempt owner: {err}"))?
+        else {
+            return Ok(false);
+        };
+        let mut seq_stmt = tx
+            .prepare(
+                "SELECT mailbox_seq FROM mailbox_delivery_attempt_items
+                 WHERE attempt_id = ?1 ORDER BY mailbox_seq",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox delivery item query: {err}"))?;
+        let seqs = seq_stmt
+            .query_map(params![attempt_id], |row| row.get::<_, i64>(0))
+            .map_err(|err| format!("Failed to query mailbox delivery items: {err}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read mailbox delivery items: {err}"))?;
+        drop(seq_stmt);
+        for seq in &seqs {
+            tx.execute(
+                "UPDATE mailbox
+                 SET delivered_at = ?3,
+                     delivered_by_invocation_uuid = ?4,
+                     delivery_attempts = delivery_attempts + 1,
+                     delivery_error = NULL
+                 WHERE session_id = ?1 AND seq = ?2 AND delivered_at IS NULL",
+                params![&session_id, seq, &now, &delivery_invocation_uuid],
+            )
+            .map_err(|err| format!("Failed to resolve mailbox delivery item: {err}"))?;
+        }
+        tx.execute(
+            "UPDATE mailbox_delivery_attempts
+             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
+                 resolved_at = COALESCE(resolved_at, ?2),
+                 resolved_by_attempt_id = COALESCE(resolved_by_attempt_id, ?1)
+             WHERE attempt_id = ?1",
+            params![attempt_id, &now],
+        )
+        .map_err(|err| format!("Failed to acknowledge mailbox delivery attempt: {err}"))?;
+        resolve_completed_delivery_attempts(&tx, &session_id, &now, Some(attempt_id))?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit mailbox delivery acknowledgement: {err}"))?;
+        Ok(true)
     }
 
     pub fn mark_delivery_failed(
@@ -965,6 +1251,31 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
         Ok(())
     }
+}
+
+fn resolve_completed_delivery_attempts(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    resolved_at: &str,
+    resolved_by_attempt_id: Option<&str>,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE mailbox_delivery_attempts AS attempt
+         SET resolved_at = COALESCE(resolved_at, ?2),
+             resolved_by_attempt_id = COALESCE(resolved_by_attempt_id, ?3)
+         WHERE session_id = ?1
+           AND resolved_at IS NULL
+           AND NOT EXISTS (
+                 SELECT 1
+                 FROM mailbox_delivery_attempt_items AS unresolved
+                 JOIN mailbox ON mailbox.seq = unresolved.mailbox_seq
+                 WHERE unresolved.attempt_id = attempt.attempt_id
+                   AND mailbox.delivered_at IS NULL
+             )",
+        params![session_id, resolved_at, resolved_by_attempt_id],
+    )
+    .map(|_| ())
+    .map_err(|err| format!("Failed to resolve completed mailbox delivery attempts: {err}"))
 }
 
 fn wake_claim_pid_identity_record<'a>(
@@ -1745,6 +2056,34 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_mailbox_pending
             ON mailbox(session_id, delivered_at, seq);
 
+        CREATE TABLE IF NOT EXISTS mailbox_delivery_attempts (
+            attempt_id                    TEXT PRIMARY KEY,
+            session_id                    TEXT NOT NULL,
+            delivery_invocation_uuid      TEXT NOT NULL,
+            created_at                    TEXT NOT NULL,
+            prepared_remaining_count      INTEGER NOT NULL,
+            acknowledged_at               TEXT,
+            resolved_at                   TEXT,
+            resolved_by_attempt_id        TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS mailbox_delivery_attempt_items (
+            attempt_id                    TEXT NOT NULL,
+            mailbox_seq                   INTEGER NOT NULL,
+            PRIMARY KEY(attempt_id, mailbox_seq),
+            FOREIGN KEY(attempt_id) REFERENCES mailbox_delivery_attempts(attempt_id),
+            FOREIGN KEY(mailbox_seq) REFERENCES mailbox(seq)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mailbox_delivery_attempt_items_seq
+            ON mailbox_delivery_attempt_items(mailbox_seq, attempt_id);
+
+        CREATE TABLE IF NOT EXISTS mailbox_notification_control (
+            session_id                    TEXT PRIMARY KEY,
+            paused                       INTEGER NOT NULL DEFAULT 0,
+            updated_at                   TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS session_runtime (
             session_id                       TEXT PRIMARY KEY,
             mode                             TEXT NOT NULL CHECK(mode IN ('headless', 'pty_interactive')),
@@ -2074,6 +2413,155 @@ mod tests {
             Some("resume-1")
         );
         assert_eq!(second.delivery_attempts, 1);
+    }
+
+    #[test]
+    fn late_attempt_ack_contracts_overlapping_delivery_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let rows = (1..=6)
+            .map(|index| {
+                inserted_row(
+                    db.enqueue_agent_bash_complete(&input(&format!("handle-{index}"), "session-a")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let first_window = rows[..3].iter().map(|row| row.seq).collect::<Vec<_>>();
+        let expanded_window = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &first_window, 3)
+            .unwrap();
+        db.register_delivery_attempt(
+            "attempt-2",
+            "session-a",
+            "invocation-a",
+            &expanded_window,
+            0,
+        )
+        .unwrap();
+        assert!(db.acknowledge_delivery_attempt("attempt-1").unwrap());
+
+        assert_eq!(db.list_pending("session-a").unwrap().len(), 3);
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-1").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Resolved)
+        );
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-2").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Stale)
+        );
+        let contracted = db.delivery_attempt_window("attempt-2").unwrap().unwrap();
+        assert_eq!(contracted.rows.len(), 3);
+        assert_eq!(contracted.rows[0].handle, "handle-4");
+        assert_eq!(contracted.remaining_count, 0);
+        assert!(db.acknowledge_delivery_attempt("attempt-1").unwrap());
+        assert_eq!(db.list_pending("session-a").unwrap().len(), 3);
+        assert!(
+            db.list_mailbox("session-a", true)
+                .unwrap()
+                .iter()
+                .take(3)
+                .all(|row| row.delivery_attempts == 1)
+        );
+        assert!(
+            db.list_mailbox("session-a", true)
+                .unwrap()
+                .iter()
+                .take(3)
+                .all(|row| row.delivered_by_invocation_uuid.as_deref() == Some("invocation-a"))
+        );
+    }
+
+    #[test]
+    fn ack_from_any_retry_resolves_notification_roots_and_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let rows = ["handle-a", "handle-b"].map(|handle| {
+            inserted_row(db.enqueue_agent_bash_complete(&input(handle, "session-a")))
+        });
+        let seqs = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
+            .unwrap();
+        db.register_delivery_attempt("attempt-2", "session-a", "invocation-a", &seqs, 0)
+            .unwrap();
+        assert!(db.acknowledge_delivery_attempt("attempt-2").unwrap());
+
+        assert!(db.list_pending("session-a").unwrap().is_empty());
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-1").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Resolved)
+        );
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-2").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Resolved)
+        );
+    }
+
+    #[test]
+    fn retry_registration_after_late_ack_is_resolved_without_redelivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        let seqs = [row.seq];
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
+            .unwrap();
+        db.acknowledge_delivery_attempt("attempt-1").unwrap();
+
+        db.register_delivery_attempt("attempt-2", "session-a", "invocation-a", &seqs, 0)
+            .unwrap();
+
+        let window = db.delivery_attempt_window("attempt-2").unwrap().unwrap();
+        assert!(window.rows.is_empty());
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-2").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Resolved)
+        );
+        assert!(db.acknowledge_delivery_attempt("attempt-2").unwrap());
+        let delivered = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(delivered.delivery_attempts, 1);
+        assert_eq!(
+            delivered.delivered_by_invocation_uuid.as_deref(),
+            Some("invocation-a")
+        );
+    }
+
+    #[test]
+    fn manual_range_ack_leaves_newer_rows_and_contracts_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let rows = ["handle-a", "handle-b", "handle-c"].map(|handle| {
+            inserted_row(db.enqueue_agent_bash_complete(&input(handle, "session-a")))
+        });
+        let seqs = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
+            .unwrap();
+
+        let changed = db
+            .acknowledge_range("session-a", rows[0].seq, rows[1].seq, "manual-test")
+            .unwrap();
+
+        assert_eq!(changed, 2);
+        let pending = db.list_pending("session-a").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].seq, rows[2].seq);
+        let window = db.delivery_attempt_window("attempt-1").unwrap().unwrap();
+        assert_eq!(window.rows.len(), 1);
+        assert_eq!(window.rows[0].seq, rows[2].seq);
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-1").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Stale)
+        );
+    }
+
+    #[test]
+    fn notification_pause_state_defaults_false_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+
+        assert!(!db.notifications_paused("session-a").unwrap());
+        db.set_notifications_paused("session-a", true).unwrap();
+        assert!(db.notifications_paused("session-a").unwrap());
+        db.set_notifications_paused("session-a", false).unwrap();
+        assert!(!db.notifications_paused("session-a").unwrap());
     }
 
     #[test]
