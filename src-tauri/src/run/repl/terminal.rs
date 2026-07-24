@@ -77,19 +77,24 @@ pub(super) fn execute_and_finalize_repl_attempt(
                 &zero_turn_baseline,
                 &mut result,
             );
-            clear_repl_session_capture_for_unpinned(
+            if let Err(err) = clear_repl_session_capture_for_unpinned(
                 input.env,
                 input.invocation_row_id,
                 input.resume,
-            )?;
+            ) {
+                handoff_repl_pty_delivery(&input, result.exit_code);
+                return Err(err);
+            }
             finalize_repl_execution_result(input, &interactive_effective_cwd, &result)
         }
         Err(_spawn_err) => {
-            clear_repl_session_capture_for_unpinned(
+            let clear_result = clear_repl_session_capture_for_unpinned(
                 input.env,
                 input.invocation_row_id,
                 input.resume,
-            )?;
+            );
+            handoff_repl_pty_delivery(&input, 1);
+            clear_result?;
             finalize_repl_spawn_error(input)
         }
     }
@@ -107,18 +112,56 @@ fn finalize_repl_execution_result(
         input.resume_session_id,
         result,
     );
-    match handle_terminal_signal_disposition(ReplTerminalDispositionInput {
+    let state = &input.env.state;
+    let sessions_cfg = &input.env.sessions_cfg;
+    let provider_name = input.provider.name.as_str();
+    let session_id = input.resume_session_id;
+    let invocation_uuid = input.invocation.id.as_str();
+    let finalization = match handle_terminal_signal_disposition(ReplTerminalDispositionInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
         invocation_row_id: input.invocation_row_id,
         guard: input.guard,
         result,
         terminal_signal_disposition,
-    })? {
-        ReplTerminalControl::Return(exit_code) => Ok(exit_code),
-        ReplTerminalControl::Completed => {
+    }) {
+        Ok(ReplTerminalControl::Return(exit_code)) => Ok(exit_code),
+        Err(err) => Err(err),
+        Ok(ReplTerminalControl::Completed) => {
             finalize_completed_repl_execution(input, interactive_effective_cwd, result)
         }
+    };
+    if let Err(err) = crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
+        state,
+        sessions_cfg,
+        provider_name,
+        session_id,
+        invocation_uuid,
+        result.exit_code,
+    ) {
+        tracing::warn!(
+            session_id,
+            invocation_uuid,
+            "Failed to hand off REPL PTY mailbox delivery: {err}"
+        );
+    }
+    finalization
+}
+
+fn handoff_repl_pty_delivery(input: &ReplExecutionInput<'_, '_>, exit_code: i32) {
+    if let Err(err) = crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        &input.provider.name,
+        input.resume_session_id,
+        &input.invocation.id,
+        exit_code,
+    ) {
+        tracing::warn!(
+            session_id = input.resume_session_id,
+            invocation_uuid = input.invocation.id,
+            "Failed to hand off REPL PTY mailbox delivery: {err}"
+        );
     }
 }
 

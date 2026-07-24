@@ -83,6 +83,7 @@ pub(super) fn finalize_completed_attempt(
     if classification.success
         && let Err(err) = ingest_completed_attempt_session(&input)
     {
+        mark_balanced_attempt_idle(&input, Some(input.result.exit_code));
         return BalancedLoopControl::Return(Err(err));
     }
 
@@ -181,11 +182,7 @@ fn emit_completed_attempt_finalize_failure(
         Some(TERMINAL_PERSISTENCE_ERROR_CATEGORY),
         Some(TERMINAL_PERSISTENCE_TERMINAL_REASON),
     ));
-    mark_balanced_attempt_idle(
-        input.zero_turn_provider_session_id,
-        &input.invocation.id,
-        Some(1),
-    );
+    mark_balanced_attempt_idle(input, Some(1));
 }
 
 fn completed_attempt_result_control(
@@ -205,11 +202,7 @@ fn emit_completed_attempt_success(
     input: &CompletedAttemptInput<'_, '_, '_>,
     classification: &CompletedAttemptClassification,
 ) -> BalancedLoopControl {
-    mark_balanced_successful_attempt_idle_and_recheck(
-        input.zero_turn_provider_session_id,
-        &input.invocation.id,
-        input.result.exit_code,
-    );
+    mark_balanced_successful_attempt_idle_and_recheck(input, input.result.exit_code);
     formatter::emit_success_output(
         &input.invocation.id,
         input.result.exit_code,
@@ -227,11 +220,7 @@ fn quota_exhausted_retry_control(
     if !classification.quota_exhausted {
         return None;
     }
-    mark_balanced_attempt_idle(
-        input.zero_turn_provider_session_id,
-        &input.invocation.id,
-        Some(input.result.exit_code),
-    );
+    mark_balanced_attempt_idle(input, Some(input.result.exit_code));
     if retry_available(input.attempts, input.max_attempts) {
         formatter::emit_routing_retry(input.provider_name);
     }
@@ -254,53 +243,95 @@ fn emit_completed_attempt_failure(
         &input.result.stderr,
         classification.error_category.as_deref(),
     );
-    mark_balanced_attempt_idle(
-        input.zero_turn_provider_session_id,
-        &input.invocation.id,
-        Some(input.result.exit_code),
-    );
+    mark_balanced_attempt_idle(input, Some(input.result.exit_code));
     BalancedLoopControl::Return(Ok(input.result.exit_code))
 }
 
-fn mark_balanced_attempt_idle(
-    provider_session_id: Option<&str>,
-    invocation_uuid: &str,
-    exit_code: Option<i32>,
-) {
-    let Some(provider_session_id) = provider_session_id else {
+fn mark_balanced_attempt_idle(input: &CompletedAttemptInput<'_, '_, '_>, exit_code: Option<i32>) {
+    if finalize_balanced_pty_handoff(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        input.provider_name,
+        input.zero_turn_provider_session_id,
+        &input.invocation.id,
+        exit_code,
+    ) {
+        return;
+    }
+    let Some(provider_session_id) = input.zero_turn_provider_session_id else {
         return;
     };
     if let Err(err) = crate::wake_coordinator::mark_session_idle_after_turn(
         provider_session_id,
-        invocation_uuid,
+        &input.invocation.id,
         exit_code,
     ) {
         tracing::warn!(
             session_id = provider_session_id,
-            invocation_uuid,
+            invocation_uuid = input.invocation.id,
             "Failed to mark balanced session idle: {err}"
         );
     }
 }
 
 fn mark_balanced_successful_attempt_idle_and_recheck(
-    provider_session_id: Option<&str>,
-    invocation_uuid: &str,
+    input: &CompletedAttemptInput<'_, '_, '_>,
     exit_code: i32,
 ) {
-    let Some(provider_session_id) = provider_session_id else {
+    if finalize_balanced_pty_handoff(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        input.provider_name,
+        input.zero_turn_provider_session_id,
+        &input.invocation.id,
+        Some(exit_code),
+    ) {
+        return;
+    }
+    let Some(provider_session_id) = input.zero_turn_provider_session_id else {
         return;
     };
     if let Err(err) = crate::wake_coordinator::mark_successful_turn_idle_and_recheck(
         provider_session_id,
-        invocation_uuid,
+        &input.invocation.id,
         exit_code,
     ) {
         tracing::warn!(
             session_id = provider_session_id,
-            invocation_uuid,
+            invocation_uuid = input.invocation.id,
             "Failed to run balanced wake recheck: {err}"
         );
+    }
+}
+
+fn finalize_balanced_pty_handoff(
+    state: &oulipoly_state::StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    provider_session_id: Option<&str>,
+    invocation_uuid: &str,
+    exit_code: Option<i32>,
+) -> bool {
+    let Some(exit_code) = exit_code else {
+        return false;
+    };
+    match crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
+        state,
+        sessions_cfg,
+        provider_name,
+        provider_session_id,
+        invocation_uuid,
+        exit_code,
+    ) {
+        Ok(handled) => handled,
+        Err(err) => {
+            tracing::warn!(
+                session_id = provider_session_id,
+                invocation_uuid,
+                "Failed to hand off balanced PTY mailbox delivery: {err}"
+            );
+            false
+        }
     }
 }
 
@@ -320,7 +351,29 @@ fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFai
         Ok(_) => input.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),
     }
-    mark_balanced_attempt_idle(input.provider_session_id, input.invocation_id, Some(1));
+    if !finalize_balanced_pty_handoff(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        input.provider_name,
+        input.provider_session_id,
+        input.invocation_id,
+        Some(1),
+    ) {
+        let Some(provider_session_id) = input.provider_session_id else {
+            return;
+        };
+        if let Err(err) = crate::wake_coordinator::mark_session_idle_after_turn(
+            provider_session_id,
+            input.invocation_id,
+            Some(1),
+        ) {
+            tracing::warn!(
+                session_id = provider_session_id,
+                invocation_uuid = input.invocation_id,
+                "Failed to mark balanced session idle: {err}"
+            );
+        }
+    }
 }
 
 fn emit_returned_artifacts_persist_failure(input: &mapper::ArtifactPersistFailureInput<'_, '_>) {

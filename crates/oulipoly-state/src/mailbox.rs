@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use crate::pid_identity::{self, ProcessIdentity};
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
+pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
+pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -194,8 +196,10 @@ pub enum MailboxDeliveryAttemptDisposition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxDeliveryWindow {
+    pub attempt_id: String,
     pub session_id: String,
     pub delivery_invocation_uuid: String,
+    pub acknowledged_at: Option<String>,
     pub rows: Vec<MailboxRow>,
     pub remaining_count: usize,
 }
@@ -542,13 +546,19 @@ impl MailboxDb {
         &self,
         attempt_id: &str,
     ) -> Result<Option<MailboxDeliveryWindow>, String> {
-        let Some((session_id, delivery_invocation_uuid)) = self
+        let Some((session_id, delivery_invocation_uuid, acknowledged_at)) = self
             .conn
             .query_row(
-                "SELECT session_id, delivery_invocation_uuid
+                "SELECT session_id, delivery_invocation_uuid, acknowledged_at
                  FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
                 params![attempt_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|err| format!("Failed to query mailbox delivery window owner: {err}"))?
@@ -576,77 +586,125 @@ impl MailboxDb {
             .query_map(params![attempt_id], map_mailbox_row)
             .map_err(|err| format!("Failed to query mailbox delivery window: {err}"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| format!("Failed to read mailbox delivery window: {err}"))?;
+            .map_err(|err| format!("Failed to read mailbox delivery window: {err}"))?
+            .into_iter()
+            .filter(mailbox_row_is_deliverable_pending)
+            .collect::<Vec<_>>();
         let pending_count = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM mailbox
-                 WHERE session_id = ?1 AND delivered_at IS NULL",
-                params![&session_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|err| format!("Failed to count mailbox delivery window remainder: {err}"))?;
+            .list_pending(&session_id)?
+            .into_iter()
+            .filter(mailbox_row_is_deliverable_pending)
+            .count();
         Ok(Some(MailboxDeliveryWindow {
+            attempt_id: attempt_id.to_string(),
             session_id,
             delivery_invocation_uuid,
-            remaining_count: (pending_count as usize).saturating_sub(rows.len()),
+            acknowledged_at,
+            remaining_count: pending_count.saturating_sub(rows.len()),
             rows,
         }))
     }
 
-    pub fn acknowledge_delivery_attempt(&mut self, attempt_id: &str) -> Result<bool, String> {
+    pub fn accepted_delivery_attempt_windows(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MailboxDeliveryWindow>, String> {
+        let oldest_deliverable_seq = self
+            .list_pending(session_id)?
+            .into_iter()
+            .find(mailbox_row_is_deliverable_pending)
+            .map(|row| row.seq);
+        let Some(oldest_deliverable_seq) = oldest_deliverable_seq else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT attempts.attempt_id
+                 FROM mailbox_delivery_attempts AS attempts
+                 WHERE attempts.session_id = ?1
+                   AND attempts.acknowledged_at IS NOT NULL
+                   AND attempts.resolved_at IS NULL
+                    AND EXISTS (
+                        SELECT 1
+                        FROM mailbox_delivery_attempt_items AS prefix_items
+                        WHERE prefix_items.attempt_id = attempts.attempt_id
+                          AND prefix_items.mailbox_seq = ?2
+                    )
+                  ORDER BY attempts.acknowledged_at, attempts.created_at, attempts.attempt_id",
+            )
+            .map_err(|err| format!("Failed to prepare accepted delivery attempt query: {err}"))?;
+        let attempt_ids = stmt
+            .query_map(params![session_id, oldest_deliverable_seq], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|err| format!("Failed to query accepted delivery attempts: {err}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read accepted delivery attempts: {err}"))?;
+        drop(stmt);
+        attempt_ids
+            .into_iter()
+            .map(|attempt_id| {
+                self.delivery_attempt_window(&attempt_id)?.ok_or_else(|| {
+                    format!("Accepted mailbox delivery attempt {attempt_id} disappeared")
+                })
+            })
+            .collect()
+    }
+
+    pub fn record_delivery_attempt_transport_ack(
+        &mut self,
+        attempt_id: &str,
+    ) -> Result<bool, String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET acknowledged_at = COALESCE(acknowledged_at, ?2)
+                 WHERE attempt_id = ?1",
+                params![attempt_id, &now],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|err| format!("Failed to record mailbox delivery transport ACK: {err}"))
+    }
+
+    pub fn confirm_delivery_attempt(&mut self, attempt_id: &str) -> Result<bool, String> {
         let now = now_rfc3339();
         let tx = self.conn.transaction().map_err(|err| {
-            format!("Failed to start mailbox delivery acknowledgement transaction: {err}")
+            format!("Failed to start mailbox delivery confirmation transaction: {err}")
         })?;
         let Some((session_id, delivery_invocation_uuid)) = tx
             .query_row(
                 "SELECT session_id, delivery_invocation_uuid
-                 FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
+                 FROM mailbox_delivery_attempts
+                 WHERE attempt_id = ?1 AND acknowledged_at IS NOT NULL",
                 params![attempt_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
-            .map_err(|err| format!("Failed to query mailbox delivery attempt owner: {err}"))?
+            .map_err(|err| format!("Failed to query confirmed delivery attempt owner: {err}"))?
         else {
             return Ok(false);
         };
-        let mut seq_stmt = tx
-            .prepare(
-                "SELECT mailbox_seq FROM mailbox_delivery_attempt_items
-                 WHERE attempt_id = ?1 ORDER BY mailbox_seq",
-            )
-            .map_err(|err| format!("Failed to prepare mailbox delivery item query: {err}"))?;
-        let seqs = seq_stmt
-            .query_map(params![attempt_id], |row| row.get::<_, i64>(0))
-            .map_err(|err| format!("Failed to query mailbox delivery items: {err}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| format!("Failed to read mailbox delivery items: {err}"))?;
-        drop(seq_stmt);
-        for seq in &seqs {
-            tx.execute(
-                "UPDATE mailbox
-                 SET delivered_at = ?3,
-                     delivered_by_invocation_uuid = ?4,
-                     delivery_attempts = delivery_attempts + 1,
-                     delivery_error = NULL
-                 WHERE session_id = ?1 AND seq = ?2 AND delivered_at IS NULL",
-                params![&session_id, seq, &now, &delivery_invocation_uuid],
-            )
-            .map_err(|err| format!("Failed to resolve mailbox delivery item: {err}"))?;
-        }
         tx.execute(
-            "UPDATE mailbox_delivery_attempts
-             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
-                 resolved_at = COALESCE(resolved_at, ?2),
-                 resolved_by_attempt_id = COALESCE(resolved_by_attempt_id, ?1)
-             WHERE attempt_id = ?1",
-            params![attempt_id, &now],
+            "UPDATE mailbox
+             SET delivered_at = ?3,
+                 delivered_by_invocation_uuid = ?4,
+                 delivery_attempts = delivery_attempts + 1,
+                 delivery_error = NULL
+             WHERE session_id = ?1
+               AND delivered_at IS NULL
+               AND seq IN (
+                   SELECT mailbox_seq
+                   FROM mailbox_delivery_attempt_items
+                   WHERE attempt_id = ?2
+               )",
+            params![&session_id, attempt_id, &now, &delivery_invocation_uuid],
         )
-        .map_err(|err| format!("Failed to acknowledge mailbox delivery attempt: {err}"))?;
+        .map_err(|err| format!("Failed to confirm mailbox delivery items: {err}"))?;
         resolve_completed_delivery_attempts(&tx, &session_id, &now, Some(attempt_id))?;
         tx.commit()
-            .map_err(|err| format!("Failed to commit mailbox delivery acknowledgement: {err}"))?;
+            .map_err(|err| format!("Failed to commit mailbox delivery confirmation: {err}"))?;
         Ok(true)
     }
 
@@ -1251,6 +1309,13 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
         Ok(())
     }
+}
+
+pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
+    row.delivered_at.is_none()
+        && row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
+        && (row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
+            || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS)
 }
 
 fn resolve_completed_delivery_attempts(
@@ -2416,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn late_attempt_ack_contracts_overlapping_delivery_window() {
+    fn late_attempt_confirmation_contracts_overlapping_delivery_window() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let rows = (1..=6)
@@ -2438,7 +2503,11 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(db.acknowledge_delivery_attempt("attempt-1").unwrap());
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-1")
+                .unwrap()
+        );
+        assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
 
         assert_eq!(db.list_pending("session-a").unwrap().len(), 3);
         assert_eq!(
@@ -2453,7 +2522,7 @@ mod tests {
         assert_eq!(contracted.rows.len(), 3);
         assert_eq!(contracted.rows[0].handle, "handle-4");
         assert_eq!(contracted.remaining_count, 0);
-        assert!(db.acknowledge_delivery_attempt("attempt-1").unwrap());
+        assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
         assert_eq!(db.list_pending("session-a").unwrap().len(), 3);
         assert!(
             db.list_mailbox("session-a", true)
@@ -2472,7 +2541,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_from_any_retry_resolves_notification_roots_and_siblings() {
+    fn confirmation_from_any_retry_resolves_notification_roots_and_siblings() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let rows = ["handle-a", "handle-b"].map(|handle| {
@@ -2483,7 +2552,11 @@ mod tests {
             .unwrap();
         db.register_delivery_attempt("attempt-2", "session-a", "invocation-a", &seqs, 0)
             .unwrap();
-        assert!(db.acknowledge_delivery_attempt("attempt-2").unwrap());
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-2")
+                .unwrap()
+        );
+        assert!(db.confirm_delivery_attempt("attempt-2").unwrap());
 
         assert!(db.list_pending("session-a").unwrap().is_empty());
         assert_eq!(
@@ -2497,14 +2570,16 @@ mod tests {
     }
 
     #[test]
-    fn retry_registration_after_late_ack_is_resolved_without_redelivery() {
+    fn retry_registration_after_late_confirmation_is_resolved_without_redelivery() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
         let seqs = [row.seq];
         db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
             .unwrap();
-        db.acknowledge_delivery_attempt("attempt-1").unwrap();
+        db.record_delivery_attempt_transport_ack("attempt-1")
+            .unwrap();
+        db.confirm_delivery_attempt("attempt-1").unwrap();
 
         db.register_delivery_attempt("attempt-2", "session-a", "invocation-a", &seqs, 0)
             .unwrap();
@@ -2515,13 +2590,287 @@ mod tests {
             db.delivery_attempt_disposition("attempt-2").unwrap(),
             Some(MailboxDeliveryAttemptDisposition::Resolved)
         );
-        assert!(db.acknowledge_delivery_attempt("attempt-2").unwrap());
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-2")
+                .unwrap()
+        );
         let delivered = db.list_mailbox("session-a", true).unwrap().remove(0);
         assert_eq!(delivered.delivery_attempts, 1);
         assert_eq!(
             delivered.delivered_by_invocation_uuid.as_deref(),
             Some("invocation-a")
         );
+    }
+
+    #[test]
+    fn transport_acknowledgement_is_nonterminal_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &[row.seq], 0)
+            .unwrap();
+
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-1")
+                .unwrap()
+        );
+        let first_ack = db
+            .delivery_attempt_window("attempt-1")
+            .unwrap()
+            .unwrap()
+            .acknowledged_at;
+        assert!(first_ack.is_some());
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-1")
+                .unwrap()
+        );
+        let window = db.delivery_attempt_window("attempt-1").unwrap().unwrap();
+        assert_eq!(window.acknowledged_at, first_ack);
+        assert_eq!(window.rows, vec![row.clone()]);
+        let persisted = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert!(persisted.delivered_at.is_none());
+        assert!(persisted.delivered_by_invocation_uuid.is_none());
+        assert_eq!(persisted.delivery_attempts, 0);
+        assert!(persisted.delivery_error.is_none());
+        let (resolved_at, resolved_by): (Option<String>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT resolved_at, resolved_by_attempt_id
+                 FROM mailbox_delivery_attempts WHERE attempt_id = 'attempt-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(resolved_at.is_none());
+        assert!(resolved_by.is_none());
+        assert!(
+            !db.record_delivery_attempt_transport_ack("missing-attempt")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn provider_confirmation_marks_only_pending_items_and_resolves_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let rows = ["handle-a", "handle-b"].map(|handle| {
+            inserted_row(db.enqueue_agent_bash_complete(&input(handle, "session-a")))
+        });
+        let seqs = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
+            .unwrap();
+        assert!(!db.confirm_delivery_attempt("attempt-1").unwrap());
+        db.mark_delivered("session-a", &[rows[0].seq], "sibling-invocation")
+            .unwrap();
+        db.record_delivery_attempt_transport_ack("attempt-1")
+            .unwrap();
+
+        assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
+        assert!(db.confirm_delivery_attempt("attempt-1").unwrap());
+        let delivered = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(delivered[0].delivery_attempts, 1);
+        assert_eq!(
+            delivered[0].delivered_by_invocation_uuid.as_deref(),
+            Some("sibling-invocation")
+        );
+        assert_eq!(delivered[1].delivery_attempts, 1);
+        assert_eq!(
+            delivered[1].delivered_by_invocation_uuid.as_deref(),
+            Some("invocation-a")
+        );
+        let (resolved_at, resolved_by): (Option<String>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT resolved_at, resolved_by_attempt_id
+                 FROM mailbox_delivery_attempts WHERE attempt_id = 'attempt-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(resolved_at.is_some());
+        assert_eq!(resolved_by.as_deref(), Some("attempt-1"));
+    }
+
+    #[test]
+    fn accepted_attempt_owner_requires_transport_ack_and_oldest_pending_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let rows = ["handle-a", "handle-b"].map(|handle| {
+            inserted_row(db.enqueue_agent_bash_complete(&input(handle, "session-a")))
+        });
+        db.register_delivery_attempt(
+            "prefix-attempt",
+            "session-a",
+            "invocation-a",
+            &[rows[0].seq],
+            1,
+        )
+        .unwrap();
+        db.register_delivery_attempt(
+            "suffix-attempt",
+            "session-a",
+            "invocation-a",
+            &[rows[1].seq],
+            0,
+        )
+        .unwrap();
+        db.record_delivery_attempt_transport_ack("suffix-attempt")
+            .unwrap();
+        assert!(
+            db.accepted_delivery_attempt_windows("session-a")
+                .unwrap()
+                .is_empty()
+        );
+
+        db.record_delivery_attempt_transport_ack("prefix-attempt")
+            .unwrap();
+        let owners = db.accepted_delivery_attempt_windows("session-a").unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].attempt_id, "prefix-attempt");
+        assert_eq!(owners[0].rows, vec![rows[0].clone()]);
+    }
+
+    #[test]
+    fn accepted_attempt_owner_skips_undeliverable_older_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let abandoned =
+            inserted_row(db.enqueue_agent_bash_complete(&input("abandoned", "session-a")));
+        let exhausted =
+            inserted_row(db.enqueue_agent_bash_complete(&input("exhausted", "session-a")));
+        let deliverable =
+            inserted_row(db.enqueue_agent_bash_complete(&input("deliverable", "session-a")));
+        db.mark_pending_abandoned("session-a", WAKE_SWEEP_ABANDONED_ERROR, 1)
+            .unwrap();
+        for _ in 0..MAX_UNCONFIRMED_DELIVERY_ATTEMPTS {
+            db.mark_delivery_failed(
+                "session-a",
+                &[exhausted.seq],
+                MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+            )
+            .unwrap();
+        }
+        db.register_delivery_attempt(
+            "deliverable-attempt",
+            "session-a",
+            "invocation-a",
+            &[deliverable.seq],
+            0,
+        )
+        .unwrap();
+        db.record_delivery_attempt_transport_ack("deliverable-attempt")
+            .unwrap();
+
+        let owners = db.accepted_delivery_attempt_windows("session-a").unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].attempt_id, "deliverable-attempt");
+        assert_eq!(owners[0].rows, vec![deliverable]);
+        assert_eq!(owners[0].remaining_count, 0);
+        let abandoned = db
+            .list_pending("session-a")
+            .unwrap()
+            .into_iter()
+            .find(|row| row.seq == abandoned.seq)
+            .unwrap();
+        assert!(!mailbox_row_is_deliverable_pending(&abandoned));
+    }
+
+    #[test]
+    fn late_transport_ack_after_sibling_confirmation_is_delivery_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        for attempt_id in ["attempt-1", "attempt-2"] {
+            db.register_delivery_attempt(attempt_id, "session-a", "invocation-a", &[row.seq], 0)
+                .unwrap();
+        }
+        db.record_delivery_attempt_transport_ack("attempt-2")
+            .unwrap();
+        db.confirm_delivery_attempt("attempt-2").unwrap();
+        let before = db.list_mailbox("session-a", true).unwrap().remove(0);
+
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-1")
+                .unwrap()
+        );
+        let after = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(after, before);
+        let late = db.delivery_attempt_window("attempt-1").unwrap().unwrap();
+        assert!(late.acknowledged_at.is_some());
+        assert!(late.rows.is_empty());
+    }
+
+    #[test]
+    fn deployed_sidecar_attempt_rows_reopen_without_schema_or_historical_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let old = inserted_row(db.enqueue_agent_bash_complete(&input("old-handle", "session-a")));
+        db.register_delivery_attempt("old-attempt", "session-a", "old-invocation", &[old.seq], 0)
+            .unwrap();
+        db.record_delivery_attempt_transport_ack("old-attempt")
+            .unwrap();
+        db.confirm_delivery_attempt("old-attempt").unwrap();
+        let old_mailbox = db.list_mailbox("session-a", true).unwrap();
+        let old_attempt: (Option<String>, Option<String>, Option<String>) = db
+            .connection()
+            .query_row(
+                "SELECT acknowledged_at, resolved_at, resolved_by_attempt_id
+                 FROM mailbox_delivery_attempts WHERE attempt_id = 'old-attempt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let attempt_ddl: String = db
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'mailbox_delivery_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(db);
+
+        let mut reopened = MailboxDb::open(&path).unwrap();
+        let new =
+            inserted_row(reopened.enqueue_agent_bash_complete(&input("new-handle", "session-a")));
+        reopened
+            .register_delivery_attempt("new-attempt", "session-a", "new-invocation", &[new.seq], 0)
+            .unwrap();
+        reopened
+            .record_delivery_attempt_transport_ack("new-attempt")
+            .unwrap();
+        assert!(reopened.list_pending("session-a").unwrap().contains(&new));
+        assert_eq!(
+            reopened
+                .list_mailbox("session-a", true)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.handle == "old-handle")
+                .collect::<Vec<_>>(),
+            old_mailbox
+        );
+        let reopened_old_attempt: (Option<String>, Option<String>, Option<String>) = reopened
+            .connection()
+            .query_row(
+                "SELECT acknowledged_at, resolved_at, resolved_by_attempt_id
+                 FROM mailbox_delivery_attempts WHERE attempt_id = 'old-attempt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(reopened_old_attempt, old_attempt);
+        let reopened_ddl: String = reopened
+            .connection()
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'mailbox_delivery_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reopened_ddl, attempt_ddl);
     }
 
     #[test]
