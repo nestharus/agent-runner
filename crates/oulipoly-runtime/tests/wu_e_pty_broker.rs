@@ -6,8 +6,13 @@
 //!
 //! Unix outer-PTY integration harness for the plain broker opt-out path.
 
-use oulipoly_config::ProviderConfig;
-use oulipoly_runtime::executor::cli::execute_interactive_with_result_and_model_identity;
+use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
+use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy};
+use oulipoly_runtime::executor::cli::{
+    ResumePayload, execute_interactive_with_result_and_model_config,
+    execute_interactive_with_result_and_model_identity,
+};
+use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -15,11 +20,19 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const HELPER_ENV: &str = "WU_E_PTY_HELPER";
 const PROVIDER_SCRIPT_ENV: &str = "WU_E_PROVIDER_SCRIPT";
 const RESULT_PATH_ENV: &str = "WU_E_RESULT_PATH";
+const OBSERVED_HELPER_ENV: &str = "WU_E_OBSERVED_HELPER";
+const OBSERVER_ADAPTER_ENV: &str = "WU_E_OBSERVER_ADAPTER";
+const OBSERVER_STATE_ENV: &str = "WU_E_OBSERVER_STATE";
+const OBSERVER_EVENTS_ENV: &str = "WU_E_OBSERVER_EVENTS";
+const OBSERVER_WORKING_DIR_ENV: &str = "WU_E_OBSERVER_WORKING_DIR";
+const OBSERVER_SESSION_ID: &str = "session-overlay-proof";
+const OBSERVER_INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 #[test]
 fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
@@ -56,6 +69,69 @@ fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
 }
 
 #[test]
+fn production_observed_relay_confirms_provider_turn_before_second_overlay_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("events.log");
+    let state = dir.path().join("observer-state");
+    fs::write(&state, "baseline").unwrap();
+    let child_script = observed_child_script(dir.path(), &events, &state);
+    let adapter = observer_adapter_script(dir.path(), &events, &state);
+    let result_path = dir.path().join("observed-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let before = terminal_attrs(pty.slave.as_raw_fd()).unwrap();
+    let mut child = spawn_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &state,
+        &events,
+        dir.path(),
+        &result_path,
+    );
+
+    let output = read_until_bytes(pty.master.as_raw_fd(), "OBS", Duration::from_secs(5));
+    write_all_fd(pty.master.as_raw_fd(), b"\x1b[<0;1;31Mfirst\rsecond\r").unwrap();
+    let output = read_until_rendered_text(
+        pty.master.as_raw_fd(),
+        output,
+        "consumed",
+        Duration::from_secs(10),
+        33,
+        100,
+    );
+
+    let status = child.wait().unwrap();
+    assert!(status.success(), "observed helper failed with {status:?}");
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "0\n");
+    assert_termios_eq(&before, &terminal_attrs(pty.slave.as_raw_fd()).unwrap());
+    let event_text = fs::read_to_string(&events).unwrap();
+    let events = event_text.lines().collect::<Vec<_>>();
+    let child_lines = events
+        .iter()
+        .filter(|line| line.starts_with("child:"))
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(child_lines, vec!["child:first", "child:second"]);
+    let observed_new = events
+        .iter()
+        .position(|line| *line == "observer:new-user-turn")
+        .expect("adapter must observe the new canonical user turn");
+    let child_second = events
+        .iter()
+        .position(|line| *line == "child:second")
+        .expect("child second line");
+    assert!(
+        observed_new < child_second,
+        "second body arrived before provider observation: {event_text}"
+    );
+    assert!(event_text.contains("session.read_turns"));
+    assert!(event_text.contains("observer-account"));
+    assert!(event_text.contains(OBSERVER_SESSION_ID));
+    assert!(event_text.contains(&dir.path().display().to_string()));
+    assert!(rendered_screen_text(&output, 33, 100).contains("consumed"));
+}
+
+#[test]
 fn helper_runs_broker_session() {
     if helper_env_missing() {
         return;
@@ -65,6 +141,44 @@ fn helper_runs_broker_session() {
     let provider = fixture_provider(&provider_script);
     let exit_code = run_broker_session(&provider);
     write_exit_code_result(&result_path, exit_code);
+}
+
+#[test]
+fn helper_runs_production_observed_session() {
+    if std::env::var_os(OBSERVED_HELPER_ENV).is_none() {
+        return;
+    }
+    let child_script = required_env_path(PROVIDER_SCRIPT_ENV);
+    let adapter = required_env_path(OBSERVER_ADAPTER_ENV);
+    let working_dir = required_env_path(OBSERVER_WORKING_DIR_ENV);
+    let result_path = required_env_path(RESULT_PATH_ENV);
+    let mut provider = fixture_provider(&child_script);
+    provider.name = "observer-account".to_string();
+    let model = observed_model(&adapter);
+    let registry = ProviderRegistry::from_model_configs(
+        std::slice::from_ref(&model),
+        ProviderRegistryOptions::default(),
+    )
+    .unwrap();
+    let strategy = ResumeStrategy {
+        kind: ResumeKind::Flag,
+        flag: Some("--resume".to_string()),
+        subcommand: None,
+    };
+    let invocation = format!(r#"{{"source":"test","id":"{OBSERVER_INVOCATION_UUID}"}}"#);
+    let result = execute_interactive_with_result_and_model_config(
+        &provider,
+        Some(&working_dir),
+        Some(&invocation),
+        Some(ResumePayload {
+            session_id: OBSERVER_SESSION_ID,
+            strategy: &strategy,
+        }),
+        &model,
+        Arc::new(registry),
+    )
+    .unwrap();
+    write_exit_code_result(&result_path, result.exit_code);
 }
 
 fn helper_env_missing() -> bool {
@@ -153,6 +267,38 @@ fn spawn_helper_under_pty(
     let (stdin, stdout, stderr) = cloned_slave_stdio(pty);
     let (slave_fd, master_fd) = pty_raw_fds(pty);
     let mut cmd = helper_command(exe, provider, result_path, stdin, stdout, stderr);
+    install_helper_pre_exec(&mut cmd, slave_fd, master_fd);
+    cmd.spawn().unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_observed_helper_under_pty(
+    pty: &OuterPty,
+    child_script: &Path,
+    adapter: &Path,
+    state: &Path,
+    events: &Path,
+    working_dir: &Path,
+    result_path: &Path,
+) -> std::process::Child {
+    let (stdin, stdout, stderr) = cloned_slave_stdio(pty);
+    let (slave_fd, master_fd) = pty_raw_fds(pty);
+    let mut cmd = Command::new(current_test_exe());
+    cmd.arg("--exact")
+        .arg("helper_runs_production_observed_session")
+        .arg("--nocapture")
+        .env(OBSERVED_HELPER_ENV, "1")
+        .env(PROVIDER_SCRIPT_ENV, child_script)
+        .env(OBSERVER_ADAPTER_ENV, adapter)
+        .env(OBSERVER_STATE_ENV, state)
+        .env(OBSERVER_EVENTS_ENV, events)
+        .env(OBSERVER_WORKING_DIR_ENV, working_dir)
+        .env(RESULT_PATH_ENV, result_path)
+        .env("TERM", "xterm-256color")
+        .env("OULIPOLY_INTERACTIVE_TUI", "1")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
     install_helper_pre_exec(&mut cmd, slave_fd, master_fd);
     cmd.spawn().unwrap()
 }
@@ -290,6 +436,126 @@ fn fixture_provider(script: &Path) -> ProviderConfig {
     }
 }
 
+fn observed_model(adapter: &Path) -> ModelConfig {
+    ModelConfig {
+        name: "observer-model".to_string(),
+        prompt_mode: PromptMode::Arg,
+        providers: vec![ProviderConfig::model_provider(
+            "observer-account",
+            Vec::new(),
+        )],
+        inputs: Vec::new(),
+        provider: Some(ProviderImplementationRef {
+            path: Some(adapter.display().to_string()),
+            crate_name: None,
+            version: None,
+            binary: None,
+            script: None,
+        }),
+    }
+}
+
+fn observed_child_script(dir: &Path, events: &Path, state: &Path) -> PathBuf {
+    let path = dir.join("observed-child.py");
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import pathlib
+import sys
+events = pathlib.Path({events:?})
+state = pathlib.Path({state:?})
+for line in sys.stdin:
+    line = line.rstrip("\r\n")
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write("child:" + line + "\n")
+    if line == "first":
+        state.write_text("new")
+    if line == "second":
+        raise SystemExit(0)
+raise SystemExit(9)
+"#,
+        events = events.display().to_string(),
+        state = state.display().to_string(),
+    );
+    write_executable(&path, &body);
+    path
+}
+
+fn observer_adapter_script(dir: &Path, events: &Path, state: &Path) -> PathBuf {
+    let path = dir.join("observer-adapter.py");
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+import time
+CONTRACT = "oulipoly.provider/v1"
+OBSERVER_SESSION_ID = {session:?}
+events = pathlib.Path({events:?})
+state = pathlib.Path({state:?})
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{{}}")
+with events.open("a", encoding="utf-8") as handle:
+    handle.write("adapter:" + subcommand + ":" + json.dumps(request, sort_keys=True) + "\n")
+
+def envelope(result):
+    return {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "outer-pty-request"),
+        "ok": True,
+        "result": result,
+    }}
+
+if subcommand == "describe":
+    print(json.dumps(envelope({{
+        "provider_id": "observer-provider",
+        "display_name": "Observer Provider",
+        "contract_versions": [CONTRACT],
+        "preferred_contract": CONTRACT,
+        "capabilities": {{
+            "launch": False, "policy": False, "quota": False, "session": True,
+            "terminal": False, "rotation": False, "discovery": False,
+            "settings": False, "setup_brain": False, "setup": False, "migration": False
+        }}
+    }})))
+    raise SystemExit(0)
+
+if subcommand != "session.read_turns":
+    raise SystemExit(4)
+time.sleep(0.2)
+turns = [{{
+    "session_id": OBSERVER_SESSION_ID,
+    "turn_id": "old-equal-body",
+    "timestamp": "2026-05-01T00:00:01Z",
+    "role": "user",
+    "body": [{{"type": "text", "text": "first"}}],
+}}]
+if state.read_text().strip() == "new":
+    turns.append({{
+        "session_id": OBSERVER_SESSION_ID,
+        "turn_id": "new-exact-body",
+        "timestamp": "2026-05-01T00:00:02Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": "first"}}],
+    }})
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write("observer:new-user-turn\n")
+print(json.dumps(envelope({{"turns": turns, "turn_count": len(turns), "complete": True}})))
+"#,
+        events = events.display().to_string(),
+        state = state.display().to_string(),
+        session = OBSERVER_SESSION_ID,
+    );
+    write_executable(&path, &body);
+    path
+}
+
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
 fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
     render_output(&read_until_bytes(fd, needle, timeout))
 }
@@ -304,6 +570,46 @@ fn read_until_bytes(fd: RawFd, needle: &str, timeout: Duration) -> Vec<u8> {
         }
     }
     output
+}
+
+fn read_until_rendered_text(
+    fd: RawFd,
+    mut output: Vec<u8>,
+    needle: &str,
+    timeout: Duration,
+    rows: u16,
+    cols: u16,
+) -> Vec<u8> {
+    let start = Instant::now();
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(&output);
+    let mut buffer = [0_u8; 4096];
+    while start.elapsed() < timeout {
+        if !poll_readable(fd, Duration::from_millis(50)).unwrap() {
+            continue;
+        }
+        let n = read_fd(fd, &mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        for byte in &buffer[..n] {
+            parser.process(std::slice::from_ref(byte));
+            output.push(*byte);
+            if parser.screen().contents().contains(needle) {
+                return output;
+            }
+        }
+    }
+    panic!(
+        "rendered terminal never contained {needle:?}: {:?}",
+        parser.screen().contents()
+    );
+}
+
+fn rendered_screen_text(output: &[u8], rows: u16, cols: u16) -> String {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(output);
+    parser.screen().contents()
 }
 
 fn read_until_step(fd: RawFd, needle: &str, output: &mut Vec<u8>, buffer: &mut [u8]) -> bool {

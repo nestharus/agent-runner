@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod cancel;
+mod outbound_observer;
 mod snapshot_worker;
 mod transcript_view;
 mod tui;
@@ -89,6 +90,14 @@ pub struct PtyControlResponse {
 
 pub(super) struct ProviderInspectMonitorContext {
     registry: Arc<ProviderRegistry>,
+}
+
+struct ProviderSessionObservationContext {
+    registry: Arc<ProviderRegistry>,
+    identity: SessionProviderIdentity,
+    provider_session_id: String,
+    invocation_uuid: String,
+    effective_cwd: Option<PathBuf>,
 }
 
 impl ProviderInspectMonitorContext {
@@ -224,6 +233,14 @@ pub(super) fn execute_interactive_child_observed(
     let pty = PtyPair::open(&child_winsize, &real_tty.original)?;
     let control = ControlSocket::bind_for(context)?;
     configure_child_pty(&mut cmd, &pty)?;
+    let provider_session =
+        provider_session_observation_context(provider, context, provider_inspect);
+    let monitor: Box<dyn ObservabilitySnapshotPort + Send> = Box::new(observability_monitor(
+        provider,
+        provider_inspect.is_some(),
+        provider_session.as_ref().ok(),
+    ));
+    let outbound_source = outbound_observer_source(provider_session);
     let mut child = cmd
         .spawn()
         .map_err(|err| format_provider_spawn_error(&provider.command, err))?;
@@ -240,8 +257,6 @@ pub(super) fn execute_interactive_child_observed(
         .writer_clone()
         .map_err(format_tui_writer_clone_error)?;
     let root = observability_root(provider, context);
-    let monitor: Box<dyn ObservabilitySnapshotPort + Send> =
-        Box::new(observability_monitor(provider, context, provider_inspect));
     let status = tui::relay_until_exit_observed(
         raw_tty.fd(),
         writer,
@@ -250,6 +265,7 @@ pub(super) fn execute_interactive_child_observed(
         &mut child,
         monitor,
         root,
+        outbound_source,
     );
     idle_guard.exit_code = status.as_ref().ok().map(exit_code_from_status);
     drop(signal_guard);
@@ -288,12 +304,14 @@ fn observability_root(
 
 fn observability_monitor(
     provider: &ProviderConfig,
-    context: Option<&SpawnIdentityContext>,
-    provider_inspect: Option<&ProviderInspectMonitorContext>,
+    provider_inspect_requested: bool,
+    provider_session: Option<&ProviderSessionObservationContext>,
 ) -> ProductionObservabilitySnapshotService {
-    match provider_inspect {
-        Some(inspect) => provider_inspect_monitor(provider, context, inspect)
-            .unwrap_or_else(|| ProductionObservabilitySnapshotService::for_session(None)),
+    match provider_session {
+        Some(provider_session) => provider_inspect_monitor(provider_session),
+        None if provider_inspect_requested => {
+            ProductionObservabilitySnapshotService::for_session(None)
+        }
         None => {
             ProductionObservabilitySnapshotService::for_session(provider.session_storage.clone())
         }
@@ -301,23 +319,51 @@ fn observability_monitor(
 }
 
 fn provider_inspect_monitor(
+    context: &ProviderSessionObservationContext,
+) -> ProductionObservabilitySnapshotService {
+    ProductionObservabilitySnapshotService::for_provider_inspect_registry(
+        Arc::clone(&context.registry),
+        context.identity.clone(),
+        context.provider_session_id.clone(),
+        context.effective_cwd.clone(),
+    )
+}
+
+fn provider_session_observation_context(
     provider: &ProviderConfig,
     context: Option<&SpawnIdentityContext>,
-    inspect: &ProviderInspectMonitorContext,
-) -> Option<ProductionObservabilitySnapshotService> {
-    let context = context?;
-    let model_name = context.model_name()?;
-    let session_id = context.session_id()?;
-    let identity =
-        provider_inspect_identity(inspect.registry.as_ref(), model_name, &provider.name)?;
-    Some(
-        ProductionObservabilitySnapshotService::for_provider_inspect_registry(
-            Arc::clone(&inspect.registry),
-            identity,
-            session_id.to_string(),
-            context.effective_cwd().map(PathBuf::from),
+    inspect: Option<&ProviderInspectMonitorContext>,
+) -> Result<ProviderSessionObservationContext, &'static str> {
+    let context = context.ok_or("awaiting_session_identity")?;
+    let model_name = context.model_name().ok_or("awaiting_session_identity")?;
+    let provider_session_id = context.session_id().ok_or("awaiting_session_identity")?;
+    let inspect = inspect.ok_or("session_turn_source_unavailable")?;
+    let identity = provider_inspect_identity(inspect.registry.as_ref(), model_name, &provider.name)
+        .ok_or("session_turn_source_unavailable")?;
+    Ok(ProviderSessionObservationContext {
+        registry: Arc::clone(&inspect.registry),
+        identity,
+        provider_session_id: provider_session_id.to_string(),
+        invocation_uuid: context.invocation_uuid().to_string(),
+        effective_cwd: context.effective_cwd().map(PathBuf::from),
+    })
+}
+
+fn outbound_observer_source(
+    context: Result<ProviderSessionObservationContext, &'static str>,
+) -> outbound_observer::OutboundObserverSource {
+    match context {
+        Ok(context) => outbound_observer::OutboundObserverSource::Provider(
+            outbound_observer::ProviderSessionTurnSource::new(
+                context.registry,
+                context.identity,
+                context.provider_session_id,
+                context.invocation_uuid,
+                context.effective_cwd,
+            ),
         ),
-    )
+        Err(detail) => outbound_observer::OutboundObserverSource::Unavailable(detail.to_string()),
+    }
 }
 
 fn provider_inspect_identity(
@@ -325,7 +371,12 @@ fn provider_inspect_identity(
     model_name: &str,
     provider_name: &str,
 ) -> Option<SessionProviderIdentity> {
-    let describe = registry.describe_model_provider(model_name).ok()?;
+    let describe = registry
+        .describe_model_provider_instance(model_name, provider_name)
+        .ok()?;
+    if !describe.capabilities.session {
+        return None;
+    }
     Some(SessionProviderIdentity {
         model_name: model_name.to_string(),
         provider_name: provider_name.to_string(),

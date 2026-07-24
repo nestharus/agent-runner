@@ -101,14 +101,13 @@ pub fn execute_interactive_with_result_and_model_config(
     model: &ModelConfig,
     provider_registry: Arc<ProviderRegistry>,
 ) -> Result<InteractiveExecutionResult, String> {
-    let registry = model.provider.is_some().then_some(provider_registry);
     execute_interactive_with_result_and_monitor_context(
         provider,
         working_dir,
         parent_invocation_env,
         resume,
         Some(&model.name),
-        registry,
+        Some(provider_registry),
     )
 }
 
