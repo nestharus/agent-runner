@@ -23,6 +23,9 @@
 
 #![cfg(unix)]
 
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, WakeClaimAcquireResult, WakeClaimRequest,
+};
 use oulipoly_state::{InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
 use std::fs;
@@ -85,6 +88,12 @@ impl Fixture {
         self.data_home
             .join("oulipoly-agent-runner")
             .join("state.db")
+    }
+
+    fn sidecar_path(&self) -> PathBuf {
+        self.data_home
+            .join("oulipoly-agent-runner")
+            .join("pid-identity.db")
     }
 
     fn open_db(&self) -> StateDb {
@@ -270,6 +279,15 @@ prompt_mode = "stdin"
     }
 
     fn run_resume_with_migration(&self, resume_input: &str, target_provider: &str) -> Output {
+        self.run_resume_with_migration_env(resume_input, target_provider, &[])
+    }
+
+    fn run_resume_with_migration_env(
+        &self,
+        resume_input: &str,
+        target_provider: &str,
+        env: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("-m")
             .arg("age123-resume")
@@ -280,7 +298,48 @@ prompt_mode = "stdin"
             .arg("--models-dir")
             .arg(&self.models_dir)
             .arg("continue after manual migration");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
         self.run(cmd)
+    }
+
+    fn seed_auto_wake_claim(&self, session_id: &str, claim_token: &str) {
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let row = match db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id,
+                handle: "notification-boundary",
+                payload_json: "{}",
+                owner_invocation_uuid: None,
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: "/tmp/notification-boundary",
+                meta_path: "/tmp/notification-boundary/meta.json",
+                log_path: "/tmp/notification-boundary/output.log",
+                rc_path: "/tmp/notification-boundary/rc",
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) | EnqueueResult::AlreadyEnqueued(row) => row,
+            EnqueueResult::Conflict { existing } => existing,
+        };
+        let result = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id,
+                claim_token,
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        assert!(matches!(result, WakeClaimAcquireResult::Acquired(_)));
+        db.mark_delivered(session_id, &[row.seq], "notification-boundary-test")
+            .unwrap();
     }
 
     fn run(&self, mut cmd: Command) -> Output {
@@ -502,4 +561,53 @@ fn manual_migration_records_target_resolved_provider_identity() {
         row.provider_session_resolved_account,
         Some(identity_for(&fixture, "claude-b"))
     );
+}
+
+#[test]
+fn notification_auto_wake_stays_bound_despite_explicit_rotation_target() {
+    const SOURCE: &str = "provider-a";
+    const TARGET: &str = "provider-b";
+    const CLAIM_TOKEN: &str = "notification-boundary-claim";
+
+    let fixture = Fixture::new();
+    fixture.write_resume_pool(
+        "age123-resume",
+        &[
+            ProviderFixture {
+                name: SOURCE,
+                body: "printf '%s\\n' 'bound notification resume accepted'\nexit 0",
+            },
+            ProviderFixture {
+                name: TARGET,
+                body: "printf '%s\\n' 'notification must not rotate' >&2\nexit 99",
+            },
+        ],
+    );
+    let source_dir = fixture.provider_projects_dir(SOURCE).join("source-project");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::write(
+        source_dir.join(format!("{SESSION_A}.jsonl")),
+        format!(
+            r#"{{"sessionId":"{SESSION_A}","turnId":"turn-1","timestamp":"2026-04-17T08:00:00Z","type":"assistant"}}"#
+        ),
+    )
+    .unwrap();
+    fixture.seed_active_chain(SOURCE, SESSION_A);
+    fixture.seed_auto_wake_claim(CHAIN_ID, CLAIM_TOKEN);
+
+    let output = fixture.run_resume_with_migration_env(
+        CHAIN_ID,
+        TARGET,
+        &[
+            ("OULIPOLY_AUTO_WAKE", "1"),
+            ("OULIPOLY_AUTO_WAKE_SESSION_ID", CHAIN_ID),
+            ("OULIPOLY_AUTO_WAKE_TOKEN", CLAIM_TOKEN),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let row = fixture.latest_invocation();
+    assert_eq!(row.provider_name, SOURCE);
+    assert_eq!(row.provider_session_id.as_deref(), Some(SESSION_A));
+    assert_eq!(row.status, InvocationStatus::Succeeded.as_str());
 }
