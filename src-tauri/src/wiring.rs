@@ -237,7 +237,7 @@ fn production_provider_registry(
     let fallback_options = options.clone();
     let providers = load_registry_providers(paths);
     let models = load_registry_models(paths, &providers);
-    registry_from_model_configs(models, options)
+    registry_from_model_configs(&models, &providers, options)
         .unwrap_or_else(|_| empty_provider_registry(fallback_options))
 }
 
@@ -254,11 +254,16 @@ fn load_registry_models(
     config::load_models(&paths.models_dir, Some(providers)).unwrap_or_default()
 }
 
-fn registry_from_model_configs(
-    models: std::collections::HashMap<String, config::ModelConfig>,
+pub(crate) fn registry_from_model_configs(
+    models: &std::collections::HashMap<String, config::ModelConfig>,
+    providers: &config::ProvidersConfig,
     options: ProviderRegistryOptions,
 ) -> Result<ProviderRegistry, oulipoly_runtime::provider_registry::ProviderRegistryError> {
-    ProviderRegistry::from_model_configs(&models.into_values().collect::<Vec<_>>(), options)
+    ProviderRegistry::from_model_configs_with_provider_config(
+        &models.values().cloned().collect::<Vec<_>>(),
+        providers,
+        options,
+    )
 }
 
 fn empty_provider_registry(options: ProviderRegistryOptions) -> ProviderRegistry {
@@ -292,4 +297,137 @@ fn create_runtime_directory(path: &Path, label: &str) -> Result<(), String> {
 
 fn format_runtime_directory_error(label: &str, error: std::io::Error) -> String {
     format!("Failed to create {label}: {error}")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
+    use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ProviderEntry};
+    use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn registry_keeps_account_inferred_and_explicit_artifacts_without_spawning_on_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let count = dir.path().join("describe-count");
+        let inferred = write_describe_provider(dir.path(), "agent-runner-fixture", &count);
+        let explicit_count = dir.path().join("explicit-describe-count");
+        let explicit = write_describe_provider(dir.path(), "explicit-provider", &explicit_count);
+        let account_model = model("account-model", "account", None);
+        let explicit_model = model(
+            "explicit-model",
+            "account",
+            Some(ProviderImplementationRef {
+                path: Some(explicit.display().to_string()),
+                crate_name: None,
+                version: None,
+                binary: None,
+                script: None,
+            }),
+        );
+        let providers = config::ProvidersConfig {
+            entries: HashMap::from([(
+                "account".to_string(),
+                ProviderEntry {
+                    command: Some("fixture5".to_string()),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let models = HashMap::from([
+            (account_model.name.clone(), account_model),
+            (explicit_model.name.clone(), explicit_model),
+        ]);
+        let registry = registry_from_model_configs(
+            &models,
+            &providers,
+            ProviderRegistryOptions::default().with_path_entries([dir.path().to_path_buf()]),
+        )
+        .expect("registry");
+
+        assert!(
+            !count.exists(),
+            "registry construction must not run describe"
+        );
+        assert!(
+            !explicit_count.exists(),
+            "explicit artifact construction must not run describe"
+        );
+        assert_eq!(
+            inferred.file_name().and_then(|name| name.to_str()),
+            Some("agent-runner-fixture")
+        );
+        assert_eq!(
+            registry
+                .describe_model_provider_instance("account-model", "account")
+                .expect("inferred account artifact")
+                .provider_id,
+            "fixture-provider"
+        );
+        assert_eq!(fs::read_to_string(&count).expect("inferred count"), "1");
+        assert_eq!(
+            registry
+                .describe_model_provider_instance("explicit-model", "account")
+                .expect("explicit model artifact")
+                .provider_id,
+            "fixture-provider"
+        );
+        assert_eq!(
+            fs::read_to_string(&explicit_count).expect("explicit count"),
+            "1"
+        );
+    }
+
+    fn model(
+        name: &str,
+        account: &str,
+        provider: Option<ProviderImplementationRef>,
+    ) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(account, Vec::new())],
+            inputs: Vec::new(),
+            provider,
+        }
+    }
+
+    fn write_describe_provider(dir: &Path, name: &str, count: &Path) -> PathBuf {
+        let path = dir.join(name);
+        let body = format!(
+            r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+request = json.loads(sys.stdin.read() or "{{}}")
+count = pathlib.Path({count:?})
+value = int(count.read_text()) + 1 if count.exists() else 1
+count.write_text(str(value))
+print(json.dumps({{
+  "contract": request.get("contract", "oulipoly.provider/v1"),
+  "request_id": request.get("request_id", "wiring-test"),
+  "ok": True,
+  "result": {{
+    "provider_id": "fixture-provider",
+    "display_name": "Fixture Provider",
+    "contract_versions": ["oulipoly.provider/v1"],
+    "preferred_contract": "oulipoly.provider/v1",
+    "capabilities": {{
+      "launch": False, "policy": False, "quota": False, "session": True,
+      "terminal": False, "rotation": False, "discovery": False,
+      "settings": False, "setup_brain": False, "setup": False, "migration": False
+    }}
+  }}
+}}))
+"#,
+            count = count.display().to_string(),
+        );
+        fs::write(&path, body).expect("provider script");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod");
+        path
+    }
 }

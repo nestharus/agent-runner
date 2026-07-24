@@ -32,6 +32,10 @@
 use super::cancel::{
     CancelRequest, cancel_outcome_message, cancel_request_for_node, execute_cancel,
 };
+use super::outbound_observer::{
+    ObservedUserTurn, OutboundObservation, OutboundObservationIdentity, OutboundObservationResult,
+    OutboundObserverSource, OutboundObserverWorker,
+};
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::transcript_view::project_transcript_tail;
 use super::{
@@ -56,7 +60,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -214,8 +218,10 @@ enum MonitorCommand {
     ToggleList,
     ToggleInspect,
     RequestCancel,
-    ConfirmCancel,
-    AbortCancel,
+    RequestOutboundRetry,
+    RequestOutboundDiscard,
+    ConfirmAction,
+    AbortAction,
 }
 
 /// Outcome of routing a chunk of real-terminal input.
@@ -334,6 +340,8 @@ enum BottomKey {
     Collapse,
     Inspect,
     Cancel,
+    RetryOutbound,
+    DiscardOutbound,
     Confirm,
     Abort,
     Printable(char),
@@ -549,6 +557,14 @@ fn parse_bottom_key(bytes: &[u8]) -> ParsedBottomKey {
             key: BottomKey::Cancel,
             consumed: 1,
         },
+        [0x10, ..] => ParsedBottomKey {
+            key: BottomKey::RetryOutbound,
+            consumed: 1,
+        },
+        [0x04, ..] => ParsedBottomKey {
+            key: BottomKey::DiscardOutbound,
+            consumed: 1,
+        },
         [0x19, ..] => ParsedBottomKey {
             key: BottomKey::Confirm,
             consumed: 1,
@@ -626,8 +642,12 @@ fn bottom_key_route(key: BottomKey) -> BottomInputRoute {
         BottomKey::Collapse => BottomInputRoute::Command(MonitorCommand::Collapse),
         BottomKey::Inspect => BottomInputRoute::Command(MonitorCommand::ToggleInspect),
         BottomKey::Cancel => BottomInputRoute::Command(MonitorCommand::RequestCancel),
-        BottomKey::Confirm => BottomInputRoute::Command(MonitorCommand::ConfirmCancel),
-        BottomKey::Abort => BottomInputRoute::Command(MonitorCommand::AbortCancel),
+        BottomKey::RetryOutbound => BottomInputRoute::Command(MonitorCommand::RequestOutboundRetry),
+        BottomKey::DiscardOutbound => {
+            BottomInputRoute::Command(MonitorCommand::RequestOutboundDiscard)
+        }
+        BottomKey::Confirm => BottomInputRoute::Command(MonitorCommand::ConfirmAction),
+        BottomKey::Abort => BottomInputRoute::Command(MonitorCommand::AbortAction),
         BottomKey::Printable(ch) => BottomInputRoute::PseudoInput(PseudoInputAction::Insert(ch)),
         BottomKey::Unknown => BottomInputRoute::Consume,
     }
@@ -1059,8 +1079,6 @@ const PSEUDO_INPUT_MIN_ROWS: u16 = MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS;
 const OUTBOUND_STATUS_ROWS: u16 = 1;
 /// Broker-owned input messages larger than this fail before reaching the child.
 const PSEUDO_INPUT_MAX_BYTES: usize = 64 * 1024;
-/// Poll cadence for a live recent-turn reader while a message awaits consumption.
-const RECENT_TURN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Sent messages fail safe to ambiguous when no consumption proof appears in time.
 const OUTBOUND_CONSUMPTION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1214,13 +1232,34 @@ fn next_char_boundary(value: &str, cursor: usize) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundRecoveryAction {
+    Retry,
+    Discard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingOutboundRecovery {
+    message_id: u64,
+    action: OutboundRecoveryAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutboundStatus {
     Queued,
     Sending,
     Sent,
     Consumed,
     Ambiguous,
+    Retrying,
+    Discarded,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutboundBaseline {
+    identity: OutboundObservationIdentity,
+    generation: u64,
+    turn_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1230,7 +1269,8 @@ struct OutboundMessage {
     status: OutboundStatus,
     created_at: Instant,
     sent_at: Option<Instant>,
-    baseline_turn_count: Option<u64>,
+    baseline: Option<OutboundBaseline>,
+    minimum_generation: u64,
     detail: Option<String>,
 }
 
@@ -1239,6 +1279,7 @@ struct OutboundQueue {
     next_id: u64,
     messages: Vec<OutboundMessage>,
     active: Option<ActiveOutboundSend>,
+    minimum_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1264,7 +1305,8 @@ impl OutboundQueue {
             status: OutboundStatus::Queued,
             created_at: now,
             sent_at: None,
-            baseline_turn_count: None,
+            baseline: None,
+            minimum_generation: 0,
             detail: None,
         });
         id
@@ -1275,15 +1317,6 @@ impl OutboundQueue {
         self.next_id
     }
 
-    fn has_sent_or_sending(&self) -> bool {
-        self.messages.iter().any(|message| {
-            matches!(
-                message.status,
-                OutboundStatus::Sending | OutboundStatus::Sent
-            )
-        })
-    }
-
     fn has_unresolved_blocker(&self) -> bool {
         self.messages.iter().any(|message| {
             matches!(
@@ -1291,15 +1324,21 @@ impl OutboundQueue {
                 OutboundStatus::Sending
                     | OutboundStatus::Sent
                     | OutboundStatus::Ambiguous
+                    | OutboundStatus::Retrying
                     | OutboundStatus::Failed
             )
         })
     }
 
-    fn next_queued_id(&self) -> Option<u64> {
+    fn next_sendable_id(&self) -> Option<u64> {
         self.messages
             .iter()
-            .find(|message| message.status == OutboundStatus::Queued)
+            .find(|message| message.status == OutboundStatus::Retrying)
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .find(|message| message.status == OutboundStatus::Queued)
+            })
             .map(|message| message.id)
     }
 
@@ -1330,13 +1369,61 @@ impl OutboundQueue {
         changed
     }
 
-    fn mark_sending(&mut self, id: u64, baseline_turn_count: Option<u64>) -> bool {
+    fn mark_sending(&mut self, id: u64, baseline: OutboundBaseline) -> bool {
         let Some(message) = self.message_mut(id) else {
             return false;
         };
         message.status = OutboundStatus::Sending;
-        message.baseline_turn_count = baseline_turn_count;
+        message.baseline = Some(baseline);
         message.detail = None;
+        true
+    }
+
+    fn observation_needed(&self) -> bool {
+        self.messages.iter().any(|message| {
+            matches!(
+                message.status,
+                OutboundStatus::Queued
+                    | OutboundStatus::Sent
+                    | OutboundStatus::Ambiguous
+                    | OutboundStatus::Retrying
+            )
+        })
+    }
+
+    fn oldest_ambiguous_id(&self) -> Option<u64> {
+        self.messages
+            .iter()
+            .find(|message| message.status == OutboundStatus::Ambiguous)
+            .map(|message| message.id)
+    }
+
+    fn apply_recovery(
+        &mut self,
+        message_id: u64,
+        action: OutboundRecoveryAction,
+        generation_floor: u64,
+    ) -> bool {
+        if self.oldest_ambiguous_id() != Some(message_id) {
+            return false;
+        }
+        let Some(message) = self.message_mut(message_id) else {
+            return false;
+        };
+        match action {
+            OutboundRecoveryAction::Retry => {
+                message.status = OutboundStatus::Retrying;
+                message.sent_at = None;
+                message.baseline = None;
+                message.minimum_generation = generation_floor;
+                message.detail = Some("awaiting_retry_baseline".to_string());
+            }
+            OutboundRecoveryAction::Discard => {
+                message.status = OutboundStatus::Discarded;
+                message.detail = Some("operator_discarded".to_string());
+                self.minimum_generation = self.minimum_generation.max(generation_floor);
+            }
+        }
         true
     }
 
@@ -1346,121 +1433,65 @@ impl OutboundQueue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecentUserTurn {
-    ordinal: u64,
-    body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RecentTurnSnapshot {
-    user_turns: Vec<RecentUserTurn>,
-    turn_count: u64,
-    complete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-enum RecentTurnRead {
-    Available(RecentTurnSnapshot),
-    Unavailable(String),
-    Failed(String),
-}
-
-trait RecentTurnReader {
-    fn read_recent_turns(&mut self) -> RecentTurnRead;
-}
-
-struct RecentTurnPump {
-    reader: Option<Box<dyn RecentTurnReader + Send>>,
-    next_poll_at: Instant,
-    last_snapshot: Option<RecentTurnSnapshot>,
-}
-
-impl RecentTurnPump {
-    fn disabled(now: Instant) -> Self {
-        Self {
-            reader: None,
-            next_poll_at: now + RECENT_TURN_POLL_INTERVAL,
-            last_snapshot: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_reader(reader: Box<dyn RecentTurnReader + Send>, now: Instant) -> Self {
-        Self {
-            reader: Some(reader),
-            next_poll_at: now,
-            last_snapshot: None,
-        }
-    }
-
-    fn last_turn_count(&self) -> Option<u64> {
-        self.last_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.turn_count)
-    }
-
-    fn poll_if_due(&mut self, now: Instant, outbound: &mut OutboundQueue) -> bool {
-        if !outbound.has_sent_or_sending() || now < self.next_poll_at {
-            return false;
-        }
-        self.next_poll_at = now + RECENT_TURN_POLL_INTERVAL;
-        let Some(reader) = self.reader.as_mut() else {
-            return false;
-        };
-        match reader.read_recent_turns() {
-            RecentTurnRead::Available(snapshot) => {
-                let dirty = apply_recent_turn_snapshot(outbound, &snapshot, now);
-                self.last_snapshot = Some(snapshot);
-                dirty
-            }
-            RecentTurnRead::Unavailable(_) | RecentTurnRead::Failed(_) => false,
-        }
-    }
-}
-
-fn apply_recent_turn_snapshot(
+fn apply_outbound_observation(
     outbound: &mut OutboundQueue,
-    snapshot: &RecentTurnSnapshot,
+    result: &OutboundObservationResult,
     now: Instant,
 ) -> bool {
-    let _ = snapshot.complete;
+    let OutboundObservationResult::Available(observation) = result else {
+        return false;
+    };
+    if !observation.complete {
+        return false;
+    }
     let mut dirty = false;
     let sent_ids: Vec<u64> = outbound
         .messages
         .iter()
-        .filter(|message| message.status == OutboundStatus::Sent)
+        .filter(|message| {
+            matches!(
+                message.status,
+                OutboundStatus::Sent | OutboundStatus::Ambiguous
+            )
+        })
         .map(|message| message.id)
         .collect();
     for id in sent_ids {
-        dirty |= apply_recent_turn_snapshot_to_message(outbound, id, snapshot, now);
+        dirty |= apply_outbound_observation_to_message(outbound, id, observation, now);
     }
     dirty
 }
 
-fn apply_recent_turn_snapshot_to_message(
+fn apply_outbound_observation_to_message(
     outbound: &mut OutboundQueue,
     id: u64,
-    snapshot: &RecentTurnSnapshot,
+    observation: &OutboundObservation,
     now: Instant,
 ) -> bool {
     let Some(message) = outbound.message(id).cloned() else {
         return false;
     };
-    let candidates = candidate_turns_after_baseline(snapshot, message.baseline_turn_count);
+    let Some(baseline) = message.baseline.as_ref() else {
+        return false;
+    };
+    if baseline.identity != observation.identity || observation.generation < baseline.generation {
+        return false;
+    }
+    let candidates = candidate_turns_after_baseline(observation, baseline);
     if candidates.is_empty() {
         return false;
     }
     let matches = exact_matching_turn_count(&message.body, candidates.iter().copied());
     match matches {
         1 => outbound.set_status(id, OutboundStatus::Consumed, now, None),
-        0 => outbound.set_status(
-            id,
-            OutboundStatus::Ambiguous,
-            now,
-            Some("new_user_turn_did_not_match".to_string()),
-        ),
+        0 => {
+            let detail = if candidates.iter().any(|turn| turn.body.is_none()) {
+                "new_user_turn_unmatchable"
+            } else {
+                "new_user_turn_did_not_match"
+            };
+            outbound.set_status(id, OutboundStatus::Ambiguous, now, Some(detail.to_string()))
+        }
         _ => outbound.set_status(
             id,
             OutboundStatus::Ambiguous,
@@ -1470,24 +1501,28 @@ fn apply_recent_turn_snapshot_to_message(
     }
 }
 
-fn candidate_turns_after_baseline(
-    snapshot: &RecentTurnSnapshot,
-    baseline: Option<u64>,
-) -> Vec<&RecentUserTurn> {
-    snapshot
+fn candidate_turns_after_baseline<'a>(
+    observation: &'a OutboundObservation,
+    baseline: &OutboundBaseline,
+) -> Vec<&'a ObservedUserTurn> {
+    observation
         .user_turns
         .iter()
-        .filter(|turn| baseline.is_none_or(|count| turn.ordinal > count))
+        .filter(|turn| !baseline.turn_ids.contains(&turn.turn_id))
         .collect()
 }
 
 fn exact_matching_turn_count<'a>(
     body: &str,
-    turns: impl Iterator<Item = &'a RecentUserTurn>,
+    turns: impl Iterator<Item = &'a ObservedUserTurn>,
 ) -> usize {
     let wanted = normalize_message_body(body);
     turns
-        .filter(|turn| normalize_message_body(&turn.body) == wanted)
+        .filter(|turn| {
+            turn.body
+                .as_deref()
+                .is_some_and(|body| normalize_message_body(body) == wanted)
+        })
         .count()
 }
 
@@ -1574,6 +1609,9 @@ struct MonitorPane {
     cancel_request: Option<CancelRequest>,
     /// The last cancel outcome message, surfaced to the operator.
     cancel_feedback: Option<String>,
+    pending_outbound_recovery: Option<PendingOutboundRecovery>,
+    outbound_recovery_request: Option<PendingOutboundRecovery>,
+    outbound_recovery_feedback: Option<String>,
 }
 
 impl MonitorPane {
@@ -1594,6 +1632,9 @@ impl MonitorPane {
             pending_cancel: None,
             cancel_request: None,
             cancel_feedback: None,
+            pending_outbound_recovery: None,
+            outbound_recovery_request: None,
+            outbound_recovery_feedback: None,
         }
     }
 
@@ -1826,12 +1867,20 @@ impl MonitorPane {
                 self.request_cancel();
                 false
             }
-            MonitorCommand::ConfirmCancel => {
-                self.confirm_cancel();
+            MonitorCommand::RequestOutboundRetry => {
+                self.request_outbound_recovery(OutboundRecoveryAction::Retry);
                 false
             }
-            MonitorCommand::AbortCancel => {
-                self.abort_cancel();
+            MonitorCommand::RequestOutboundDiscard => {
+                self.request_outbound_recovery(OutboundRecoveryAction::Discard);
+                false
+            }
+            MonitorCommand::ConfirmAction => {
+                self.confirm_action();
+                false
+            }
+            MonitorCommand::AbortAction => {
+                self.abort_action();
                 false
             }
         }
@@ -1849,6 +1898,7 @@ impl MonitorPane {
         self.inspect.clear();
         self.last_inspect_refresh = None;
         self.pending_cancel = None;
+        self.pending_outbound_recovery = None;
     }
 
     fn selected_node(&self) -> Option<&MonitorNode> {
@@ -1864,7 +1914,17 @@ impl MonitorPane {
     /// Arm a cancel for the selected node, only when it exposes a cancel ref.
     fn request_cancel(&mut self) {
         self.cancel_feedback = None;
+        self.pending_outbound_recovery = None;
         self.pending_cancel = self.selected_cancelable_node().map(node_id);
+    }
+
+    fn request_outbound_recovery(&mut self, action: OutboundRecoveryAction) {
+        self.outbound_recovery_feedback = None;
+        self.pending_cancel = None;
+        self.pending_outbound_recovery = self
+            .outbound
+            .oldest_ambiguous_id()
+            .map(|message_id| PendingOutboundRecovery { message_id, action });
     }
 
     /// The selected node, but only when it exposes a cancel ref.
@@ -1883,17 +1943,42 @@ impl MonitorPane {
             .and_then(cancel_request_for_node);
     }
 
+    fn confirm_action(&mut self) {
+        if let Some(pending) = self.pending_outbound_recovery.take() {
+            if self.outbound.oldest_ambiguous_id() == Some(pending.message_id) {
+                self.outbound_recovery_request = Some(pending);
+            } else {
+                self.outbound_recovery_feedback = Some(format!(
+                    "message #{} is no longer ambiguous",
+                    pending.message_id
+                ));
+            }
+            return;
+        }
+        self.confirm_cancel();
+    }
+
     /// The selected node, but only when its id matches.
     fn selected_node_with_id(&self, id: &str) -> Option<&MonitorNode> {
         self.selected_node().filter(|node| node.id == id)
     }
 
-    fn abort_cancel(&mut self) {
+    fn abort_action(&mut self) {
         self.pending_cancel = None;
+        self.pending_outbound_recovery = None;
     }
 
     fn take_cancel_request(&mut self) -> Option<CancelRequest> {
         self.cancel_request.take()
+    }
+
+    fn take_outbound_recovery_request(&mut self) -> Option<PendingOutboundRecovery> {
+        self.outbound_recovery_request.take()
+    }
+
+    fn record_outbound_recovery_feedback(&mut self, message: String) {
+        self.outbound_recovery_feedback = Some(message);
+        self.pending_outbound_recovery = None;
     }
 
     fn record_cancel_feedback(&mut self, message: String) {
@@ -3143,6 +3228,8 @@ fn outbound_status_word(status: OutboundStatus) -> &'static str {
         OutboundStatus::Sent => "sent",
         OutboundStatus::Consumed => "consumed",
         OutboundStatus::Ambiguous => "ambiguous",
+        OutboundStatus::Retrying => "retrying",
+        OutboundStatus::Discarded => "discarded",
         OutboundStatus::Failed => "failed",
     }
 }
@@ -3219,13 +3306,38 @@ fn status_hint(pane: &MonitorPane, focus: Focus, overlay_constrained: bool) -> S
 
 fn bottom_status_hint(pane: &MonitorPane, overlay_constrained: bool) -> String {
     let protected_suffix = overlay_constrained.then_some("input viewport protected");
+    if let Some(pending) = pane.pending_outbound_recovery {
+        let action = match pending.action {
+            OutboundRecoveryAction::Retry => {
+                "retry may duplicate a prompt that was consumed but not observed"
+            }
+            OutboundRecoveryAction::Discard => "discard may drop a prompt that was never consumed",
+        };
+        let suffix = protected_suffix
+            .map(|suffix| format!(" · {suffix}"))
+            .unwrap_or_default();
+        return format!(
+            "confirm {action} for #{}: Ctrl+Y = confirm · Ctrl+N = abort{suffix}",
+            pending.message_id
+        );
+    }
     if pane.pending_cancel.is_some() {
         let protected_suffix = protected_suffix
             .map(|suffix| format!(" · {suffix}"))
             .unwrap_or_default();
         return format!("confirm cancel: y = SIGTERM · n = abort{protected_suffix}");
     }
-    match pane.cancel_feedback.as_deref() {
+    if let Some(message_id) = pane.outbound.oldest_ambiguous_id() {
+        let suffix = protected_suffix
+            .map(|suffix| format!(" · {suffix}"))
+            .unwrap_or_default();
+        return format!("#{message_id} ambiguous: Ctrl+P = retry · Ctrl+D = discard{suffix}");
+    }
+    match pane
+        .outbound_recovery_feedback
+        .as_deref()
+        .or(pane.cancel_feedback.as_deref())
+    {
         Some(feedback) => match protected_suffix {
             Some(suffix) => format!("{feedback} · {suffix}"),
             None => feedback.to_string(),
@@ -3902,6 +4014,7 @@ fn render_thread_panic_error() -> String {
 }
 
 /// Run the split-pane relay until the child exits, returning its exit status.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn relay_until_exit_observed(
     input_fd: RawFd,
     writer: File,
@@ -3910,6 +4023,7 @@ pub(super) fn relay_until_exit_observed(
     child: &mut Child,
     monitor: MonitorSnapshotProvider,
     root: ObservabilityRoot,
+    outbound_source: OutboundObserverSource,
 ) -> Result<ExitStatus, String> {
     let real_fd = input_fd;
     let master_fd = master.as_raw_fd();
@@ -3918,6 +4032,7 @@ pub(super) fn relay_until_exit_observed(
 
     let mut pane = MonitorPane::new();
     let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
+    let outbound_worker = OutboundObserverWorker::start(outbound_source)?;
     let initial = child_pane_winsize(real_fd, &pane, TypingProtection::for_focus(Focus::Top));
     let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
@@ -3929,7 +4044,6 @@ pub(super) fn relay_until_exit_observed(
     let mut applied: Option<(libc::winsize, u16)> = None;
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
-    let mut recent_turns = RecentTurnPump::disabled(Instant::now());
     let mut status = None;
     publish_render_snapshot(
         &publisher,
@@ -3975,12 +4089,12 @@ pub(super) fn relay_until_exit_observed(
         mark_render_dirty(
             &mut dirty,
             &mut priority,
-            pump_outbound_queue(
+            pump_outbound_queue_from_worker(
                 &mut pane,
                 &mut pending_child_input,
                 &mut line_state,
                 parser.screen().bracketed_paste(),
-                &mut recent_turns,
+                &outbound_worker,
                 Instant::now(),
             ),
             RenderPriority::Interactive,
@@ -3996,12 +4110,12 @@ pub(super) fn relay_until_exit_observed(
             mark_render_dirty(
                 &mut dirty,
                 &mut priority,
-                pump_outbound_queue(
+                pump_outbound_queue_from_worker(
                     &mut pane,
                     &mut pending_child_input,
                     &mut line_state,
                     parser.screen().bracketed_paste(),
-                    &mut recent_turns,
+                    &outbound_worker,
                     Instant::now(),
                 ),
                 RenderPriority::Interactive,
@@ -4033,18 +4147,18 @@ pub(super) fn relay_until_exit_observed(
             mark_render_dirty(
                 &mut dirty,
                 &mut priority,
-                apply_routed_to_pane(&mut pane, routed, &snapshot_worker),
+                apply_routed_to_pane(&mut pane, routed, &snapshot_worker, &outbound_worker),
                 input_priority,
             );
             mark_render_dirty(
                 &mut dirty,
                 &mut priority,
-                pump_outbound_queue(
+                pump_outbound_queue_from_worker(
                     &mut pane,
                     &mut pending_child_input,
                     &mut line_state,
                     parser.screen().bracketed_paste(),
-                    &mut recent_turns,
+                    &outbound_worker,
                     Instant::now(),
                 ),
                 RenderPriority::Interactive,
@@ -4167,6 +4281,7 @@ pub(super) fn relay_until_exit_observed(
     );
     renderer.shutdown_and_join()?;
     snapshot_worker.shutdown_and_join()?;
+    outbound_worker.shutdown_and_join()?;
     Ok(status.expect("status checked above"))
 }
 
@@ -4810,6 +4925,7 @@ fn apply_routed_to_pane(
     pane: &mut MonitorPane,
     routed: RoutedInput,
     snapshot_worker: &MonitorSnapshotWorker,
+    outbound_worker: &OutboundObserverWorker,
 ) -> bool {
     apply_routed_pseudo_input(
         pane,
@@ -4820,8 +4936,9 @@ fn apply_routed_to_pane(
     );
     let force_refresh = apply_routed_commands(pane, &routed.commands);
     let cancelled = run_pending_cancel(pane);
+    let recovered = run_pending_outbound_recovery(pane, outbound_worker);
     snapshot_worker.set_interval(pane.refresh_interval());
-    if pane_refresh_required(force_refresh, cancelled) {
+    if pane_refresh_required(force_refresh, cancelled || recovered) {
         snapshot_worker.request_refresh();
     }
     routed.redraw
@@ -4876,8 +4993,10 @@ fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
             | MonitorCommand::ToggleList
             | MonitorCommand::ToggleInspect
             | MonitorCommand::RequestCancel
-            | MonitorCommand::ConfirmCancel
-            | MonitorCommand::AbortCancel
+            | MonitorCommand::RequestOutboundRetry
+            | MonitorCommand::RequestOutboundDiscard
+            | MonitorCommand::ConfirmAction
+            | MonitorCommand::AbortAction
     )
 }
 
@@ -4907,6 +5026,27 @@ fn run_pending_cancel(pane: &mut MonitorPane) -> bool {
     let outcome = execute_cancel(&request);
     pane.record_cancel_feedback(cancel_outcome_message(&outcome));
     true
+}
+
+fn run_pending_outbound_recovery(pane: &mut MonitorPane, worker: &OutboundObserverWorker) -> bool {
+    let Some(request) = pane.take_outbound_recovery_request() else {
+        return false;
+    };
+    let generation_floor = worker.request_fresh_generation();
+    let applied =
+        pane.outbound
+            .apply_recovery(request.message_id, request.action, generation_floor);
+    let action = match request.action {
+        OutboundRecoveryAction::Retry => "retrying",
+        OutboundRecoveryAction::Discard => "discarded",
+    };
+    let feedback = if applied {
+        format!("message #{} {action}", request.message_id)
+    } else {
+        format!("message #{} is no longer ambiguous", request.message_id)
+    };
+    pane.record_outbound_recovery_feedback(feedback);
+    applied
 }
 
 /// Read child PTY output into the virtual terminal. Returns whether new output
@@ -5060,10 +5200,12 @@ fn pump_outbound_queue(
     pending_child_input: &mut PendingChildInput,
     line_state: &mut InputLineState,
     bracketed_paste: bool,
-    recent_turns: &mut RecentTurnPump,
+    observation: Option<&OutboundObservationResult>,
     now: Instant,
 ) -> bool {
-    let mut dirty = recent_turns.poll_if_due(now, &mut pane.outbound);
+    let mut dirty = observation.is_some_and(|observation| {
+        apply_outbound_observation(&mut pane.outbound, observation, now)
+    });
     dirty |= mark_outbound_timeouts(&mut pane.outbound, now);
     dirty |= advance_active_outbound_send(&mut pane.outbound, pending_child_input, line_state, now);
     dirty |= start_next_outbound_message(
@@ -5071,9 +5213,33 @@ fn pump_outbound_queue(
         pending_child_input,
         line_state,
         bracketed_paste,
-        recent_turns.last_turn_count(),
+        observation,
         now,
     );
+    dirty
+}
+
+fn pump_outbound_queue_from_worker(
+    pane: &mut MonitorPane,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    bracketed_paste: bool,
+    worker: &OutboundObserverWorker,
+    now: Instant,
+) -> bool {
+    if let Some(generation_floor) = worker.set_demand(pane.outbound.observation_needed()) {
+        pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
+    }
+    let latest = worker.latest_result();
+    let dirty = pump_outbound_queue(
+        pane,
+        pending_child_input,
+        line_state,
+        bracketed_paste,
+        latest.as_deref(),
+        now,
+    );
+    let _ = worker.set_demand(pane.outbound.observation_needed());
     dirty
 }
 
@@ -5177,19 +5343,33 @@ fn start_next_outbound_message(
     pending_child_input: &mut PendingChildInput,
     line_state: &mut InputLineState,
     bracketed_paste: bool,
-    baseline_turn_count: Option<u64>,
+    observation: Option<&OutboundObservationResult>,
     now: Instant,
 ) -> bool {
     if outbound.active.is_some()
-        || outbound.has_unresolved_blocker()
         || !pending_child_input.is_empty()
         || !line_state.is_safe_to_inject()
     {
         return false;
     }
-    let Some(id) = outbound.next_queued_id() else {
+    let Some(id) = outbound.next_sendable_id() else {
         return false;
     };
+    if outbound.has_unresolved_blocker()
+        && outbound.messages.iter().any(|message| {
+            message.id != id
+                && matches!(
+                    message.status,
+                    OutboundStatus::Sending
+                        | OutboundStatus::Sent
+                        | OutboundStatus::Ambiguous
+                        | OutboundStatus::Retrying
+                        | OutboundStatus::Failed
+                )
+        })
+    {
+        return false;
+    }
     let Some(body) = outbound.message(id).map(|message| message.body.clone()) else {
         return false;
     };
@@ -5201,16 +5381,61 @@ fn start_next_outbound_message(
             Some("oversize_message".to_string()),
         );
     }
+    let minimum_generation = outbound
+        .message(id)
+        .map(|message| message.minimum_generation)
+        .unwrap_or_default()
+        .max(outbound.minimum_generation);
+    let baseline = match observation_baseline(observation, minimum_generation) {
+        Ok(baseline) => baseline,
+        Err(detail) => {
+            return outbound.set_status(
+                id,
+                outbound
+                    .message(id)
+                    .map(|message| message.status)
+                    .unwrap_or(OutboundStatus::Queued),
+                now,
+                Some(detail),
+            );
+        }
+    };
     let child_bytes = control_payload_bytes(body.as_bytes(), bracketed_paste);
     line_state.observe_user_input(&child_bytes);
     pending_child_input.enqueue(&child_bytes);
-    outbound.mark_sending(id, baseline_turn_count);
+    outbound.mark_sending(id, baseline);
     outbound.active = Some(ActiveOutboundSend {
         message_id: id,
         phase: OutboundSendPhase::Body,
         bracketed_paste,
     });
     true
+}
+
+fn observation_baseline(
+    result: Option<&OutboundObservationResult>,
+    minimum_generation: u64,
+) -> Result<OutboundBaseline, String> {
+    match result {
+        None => Err("awaiting_outbound_observation".to_string()),
+        Some(OutboundObservationResult::Unavailable { detail, .. }) => Err(detail.clone()),
+        Some(OutboundObservationResult::Failed { detail, .. }) => {
+            Err(format!("outbound_observation_failed:{detail}"))
+        }
+        Some(OutboundObservationResult::Available(observation))
+            if observation.generation < minimum_generation =>
+        {
+            Err("awaiting_fresh_observation".to_string())
+        }
+        Some(OutboundObservationResult::Available(observation)) if !observation.complete => {
+            Err("awaiting_complete_observation".to_string())
+        }
+        Some(OutboundObservationResult::Available(observation)) => Ok(OutboundBaseline {
+            identity: observation.identity.clone(),
+            generation: observation.generation,
+            turn_ids: observation.turn_ids.clone(),
+        }),
+    }
 }
 
 fn queue_outbound_submit_delimiter(
@@ -6155,7 +6380,7 @@ mod tests {
         }
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let mut recent = RecentTurnPump::disabled(now);
+        let baseline = available_observation(1, []);
 
         assert_eq!(pane.pseudo_input.buffer, "");
         assert_eq!(pane.outbound.messages.len(), 1);
@@ -6164,7 +6389,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         ));
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
@@ -6176,7 +6401,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         ));
         assert_eq!(
@@ -6187,20 +6412,100 @@ mod tests {
     }
 
     #[test]
+    fn newly_activated_queue_rejects_an_observation_from_the_previous_demand_cycle() {
+        let now = Instant::now();
+        let mut pane = queued_pane("hello", now);
+        pane.outbound.minimum_generation = 2;
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(1, [])),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+        assert!(pending.is_empty());
+        assert_eq!(
+            pane.outbound
+                .message(1)
+                .and_then(|message| message.detail.as_deref()),
+            Some("awaiting_fresh_observation")
+        );
+
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(2, [])),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        assert_eq!(pending.pending_len(), "hello".len());
+    }
+
+    #[test]
+    fn queued_message_waits_for_complete_available_baseline_without_writing() {
+        let now = Instant::now();
+        for observation in [
+            None,
+            Some(OutboundObservationResult::Available(Box::new(
+                OutboundObservation {
+                    identity: outbound_identity(),
+                    generation: 1,
+                    complete: false,
+                    turn_count: 1,
+                    turn_ids: ["old".to_string()].into_iter().collect(),
+                    user_turns: vec![ObservedUserTurn {
+                        turn_id: "old".to_string(),
+                        body: Some("hello".to_string()),
+                    }],
+                },
+            ))),
+            Some(OutboundObservationResult::Unavailable {
+                generation: 1,
+                detail: "observation_identity_mismatch".to_string(),
+            }),
+            Some(OutboundObservationResult::Failed {
+                generation: 1,
+                detail: "host_timeout".to_string(),
+            }),
+        ] {
+            let mut pane = queued_pane("hello", now);
+            let mut pending = PendingChildInput::new();
+            let mut line_state = InputLineState::default();
+            pump_outbound_queue(
+                &mut pane,
+                &mut pending,
+                &mut line_state,
+                false,
+                observation.as_ref(),
+                now,
+            );
+            assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+            assert!(pending.is_empty());
+        }
+    }
+
+    #[test]
     fn queued_message_transitions_sending_to_sent_after_body_and_enter_drain() {
         let now = Instant::now();
         let (mut read_end, write_end) = pipe_files();
         let mut pane = queued_pane("hello", now);
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let mut recent = RecentTurnPump::disabled(now);
+        let baseline = available_observation(1, []);
 
         pump_outbound_queue(
             &mut pane,
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
@@ -6210,7 +6515,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
@@ -6221,7 +6526,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
@@ -6234,14 +6539,14 @@ mod tests {
         let mut pane = queued_pane("hello", now);
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let mut recent = RecentTurnPump::disabled(now);
+        let baseline = available_observation(1, []);
 
         pump_outbound_queue(
             &mut pane,
             &mut pending,
             &mut line_state,
             true,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
@@ -6251,7 +6556,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             true,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         assert_eq!(pending.pending_len(), 0, "submit waits for paste delay");
@@ -6261,7 +6566,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             true,
-            &mut recent,
+            Some(&baseline),
             now + CONTROL_SUBMIT_DELAY,
         );
         flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
@@ -6269,24 +6574,19 @@ mod tests {
     }
 
     #[test]
-    fn sent_message_becomes_consumed_on_exact_recent_user_turn_match() {
+    fn sent_message_becomes_consumed_on_exact_post_baseline_user_turn_match() {
         let now = Instant::now();
-        let mut pane = sent_pane("hello", Some(0), now);
+        let mut pane = sent_pane("hello", ["old"], now);
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let mut recent = RecentTurnPump::with_reader(
-            Box::new(FakeRecentTurnReader::new(vec![RecentTurnRead::Available(
-                recent_snapshot([(1, "hello")]),
-            )])),
-            now,
-        );
+        let observed = available_observation(2, [("old", Some("hello")), ("new", Some("hello"))]);
 
         assert!(pump_outbound_queue(
             &mut pane,
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&observed),
             now,
         ));
 
@@ -6296,10 +6596,17 @@ mod tests {
     #[test]
     fn duplicate_or_transformed_turns_mark_sent_message_ambiguous() {
         let now = Instant::now();
-        let mut duplicate = sent_pane("hello", Some(0), now);
-        assert!(apply_recent_turn_snapshot(
+        let mut duplicate = sent_pane("hello", ["old"], now);
+        assert!(apply_outbound_observation(
             &mut duplicate.outbound,
-            &recent_snapshot([(1, "hello"), (2, "hello")]),
+            &available_observation(
+                2,
+                [
+                    ("old", Some("hello")),
+                    ("new-1", Some("hello")),
+                    ("new-2", Some("hello")),
+                ],
+            ),
             now,
         ));
         assert_eq!(
@@ -6307,15 +6614,32 @@ mod tests {
             Some(OutboundStatus::Ambiguous)
         );
 
-        let mut transformed = sent_pane("hello", Some(0), now);
-        assert!(apply_recent_turn_snapshot(
+        let mut transformed = sent_pane("hello", ["old"], now);
+        assert!(apply_outbound_observation(
             &mut transformed.outbound,
-            &recent_snapshot([(1, "HELLO")]),
+            &available_observation(2, [("old", Some("hello")), ("new", Some("HELLO"))],),
             now,
         ));
         assert_eq!(
             transformed.outbound.status(1),
             Some(OutboundStatus::Ambiguous)
+        );
+        assert!(apply_outbound_observation(
+            &mut transformed.outbound,
+            &available_observation(
+                3,
+                [
+                    ("old", Some("hello")),
+                    ("new", Some("HELLO")),
+                    ("late", Some("hello")),
+                ],
+            ),
+            now,
+        ));
+        assert_eq!(
+            transformed.outbound.status(1),
+            Some(OutboundStatus::Consumed),
+            "late exact evidence is evaluated against the original baseline"
         );
     }
 
@@ -6324,23 +6648,137 @@ mod tests {
         let now = Instant::now();
         let mut pane = sent_pane(
             "hello",
-            Some(0),
+            [],
             now - OUTBOUND_CONSUMPTION_TIMEOUT - Duration::from_millis(1),
         );
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let mut recent = RecentTurnPump::disabled(now);
+        let unavailable = OutboundObservationResult::Unavailable {
+            generation: 2,
+            detail: "session_turn_source_unavailable".to_string(),
+        };
 
         assert!(pump_outbound_queue(
             &mut pane,
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&unavailable),
             now,
         ));
 
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Ambiguous));
+    }
+
+    #[test]
+    fn production_confirmation_timeout_does_not_permanently_block_later_messages() {
+        let now = Instant::now();
+        let mut pane = sent_pane("first", [], now);
+        pane.outbound.enqueue("second".to_string(), now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let baseline = available_observation(1, []);
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&baseline),
+            now + OUTBOUND_CONSUMPTION_TIMEOUT,
+        );
+
+        assert_eq!(
+            (pane.outbound.status(1), pane.outbound.status(2)),
+            (
+                Some(OutboundStatus::Ambiguous),
+                Some(OutboundStatus::Queued)
+            ),
+            "timeout remains fail-closed and does not forward the later message"
+        );
+        assert!(pending.is_empty(), "timeout must enqueue no second bytes");
+
+        assert!(
+            pane.outbound
+                .apply_recovery(1, OutboundRecoveryAction::Discard, 2,)
+        );
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&baseline),
+            now + OUTBOUND_CONSUMPTION_TIMEOUT,
+        );
+        assert!(!pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&baseline),
+            now + OUTBOUND_CONSUMPTION_TIMEOUT,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Discarded));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        assert!(
+            pending.is_empty(),
+            "pre-discard read cannot cross the barrier"
+        );
+
+        let fresh = available_observation(2, []);
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&fresh),
+            now + OUTBOUND_CONSUMPTION_TIMEOUT,
+        ));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
+        assert_eq!(pending.pending_len(), "second".len());
+    }
+
+    #[test]
+    fn confirmed_retry_waits_for_fresh_baseline_and_stays_ahead_of_later_items() {
+        let now = Instant::now();
+        let mut pane = sent_pane("first", [], now);
+        pane.outbound.enqueue("second".to_string(), now);
+        pane.outbound.set_status(
+            1,
+            OutboundStatus::Ambiguous,
+            now,
+            Some("consumption_timeout".to_string()),
+        );
+        assert!(
+            pane.outbound
+                .apply_recovery(1, OutboundRecoveryAction::Retry, 2,)
+        );
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(1, [])),
+            now,
+        );
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Retrying));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        assert!(pending.is_empty());
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(2, [("possibly-old", Some("first"))])),
+            now,
+        );
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
+        assert_eq!(pending.pending_len(), "first".len());
     }
 
     #[test]
@@ -6351,14 +6789,14 @@ mod tests {
         pane.outbound.enqueue("second".to_string(), now);
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
-        let mut recent = RecentTurnPump::disabled(now);
+        let baseline = available_observation(1, [("old", Some("first"))]);
 
         pump_outbound_queue(
             &mut pane,
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         drain_pending_without_pipe(&mut pending);
@@ -6367,7 +6805,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         );
         drain_pending_without_pipe(&mut pending);
@@ -6376,7 +6814,7 @@ mod tests {
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&baseline),
             now,
         );
 
@@ -6384,38 +6822,18 @@ mod tests {
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Queued));
         assert!(pending.is_empty());
 
-        apply_recent_turn_snapshot(&mut pane.outbound, &recent_snapshot([(1, "first")]), now);
+        let consumed = available_observation(2, [("old", Some("first")), ("new", Some("first"))]);
         pump_outbound_queue(
             &mut pane,
             &mut pending,
             &mut line_state,
             false,
-            &mut recent,
+            Some(&consumed),
             now,
         );
 
         assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Consumed));
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
-    }
-
-    struct FakeRecentTurnReader {
-        reads: Vec<RecentTurnRead>,
-    }
-
-    impl FakeRecentTurnReader {
-        fn new(reads: Vec<RecentTurnRead>) -> Self {
-            Self { reads }
-        }
-    }
-
-    impl RecentTurnReader for FakeRecentTurnReader {
-        fn read_recent_turns(&mut self) -> RecentTurnRead {
-            if self.reads.is_empty() {
-                RecentTurnRead::Unavailable("empty_fake_reader".to_string())
-            } else {
-                self.reads.remove(0)
-            }
-        }
     }
 
     fn queued_pane(body: &str, now: Instant) -> MonitorPane {
@@ -6424,26 +6842,59 @@ mod tests {
         pane
     }
 
-    fn sent_pane(body: &str, baseline: Option<u64>, sent_at: Instant) -> MonitorPane {
+    fn sent_pane<const N: usize>(
+        body: &str,
+        baseline_ids: [&str; N],
+        sent_at: Instant,
+    ) -> MonitorPane {
         let mut pane = queued_pane(body, sent_at);
-        pane.outbound.mark_sending(1, baseline);
+        pane.outbound.mark_sending(
+            1,
+            OutboundBaseline {
+                identity: outbound_identity(),
+                generation: 1,
+                turn_ids: baseline_ids.into_iter().map(str::to_string).collect(),
+            },
+        );
         pane.outbound
             .set_status(1, OutboundStatus::Sent, sent_at, None);
         pane
     }
 
-    fn recent_snapshot<const N: usize>(turns: [(u64, &str); N]) -> RecentTurnSnapshot {
-        RecentTurnSnapshot {
-            turn_count: turns.last().map(|(ordinal, _)| *ordinal).unwrap_or(0),
+    fn outbound_identity() -> OutboundObservationIdentity {
+        OutboundObservationIdentity {
+            invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-account".to_string(),
+            provider_instance_id: Some("fixture-instance".to_string()),
+            settings_id: "fixture-settings".to_string(),
+            provider_session_id: "fixture-session".to_string(),
+            effective_cwd: Some(std::path::PathBuf::from("/fixture")),
+        }
+    }
+
+    fn available_observation<const N: usize>(
+        generation: u64,
+        turns: [(&str, Option<&str>); N],
+    ) -> OutboundObservationResult {
+        let turn_ids = turns
+            .iter()
+            .map(|(turn_id, _)| (*turn_id).to_string())
+            .collect();
+        OutboundObservationResult::Available(Box::new(OutboundObservation {
+            identity: outbound_identity(),
+            generation,
+            complete: true,
+            turn_count: turns.len() as u64,
+            turn_ids,
             user_turns: turns
                 .into_iter()
-                .map(|(ordinal, body)| RecentUserTurn {
-                    ordinal,
-                    body: body.to_string(),
+                .map(|(turn_id, body)| ObservedUserTurn {
+                    turn_id: turn_id.to_string(),
+                    body: body.map(str::to_string),
                 })
                 .collect(),
-            complete: true,
-        }
+        }))
     }
 
     fn assert_pipe_bytes(read_end: &mut File, expected: &[u8]) {
@@ -7082,7 +7533,14 @@ mod tests {
         let relay = thread::spawn(move || {
             let mut child = child;
             let result = relay_until_exit_observed(
-                input_fd, writer, &master, None, &mut child, monitor, root,
+                input_fd,
+                writer,
+                &master,
+                None,
+                &mut child,
+                monitor,
+                root,
+                OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
             );
             done_relay.store(true, Ordering::SeqCst);
             result
@@ -7170,7 +7628,14 @@ mod tests {
         let relay = thread::spawn(move || {
             let mut child = child;
             let result = relay_until_exit_observed(
-                input_fd, writer, &master, None, &mut child, monitor, root,
+                input_fd,
+                writer,
+                &master,
+                None,
+                &mut child,
+                monitor,
+                root,
+                OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
             );
             done_relay.store(true, Ordering::SeqCst);
             result
@@ -7429,6 +7894,9 @@ mod tests {
             pending_cancel: None,
             cancel_request: None,
             cancel_feedback: None,
+            pending_outbound_recovery: None,
+            outbound_recovery_request: None,
+            outbound_recovery_feedback: None,
         }
     }
 
@@ -9082,7 +9550,7 @@ mod tests {
         let mut pane = cancel_pane();
         pane.apply(MonitorCommand::SelectNext);
         pane.apply(MonitorCommand::RequestCancel);
-        pane.apply(MonitorCommand::ConfirmCancel);
+        pane.apply(MonitorCommand::ConfirmAction);
         assert_eq!(pane.pending_cancel, None, "confirm disarms");
         assert!(
             matches!(
@@ -9098,7 +9566,7 @@ mod tests {
         let mut pane = cancel_pane();
         pane.apply(MonitorCommand::SelectNext);
         pane.apply(MonitorCommand::RequestCancel);
-        pane.apply(MonitorCommand::AbortCancel);
+        pane.apply(MonitorCommand::AbortAction);
         assert_eq!(pane.pending_cancel, None);
         assert_eq!(pane.take_cancel_request(), None);
     }
@@ -9109,7 +9577,7 @@ mod tests {
         pane.apply(MonitorCommand::SelectNext);
         pane.apply(MonitorCommand::RequestCancel);
         pane.apply(MonitorCommand::SelectPrev);
-        pane.apply(MonitorCommand::ConfirmCancel);
+        pane.apply(MonitorCommand::ConfirmAction);
         assert_eq!(
             pane.take_cancel_request(),
             None,
@@ -9127,12 +9595,96 @@ mod tests {
         );
         assert_eq!(
             router.route_input(&[0x19]).commands,
-            vec![MonitorCommand::ConfirmCancel]
+            vec![MonitorCommand::ConfirmAction]
         );
         assert_eq!(
             router.route_input(&[0x0e]).commands,
-            vec![MonitorCommand::AbortCancel]
+            vec![MonitorCommand::AbortAction]
         );
+    }
+
+    #[test]
+    fn outbound_recovery_keys_arm_confirm_abort_and_revalidate_message() {
+        let now = Instant::now();
+        let mut pane = sent_pane("first", [], now);
+        pane.outbound.set_status(
+            1,
+            OutboundStatus::Ambiguous,
+            now,
+            Some("consumption_timeout".to_string()),
+        );
+        let mut router = InputRouter::new();
+        router.focus = Focus::Bottom;
+
+        let hint = bottom_status_hint(&pane, false);
+        assert!(hint.contains("Ctrl+P = retry"), "{hint}");
+        assert!(hint.contains("Ctrl+D = discard"), "{hint}");
+
+        assert_eq!(
+            router.route_input(&[0x10]).commands,
+            vec![MonitorCommand::RequestOutboundRetry]
+        );
+        pane.apply(MonitorCommand::RequestOutboundRetry);
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Ambiguous));
+        assert_eq!(
+            pane.pending_outbound_recovery,
+            Some(PendingOutboundRecovery {
+                message_id: 1,
+                action: OutboundRecoveryAction::Retry,
+            })
+        );
+        pane.apply(MonitorCommand::AbortAction);
+        assert_eq!(pane.pending_outbound_recovery, None);
+
+        assert_eq!(
+            router.route_input(&[0x04]).commands,
+            vec![MonitorCommand::RequestOutboundDiscard]
+        );
+        pane.apply(MonitorCommand::RequestOutboundDiscard);
+        pane.apply(MonitorCommand::ConfirmAction);
+        assert_eq!(
+            pane.take_outbound_recovery_request(),
+            Some(PendingOutboundRecovery {
+                message_id: 1,
+                action: OutboundRecoveryAction::Discard,
+            })
+        );
+
+        pane.apply(MonitorCommand::RequestOutboundRetry);
+        apply_outbound_observation(
+            &mut pane.outbound,
+            &available_observation(2, [("late", Some("first"))]),
+            now,
+        );
+        pane.apply(MonitorCommand::ConfirmAction);
+        assert_eq!(pane.take_outbound_recovery_request(), None);
+        assert!(
+            pane.outbound_recovery_feedback
+                .as_deref()
+                .is_some_and(|feedback| feedback.contains("no longer ambiguous"))
+        );
+    }
+
+    #[test]
+    fn cancel_and_outbound_recovery_arming_are_mutually_exclusive() {
+        let now = Instant::now();
+        let mut pane = cancel_pane();
+        pane.outbound = sent_pane("first", [], now).outbound;
+        pane.outbound.set_status(
+            1,
+            OutboundStatus::Ambiguous,
+            now,
+            Some("consumption_timeout".to_string()),
+        );
+        pane.apply(MonitorCommand::SelectNext);
+        pane.apply(MonitorCommand::RequestCancel);
+        assert!(pane.pending_cancel.is_some());
+        pane.apply(MonitorCommand::RequestOutboundRetry);
+        assert!(pane.pending_cancel.is_none());
+        assert!(pane.pending_outbound_recovery.is_some());
+        pane.apply(MonitorCommand::RequestCancel);
+        assert!(pane.pending_outbound_recovery.is_none());
+        assert!(pane.pending_cancel.is_some());
     }
 
     fn diagnostic(code: &str, node_id: Option<&str>) -> MonitorDiagnostic {
