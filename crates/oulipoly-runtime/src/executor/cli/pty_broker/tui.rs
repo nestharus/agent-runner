@@ -6344,6 +6344,43 @@ mod tests {
     }
 
     #[test]
+    fn production_confirmation_timeout_does_not_permanently_block_later_messages() {
+        let now = Instant::now();
+        let mut pane = sent_pane("first", Some(0), now);
+        pane.outbound.enqueue("second".to_string(), now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut recent = RecentTurnPump::disabled(now);
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            &mut recent,
+            now + OUTBOUND_CONSUMPTION_TIMEOUT,
+        );
+
+        let first = pane.outbound.status(1);
+        let second = pane.outbound.status(2);
+        assert!(
+            !matches!(
+                second,
+                Some(OutboundStatus::Sending | OutboundStatus::Sent | OutboundStatus::Consumed)
+            ) || first == Some(OutboundStatus::Consumed),
+            "single-flight ordering must not advance the later message before consuming the first"
+        );
+        assert_ne!(
+            (first, second),
+            (
+                Some(OutboundStatus::Ambiguous),
+                Some(OutboundStatus::Queued)
+            ),
+            "production confirmation must not leave an unresolvable first message permanently blocking later queued messages"
+        );
+    }
+
+    #[test]
     fn single_flight_blocks_later_message_until_first_is_consumed() {
         let now = Instant::now();
         let mut pane = MonitorPane::new();
