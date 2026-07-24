@@ -1148,6 +1148,16 @@ impl Drop for SessionRuntimeIdleGuard {
             return;
         };
         if let Ok(mut db) = MailboxDb::open_default() {
+            if db
+                .accepted_delivery_attempt_windows(session_id)
+                .is_ok_and(|windows| {
+                    windows.iter().any(|window| {
+                        window.delivery_invocation_uuid.as_str() == invocation_uuid.as_str()
+                    })
+                })
+            {
+                return;
+            }
             let _ = db.mark_session_idle(SessionRuntimeIdleUpdate {
                 session_id,
                 invocation_uuid,
@@ -2096,7 +2106,24 @@ fn prepare_control_payload(
     {
         return Err("mailbox_delivery_target_mismatch".to_string());
     }
-    let bytes = if window.rows.is_empty() {
+    if window.rows.is_empty() {
+        return Ok(PreparedControlPayload {
+            bytes: Vec::new(),
+            delivery_attempt_id: None,
+        });
+    }
+    if window.acknowledged_at.is_none()
+        && db
+            .accepted_delivery_attempt_windows(&window.session_id)?
+            .into_iter()
+            .any(|owner| {
+                owner.attempt_id != attempt_id
+                    && owner.delivery_invocation_uuid == window.delivery_invocation_uuid
+            })
+    {
+        return Err("mailbox_delivery_owned".to_string());
+    }
+    let bytes = if window.acknowledged_at.is_some() {
         Vec::new()
     } else {
         render_mailbox_notification_envelope(&window.rows, window.remaining_count, &attempt_id)
@@ -2115,7 +2142,7 @@ fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), S
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("Mailbox sidecar disappeared while acknowledging delivery".to_string());
     };
-    if db.acknowledge_delivery_attempt(attempt_id)? {
+    if db.record_delivery_attempt_transport_ack(attempt_id)? {
         Ok(())
     } else {
         Err(format!(

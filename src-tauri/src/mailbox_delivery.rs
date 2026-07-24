@@ -2,8 +2,12 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
+use oulipoly_config::SessionsConfig;
+use oulipoly_runtime::sessions;
+use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxRow, SessionRuntimeRow, SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR,
+    MailboxDb, MailboxDeliveryWindow, MailboxRow, SessionRuntimeRow, SessionRuntimeUpsert,
+    mailbox_row_is_deliverable_pending,
 };
 use serde::Serialize;
 use std::path::Path;
@@ -18,8 +22,6 @@ use oulipoly_runtime::executor::cli::pty_broker::{
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
-const MAILBOX_DELIVERY_UNCONFIRMED: &str = "mailbox_delivery_unconfirmed";
-const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
@@ -31,7 +33,6 @@ pub(crate) struct PreparedMailboxDelivery {
 
 pub(crate) struct PreparedPtyMailboxDelivery {
     pub envelope: String,
-    pub seqs: Vec<i64>,
     pub attempt_id: String,
 }
 
@@ -116,6 +117,50 @@ fn attempt_pty_mailbox_delivery_inner(
             Some("running invocation missing".to_string()),
         );
     };
+    let state = match open_default_state_read_only_if_exists() {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                session_id,
+                "Failed to open state for PTY delivery reconciliation: {err}"
+            );
+            None
+        }
+    };
+    if let Err(err) = reconcile_accepted_pty_delivery_attempts(
+        mailbox,
+        state.as_ref(),
+        runtime.provider_name.as_deref(),
+        session_id,
+    ) {
+        tracing::warn!(
+            session_id,
+            "Failed to reconcile accepted PTY delivery: {err}"
+        );
+    }
+    match accepted_pty_owner(mailbox, session_id, delivery_invocation_uuid) {
+        Ok(Some(_)) => {
+            return pty_status(
+                false,
+                "awaiting_observation",
+                Some(control_path),
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                Some("accepted PTY delivery awaits provider observation".to_string()),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return pty_status(
+                false,
+                "protocol_error",
+                Some(control_path),
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                Some(err),
+            );
+        }
+    }
     let Some(prepared) =
         (match prepare_pty_mailbox_delivery(mailbox, session_id, delivery_invocation_uuid) {
             Ok(prepared) => prepared,
@@ -151,10 +196,9 @@ fn attempt_pty_mailbox_delivery_inner(
         );
     }
     match inject_control_envelope(&control_path, &prepared.envelope) {
-        Ok(response) if response.ack => mark_pty_batch_delivered(
+        Ok(response) if response.ack => mark_pty_batch_transport_accepted(
             mailbox,
             session_id,
-            &prepared.seqs,
             &prepared.attempt_id,
             control_path,
         ),
@@ -207,14 +251,11 @@ pub(crate) fn prepare_pty_mailbox_delivery(
         .delivery_attempt_window(&attempt_id)?
         .ok_or_else(|| format!("Mailbox delivery attempt {attempt_id} disappeared"))?;
     if window.rows.is_empty() {
-        db.acknowledge_delivery_attempt(&attempt_id)?;
         return Ok(None);
     }
-    let seqs = window.rows.iter().map(|row| row.seq).collect();
     let envelope = render_notification_prefix(&window.rows, window.remaining_count, &attempt_id);
     Ok(Some(PreparedPtyMailboxDelivery {
         envelope,
-        seqs,
         attempt_id,
     }))
 }
@@ -233,19 +274,18 @@ fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
 }
 
 #[cfg(unix)]
-fn mark_pty_batch_delivered(
+fn mark_pty_batch_transport_accepted(
     mailbox: &mut MailboxDb,
     session_id: &str,
-    seqs: &[i64],
     attempt_id: &str,
     control_path: String,
 ) -> PtyMailboxDeliveryDiagnostic {
-    match mailbox.acknowledge_delivery_attempt(attempt_id) {
+    match mailbox.record_delivery_attempt_transport_ack(attempt_id) {
         Ok(true) => pty_status(
             true,
             "acked",
             Some(control_path),
-            seqs.to_vec(),
+            Vec::new(),
             pending_count(mailbox, session_id),
             Some("ok".to_string()),
         ),
@@ -293,7 +333,9 @@ fn pty_client_error_status(
 }
 
 fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
-    mailbox.list_pending(session_id).map(|rows| rows.len()).ok()
+    pending_mailbox_rows(mailbox, session_id)
+        .map(|rows| rows.len())
+        .ok()
 }
 
 fn pty_status(
@@ -316,11 +358,138 @@ fn pty_status(
 }
 
 fn pty_status_implies_submit(status: &str) -> bool {
-    matches!(status, "acked" | "mark_delivered_error")
+    matches!(
+        status,
+        "acked" | "awaiting_observation" | "mark_delivered_error"
+    )
+}
+
+fn open_default_state_read_only_if_exists() -> Result<Option<StateDb>, String> {
+    let path = StateDb::default_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    StateDb::open_read_only(&path)
+        .map(Some)
+        .map_err(|err| format!("Failed to open state DB read-only: {err:?}"))
+}
+
+fn accepted_pty_owner(
+    mailbox: &MailboxDb,
+    session_id: &str,
+    invocation_uuid: &str,
+) -> Result<Option<MailboxDeliveryWindow>, String> {
+    Ok(mailbox
+        .accepted_delivery_attempt_windows(session_id)?
+        .into_iter()
+        .find(|window| window.delivery_invocation_uuid == invocation_uuid))
+}
+
+fn reconcile_accepted_pty_delivery_attempts(
+    mailbox: &mut MailboxDb,
+    state: Option<&StateDb>,
+    provider_name: Option<&str>,
+    session_id: &str,
+) -> Result<(), String> {
+    loop {
+        let windows = mailbox.accepted_delivery_attempt_windows(session_id)?;
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let provider_name = provider_name
+            .filter(|provider_name| !provider_name.is_empty())
+            .ok_or_else(|| "provider name missing for accepted PTY delivery".to_string())?;
+        let state = state.ok_or_else(|| {
+            "state DB unavailable for accepted PTY delivery reconciliation".to_string()
+        })?;
+        let mut confirmed_any = false;
+        for window in windows {
+            let marker = delivery_attempt_marker(&window.attempt_id);
+            if state.has_session_user_turn_containing(provider_name, session_id, &marker)? {
+                mailbox.confirm_delivery_attempt(&window.attempt_id)?;
+                confirmed_any = true;
+            }
+        }
+        if !confirmed_any {
+            return Ok(());
+        }
+    }
+}
+
+fn delivery_attempt_marker(attempt_id: &str) -> String {
+    format!("[OULIPOLY-DELIVERY {attempt_id}]")
+}
+
+pub(crate) fn finalize_pty_mailbox_delivery_handoff(
+    state: &StateDb,
+    sessions_cfg: &SessionsConfig,
+    provider_name: &str,
+    session_id: Option<&str>,
+    invocation_uuid: &str,
+    exit_code: i32,
+) -> Result<bool, String> {
+    let Some(session_id) = session_id else {
+        return Ok(false);
+    };
+    let Some(mut mailbox) = MailboxDb::open_default_if_exists()? else {
+        return Ok(false);
+    };
+    if accepted_pty_owner(&mailbox, session_id, invocation_uuid)?.is_none() {
+        return Ok(false);
+    }
+    if let Err(err) = reconcile_accepted_pty_delivery_attempts(
+        &mut mailbox,
+        Some(state),
+        Some(provider_name),
+        session_id,
+    ) {
+        tracing::warn!(
+            session_id,
+            provider_name,
+            "Failed final PTY delivery reconciliation: {err}"
+        );
+    }
+    if accepted_pty_owner(&mailbox, session_id, invocation_uuid)?.is_some()
+        && sessions_cfg.get(provider_name).is_some()
+    {
+        let report =
+            sessions::scan_provider_session(provider_name, sessions_cfg, state, session_id);
+        for error in report.errors {
+            tracing::warn!(
+                session_id,
+                provider_name,
+                "PTY delivery session scan failed: {error}"
+            );
+        }
+        if let Err(err) = reconcile_accepted_pty_delivery_attempts(
+            &mut mailbox,
+            Some(state),
+            Some(provider_name),
+            session_id,
+        ) {
+            tracing::warn!(
+                session_id,
+                provider_name,
+                "Failed post-scan PTY delivery reconciliation: {err}"
+            );
+        }
+    }
+    let pending_rows = pending_mailbox_rows(&mailbox, session_id)?.len();
+    drop(mailbox);
+    crate::wake_coordinator::mark_session_idle_after_turn(
+        session_id,
+        invocation_uuid,
+        Some(exit_code),
+    )?;
+    if pending_rows > 0 {
+        let _ = crate::wake_coordinator::trigger_notify_wake(session_id);
+    }
+    Ok(true)
 }
 
 fn pty_nack_status(message: &str) -> &str {
     match message {
+        "mailbox_delivery_owned" => "awaiting_observation",
         "unsafe_mid_line"
         | "unsafe_child_output_active"
         | "unsafe_foreground_process"
@@ -436,12 +605,6 @@ fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
     rows.into_iter()
         .filter(mailbox_row_is_deliverable_pending)
         .collect()
-}
-
-fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
-    row.delivery_error.as_deref() != Some(WAKE_SWEEP_ABANDONED_ERROR)
-        && (row.delivery_error.as_deref() != Some(MAILBOX_DELIVERY_UNCONFIRMED)
-            || row.delivery_attempts < MAX_UNCONFIRMED_DELIVERY_ATTEMPTS)
 }
 
 fn delivery_for_pending(

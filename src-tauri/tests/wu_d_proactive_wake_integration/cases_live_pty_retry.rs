@@ -7,7 +7,7 @@
 use crate::SESSION;
 use crate::fake_cli::notify_command;
 use crate::fixtures::Fixture;
-use crate::liveness::{delivered_rows_without_pending_or_claim, wait_for_file, wait_until};
+use crate::liveness::{wait_for_file, wait_until};
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
     assert_capture_notify_wake_busy, assert_no_wake_claim, assert_pending_handle_without_error,
@@ -46,15 +46,26 @@ pub(crate) fn live_pty_nack_pending_is_retried_by_sweep() {
 
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
-    wait_until("live PTY retry delivered", || {
-        delivered_rows_without_pending_or_claim(&fixture, SESSION, 1)
-    });
     wait_until("two PTY control requests", || control.accepted_count() == 2);
+    for _ in 0..2 {
+        let output = fixture.run_mailbox_list(SESSION);
+        assert_success(&output);
+    }
+    std::thread::sleep(Duration::from_millis(300));
 
     let payloads = control.payloads();
     assert_eq!(payloads.len(), 2, "control payloads: {payloads:?}");
     assert_payload_contains_handle(&payloads[0], "h-live-pty-retry");
     assert_payload_contains_handle(&payloads[1], "h-live-pty-retry");
+    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    assert!(rows[0].delivered_at.is_none(), "mailbox rows: {rows:?}");
+    assert_eq!(rows[0].delivery_attempts, 0, "mailbox rows: {rows:?}");
+    let accepted = fixture
+        .mailbox()
+        .accepted_delivery_attempt_windows(SESSION)
+        .unwrap();
+    assert_eq!(accepted.len(), 1, "accepted windows: {accepted:?}");
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
@@ -77,7 +88,7 @@ pub(crate) fn live_pty_acked_pending_is_submitted_once_across_repeated_sweeps() 
     let notify = notify_response(&output);
     assert_notify_pty_status(&notify, "acked");
     assert_notify_pty_submitted(&notify, true);
-    assert_pending_mailbox_count(&fixture, SESSION, 0);
+    assert_pending_mailbox_count(&fixture, SESSION, 1);
     assert_no_wake_claim(&fixture, SESSION);
 
     for _ in 0..3 {
@@ -88,8 +99,13 @@ pub(crate) fn live_pty_acked_pending_is_submitted_once_across_repeated_sweeps() 
     assert_eq!(control.accepted_count(), 1);
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert_eq!(rows.len(), 1, "mailbox rows: {rows:?}");
-    assert!(rows[0].delivered_at.is_some(), "mailbox rows: {rows:?}");
-    assert_eq!(rows[0].delivery_attempts, 1, "mailbox rows: {rows:?}");
+    assert!(rows[0].delivered_at.is_none(), "mailbox rows: {rows:?}");
+    assert_eq!(rows[0].delivery_attempts, 0, "mailbox rows: {rows:?}");
+    let accepted = fixture
+        .mailbox()
+        .accepted_delivery_attempt_windows(SESSION)
+        .unwrap();
+    assert_eq!(accepted.len(), 1, "accepted windows: {accepted:?}");
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
@@ -157,19 +173,17 @@ sleep 10"#,
     assert_notify_pty_submitted(&notify, false);
     assert_capture_notify_wake_busy(&notify);
 
-    wait_until("owner-hosted live PTY retry delivered", || {
-        delivered_rows_without_pending_or_claim(&fixture, SESSION, 1)
-    });
     wait_until("notify plus owner retry reached PTY control", || {
         control.accepted_count() == 2
     });
+    assert_pending_mailbox_count(&fixture, SESSION, 1);
 
     stop_owner(&mut owner);
     fixture.seed_mailbox(SESSION, "h-after-owner-exit");
     std::thread::sleep(Duration::from_millis(3_500));
 
     assert_eq!(control.accepted_count(), 2);
-    assert_pending_mailbox_count(&fixture, SESSION, 1);
+    assert_pending_mailbox_count(&fixture, SESSION, 2);
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
