@@ -17,8 +17,6 @@ pub(super) fn map_external_rotation_identity(
         source_session_id: resolved.active_session_id.clone(),
         target_provider: target_provider.to_string(),
         provider_instance_id: Some(format!("{}-instance", describe.provider_id)),
-        settings_id: describe
-            .settings_schema_id
-            .unwrap_or_else(|| "default-settings".to_string()),
+        settings_id: target_provider.to_string(),
     }
 }
