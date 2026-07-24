@@ -914,6 +914,7 @@ fn s7c_production_migration_service_external_failure_does_not_fail_open_to_built
     );
     fixture.assert_call_count(2);
     fixture.assert_last_request("rotation.materialize");
+    fixture.assert_materialize_request_context("manual");
 }
 
 #[test]
@@ -1246,6 +1247,25 @@ impl RuntimeFixture {
         assert!(
             record.contains(&self.resolved.chain_id),
             "record must contain chain id: {record}"
+        );
+    }
+
+    fn assert_materialize_request_context(&self, transition_reason: &str) {
+        let record = std::fs::read_to_string(&self.record_path).expect("record");
+        let request: serde_json::Value = serde_json::from_str(
+            record
+                .split_once("stdin:\n")
+                .map(|(_, stdin)| stdin)
+                .expect("recorded provider stdin"),
+        )
+        .expect("recorded provider request JSON");
+        assert_eq!(request["params"]["settings_id"], TARGET_PROVIDER);
+        assert_eq!(request["params"]["transition_reason"], transition_reason);
+        assert!(
+            request["host"]["data_root"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "rotation materialization requires a durable artifact root: {request}"
         );
     }
 

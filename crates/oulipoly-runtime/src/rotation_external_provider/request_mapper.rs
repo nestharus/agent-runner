@@ -75,7 +75,21 @@ fn request_fields(
         "chain_id".to_string(),
         Value::String(request.resolved.chain_id.clone()),
     );
+    fields.insert(
+        "transition_reason".to_string(),
+        Value::String(rotation_transition_reason(request).to_string()),
+    );
     fields
+}
+
+fn rotation_transition_reason(request: &MigrationServiceRequest<'_>) -> &'static str {
+    if request.manual_target.is_some() {
+        return "manual";
+    }
+    if request.active_exhausted {
+        return "exhausted";
+    }
+    "quota_threshold"
 }
 
 fn host_context(request: &MigrationServiceRequest<'_>) -> HostContext {
@@ -85,7 +99,9 @@ fn host_context(request: &MigrationServiceRequest<'_>) -> HostContext {
         platform: Some(std::env::consts::OS.to_string()),
         working_directory: Some(request.effective_cwd.display().to_string()),
         config_root: None,
-        data_root: None,
+        data_root: oulipoly_state::paths::data_dir()
+            .ok()
+            .map(|path| path.display().to_string()),
         env: BTreeMap::new(),
         deadline_unix_ms: None,
     }

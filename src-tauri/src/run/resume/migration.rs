@@ -25,6 +25,9 @@ pub(super) fn migrate_resume_target(
     attempts: usize,
     effective_spawn_cwd: &Path,
 ) -> Result<(), i32> {
+    if resume_notification_must_stay_bound(crate::wake_coordinator::is_auto_wake_invocation()) {
+        return Ok(());
+    }
     if validate_provider_ref_default_migration_skip(resolved, target, manual_migrate)? {
         return Ok(());
     }
@@ -39,6 +42,10 @@ pub(super) fn migrate_resume_target(
         &migration_model,
     );
     apply_resume_migration_result(env, resolved, target, migration_result)
+}
+
+fn resume_notification_must_stay_bound(is_auto_wake: bool) -> bool {
+    is_auto_wake
 }
 
 fn validate_provider_ref_default_migration_skip(
@@ -131,5 +138,16 @@ fn apply_resume_migration_result(
             formatter::emit_migration_service_failure(&err);
             Err(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_notification_must_stay_bound;
+
+    #[test]
+    fn notification_wake_stays_bound_while_manual_resume_can_migrate() {
+        assert!(resume_notification_must_stay_bound(true));
+        assert!(!resume_notification_must_stay_bound(false));
     }
 }
