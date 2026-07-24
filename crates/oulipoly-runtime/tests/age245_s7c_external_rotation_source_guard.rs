@@ -586,6 +586,13 @@ fn s7c_host_apply_transaction_rolls_back_when_open_segment_fails() {
 }
 
 #[test]
+fn s7c_external_rotation_identity_uses_target_account_as_settings_id() {
+    let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
+
+    assert_eq!(fixture.identity().settings_id, TARGET_PROVIDER);
+}
+
+#[test]
 fn s7c_host_apply_transaction_rechecks_validated_source_segment() {
     let fixture = RuntimeFixture::new("s7c-rotation-materialize-success");
     let result = fixture.materialize_result();
