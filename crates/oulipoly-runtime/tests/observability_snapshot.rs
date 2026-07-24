@@ -14,7 +14,7 @@ use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOpti
 use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
-    WakeClaimAcquireResult, WakeClaimRequest,
+    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
@@ -598,6 +598,40 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
         .unwrap();
     assert_eq!(row.kind, MonitorNodeKind::MailboxNotification);
     assert_eq!(row.status, MonitorStatus::Pending);
+}
+
+#[test]
+fn abandoned_mailbox_is_failed_and_does_not_require_wake() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let mut mailbox = fixture.open_mailbox();
+    mailbox
+        .enqueue_agent_bash_complete(&mailbox_input("handle-abandoned", SESSION_ID))
+        .unwrap();
+    assert_eq!(
+        mailbox
+            .mark_pending_abandoned(SESSION_ID, WAKE_SWEEP_ABANDONED_ERROR, 1)
+            .unwrap(),
+        1
+    );
+    drop(mailbox);
+
+    let live = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+    assert_eq!(live.summary.pending_mailbox_count, 0);
+    assert!(!has_diagnostic(&live, "wake-needed:no-runtime"));
+    assert!(find_node(&live, "mailbox:session-observe:1").is_none());
+
+    let full = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+    let row = node(&full, "mailbox:session-observe:1");
+    assert_eq!(row.status, MonitorStatus::Failed);
+    assert_eq!(
+        row.mailbox.as_ref().unwrap().delivery_error.as_deref(),
+        Some(WAKE_SWEEP_ABANDONED_ERROR)
+    );
 }
 
 #[test]

@@ -17,7 +17,8 @@ use crate::observability::liveness::{
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::storage_diagnostic;
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxRow, SessionRuntimeReadOnlyLiveness, SessionRuntimeRow, WakeClaimRow,
+    MailboxDb, MailboxRow, SessionRuntimeReadOnlyLiveness, SessionRuntimeRow,
+    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
 };
 use oulipoly_state::pid_identity::PidIdentityDb;
 use std::collections::HashSet;
@@ -550,6 +551,8 @@ fn session_status(
 fn mailbox_status(row: &MailboxRow) -> MonitorStatus {
     if row.delivered_at.is_some() {
         MonitorStatus::Delivered
+    } else if row.delivery_error.as_deref() == Some(WAKE_SWEEP_ABANDONED_ERROR) {
+        MonitorStatus::Failed
     } else {
         MonitorStatus::Pending
     }
@@ -572,7 +575,9 @@ fn wake_status(
 }
 
 fn pending_count(rows: &[MailboxRow]) -> usize {
-    rows.iter().filter(|row| row.delivered_at.is_none()).count()
+    rows.iter()
+        .filter(|row| mailbox_status(row) == MonitorStatus::Pending)
+        .count()
 }
 
 fn wake_diagnostic(code: &str, message: &str, node_id: Option<String>) -> MonitorDiagnostic {
