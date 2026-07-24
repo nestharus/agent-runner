@@ -1434,6 +1434,10 @@ fn fixture_provider_gated_after_notification(
         format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
+# Registry capability probes are not headless provider launches.
+if [ "${{1-}}" = "describe" ]; then
+  exit 3
+fi
 if test -t 0; then
   printf 'interactive\n' >> {launches}
 else
