@@ -1754,19 +1754,23 @@ impl Default for InputLineState {
 }
 
 impl InputLineState {
-    fn observe_user_input(&mut self, bytes: &[u8]) {
+    fn observe_user_input(&mut self, bytes: &[u8]) -> bool {
         if no_user_input(bytes) {
-            return;
+            return false;
         }
         self.last_submit_trace = None;
         let now = Instant::now();
         let mut saw_line_affecting_input = false;
+        let mut reached_line_boundary = false;
         for byte in bytes.iter().copied() {
-            saw_line_affecting_input |= self.observe_user_input_byte(byte);
+            let line_affecting = self.observe_user_input_byte(byte);
+            saw_line_affecting_input |= line_affecting;
+            reached_line_boundary |= line_affecting && self.input_empty();
         }
         if saw_line_affecting_input {
             self.last_user_input_at = Some(now);
         }
+        reached_line_boundary
     }
 
     fn observe_user_input_byte(&mut self, byte: u8) -> bool {

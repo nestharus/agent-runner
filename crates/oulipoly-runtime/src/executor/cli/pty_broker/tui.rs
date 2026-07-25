@@ -1293,6 +1293,61 @@ enum OutboundSendPhase {
     Submit,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum OutboundReleaseState {
+    #[default]
+    Ready,
+    // An Enter-like byte is only a parsed boundary after the child consumes it.
+    UserBoundaryPendingWrite,
+    AwaitingChildOutput,
+}
+
+#[derive(Debug, Default)]
+struct OutboundReleaseGate {
+    state: OutboundReleaseState,
+    last_child_output_at: Option<Instant>,
+}
+
+impl OutboundReleaseGate {
+    fn observe_user_input(&mut self, reached_line_boundary: bool) {
+        if reached_line_boundary {
+            self.state = OutboundReleaseState::UserBoundaryPendingWrite;
+        }
+    }
+
+    fn observe_pending_write_drained(&mut self, pending_empty: bool) {
+        if pending_empty && self.state == OutboundReleaseState::UserBoundaryPendingWrite {
+            self.state = OutboundReleaseState::AwaitingChildOutput;
+        }
+    }
+
+    fn awaiting_child_output(&self) -> bool {
+        self.state == OutboundReleaseState::AwaitingChildOutput
+    }
+
+    fn observe_child_output(&mut self, acknowledges_boundary: bool, now: Instant) {
+        self.last_child_output_at = Some(now);
+        if acknowledges_boundary && self.awaiting_child_output() {
+            self.state = OutboundReleaseState::Ready;
+        }
+    }
+
+    fn blocking_detail(&self, now: Instant) -> Option<&'static str> {
+        match self.state {
+            OutboundReleaseState::UserBoundaryPendingWrite => Some("awaiting_user_boundary_write"),
+            OutboundReleaseState::AwaitingChildOutput => Some("awaiting_user_boundary_output"),
+            OutboundReleaseState::Ready
+                if self.last_child_output_at.is_some_and(|last| {
+                    now.saturating_duration_since(last) < super::INJECT_CHILD_OUTPUT_DEBOUNCE
+                }) =>
+            {
+                Some("awaiting_child_output_quiescence")
+            }
+            OutboundReleaseState::Ready => None,
+        }
+    }
+}
+
 impl OutboundQueue {
     fn enqueue(&mut self, body: String) -> u64 {
         let id = self.next_message_id();
@@ -3974,6 +4029,7 @@ pub(super) fn relay_until_exit_observed(
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
     let mut deferred_child_input = PendingChildInput::new();
+    let mut outbound_release_gate = OutboundReleaseGate::default();
     let mut status = None;
     publish_render_snapshot(
         &publisher,
@@ -4006,6 +4062,7 @@ pub(super) fn relay_until_exit_observed(
             &mut line_state,
             &mut pending_child_input,
             &mut deferred_child_input,
+            &mut outbound_release_gate,
         );
         let mut protection = typing_protection(router.focus, &line_state);
         mark_render_dirty(
@@ -4029,12 +4086,14 @@ pub(super) fn relay_until_exit_observed(
                 &mut pane,
                 &mut pending_child_input,
                 &mut line_state,
+                &outbound_release_gate,
                 parser.screen().bracketed_paste(),
                 &outbound_worker,
                 Instant::now(),
             ),
             RenderPriority::Interactive,
         );
+        let release_gate_was_awaiting_output = outbound_release_gate.awaiting_child_output();
         let ready = poll_relay_fds(
             real_fd,
             master_fd,
@@ -4043,6 +4102,7 @@ pub(super) fn relay_until_exit_observed(
         )?;
         if ready.pty_writable {
             flush_pending_child_input(master_fd, &mut pending_child_input)?;
+            outbound_release_gate.observe_pending_write_drained(pending_child_input.is_empty());
             mark_render_dirty(
                 &mut dirty,
                 &mut priority,
@@ -4050,6 +4110,7 @@ pub(super) fn relay_until_exit_observed(
                     &mut pane,
                     &mut pending_child_input,
                     &mut line_state,
+                    &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
                     Instant::now(),
@@ -4066,6 +4127,7 @@ pub(super) fn relay_until_exit_observed(
                 line_state: &mut line_state,
                 pending_child_input: &mut pending_child_input,
                 deferred_child_input: &mut deferred_child_input,
+                outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
             };
             let mut routed = forward_real_input(&mut input_io)?;
@@ -4095,6 +4157,7 @@ pub(super) fn relay_until_exit_observed(
                     &mut pane,
                     &mut pending_child_input,
                     &mut line_state,
+                    &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
                     Instant::now(),
@@ -4135,6 +4198,7 @@ pub(super) fn relay_until_exit_observed(
                     line_state: &mut line_state,
                     pending_child_input: &mut pending_child_input,
                     deferred_child_input: &mut deferred_child_input,
+                    outbound_release_gate: &mut outbound_release_gate,
                     outbound_active: pane.outbound.active.is_some(),
                 };
                 mark_render_dirty(
@@ -4153,6 +4217,8 @@ pub(super) fn relay_until_exit_observed(
         }
         if ready.pty_output && pump_pty_output_burst(master_fd, &mut parser, &mut buffer)? {
             child_output_state.observe_child_output();
+            outbound_release_gate
+                .observe_child_output(release_gate_was_awaiting_output, Instant::now());
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
         if ready.control
@@ -4168,6 +4234,7 @@ pub(super) fn relay_until_exit_observed(
                 child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
                 deferred_child_input: &mut deferred_child_input,
+                outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
                 child_pid: Some(child.id()),
             };
@@ -4332,6 +4399,7 @@ struct RealInputForwardIo<'a> {
     line_state: &'a mut InputLineState,
     pending_child_input: &'a mut PendingChildInput,
     deferred_child_input: &'a mut PendingChildInput,
+    outbound_release_gate: &'a mut OutboundReleaseGate,
     buffer: &'a mut [u8],
 }
 
@@ -4353,6 +4421,7 @@ fn forward_real_input(io: &mut RealInputForwardIo<'_>) -> Result<RoutedInput, St
                 io.line_state,
                 io.pending_child_input,
                 io.deferred_child_input,
+                io.outbound_release_gate,
                 io.pane.outbound.active.is_some(),
                 &routed,
             );
@@ -4696,6 +4765,7 @@ struct MouseActionIo<'a> {
     line_state: &'a mut InputLineState,
     pending_child_input: &'a mut PendingChildInput,
     deferred_child_input: &'a mut PendingChildInput,
+    outbound_release_gate: &'a mut OutboundReleaseGate,
     outbound_active: bool,
 }
 
@@ -4730,6 +4800,7 @@ fn handle_top_right_click(
             io.line_state,
             io.pending_child_input,
             io.deferred_child_input,
+            io.outbound_release_gate,
             io.outbound_active,
             io.clipboard,
         );
@@ -4743,6 +4814,7 @@ fn inject_clipboard_paste(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
     deferred_child_input: &mut PendingChildInput,
+    outbound_release_gate: &mut OutboundReleaseGate,
     outbound_active: bool,
     text: &str,
 ) {
@@ -4754,6 +4826,7 @@ fn inject_clipboard_paste(
         line_state,
         pending_child_input,
         deferred_child_input,
+        outbound_release_gate,
         outbound_active,
         &bytes,
     );
@@ -4875,6 +4948,7 @@ fn enqueue_routed_child_input(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
     deferred_child_input: &mut PendingChildInput,
+    outbound_release_gate: &mut OutboundReleaseGate,
     outbound_active: bool,
     routed: &RoutedInput,
 ) {
@@ -4886,6 +4960,7 @@ fn enqueue_routed_child_input(
         line_state,
         pending_child_input,
         deferred_child_input,
+        outbound_release_gate,
         outbound_active,
         &child_bytes,
     );
@@ -4895,6 +4970,7 @@ fn enqueue_user_child_input(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
     deferred_child_input: &mut PendingChildInput,
+    outbound_release_gate: &mut OutboundReleaseGate,
     outbound_active: bool,
     bytes: &[u8],
 ) {
@@ -4902,7 +4978,8 @@ fn enqueue_user_child_input(
         deferred_child_input.enqueue(bytes);
         return;
     }
-    line_state.observe_user_input(bytes);
+    let reached_line_boundary = line_state.observe_user_input(bytes);
+    outbound_release_gate.observe_user_input(reached_line_boundary);
     pending_child_input.enqueue(bytes);
 }
 
@@ -4911,12 +4988,14 @@ fn release_deferred_child_input(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
     deferred_child_input: &mut PendingChildInput,
+    outbound_release_gate: &mut OutboundReleaseGate,
 ) {
     if outbound_active || !pending_child_input.is_empty() || deferred_child_input.is_empty() {
         return;
     }
     let bytes = deferred_child_input.take_pending();
-    line_state.observe_user_input(&bytes);
+    let reached_line_boundary = line_state.observe_user_input(&bytes);
+    outbound_release_gate.observe_user_input(reached_line_boundary);
     pending_child_input.enqueue(&bytes);
 }
 
@@ -5195,10 +5274,11 @@ fn publish_render_snapshot(
     ));
 }
 
-fn pump_outbound_queue(
+fn pump_outbound_queue_with_gate(
     pane: &mut MonitorPane,
     pending_child_input: &mut PendingChildInput,
     line_state: &mut InputLineState,
+    release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     observation: Option<&OutboundObservationResult>,
     now: Instant,
@@ -5212,6 +5292,7 @@ fn pump_outbound_queue(
         &mut pane.outbound,
         pending_child_input,
         line_state,
+        release_gate,
         bracketed_paste,
         observation,
         now,
@@ -5219,10 +5300,31 @@ fn pump_outbound_queue(
     dirty
 }
 
+#[cfg(test)]
+fn pump_outbound_queue(
+    pane: &mut MonitorPane,
+    pending_child_input: &mut PendingChildInput,
+    line_state: &mut InputLineState,
+    bracketed_paste: bool,
+    observation: Option<&OutboundObservationResult>,
+    now: Instant,
+) -> bool {
+    pump_outbound_queue_with_gate(
+        pane,
+        pending_child_input,
+        line_state,
+        &OutboundReleaseGate::default(),
+        bracketed_paste,
+        observation,
+        now,
+    )
+}
+
 fn pump_outbound_queue_from_worker(
     pane: &mut MonitorPane,
     pending_child_input: &mut PendingChildInput,
     line_state: &mut InputLineState,
+    release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     worker: &OutboundObserverWorker,
     now: Instant,
@@ -5231,10 +5333,11 @@ fn pump_outbound_queue_from_worker(
         pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
     }
     let latest = worker.latest_result();
-    let dirty = pump_outbound_queue(
+    let dirty = pump_outbound_queue_with_gate(
         pane,
         pending_child_input,
         line_state,
+        release_gate,
         bracketed_paste,
         latest.as_deref(),
         now,
@@ -5342,6 +5445,7 @@ fn start_next_outbound_message(
     outbound: &mut OutboundQueue,
     pending_child_input: &mut PendingChildInput,
     line_state: &mut InputLineState,
+    release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     observation: Option<&OutboundObservationResult>,
     now: Instant,
@@ -5361,6 +5465,17 @@ fn start_next_outbound_message(
                 .unwrap_or(OutboundStatus::Queued),
             now,
             Some("awaiting_line_boundary".to_string()),
+        );
+    }
+    if let Some(detail) = release_gate.blocking_detail(now) {
+        return outbound.set_status(
+            id,
+            outbound
+                .message(id)
+                .map(|message| message.status)
+                .unwrap_or(OutboundStatus::Queued),
+            now,
+            Some(detail.to_string()),
         );
     }
     if outbound.has_unresolved_blocker()
@@ -5475,6 +5590,7 @@ struct ControlInjectionIo<'a> {
     child_output_state: &'a mut ChildOutputState,
     pending_child_input: &'a mut PendingChildInput,
     deferred_child_input: &'a mut PendingChildInput,
+    outbound_release_gate: &'a mut OutboundReleaseGate,
     buffer: &'a mut [u8],
     child_pid: Option<u32>,
 }
@@ -5592,6 +5708,8 @@ fn drain_control_payload_body(io: &mut ControlInjectionIo<'_>) -> Result<(), Str
         if ready.pty_output {
             if pump_pty_output(io.master_fd, io.parser, io.buffer)? {
                 io.child_output_state.observe_child_output();
+                io.outbound_release_gate
+                    .observe_child_output(false, Instant::now());
             } else {
                 return Err("control_submit_pty_closed".to_string());
             }
@@ -5657,6 +5775,7 @@ fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), Stri
         io.line_state,
         io.child_output_state,
         io.pending_child_input,
+        io.outbound_release_gate,
     ) {
         pump_inject_wait_io(io)?;
     }
@@ -5666,6 +5785,7 @@ fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), Stri
         io.line_state,
         io.child_output_state,
         io.pending_child_input,
+        io.outbound_release_gate,
     )
 }
 
@@ -5676,6 +5796,7 @@ fn injection_wait_should_pump(
     line_state: &InputLineState,
     child_output_state: &ChildOutputState,
     pending_child_input: &PendingChildInput,
+    outbound_release_gate: &OutboundReleaseGate,
 ) -> bool {
     inject_wait_remaining(start)
         && !safe_to_inject_now(
@@ -5684,6 +5805,7 @@ fn injection_wait_should_pump(
             line_state,
             child_output_state,
             pending_child_input,
+            outbound_release_gate,
         )
 }
 
@@ -5697,8 +5819,12 @@ fn safe_to_inject_now(
     line_state: &InputLineState,
     child_output_state: &ChildOutputState,
     pending_child_input: &PendingChildInput,
+    outbound_release_gate: &OutboundReleaseGate,
 ) -> bool {
     pending_child_input.is_empty()
+        && outbound_release_gate
+            .blocking_detail(Instant::now())
+            .is_none()
         && super::safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok()
 }
 
@@ -5708,9 +5834,13 @@ fn validate_safe_to_inject(
     line_state: &InputLineState,
     child_output_state: &ChildOutputState,
     pending_child_input: &PendingChildInput,
+    outbound_release_gate: &OutboundReleaseGate,
 ) -> Result<(), String> {
     if !pending_child_input.is_empty() {
         return Err(unsafe_mid_line_error());
+    }
+    if let Some(detail) = outbound_release_gate.blocking_detail(Instant::now()) {
+        return Err(detail.to_string());
     }
     if super::safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok() {
         Ok(())
@@ -5725,6 +5855,7 @@ fn validate_safe_to_inject(
 }
 
 fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
+    let release_gate_was_awaiting_output = io.outbound_release_gate.awaiting_child_output();
     let ready = poll_relay_fds(
         io.real_fd,
         io.master_fd,
@@ -5733,6 +5864,8 @@ fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     )?;
     if ready.pty_writable {
         flush_pending_child_input(io.master_fd, io.pending_child_input)?;
+        io.outbound_release_gate
+            .observe_pending_write_drained(io.pending_child_input.is_empty());
     }
     if ready.real_input {
         let mut input_io = RealInputForwardIo {
@@ -5743,12 +5876,15 @@ fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
             line_state: io.line_state,
             pending_child_input: io.pending_child_input,
             deferred_child_input: io.deferred_child_input,
+            outbound_release_gate: io.outbound_release_gate,
             buffer: io.buffer,
         };
         forward_real_input(&mut input_io)?;
     }
     if ready.pty_output && pump_pty_output(io.master_fd, io.parser, io.buffer)? {
         io.child_output_state.observe_child_output();
+        io.outbound_release_gate
+            .observe_child_output(release_gate_was_awaiting_output, Instant::now());
     }
     Ok(())
 }
@@ -6339,6 +6475,7 @@ mod tests {
         let mut child_output_state = ChildOutputState::default();
         let mut pending_child_input = PendingChildInput::new();
         let mut deferred_child_input = PendingChildInput::new();
+        let mut outbound_release_gate = OutboundReleaseGate::default();
         let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
         let mut io = ControlInjectionIo {
             real_fd: read_end.as_raw_fd(),
@@ -6350,6 +6487,7 @@ mod tests {
             child_output_state: &mut child_output_state,
             pending_child_input: &mut pending_child_input,
             deferred_child_input: &mut deferred_child_input,
+            outbound_release_gate: &mut outbound_release_gate,
             buffer: &mut buffer,
             child_pid: None,
         };
@@ -6558,6 +6696,94 @@ mod tests {
     }
 
     #[test]
+    fn queued_message_waits_for_post_submit_child_output_boundary() {
+        let now = Instant::now();
+        let (mut read_end, write_end) = pipe_files();
+        let mut pane = queued_pane("overlay", now);
+        let mut pending = PendingChildInput::new();
+        let mut deferred = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let mut release_gate = OutboundReleaseGate::default();
+        let baseline = available_observation(1, []);
+
+        line_state.observe_user_input(b"ordinary draft");
+        let submit = RoutedInput {
+            forward: b"\r".to_vec(),
+            ..Default::default()
+        };
+        enqueue_routed_child_input(
+            &mut line_state,
+            &mut pending,
+            &mut deferred,
+            &mut release_gate,
+            false,
+            &submit,
+        );
+        assert!(line_state.input_empty());
+        assert_eq!(pending.pending_len(), 1);
+
+        assert!(!pump_outbound_queue_with_gate(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            &release_gate,
+            false,
+            Some(&baseline),
+            now,
+        ));
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        release_gate.observe_pending_write_drained(pending.is_empty());
+        assert_pipe_bytes(&mut read_end, b"\r");
+
+        assert!(pump_outbound_queue_with_gate(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            &release_gate,
+            false,
+            Some(&baseline),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+        assert_eq!(
+            pane.outbound
+                .message(1)
+                .and_then(|message| message.detail.as_deref()),
+            Some("awaiting_user_boundary_output")
+        );
+
+        release_gate.observe_child_output(true, now);
+        assert!(pump_outbound_queue_with_gate(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            &release_gate,
+            false,
+            Some(&baseline),
+            now,
+        ));
+        assert_eq!(
+            pane.outbound
+                .message(1)
+                .and_then(|message| message.detail.as_deref()),
+            Some("awaiting_child_output_quiescence")
+        );
+        assert!(pending.is_empty());
+
+        assert!(pump_outbound_queue_with_gate(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            &release_gate,
+            false,
+            Some(&baseline),
+            now + super::super::INJECT_CHILD_OUTPUT_DEBOUNCE + Duration::from_millis(1),
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        assert_eq!(pending.pending_len(), "overlay".len());
+    }
+
+    #[test]
     fn queued_message_transitions_sending_to_sent_after_body_and_enter_drain() {
         let now = Instant::now();
         let (mut read_end, write_end) = pipe_files();
@@ -6647,6 +6873,7 @@ mod tests {
         let mut pending = PendingChildInput::new();
         let mut deferred = PendingChildInput::new();
         let mut line_state = InputLineState::default();
+        let mut outbound_release_gate = OutboundReleaseGate::default();
         let baseline = available_observation(1, []);
 
         pump_outbound_queue(
@@ -6676,6 +6903,7 @@ mod tests {
             &mut line_state,
             &mut pending,
             &mut deferred,
+            &mut outbound_release_gate,
             pane.outbound.active.is_some(),
             &routed,
         );
@@ -6707,6 +6935,7 @@ mod tests {
             &mut line_state,
             &mut pending,
             &mut deferred,
+            &mut outbound_release_gate,
         );
         flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
         assert_pipe_bytes(&mut read_end, b"ordinary");

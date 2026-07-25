@@ -69,7 +69,7 @@ fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
 }
 
 #[test]
-fn production_observed_relay_confirms_provider_turn_before_second_overlay_send() {
+fn production_observed_relay_separates_idle_draft_from_queued_overlay() {
     let dir = tempfile::tempdir().unwrap();
     let events = dir.path().join("events.log");
     let state = dir.path().join("observer-state");
@@ -90,7 +90,15 @@ fn production_observed_relay_confirms_provider_turn_before_second_overlay_send()
     );
 
     let output = read_until_bytes(pty.master.as_raw_fd(), "OBS", Duration::from_secs(5));
-    write_all_fd(pty.master.as_raw_fd(), b"\x1b[<0;1;32Mfirst\rsecond\r").unwrap();
+    write_all_fd(pty.master.as_raw_fd(), b"first").unwrap();
+    std::thread::sleep(Duration::from_millis(1_700));
+    write_all_fd(pty.master.as_raw_fd(), b"\x1b[<0;1;32Msecond\r").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !fs::read_to_string(&events).unwrap().contains("child:"),
+        "queued overlay reached the child before the ordinary draft was submitted"
+    );
+    write_all_fd(pty.master.as_raw_fd(), b"\x1b[<0;1;1M\r").unwrap();
     let output = read_until_bytes_with_prefix(
         pty.master.as_raw_fd(),
         output,
@@ -467,6 +475,7 @@ for line in sys.stdin:
         handle.write("child:" + line + "\n")
     if line == "first":
         state.write_text("new")
+        print("READY-FOR-NEXT", flush=True)
     if line == "second":
         raise SystemExit(0)
 raise SystemExit(9)
