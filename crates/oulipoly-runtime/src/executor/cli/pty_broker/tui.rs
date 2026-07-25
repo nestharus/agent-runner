@@ -74,7 +74,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Rows reserved for the always-visible overlay at the bottom of the screen.
-const COLLAPSED_MONITOR_ROWS: u16 = STATUS_ROW_ROWS + PSEUDO_INPUT_MIN_ROWS + OUTBOUND_STATUS_ROWS;
+const COLLAPSED_MONITOR_ROWS: u16 = STATUS_ROW_ROWS + PSEUDO_INPUT_MIN_ROWS;
 /// Rows reserved for the overlay/status bar.
 const STATUS_ROW_ROWS: u16 = 1;
 /// Minimum terminal rows for the split to be usable.
@@ -1075,8 +1075,6 @@ const DEFAULT_PSEUDO_INPUT_WIDTH: u16 = 80;
 const PSEUDO_INPUT_HELP_ROWS: u16 = 0;
 /// Minimum rows reserved by the pseudo input.
 const PSEUDO_INPUT_MIN_ROWS: u16 = MIN_INPUT_ROWS + PSEUDO_INPUT_HELP_ROWS;
-/// Rows reserved below the pseudo input for outbound message state.
-const OUTBOUND_STATUS_ROWS: u16 = 1;
 /// Broker-owned input messages larger than this fail before reaching the child.
 const PSEUDO_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// Sent messages fail safe to ambiguous when no consumption proof appears in time.
@@ -1267,7 +1265,6 @@ struct OutboundMessage {
     id: u64,
     body: String,
     status: OutboundStatus,
-    created_at: Instant,
     sent_at: Option<Instant>,
     baseline: Option<OutboundBaseline>,
     minimum_generation: u64,
@@ -1297,13 +1294,12 @@ enum OutboundSendPhase {
 }
 
 impl OutboundQueue {
-    fn enqueue(&mut self, body: String, now: Instant) -> u64 {
+    fn enqueue(&mut self, body: String) -> u64 {
         let id = self.next_message_id();
         self.messages.push(OutboundMessage {
             id,
             body,
             status: OutboundStatus::Queued,
-            created_at: now,
             sent_at: None,
             baseline: None,
             minimum_generation: 0,
@@ -1641,7 +1637,7 @@ impl MonitorPane {
     /// Rows the monitor occupies at the bottom for the given full terminal height.
     fn bottom_rows(&self, full_rows: u16, full_cols: u16, protection: TypingProtection) -> u16 {
         let desired_input_rows = self.pseudo_input.desired_rows(full_cols);
-        let desired_input_bottom = STATUS_ROW_ROWS + desired_input_rows + OUTBOUND_STATUS_ROWS;
+        let desired_input_bottom = STATUS_ROW_ROWS + desired_input_rows;
         let protected_ceiling = full_rows.saturating_sub(protection.top_min_rows());
         let minimum_bottom = COLLAPSED_MONITOR_ROWS.min(full_rows);
         let ceiling = if protected_ceiling >= minimum_bottom {
@@ -1886,9 +1882,9 @@ impl MonitorPane {
         }
     }
 
-    fn apply_pseudo_input(&mut self, action: PseudoInputAction, width: u16, now: Instant) {
+    fn apply_pseudo_input(&mut self, action: PseudoInputAction, width: u16) {
         if let Some(body) = self.pseudo_input.apply(action, width) {
-            self.outbound.enqueue(body, now);
+            self.outbound.enqueue(body);
         }
     }
 
@@ -2806,7 +2802,6 @@ fn render_monitor(
     let layout = expanded_bottom_layout(area, pane);
     render_pseudo_input(buf, layout.input, pane, focus);
     render_status_row(buf, layout.status, pane, focus, overlay_constrained);
-    render_outbound_status(buf, layout.outbound, pane);
     if !pane.collapsed {
         render_monitor_body(buf, layout.content, pane);
     }
@@ -2817,19 +2812,15 @@ struct ExpandedBottomLayout {
     status: Rect,
     content: Rect,
     input: Rect,
-    outbound: Rect,
 }
 
 fn expanded_bottom_layout(area: Rect, pane: &MonitorPane) -> ExpandedBottomLayout {
     let status_rows = STATUS_ROW_ROWS.min(area.height);
-    let outbound_rows = OUTBOUND_STATUS_ROWS.min(area.height.saturating_sub(status_rows));
     let input_rows = pane
         .pseudo_input
         .desired_rows(area.width)
-        .min(area.height.saturating_sub(status_rows + outbound_rows));
-    let content_rows = area
-        .height
-        .saturating_sub(input_rows + status_rows + outbound_rows);
+        .min(area.height.saturating_sub(status_rows));
+    let content_rows = area.height.saturating_sub(input_rows + status_rows);
     ExpandedBottomLayout {
         input: Rect {
             height: input_rows,
@@ -2840,13 +2831,8 @@ fn expanded_bottom_layout(area: Rect, pane: &MonitorPane) -> ExpandedBottomLayou
             height: status_rows,
             ..area
         },
-        outbound: Rect {
-            y: area.y + input_rows + status_rows,
-            height: outbound_rows,
-            ..area
-        },
         content: Rect {
-            y: area.y + input_rows + status_rows + outbound_rows,
+            y: area.y + input_rows + status_rows,
             height: content_rows,
             ..area
         },
@@ -3175,63 +3161,6 @@ fn byte_index_for_line_col(buffer: &str, line_index: usize, col: usize) -> usize
     };
     let line = &buffer[span.start_byte..span.start_byte + span.byte_len];
     span.start_byte + byte_index_for_char_col(line, col.min(span.char_len))
-}
-
-fn render_outbound_status(buf: &mut Buffer, area: Rect, pane: &MonitorPane) {
-    if area.height == 0 {
-        return;
-    }
-    buf.set_string(
-        area.x,
-        area.y,
-        pad_to_width(outbound_summary_text(&pane.outbound), area.width),
-        Style::default().fg(Color::Cyan).bg(Color::Indexed(234)),
-    );
-}
-
-fn outbound_summary_text(outbound: &OutboundQueue) -> String {
-    let visible: Vec<String> = outbound
-        .messages
-        .iter()
-        .rev()
-        .take(4)
-        .rev()
-        .map(format_outbound_message_summary)
-        .collect();
-    if visible.is_empty() {
-        " outbound: idle".to_string()
-    } else {
-        format!(" outbound: {}", visible.join(" · "))
-    }
-}
-
-fn format_outbound_message_summary(message: &OutboundMessage) -> String {
-    let age = message.created_at.elapsed().as_secs();
-    match message.detail.as_deref() {
-        Some(detail) => format!(
-            "#{} {} {age}s ({detail})",
-            message.id,
-            outbound_status_word(message.status)
-        ),
-        None => format!(
-            "#{} {} {age}s",
-            message.id,
-            outbound_status_word(message.status)
-        ),
-    }
-}
-
-fn outbound_status_word(status: OutboundStatus) -> &'static str {
-    match status {
-        OutboundStatus::Queued => "queued",
-        OutboundStatus::Sending => "sending",
-        OutboundStatus::Sent => "sent",
-        OutboundStatus::Consumed => "consumed",
-        OutboundStatus::Ambiguous => "ambiguous",
-        OutboundStatus::Retrying => "retrying",
-        OutboundStatus::Discarded => "discarded",
-        OutboundStatus::Failed => "failed",
-    }
 }
 
 /// Render the inspect sub-pane: a header bar plus the selected node's bounded
@@ -4044,6 +3973,7 @@ pub(super) fn relay_until_exit_observed(
     let mut applied: Option<(libc::winsize, u16)> = None;
     let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
     let mut pending_child_input = PendingChildInput::new();
+    let mut deferred_child_input = PendingChildInput::new();
     let mut status = None;
     publish_render_snapshot(
         &publisher,
@@ -4070,6 +4000,12 @@ pub(super) fn relay_until_exit_observed(
             &mut priority,
             pane.refresh_detail_if_due(Instant::now()),
             RenderPriority::Background,
+        );
+        release_deferred_child_input(
+            pane.outbound.active.is_some(),
+            &mut line_state,
+            &mut pending_child_input,
+            &mut deferred_child_input,
         );
         let mut protection = typing_protection(router.focus, &line_state);
         mark_render_dirty(
@@ -4122,15 +4058,17 @@ pub(super) fn relay_until_exit_observed(
             );
         }
         if ready.real_input {
-            let mut routed = forward_real_input(
+            let mut input_io = RealInputForwardIo {
                 real_fd,
-                &mut router,
-                &pane,
-                mouse_request_from_screen(parser.screen()),
-                &mut line_state,
-                &mut pending_child_input,
-                &mut buffer,
-            )?;
+                router: &mut router,
+                pane: &pane,
+                mouse_request: mouse_request_from_screen(parser.screen()),
+                line_state: &mut line_state,
+                pending_child_input: &mut pending_child_input,
+                deferred_child_input: &mut deferred_child_input,
+                buffer: &mut buffer,
+            };
+            let mut routed = forward_real_input(&mut input_io)?;
             let scroll_lines = routed.top_scroll_lines;
             // Sending keystrokes to the child snaps the view back to the live tail, like
             // a terminal jumps to the prompt when you start typing.
@@ -4196,6 +4134,8 @@ pub(super) fn relay_until_exit_observed(
                     renderer: &publisher,
                     line_state: &mut line_state,
                     pending_child_input: &mut pending_child_input,
+                    deferred_child_input: &mut deferred_child_input,
+                    outbound_active: pane.outbound.active.is_some(),
                 };
                 mark_render_dirty(
                     &mut dirty,
@@ -4227,6 +4167,7 @@ pub(super) fn relay_until_exit_observed(
                 line_state: &mut line_state,
                 child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
+                deferred_child_input: &mut deferred_child_input,
                 buffer: &mut buffer,
                 child_pid: Some(child.id()),
             };
@@ -4383,29 +4324,38 @@ fn record_applied_sizing(
 
 /// Read real-terminal input, route it by focus, and forward top-pane bytes to the
 /// child. Returns the routing outcome for the caller to apply to the monitor.
-fn forward_real_input(
+struct RealInputForwardIo<'a> {
     real_fd: RawFd,
-    router: &mut InputRouter,
-    pane: &MonitorPane,
+    router: &'a mut InputRouter,
+    pane: &'a MonitorPane,
     mouse_request: MouseRequest,
-    line_state: &mut InputLineState,
-    pending_child_input: &mut PendingChildInput,
-    buffer: &mut [u8],
-) -> Result<RoutedInput, String> {
-    match read_real_input(real_fd, buffer) {
+    line_state: &'a mut InputLineState,
+    pending_child_input: &'a mut PendingChildInput,
+    deferred_child_input: &'a mut PendingChildInput,
+    buffer: &'a mut [u8],
+}
+
+fn forward_real_input(io: &mut RealInputForwardIo<'_>) -> Result<RoutedInput, String> {
+    match read_real_input(io.real_fd, io.buffer) {
         Ok(0) => Ok(RoutedInput::default()),
         Ok(n) => {
-            let full = terminal_winsize_with_fallback(read_terminal_winsize(real_fd));
-            let protection = typing_protection(router.focus, line_state);
+            let full = terminal_winsize_with_fallback(read_terminal_winsize(io.real_fd));
+            let protection = typing_protection(io.router.focus, io.line_state);
             let routed = route_real_input_with_protection(
-                &buffer[..n],
-                router,
-                pane,
-                mouse_request,
+                &io.buffer[..n],
+                io.router,
+                io.pane,
+                io.mouse_request,
                 &full,
                 protection,
             );
-            enqueue_routed_child_input(line_state, pending_child_input, &routed);
+            enqueue_routed_child_input(
+                io.line_state,
+                io.pending_child_input,
+                io.deferred_child_input,
+                io.pane.outbound.active.is_some(),
+                &routed,
+            );
             Ok(routed)
         }
         Err(err) => Err(format_user_terminal_input_read_error(err)),
@@ -4745,6 +4695,8 @@ struct MouseActionIo<'a> {
     renderer: &'a RenderPublisher,
     line_state: &'a mut InputLineState,
     pending_child_input: &'a mut PendingChildInput,
+    deferred_child_input: &'a mut PendingChildInput,
+    outbound_active: bool,
 }
 
 /// Handle a top-pane right-click: if it lands on the current selection, copy that
@@ -4774,7 +4726,13 @@ fn handle_top_right_click(
         *selection = None;
         Ok(true)
     } else {
-        inject_clipboard_paste(io.line_state, io.pending_child_input, io.clipboard);
+        inject_clipboard_paste(
+            io.line_state,
+            io.pending_child_input,
+            io.deferred_child_input,
+            io.outbound_active,
+            io.clipboard,
+        );
         Ok(false)
     }
 }
@@ -4784,14 +4742,21 @@ fn handle_top_right_click(
 fn inject_clipboard_paste(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
+    deferred_child_input: &mut PendingChildInput,
+    outbound_active: bool,
     text: &str,
 ) {
     if text.is_empty() {
         return;
     }
     let bytes = wrap_real_terminal_paste(text.as_bytes());
-    line_state.observe_user_input(&bytes);
-    pending_child_input.enqueue(&bytes);
+    enqueue_user_child_input(
+        line_state,
+        pending_child_input,
+        deferred_child_input,
+        outbound_active,
+        &bytes,
+    );
 }
 
 fn route_bottom_mouse_event(
@@ -4909,14 +4874,50 @@ fn routed_child_input(routed: &RoutedInput) -> Option<&[u8]> {
 fn enqueue_routed_child_input(
     line_state: &mut InputLineState,
     pending_child_input: &mut PendingChildInput,
+    deferred_child_input: &mut PendingChildInput,
+    outbound_active: bool,
     routed: &RoutedInput,
 ) {
     let Some(bytes) = routed_child_input(routed) else {
         return;
     };
     let child_bytes = child_input_for_real_read(bytes);
-    line_state.observe_user_input(&child_bytes);
-    pending_child_input.enqueue(&child_bytes);
+    enqueue_user_child_input(
+        line_state,
+        pending_child_input,
+        deferred_child_input,
+        outbound_active,
+        &child_bytes,
+    );
+}
+
+fn enqueue_user_child_input(
+    line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
+    deferred_child_input: &mut PendingChildInput,
+    outbound_active: bool,
+    bytes: &[u8],
+) {
+    if outbound_active || !deferred_child_input.is_empty() {
+        deferred_child_input.enqueue(bytes);
+        return;
+    }
+    line_state.observe_user_input(bytes);
+    pending_child_input.enqueue(bytes);
+}
+
+fn release_deferred_child_input(
+    outbound_active: bool,
+    line_state: &mut InputLineState,
+    pending_child_input: &mut PendingChildInput,
+    deferred_child_input: &mut PendingChildInput,
+) {
+    if outbound_active || !pending_child_input.is_empty() || deferred_child_input.is_empty() {
+        return;
+    }
+    let bytes = deferred_child_input.take_pending();
+    line_state.observe_user_input(&bytes);
+    pending_child_input.enqueue(&bytes);
 }
 
 /// Apply routed monitor effects (expand/select/refresh/collapse) to the pane.
@@ -5001,9 +5002,8 @@ fn monitor_command_is_interactive(command: &MonitorCommand) -> bool {
 }
 
 fn apply_routed_pseudo_input(pane: &mut MonitorPane, actions: &[PseudoInputAction], width: u16) {
-    let now = Instant::now();
     for action in actions {
-        pane.apply_pseudo_input(*action, width, now);
+        pane.apply_pseudo_input(*action, width);
     }
 }
 
@@ -5346,15 +5346,23 @@ fn start_next_outbound_message(
     observation: Option<&OutboundObservationResult>,
     now: Instant,
 ) -> bool {
-    if outbound.active.is_some()
-        || !pending_child_input.is_empty()
-        || !line_state.is_safe_to_inject()
-    {
+    if outbound.active.is_some() || !pending_child_input.is_empty() {
         return false;
     }
     let Some(id) = outbound.next_sendable_id() else {
         return false;
     };
+    if !line_state.input_empty() {
+        return outbound.set_status(
+            id,
+            outbound
+                .message(id)
+                .map(|message| message.status)
+                .unwrap_or(OutboundStatus::Queued),
+            now,
+            Some("awaiting_line_boundary".to_string()),
+        );
+    }
     if outbound.has_unresolved_blocker()
         && outbound.messages.iter().any(|message| {
             message.id != id
@@ -5466,6 +5474,7 @@ struct ControlInjectionIo<'a> {
     line_state: &'a mut InputLineState,
     child_output_state: &'a mut ChildOutputState,
     pending_child_input: &'a mut PendingChildInput,
+    deferred_child_input: &'a mut PendingChildInput,
     buffer: &'a mut [u8],
     child_pid: Option<u32>,
 }
@@ -5531,6 +5540,9 @@ fn inject_control_payload(
     )?;
     if payload.bytes.is_empty() {
         return acknowledge_control_payload(&payload);
+    }
+    if io.pane.outbound.active.is_some() {
+        return Err("outbound_send_active".to_string());
     }
     // Match the non-TUI broker contract: only submit proactive control payloads
     // when the agent owns the foreground process group, child output has cleared
@@ -5723,15 +5735,17 @@ fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
         flush_pending_child_input(io.master_fd, io.pending_child_input)?;
     }
     if ready.real_input {
-        forward_real_input(
-            io.real_fd,
-            io.router,
-            io.pane,
-            mouse_request_from_screen(io.parser.screen()),
-            io.line_state,
-            io.pending_child_input,
-            io.buffer,
-        )?;
+        let mut input_io = RealInputForwardIo {
+            real_fd: io.real_fd,
+            router: io.router,
+            pane: io.pane,
+            mouse_request: mouse_request_from_screen(io.parser.screen()),
+            line_state: io.line_state,
+            pending_child_input: io.pending_child_input,
+            deferred_child_input: io.deferred_child_input,
+            buffer: io.buffer,
+        };
+        forward_real_input(&mut input_io)?;
     }
     if ready.pty_output && pump_pty_output(io.master_fd, io.parser, io.buffer)? {
         io.child_output_state.observe_child_output();
@@ -6134,8 +6148,12 @@ mod tests {
 
         let areas =
             pane_areas_for_winsize(&winsize, &pane, TypingProtection::for_focus(router.focus));
-        let outbound = expanded_bottom_layout(areas.bottom, &pane).outbound;
-        let bytes = sgr_press(0, outbound.x + 1, outbound.y + 1);
+        let content = expanded_bottom_layout(areas.bottom, &pane).content;
+        let bytes = sgr_press(
+            0,
+            content.x + 1,
+            content.y + content.height.saturating_sub(1),
+        );
 
         let routed = route_real_input(&bytes, &mut router, &pane, child, &winsize);
 
@@ -6320,6 +6338,7 @@ mod tests {
         let mut line_state = InputLineState::default();
         let mut child_output_state = ChildOutputState::default();
         let mut pending_child_input = PendingChildInput::new();
+        let mut deferred_child_input = PendingChildInput::new();
         let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
         let mut io = ControlInjectionIo {
             real_fd: read_end.as_raw_fd(),
@@ -6330,6 +6349,7 @@ mod tests {
             line_state: &mut line_state,
             child_output_state: &mut child_output_state,
             pending_child_input: &mut pending_child_input,
+            deferred_child_input: &mut deferred_child_input,
             buffer: &mut buffer,
             child_pid: None,
         };
@@ -6376,7 +6396,7 @@ mod tests {
             PseudoInputAction::Insert('i'),
             PseudoInputAction::Submit,
         ] {
-            pane.apply_pseudo_input(action, DEFAULT_PSEUDO_INPUT_WIDTH, now);
+            pane.apply_pseudo_input(action, DEFAULT_PSEUDO_INPUT_WIDTH);
         }
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
@@ -6492,6 +6512,52 @@ mod tests {
     }
 
     #[test]
+    fn queued_message_waits_for_parsed_line_boundary_even_after_idle() {
+        let now = Instant::now();
+        let mut pane = queued_pane("overlay", now);
+        let mut pending = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        line_state.observe_user_input(b"ordinary draft");
+        line_state.last_user_input_at = Some(
+            Instant::now() - Duration::from_millis(super::super::USER_INPUT_IDLE_INJECT_MS + 1),
+        );
+
+        assert!(
+            line_state.is_safe_to_inject(),
+            "generic idle fallback remains"
+        );
+        assert!(!line_state.input_empty(), "draft has no submit boundary");
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(1, [])),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Queued));
+        assert!(pending.is_empty());
+        assert_eq!(
+            pane.outbound
+                .message(1)
+                .and_then(|message| message.detail.as_deref()),
+            Some("awaiting_line_boundary")
+        );
+
+        line_state.mark_submitted();
+        assert!(pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            false,
+            Some(&available_observation(1, [])),
+            now,
+        ));
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sending));
+        assert_eq!(pending.pending_len(), "overlay".len());
+    }
+
+    #[test]
     fn queued_message_transitions_sending_to_sent_after_body_and_enter_drain() {
         let now = Instant::now();
         let (mut read_end, write_end) = pipe_files();
@@ -6571,6 +6637,79 @@ mod tests {
         );
         flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
         assert_pipe_bytes(&mut read_end, b"\r");
+    }
+
+    #[test]
+    fn active_bracketed_send_defers_real_input_until_submit_drains() {
+        let now = Instant::now();
+        let (mut read_end, write_end) = pipe_files();
+        let mut pane = queued_pane("overlay", now);
+        let mut pending = PendingChildInput::new();
+        let mut deferred = PendingChildInput::new();
+        let mut line_state = InputLineState::default();
+        let baseline = available_observation(1, []);
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            Some(&baseline),
+            now,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, &control_payload_bytes(b"overlay", true));
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            Some(&baseline),
+            now,
+        );
+
+        let routed = RoutedInput {
+            forward: b"ordinary".to_vec(),
+            ..Default::default()
+        };
+        enqueue_routed_child_input(
+            &mut line_state,
+            &mut pending,
+            &mut deferred,
+            pane.outbound.active.is_some(),
+            &routed,
+        );
+        assert!(pending.is_empty());
+        assert_eq!(deferred.pending_len(), "ordinary".len());
+
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            Some(&baseline),
+            now + CONTROL_SUBMIT_DELAY,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, b"\r");
+        pump_outbound_queue(
+            &mut pane,
+            &mut pending,
+            &mut line_state,
+            true,
+            Some(&baseline),
+            now + CONTROL_SUBMIT_DELAY,
+        );
+        assert_eq!(pane.outbound.status(1), Some(OutboundStatus::Sent));
+
+        release_deferred_child_input(
+            pane.outbound.active.is_some(),
+            &mut line_state,
+            &mut pending,
+            &mut deferred,
+        );
+        flush_pending_child_input(write_end.as_raw_fd(), &mut pending).unwrap();
+        assert_pipe_bytes(&mut read_end, b"ordinary");
     }
 
     #[test]
@@ -6674,7 +6813,7 @@ mod tests {
     fn production_confirmation_timeout_does_not_permanently_block_later_messages() {
         let now = Instant::now();
         let mut pane = sent_pane("first", [], now);
-        pane.outbound.enqueue("second".to_string(), now);
+        pane.outbound.enqueue("second".to_string());
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
         let baseline = available_observation(1, []);
@@ -6742,7 +6881,7 @@ mod tests {
     fn confirmed_retry_waits_for_fresh_baseline_and_stays_ahead_of_later_items() {
         let now = Instant::now();
         let mut pane = sent_pane("first", [], now);
-        pane.outbound.enqueue("second".to_string(), now);
+        pane.outbound.enqueue("second".to_string());
         pane.outbound.set_status(
             1,
             OutboundStatus::Ambiguous,
@@ -6785,8 +6924,8 @@ mod tests {
     fn single_flight_blocks_later_message_until_first_is_consumed() {
         let now = Instant::now();
         let mut pane = MonitorPane::new();
-        pane.outbound.enqueue("first".to_string(), now);
-        pane.outbound.enqueue("second".to_string(), now);
+        pane.outbound.enqueue("first".to_string());
+        pane.outbound.enqueue("second".to_string());
         let mut pending = PendingChildInput::new();
         let mut line_state = InputLineState::default();
         let baseline = available_observation(1, [("old", Some("first"))]);
@@ -6836,9 +6975,9 @@ mod tests {
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
     }
 
-    fn queued_pane(body: &str, now: Instant) -> MonitorPane {
+    fn queued_pane(body: &str, _now: Instant) -> MonitorPane {
         let mut pane = MonitorPane::new();
-        pane.outbound.enqueue(body.to_string(), now);
+        pane.outbound.enqueue(body.to_string());
         pane
     }
 
@@ -8983,7 +9122,7 @@ mod tests {
         let text = screen_text(terminal.backend().buffer(), 20, 80);
         assert!(text.contains("draft"), "{text}");
         assert!(!text.contains("input["), "{text}");
-        assert!(text.contains("outbound: idle"), "{text}");
+        assert!(!text.contains("outbound:"), "{text}");
         assert!(
             !text.contains("cargo test"),
             "collapsed list should stay hidden: {text}"
@@ -9050,8 +9189,7 @@ mod tests {
 
         assert_eq!(layout.input.y, bottom.y);
         assert_eq!(layout.status.y, layout.input.y + layout.input.height);
-        assert_eq!(layout.outbound.y, layout.status.y + layout.status.height);
-        assert_eq!(layout.content.y, layout.outbound.y + layout.outbound.height);
+        assert_eq!(layout.content.y, layout.status.y + layout.status.height);
         assert_eq!(
             layout.content.y + layout.content.height,
             bottom.y + bottom.height

@@ -90,14 +90,12 @@ fn production_observed_relay_confirms_provider_turn_before_second_overlay_send()
     );
 
     let output = read_until_bytes(pty.master.as_raw_fd(), "OBS", Duration::from_secs(5));
-    write_all_fd(pty.master.as_raw_fd(), b"\x1b[<0;1;31Mfirst\rsecond\r").unwrap();
-    let output = read_until_rendered_text(
+    write_all_fd(pty.master.as_raw_fd(), b"\x1b[<0;1;32Mfirst\rsecond\r").unwrap();
+    let output = read_until_bytes_with_prefix(
         pty.master.as_raw_fd(),
         output,
-        "consumed",
+        "test result:",
         Duration::from_secs(10),
-        33,
-        100,
     );
 
     let status = child.wait().unwrap();
@@ -128,7 +126,7 @@ fn production_observed_relay_confirms_provider_turn_before_second_overlay_send()
     assert!(event_text.contains("observer-account"));
     assert!(event_text.contains(OBSERVER_SESSION_ID));
     assert!(event_text.contains(&dir.path().display().to_string()));
-    assert!(rendered_screen_text(&output, 33, 100).contains("consumed"));
+    assert!(!rendered_screen_text(&output, 33, 100).contains("outbound:"));
 }
 
 #[test]
@@ -561,8 +559,16 @@ fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
 }
 
 fn read_until_bytes(fd: RawFd, needle: &str, timeout: Duration) -> Vec<u8> {
+    read_until_bytes_with_prefix(fd, Vec::new(), needle, timeout)
+}
+
+fn read_until_bytes_with_prefix(
+    fd: RawFd,
+    mut output: Vec<u8>,
+    needle: &str,
+    timeout: Duration,
+) -> Vec<u8> {
     let start = Instant::now();
-    let mut output = Vec::new();
     let mut buffer = [0_u8; 4096];
     while start.elapsed() < timeout {
         if read_until_step(fd, needle, &mut output, &mut buffer) {
@@ -570,40 +576,6 @@ fn read_until_bytes(fd: RawFd, needle: &str, timeout: Duration) -> Vec<u8> {
         }
     }
     output
-}
-
-fn read_until_rendered_text(
-    fd: RawFd,
-    mut output: Vec<u8>,
-    needle: &str,
-    timeout: Duration,
-    rows: u16,
-    cols: u16,
-) -> Vec<u8> {
-    let start = Instant::now();
-    let mut parser = vt100::Parser::new(rows, cols, 0);
-    parser.process(&output);
-    let mut buffer = [0_u8; 4096];
-    while start.elapsed() < timeout {
-        if !poll_readable(fd, Duration::from_millis(50)).unwrap() {
-            continue;
-        }
-        let n = read_fd(fd, &mut buffer).unwrap();
-        if n == 0 {
-            break;
-        }
-        for byte in &buffer[..n] {
-            parser.process(std::slice::from_ref(byte));
-            output.push(*byte);
-            if parser.screen().contents().contains(needle) {
-                return output;
-            }
-        }
-    }
-    panic!(
-        "rendered terminal never contained {needle:?}: {:?}",
-        parser.screen().contents()
-    );
 }
 
 fn rendered_screen_text(output: &[u8], rows: u16, cols: u16) -> String {
