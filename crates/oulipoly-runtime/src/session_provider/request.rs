@@ -109,6 +109,16 @@ pub(super) fn capture_extra(invocation_uuid: &str) -> JsonObject {
     extra
 }
 
+pub(super) fn user_observation_extra() -> JsonObject {
+    let mut extra = JsonObject::new();
+    extra.insert(
+        "turn_projection".to_string(),
+        Value::String("user_observation".to_string()),
+    );
+    extra.insert("body_tail_limit".to_string(), Value::from(4));
+    extra
+}
+
 pub(super) fn enumerate_request(
     request: &SessionProviderEnumerateRequest<'_>,
 ) -> Result<Value, SessionProviderError> {

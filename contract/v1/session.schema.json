@@ -8,7 +8,18 @@
       "type": "object",
       "properties": {
         "settings_id": { "type": "string", "minLength": 1 },
-        "session_id": { "type": "string" }
+        "session_id": { "type": "string" },
+        "turn_projection": {
+          "type": "string",
+          "enum": ["user_observation"],
+          "description": "Optional bounded projection for provider-neutral outbound user-turn observation."
+        },
+        "body_tail_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Number of trailing projected user turns whose canonical bodies are included."
+        }
       },
       "required": ["settings_id"],
       "additionalProperties": true

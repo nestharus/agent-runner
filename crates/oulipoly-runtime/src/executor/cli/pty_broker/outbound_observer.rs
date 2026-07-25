@@ -74,12 +74,13 @@ impl ProviderSessionTurnSource {
     }
 
     fn read(&self, generation: u64) -> OutboundObservationResult {
-        let result = session_provider::read_turns(SessionProviderReadTurnsRequest {
-            registry: self.registry.as_ref(),
-            identity: self.identity.clone(),
-            session_id: &self.provider_session_id,
-            effective_cwd: self.effective_cwd.as_deref(),
-        });
+        let result =
+            session_provider::read_user_turn_observations(SessionProviderReadTurnsRequest {
+                registry: self.registry.as_ref(),
+                identity: self.identity.clone(),
+                session_id: &self.provider_session_id,
+                effective_cwd: self.effective_cwd.as_deref(),
+            });
         match result {
             Ok(result) => self.map_result(generation, result),
             Err(error) => map_source_error(generation, error),
