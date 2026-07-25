@@ -138,6 +138,35 @@ impl ProviderRegistry {
             .or_else(|| self.artifact_key_for_model(model_name))
     }
 
+    pub fn resolve_model_name_for_provider_instance(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+    ) -> Option<String> {
+        if self
+            .artifact_key_for_model_provider(model_name, provider_name)
+            .is_some()
+        {
+            return Some(model_name.to_string());
+        }
+
+        let mut candidates = self
+            .model_provider_artifacts
+            .iter()
+            .filter(|((_, candidate_provider), _)| candidate_provider == provider_name);
+        let ((first_model, _), first_artifact) = candidates.next()?;
+        let mut resolved_model = first_model;
+        for ((candidate_model, _), candidate_artifact) in candidates {
+            if candidate_artifact != first_artifact {
+                return None;
+            }
+            if candidate_model < resolved_model {
+                resolved_model = candidate_model;
+            }
+        }
+        Some(resolved_model.clone())
+    }
+
     pub fn configured_model_names(&self) -> Vec<String> {
         let mut names = self.model_artifacts.keys().cloned().collect::<Vec<_>>();
         names.sort();

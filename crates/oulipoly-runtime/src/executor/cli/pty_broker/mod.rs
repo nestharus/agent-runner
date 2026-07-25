@@ -17,7 +17,7 @@ use crate::observability::{
     ObservabilityRoot, ObservabilitySnapshotPort, ProductionObservabilitySnapshotService,
 };
 use crate::provider_registry::ProviderRegistry;
-use crate::session_provider::{self, SessionProviderIdentity};
+use crate::session_provider::SessionProviderIdentity;
 use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
 use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeIdleUpdate};
@@ -371,19 +371,19 @@ fn provider_inspect_identity(
     model_name: &str,
     provider_name: &str,
 ) -> Option<SessionProviderIdentity> {
+    let model_name =
+        registry.resolve_model_name_for_provider_instance(model_name, provider_name)?;
     let describe = registry
-        .describe_model_provider_instance(model_name, provider_name)
+        .describe_model_provider_instance(&model_name, provider_name)
         .ok()?;
     if !describe.capabilities.session {
         return None;
     }
     Some(SessionProviderIdentity {
-        model_name: model_name.to_string(),
+        model_name,
         provider_name: provider_name.to_string(),
         provider_instance_id: Some(format_provider_instance_id(&describe.provider_id)),
-        settings_id: describe
-            .settings_schema_id
-            .unwrap_or_else(|| session_provider::S7A_NEUTRAL_SETTINGS_ID.to_string()),
+        settings_id: provider_name.to_string(),
     })
 }
 
@@ -2693,7 +2693,121 @@ fn validate_peer_uid(_stream: &UnixStream) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_registry::ProviderRegistryOptions;
+    use oulipoly_config::{
+        ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
+        provider_implementation_ref::ProviderImplementationRef,
+    };
+    use std::os::unix::fs::PermissionsExt;
     use std::thread;
+
+    #[test]
+    fn provider_default_identity_uses_unique_account_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_session_describe_provider(temp.path(), "provider.py");
+        let registry = provider_registry(&[
+            provider_model("z-model", "provider-account", &script),
+            provider_model("a-model", "provider-account", &script),
+        ]);
+
+        let identity =
+            provider_inspect_identity(&registry, "<provider-default>", "provider-account")
+                .expect("a unique account artifact should resolve provider-default identity");
+
+        assert_eq!(identity.model_name, "a-model");
+        assert_eq!(identity.provider_name, "provider-account");
+        assert_eq!(
+            identity.provider_instance_id.as_deref(),
+            Some("fixture-instance")
+        );
+        assert_eq!(identity.settings_id, "provider-account");
+    }
+
+    #[test]
+    fn provider_default_identity_rejects_conflicting_account_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = write_session_describe_provider(temp.path(), "provider-a.py");
+        let second = write_session_describe_provider(temp.path(), "provider-b.py");
+        let registry = provider_registry(&[
+            provider_model("a-model", "provider-account", &first),
+            provider_model("b-model", "provider-account", &second),
+        ]);
+
+        assert!(
+            provider_inspect_identity(&registry, "<provider-default>", "provider-account",)
+                .is_none(),
+            "provider-default identity must remain unavailable when the account maps to multiple artifacts"
+        );
+    }
+
+    fn provider_registry(models: &[ModelConfig]) -> ProviderRegistry {
+        ProviderRegistry::from_model_configs_with_provider_config(
+            models,
+            &ProvidersConfig::default(),
+            ProviderRegistryOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn provider_model(name: &str, provider_name: &str, script: &Path) -> ModelConfig {
+        ModelConfig {
+            name: name.to_string(),
+            prompt_mode: PromptMode::Arg,
+            providers: vec![ProviderConfig::model_provider(provider_name, Vec::new())],
+            inputs: Vec::new(),
+            provider: Some(ProviderImplementationRef {
+                path: Some(script.display().to_string()),
+                crate_name: None,
+                version: None,
+                binary: None,
+                script: None,
+            }),
+        }
+    }
+
+    fn write_session_describe_provider(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+request = json.load(sys.stdin)
+print(json.dumps({
+    "contract": request["contract"],
+    "request_id": request["request_id"],
+    "ok": True,
+    "result": {
+        "provider_id": "fixture",
+        "display_name": "Fixture",
+        "contract_versions": [request["contract"]],
+        "preferred_contract": request["contract"],
+        "capabilities": {
+            "launch": False,
+            "policy": False,
+            "quota": False,
+            "session": True,
+            "session_enumerate": False,
+            "terminal": False,
+            "rotation": False,
+            "discovery": False,
+            "settings": False,
+            "setup_brain": False,
+            "setup": False,
+            "migration": False
+        },
+        "settings_schema_id": "fixture-settings"
+    }
+}))
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
 
     #[test]
     fn input_line_state_tracks_boundary_and_idle_fallback() {
