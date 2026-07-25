@@ -497,6 +497,24 @@ fn external_provider_read_turns_maps_transport_into_owned_turn_interface_before_
 }
 
 #[test]
+fn outbound_user_turn_observation_requests_bounded_provider_projection() {
+    let fixture = Fixture::new();
+    fixture.set_mode("read_success");
+    let registry = fixture.registry();
+
+    session_provider::read_user_turn_observations(read_request(&registry, SESSION_ID))
+        .expect("read projected user-turn observation");
+
+    let records = fixture.request_records_for("session.read_turns");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["request"]["params"]["turn_projection"],
+        "user_observation"
+    );
+    assert_eq!(records[0]["request"]["params"]["body_tail_limit"], 4);
+}
+
+#[test]
 fn external_provider_enumerate_maps_provider_native_sessions_without_mutating_sqlite() {
     let fixture = Fixture::new();
     fixture.set_mode("enumerate_success");

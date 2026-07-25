@@ -5,7 +5,7 @@ use super::provider_client::{
 };
 use super::request::{
     base_request, capture_extra, enumerate_request, lifecycle_extra, locate_extra,
-    read_session_id_for_lifecycle,
+    read_session_id_for_lifecycle, user_observation_extra,
 };
 use super::turns;
 use super::types::{
@@ -66,6 +66,19 @@ pub fn read_turns(
         Some(request.session_id),
         request.effective_cwd,
         JsonObject::new(),
+    )
+}
+
+pub fn read_user_turn_observations(
+    request: SessionProviderReadTurnsRequest<'_>,
+) -> Result<SessionProviderReadTurnsResult, SessionProviderError> {
+    let client = provider_client(request.registry, &request.identity)?;
+    read_turns_with_client(
+        &client,
+        &request.identity,
+        Some(request.session_id),
+        request.effective_cwd,
+        user_observation_extra(),
     )
 }
 

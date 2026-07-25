@@ -20,6 +20,7 @@ mod types;
 pub use dispatch::{
     capture, capture_for_lifecycle, enumerate_sessions, locate_transcript,
     locate_transcript_with_raw_metadata, read_turns, read_turns_for_lifecycle,
+    read_user_turn_observations,
 };
 pub use lifecycle_proof::dispatch_aware_no_ref_lifecycle_proof;
 pub use turns::{assert_turn_count_diagnostic, ingest_owned_turns};
