@@ -1492,6 +1492,13 @@ impl PendingChildInput {
         self.bytes.len().saturating_sub(self.drained)
     }
 
+    fn take_pending(&mut self) -> Vec<u8> {
+        let pending = self.bytes[self.drained..].to_vec();
+        self.bytes.clear();
+        self.drained = 0;
+        pending
+    }
+
     fn flush_some(&mut self, fd: RawFd) -> io::Result<FlushProgress> {
         if self.is_empty() {
             self.compact_if_drained();
