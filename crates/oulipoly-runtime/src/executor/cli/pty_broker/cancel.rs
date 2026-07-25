@@ -3,13 +3,17 @@
 //! `mapper`, `predicate`, `accessor`, `formatter`, `orchestration`
 //!
 //! Derive a cancel request from a monitor node and execute it safely against PID
-//! reuse. Only provider process groups are cancellable today: the recorded
-//! identity (boot id + start-time ticks) is re-verified against the live process
-//! before any signal, so a reused PID is never killed. Agent-bash workloads and
-//! provider-session-end are surfaced as not-yet-supported.
+//! reuse. Provider process groups are identity-verified before signalling.
+//! Agent-bash workloads delegate cancellation to the spooler's identity-safe
+//! `cancel` command. Provider-session-end remains not-yet-supported.
+
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use crate::observability::{CancelRef, MonitorNode, MonitorProcessIdentity};
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
+use serde::Deserialize;
 
 /// A cancel action derived from a node's cancel reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +21,10 @@ pub(super) enum CancelRequest {
     ProcessGroup {
         pgid: i64,
         identity: Option<RecordedIdentity>,
+    },
+    AgentBashHandle {
+        handle: String,
+        state_dir: String,
     },
     Unsupported {
         reason: &'static str,
@@ -35,6 +43,8 @@ pub(super) struct RecordedIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum CancelOutcome {
     Signalled { pgid: i64 },
+    AgentBashCancelRequested { handle: String },
+    AgentBashFailed { handle: String, detail: String },
     AlreadyGone,
     Unverifiable,
     IdentityMismatch,
@@ -55,6 +65,12 @@ enum CancelDecision {
     Report(CancelOutcome),
 }
 
+#[derive(Deserialize)]
+struct AgentBashCancelResponse {
+    handle: String,
+    requested: bool,
+}
+
 /// Derive the cancel request for a node, or `None` when it exposes no cancel ref.
 pub(super) fn cancel_request_for_node(node: &MonitorNode) -> Option<CancelRequest> {
     node.cancel_ref.as_ref().map(cancel_request_from_ref)
@@ -66,8 +82,9 @@ fn cancel_request_from_ref(cancel_ref: &CancelRef) -> CancelRequest {
             pgid: *pgid,
             identity: identity.as_ref().map(recorded_identity),
         },
-        CancelRef::AgentBashHandle { .. } => CancelRequest::Unsupported {
-            reason: "agent-bash cancel not yet supported",
+        CancelRef::AgentBashHandle { handle, state_dir } => CancelRequest::AgentBashHandle {
+            handle: handle.clone(),
+            state_dir: state_dir.clone(),
         },
         CancelRef::ProviderSessionEnd { .. } => CancelRequest::Unsupported {
             reason: "session end not yet supported",
@@ -90,7 +107,86 @@ pub(super) fn execute_cancel(request: &CancelRequest) -> CancelOutcome {
         CancelRequest::ProcessGroup { pgid, identity } => {
             cancel_process_group(*pgid, identity.as_ref())
         }
+        CancelRequest::AgentBashHandle { handle, state_dir } => {
+            cancel_agent_bash_handle(handle, state_dir)
+        }
         CancelRequest::Unsupported { reason } => CancelOutcome::Unsupported { reason },
+    }
+}
+
+fn cancel_agent_bash_handle(handle: &str, state_dir: &str) -> CancelOutcome {
+    let Some(state_home) = agent_bash_state_home(handle, state_dir) else {
+        return agent_bash_failed(handle, "invalid agent-bash state directory");
+    };
+    execute_agent_bash_cancel(&agent_bash_binary(), handle, &state_home)
+}
+
+fn agent_bash_state_home(handle: &str, state_dir: &str) -> Option<PathBuf> {
+    let state_dir = Path::new(state_dir);
+    if !state_dir.is_absolute() {
+        return None;
+    }
+    if state_dir.file_name()? != OsStr::new(handle) {
+        return None;
+    }
+    let spool_root = state_dir.parent()?;
+    if spool_root.file_name()? != OsStr::new("agent-bash") {
+        return None;
+    }
+    spool_root.parent().map(Path::to_path_buf)
+}
+
+fn agent_bash_binary() -> OsString {
+    if let Some(binary) = std::env::var_os("AGENT_BASH_BIN") {
+        return binary;
+    }
+    let local_binary = dirs::home_dir().map(|home| home.join(".local/bin/agent-bash"));
+    match local_binary {
+        Some(path) if path.is_file() => path.into_os_string(),
+        _ => OsString::from("agent-bash"),
+    }
+}
+
+fn execute_agent_bash_cancel(binary: &OsStr, handle: &str, state_home: &Path) -> CancelOutcome {
+    match Command::new(binary)
+        .args(["cancel", handle])
+        .env("XDG_STATE_HOME", state_home)
+        .output()
+    {
+        Ok(output) => agent_bash_output_outcome(handle, output),
+        Err(err) => agent_bash_failed(handle, format!("failed to execute agent-bash: {err}")),
+    }
+}
+
+fn agent_bash_output_outcome(handle: &str, output: Output) -> CancelOutcome {
+    if !output.status.success() {
+        return agent_bash_failed(handle, agent_bash_failure_detail(&output));
+    }
+    match serde_json::from_slice::<AgentBashCancelResponse>(&output.stdout) {
+        Ok(response) if response.handle == handle && response.requested => {
+            CancelOutcome::AgentBashCancelRequested {
+                handle: handle.to_string(),
+            }
+        }
+        Ok(response) if response.handle == handle => CancelOutcome::AlreadyGone,
+        Ok(_) => agent_bash_failed(handle, "agent-bash returned a different handle"),
+        Err(err) => agent_bash_failed(handle, format!("invalid agent-bash response: {err}")),
+    }
+}
+
+fn agent_bash_failure_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        format!("agent-bash exited with {}", output.status)
+    } else {
+        stderr
+    }
+}
+
+fn agent_bash_failed(handle: &str, detail: impl Into<String>) -> CancelOutcome {
+    CancelOutcome::AgentBashFailed {
+        handle: handle.to_string(),
+        detail: detail.into(),
     }
 }
 
@@ -170,6 +266,12 @@ fn failed_signal_outcome(errno: i32) -> CancelOutcome {
 pub(super) fn cancel_outcome_message(outcome: &CancelOutcome) -> String {
     match outcome {
         CancelOutcome::Signalled { pgid } => format!("sent SIGTERM to process group {pgid}"),
+        CancelOutcome::AgentBashCancelRequested { handle } => {
+            format!("requested cancellation for agent-bash handle {handle}")
+        }
+        CancelOutcome::AgentBashFailed { handle, detail } => {
+            format!("agent-bash cancellation failed for {handle}: {detail}")
+        }
         CancelOutcome::AlreadyGone => "process already exited".to_string(),
         CancelOutcome::Unverifiable => "skipped: no recorded identity to verify".to_string(),
         CancelOutcome::IdentityMismatch => "skipped: PID was reused by another process".to_string(),
@@ -185,6 +287,8 @@ mod tests {
         CancelRef, LivenessStatus, MonitorNode, MonitorNodeKind, MonitorProcessIdentity,
         MonitorStatus,
     };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     fn node_with_cancel_ref(cancel_ref: Option<CancelRef>) -> MonitorNode {
         MonitorNode {
@@ -248,15 +352,22 @@ mod tests {
     }
 
     #[test]
-    fn agent_bash_and_session_end_are_unsupported() {
+    fn agent_bash_ref_maps_to_handle_request() {
         let bash = node_with_cancel_ref(Some(CancelRef::AgentBashHandle {
             handle: "h".to_string(),
-            state_dir: "d".to_string(),
+            state_dir: "/tmp/state/agent-bash/h".to_string(),
         }));
-        assert!(matches!(
+        assert_eq!(
             cancel_request_for_node(&bash),
-            Some(CancelRequest::Unsupported { .. })
-        ));
+            Some(CancelRequest::AgentBashHandle {
+                handle: "h".to_string(),
+                state_dir: "/tmp/state/agent-bash/h".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn session_end_is_unsupported() {
         let session = node_with_cancel_ref(Some(CancelRef::ProviderSessionEnd {
             invocation_uuid: "u".to_string(),
         }));
@@ -309,6 +420,63 @@ mod tests {
         assert_eq!(
             cancel_outcome_message(&CancelOutcome::IdentityMismatch),
             "skipped: PID was reused by another process"
+        );
+        assert_eq!(
+            cancel_outcome_message(&CancelOutcome::AgentBashCancelRequested {
+                handle: "h".to_string(),
+            }),
+            "requested cancellation for agent-bash handle h"
+        );
+    }
+
+    #[test]
+    fn agent_bash_state_home_requires_matching_spool_shape() {
+        assert_eq!(
+            agent_bash_state_home("h", "/tmp/state/agent-bash/h"),
+            Some(PathBuf::from("/tmp/state"))
+        );
+        assert_eq!(
+            agent_bash_state_home("other", "/tmp/state/agent-bash/h"),
+            None
+        );
+        assert_eq!(
+            agent_bash_state_home("h", "/tmp/state/not-agent-bash/h"),
+            None
+        );
+        assert_eq!(agent_bash_state_home("h", "state/agent-bash/h"), None);
+    }
+
+    #[test]
+    fn agent_bash_cancel_command_receives_handle_and_observed_state_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("agent-bash");
+        let state_home = temp.path().join("state-home");
+        let script = format!(
+            "#!/bin/sh\n[ \"$1\" = cancel ] || exit 2\n[ \"$2\" = h ] || exit 3\n[ \"$XDG_STATE_HOME\" = \"{}\" ] || exit 4\nprintf '%s\\n' '{{\"handle\":\"h\",\"requested\":true}}'\n",
+            state_home.display()
+        );
+        fs::write(&binary, script).expect("fake agent-bash");
+        let mut permissions = fs::metadata(&binary).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions).expect("chmod");
+
+        assert_eq!(
+            execute_agent_bash_cancel(binary.as_os_str(), "h", &state_home),
+            CancelOutcome::AgentBashCancelRequested {
+                handle: "h".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_bash_cancel_response_reports_already_gone() {
+        let output = Command::new("printf")
+            .args(["%s\\n", "{\"handle\":\"h\",\"requested\":false}"])
+            .output()
+            .expect("printf");
+        assert_eq!(
+            agent_bash_output_outcome("h", output),
+            CancelOutcome::AlreadyGone
         );
     }
 }
