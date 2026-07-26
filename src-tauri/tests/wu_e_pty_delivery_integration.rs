@@ -540,6 +540,89 @@ fn accepted_pty_attempt_suppresses_repeated_notify_and_newer_overtake() {
 }
 
 #[test]
+fn accepted_previous_invocation_prefix_suppresses_redelivery() {
+    let fixture = Fixture::new();
+    let identity = current_identity();
+    fixture.record_owner_identity(&identity);
+    let socket = fixture.socket_path("previous-owner.sock");
+    fixture.mark_live_pty_runtime(&identity, &socket);
+    let previous = fixture.seed_mailbox("h-previous-owner");
+    let mut mailbox = fixture.mailbox();
+    mailbox
+        .register_delivery_attempt(
+            "previous-owner-attempt",
+            SESSION_A,
+            "previous-invocation",
+            &[previous.seq],
+            0,
+        )
+        .unwrap();
+    mailbox
+        .record_delivery_attempt_transport_ack("previous-owner-attempt")
+        .unwrap();
+    drop(mailbox);
+
+    let output = fixture.run_notify("h-current-newer", caller_chain(&identity));
+    assert_success(&output);
+    let diagnostic = stdout_json(&output);
+    assert_eq!(diagnostic["pty_delivery"]["status"], "awaiting_observation");
+    assert_eq!(diagnostic["pty_delivery"]["attempted"], false);
+    assert_eq!(diagnostic["pty_delivery"]["remaining_pending"], 2);
+    let pending = fixture.mailbox().list_pending(SESSION_A).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|row| row.delivery_attempts == 0));
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn pty_protocol_timeout_reuses_one_unresolved_attempt() {
+    let fixture = Fixture::new();
+    let identity = current_identity();
+    fixture.record_owner_identity(&identity);
+    let socket = fixture.socket_path("timeout-retry.sock");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let server = spawn_timeout_then_ack_control_server(&socket, Arc::clone(&captured));
+    fixture.mark_live_pty_runtime(&identity, &socket);
+
+    let first = fixture.run_notify("h-timeout-retry", caller_chain(&identity));
+    assert_success(&first);
+    let first_diagnostic = stdout_json(&first);
+    assert_eq!(first_diagnostic["pty_delivery"]["status"], "protocol_error");
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 1);
+
+    let retry = fixture.run_notify("h-timeout-retry", caller_chain(&identity));
+    server.join().unwrap();
+    assert_success(&retry);
+    let retry_diagnostic = stdout_json(&retry);
+    assert!(
+        matches!(
+            retry_diagnostic["pty_delivery"]["status"].as_str(),
+            Some("acked" | "awaiting_observation")
+        ),
+        "diagnostic was {retry_diagnostic}"
+    );
+
+    let payloads = captured.lock().unwrap();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(
+        delivery_attempt_id(&payloads[0]),
+        delivery_attempt_id(&payloads[1])
+    );
+    let attempt_count: i64 = fixture
+        .mailbox()
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox_delivery_attempts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 1);
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 1);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn undeliverable_older_rows_do_not_hide_accepted_pty_owner() {
     let fixture = Fixture::new();
     let identity = current_identity();
@@ -626,6 +709,7 @@ fn notify_live_pty_failure_leaves_pending_and_wake_busy() {
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     assert!(captured.lock().unwrap().contains("h-unsafe"));
     fixture.assert_default_user_paths_untouched();
 }
@@ -677,6 +761,7 @@ fn notify_live_pty_child_output_active_is_precise_nack_and_traced() {
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     assert!(captured.lock().unwrap().contains("h-child-output-active"));
     fixture.assert_default_user_paths_untouched();
 }
@@ -709,6 +794,7 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     assert_eq!(runtime.run_state, "idle");
     assert!(runtime.pty_control_path.is_none());
     assert!(!stale_socket.exists());
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
     assert!(
         trace.contains("decision=skip-connect_error"),
@@ -893,6 +979,88 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
             .unwrap()
             .is_empty()
     );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("resolved-request-received.log");
+    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-resolved-request", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "abababab-abab-4bab-8bab-abababababab",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-resolved-request",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-resolved-request", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let control_path = running_control_path(&fixture);
+    let row = fixture.seed_mailbox("h-resolved-request");
+    let mut mailbox = fixture.mailbox();
+    mailbox
+        .register_delivery_attempt(
+            "resolved-before-accept",
+            SESSION_A,
+            &invocation_uuid,
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+    mailbox
+        .resolve_unacknowledged_delivery_attempt("resolved-before-accept")
+        .unwrap();
+    drop(mailbox);
+
+    let stale = render_mailbox_notification_envelope(
+        std::slice::from_ref(&row),
+        0,
+        "resolved-before-accept",
+    );
+    let stale_response = inject_control_envelope(&control_path, &stale).unwrap();
+    assert!(!stale_response.ack, "{stale_response:?}");
+    assert_eq!(stale_response.message, "mailbox_delivery_stale");
+    let stale_output = read_until(
+        pty.master.as_raw_fd(),
+        "GOT_NOTIFY",
+        Duration::from_millis(250),
+    );
+    assert!(!stale_output.contains("GOT_NOTIFY"), "{stale_output:?}");
+
+    fixture
+        .mailbox()
+        .register_delivery_attempt(
+            "fresh-after-stale",
+            SESSION_A,
+            &invocation_uuid,
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+    let fresh = render_mailbox_notification_envelope(&[row], 0, "fresh-after-stale");
+    let fresh_response = inject_control_envelope(&control_path, &fresh).unwrap();
+    assert!(fresh_response.ack, "{fresh_response:?}");
+    let fresh_output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+    assert!(fresh_output.contains("GOT_NOTIFY"), "{fresh_output:?}");
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "fresh-after-stale-turn",
+        "user",
+        "[OULIPOLY-DELIVERY fresh-after-stale]",
+    );
+    assert!(repl.wait().unwrap().success());
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -1289,6 +1457,29 @@ fn spawn_control_server(
     })
 }
 
+fn spawn_timeout_then_ack_control_server(
+    path: &Path,
+    captured: Arc<Mutex<Vec<String>>>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(read_inject_payload(&mut first));
+        thread::sleep(Duration::from_millis(2_300));
+        drop(first);
+
+        let (mut retry, _) = listener.accept().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .push(read_inject_payload(&mut retry));
+        write_response(&mut retry, true, "ok");
+    })
+}
+
 struct OuterPty {
     master: File,
     slave: File,
@@ -1613,6 +1804,18 @@ fn delivery_attempt_id(payload: &str) -> String {
     let start = payload.rfind(marker).expect("delivery marker") + marker.len();
     let tail = &payload[start..];
     tail[..tail.find(']').expect("delivery marker suffix")].to_string()
+}
+
+fn unresolved_delivery_attempt_count(fixture: &Fixture) -> i64 {
+    fixture
+        .mailbox()
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox_delivery_attempts WHERE resolved_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn caller_chain(identity: &ProcessIdentity) -> Value {

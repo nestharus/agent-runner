@@ -8,11 +8,18 @@
 
 use oulipoly_config::provider_implementation_ref::ProviderImplementationRef;
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig, ResumeKind, ResumeStrategy};
+use oulipoly_runtime::executor::cli::pty_broker::{
+    inject_control_envelope, render_mailbox_notification_envelope,
+};
 use oulipoly_runtime::executor::cli::{
     ResumePayload, execute_interactive_with_result_and_model_config,
     execute_interactive_with_result_and_model_identity,
 };
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, EnqueueResult, MAILBOX_DELIVERY_UNCONFIRMED_ERROR, MailboxDb,
+    MailboxRow,
+};
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -33,6 +40,8 @@ const OBSERVER_EVENTS_ENV: &str = "WU_E_OBSERVER_EVENTS";
 const OBSERVER_WORKING_DIR_ENV: &str = "WU_E_OBSERVER_WORKING_DIR";
 const OBSERVER_SESSION_ID: &str = "session-overlay-proof";
 const OBSERVER_INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
+const PREVIOUS_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
+const MAILBOX_ATTEMPT_ID: &str = "mailbox-live-observation-attempt";
 
 #[test]
 fn broker_child_sees_tty_relays_io_preserves_exit_and_restores_raw_mode() {
@@ -135,6 +144,173 @@ fn production_observed_relay_separates_idle_draft_from_queued_overlay() {
     assert!(event_text.contains(OBSERVER_SESSION_ID));
     assert!(event_text.contains(&dir.path().display().to_string()));
     assert!(!rendered_screen_text(&output, 33, 100).contains("outbound:"));
+}
+
+#[test]
+fn production_observed_relay_confirms_live_mailbox_marker_without_state_ingest() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("mailbox-events.log");
+    let observer_state = dir.path().join("mailbox-observer-state");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&observer_state, "baseline").unwrap();
+    let child_script = observed_mailbox_child_script(dir.path(), &events, &observer_state);
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    let row = seed_mailbox_attempt(&mailbox_path, OBSERVER_INVOCATION_UUID, false);
+    let result_path = dir.path().join("mailbox-observed-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    let output = read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    let control_path = wait_for_control_path(&mailbox_path);
+    let envelope = render_mailbox_notification_envelope(&[row], 0, MAILBOX_ATTEMPT_ID);
+    let response = inject_control_envelope(&control_path, &envelope).unwrap();
+    assert!(response.ack, "{response:?}");
+    let output = read_until_bytes_with_prefix(
+        pty.master.as_raw_fd(),
+        output,
+        "GOT-MAILBOX",
+        Duration::from_secs(5),
+    );
+    wait_for_mailbox_delivery(&mailbox_path);
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+
+    let status = child.wait().unwrap();
+    assert!(status.success(), "observed helper failed with {status:?}");
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "0\n");
+    let event_text = fs::read_to_string(events).unwrap();
+    assert!(event_text.contains("observer:mailbox-user-turn"));
+    assert!(event_text.contains(MAILBOX_ATTEMPT_ID));
+    assert!(!rendered_screen_text(&output, 33, 100).contains("outbound:"));
+}
+
+#[test]
+fn production_observer_resolves_previous_pty_invocation_before_redelivery() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("restart-mailbox-events.log");
+    let observer_state = dir.path().join("restart-mailbox-state");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(
+        &observer_state,
+        format!("[OULIPOLY-DELIVERY {MAILBOX_ATTEMPT_ID}]"),
+    )
+    .unwrap();
+    let child_script = observed_mailbox_child_script(dir.path(), &events, &observer_state);
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    seed_mailbox_attempt(&mailbox_path, PREVIOUS_INVOCATION_UUID, true);
+    let result_path = dir.path().join("restart-mailbox-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    wait_for_mailbox_delivery(&mailbox_path);
+    let delivered = MailboxDb::open(&mailbox_path)
+        .unwrap()
+        .list_mailbox(OBSERVER_SESSION_ID, true)
+        .unwrap();
+    assert_eq!(
+        delivered[0].delivered_by_invocation_uuid.as_deref(),
+        Some(PREVIOUS_INVOCATION_UUID)
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "0\n");
+    let event_text = fs::read_to_string(events).unwrap();
+    assert!(event_text.contains("observer:mailbox-user-turn"));
+    assert!(!event_text.contains("child:[OULIPOLY NOTIFICATIONS]"));
+}
+
+#[test]
+fn production_observed_relay_releases_unobserved_mailbox_attempt_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("unobserved-mailbox-events.log");
+    let observer_state = dir.path().join("unobserved-mailbox-state");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&observer_state, "baseline").unwrap();
+    let child_script =
+        observed_unconfirmed_mailbox_child_script(dir.path(), &events, &observer_state);
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    let row = seed_mailbox_attempt(&mailbox_path, OBSERVER_INVOCATION_UUID, false);
+    let result_path = dir.path().join("unobserved-mailbox-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    let control_path = wait_for_control_path(&mailbox_path);
+    let envelope = render_mailbox_notification_envelope(&[row], 0, MAILBOX_ATTEMPT_ID);
+    let response = inject_control_envelope(&control_path, &envelope).unwrap();
+    assert!(response.ack, "{response:?}");
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "GOT-MAILBOX",
+        Duration::from_secs(5),
+    );
+    wait_for_unobserved_mailbox_attempt(&mailbox_path);
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+
+    let status = child.wait().unwrap();
+    assert!(status.success(), "observed helper failed with {status:?}");
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "0\n");
+    let event_text = fs::read_to_string(events).unwrap();
+    assert!(event_text.contains("observer:later-user-turn"));
+    assert!(!event_text.contains("observer:mailbox-user-turn"));
 }
 
 #[test]
@@ -300,6 +476,42 @@ fn spawn_observed_helper_under_pty(
         .env(OBSERVER_EVENTS_ENV, events)
         .env(OBSERVER_WORKING_DIR_ENV, working_dir)
         .env(RESULT_PATH_ENV, result_path)
+        .env("TERM", "xterm-256color")
+        .env("OULIPOLY_INTERACTIVE_TUI", "1")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    install_helper_pre_exec(&mut cmd, slave_fd, master_fd);
+    cmd.spawn().unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_mailbox_observed_helper_under_pty(
+    pty: &OuterPty,
+    child_script: &Path,
+    adapter: &Path,
+    state: &Path,
+    events: &Path,
+    working_dir: &Path,
+    data_root: &Path,
+    runtime_root: &Path,
+    result_path: &Path,
+) -> std::process::Child {
+    let (stdin, stdout, stderr) = cloned_slave_stdio(pty);
+    let (slave_fd, master_fd) = pty_raw_fds(pty);
+    let mut cmd = Command::new(current_test_exe());
+    cmd.arg("--exact")
+        .arg("helper_runs_production_observed_session")
+        .arg("--nocapture")
+        .env(OBSERVED_HELPER_ENV, "1")
+        .env(PROVIDER_SCRIPT_ENV, child_script)
+        .env(OBSERVER_ADAPTER_ENV, adapter)
+        .env(OBSERVER_STATE_ENV, state)
+        .env(OBSERVER_EVENTS_ENV, events)
+        .env(OBSERVER_WORKING_DIR_ENV, working_dir)
+        .env(RESULT_PATH_ENV, result_path)
+        .env("OULIPOLY_DATA_DIR", data_root)
+        .env("XDG_RUNTIME_DIR", runtime_root)
         .env("TERM", "xterm-256color")
         .env("OULIPOLY_INTERACTIVE_TUI", "1")
         .stdin(Stdio::from(stdin))
@@ -487,6 +699,61 @@ raise SystemExit(9)
     path
 }
 
+fn observed_mailbox_child_script(dir: &Path, events: &Path, state: &Path) -> PathBuf {
+    let path = dir.join("observed-mailbox-child.py");
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import pathlib
+import sys
+events = pathlib.Path({events:?})
+state = pathlib.Path({state:?})
+print("READY-MAILBOX", flush=True)
+for line in sys.stdin:
+    line = line.rstrip("\r\n")
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write("child:" + line + "\n")
+    if line.startswith("[OULIPOLY-DELIVERY "):
+        state.write_text(line)
+    if line == "[END OULIPOLY NOTIFICATIONS]":
+        print("GOT-MAILBOX", flush=True)
+    if line == "exit":
+        raise SystemExit(0)
+raise SystemExit(9)
+"#,
+        events = events.display().to_string(),
+        state = state.display().to_string(),
+    );
+    write_executable(&path, &body);
+    path
+}
+
+fn observed_unconfirmed_mailbox_child_script(dir: &Path, events: &Path, state: &Path) -> PathBuf {
+    let path = dir.join("observed-unconfirmed-mailbox-child.py");
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import pathlib
+import sys
+events = pathlib.Path({events:?})
+state = pathlib.Path({state:?})
+print("READY-MAILBOX", flush=True)
+for line in sys.stdin:
+    line = line.rstrip("\r\n")
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write("child:" + line + "\n")
+    if line == "[END OULIPOLY NOTIFICATIONS]":
+        state.write_text("later-without-marker")
+        print("GOT-MAILBOX", flush=True)
+    if line == "exit":
+        raise SystemExit(0)
+raise SystemExit(9)
+"#,
+        events = events.display().to_string(),
+        state = state.display().to_string(),
+    );
+    write_executable(&path, &body);
+    path
+}
+
 fn observer_adapter_script(dir: &Path, events: &Path, state: &Path) -> PathBuf {
     let path = dir.join("observer-adapter.py");
     let body = format!(
@@ -536,7 +803,8 @@ turns = [{{
     "role": "user",
     "body": [{{"type": "text", "text": "first"}}],
 }}]
-if state.read_text().strip() == "new":
+state_value = state.read_text().strip()
+if state_value == "new":
     turns.append({{
         "session_id": OBSERVER_SESSION_ID,
         "turn_id": "new-exact-body",
@@ -546,6 +814,26 @@ if state.read_text().strip() == "new":
     }})
     with events.open("a", encoding="utf-8") as handle:
         handle.write("observer:new-user-turn\n")
+elif state_value.startswith("[OULIPOLY-DELIVERY "):
+    turns.append({{
+        "session_id": OBSERVER_SESSION_ID,
+        "turn_id": "mailbox-exact-marker",
+        "timestamp": "2026-07-25T20:56:24Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": state_value}}],
+    }})
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write("observer:mailbox-user-turn\n")
+elif state_value == "later-without-marker":
+    turns.append({{
+        "session_id": OBSERVER_SESSION_ID,
+        "turn_id": "later-ordinary-user-turn",
+        "timestamp": "2099-07-25T20:57:25Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": "ordinary later user turn"}}],
+    }})
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write("observer:later-user-turn\n")
 print(json.dumps(envelope({{"turns": turns, "turn_count": len(turns), "complete": True}})))
 "#,
         events = events.display().to_string(),
@@ -554,6 +842,97 @@ print(json.dumps(envelope({{"turns": turns, "turn_count": len(turns), "complete"
     );
     write_executable(&path, &body);
     path
+}
+
+fn seed_mailbox_attempt(
+    mailbox_path: &Path,
+    delivery_invocation_uuid: &str,
+    acknowledged: bool,
+) -> MailboxRow {
+    let mut db = MailboxDb::open(mailbox_path).unwrap();
+    let row = match db
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: OBSERVER_SESSION_ID,
+            handle: "mailbox-live-observation-handle",
+            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+            owner_invocation_uuid: Some(OBSERVER_INVOCATION_UUID),
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: Some(0),
+            state_dir: "/fixture/state",
+            meta_path: "/fixture/meta.json",
+            log_path: "/fixture/log",
+            rc_path: "/fixture/rc",
+            rc: 0,
+        })
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        other => panic!("expected inserted mailbox row, got {other:?}"),
+    };
+    db.register_delivery_attempt(
+        MAILBOX_ATTEMPT_ID,
+        OBSERVER_SESSION_ID,
+        delivery_invocation_uuid,
+        &[row.seq],
+        0,
+    )
+    .unwrap();
+    if acknowledged {
+        db.record_delivery_attempt_transport_ack(MAILBOX_ATTEMPT_ID)
+            .unwrap();
+    }
+    row
+}
+
+fn wait_for_control_path(mailbox_path: &Path) -> PathBuf {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let db = MailboxDb::open(mailbox_path).unwrap();
+        if let Some(path) = db
+            .session_runtime(OBSERVER_SESSION_ID)
+            .unwrap()
+            .and_then(|runtime| runtime.pty_control_path)
+        {
+            return PathBuf::from(path);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for PTY control path")
+}
+
+fn wait_for_mailbox_delivery(mailbox_path: &Path) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let db = MailboxDb::open(mailbox_path).unwrap();
+        let rows = db.list_mailbox(OBSERVER_SESSION_ID, true).unwrap();
+        if rows.len() == 1 && rows[0].delivered_at.is_some() && rows[0].delivery_attempts == 1 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for provider-observed mailbox delivery")
+}
+
+fn wait_for_unobserved_mailbox_attempt(mailbox_path: &Path) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let db = MailboxDb::open(mailbox_path).unwrap();
+        let rows = db.list_pending(OBSERVER_SESSION_ID).unwrap();
+        let accepted = db
+            .accepted_delivery_attempt_windows(OBSERVER_SESSION_ID)
+            .unwrap();
+        if rows.len() == 1
+            && rows[0].delivery_attempts == 1
+            && rows[0].delivery_error.as_deref() == Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
+            && accepted.is_empty()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for unobserved mailbox attempt release")
 }
 
 fn write_executable(path: &Path, body: &str) {

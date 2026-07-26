@@ -5,6 +5,7 @@ use crate::session_provider::{
     self, SessionProviderIdentity, SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
     SessionProviderTurn,
 };
+use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,7 @@ pub(super) struct OutboundObservationIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ObservedUserTurn {
     pub(super) turn_id: String,
+    pub(super) timestamp: DateTime<Utc>,
     pub(super) body: Option<String>,
 }
 
@@ -140,6 +142,7 @@ impl ProviderSessionTurnSource {
 fn observed_user_turn(turn: &SessionProviderTurn) -> ObservedUserTurn {
     ObservedUserTurn {
         turn_id: turn.turn_id.clone(),
+        timestamp: turn.timestamp,
         body: turn.body.as_ref().and_then(canonical_text_body),
     }
 }
@@ -451,10 +454,16 @@ mod tests {
             vec![
                 ObservedUserTurn {
                     turn_id: "user-old".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
                     body: Some("same body".to_string()),
                 },
                 ObservedUserTurn {
                     turn_id: "user-text".to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
                     body: Some("helloworld".to_string()),
                 },
             ]

@@ -138,7 +138,7 @@ fn attempt_pty_mailbox_delivery_inner(
             "Failed to reconcile accepted PTY delivery: {err}"
         );
     }
-    match accepted_pty_owner(mailbox, session_id, delivery_invocation_uuid) {
+    match accepted_pty_prefix(mailbox, session_id) {
         Ok(Some(_)) => {
             return pty_status(
                 false,
@@ -203,6 +203,7 @@ fn attempt_pty_mailbox_delivery_inner(
             control_path,
         ),
         Ok(response) => {
+            resolve_unacknowledged_pty_attempt_or_warn(mailbox, session_id, &prepared.attempt_id);
             let status = pty_nack_status(&response.message).to_string();
             pty_status(
                 true,
@@ -214,8 +215,30 @@ fn attempt_pty_mailbox_delivery_inner(
             )
         }
         Err(err) => {
+            if !pty_client_error_may_have_reached_broker(&err.kind) {
+                resolve_unacknowledged_pty_attempt_or_warn(
+                    mailbox,
+                    session_id,
+                    &prepared.attempt_id,
+                );
+            }
             pty_client_error_status(mailbox, session_id, control_path, err.kind, err.message)
         }
+    }
+}
+
+#[cfg(unix)]
+fn resolve_unacknowledged_pty_attempt_or_warn(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    attempt_id: &str,
+) {
+    if let Err(err) = mailbox.resolve_unacknowledged_delivery_attempt(attempt_id) {
+        tracing::warn!(
+            session_id,
+            attempt_id,
+            "Failed to resolve unacknowledged PTY delivery attempt: {err}"
+        );
     }
 }
 
@@ -239,9 +262,9 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     }
     let batch = select_batch(&pending);
     let seqs = batch_seqs(&batch);
-    let attempt_id = new_delivery_nonce();
-    db.register_delivery_attempt(
-        &attempt_id,
+    let candidate_attempt_id = new_delivery_nonce();
+    let attempt_id = db.register_or_reuse_delivery_attempt(
+        &candidate_attempt_id,
         session_id,
         delivery_invocation_uuid,
         &seqs,
@@ -332,6 +355,11 @@ fn pty_client_error_status(
     )
 }
 
+#[cfg(unix)]
+fn pty_client_error_may_have_reached_broker(kind: &PtyControlClientErrorKind) -> bool {
+    matches!(kind, PtyControlClientErrorKind::Protocol)
+}
+
 fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
     pending_mailbox_rows(mailbox, session_id)
         .map(|rows| rows.len())
@@ -383,6 +411,16 @@ fn accepted_pty_owner(
         .accepted_delivery_attempt_windows(session_id)?
         .into_iter()
         .find(|window| window.delivery_invocation_uuid == invocation_uuid))
+}
+
+fn accepted_pty_prefix(
+    mailbox: &MailboxDb,
+    session_id: &str,
+) -> Result<Option<MailboxDeliveryWindow>, String> {
+    Ok(mailbox
+        .accepted_delivery_attempt_windows(session_id)?
+        .into_iter()
+        .next())
 }
 
 fn reconcile_accepted_pty_delivery_attempts(

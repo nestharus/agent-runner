@@ -53,6 +53,10 @@ use crate::observability::{
 #[cfg(test)]
 use crate::observability::{ObservabilitySnapshotPort, SnapshotLimits};
 use base64::Engine as _;
+use chrono::{DateTime, Utc};
+use oulipoly_state::mailbox::{
+    MAILBOX_DELIVERY_UNCONFIRMED_ERROR, MailboxDb, MailboxDeliveryWindow,
+};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -1279,6 +1283,61 @@ struct OutboundQueue {
     minimum_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailboxDeliveryObservationDisposition {
+    Confirm,
+    FailUnobserved,
+    Await,
+}
+
+#[derive(Debug, Default)]
+struct MailboxDeliveryObservationState {
+    active: bool,
+    last_generation: Option<u64>,
+    session_id: Option<String>,
+    invocation_uuid: Option<String>,
+}
+
+impl MailboxDeliveryObservationState {
+    fn refresh(&mut self, control: Option<&ControlSocket>) {
+        if let Some(control) = control {
+            self.session_id = Some(control.session_id().to_string());
+            self.invocation_uuid = Some(control.invocation_uuid().to_string());
+        }
+        match accepted_mailbox_delivery_is_active(self.session_id.as_deref()) {
+            Ok(active) => {
+                if active && !self.active {
+                    self.last_generation = None;
+                }
+                self.active = active;
+            }
+            Err(err) => tracing::warn!("Failed to inspect accepted PTY mailbox delivery: {err}"),
+        }
+    }
+
+    fn reconcile(&mut self, observation: Option<&OutboundObservationResult>) {
+        if !self.active {
+            return;
+        }
+        let Some(observation) = observation else {
+            return;
+        };
+        let generation = outbound_observation_generation(observation);
+        if self.last_generation == Some(generation) {
+            return;
+        }
+        self.last_generation = Some(generation);
+        if let Err(err) = reconcile_accepted_mailbox_delivery(
+            self.session_id.as_deref(),
+            self.invocation_uuid.as_deref(),
+            observation,
+        ) {
+            tracing::warn!("Failed to reconcile accepted PTY mailbox delivery: {err}");
+        }
+        self.refresh(None);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveOutboundSend {
     message_id: u64,
@@ -1481,6 +1540,92 @@ impl OutboundQueue {
     #[cfg(test)]
     fn status(&self, id: u64) -> Option<OutboundStatus> {
         self.message(id).map(|message| message.status)
+    }
+}
+
+fn outbound_observation_generation(observation: &OutboundObservationResult) -> u64 {
+    match observation {
+        OutboundObservationResult::Available(observation) => observation.generation,
+        OutboundObservationResult::Unavailable { generation, .. }
+        | OutboundObservationResult::Failed { generation, .. } => *generation,
+    }
+}
+
+fn accepted_mailbox_delivery_is_active(session_id: Option<&str>) -> Result<bool, String> {
+    let Some(session_id) = session_id else {
+        return Ok(false);
+    };
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(false);
+    };
+    Ok(!db.accepted_delivery_attempt_windows(session_id)?.is_empty())
+}
+
+fn reconcile_accepted_mailbox_delivery(
+    session_id: Option<&str>,
+    invocation_uuid: Option<&str>,
+    result: &OutboundObservationResult,
+) -> Result<(), String> {
+    let (Some(session_id), Some(invocation_uuid)) = (session_id, invocation_uuid) else {
+        return Ok(());
+    };
+    let OutboundObservationResult::Available(observation) = result else {
+        return Ok(());
+    };
+    if !observation.complete
+        || observation.identity.provider_session_id != session_id
+        || observation.identity.invocation_uuid != invocation_uuid
+    {
+        return Ok(());
+    }
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(());
+    };
+    let windows = db.accepted_delivery_attempt_windows(session_id)?;
+    for window in windows {
+        match mailbox_delivery_observation_disposition(&window, observation)? {
+            MailboxDeliveryObservationDisposition::Confirm => {
+                db.confirm_delivery_attempt(&window.attempt_id)?;
+            }
+            MailboxDeliveryObservationDisposition::FailUnobserved => {
+                db.fail_unobserved_delivery_attempt(
+                    &window.attempt_id,
+                    MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+                )?;
+            }
+            MailboxDeliveryObservationDisposition::Await => {}
+        }
+    }
+    Ok(())
+}
+
+fn mailbox_delivery_observation_disposition(
+    window: &MailboxDeliveryWindow,
+    observation: &OutboundObservation,
+) -> Result<MailboxDeliveryObservationDisposition, String> {
+    let marker = format!("[OULIPOLY-DELIVERY {}]", window.attempt_id);
+    if observation.user_turns.iter().any(|turn| {
+        turn.body
+            .as_deref()
+            .is_some_and(|body| body.contains(&marker))
+    }) {
+        return Ok(MailboxDeliveryObservationDisposition::Confirm);
+    }
+    let Some(acknowledged_at) = window.acknowledged_at.as_deref() else {
+        return Ok(MailboxDeliveryObservationDisposition::Await);
+    };
+    let acknowledged_at = DateTime::parse_from_rfc3339(acknowledged_at)
+        .map_err(|err| format!("Invalid mailbox delivery acknowledgement timestamp: {err}"))?
+        .with_timezone(&Utc);
+    let turns_after_ack = observation
+        .user_turns
+        .iter()
+        .filter(|turn| turn.timestamp > acknowledged_at)
+        .collect::<Vec<_>>();
+    if !turns_after_ack.is_empty() && turns_after_ack.iter().all(|turn| turn.body.is_some()) {
+        Ok(MailboxDeliveryObservationDisposition::FailUnobserved)
+    } else {
+        Ok(MailboxDeliveryObservationDisposition::Await)
     }
 }
 
@@ -4017,6 +4162,8 @@ pub(super) fn relay_until_exit_observed(
     let mut pane = MonitorPane::new();
     let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
     let outbound_worker = OutboundObserverWorker::start(outbound_source)?;
+    let mut mailbox_observation = MailboxDeliveryObservationState::default();
+    mailbox_observation.refresh(control);
     let initial = child_pane_winsize(real_fd, &pane, TypingProtection::for_focus(Focus::Top));
     let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
@@ -4089,7 +4236,7 @@ pub(super) fn relay_until_exit_observed(
                 &outbound_release_gate,
                 parser.screen().bracketed_paste(),
                 &outbound_worker,
-                Instant::now(),
+                &mut mailbox_observation,
             ),
             RenderPriority::Interactive,
         );
@@ -4113,7 +4260,7 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
-                    Instant::now(),
+                    &mut mailbox_observation,
                 ),
                 RenderPriority::Interactive,
             );
@@ -4160,7 +4307,7 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
-                    Instant::now(),
+                    &mut mailbox_observation,
                 ),
                 RenderPriority::Interactive,
             );
@@ -4239,6 +4386,7 @@ pub(super) fn relay_until_exit_observed(
                 child_pid: Some(child.id()),
             };
             let _ = service_control(control, &mut control_io);
+            mailbox_observation.refresh(Some(control));
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
         // Re-assert the scrollback view each frame (clamped to retained history) so it
@@ -5327,12 +5475,14 @@ fn pump_outbound_queue_from_worker(
     release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     worker: &OutboundObserverWorker,
-    now: Instant,
+    mailbox_observation: &mut MailboxDeliveryObservationState,
 ) -> bool {
-    if let Some(generation_floor) = worker.set_demand(pane.outbound.observation_needed()) {
+    let observation_needed = pane.outbound.observation_needed() || mailbox_observation.active;
+    if let Some(generation_floor) = worker.set_demand(observation_needed) {
         pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
     }
     let latest = worker.latest_result();
+    mailbox_observation.reconcile(latest.as_deref());
     let dirty = pump_outbound_queue_with_gate(
         pane,
         pending_child_input,
@@ -5340,9 +5490,9 @@ fn pump_outbound_queue_from_worker(
         release_gate,
         bracketed_paste,
         latest.as_deref(),
-        now,
+        Instant::now(),
     );
-    let _ = worker.set_demand(pane.outbound.observation_needed());
+    let _ = worker.set_demand(pane.outbound.observation_needed() || mailbox_observation.active);
     dirty
 }
 
@@ -6620,6 +6770,9 @@ mod tests {
                     turn_ids: ["old".to_string()].into_iter().collect(),
                     user_turns: vec![ObservedUserTurn {
                         turn_id: "old".to_string(),
+                        timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
+                            .unwrap()
+                            .with_timezone(&Utc),
                         body: Some("hello".to_string()),
                     }],
                 },
@@ -7204,10 +7357,95 @@ mod tests {
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
     }
 
+    #[test]
+    fn mailbox_delivery_observation_confirms_exact_provider_marker() {
+        let window = mailbox_delivery_window("attempt-1", "2026-07-25T20:56:23Z");
+        let observation = mailbox_observation([(
+            "marker-turn",
+            "2026-07-25T20:56:24Z",
+            Some("prefix [OULIPOLY-DELIVERY attempt-1] suffix"),
+        )]);
+
+        assert_eq!(
+            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
+            MailboxDeliveryObservationDisposition::Confirm
+        );
+    }
+
+    #[test]
+    fn mailbox_delivery_observation_retries_after_complete_later_turn_without_marker() {
+        let window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
+        let observation = mailbox_observation([(
+            "later-turn",
+            "2026-07-25T19:57:25Z",
+            Some("ordinary user input"),
+        )]);
+
+        assert_eq!(
+            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
+            MailboxDeliveryObservationDisposition::FailUnobserved
+        );
+    }
+
+    #[test]
+    fn mailbox_delivery_observation_does_not_infer_loss_from_unprojected_or_older_turns() {
+        let window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
+        for observation in [
+            mailbox_observation([("later-unprojected", "2026-07-25T19:57:25Z", None)]),
+            mailbox_observation([(
+                "older-turn",
+                "2026-07-25T19:55:25Z",
+                Some("ordinary user input"),
+            )]),
+        ] {
+            assert_eq!(
+                mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
+                MailboxDeliveryObservationDisposition::Await
+            );
+        }
+    }
+
     fn queued_pane(body: &str, _now: Instant) -> MonitorPane {
         let mut pane = MonitorPane::new();
         pane.outbound.enqueue(body.to_string());
         pane
+    }
+
+    fn mailbox_delivery_window(attempt_id: &str, acknowledged_at: &str) -> MailboxDeliveryWindow {
+        MailboxDeliveryWindow {
+            attempt_id: attempt_id.to_string(),
+            session_id: "fixture-session".to_string(),
+            delivery_invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            acknowledged_at: Some(acknowledged_at.to_string()),
+            resolved_at: None,
+            rows: Vec::new(),
+            remaining_count: 0,
+        }
+    }
+
+    fn mailbox_observation<const N: usize>(
+        turns: [(&str, &str, Option<&str>); N],
+    ) -> OutboundObservation {
+        OutboundObservation {
+            identity: outbound_identity(),
+            generation: 1,
+            complete: true,
+            turn_count: turns.len() as u64,
+            turn_ids: turns
+                .iter()
+                .map(|(turn_id, _, _)| (*turn_id).to_string())
+                .collect(),
+            user_turns: turns
+                .into_iter()
+                .map(|(turn_id, timestamp, body)| ObservedUserTurn {
+                    turn_id: turn_id.to_string(),
+                    timestamp: DateTime::parse_from_rfc3339(timestamp)
+                        .unwrap()
+                        .with_timezone(&Utc),
+                    body: body.map(str::to_string),
+                })
+                .collect(),
+        }
     }
 
     fn sent_pane<const N: usize>(
@@ -7259,6 +7497,9 @@ mod tests {
                 .into_iter()
                 .map(|(turn_id, body)| ObservedUserTurn {
                     turn_id: turn_id.to_string(),
+                    timestamp: DateTime::parse_from_rfc3339("2026-05-01T00:00:01Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
                     body: body.map(str::to_string),
                 })
                 .collect(),
