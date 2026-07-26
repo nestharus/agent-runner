@@ -2072,10 +2072,9 @@ fn process_control_request_with_pending(
     if payload.bytes.is_empty() {
         return acknowledge_control_payload(&payload);
     }
-    // Safe proactive delivery means the PTY foreground process group is still
-    // the agent, child output has cleared the short debounce, and either the
-    // line parser saw a boundary or user input has been idle long enough to
-    // tolerate terminals whose Enter sequence is not recognized here.
+    // Prefer a short child-output quiet window. After the bounded wait, a TUI
+    // that continuously redraws may still receive delivery only at a verified
+    // empty input boundary with the agent retaining foreground ownership.
     wait_until_safe_to_inject(
         io.real_fd,
         io.master_fd,
@@ -2123,14 +2122,14 @@ fn prepare_control_payload(
             delivery_attempt_id: None,
         });
     }
+    if window.resolved_at.is_some() {
+        return Err("mailbox_delivery_stale".to_string());
+    }
     if window.acknowledged_at.is_none()
         && db
             .accepted_delivery_attempt_windows(&window.session_id)?
             .into_iter()
-            .any(|owner| {
-                owner.attempt_id != attempt_id
-                    && owner.delivery_invocation_uuid == window.delivery_invocation_uuid
-            })
+            .any(|owner| owner.attempt_id != attempt_id)
     {
         return Err("mailbox_delivery_owned".to_string());
     }
@@ -2355,8 +2354,27 @@ fn validate_safe_to_inject(
     line_state: &InputLineState,
     child_output_state: &ChildOutputState,
 ) -> Result<(), String> {
-    safe_to_inject(master_fd, child_pid, line_state, child_output_state)
-        .map_err(unsafe_reason_message)
+    safe_to_inject_after_wait_for_foreground(
+        foreground_owner_state(master_fd, child_pid),
+        line_state,
+        child_output_state,
+    )
+    .map_err(unsafe_reason_message)
+}
+
+fn safe_to_inject_after_wait_for_foreground(
+    foreground: ForegroundOwnerState,
+    line_state: &InputLineState,
+    child_output_state: &ChildOutputState,
+) -> Result<(), InjectionUnsafeReason> {
+    match safe_to_inject_for_foreground(foreground, line_state, child_output_state) {
+        Err(InjectionUnsafeReason::ChildOutputActive)
+            if foreground == ForegroundOwnerState::Owner && line_state.input_empty() =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn safe_to_inject(
@@ -3000,6 +3018,33 @@ print(json.dumps({
     }
 
     #[test]
+    fn bounded_wait_fallback_allows_continuous_redraw_only_at_empty_input() {
+        let output_state = ChildOutputState {
+            last_child_output_at: Some(Instant::now()),
+        };
+        let empty = InputLineState::default();
+        assert_eq!(
+            safe_to_inject_after_wait_for_foreground(
+                ForegroundOwnerState::Owner,
+                &empty,
+                &output_state,
+            ),
+            Ok(())
+        );
+
+        let mut partial = InputLineState::default();
+        partial.observe_user_input(b"partial");
+        assert_eq!(
+            safe_to_inject_after_wait_for_foreground(
+                ForegroundOwnerState::Owner,
+                &partial,
+                &output_state,
+            ),
+            Err(InjectionUnsafeReason::ChildOutputActive)
+        );
+    }
+
+    #[test]
     fn safe_to_inject_keeps_foreground_process_group_guard() {
         let line_state = InputLineState::default();
         let output_state = ChildOutputState::default();
@@ -3403,7 +3448,7 @@ print(json.dumps({
     }
 
     #[test]
-    fn control_request_active_child_output_returns_err_without_injection() {
+    fn control_request_continuous_redraw_injects_once_after_bounded_wait() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
         let (real_fd, _real_peer) = socketpair_files();
@@ -3425,7 +3470,8 @@ print(json.dumps({
             }
         });
 
-        let err = {
+        let started = Instant::now();
+        let result = {
             let mut request_io = ControlRequestIo {
                 real_fd: real_fd.as_raw_fd(),
                 master_fd: master.as_raw_fd(),
@@ -3435,18 +3481,19 @@ print(json.dumps({
                 pending_child_input: &mut pending,
                 buffer: &mut buffer,
             };
-            process_control_request_with_pending(&mut server, &mut request_io, None).unwrap_err()
+            process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
         writer.join().unwrap();
-        assert_eq!(err, "unsafe_child_output_active");
-        assert!(pending.is_empty());
+        assert_eq!(result, Ok(()));
+        assert!(started.elapsed() >= INJECT_WAIT_LIMIT);
         set_nonblocking(child_reader.as_raw_fd());
         let mut injected = Vec::new();
+        flush_pending_child_input_to_completion(master.as_raw_fd(), &mut pending).unwrap();
         drain_available(child_reader.as_raw_fd(), &mut injected).unwrap();
-        assert!(
-            !String::from_utf8_lossy(&injected).contains("notify"),
-            "unsafe injection wrote: {injected:?}"
+        assert_eq!(
+            String::from_utf8_lossy(&injected).matches("notify").count(),
+            1
         );
     }
 
