@@ -21,7 +21,8 @@ use super::error_mapper::{
     protocol_service_error, provider_client_error_is_rotatable, service_error,
 };
 use super::launch_result_mapper::{
-    launch_provider_session_id, map_launch_result_with_terminal_classification,
+    PROVIDER_SESSION_MARKER, launch_provider_session_id,
+    map_launch_result_with_terminal_classification, marker_provider_session_id,
 };
 use super::policy_transform::apply_policy_transform;
 use super::request_builder::{build_launch_candidate, build_launch_request, build_policy_request};
@@ -37,6 +38,7 @@ use oulipoly_provider::client::ProcessSpawnObserver;
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::stream::LaunchResult;
+use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver};
 use oulipoly_state::pid_identity::ProcessIdentity;
 use std::sync::{Arc, Mutex};
 
@@ -131,9 +133,13 @@ fn attempt_account_dispatch(
     let recorded_identity = recorded_launch_identity();
     let spawn_observer =
         external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_identity));
-    let client = registry
-        .client_factory()
-        .client_for_with_spawn_observer(artifact.clone(), spawn_observer);
+    let launch_event_observer =
+        external_launch_event_observer(spawn_identity.as_ref(), Arc::clone(&recorded_identity));
+    let client = registry.client_factory().client_for_with_observers(
+        artifact.clone(),
+        spawn_observer,
+        launch_event_observer,
+    );
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
     let policy_request = build_policy_request(context, &candidate)
@@ -188,6 +194,37 @@ fn external_launch_spawn_observer(
         let identity = record_child_identity(child_id, Some(&context));
         remember_recorded_launch_identity(&recorded_identity, identity);
     }))
+}
+
+fn external_launch_event_observer(
+    context: Option<&SpawnIdentityContext>,
+    recorded_identity: RecordedLaunchIdentity,
+) -> Option<LaunchEventObserver> {
+    let context = context.cloned()?;
+    Some(LaunchEventObserver::new(move |event| {
+        backfill_external_launch_session_marker(&context, &recorded_identity, event);
+    }))
+}
+
+fn backfill_external_launch_session_marker(
+    context: &SpawnIdentityContext,
+    recorded_identity: &RecordedLaunchIdentity,
+    event: &DecodedLaunchEvent,
+) {
+    let DecodedLaunchEvent::Marker { name, value, .. } = event else {
+        return;
+    };
+    if name != PROVIDER_SESSION_MARKER {
+        return;
+    }
+    let Some(session_id) = marker_provider_session_id(value) else {
+        return;
+    };
+    let identity = recorded_identity
+        .lock()
+        .ok()
+        .and_then(|identity| identity.clone());
+    backfill_captured_session_id(Some(context), identity.as_ref(), &session_id);
 }
 
 fn remember_recorded_launch_identity(
