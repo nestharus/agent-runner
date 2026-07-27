@@ -61,6 +61,7 @@ use crate::schemas::{SchemaRegistry, SchemaValidationError};
 use base64::Engine;
 use serde_json::Value;
 use std::io::Read;
+use std::sync::Arc;
 
 const DEFAULT_RETAINED_LAUNCH_EVENTS: usize = 1024;
 const DEFAULT_LAUNCH_RETAINED_BYTES: usize = 1024 * 1024;
@@ -125,6 +126,30 @@ impl DecodedLaunchEvent {
             Self::Stdout { data, .. } | Self::Stderr { data, .. } => Some(data),
             _ => None,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct LaunchEventObserver {
+    callback: Arc<dyn Fn(&DecodedLaunchEvent) + Send + Sync>,
+}
+
+impl LaunchEventObserver {
+    pub fn new(callback: impl Fn(&DecodedLaunchEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    fn observe(&self, event: &DecodedLaunchEvent) {
+        (self.callback)(event);
+    }
+}
+
+impl std::fmt::Debug for LaunchEventObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchEventObserver")
+            .finish_non_exhaustive()
     }
 }
 
@@ -273,6 +298,11 @@ impl LaunchStdoutProcessor {
             error: None,
         }
     }
+
+    pub(crate) fn with_event_observer(mut self, observer: Option<LaunchEventObserver>) -> Self {
+        self.parser.event_observer = observer;
+        self
+    }
 }
 
 impl StdoutProcessor for LaunchStdoutProcessor {
@@ -337,6 +367,7 @@ struct LaunchStreamParser {
     expected_seq: u64,
     last_seq: Option<u64>,
     deferred_initial_skip: bool,
+    event_observer: Option<LaunchEventObserver>,
 }
 
 impl LaunchStreamParser {
@@ -361,6 +392,7 @@ impl LaunchStreamParser {
             expected_seq: 1,
             last_seq: None,
             deferred_initial_skip: false,
+            event_observer: None,
         }
     }
 
@@ -542,6 +574,9 @@ impl LaunchStreamParser {
     }
 
     fn record_launch_event(&mut self, decoded: DecodedLaunchEvent) {
+        if let Some(observer) = &self.event_observer {
+            observer.observe(&decoded);
+        }
         self.record_decoded_bytes(&decoded);
         self.record_marker(&decoded);
         self.record_exit(&decoded);

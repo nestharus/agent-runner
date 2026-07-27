@@ -51,7 +51,7 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
 ) {
-    if !mailbox_delivery_requires_turn_confirmation(input, &provider.name, result)
+    if !mailbox_delivery_requires_turn_confirmation(input, result)
         || mailbox_delivery_turn_confirmed(input, &provider.name, result, zero_turn_action)
     {
         return;
@@ -97,19 +97,17 @@ fn mailbox_delivery_unconfirmed(
     result: &executor::ExecutionResult,
     zero_turn_action: ZeroTurnAction,
 ) -> bool {
-    mailbox_delivery_requires_turn_confirmation(input, provider_name, result)
+    mailbox_delivery_requires_turn_confirmation(input, result)
         && !mailbox_delivery_turn_confirmed(input, provider_name, result, zero_turn_action)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
     input: &ResumeAttemptInput<'_>,
-    provider_name: &str,
     result: &executor::ExecutionResult,
 ) -> bool {
     result.exit_code == 0
         && !input.mailbox_delivery_seqs.is_empty()
         && input.answer.is_some_and(|answer| !answer.trim().is_empty())
-        && input.env.sessions_cfg.get(provider_name).is_some()
 }
 
 fn mailbox_delivery_turn_confirmed(

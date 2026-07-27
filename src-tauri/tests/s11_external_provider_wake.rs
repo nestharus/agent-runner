@@ -166,6 +166,11 @@ turn_script = {}
         .unwrap();
     }
 
+    fn write_external_provider_without_session_config(&self) {
+        self.write_external_provider();
+        fs::remove_file(self.app_config_dir.join("sessions.toml")).unwrap();
+    }
+
     fn write_external_provider_script(&self) -> PathBuf {
         let path = self.dir.path().join("external-provider.py");
         fs::write(&path, external_provider_script()).unwrap();
@@ -314,6 +319,43 @@ fn external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes() {
 }
 
 #[test]
+fn external_provider_live_notification_resolves_owner_before_launch_exit() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch live external provider wake",
+        &[
+            ("S11_NOTIFY_DELAY_SECONDS", "0.1"),
+            ("S11_INITIAL_LAUNCH_HOLD_SECONDS", "1.0"),
+        ],
+    );
+    assert_success(&output);
+
+    let (notify_json, notify) =
+        wait_for_json_file(&fixture.work_dir.join(HANDLE).join("notify.json"));
+    assert_eq!(
+        notify.get("status").and_then(Value::as_str),
+        Some("enqueued"),
+        "live notify response: {notify_json}"
+    );
+    assert_eq!(
+        notify.get("owner_session_id").and_then(Value::as_str),
+        Some(SESSION),
+        "live notify response: {notify_json}"
+    );
+    wait_until("live external provider wake delivered", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && rows[0].delivery_attempts == 1
+            && rows[0].delivery_error.is_none()
+    });
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
 fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -375,6 +417,34 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
         !fixture.prompt_file("external-wake-resumed.txt").exists(),
         "drop mode must not write the payload-bearing resume file"
     );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_wake_without_session_config_still_requires_turn_confirmation() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider_without_session_config();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider wake without session config",
+        &[
+            ("S11_DROP_RESUME_PAYLOAD", "1"),
+            ("OULIPOLY_AUTO_WAKE_MAX", "1"),
+        ],
+    );
+    assert_success(&output);
+
+    let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
+    wait_until("unconfigured session source left mailbox pending", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_none()
+            && rows[0].delivery_attempts == 1
+            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 1);
     fixture.assert_xdg_isolated();
 }
 
@@ -664,6 +734,17 @@ def stdout_event(request, seq, payload):
         "data_base64": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
     }
 
+def provider_session_marker_event(request, seq, session_id):
+    return {
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.provider_session",
+        "value": {"provider_session_id": session_id},
+    }
+
 def delivery_nonce(text):
     prefix = "[OULIPOLY-DELIVERY "
     start = text.find(prefix)
@@ -814,11 +895,16 @@ def launch(request):
             seq += 1
         emit(exit_event(request, seq, known))
         return
+    session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
+    seq = 1
+    if session_id:
+        emit(provider_session_marker_event(request, seq, session_id))
+        seq += 1
     if os.environ.get("S11_NO_NOTIFY") != "1":
         spawn_notify_workload()
-    emit(stdout_event(request, 1, "initial\n"))
-    session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
-    emit(exit_event(request, 2, session_id))
+    time.sleep(float(os.environ.get("S11_INITIAL_LAUNCH_HOLD_SECONDS", "0")))
+    emit(stdout_event(request, seq, "initial\n"))
+    emit(exit_event(request, seq + 1, session_id))
 
 def session_id_from_request(request):
     params = request.get("params", {})
@@ -871,7 +957,7 @@ def notify_helper():
     provider_pid = int(sys.argv[2])
     boot_id = sys.argv[3]
     start_ticks = int(sys.argv[4])
-    time.sleep(1.5)
+    time.sleep(float(os.environ.get("S11_NOTIFY_DELAY_SECONDS", "1.5")))
     work = pathlib.Path(os.environ["S11_WORK_DIR"])
     state = work / HANDLE
     state.mkdir(parents=True, exist_ok=True)

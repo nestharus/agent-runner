@@ -58,7 +58,7 @@ use crate::resolver::{
     ProviderArtifactRef, ProviderResolveOptions, ProviderResolver, ResolvedProviderCommand,
 };
 use crate::schemas::{SchemaRegistry, SchemaValidationError};
-use crate::stream::{LaunchResult, LaunchStdoutDrain, LaunchStdoutProcessor};
+use crate::stream::{LaunchEventObserver, LaunchResult, LaunchStdoutDrain, LaunchStdoutProcessor};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::ffi::OsString;
@@ -134,6 +134,7 @@ pub struct ProviderClientOptions {
     pub cancellation: Option<CancellationToken>,
     pub resolver: ProviderResolveOptions,
     pub spawn_observer: Option<ProcessSpawnObserver>,
+    pub launch_event_observer: Option<LaunchEventObserver>,
 }
 
 pub trait ProviderEnv {
@@ -172,6 +173,7 @@ impl Default for ProviderClientOptions {
             cancellation: None,
             resolver: ProviderResolveOptions::default(),
             spawn_observer: None,
+            launch_event_observer: None,
         }
     }
 }
@@ -201,6 +203,11 @@ impl ProviderClientOptions {
 
     pub fn with_spawn_observer(mut self, observer: Option<ProcessSpawnObserver>) -> Self {
         self.spawn_observer = observer;
+        self
+    }
+
+    pub fn with_launch_event_observer(mut self, observer: Option<LaunchEventObserver>) -> Self {
+        self.launch_event_observer = observer;
         self
     }
 }
@@ -379,7 +386,8 @@ impl ProviderClient {
         let limits = process_limits_for("launch", self.options.timeouts.launch, &self.options);
         let command = process_command_from_resolved(resolved, "launch");
         let stdout_processor =
-            LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit);
+            LaunchStdoutProcessor::new(request_id.clone().unwrap_or_default(), limits.stdout_limit)
+                .with_event_observer(self.options.launch_event_observer.clone());
         let runner = ProcessRunner::new(limits);
         runner
             .run_with_stdout_line_gap_timeout_and_stdout_processor(

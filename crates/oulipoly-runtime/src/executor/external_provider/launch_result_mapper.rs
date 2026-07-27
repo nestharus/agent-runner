@@ -50,6 +50,7 @@ use oulipoly_provider::stream::LaunchResult;
 use serde_json::Value;
 
 const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
+pub(crate) const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 
 pub(crate) fn map_launch_result_with_terminal_classification(
     result: LaunchResult,
@@ -132,6 +133,15 @@ pub(crate) fn launch_provider_session_id(result: &LaunchResult) -> Option<String
         .session
         .as_ref()
         .and_then(provider_session_id_from_value)
+        .or_else(|| {
+            result
+                .retained_marker_value(PROVIDER_SESSION_MARKER)
+                .and_then(marker_provider_session_id)
+        })
+}
+
+pub(crate) fn marker_provider_session_id(value: &Value) -> Option<String> {
+    provider_session_id_from_value(value)
 }
 
 fn provider_session_id_from_value(value: &Value) -> Option<String> {
