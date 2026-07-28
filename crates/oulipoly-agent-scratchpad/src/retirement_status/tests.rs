@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::ScratchpadName;
-use crate::map_store_retirement_status;
+use crate::store_adapter::map_store_retirement_status;
 
 const GENERATED_MAX_LEN: usize = 8;
 

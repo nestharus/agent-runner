@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::*;
+use crate::store_adapter::private_workflow;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-scratchpad")]

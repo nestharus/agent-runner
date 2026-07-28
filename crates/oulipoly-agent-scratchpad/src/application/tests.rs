@@ -12,11 +12,12 @@ use uuid::Uuid;
 
 use super::*;
 use crate::retirement_status::RetirementStatus;
+use crate::store_adapter::StoreScratchpadPersistence;
 use crate::{
     CanonicalAddress, DeleteReceipt, DeleteRequest, DeleteSelector, GcReport, GcRequest,
     GcSelector, InvocationScope, ListRequest, PublishReceipt, PublishRequest, ReadRequest,
     ScratchpadAddress, ScratchpadError, ScratchpadMeta, ScratchpadName, ScratchpadRecord,
-    StoreScratchpadPersistence, WriteReceipt, WriteRequest,
+    WriteReceipt, WriteRequest,
 };
 
 type SharedEvents = Rc<RefCell<VecDeque<ScriptedEvent>>>;
@@ -2741,28 +2742,44 @@ mod core_struct_01 {
 /// Intent: CORE-STRUCT-02.
 /// Risk/finding lineage: S1, S2, S9, S14; R1-F04 -> R2-F01 -> R3-F01;
 /// R3-F02; R3-F03; R5-F01/AUDIT-RISK-R5-001/SHORTCUT-RISK-002/PR-002/CQ-R5-F01.
-/// Fixture source/application: compile-time root/application source and construction review.
+/// Fixture source/application: compile-time root/application/adapter/DDL source and construction review.
 /// Observable: one facade -> application -> capability -> adapter -> Store route; no public bypass.
 mod core_struct_02 {
     use super::*;
 
-    fn sources() -> (&'static str, &'static str) {
-        (include_str!("../application.rs"), include_str!("../lib.rs"))
+    fn sources() -> (&'static str, &'static str, &'static str, &'static str) {
+        (
+            include_str!("../application.rs"),
+            include_str!("../lib.rs"),
+            include_str!("../store_adapter.rs"),
+            include_str!("../compatibility_ddl.rs"),
+        )
     }
 
     #[test]
     fn production_source_has_one_private_application_adapter_and_construction_route() {
-        let (application, root) = sources();
+        let (application, root, adapter, compatibility_ddl) = sources();
         let facade = braced_item(root, "impl Scratchpad {");
         let facade_state = braced_item(root, "pub struct Scratchpad {");
         let application_state = braced_item(application, "pub(super) struct ScratchpadApplication");
 
         assert_eq!(
-            root.matches("impl ScratchpadPersistence for StoreScratchpadPersistence")
+            adapter
+                .matches("impl ScratchpadPersistence for StoreScratchpadPersistence")
                 .count(),
             1,
             "one production capability implementation"
         );
+        for (owner, source) in [
+            ("root", root),
+            ("application", application),
+            ("compatibility DDL", compatibility_ddl),
+        ] {
+            assert!(
+                !source.contains("impl ScratchpadPersistence for StoreScratchpadPersistence"),
+                "{owner} contains a second production capability implementation"
+            );
+        }
         assert_eq!(
             root.matches("StoreScratchpadPersistence::new(").count(),
             1,
@@ -2777,6 +2794,25 @@ mod core_struct_02 {
             root.matches("Store::open(").count(),
             1,
             "one composition-root Store open"
+        );
+        assert!(!application.contains("Store::open("));
+        assert!(!adapter.contains("Store::open("));
+        assert!(!compatibility_ddl.contains("Store::open("));
+        let store_open = facade.find("Store::open(").expect("facade opens Store");
+        let compatibility_install = facade
+            .find("install_store_aliases(")
+            .expect("facade installs compatibility DDL");
+        let adapter_construction = facade
+            .find("StoreScratchpadPersistence::new(")
+            .expect("facade constructs adapter");
+        let application_construction = facade
+            .find("ScratchpadApplication::new(")
+            .expect("facade constructs application");
+        assert!(
+            store_open < compatibility_install
+                && compatibility_install < adapter_construction
+                && adapter_construction < application_construction,
+            "composition order must remain Store::open -> compatibility DDL -> adapter -> application"
         );
         assert!(facade_state.contains("application:"));
         assert!(!facade_state.contains("store:"));
@@ -2796,8 +2832,100 @@ mod core_struct_02 {
         assert!(!application.contains("pub struct ScratchpadApplication"));
         assert!(!application.contains("#[cfg(feature"));
         assert!(!root.contains("#[cfg(feature"));
+        assert!(!adapter.contains("#[cfg(feature"));
+        assert!(!compatibility_ddl.contains("#[cfg(feature"));
         assert!(!application.contains("StrictFakePersistence"));
         assert!(!root.contains("StrictFakePersistence"));
+        assert!(!adapter.contains("include!("));
+        assert!(!compatibility_ddl.contains("include!("));
+        assert!(!root.contains("pub use store_adapter"));
+        assert!(!root.contains("pub use compatibility_ddl"));
+    }
+
+    #[test]
+    fn adapter_helpers_and_compatibility_ddl_have_single_private_owners() {
+        let (application, root, adapter, compatibility_ddl) = sources();
+
+        for marker in [
+            "struct StoreScratchpadPersistence",
+            "fn private_workflow(",
+            "fn private_key(",
+            "fn map_private_append_request(",
+            "fn map_store_private_append_outcome(",
+            "fn map_scoped_private_filter(",
+            "fn parse_private_workflow(",
+            "fn validate_private_name(",
+            "fn map_store_tombstone(",
+            "fn map_store_meta_to_private_version(",
+            "fn decode_private_store_meta(",
+            "fn decode_private_store_metas(",
+            "fn decode_private_store_record(",
+            "fn map_private_record_data(",
+            "fn load_ordered_active_store_metadata(",
+            "fn filter_private_age_eligible_store_metadata(",
+            "fn map_store_retirement_outcome(",
+            "fn map_canonical_put_request(",
+            "fn map_store_publication_outcome(",
+            "impl From<PrivateTombstone> for TombstoneMeta",
+            "impl From<StoreError> for ScratchpadError",
+        ] {
+            assert_eq!(
+                adapter.matches(marker).count(),
+                1,
+                "adapter owner {marker:?}"
+            );
+            assert!(
+                !root.contains(marker),
+                "root retains moved owner {marker:?}"
+            );
+            assert!(
+                !application.contains(marker),
+                "application copies moved owner {marker:?}"
+            );
+            assert!(
+                !compatibility_ddl.contains(marker),
+                "compatibility DDL copies moved owner {marker:?}"
+            );
+        }
+
+        assert_eq!(
+            compatibility_ddl
+                .matches("fn install_store_aliases(")
+                .count(),
+            1,
+            "one compatibility DDL owner"
+        );
+        assert_eq!(
+            root.matches("install_store_aliases(").count(),
+            1,
+            "one compatibility DDL call"
+        );
+        assert!(!application.contains("install_store_aliases("));
+        assert!(!adapter.contains("install_store_aliases("));
+        for ddl in [
+            "CREATE VIEW IF NOT EXISTS artifacts AS",
+            "CREATE TRIGGER IF NOT EXISTS artifacts_update_created_at",
+            "INSTEAD OF UPDATE OF created_at ON artifacts",
+            "UPDATE artifact_versions",
+        ] {
+            assert_eq!(
+                compatibility_ddl.matches(ddl).count(),
+                1,
+                "one compatibility DDL statement fragment {ddl:?}"
+            );
+            assert!(
+                !root.contains(ddl),
+                "root retains compatibility DDL {ddl:?}"
+            );
+            assert!(
+                !application.contains(ddl),
+                "application copies compatibility DDL {ddl:?}"
+            );
+            assert!(
+                !adapter.contains(ddl),
+                "adapter copies compatibility DDL {ddl:?}"
+            );
+        }
     }
 }
 
@@ -2805,15 +2933,22 @@ mod core_struct_02 {
 /// Risk/finding lineage: S10, S11, S12, S13, S14; R3-F02 -> R4-F01/
 /// SHORTCUT-RISK-001; R5-F01/AUDIT-RISK-R5-001/SHORTCUT-RISK-002/PR-002/CQ-R5-F01;
 /// STATUS Phase 6 historical HIGH watch.
-/// Fixture source/application: frozen hashes plus root/application/STATUS source attachment review.
-/// Observable: byte-identical STATUS, one root mapper and direct adapter/test attachment, no copy.
+/// Fixture source/application: frozen hashes plus adapter/root/application/STATUS source attachment review.
+/// Observable: byte-identical STATUS, one adapter mapper and direct production/test attachment, no copy.
 mod core_struct_03 {
     use super::*;
 
-    fn sources() -> (&'static str, &'static str, &'static str, &'static str) {
+    fn sources() -> (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ) {
         (
             include_str!("../application.rs"),
             include_str!("../lib.rs"),
+            include_str!("../store_adapter.rs"),
             include_str!("../retirement_status.rs"),
             include_str!("../retirement_status/tests.rs"),
         )
@@ -2830,29 +2965,32 @@ mod core_struct_03 {
         );
         assert_eq!(
             sha256_hex(status_tests),
-            "f219c83b7fdcd3fd01732653f7bdcda2099acee041a8c211956279b977a0a738"
+            "27d593fcc8b8a6972891db80f5ac7e819b183ecd70a5a5e48f8af4f302332fb4"
         );
     }
 
     #[test]
-    fn status_translation_has_one_root_definition_and_direct_adapter_and_test_attachments() {
-        let (application, root, status, status_tests) = sources();
+    fn status_translation_has_one_adapter_definition_and_direct_production_and_test_attachments() {
+        let (application, root, adapter, status, status_tests) = sources();
 
         assert_eq!(
-            root.matches("fn map_store_retirement_status(").count(),
+            adapter.matches("fn map_store_retirement_status(").count(),
             1,
-            "one root-private mapper definition"
+            "one adapter-private mapper definition"
         );
         assert_eq!(
-            root.matches("crate::map_store_retirement_status(").count(),
+            adapter
+                .matches("status: map_store_retirement_status(")
+                .count(),
             1,
             "one direct production adapter call"
         );
         assert!(
-            status_tests.contains("use crate::map_store_retirement_status;"),
+            status_tests.contains("use crate::store_adapter::map_store_retirement_status;"),
             "accepted direct test attachment"
         );
         assert!(!application.contains("map_store_retirement_status"));
+        assert!(!root.contains("fn map_store_retirement_status("));
         assert!(!status.contains("TombstoneStatus"));
         for duplicate in [
             "PrivateRetirementStatus",
@@ -2870,8 +3008,14 @@ mod core_struct_03 {
                 !root.contains(duplicate),
                 "root contains superseded STATUS owner {duplicate:?}"
             );
+            assert!(
+                !adapter.contains(duplicate),
+                "adapter contains duplicate STATUS owner {duplicate:?}"
+            );
         }
         assert!(!root.contains("pub use map_store_retirement_status"));
         assert!(!root.contains("pub(crate) use map_store_retirement_status"));
+        assert!(!adapter.contains("pub use map_store_retirement_status"));
+        assert!(!adapter.contains("pub(crate) use map_store_retirement_status"));
     }
 }
