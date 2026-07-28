@@ -220,3 +220,43 @@ fn delete_latest_and_all_versions_resolve_expected_private_versions() {
         .expect_err("all versions hidden");
     assert!(matches!(not_found, ScratchpadError::NotFound));
 }
+
+#[test]
+fn list_returns_first_metadata_decode_error_in_persistence_order() {
+    let (db, store) = common::init_temp_store();
+    let scratchpad = common::open_scratchpad(&db);
+    let invocation = Uuid::from_u128(1);
+    let first = common::put_scratchpad_row(&store, invocation, "a-empty", b"first".to_vec());
+    common::put_scratchpad_row(
+        &store,
+        invocation,
+        "scratchpad:reserved",
+        b"second".to_vec(),
+    );
+    let connection = rusqlite::Connection::open(db.path()).expect("open metadata fixture");
+    connection
+        .pragma_update(None, "ignore_check_constraints", true)
+        .expect("allow malformed metadata fixture");
+    connection
+        .execute(
+            "UPDATE artifact_versions SET artifact_name = '' \
+             WHERE workflow_run_id = ?1 AND artifact_name = ?2 AND version = ?3",
+            rusqlite::params![
+                first.key.workflow_run_id,
+                first.key.artifact_name,
+                first.version as i64,
+            ],
+        )
+        .expect("make first ordered artifact name malformed");
+    drop(connection);
+
+    let error = scratchpad
+        .list(common::list_request(invocation, None, false))
+        .expect_err("first malformed metadata must fail list");
+
+    assert!(matches!(
+        error,
+        ScratchpadError::InvalidInput(reason)
+            if reason == "scratchpad name must not be empty"
+    ));
+}

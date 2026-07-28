@@ -1,6 +1,7 @@
 mod common;
 
 use oulipoly_agent_scratchpad::{PublishRequest, ScratchpadError};
+use oulipoly_agent_store::StoreError;
 use uuid::Uuid;
 
 // proposal § Test-Intent Track rows 7, 8, 19
@@ -163,4 +164,93 @@ fn publish_request_has_no_filesystem_output_path_surface() {
 
     assert_eq!(request.destination.workflow_run_id, "canonical-run");
     assert_eq!(request.destination.artifact_name, "artifact.md");
+}
+
+#[test]
+fn publish_rejects_reserved_destination_before_missing_source_lookup() {
+    let (db, _store) = common::init_temp_store();
+    let scratchpad = common::open_scratchpad(&db);
+    let invocation = Uuid::from_u128(1);
+
+    let error = scratchpad
+        .publish(common::publish_request(
+            invocation,
+            "missing.md",
+            "scratchpad:reserved",
+            "artifact.md",
+        ))
+        .expect_err("reserved destination must be validated first");
+
+    assert!(matches!(
+        error,
+        ScratchpadError::InvalidInput(reason)
+            if reason
+                == "canonical workflow_run_id must not start with reserved prefix scratchpad:"
+    ));
+}
+
+#[test]
+fn publish_does_not_inherit_source_predecessor() {
+    let (db, store) = common::init_temp_store();
+    let scratchpad = common::open_scratchpad(&db);
+    let invocation = Uuid::from_u128(2);
+    scratchpad
+        .write({
+            let mut request = common::write_request(invocation, "draft.md", b"draft".to_vec());
+            request.predecessor_version = Some(41);
+            request
+        })
+        .expect("write source with predecessor");
+
+    let receipt = scratchpad
+        .publish(common::publish_request(
+            invocation,
+            "draft.md",
+            "canonical-run",
+            "artifact.md",
+        ))
+        .expect("publish without predecessor override");
+    let canonical = store
+        .get_meta(
+            &common::store_key("canonical-run", "artifact.md"),
+            Some(receipt.destination_version),
+        )
+        .expect("canonical metadata");
+
+    assert_eq!(receipt.predecessor_version, None);
+    assert_eq!(canonical.predecessor_version, None);
+}
+
+#[test]
+fn publish_rejects_explicit_tombstoned_source_version() {
+    let (db, store) = common::init_temp_store();
+    let scratchpad = common::open_scratchpad(&db);
+    let invocation = Uuid::from_u128(3);
+    let source = scratchpad
+        .write(common::write_request(
+            invocation,
+            "draft.md",
+            b"draft".to_vec(),
+        ))
+        .expect("write source");
+    scratchpad
+        .delete(common::delete_request(
+            invocation,
+            "draft.md",
+            oulipoly_agent_scratchpad::DeleteSelector::Version(source.version),
+        ))
+        .expect("tombstone source");
+    let mut request =
+        common::publish_request(invocation, "draft.md", "canonical-run", "artifact.md");
+    request.source_version = Some(source.version);
+
+    let error = scratchpad
+        .publish(request)
+        .expect_err("tombstoned source must be inactive");
+
+    assert!(matches!(error, ScratchpadError::NotFound));
+    assert!(matches!(
+        store.get_meta(&common::store_key("canonical-run", "artifact.md"), None),
+        Err(StoreError::NotFound)
+    ));
 }

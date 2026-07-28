@@ -1,3 +1,6 @@
+mod application;
+mod retirement_status;
+
 use std::error::Error;
 use std::fmt;
 use std::fs;
@@ -5,20 +8,21 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use oulipoly_agent_store::{
     ArtifactKey, ArtifactMeta, ArtifactRecord, ListFilter, PutReceipt, PutRequest, Store,
     StoreError, TombstoneMeta, TombstoneReceipt, TombstoneStatus,
 };
 use uuid::Uuid;
 
+use application::{
+    CanonicalPublicationDraft, PrivateAppendOutcome, PrivateRecordData, PrivateRetirementOutcome,
+    PrivateTombstone, PrivateVersionDraft, PrivateVersionMeta, PrivateVersionTarget,
+    PrivateVisibility, PublicationAppendOutcome, ScratchpadApplication, ScratchpadPersistence,
+};
+use retirement_status::RetirementStatus;
+
 const SCRATCHPAD_PREFIX: &str = "scratchpad:";
-const DEFAULT_DELETE_ACTOR: &str = "agent-scratchpad";
-const DEFAULT_DELETE_REASON: &str = "scratchpad delete";
-const DEFAULT_GC_ACTOR: &str = "agent-scratchpad-gc";
-const DEFAULT_GC_INVOCATION_REASON: &str = "scratchpad gc invocation";
-const DEFAULT_GC_EXPIRED_REASON: &str = "scratchpad gc expired";
-const TTL_DAYS: i64 = 7;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScratchpadName(String);
@@ -276,30 +280,100 @@ impl From<serde_json::Error> for ScratchpadError {
 }
 
 pub struct Scratchpad {
+    application: ScratchpadApplication<StoreScratchpadPersistence, fn() -> DateTime<Utc>>,
+}
+
+struct StoreScratchpadPersistence {
     store: Store,
 }
 
-struct DeleteDefaults {
-    actor: String,
-    reason: String,
+impl StoreScratchpadPersistence {
+    fn new(store: Store) -> Self {
+        Self { store }
+    }
 }
 
-#[derive(Default)]
-struct DeleteSummary {
-    tombstoned_versions: Vec<u64>,
-    already_tombstoned_versions: Vec<u64>,
-    tombstoned_at: Option<DateTime<Utc>>,
+impl ScratchpadPersistence for StoreScratchpadPersistence {
+    fn append_private_version(
+        &self,
+        draft: PrivateVersionDraft,
+    ) -> Result<PrivateAppendOutcome, ScratchpadError> {
+        let receipt = self.store.put(map_private_append_request(draft))?;
+        Ok(map_store_private_append_outcome(receipt))
+    }
+
+    fn load_active_private_record(
+        &self,
+        address: &ScratchpadAddress,
+        version: Option<u64>,
+    ) -> Result<PrivateRecordData, ScratchpadError> {
+        let record = self.store.get(&private_key(address), version)?;
+        decode_private_store_record(record)
+    }
+
+    fn acquire_newest_active_target(
+        &self,
+        address: &ScratchpadAddress,
+    ) -> Result<PrivateVersionTarget, ScratchpadError> {
+        let meta = self.store.get_meta(&private_key(address), None)?;
+        let private_meta = decode_private_store_meta(meta)?;
+        Ok(application::map_private_meta_to_target(private_meta))
+    }
+
+    fn acquire_existing_target(
+        &self,
+        address: &ScratchpadAddress,
+        version: u64,
+    ) -> Result<PrivateVersionTarget, ScratchpadError> {
+        let meta = self.store.get_meta(&private_key(address), Some(version))?;
+        let private_meta = decode_private_store_meta(meta)?;
+        Ok(application::map_private_meta_to_target(private_meta))
+    }
+
+    fn enumerate_private_versions(
+        &self,
+        invocation_uuid: Uuid,
+        name: Option<&ScratchpadName>,
+        visibility: PrivateVisibility,
+    ) -> Result<Vec<PrivateVersionMeta>, ScratchpadError> {
+        let rows = self
+            .store
+            .list(map_scoped_private_filter(invocation_uuid, name, visibility))?;
+        decode_private_store_metas(rows)
+    }
+
+    fn collect_cleanup_eligible_versions(
+        &self,
+        eligible_by_age: &mut dyn FnMut(DateTime<Utc>) -> bool,
+    ) -> Result<Vec<PrivateVersionMeta>, ScratchpadError> {
+        let rows = load_ordered_active_store_metadata(&self.store)?;
+        let rows = filter_private_age_eligible_store_metadata(rows, eligible_by_age);
+        decode_private_store_metas(rows)
+    }
+
+    fn retire_private_version(
+        &self,
+        target: &PrivateVersionTarget,
+        actor: &str,
+        reason: &str,
+    ) -> Result<PrivateRetirementOutcome, ScratchpadError> {
+        let receipt =
+            self.store
+                .tombstone(&private_key(&target.address), target.version, actor, reason)?;
+        Ok(map_store_retirement_outcome(receipt))
+    }
+
+    fn append_canonical_publication(
+        &self,
+        draft: CanonicalPublicationDraft,
+    ) -> Result<PublicationAppendOutcome, ScratchpadError> {
+        let receipt = self.store.put(map_canonical_put_request(draft))?;
+        Ok(map_store_publication_outcome(receipt))
+    }
 }
 
-struct GcDefaults {
-    actor: String,
-    reason: String,
-}
-
-#[derive(Default)]
-struct GcSummary {
-    tombstoned_rows: Vec<ScratchpadAddress>,
-    already_tombstoned_rows: Vec<ScratchpadAddress>,
+fn system_current_utc() -> DateTime<Utc> {
+    Utc::now()
 }
 
 impl Scratchpad {
@@ -307,408 +381,228 @@ impl Scratchpad {
         let db_path = db_path.as_ref();
         let store = Store::open(db_path)?;
         install_store_aliases(db_path)?;
-        Ok(Self { store })
+        let persistence = StoreScratchpadPersistence::new(store);
+        let application =
+            ScratchpadApplication::new(persistence, system_current_utc as fn() -> DateTime<Utc>);
+        Ok(Self { application })
     }
 
     pub fn write(&self, req: WriteRequest) -> Result<WriteReceipt, ScratchpadError> {
-        let key = private_key(req.scope.invocation_uuid, &req.name);
-        let invocation_uuid = req.scope.invocation_uuid;
-        let name = req.name;
-        let receipt = self.store.put(scratchpad_put_request(
-            key,
-            invocation_uuid,
-            req.format_hint,
-            req.verdict_line,
-            req.predecessor_version,
-            req.content,
-        ))?;
-        Ok(write_receipt_from_put(receipt, invocation_uuid, name))
+        self.application.write(req)
     }
 
     pub fn read(&self, req: ReadRequest) -> Result<ScratchpadRecord, ScratchpadError> {
-        let key = private_key(req.scope.invocation_uuid, &req.name);
-        let record = self.store.get(&key, req.version)?;
-        record_from_store(record)
+        self.application.read(req)
     }
 
     pub fn list(&self, req: ListRequest) -> Result<Vec<ScratchpadMeta>, ScratchpadError> {
-        self.store
-            .list(scratchpad_list_filter(req))?
-            .into_iter()
-            .map(meta_from_store)
-            .collect()
+        self.application.list(req)
     }
 
     pub fn delete(&self, req: DeleteRequest) -> Result<DeleteReceipt, ScratchpadError> {
-        let invocation_uuid = req.scope.invocation_uuid;
-        let key = private_key(invocation_uuid, &req.name);
-        let name = req.name;
-        let selector = req.selector;
-        let defaults = delete_defaults(req.actor, req.reason);
-        let versions = self.delete_versions(&key, &selector)?;
-        require_delete_versions(&selector, &versions)?;
-        let summary =
-            self.tombstone_delete_versions(&key, &versions, &defaults.actor, &defaults.reason)?;
-        Ok(delete_receipt(
-            invocation_uuid,
-            name,
-            selector,
-            defaults,
-            summary,
-        ))
+        self.application.delete(req)
     }
 
     pub fn publish(&self, req: PublishRequest) -> Result<PublishReceipt, ScratchpadError> {
-        validate_canonical_destination(&req.destination)?;
-        let source_key = private_key(req.source.invocation_uuid, &req.source.name);
-        let source = self.store.get(&source_key, req.source_version)?;
-        let destination = req.destination;
-        let producer_invocation_uuid = req.source.invocation_uuid;
-        let ArtifactRecord {
-            meta: source_meta,
-            content,
-        } = source;
-        let destination_receipt = self.store.put(publish_put_request(
-            &destination,
-            req.source.invocation_uuid,
-            req.format_hint,
-            req.verdict_line,
-            req.predecessor_version,
-            &source_meta,
-            content,
-        ))?;
-
-        Ok(publish_receipt(
-            req.source,
-            source_meta,
-            destination,
-            producer_invocation_uuid,
-            destination_receipt,
-        ))
+        self.application.publish(req)
     }
 
     pub fn gc(&self, req: GcRequest) -> Result<GcReport, ScratchpadError> {
-        let evaluated_at = Utc::now();
-        let selector = req.selector;
-        let dry_run = req.dry_run;
-        let defaults = gc_defaults(req.actor, req.reason, &selector);
-        let candidates = self.gc_candidates(&selector)?;
-        let summary =
-            self.tombstone_gc_candidates(candidates, dry_run, &defaults.actor, &defaults.reason)?;
-
-        Ok(gc_report(
-            selector,
-            dry_run,
-            defaults,
-            summary,
-            evaluated_at,
-        ))
-    }
-
-    fn delete_versions(
-        &self,
-        key: &ArtifactKey,
-        selector: &DeleteSelector,
-    ) -> Result<Vec<u64>, ScratchpadError> {
-        match selector {
-            DeleteSelector::Latest => self.latest_delete_version(key),
-            DeleteSelector::Version(version) => self.specific_delete_version(key, *version),
-            DeleteSelector::AllVersions => self.all_delete_versions(key),
-        }
-    }
-
-    fn gc_candidates(&self, selector: &GcSelector) -> Result<Vec<ScratchpadMeta>, ScratchpadError> {
-        match selector {
-            GcSelector::Invocation(invocation_uuid) => {
-                self.invocation_gc_candidates(*invocation_uuid)
-            }
-            GcSelector::ExpiredBefore(cutoff) => self.expired_gc_candidates(cutoff),
-        }
-    }
-
-    fn latest_delete_version(&self, key: &ArtifactKey) -> Result<Vec<u64>, ScratchpadError> {
-        Ok(vec![self.store.get_meta(key, None)?.version])
-    }
-
-    fn specific_delete_version(
-        &self,
-        key: &ArtifactKey,
-        version: u64,
-    ) -> Result<Vec<u64>, ScratchpadError> {
-        self.store.get_meta(key, Some(version))?;
-        Ok(vec![version])
-    }
-
-    fn all_delete_versions(&self, key: &ArtifactKey) -> Result<Vec<u64>, ScratchpadError> {
-        Ok(self
-            .store
-            .list(ListFilter {
-                workflow_run_id: Some(key.workflow_run_id.clone()),
-                artifact_name: Some(key.artifact_name.clone()),
-                include_tombstoned: false,
-            })?
-            .into_iter()
-            .map(|meta| meta.version)
-            .collect())
-    }
-
-    fn tombstone_delete_versions(
-        &self,
-        key: &ArtifactKey,
-        versions: &[u64],
-        actor: &str,
-        reason: &str,
-    ) -> Result<DeleteSummary, ScratchpadError> {
-        let mut summary = DeleteSummary::default();
-        for version in versions {
-            let receipt = self.store.tombstone(key, *version, actor, reason)?;
-            record_delete_tombstone(&mut summary, *version, &receipt);
-        }
-        Ok(summary)
-    }
-
-    fn invocation_gc_candidates(
-        &self,
-        invocation_uuid: Uuid,
-    ) -> Result<Vec<ScratchpadMeta>, ScratchpadError> {
-        self.store
-            .list(ListFilter {
-                workflow_run_id: Some(private_workflow(invocation_uuid)),
-                artifact_name: None,
-                include_tombstoned: false,
-            })?
-            .into_iter()
-            .map(meta_from_store)
-            .collect()
-    }
-
-    fn expired_gc_candidates(
-        &self,
-        cutoff: &DateTime<Utc>,
-    ) -> Result<Vec<ScratchpadMeta>, ScratchpadError> {
-        let ttl = TimeDelta::days(TTL_DAYS);
-        self.store
-            .list(ListFilter {
-                workflow_run_id: None,
-                artifact_name: None,
-                include_tombstoned: false,
-            })?
-            .into_iter()
-            .filter(is_scratchpad_meta)
-            .filter(|meta| is_expired_meta(meta, ttl, cutoff))
-            .map(meta_from_store)
-            .collect()
-    }
-
-    fn tombstone_gc_candidates(
-        &self,
-        candidates: Vec<ScratchpadMeta>,
-        dry_run: bool,
-        actor: &str,
-        reason: &str,
-    ) -> Result<GcSummary, ScratchpadError> {
-        let mut summary = GcSummary::default();
-        for meta in candidates {
-            self.record_gc_tombstone(&mut summary, meta, dry_run, actor, reason)?;
-        }
-        Ok(summary)
-    }
-
-    fn record_gc_tombstone(
-        &self,
-        summary: &mut GcSummary,
-        meta: ScratchpadMeta,
-        dry_run: bool,
-        actor: &str,
-        reason: &str,
-    ) -> Result<(), ScratchpadError> {
-        let address = meta.address.clone();
-        if dry_run {
-            summary.tombstoned_rows.push(address);
-            return Ok(());
-        }
-
-        let key = private_key(address.invocation_uuid, &address.name);
-        let receipt = self.store.tombstone(&key, meta.version, actor, reason)?;
-        record_gc_tombstone_status(summary, address, &receipt.status);
-        Ok(())
+        self.application.gc(req)
     }
 }
 
-fn scratchpad_put_request(
-    key: ArtifactKey,
-    invocation_uuid: Uuid,
-    format_hint: Option<String>,
-    verdict_line: Option<String>,
-    predecessor_version: Option<u64>,
-    content: Vec<u8>,
-) -> PutRequest {
+fn private_workflow(invocation_uuid: Uuid) -> String {
+    format!("{SCRATCHPAD_PREFIX}{invocation_uuid}")
+}
+
+fn private_key(address: &ScratchpadAddress) -> ArtifactKey {
+    ArtifactKey {
+        workflow_run_id: private_workflow(address.invocation_uuid),
+        artifact_name: address.name.as_str().to_string(),
+    }
+}
+
+fn map_private_append_request(draft: PrivateVersionDraft) -> PutRequest {
     PutRequest {
-        key,
-        producer_invocation_uuid: Some(invocation_uuid),
-        format_hint,
-        verdict_line,
-        predecessor_version,
-        content,
+        key: private_key(&draft.address),
+        producer_invocation_uuid: Some(draft.producer_invocation_uuid),
+        format_hint: draft.format_hint,
+        verdict_line: draft.verdict_line,
+        predecessor_version: draft.predecessor_version,
+        content: draft.content,
     }
 }
 
-fn scratchpad_list_filter(req: ListRequest) -> ListFilter {
+fn map_store_private_append_outcome(receipt: PutReceipt) -> PrivateAppendOutcome {
+    PrivateAppendOutcome {
+        version: receipt.version,
+        producer_invocation_uuid: receipt.producer_invocation_uuid,
+        sha256: receipt.sha256,
+        content_len: receipt.content_len,
+        format_hint: receipt.format_hint,
+        verdict_line: receipt.verdict_line,
+        predecessor_version: receipt.predecessor_version,
+        created_at: receipt.created_at,
+    }
+}
+
+fn map_scoped_private_filter(
+    invocation_uuid: Uuid,
+    name: Option<&ScratchpadName>,
+    visibility: PrivateVisibility,
+) -> ListFilter {
     ListFilter {
-        workflow_run_id: Some(private_workflow(req.scope.invocation_uuid)),
-        artifact_name: req.name.as_ref().map(|name| name.as_str().to_string()),
-        include_tombstoned: req.include_tombstoned,
+        workflow_run_id: Some(private_workflow(invocation_uuid)),
+        artifact_name: name.map(|name| name.as_str().to_string()),
+        include_tombstoned: matches!(visibility, PrivateVisibility::IncludeTombstoned),
     }
 }
 
-fn delete_defaults(actor: Option<String>, reason: Option<String>) -> DeleteDefaults {
-    DeleteDefaults {
-        actor: actor.unwrap_or_else(|| DEFAULT_DELETE_ACTOR.to_string()),
-        reason: reason.unwrap_or_else(|| DEFAULT_DELETE_REASON.to_string()),
+fn parse_private_workflow(workflow_run_id: &str) -> Result<Uuid, ScratchpadError> {
+    let raw = workflow_run_id
+        .strip_prefix(SCRATCHPAD_PREFIX)
+        .ok_or_else(|| {
+            ScratchpadError::MetadataDecode(format!(
+                "workflow_run_id {workflow_run_id:?} is not a scratchpad row"
+            ))
+        })?;
+    Uuid::parse_str(raw).map_err(|err| {
+        ScratchpadError::MetadataDecode(format!(
+            "workflow_run_id {workflow_run_id:?} has invalid scratchpad UUID: {err}"
+        ))
+    })
+}
+
+fn validate_private_name(value: String) -> Result<ScratchpadName, ScratchpadError> {
+    ScratchpadName::new(value)
+}
+
+fn map_store_tombstone(tombstone: TombstoneMeta) -> PrivateTombstone {
+    PrivateTombstone {
+        tombstoned_at: tombstone.tombstoned_at,
+        actor: tombstone.actor,
+        reason: tombstone.reason,
     }
 }
 
-fn require_delete_versions(
-    selector: &DeleteSelector,
-    versions: &[u64],
-) -> Result<(), ScratchpadError> {
-    if matches!(selector, DeleteSelector::Latest) && versions.is_empty() {
-        return Err(ScratchpadError::NotFound);
-    }
-    Ok(())
-}
-
-fn record_delete_tombstone(summary: &mut DeleteSummary, version: u64, receipt: &TombstoneReceipt) {
-    summary.tombstoned_at = Some(receipt.tombstone.tombstoned_at);
-    match receipt.status {
-        TombstoneStatus::Tombstoned => summary.tombstoned_versions.push(version),
-        TombstoneStatus::AlreadyTombstoned => summary.already_tombstoned_versions.push(version),
-    }
-}
-
-fn delete_receipt(
+fn map_store_meta_to_private_version(
+    meta: ArtifactMeta,
     invocation_uuid: Uuid,
     name: ScratchpadName,
-    selector: DeleteSelector,
-    defaults: DeleteDefaults,
-    summary: DeleteSummary,
-) -> DeleteReceipt {
-    DeleteReceipt {
+) -> PrivateVersionMeta {
+    PrivateVersionMeta {
         address: ScratchpadAddress {
             invocation_uuid,
             name,
         },
-        selector,
-        tombstoned_versions: summary.tombstoned_versions,
-        already_tombstoned_versions: summary.already_tombstoned_versions,
-        actor: defaults.actor,
-        reason: defaults.reason,
-        tombstoned_at: summary.tombstoned_at,
+        version: meta.version,
+        sha256: meta.sha256,
+        content_len: meta.content_len,
+        producer_invocation_uuid: meta.producer_invocation_uuid,
+        format_hint: meta.format_hint,
+        verdict_line: meta.verdict_line,
+        predecessor_version: meta.predecessor_version,
+        created_at: meta.created_at,
+        tombstone: meta.tombstone.map(map_store_tombstone),
     }
 }
 
-fn validate_canonical_destination(destination: &CanonicalAddress) -> Result<(), ScratchpadError> {
-    if destination.workflow_run_id.starts_with(SCRATCHPAD_PREFIX) {
-        return Err(ScratchpadError::InvalidInput(format!(
-            "canonical workflow_run_id must not start with reserved prefix {SCRATCHPAD_PREFIX}"
-        )));
-    }
-    Ok(())
+fn decode_private_store_meta(meta: ArtifactMeta) -> Result<PrivateVersionMeta, ScratchpadError> {
+    let invocation_uuid = parse_private_workflow(&meta.key.workflow_run_id)?;
+    let name = validate_private_name(meta.key.artifact_name.clone())?;
+    Ok(map_store_meta_to_private_version(
+        meta,
+        invocation_uuid,
+        name,
+    ))
 }
 
-fn publish_put_request(
-    destination: &CanonicalAddress,
-    invocation_uuid: Uuid,
-    format_hint: Option<String>,
-    verdict_line: Option<String>,
-    predecessor_version: Option<u64>,
-    source_meta: &ArtifactMeta,
-    content: Vec<u8>,
-) -> PutRequest {
+fn decode_private_store_metas(
+    rows: Vec<ArtifactMeta>,
+) -> Result<Vec<PrivateVersionMeta>, ScratchpadError> {
+    rows.into_iter().map(decode_private_store_meta).collect()
+}
+
+fn decode_private_store_record(
+    record: ArtifactRecord,
+) -> Result<PrivateRecordData, ScratchpadError> {
+    let ArtifactRecord { meta, content } = record;
+    let meta = decode_private_store_meta(meta)?;
+    Ok(map_private_record_data(meta, content))
+}
+
+fn map_private_record_data(meta: PrivateVersionMeta, content: Vec<u8>) -> PrivateRecordData {
+    PrivateRecordData { meta, content }
+}
+
+fn load_ordered_active_store_metadata(store: &Store) -> Result<Vec<ArtifactMeta>, ScratchpadError> {
+    Ok(store.list(ListFilter {
+        workflow_run_id: None,
+        artifact_name: None,
+        include_tombstoned: false,
+    })?)
+}
+
+fn filter_private_age_eligible_store_metadata(
+    rows: Vec<ArtifactMeta>,
+    eligible_by_age: &mut dyn FnMut(DateTime<Utc>) -> bool,
+) -> Vec<ArtifactMeta> {
+    rows.into_iter()
+        .filter(|meta| {
+            meta.key.workflow_run_id.starts_with(SCRATCHPAD_PREFIX)
+                && eligible_by_age(meta.created_at)
+        })
+        .collect()
+}
+
+fn map_store_retirement_status(status: &TombstoneStatus) -> RetirementStatus {
+    match status {
+        TombstoneStatus::Tombstoned => RetirementStatus::Retired,
+        TombstoneStatus::AlreadyTombstoned => RetirementStatus::AlreadyRetired,
+    }
+}
+
+fn map_store_retirement_outcome(receipt: TombstoneReceipt) -> PrivateRetirementOutcome {
+    PrivateRetirementOutcome {
+        status: crate::map_store_retirement_status(&receipt.status),
+        tombstoned_at: receipt.tombstone.tombstoned_at,
+    }
+}
+
+fn map_canonical_put_request(draft: CanonicalPublicationDraft) -> PutRequest {
     PutRequest {
         key: ArtifactKey {
-            workflow_run_id: destination.workflow_run_id.clone(),
-            artifact_name: destination.artifact_name.clone(),
+            workflow_run_id: draft.destination.workflow_run_id,
+            artifact_name: draft.destination.artifact_name,
         },
-        producer_invocation_uuid: Some(invocation_uuid),
-        format_hint: format_hint.or_else(|| source_meta.format_hint.clone()),
-        verdict_line: verdict_line.or_else(|| source_meta.verdict_line.clone()),
-        predecessor_version,
-        content,
+        producer_invocation_uuid: Some(draft.producer_invocation_uuid),
+        format_hint: draft.format_hint,
+        verdict_line: draft.verdict_line,
+        predecessor_version: draft.predecessor_version,
+        content: draft.content,
     }
 }
 
-fn publish_receipt(
-    source: ScratchpadAddress,
-    source_meta: ArtifactMeta,
-    destination: CanonicalAddress,
-    producer_invocation_uuid: Uuid,
-    destination_receipt: PutReceipt,
-) -> PublishReceipt {
-    PublishReceipt {
-        source,
-        source_version: source_meta.version,
-        source_sha256: source_meta.sha256,
-        destination,
-        destination_version: destination_receipt.version,
-        destination_sha256: destination_receipt.sha256,
-        content_len: destination_receipt.content_len,
-        producer_invocation_uuid,
-        format_hint: destination_receipt.format_hint,
-        verdict_line: destination_receipt.verdict_line,
-        predecessor_version: destination_receipt.predecessor_version,
-        created_at: destination_receipt.created_at,
+fn map_store_publication_outcome(receipt: PutReceipt) -> PublicationAppendOutcome {
+    PublicationAppendOutcome {
+        version: receipt.version,
+        sha256: receipt.sha256,
+        content_len: receipt.content_len,
+        format_hint: receipt.format_hint,
+        verdict_line: receipt.verdict_line,
+        predecessor_version: receipt.predecessor_version,
+        created_at: receipt.created_at,
     }
 }
 
-fn gc_defaults(actor: Option<String>, reason: Option<String>, selector: &GcSelector) -> GcDefaults {
-    GcDefaults {
-        actor: actor.unwrap_or_else(|| DEFAULT_GC_ACTOR.to_string()),
-        reason: reason.unwrap_or_else(|| gc_default_reason(selector)),
-    }
-}
-
-fn gc_default_reason(selector: &GcSelector) -> String {
-    match selector {
-        GcSelector::Invocation(_) => DEFAULT_GC_INVOCATION_REASON.to_string(),
-        GcSelector::ExpiredBefore(_) => DEFAULT_GC_EXPIRED_REASON.to_string(),
-    }
-}
-
-fn is_scratchpad_meta(meta: &ArtifactMeta) -> bool {
-    meta.key.workflow_run_id.starts_with(SCRATCHPAD_PREFIX)
-}
-
-fn is_expired_meta(meta: &ArtifactMeta, ttl: TimeDelta, cutoff: &DateTime<Utc>) -> bool {
-    meta.created_at + ttl <= *cutoff
-}
-
-fn record_gc_tombstone_status(
-    summary: &mut GcSummary,
-    address: ScratchpadAddress,
-    status: &TombstoneStatus,
-) {
-    match status {
-        TombstoneStatus::Tombstoned => summary.tombstoned_rows.push(address),
-        TombstoneStatus::AlreadyTombstoned => summary.already_tombstoned_rows.push(address),
-    }
-}
-
-fn gc_report(
-    selector: GcSelector,
-    dry_run: bool,
-    defaults: GcDefaults,
-    summary: GcSummary,
-    evaluated_at: DateTime<Utc>,
-) -> GcReport {
-    GcReport {
-        selector,
-        dry_run,
-        tombstoned_rows: summary.tombstoned_rows,
-        already_tombstoned_rows: summary.already_tombstoned_rows,
-        actor: defaults.actor,
-        reason: defaults.reason,
-        evaluated_at,
+impl From<PrivateTombstone> for TombstoneMeta {
+    fn from(value: PrivateTombstone) -> Self {
+        Self {
+            tombstoned_at: value.tombstoned_at,
+            actor: value.actor,
+            reason: value.reason,
+        }
     }
 }
 
@@ -732,83 +626,6 @@ fn install_store_aliases(db_path: &Path) -> Result<(), ScratchpadError> {
     )
     .map_err(ScratchpadError::Database)?;
     Ok(())
-}
-
-fn private_workflow(invocation_uuid: Uuid) -> String {
-    format!("{SCRATCHPAD_PREFIX}{invocation_uuid}")
-}
-
-fn private_key(invocation_uuid: Uuid, name: &ScratchpadName) -> ArtifactKey {
-    ArtifactKey {
-        workflow_run_id: private_workflow(invocation_uuid),
-        artifact_name: name.as_str().to_string(),
-    }
-}
-
-fn parse_private_workflow(workflow_run_id: &str) -> Result<Uuid, ScratchpadError> {
-    let raw = workflow_run_id
-        .strip_prefix(SCRATCHPAD_PREFIX)
-        .ok_or_else(|| {
-            ScratchpadError::MetadataDecode(format!(
-                "workflow_run_id {workflow_run_id:?} is not a scratchpad row"
-            ))
-        })?;
-    Uuid::parse_str(raw).map_err(|err| {
-        ScratchpadError::MetadataDecode(format!(
-            "workflow_run_id {workflow_run_id:?} has invalid scratchpad UUID: {err}"
-        ))
-    })
-}
-
-fn meta_from_store(meta: ArtifactMeta) -> Result<ScratchpadMeta, ScratchpadError> {
-    let invocation_uuid = parse_private_workflow(&meta.key.workflow_run_id)?;
-    let name = ScratchpadName::new(meta.key.artifact_name)?;
-    let address = ScratchpadAddress {
-        invocation_uuid,
-        name: name.clone(),
-    };
-    Ok(ScratchpadMeta {
-        address,
-        invocation_uuid,
-        name,
-        version: meta.version,
-        sha256: meta.sha256,
-        content_len: meta.content_len,
-        producer_invocation_uuid: meta.producer_invocation_uuid,
-        format_hint: meta.format_hint,
-        verdict_line: meta.verdict_line,
-        predecessor_version: meta.predecessor_version,
-        created_at: meta.created_at,
-        tombstone: meta.tombstone,
-    })
-}
-
-fn record_from_store(record: ArtifactRecord) -> Result<ScratchpadRecord, ScratchpadError> {
-    Ok(ScratchpadRecord {
-        meta: meta_from_store(record.meta)?,
-        content: record.content,
-    })
-}
-
-fn write_receipt_from_put(
-    receipt: PutReceipt,
-    invocation_uuid: Uuid,
-    name: ScratchpadName,
-) -> WriteReceipt {
-    WriteReceipt {
-        address: ScratchpadAddress {
-            invocation_uuid,
-            name,
-        },
-        version: receipt.version,
-        producer_invocation_uuid: receipt.producer_invocation_uuid,
-        sha256: receipt.sha256,
-        content_len: receipt.content_len,
-        format_hint: receipt.format_hint,
-        verdict_line: receipt.verdict_line,
-        predecessor_version: receipt.predecessor_version,
-        created_at: receipt.created_at,
-    }
 }
 
 pub mod cli {
