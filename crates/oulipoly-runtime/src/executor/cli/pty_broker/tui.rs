@@ -97,6 +97,8 @@ const MAX_COALESCED_PTY_READS: usize = 8;
 /// the trailing Enter submits it.
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const BRACKETED_PASTE_ENABLE: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
 /// Pause between writing an injected notification's body and the Enter that submits it.
 /// An Ink-style child (Claude Code) commits a bracketed paste to its input buffer on a
 /// later async render tick; a `\r` written back-to-back races ahead of that commit and is
@@ -2805,6 +2807,7 @@ struct RenderSnapshot {
     pane: MonitorPane,
     selection: Option<SelectionSpan>,
     mouse_request: MouseRequest,
+    bracketed_paste: bool,
     typing_protection: TypingProtection,
     priority: RenderPriority,
 }
@@ -2858,6 +2861,7 @@ impl RenderSnapshot {
             pane: pane.clone(),
             selection,
             mouse_request: effective_mouse_request(mouse_request_from_screen(screen)),
+            bracketed_paste: focus == Focus::Top && screen.bracketed_paste(),
             typing_protection,
             priority,
         }
@@ -3729,6 +3733,7 @@ fn liveness_glyph(liveness: LivenessStatus) -> &'static str {
 struct AltScreenGuard {
     writer: File,
     mouse: TerminalMouseState,
+    bracketed_paste: bool,
 }
 
 impl AltScreenGuard {
@@ -3738,6 +3743,7 @@ impl AltScreenGuard {
         let mut guard = Self {
             writer,
             mouse: TerminalMouseState::new(),
+            bracketed_paste: false,
         };
         guard.enable_keyboard_protocol()?;
         Ok(guard)
@@ -3753,6 +3759,23 @@ impl AltScreenGuard {
     fn sync_mouse(&mut self, request: MouseRequest) -> Result<(), String> {
         sync_terminal_mouse(&mut self.writer, &mut self.mouse, request)
             .map_err(format_tui_mouse_sync_error)
+    }
+
+    fn sync_bracketed_paste(&mut self, enabled: bool) -> Result<(), String> {
+        if self.bracketed_paste == enabled {
+            return Ok(());
+        }
+        let sequence = if enabled {
+            BRACKETED_PASTE_ENABLE
+        } else {
+            BRACKETED_PASTE_DISABLE
+        };
+        self.writer
+            .write_all(sequence)
+            .and_then(|()| self.writer.flush())
+            .map_err(format_tui_bracketed_paste_sync_error)?;
+        self.bracketed_paste = enabled;
+        Ok(())
     }
 
     /// Copy `text` to the host's system clipboard via the OSC 52 escape, so the operator
@@ -3772,6 +3795,7 @@ impl AltScreenGuard {
 
 impl Drop for AltScreenGuard {
     fn drop(&mut self) {
+        let _ = self.writer.write_all(BRACKETED_PASTE_DISABLE);
         let _ = self.writer.write_all(&terminal_keyboard_restore_sequence());
         let _ = self.writer.write_all(&terminal_mouse_restore_sequence());
         let _ = execute!(self.writer, LeaveAlternateScreen);
@@ -3784,6 +3808,10 @@ fn format_tui_keyboard_sync_error(err: io::Error) -> String {
 
 fn format_tui_mouse_sync_error(err: io::Error) -> String {
     format!("Failed to sync terminal mouse mode: {err}")
+}
+
+fn format_tui_bracketed_paste_sync_error(err: io::Error) -> String {
+    format!("Failed to sync terminal bracketed-paste mode: {err}")
 }
 
 fn clone_terminal_writer(writer: &File) -> io::Result<File> {
@@ -4102,6 +4130,7 @@ fn render_snapshot(
     for text in shared.drain_clipboard_copies() {
         alt.copy_to_clipboard(&text)?;
     }
+    alt.sync_bracketed_paste(snapshot.bracketed_paste)?;
     alt.sync_mouse(snapshot.mouse_request)?;
     draw_snapshot(terminal, snapshot)?;
     #[cfg(test)]
@@ -6202,6 +6231,54 @@ mod tests {
         assert!(enable_pos < restore_pos, "restore should follow enable");
         assert!(
             restore_pos < leave_pos,
+            "restore should precede alternate-screen exit"
+        );
+    }
+
+    #[test]
+    fn child_bracketed_paste_mode_is_mirrored_only_for_agent_input() {
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        parser.process(b"\x1b[?2004h");
+        let pane = MonitorPane::new();
+
+        let agent_input = RenderSnapshot::capture(parser.screen(), Focus::Top, &pane, None);
+        let overlay_input = RenderSnapshot::capture(parser.screen(), Focus::Bottom, &pane, None);
+
+        assert!(agent_input.bracketed_paste);
+        assert!(!overlay_input.bracketed_paste);
+    }
+
+    #[test]
+    fn alt_screen_guard_mirrors_and_restores_bracketed_paste_mode() {
+        let file = tempfile::tempfile().unwrap();
+        let mut reader = file.try_clone().unwrap();
+
+        {
+            let mut guard = AltScreenGuard::enter(file).unwrap();
+            guard.sync_bracketed_paste(true).unwrap();
+            guard.sync_bracketed_paste(true).unwrap();
+        }
+
+        let mut written = Vec::new();
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_to_end(&mut written).unwrap();
+
+        let enable_pos =
+            find_bytes(&written, BRACKETED_PASTE_ENABLE).expect("bracketed-paste enable sequence");
+        let disable_pos = find_bytes(&written, BRACKETED_PASTE_DISABLE)
+            .expect("bracketed-paste disable sequence");
+        let leave_pos = find_bytes(&written, b"\x1b[?1049l").expect("leave alternate screen");
+        assert_eq!(
+            written
+                .windows(BRACKETED_PASTE_ENABLE.len())
+                .filter(|window| *window == BRACKETED_PASTE_ENABLE)
+                .count(),
+            1,
+            "an unchanged mode must not be written again"
+        );
+        assert!(enable_pos < disable_pos, "restore should follow enable");
+        assert!(
+            disable_pos < leave_pos,
             "restore should precede alternate-screen exit"
         );
     }
