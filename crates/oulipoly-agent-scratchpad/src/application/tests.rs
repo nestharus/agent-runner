@@ -2742,15 +2742,22 @@ mod core_struct_01 {
 /// Intent: CORE-STRUCT-02.
 /// Risk/finding lineage: S1, S2, S9, S14; R1-F04 -> R2-F01 -> R3-F01;
 /// R3-F02; R3-F03; R5-F01/AUDIT-RISK-R5-001/SHORTCUT-RISK-002/PR-002/CQ-R5-F01.
-/// Fixture source/application: compile-time root/application/adapter/DDL source and construction review.
+/// Fixture source/application: compile-time root/core/application/adapter/DDL source and construction review.
 /// Observable: one facade -> application -> capability -> adapter -> Store route; no public bypass.
 mod core_struct_02 {
     use super::*;
 
-    fn sources() -> (&'static str, &'static str, &'static str, &'static str) {
+    fn sources() -> (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+    ) {
         (
             include_str!("../application.rs"),
             include_str!("../lib.rs"),
+            include_str!("../core_api.rs"),
             include_str!("../store_adapter.rs"),
             include_str!("../compatibility_ddl.rs"),
         )
@@ -2758,8 +2765,8 @@ mod core_struct_02 {
 
     #[test]
     fn production_source_has_one_private_application_adapter_and_construction_route() {
-        let (application, root, adapter, compatibility_ddl) = sources();
-        let facade = braced_item(root, "impl Scratchpad {");
+        let (application, root, core_api, adapter, compatibility_ddl) = sources();
+        let facade = braced_item(core_api, "impl Scratchpad {");
         let facade_state = braced_item(root, "pub struct Scratchpad {");
         let application_state = braced_item(application, "pub(super) struct ScratchpadApplication");
 
@@ -2772,6 +2779,7 @@ mod core_struct_02 {
         );
         for (owner, source) in [
             ("root", root),
+            ("core API", core_api),
             ("application", application),
             ("compatibility DDL", compatibility_ddl),
         ] {
@@ -2781,20 +2789,21 @@ mod core_struct_02 {
             );
         }
         assert_eq!(
-            root.matches("StoreScratchpadPersistence::new(").count(),
+            core_api.matches("StoreScratchpadPersistence::new(").count(),
             1,
             "one adapter construction"
         );
         assert_eq!(
-            root.matches("ScratchpadApplication::new(").count(),
+            core_api.matches("ScratchpadApplication::new(").count(),
             1,
             "one application construction"
         );
         assert_eq!(
-            root.matches("Store::open(").count(),
+            core_api.matches("Store::open(").count(),
             1,
-            "one composition-root Store open"
+            "one core API Store open"
         );
+        assert!(!root.contains("Store::open("));
         assert!(!application.contains("Store::open("));
         assert!(!adapter.contains("Store::open("));
         assert!(!compatibility_ddl.contains("Store::open("));
@@ -2832,19 +2841,159 @@ mod core_struct_02 {
         assert!(!application.contains("pub struct ScratchpadApplication"));
         assert!(!application.contains("#[cfg(feature"));
         assert!(!root.contains("#[cfg(feature"));
+        assert!(!core_api.contains("#[cfg(feature"));
         assert!(!adapter.contains("#[cfg(feature"));
         assert!(!compatibility_ddl.contains("#[cfg(feature"));
         assert!(!application.contains("StrictFakePersistence"));
         assert!(!root.contains("StrictFakePersistence"));
+        assert!(!core_api.contains("StrictFakePersistence"));
+        assert!(!core_api.contains("include!("));
         assert!(!adapter.contains("include!("));
         assert!(!compatibility_ddl.contains("include!("));
+        assert!(!root.contains("pub use core_api"));
         assert!(!root.contains("pub use store_adapter"));
         assert!(!root.contains("pub use compatibility_ddl"));
     }
 
     #[test]
+    fn root_public_declarations_and_core_impl_signatures_keep_the_exact_public_paths() {
+        let (application, root, core_api, adapter, compatibility_ddl) = sources();
+        let error_compatibility = include_str!("../error_compatibility.rs");
+
+        for declaration in [
+            "pub struct ScratchpadName(",
+            "pub struct InvocationScope {",
+            "pub struct ScratchpadAddress {",
+            "pub struct CanonicalAddress {",
+            "pub struct WriteRequest {",
+            "pub struct ReadRequest {",
+            "pub struct ListRequest {",
+            "pub struct DeleteRequest {",
+            "pub enum DeleteSelector {",
+            "pub struct PublishRequest {",
+            "pub struct GcRequest {",
+            "pub enum GcSelector {",
+            "pub struct ScratchpadMeta {",
+            "pub struct ScratchpadRecord {",
+            "pub struct WriteReceipt {",
+            "pub struct DeleteReceipt {",
+            "pub struct PublishReceipt {",
+            "pub struct GcReport {",
+            "pub enum ScratchpadError {",
+            "pub struct Scratchpad {",
+        ] {
+            assert_eq!(
+                root.matches(declaration).count(),
+                1,
+                "root owner {declaration:?}"
+            );
+            for (owner, source) in [
+                ("core API", core_api),
+                ("application", application),
+                ("adapter", adapter),
+                ("compatibility DDL", compatibility_ddl),
+                ("error compatibility", error_compatibility),
+            ] {
+                assert!(
+                    !source.contains(declaration),
+                    "{owner} copies root-public declaration {declaration:?}"
+                );
+            }
+        }
+
+        for signature in [
+            "pub fn new(value: impl Into<String>) -> Result<Self, ScratchpadError>",
+            "pub fn as_str(&self) -> &str",
+            "pub fn open(db_path: impl AsRef<Path>) -> Result<Self, ScratchpadError>",
+            "pub fn write(&self, req: WriteRequest) -> Result<WriteReceipt, ScratchpadError>",
+            "pub fn read(&self, req: ReadRequest) -> Result<ScratchpadRecord, ScratchpadError>",
+            "pub fn list(&self, req: ListRequest) -> Result<Vec<ScratchpadMeta>, ScratchpadError>",
+            "pub fn delete(&self, req: DeleteRequest) -> Result<DeleteReceipt, ScratchpadError>",
+            "pub fn publish(&self, req: PublishRequest) -> Result<PublishReceipt, ScratchpadError>",
+            "pub fn gc(&self, req: GcRequest) -> Result<GcReport, ScratchpadError>",
+        ] {
+            assert_eq!(
+                core_api.matches(signature).count(),
+                1,
+                "core signature {signature:?}"
+            );
+            assert!(
+                !root.contains(signature),
+                "root retains impl signature {signature:?}"
+            );
+        }
+        assert_eq!(core_api.matches("impl ScratchpadName {").count(), 1);
+        assert_eq!(core_api.matches("impl Scratchpad {").count(), 1);
+        assert!(!root.contains("impl ScratchpadName {"));
+        assert!(!root.contains("impl Scratchpad {"));
+        assert!(!root.contains("pub type "));
+        assert!(!root.contains("pub use "));
+    }
+
+    #[test]
+    fn core_component_and_time_ownership_are_explicit_and_single() {
+        let (application, root, core_api, adapter, compatibility_ddl) = sources();
+
+        for path in [
+            "crates/oulipoly-agent-scratchpad/src/lib.rs",
+            "crates/oulipoly-agent-scratchpad/src/core_api.rs",
+            "crates/oulipoly-agent-scratchpad/src/application.rs",
+            "crates/oulipoly-agent-scratchpad/src/retirement_status.rs",
+        ] {
+            assert!(core_api.contains(path), "scratchpad-core path {path:?}");
+        }
+        assert!(core_api.contains("component: scratchpad-core"));
+        assert_eq!(core_api.matches("fn system_current_utc()").count(), 1);
+        assert_eq!(
+            core_api
+                .matches("std::time::SystemTime::now().into()")
+                .count(),
+            1
+        );
+        assert_eq!(
+            application.matches("(self.observe_current_utc)()").count(),
+            1,
+            "application observes current UTC exactly once"
+        );
+        let gc = braced_item(application, "pub(super) fn gc(");
+        assert!(
+            gc.find("(self.observe_current_utc)()") < gc.find("let GcRequest"),
+            "current UTC remains the first application observation"
+        );
+        assert!(application.contains("std::time::Duration::from_secs(7 * 24 * 60 * 60)"));
+        assert!(!application.contains("TimeDelta"));
+        for (owner, source) in [
+            ("root", root),
+            ("application", application),
+            ("adapter", adapter),
+            ("compatibility DDL", compatibility_ddl),
+        ] {
+            assert!(
+                !source.contains("fn system_current_utc()"),
+                "{owner} copies UTC bridge"
+            );
+            assert!(
+                !source.contains("SystemTime::now()"),
+                "{owner} observes production time"
+            );
+            assert!(
+                !source.contains("Utc::now()"),
+                "{owner} owns a second production clock"
+            );
+        }
+        assert_eq!(adapter.matches("created_at: receipt.created_at").count(), 2);
+        assert_eq!(
+            adapter
+                .matches("tombstoned_at: receipt.tombstone.tombstoned_at")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn adapter_helpers_and_compatibility_ddl_have_single_private_owners() {
-        let (application, root, adapter, compatibility_ddl) = sources();
+        let (application, root, core_api, adapter, compatibility_ddl) = sources();
+        let error_compatibility = include_str!("../error_compatibility.rs");
 
         for marker in [
             "struct StoreScratchpadPersistence",
@@ -2883,8 +3032,16 @@ mod core_struct_02 {
                 "application copies moved owner {marker:?}"
             );
             assert!(
+                !core_api.contains(marker),
+                "core API copies moved owner {marker:?}"
+            );
+            assert!(
                 !compatibility_ddl.contains(marker),
                 "compatibility DDL copies moved owner {marker:?}"
+            );
+            assert!(
+                !error_compatibility.contains(marker),
+                "error compatibility copies moved owner {marker:?}"
             );
         }
 
@@ -2896,10 +3053,11 @@ mod core_struct_02 {
             "one compatibility DDL owner"
         );
         assert_eq!(
-            root.matches("install_store_aliases(").count(),
+            core_api.matches("install_store_aliases(").count(),
             1,
             "one compatibility DDL call"
         );
+        assert!(!root.contains("install_store_aliases("));
         assert!(!application.contains("install_store_aliases("));
         assert!(!adapter.contains("install_store_aliases("));
         for ddl in [
@@ -2922,10 +3080,105 @@ mod core_struct_02 {
                 "application copies compatibility DDL {ddl:?}"
             );
             assert!(
+                !core_api.contains(ddl),
+                "core API copies compatibility DDL {ddl:?}"
+            );
+            assert!(
                 !adapter.contains(ddl),
                 "adapter copies compatibility DDL {ddl:?}"
             );
         }
+    }
+
+    #[test]
+    fn compatibility_errors_have_one_owner_and_store_conversion_stays_in_the_adapter() {
+        let (application, root, core_api, adapter, compatibility_ddl) = sources();
+        let error_compatibility = include_str!("../error_compatibility.rs");
+
+        for marker in [
+            "impl fmt::Display for ScratchpadError",
+            "impl Error for ScratchpadError",
+            "impl From<std::io::Error> for ScratchpadError",
+            "impl From<serde_json::Error> for ScratchpadError",
+        ] {
+            assert_eq!(
+                error_compatibility.matches(marker).count(),
+                1,
+                "error owner {marker:?}"
+            );
+            for (owner, source) in [
+                ("root", root),
+                ("core API", core_api),
+                ("application", application),
+                ("adapter", adapter),
+                ("compatibility DDL", compatibility_ddl),
+            ] {
+                assert!(
+                    !source.contains(marker),
+                    "{owner} copies error owner {marker:?}"
+                );
+            }
+        }
+        assert_eq!(
+            adapter
+                .matches("impl From<StoreError> for ScratchpadError")
+                .count(),
+            1
+        );
+        assert!(!error_compatibility.contains("StoreError"));
+        assert!(!root.contains("pub use error_compatibility"));
+    }
+
+    #[test]
+    fn cli_keeps_the_public_route_and_owns_its_runtime_imports() {
+        let (_, root, core_api, _, _) = sources();
+        let cli = include_str!("../cli.rs");
+        let main = include_str!("../main.rs");
+
+        assert_eq!(root.matches("pub mod cli;").count(), 1);
+        assert_eq!(
+            main.matches("oulipoly_agent_scratchpad::cli::run()")
+                .count(),
+            1
+        );
+        for import in [
+            "use std::fs;",
+            "use std::io::{self, Read, Write};",
+            "use std::path::{Path, PathBuf};",
+            "use std::process::ExitCode;",
+        ] {
+            assert!(cli.contains(import), "CLI import {import:?}");
+            assert!(!root.contains(import), "root retains CLI import {import:?}");
+        }
+        for import in ["use chrono::{DateTime, Utc};", "use uuid::Uuid;"] {
+            assert!(cli.contains(import), "explicit CLI import {import:?}");
+            assert!(root.contains(import), "root declaration import {import:?}");
+        }
+        assert_eq!(cli.matches("Scratchpad::open(").count(), 6);
+        for (handler, operation) in [
+            ("fn handle_write(", ".write("),
+            ("fn handle_read(", ".read("),
+            ("fn handle_list(", ".list("),
+            ("fn handle_delete(", ".delete("),
+            ("fn handle_publish(", ".publish("),
+            ("fn handle_gc(", ".gc("),
+        ] {
+            let body = braced_item(cli, handler);
+            assert_eq!(
+                body.matches("Scratchpad::open(").count(),
+                1,
+                "CLI route {handler:?}"
+            );
+            assert_eq!(
+                body.matches(operation).count(),
+                1,
+                "CLI facade operation {operation:?}"
+            );
+        }
+        assert!(!cli.contains("ScratchpadApplication"));
+        assert!(!cli.contains("StoreScratchpadPersistence"));
+        assert!(!cli.contains("Store::open("));
+        assert_eq!(core_api.matches("Store::open(").count(), 1);
     }
 }
 
@@ -2972,6 +3225,8 @@ mod core_struct_03 {
     #[test]
     fn status_translation_has_one_adapter_definition_and_direct_production_and_test_attachments() {
         let (application, root, adapter, status, status_tests) = sources();
+        let core_api = include_str!("../core_api.rs");
+        let error_compatibility = include_str!("../error_compatibility.rs");
 
         assert_eq!(
             adapter.matches("fn map_store_retirement_status(").count(),
@@ -2991,6 +3246,8 @@ mod core_struct_03 {
         );
         assert!(!application.contains("map_store_retirement_status"));
         assert!(!root.contains("fn map_store_retirement_status("));
+        assert!(!core_api.contains("map_store_retirement_status"));
+        assert!(!error_compatibility.contains("map_store_retirement_status"));
         assert!(!status.contains("TombstoneStatus"));
         for duplicate in [
             "PrivateRetirementStatus",
@@ -3012,9 +3269,19 @@ mod core_struct_03 {
                 !adapter.contains(duplicate),
                 "adapter contains duplicate STATUS owner {duplicate:?}"
             );
+            assert!(
+                !core_api.contains(duplicate),
+                "core API contains duplicate STATUS owner {duplicate:?}"
+            );
+            assert!(
+                !error_compatibility.contains(duplicate),
+                "error compatibility contains duplicate STATUS owner {duplicate:?}"
+            );
         }
         assert!(!root.contains("pub use map_store_retirement_status"));
         assert!(!root.contains("pub(crate) use map_store_retirement_status"));
+        assert!(!core_api.contains("pub use map_store_retirement_status"));
+        assert!(!core_api.contains("pub(crate) use map_store_retirement_status"));
         assert!(!adapter.contains("pub use map_store_retirement_status"));
         assert!(!adapter.contains("pub(crate) use map_store_retirement_status"));
     }

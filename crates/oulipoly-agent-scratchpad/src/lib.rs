@@ -1,48 +1,18 @@
 mod application;
 mod compatibility_ddl;
+mod core_api;
+mod error_compatibility;
 mod retirement_status;
 mod store_adapter;
 
-use std::error::Error;
-use std::fmt;
-use std::fs;
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-
 use chrono::{DateTime, Utc};
-use oulipoly_agent_store::{Store, TombstoneMeta};
+use oulipoly_agent_store::TombstoneMeta;
 use uuid::Uuid;
-
-use application::ScratchpadApplication;
-use compatibility_ddl::install_store_aliases;
-use store_adapter::StoreScratchpadPersistence;
 
 const SCRATCHPAD_PREFIX: &str = "scratchpad:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScratchpadName(String);
-
-impl ScratchpadName {
-    pub fn new(value: impl Into<String>) -> Result<Self, ScratchpadError> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(ScratchpadError::InvalidInput(
-                "scratchpad name must not be empty".to_string(),
-            ));
-        }
-        if value.starts_with(SCRATCHPAD_PREFIX) {
-            return Err(ScratchpadError::InvalidInput(format!(
-                "scratchpad name must not start with reserved prefix {SCRATCHPAD_PREFIX}"
-            )));
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationScope {
@@ -214,95 +184,11 @@ pub enum ScratchpadError {
     MetadataDecode(String),
 }
 
-impl fmt::Display for ScratchpadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
-            Self::MissingInvocationScope => write!(
-                f,
-                "missing invocation scope: pass --invocation-uuid or set OULIPOLY_PARENT_INVOCATION"
-            ),
-            Self::InvalidInvocationScope(message) => {
-                write!(f, "invalid invocation scope: {message}")
-            }
-            Self::NotFound => write!(f, "scratchpad artifact not found"),
-            Self::NotFoundNamed(name) => write!(f, "scratchpad artifact not found: {name}"),
-            Self::Collision => write!(f, "backing store collision"),
-            Self::Io(err) => write!(f, "io error: {err}"),
-            Self::Database(err) => write!(f, "database error: {err}"),
-            Self::MigrationRequired => write!(f, "database schema migration required"),
-            Self::IncompatibleSchema => write!(f, "incompatible database schema"),
-            Self::Serialization(err) => write!(f, "json serialization error: {err}"),
-            Self::MetadataDecode(message) => write!(f, "metadata decode error: {message}"),
-        }
-    }
-}
-
-impl Error for ScratchpadError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::Database(err) => Some(err),
-            Self::Serialization(err) => Some(err),
-            _ => None,
-        }
-    }
-}
-
-impl From<io::Error> for ScratchpadError {
-    fn from(value: io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-
-impl From<serde_json::Error> for ScratchpadError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Serialization(value)
-    }
-}
-
 pub struct Scratchpad {
-    application: ScratchpadApplication<StoreScratchpadPersistence, fn() -> DateTime<Utc>>,
-}
-
-fn system_current_utc() -> DateTime<Utc> {
-    Utc::now()
-}
-
-impl Scratchpad {
-    pub fn open(db_path: impl AsRef<Path>) -> Result<Self, ScratchpadError> {
-        let db_path = db_path.as_ref();
-        let store = Store::open(db_path)?;
-        install_store_aliases(db_path)?;
-        let persistence = StoreScratchpadPersistence::new(store);
-        let application =
-            ScratchpadApplication::new(persistence, system_current_utc as fn() -> DateTime<Utc>);
-        Ok(Self { application })
-    }
-
-    pub fn write(&self, req: WriteRequest) -> Result<WriteReceipt, ScratchpadError> {
-        self.application.write(req)
-    }
-
-    pub fn read(&self, req: ReadRequest) -> Result<ScratchpadRecord, ScratchpadError> {
-        self.application.read(req)
-    }
-
-    pub fn list(&self, req: ListRequest) -> Result<Vec<ScratchpadMeta>, ScratchpadError> {
-        self.application.list(req)
-    }
-
-    pub fn delete(&self, req: DeleteRequest) -> Result<DeleteReceipt, ScratchpadError> {
-        self.application.delete(req)
-    }
-
-    pub fn publish(&self, req: PublishRequest) -> Result<PublishReceipt, ScratchpadError> {
-        self.application.publish(req)
-    }
-
-    pub fn gc(&self, req: GcRequest) -> Result<GcReport, ScratchpadError> {
-        self.application.gc(req)
-    }
+    application: application::ScratchpadApplication<
+        store_adapter::StoreScratchpadPersistence,
+        fn() -> DateTime<Utc>,
+    >,
 }
 
 pub mod cli;

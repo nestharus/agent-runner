@@ -1,9 +1,22 @@
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use oulipoly_agent_store::TombstoneMeta;
 use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
-use super::*;
 use crate::store_adapter::private_workflow;
+use crate::{
+    CanonicalAddress, DeleteReceipt, DeleteRequest, DeleteSelector, GcReport, GcRequest,
+    GcSelector, InvocationScope, ListRequest, PublishReceipt, PublishRequest, ReadRequest,
+    Scratchpad, ScratchpadAddress, ScratchpadError, ScratchpadMeta, ScratchpadName, WriteReceipt,
+    WriteRequest,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-scratchpad")]
@@ -305,8 +318,7 @@ fn handle_gc(args: GcArgs) -> ExitCode {
     run_cli(|| {
         let selector = gc_selector(args.selector)?;
         let scratchpad = Scratchpad::open(args.db)?;
-        let report =
-            scratchpad.gc(gc_request(selector, args.dry_run, args.actor, args.reason))?;
+        let report = scratchpad.gc(gc_request(selector, args.dry_run, args.actor, args.reason))?;
         write_gc_output(&report, args.json)?;
         Ok(())
     })
@@ -337,11 +349,7 @@ fn write_request(
     }
 }
 
-fn read_request(
-    scope: InvocationScope,
-    name: ScratchpadName,
-    version: Option<u64>,
-) -> ReadRequest {
+fn read_request(scope: InvocationScope, name: ScratchpadName, version: Option<u64>) -> ReadRequest {
     ReadRequest {
         scope,
         name,
@@ -411,9 +419,7 @@ fn publish_request(
 
 fn gc_selector(args: GcSelectorArgs) -> Result<GcSelector, ScratchpadError> {
     match (args.invocation_uuid, args.expired_before) {
-        (Some(invocation_uuid), None) => {
-            Ok(GcSelector::Invocation(parse_uuid(&invocation_uuid)?))
-        }
+        (Some(invocation_uuid), None) => Ok(GcSelector::Invocation(parse_uuid(&invocation_uuid)?)),
         (None, Some(expired_before)) => Ok(GcSelector::ExpiredBefore(parse_expired_before(
             &expired_before,
         )?)),
@@ -788,9 +794,7 @@ impl MetaEnvelope {
             version: meta.version,
             sha256: meta.sha256.clone(),
             content_len: meta.content_len,
-            producer_invocation_uuid: meta
-                .producer_invocation_uuid
-                .map(|uuid| uuid.to_string()),
+            producer_invocation_uuid: meta.producer_invocation_uuid.map(|uuid| uuid.to_string()),
             format_hint: meta.format_hint.clone(),
             verdict_line: meta.verdict_line.clone(),
             predecessor_version: meta.predecessor_version,

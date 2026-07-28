@@ -2,7 +2,7 @@
 //!
 //! `orchestration`, `validator`, `predicate`, `mapper`, `formatter`.
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::retirement_status::{
@@ -21,8 +21,6 @@ const DEFAULT_DELETE_REASON: &str = "scratchpad delete";
 const DEFAULT_GC_ACTOR: &str = "agent-scratchpad-gc";
 const DEFAULT_GC_INVOCATION_REASON: &str = "scratchpad gc invocation";
 const DEFAULT_GC_EXPIRED_REASON: &str = "scratchpad gc expired";
-const TTL_DAYS: i64 = 7;
-
 pub(super) trait ScratchpadPersistence {
     fn append_private_version(
         &self,
@@ -446,7 +444,7 @@ fn validate_canonical_destination(destination: &CanonicalAddress) -> Result<(), 
 }
 
 fn is_expired_at(created_at: DateTime<Utc>, cutoff: DateTime<Utc>) -> bool {
-    created_at + TimeDelta::days(TTL_DAYS) <= cutoff
+    created_at + std::time::Duration::from_secs(7 * 24 * 60 * 60) <= cutoff
 }
 
 fn format_scratchpad_meta(meta: PrivateVersionMeta) -> ScratchpadMeta {
