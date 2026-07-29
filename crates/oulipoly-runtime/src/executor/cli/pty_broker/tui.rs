@@ -5864,11 +5864,9 @@ fn submit_control_payload(
 ) -> Result<(), String> {
     queue_control_injection(io.pending_child_input, payload, bracketed_paste, false);
     drain_control_payload_body(io)?;
-    // Let the child commit the (pasted) body to its input buffer before the Enter, so the
-    // submit doesn't race ahead of the async paste commit and get dropped.
-    if bracketed_paste {
-        std::thread::sleep(CONTROL_SUBMIT_DELAY);
-    }
+    // Let the child commit the body to its input buffer before Enter. Ink-style TUIs may
+    // batch a raw control write as a paste even before they advertise bracketed-paste mode.
+    std::thread::sleep(CONTROL_SUBMIT_DELAY);
     io.pending_child_input.enqueue(b"\r");
     io.line_state.mark_submitted();
     Ok(())
@@ -6691,7 +6689,7 @@ mod tests {
     }
 
     #[test]
-    fn control_submit_drains_body_before_queueing_enter() {
+    fn unbracketed_control_submit_delays_enter_after_draining_body() {
         let (mut read_end, write_end) = pipe_files();
         let mut router = InputRouter::new();
         let pane = MonitorPane::new();
@@ -6717,9 +6715,11 @@ mod tests {
             child_pid: None,
         };
 
-        submit_control_payload(&mut io, b"body", true).expect("submit payload");
+        let started = Instant::now();
+        submit_control_payload(&mut io, b"body", false).expect("submit payload");
 
-        let expected_body = control_payload_bytes(b"body", true);
+        assert!(started.elapsed() >= CONTROL_SUBMIT_DELAY);
+        let expected_body = control_payload_bytes(b"body", false);
         let mut received_body = vec![0_u8; expected_body.len()];
         read_end
             .read_exact(&mut received_body)
