@@ -13,6 +13,7 @@ use std::path::Path;
 impl Fixture {
     pub(crate) fn write_provider(&self, body: &str) {
         let script = self.write_script("provider.sh", body);
+        self.write_session_source(PROVIDER);
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
             format!(
@@ -48,6 +49,7 @@ flag = "--resume"
 
     pub(crate) fn write_opencode_provider(&self, body: &str) {
         let script = self.write_script("opencode.sh", body);
+        self.write_session_source("opencode");
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
             r#"[[providers]]
@@ -77,6 +79,7 @@ flag = "--session"
 
     pub(crate) fn write_opencode_capture_provider(&self, body: &str) {
         let script = self.write_script("opencode-capture.sh", body);
+        self.write_session_source("opencode");
         fs::write(
             self.models_dir.join(format!("{MODEL}.toml")),
             r#"[[providers]]
@@ -103,6 +106,26 @@ event_id_path = "sessionID"
 [opencode.resume]
 kind = "flag"
 flag = "--session"
+"#,
+                toml_string(&path_string(&script))
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_session_source(&self, provider: &str) {
+        let script = self.write_script(
+            "session-turns.sh",
+            r#"turns="${WU_D_WORK_DIR:?missing}/session-turns"
+if [ -d "$turns" ]; then
+  find "$turns" -maxdepth 1 -type f -name '*.jsonl' -print0 | sort -z | xargs -0 -r cat
+fi"#,
+        );
+        fs::write(
+            self.app_config_dir.join("sessions.toml"),
+            format!(
+                r#"[{provider}]
+turn_script = {}
 "#,
                 toml_string(&path_string(&script))
             ),

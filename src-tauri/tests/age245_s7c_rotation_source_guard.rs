@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BASELINE_COMMIT: &str = "ba61435d6b68674901427da4cf61d7def10a6b39";
+const BASELINE_COMMIT: &str = "d807db935388ce9e56e73e210632665dc2df68b2";
 const MANAGER_BASELINE_PROVIDER_NAME_COUNT: usize = 4628;
 
 #[test]
