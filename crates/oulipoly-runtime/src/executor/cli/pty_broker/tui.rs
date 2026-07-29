@@ -6018,19 +6018,17 @@ fn validate_safe_to_inject(
     if !pending_child_input.is_empty() {
         return Err(unsafe_mid_line_error());
     }
-    if let Some(detail) = outbound_release_gate.blocking_detail(Instant::now()) {
+    if let Some(detail) = outbound_release_gate.blocking_detail(Instant::now())
+        && detail != "awaiting_child_output_quiescence"
+    {
         return Err(detail.to_string());
     }
-    if super::safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok() {
-        Ok(())
-    } else {
-        Err(
-            super::safe_to_inject(master_fd, child_pid, line_state, child_output_state)
-                .err()
-                .map(super::unsafe_reason_message)
-                .unwrap_or_else(unsafe_mid_line_error),
-        )
-    }
+    super::safe_to_inject_after_wait_for_foreground(
+        super::foreground_owner_state(master_fd, child_pid),
+        line_state,
+        child_output_state,
+    )
+    .map_err(super::unsafe_reason_message)
 }
 
 fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {

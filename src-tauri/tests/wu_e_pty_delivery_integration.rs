@@ -869,6 +869,121 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
 }
 
 #[test]
+fn observed_tui_delivers_live_notification_during_continuous_child_redraw() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("continuous-redraw-received.log");
+    let script = fixture_provider_with_continuous_redraw(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-continuous-redraw", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-continuous-redraw",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-continuous-redraw", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+
+    let notify = fixture.run_notify("h-continuous-redraw", caller_chain(&child_identity));
+    let diagnostic = stdout_json(&notify);
+    if diagnostic["pty_delivery"]["status"] != "acked" {
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!("continuous-redraw delivery was not accepted: {diagnostic}");
+    }
+    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert!(
+        received.contains("handle: h-continuous-redraw"),
+        "{received}"
+    );
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "continuous-redraw-notification-turn",
+        "user",
+        &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
+    );
+    assert!(repl.wait().unwrap().success());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn resumed_repl_retries_pending_mailbox_after_replacing_stale_runtime() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("resumed-pending-received.log");
+    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-resumed-pending", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-resumed-pending",
+    );
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "pre-reboot-assistant-turn",
+        "assistant",
+        "durable work before reboot",
+    );
+    let stale_identity = ProcessIdentity {
+        os_pid: 999_999_001,
+        os_boot_id: "pre-reboot-boot-id".to_string(),
+        os_pid_starttime_ticks: 1,
+    };
+    fixture.mark_live_pty_runtime(
+        &stale_identity,
+        &fixture.socket_path("pre-reboot-stale.sock"),
+    );
+    fixture.seed_mailbox("h-pre-reboot-pending");
+
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-resumed-pending", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+
+    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(6));
+    if !output.contains("GOT_NOTIFY") {
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!("resumed REPL did not retry its pending mailbox: {output:?}");
+    }
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert!(
+        received.contains("handle: h-pre-reboot-pending"),
+        "{received}"
+    );
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "resumed-pending-notification-turn",
+        "user",
+        &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
+    );
+    assert!(repl.wait().unwrap().success());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn live_broker_confirmation_contracts_overlapping_attempts() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("overlap-received.log");
@@ -1390,7 +1505,7 @@ fn pty_exit_session_scan_confirms_marker_without_preingested_turn() {
 }
 
 #[test]
-fn pty_exit_unconfirmed_marker_hands_off_to_single_headless_wake() {
+fn pty_exit_unconfirmed_marker_retries_headless_until_confirmation_cap() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("unconfirmed-exit-received.log");
     let release = fixture.dir.path().join("unconfirmed-exit-release");
@@ -1429,15 +1544,19 @@ fn pty_exit_unconfirmed_marker_hands_off_to_single_headless_wake() {
     fs::write(&release, "release\n").unwrap();
 
     assert!(repl.wait().unwrap().success());
-    wait_for_launch_count(&launches, 2);
-    wait_for_mailbox_delivery(&fixture, 1);
+    wait_for_launch_count(&launches, 1 + MAX_UNCONFIRMED_DELIVERY_ATTEMPTS as usize);
+    wait_for_mailbox_unconfirmed_cap(&fixture);
     let launch_log = fs::read_to_string(&launches).unwrap();
     assert_eq!(
         launch_log.matches("interactive\n").count(),
         1,
         "{launch_log}"
     );
-    assert_eq!(launch_log.matches("headless\n").count(), 1, "{launch_log}");
+    assert_eq!(
+        launch_log.matches("headless\n").count(),
+        MAX_UNCONFIRMED_DELIVERY_ATTEMPTS as usize,
+        "{launch_log}"
+    );
     assert!(fixture.mailbox().wake_claim(SESSION_A).unwrap().is_none());
     fixture.assert_default_user_paths_untouched();
 }
@@ -1578,6 +1697,41 @@ done
     path
 }
 
+fn fixture_provider_with_continuous_redraw(dir: &Path, received_log: &Path) -> PathBuf {
+    let path = dir.join("fixture-continuous-redraw-provider.sh");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+: > {received}
+test -t 0
+test -t 1
+test -t 2
+printf 'READY_FOR_NOTIFY\n'
+while true; do
+  if IFS= read -r -t 0.05 line; then
+    printf '%s\n' "$line" >> {received}
+    if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
+      printf 'GOT_NOTIFY\n'
+      sleep 1
+      exit 0
+    fi
+  else
+    printf '\033[2;1H'
+  fi
+done
+"#,
+            received = shell_single_quote(&path_string(received_log))
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
 fn fixture_provider_waiting_for_two_notifications(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-two-notifications-provider.sh");
     fs::write(
@@ -1673,19 +1827,22 @@ fn wait_for_launch_count(path: &Path, expected: usize) {
     );
 }
 
-fn wait_for_mailbox_delivery(fixture: &Fixture, expected: usize) {
+fn wait_for_mailbox_unconfirmed_cap(fixture: &Fixture) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-        if rows.len() == expected
-            && rows.iter().all(|row| row.delivered_at.is_some())
-            && fixture.mailbox().wake_claim(SESSION_A).unwrap().is_none()
+        let mailbox = fixture.mailbox();
+        let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+        if rows.len() == 1
+            && rows[0].delivered_at.is_none()
+            && rows[0].delivery_attempts == MAX_UNCONFIRMED_DELIVERY_ATTEMPTS
+            && rows[0].delivery_error.as_deref() == Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
+            && mailbox.wake_claim(SESSION_A).unwrap().is_none()
         {
             return;
         }
         thread::sleep(Duration::from_millis(25));
     }
-    panic!("timed out waiting for {expected} delivered mailbox rows");
+    panic!("timed out waiting for mailbox confirmation retry cap");
 }
 
 fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {

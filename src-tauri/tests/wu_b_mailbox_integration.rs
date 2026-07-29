@@ -306,6 +306,29 @@ turn_script = {}
         .unwrap();
     }
 
+    fn write_confirming_resume_model(
+        &self,
+        model_name: &str,
+        prompt_dump: &Path,
+        session_id: &str,
+    ) {
+        let turns = self.dir.path().join(format!("{model_name}-turns.jsonl"));
+        let turn_script = self.write_script(
+            &format!("{model_name}-turns.sh"),
+            &format!(
+                "if [ -f {} ]; then cat {}; fi",
+                shell_path(&turns),
+                shell_path(&turns)
+            ),
+        );
+        let provider_script = self.write_script(
+            &format!("{model_name}-provider.sh"),
+            &write_user_turn_script(prompt_dump, &turns, session_id, None, 0),
+        );
+        self.write_single_provider_model(model_name, "fixture-provider", &provider_script);
+        self.write_sessions_config("fixture-provider", &turn_script);
+    }
+
     fn seed_session_turn(&self, provider: &str, session_id: &str) {
         let db = self.open_state();
         db.ingest_session_turns_batch(
@@ -656,11 +679,7 @@ fn mailbox_pause_suppresses_notify_delivery_and_wake_until_resume() {
 fn resume_with_pending_mailbox_prepends_notifications() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
-    let script = fixture.write_script(
-        "resume-prepend.sh",
-        &dump_last_arg_script(&prompt_dump, None, 0),
-    );
-    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_confirming_resume_model("fixture-model", &prompt_dump, SESSION_A);
     fixture.seed_session_turn("fixture-provider", SESSION_A);
     fixture.seed_mailbox(SESSION_A, "h-1", 0);
     fixture.seed_mailbox(SESSION_A, "h-2", 7);
@@ -728,11 +747,7 @@ fn resume_without_mailbox_and_without_prompt_preserves_native_resume() {
 fn resume_with_only_mailbox_sends_notification_prompt() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
-    let script = fixture.write_script(
-        "resume-only-mailbox.sh",
-        &dump_last_arg_script(&prompt_dump, None, 0),
-    );
-    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_confirming_resume_model("fixture-model", &prompt_dump, SESSION_A);
     fixture.seed_session_turn("fixture-provider", SESSION_A);
     fixture.seed_mailbox(SESSION_A, "h-only", 0);
 
@@ -747,14 +762,10 @@ fn resume_with_only_mailbox_sends_notification_prompt() {
 }
 
 #[test]
-fn resume_marks_delivered_after_success() {
+fn resume_marks_delivered_after_exact_turn_confirmation() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
-    let script = fixture.write_script(
-        "resume-deliver.sh",
-        &dump_last_arg_script(&prompt_dump, None, 0),
-    );
-    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_confirming_resume_model("fixture-model", &prompt_dump, SESSION_A);
     fixture.seed_session_turn("fixture-provider", SESSION_A);
     let row = fixture.seed_mailbox(SESSION_A, "h-deliver", 0);
 
@@ -897,11 +908,7 @@ fn resume_failure_leaves_pending() {
 fn resume_drains_in_order_and_respects_batch_cap() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
-    let script = fixture.write_script(
-        "resume-batch.sh",
-        &dump_last_arg_script(&prompt_dump, None, 0),
-    );
-    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_confirming_resume_model("fixture-model", &prompt_dump, SESSION_A);
     fixture.seed_session_turn("fixture-provider", SESSION_A);
     for index in 1..=21 {
         fixture.seed_mailbox(SESSION_A, &format!("h-{index:02}"), 0);
@@ -937,11 +944,7 @@ fn resume_drains_in_order_and_respects_batch_cap() {
 fn resume_uses_resolved_active_session_id() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
-    let script = fixture.write_script(
-        "resume-chain.sh",
-        &dump_last_arg_script(&prompt_dump, None, 0),
-    );
-    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_confirming_resume_model("fixture-model", &prompt_dump, SESSION_B);
     fixture.seed_active_chain(CHAIN_ID, "fixture-provider", SESSION_B, "fixture-model");
     fixture.seed_mailbox(SESSION_B, "h-active", 0);
 
