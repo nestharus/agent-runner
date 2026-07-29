@@ -548,6 +548,7 @@ impl ProcessRunner {
             record_stdout_line_activity(&stdout_line_rx, &mut last_stdout_line);
 
             if let Some(status) = poll_child_status(&mut child, &command)? {
+                kill_tree(&mut child);
                 return Ok(map_completed_process_outcome(
                     status,
                     threads,
@@ -1119,6 +1120,33 @@ mod tests {
         assert!(outcome.stderr.truncated);
         assert_eq!(outcome.stdout.captured_len, 64 * 1024);
         assert_eq!(outcome.stderr.captured_len, 64 * 1024);
+    }
+
+    #[test]
+    fn successful_exit_cleans_descendants_before_joining_pipe_drains() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let leak_probe = LeakProbe::new();
+        let limits = ProcessLimits {
+            timeout: Duration::from_secs(5),
+            kill_after_grace: Duration::from_millis(50),
+            ..ProcessLimits::default()
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = ProcessRunner::new(limits)
+            .run(
+                ProcessCommand::new(fake.path()).arg("describe"),
+                serde_json::to_vec(&describe_request()).expect("request should serialize"),
+                FakeProviderMode::ExitWithPipeHoldingDescendant.env_with_probe(&leak_probe),
+            )
+            .expect("successful provider exit should not wait for leaked pipe holders");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "successful provider exit waited for a descendant to close inherited pipes"
+        );
+        assert!(outcome.status.exited_successfully());
+        leak_probe.assert_no_descendants();
     }
 
     #[test]

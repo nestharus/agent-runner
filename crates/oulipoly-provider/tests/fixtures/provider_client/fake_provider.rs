@@ -127,6 +127,8 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
         "sleep" => sleep_forever(),
         "child-grandchild" => child_grandchild(),
         "sigterm-resistant-child-grandchild" => sigterm_resistant_child_grandchild(),
+        "exit-with-pipe-holding-descendant" => exit_with_pipe_holding_descendant(),
+        "pipe-holding-descendant" => pipe_holding_descendant(),
         "probe-child" => probe_child(),
         "probe-grandchild" => probe_grandchild(),
         "early-stdin-success" => early_stdin_success(),
@@ -841,6 +843,30 @@ fn child_grandchild() -> i32 {
 fn sigterm_resistant_child_grandchild() -> i32 {
     ignore_sigterm();
     spawn_probe_child(true)
+}
+
+fn exit_with_pipe_holding_descendant() -> i32 {
+    let _ = read_stdin_to_string();
+    let mut command = pipe_holding_descendant_command();
+    let _descendant = command.spawn().expect("pipe-holding descendant should spawn");
+    write_stdout(&success_json())
+}
+
+fn pipe_holding_descendant() -> i32 {
+    write_probe_pid("pipe-holder");
+    thread::sleep(Duration::from_secs(2));
+    0
+}
+
+fn pipe_holding_descendant_command() -> Command {
+    let mut command = Command::new(current_executable_path());
+    command
+        .env("FAKE_PROVIDER_MODE", "pipe-holding-descendant")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    apply_probe_dir_env(&mut command, probe_dir_env());
+    command
 }
 
 fn spawn_probe_child(ignore_sigterm: bool) -> i32 {
