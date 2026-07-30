@@ -259,6 +259,50 @@ fn production_observer_resolves_previous_pty_invocation_before_redelivery() {
 }
 
 #[test]
+fn production_observer_releases_unobserved_previous_pty_invocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("restart-unobserved-mailbox-events.log");
+    let observer_state = dir.path().join("restart-unobserved-mailbox-state");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&observer_state, "baseline").unwrap();
+    let child_script = observed_mailbox_child_script(dir.path(), &events, &observer_state);
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    seed_mailbox_attempt(&mailbox_path, PREVIOUS_INVOCATION_UUID, true);
+    let result_path = dir.path().join("restart-unobserved-mailbox-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    wait_for_unobserved_mailbox_attempt(&mailbox_path);
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+
+    assert!(child.wait().unwrap().success());
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "0\n");
+    let event_text = fs::read_to_string(events).unwrap();
+    assert!(event_text.contains("session.read_turns"));
+    assert!(!event_text.contains("child:[OULIPOLY NOTIFICATIONS]"));
+}
+
+#[test]
 fn production_observed_relay_releases_unobserved_mailbox_attempt_for_retry() {
     let dir = tempfile::tempdir().unwrap();
     let events = dir.path().join("unobserved-mailbox-events.log");
@@ -707,9 +751,10 @@ import pathlib
 import sys
 events = pathlib.Path({events:?})
 state = pathlib.Path({state:?})
-print("READY-MAILBOX", flush=True)
+print("\x1b[?2004hREADY-MAILBOX", flush=True)
 for line in sys.stdin:
     line = line.rstrip("\r\n")
+    line = line.replace("\x1b[200~", "").replace("\x1b[201~", "")
     with events.open("a", encoding="utf-8") as handle:
         handle.write("child:" + line + "\n")
     if line.startswith("[OULIPOLY-DELIVERY "):
@@ -735,9 +780,10 @@ import pathlib
 import sys
 events = pathlib.Path({events:?})
 state = pathlib.Path({state:?})
-print("READY-MAILBOX", flush=True)
+print("\x1b[?2004hREADY-MAILBOX", flush=True)
 for line in sys.stdin:
     line = line.rstrip("\r\n")
+    line = line.replace("\x1b[200~", "").replace("\x1b[201~", "")
     with events.open("a", encoding="utf-8") as handle:
         handle.write("child:" + line + "\n")
     if line == "[END OULIPOLY NOTIFICATIONS]":

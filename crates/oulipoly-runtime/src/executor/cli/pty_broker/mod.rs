@@ -823,6 +823,7 @@ struct ControlSocket {
     owned_dir: PathBuf,
     session_id: String,
     invocation_uuid: String,
+    bound_at: Instant,
 }
 
 impl ControlSocket {
@@ -841,6 +842,7 @@ impl ControlSocket {
             owned_dir: dir,
             session_id: session_id.to_string(),
             invocation_uuid: invocation_uuid.to_string(),
+            bound_at: Instant::now(),
         }))
     }
 
@@ -858,6 +860,10 @@ impl ControlSocket {
 
     fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
+    }
+
+    fn age(&self) -> Duration {
+        self.bound_at.elapsed()
     }
 }
 

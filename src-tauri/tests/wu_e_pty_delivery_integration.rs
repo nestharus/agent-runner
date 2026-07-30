@@ -984,6 +984,73 @@ fn resumed_repl_retries_pending_mailbox_after_replacing_stale_runtime() {
 }
 
 #[test]
+fn resumed_repl_waits_for_provider_readiness_before_retrying_pending_mailbox() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("startup-flush-received.log");
+    let script = fixture_provider_flushing_startup_input(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-startup-flush", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "abababab-abab-4bab-8bab-abababababab",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-startup-flush",
+    );
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "pre-restart-assistant-turn",
+        "assistant",
+        "durable work before restart",
+    );
+    fixture.mark_live_pty_runtime(
+        &ProcessIdentity {
+            os_pid: 999_999_002,
+            os_boot_id: "startup-flush-stale-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        },
+        &fixture.socket_path("startup-flush-stale.sock"),
+    );
+    fixture.seed_mailbox("h-startup-flush-pending");
+
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-startup-flush", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(7),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+
+    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(8));
+    if !output.contains("GOT_NOTIFY") {
+        let received = fs::read_to_string(&received_log).unwrap_or_default();
+        let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!(
+            "startup-flushed mailbox delivery was not retried: output={output:?} received={received:?} rows={rows:?}"
+        );
+    }
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert!(
+        received.contains("handle: h-startup-flush-pending"),
+        "{received}"
+    );
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "startup-flush-notification-turn",
+        "user",
+        &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
+    );
+    assert!(repl.wait().unwrap().success());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn live_broker_confirmation_contracts_overlapping_attempts() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("overlap-received.log");
@@ -1677,8 +1744,46 @@ set -euo pipefail
 test -t 0
 test -t 1
 test -t 2
-printf 'READY_FOR_NOTIFY\n'
+printf '\033[?2004hREADY_FOR_NOTIFY\n'
 while IFS= read -r line; do
+  line="${{line//$'\033[200~'/}}"
+  line="${{line//$'\033[201~'/}}"
+  printf '%s\n' "$line" >> {received}
+  if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
+    printf 'GOT_NOTIFY\n'
+    sleep 1
+    exit 0
+  fi
+done
+"#,
+            received = shell_single_quote(&path_string(received_log))
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+fn fixture_provider_flushing_startup_input(dir: &Path, received_log: &Path) -> PathBuf {
+    let path = dir.join("fixture-startup-flush-provider.sh");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+: > {received}
+test -t 0
+test -t 1
+test -t 2
+printf 'BOOTSTRAPPING\n'
+sleep 4
+python3 -c 'import termios; termios.tcflush(0, termios.TCIFLUSH)'
+printf '\033[?2004hREADY_FOR_NOTIFY\n'
+while IFS= read -r line; do
+  line="${{line//$'\033[200~'/}}"
+  line="${{line//$'\033[201~'/}}"
   printf '%s\n' "$line" >> {received}
   if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
     printf 'GOT_NOTIFY\n'
@@ -1708,9 +1813,11 @@ set -euo pipefail
 test -t 0
 test -t 1
 test -t 2
-printf 'READY_FOR_NOTIFY\n'
+printf '\033[?2004hREADY_FOR_NOTIFY\n'
 while true; do
   if IFS= read -r -t 0.05 line; then
+    line="${{line//$'\033[200~'/}}"
+    line="${{line//$'\033[201~'/}}"
     printf '%s\n' "$line" >> {received}
     if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
       printf 'GOT_NOTIFY\n'
@@ -1743,9 +1850,11 @@ set -euo pipefail
 test -t 0
 test -t 1
 test -t 2
-printf 'READY_FOR_NOTIFY\n'
+printf '\033[?2004hREADY_FOR_NOTIFY\n'
 count=0
 while IFS= read -r line; do
+  line="${{line//$'\033[200~'/}}"
+  line="${{line//$'\033[201~'/}}"
   printf '%s\n' "$line" >> {received}
   if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
     count=$((count + 1))
@@ -1790,8 +1899,10 @@ else
   exit 0
 fi
 : > {received}
-printf 'READY_FOR_NOTIFY\n'
+printf '\033[?2004hREADY_FOR_NOTIFY\n'
 while IFS= read -r line; do
+  line="${{line//$'\033[200~'/}}"
+  line="${{line//$'\033[201~'/}}"
   printf '%s\n' "$line" >> {received}
   if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
     printf 'GOT_NOTIFY\n'
