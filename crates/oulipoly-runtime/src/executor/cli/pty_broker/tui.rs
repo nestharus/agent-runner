@@ -1609,6 +1609,8 @@ fn mailbox_delivery_observation_disposition(
     window: &MailboxDeliveryWindow,
     observation: &OutboundObservation,
 ) -> Result<MailboxDeliveryObservationDisposition, String> {
+    // The observer identity names the relay reading a session-wide transcript.
+    // A prior relay's exact marker therefore remains authoritative after restart.
     let marker = format!("[OULIPOLY-DELIVERY {}]", window.attempt_id);
     if observation.user_turns.iter().any(|turn| {
         turn.body
@@ -7491,6 +7493,22 @@ mod tests {
         assert_eq!(
             mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
             MailboxDeliveryObservationDisposition::FailUnobserved
+        );
+    }
+
+    #[test]
+    fn mailbox_delivery_observation_confirms_previous_invocation_marker() {
+        let mut window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
+        window.delivery_invocation_uuid = "previous-invocation".to_string();
+        let observation = mailbox_observation([(
+            "marker-turn",
+            "2026-07-25T19:56:24Z",
+            Some("[OULIPOLY-DELIVERY attempt-1]"),
+        )]);
+
+        assert_eq!(
+            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
+            MailboxDeliveryObservationDisposition::Confirm
         );
     }
 
