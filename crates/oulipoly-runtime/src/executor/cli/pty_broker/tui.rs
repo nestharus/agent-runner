@@ -105,6 +105,10 @@ const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
 /// dropped, leaving the notification unsent until the operator presses Enter themselves.
 /// Waiting lets the paste commit land first so the Enter actually submits.
 const CONTROL_SUBMIT_DELAY: Duration = Duration::from_millis(400);
+/// Plain line-oriented providers may never advertise bracketed-paste mode. Keep
+/// their startup delivery bounded without overriding the readiness signal for a
+/// full-screen TUI that is still initializing its input handler.
+const CONTROL_PRIMARY_SCREEN_READY_FALLBACK: Duration = Duration::from_secs(10);
 const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
 const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
 const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
@@ -1605,6 +1609,8 @@ fn mailbox_delivery_observation_disposition(
     window: &MailboxDeliveryWindow,
     observation: &OutboundObservation,
 ) -> Result<MailboxDeliveryObservationDisposition, String> {
+    // The observer identity names the relay reading a session-wide transcript.
+    // A prior relay's exact marker therefore remains authoritative after restart.
     let marker = format!("[OULIPOLY-DELIVERY {}]", window.attempt_id);
     if observation.user_turns.iter().any(|turn| {
         turn.body
@@ -1612,6 +1618,9 @@ fn mailbox_delivery_observation_disposition(
             .is_some_and(|body| body.contains(&marker))
     }) {
         return Ok(MailboxDeliveryObservationDisposition::Confirm);
+    }
+    if window.delivery_invocation_uuid != observation.identity.invocation_uuid {
+        return Ok(MailboxDeliveryObservationDisposition::FailUnobserved);
     }
     let Some(acknowledged_at) = window.acknowledged_at.as_deref() else {
         return Ok(MailboxDeliveryObservationDisposition::Await);
@@ -5779,12 +5788,7 @@ struct ControlInjectionIo<'a> {
 /// into the virtual terminal (never to the real terminal) during the wait.
 fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
-    let response = inject_control_payload(
-        &mut stream,
-        io,
-        control.session_id(),
-        control.invocation_uuid(),
-    );
+    let response = inject_control_payload(&mut stream, io, control);
     let (ack, message) = control_response_message(response);
     super::trace_notify_gate_decision(
         control,
@@ -5825,17 +5829,21 @@ fn format_control_response_write_error(err: io::Error) -> String {
 fn inject_control_payload(
     stream: &mut UnixStream,
     io: &mut ControlInjectionIo<'_>,
-    session_id: &str,
-    invocation_uuid: &str,
+    control: &ControlSocket,
 ) -> Result<(), String> {
     validate_control_peer(stream)?;
     let payload = prepare_control_payload(
         read_tui_control_payload(stream)?,
-        Some((session_id, invocation_uuid)),
+        Some((control.session_id(), control.invocation_uuid())),
     )?;
     if payload.bytes.is_empty() {
         return acknowledge_control_payload(&payload);
     }
+    validate_control_input_ready(
+        io.parser.screen().bracketed_paste(),
+        io.parser.screen().alternate_screen(),
+        control.age(),
+    )?;
     if io.pane.outbound.active.is_some() {
         return Err("outbound_send_active".to_string());
     }
@@ -5847,6 +5855,20 @@ fn inject_control_payload(
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload.bytes, bracketed_paste)?;
     acknowledge_control_payload(&payload)
+}
+
+fn validate_control_input_ready(
+    bracketed_paste: bool,
+    alternate_screen: bool,
+    control_age: Duration,
+) -> Result<(), String> {
+    if bracketed_paste
+        || (!alternate_screen && control_age >= CONTROL_PRIMARY_SCREEN_READY_FALLBACK)
+    {
+        Ok(())
+    } else {
+        Err("unsafe_provider_starting".to_string())
+    }
 }
 
 fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
@@ -7459,6 +7481,55 @@ mod tests {
         assert_eq!(
             mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
             MailboxDeliveryObservationDisposition::FailUnobserved
+        );
+    }
+
+    #[test]
+    fn mailbox_delivery_observation_retries_unmarked_attempt_from_previous_invocation() {
+        let mut window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
+        window.delivery_invocation_uuid = "previous-invocation".to_string();
+        let observation = mailbox_observation([]);
+
+        assert_eq!(
+            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
+            MailboxDeliveryObservationDisposition::FailUnobserved
+        );
+    }
+
+    #[test]
+    fn mailbox_delivery_observation_confirms_previous_invocation_marker() {
+        let mut window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
+        window.delivery_invocation_uuid = "previous-invocation".to_string();
+        let observation = mailbox_observation([(
+            "marker-turn",
+            "2026-07-25T19:56:24Z",
+            Some("[OULIPOLY-DELIVERY attempt-1]"),
+        )]);
+
+        assert_eq!(
+            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
+            MailboxDeliveryObservationDisposition::Confirm
+        );
+    }
+
+    #[test]
+    fn control_input_readiness_prefers_terminal_signal_with_bounded_fallback() {
+        assert!(validate_control_input_ready(true, true, Duration::ZERO).is_ok());
+        assert!(
+            validate_control_input_ready(false, false, CONTROL_PRIMARY_SCREEN_READY_FALLBACK)
+                .is_ok()
+        );
+        assert_eq!(
+            validate_control_input_ready(
+                false,
+                false,
+                CONTROL_PRIMARY_SCREEN_READY_FALLBACK - Duration::from_millis(1)
+            ),
+            Err("unsafe_provider_starting".to_string())
+        );
+        assert_eq!(
+            validate_control_input_ready(false, true, CONTROL_PRIMARY_SCREEN_READY_FALLBACK),
+            Err("unsafe_provider_starting".to_string())
         );
     }
 

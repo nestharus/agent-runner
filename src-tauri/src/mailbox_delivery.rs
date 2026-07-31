@@ -530,6 +530,7 @@ fn pty_nack_status(message: &str) -> &str {
         "mailbox_delivery_owned" => "awaiting_observation",
         "unsafe_mid_line"
         | "unsafe_child_output_active"
+        | "unsafe_provider_starting"
         | "unsafe_foreground_process"
         | "unsafe_foreground_unknown" => message,
         _ => "protocol_error",
@@ -595,6 +596,7 @@ fn notify_trace_summary_reason(status: &str) -> &'static str {
         "acked" | "mark_delivered_error" => "control_ack",
         "unsafe_mid_line" => "unsafe_mid_line",
         "unsafe_child_output_active" => "child_output_active",
+        "unsafe_provider_starting" => "provider_starting",
         "unsafe_foreground_process" => "foreground_process",
         "unsafe_foreground_unknown" => "foreground_unknown",
         "connect_error" => "connect_error",
