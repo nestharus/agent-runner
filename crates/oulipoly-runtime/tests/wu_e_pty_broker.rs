@@ -358,6 +358,280 @@ fn production_observed_relay_releases_unobserved_mailbox_attempt_for_retry() {
 }
 
 #[test]
+fn production_observed_relay_retries_silent_mailbox_attempt_once_under_control_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("retry-mailbox-events.log");
+    let observer_state = dir.path().join("retry-mailbox-state");
+    let bodies = dir.path().join("retry-mailbox-bodies.bin");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&observer_state, "baseline").unwrap();
+    let child_script = observed_retry_mailbox_child_script(
+        dir.path(),
+        &events,
+        &observer_state,
+        &bodies,
+        "drop-first",
+    );
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    let row = seed_mailbox_attempt(&mailbox_path, OBSERVER_INVOCATION_UUID, false);
+    let result_path = dir.path().join("retry-mailbox-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    let control_path = wait_for_control_path(&mailbox_path);
+    let envelope = render_mailbox_notification_envelope(&[row], 0, MAILBOX_ATTEMPT_ID);
+    assert!(
+        inject_control_envelope(&control_path, &envelope)
+            .unwrap()
+            .ack
+    );
+    wait_for_body_count(&bodies, 1, Duration::from_secs(5));
+
+    let replay_threads = (0..4)
+        .map(|_| {
+            let control_path = control_path.clone();
+            let envelope = envelope.clone();
+            std::thread::spawn(move || inject_control_envelope(control_path, &envelope).unwrap())
+        })
+        .collect::<Vec<_>>();
+    for replay in replay_threads {
+        assert!(replay.join().unwrap().ack);
+    }
+    assert_eq!(read_length_prefixed_records(&bodies).len(), 1);
+
+    wait_for_body_count(&bodies, 2, Duration::from_secs(40));
+    wait_for_mailbox_delivery(&mailbox_path);
+    std::thread::sleep(Duration::from_secs(2));
+    let submitted = read_length_prefixed_records(&bodies);
+    assert_eq!(submitted.len(), 2);
+    assert_eq!(submitted[0], submitted[1]);
+    assert!(String::from_utf8_lossy(&submitted[0]).contains(MAILBOX_ATTEMPT_ID));
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(fs::read_to_string(result_path).unwrap(), "0\n");
+}
+
+#[test]
+fn production_observed_relay_delayed_original_marker_cancels_mailbox_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("delayed-marker-events.log");
+    let observer_state = dir.path().join("delayed-marker-state");
+    let bodies = dir.path().join("delayed-marker-bodies.bin");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&observer_state, "baseline").unwrap();
+    let child_script = observed_retry_mailbox_child_script(
+        dir.path(),
+        &events,
+        &observer_state,
+        &bodies,
+        "publish-delayed",
+    );
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    let row = seed_mailbox_attempt(&mailbox_path, OBSERVER_INVOCATION_UUID, false);
+    let result_path = dir.path().join("delayed-marker-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    let control_path = wait_for_control_path(&mailbox_path);
+    let envelope = render_mailbox_notification_envelope(&[row], 0, MAILBOX_ATTEMPT_ID);
+    assert!(
+        inject_control_envelope(&control_path, &envelope)
+            .unwrap()
+            .ack
+    );
+    wait_for_mailbox_delivery(&mailbox_path);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(read_length_prefixed_records(&bodies).len(), 1);
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn production_observed_relay_late_marker_during_retry_confirms_once_and_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let events = dir.path().join("late-marker-events.log");
+    let observer_state = dir.path().join("late-marker-state");
+    let bodies = dir.path().join("late-marker-bodies.bin");
+    let data_root = dir.path().join("runner-data");
+    let runtime_root = dir.path().join("runtime");
+    fs::create_dir_all(&data_root).unwrap();
+    fs::create_dir_all(&runtime_root).unwrap();
+    fs::write(&observer_state, "baseline").unwrap();
+    let child_script = observed_retry_mailbox_child_script(
+        dir.path(),
+        &events,
+        &observer_state,
+        &bodies,
+        "publish-second-body",
+    );
+    let adapter = observer_adapter_script(dir.path(), &events, &observer_state);
+    let mailbox_path = data_root.join("pid-identity.db");
+    let row = seed_mailbox_attempt(&mailbox_path, OBSERVER_INVOCATION_UUID, false);
+    let result_path = dir.path().join("late-marker-result.txt");
+    let pty = OuterPty::open(33, 100);
+    let mut child = spawn_mailbox_observed_helper_under_pty(
+        &pty,
+        &child_script,
+        &adapter,
+        &observer_state,
+        &events,
+        dir.path(),
+        &data_root,
+        &runtime_root,
+        &result_path,
+    );
+
+    read_until_bytes(
+        pty.master.as_raw_fd(),
+        "READY-MAILBOX",
+        Duration::from_secs(5),
+    );
+    let control_path = wait_for_control_path(&mailbox_path);
+    let envelope = render_mailbox_notification_envelope(&[row], 0, MAILBOX_ATTEMPT_ID);
+    assert!(
+        inject_control_envelope(&control_path, &envelope)
+            .unwrap()
+            .ack
+    );
+    wait_for_body_count(&bodies, 2, Duration::from_secs(40));
+    wait_for_mailbox_delivery(&mailbox_path);
+    std::thread::sleep(Duration::from_secs(2));
+    let submitted = read_length_prefixed_records(&bodies);
+    assert_eq!(submitted.len(), 2);
+    assert_eq!(submitted[0], submitted[1]);
+    let rows = MailboxDb::open(&mailbox_path)
+        .unwrap()
+        .list_mailbox(OBSERVER_SESSION_ID, true)
+        .unwrap();
+    assert_eq!(rows[0].delivery_attempts, 1);
+    assert!(child.try_wait().unwrap().is_none());
+    write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn production_observed_relay_unavailable_or_incomplete_observation_does_not_retry_mailbox() {
+    let dir = tempfile::tempdir().unwrap();
+
+    for (case, initial_mode, eventually_complete) in [
+        ("unavailable", "unavailable", false),
+        ("incomplete", "incomplete", true),
+    ] {
+        let events = dir.path().join(format!("{case}-events.log"));
+        let observer_state = dir.path().join(format!("{case}-state"));
+        let observer_mode = dir.path().join(format!("{case}-mode"));
+        let bodies = dir.path().join(format!("{case}-bodies.bin"));
+        let data_root = dir.path().join(format!("{case}-runner-data"));
+        let runtime_root = dir.path().join(format!("{case}-runtime"));
+        fs::create_dir_all(&data_root).unwrap();
+        fs::create_dir_all(&runtime_root).unwrap();
+        fs::write(&observer_state, "baseline").unwrap();
+        fs::write(&observer_mode, initial_mode).unwrap();
+        let child_script = observed_retry_mailbox_child_script(
+            dir.path(),
+            &events,
+            &observer_state,
+            &bodies,
+            if eventually_complete {
+                "publish-first"
+            } else {
+                "never"
+            },
+        );
+        let adapter = retry_observer_adapter_script(
+            dir.path(),
+            &events,
+            &observer_state,
+            &observer_mode,
+            case,
+        );
+        let mailbox_path = data_root.join("pid-identity.db");
+        seed_mailbox_attempt(&mailbox_path, OBSERVER_INVOCATION_UUID, true);
+        let result_path = dir.path().join(format!("{case}-result.txt"));
+        let pty = OuterPty::open(33, 100);
+        let mut child = spawn_mailbox_observed_helper_under_pty(
+            &pty,
+            &child_script,
+            &adapter,
+            &observer_state,
+            &events,
+            dir.path(),
+            &data_root,
+            &runtime_root,
+            &result_path,
+        );
+
+        read_until_bytes(
+            pty.master.as_raw_fd(),
+            "READY-MAILBOX",
+            Duration::from_secs(5),
+        );
+        std::thread::sleep(Duration::from_secs(32));
+        assert!(
+            read_length_prefixed_records(&bodies).is_empty(),
+            "{case} observation authorized retry input"
+        );
+        let db = MailboxDb::open(&mailbox_path).unwrap();
+        assert_eq!(db.list_pending(OBSERVER_SESSION_ID).unwrap().len(), 1);
+        assert_eq!(
+            db.accepted_delivery_attempt_windows(OBSERVER_SESSION_ID)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        if eventually_complete {
+            fs::write(&observer_mode, "complete").unwrap();
+            wait_for_body_count(&bodies, 1, Duration::from_secs(8));
+            wait_for_mailbox_delivery(&mailbox_path);
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        write_all_fd(pty.master.as_raw_fd(), b"exit\r").unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+}
+
+#[test]
 fn helper_runs_broker_session() {
     if helper_env_missing() {
         return;
@@ -800,6 +1074,123 @@ raise SystemExit(9)
     path
 }
 
+fn observed_retry_mailbox_child_script(
+    dir: &Path,
+    events: &Path,
+    state: &Path,
+    bodies: &Path,
+    behavior: &str,
+) -> PathBuf {
+    let path = dir.join(format!("observed-retry-mailbox-child-{behavior}.py"));
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import os
+import pathlib
+import termios
+import time
+import tty
+
+events = pathlib.Path({events:?})
+state = pathlib.Path({state:?})
+bodies = pathlib.Path({bodies:?})
+behavior = {behavior:?}
+events.write_text("")
+bodies.write_bytes(b"")
+start = b"\x1b[200~"
+end = b"\x1b[201~"
+buffer = b""
+paste = None
+pending = None
+first_marker = None
+transport_count = 0
+submit_count = 0
+original = termios.tcgetattr(0)
+tty.setraw(0)
+os.write(1, b"\x1b[?1049h\x1b[?2004hREADY-MAILBOX\r\n")
+
+def record(value):
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write(value + "\n")
+
+def append_body(value):
+    with bodies.open("ab") as handle:
+        handle.write(len(value).to_bytes(8, "big") + value)
+
+def delivery_marker(value):
+    for line in value.decode("utf-8").splitlines():
+        if line.startswith("[OULIPOLY-DELIVERY "):
+            return line
+    raise SystemExit("mailbox body lacked delivery marker")
+
+try:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            raise SystemExit(9)
+        buffer += chunk
+        while True:
+            if paste is not None:
+                offset = buffer.find(end)
+                if offset < 0:
+                    paste += buffer
+                    buffer = b""
+                    break
+                paste += buffer[:offset]
+                buffer = buffer[offset + len(end):]
+                pending = paste
+                paste = None
+                transport_count += 1
+                append_body(pending)
+                marker = delivery_marker(pending)
+                if first_marker is None:
+                    first_marker = marker
+                if behavior == "publish-second-body" and transport_count == 2:
+                    state.write_text(first_marker)
+                    record("published-marker-during-retry")
+                record(f"body:{{transport_count}}")
+                continue
+
+            offset = buffer.find(start)
+            if offset >= 0:
+                buffer = buffer[offset + len(start):]
+                paste = b""
+                continue
+
+            if buffer.startswith(b"exit\r"):
+                os.write(1, b"\x1b[?2004l\x1b[?1049l")
+                raise SystemExit(0)
+
+            if pending is not None and buffer.startswith(b"\r"):
+                buffer = buffer[1:]
+                submit_count += 1
+                marker = delivery_marker(pending)
+                if behavior == "publish-first" and submit_count == 1:
+                    state.write_text(marker)
+                    record("published-first-marker")
+                if behavior == "publish-delayed" and submit_count == 1:
+                    time.sleep(1)
+                    state.write_text(marker)
+                    record("published-delayed-marker")
+                if behavior == "drop-first" and submit_count == 2:
+                    state.write_text(marker)
+                    record("published-retry-marker")
+                pending = None
+                os.write(1, f"GOT-MAILBOX-{{submit_count}}\r\n".encode())
+                record(f"submit:{{submit_count}}")
+                continue
+            break
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, original)
+"#,
+        events = events.display().to_string(),
+        state = state.display().to_string(),
+        bodies = bodies.display().to_string(),
+        behavior = behavior,
+    );
+    write_executable(&path, &body);
+    path
+}
+
 fn observer_adapter_script(dir: &Path, events: &Path, state: &Path) -> PathBuf {
     let path = dir.join("observer-adapter.py");
     let body = format!(
@@ -884,6 +1275,87 @@ print(json.dumps(envelope({{"turns": turns, "turn_count": len(turns), "complete"
 "#,
         events = events.display().to_string(),
         state = state.display().to_string(),
+        session = OBSERVER_SESSION_ID,
+    );
+    write_executable(&path, &body);
+    path
+}
+
+fn retry_observer_adapter_script(
+    dir: &Path,
+    events: &Path,
+    state: &Path,
+    mode: &Path,
+    case: &str,
+) -> PathBuf {
+    let path = dir.join(format!("retry-observer-adapter-{case}.py"));
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+CONTRACT = "oulipoly.provider/v1"
+OBSERVER_SESSION_ID = {session:?}
+events = pathlib.Path({events:?})
+state = pathlib.Path({state:?})
+mode_path = pathlib.Path({mode:?})
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{{}}")
+mode = mode_path.read_text().strip()
+
+def envelope(result):
+    return {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "retry-observer"),
+        "ok": True,
+        "result": result,
+    }}
+
+if subcommand == "describe":
+    print(json.dumps(envelope({{
+        "provider_id": "observer-provider",
+        "display_name": "Observer Provider",
+        "contract_versions": [CONTRACT],
+        "preferred_contract": CONTRACT,
+        "capabilities": {{
+            "launch": False, "policy": False, "quota": False,
+            "session": mode != "unavailable", "terminal": False,
+            "rotation": False, "discovery": False, "settings": False,
+            "setup_brain": False, "setup": False, "migration": False
+        }}
+    }})))
+    raise SystemExit(0)
+
+if subcommand != "session.read_turns":
+    raise SystemExit(4)
+turns = [{{
+        "session_id": OBSERVER_SESSION_ID,
+        "turn_id": "old-baseline-turn",
+        "timestamp": "2026-05-01T00:00:01Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": "baseline"}}],
+}}]
+state_value = state.read_text().strip()
+if state_value.startswith("[OULIPOLY-DELIVERY "):
+    turns.append({{
+        "session_id": OBSERVER_SESSION_ID,
+        "turn_id": "mailbox-exact-marker",
+        "timestamp": "2026-07-25T20:56:24Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": state_value}}],
+    }})
+with events.open("a", encoding="utf-8") as handle:
+    handle.write(f"adapter-mode:{{mode}}\n")
+print(json.dumps(envelope({{
+    "turns": turns,
+    "turn_count": len(turns),
+    "complete": mode != "incomplete",
+}})))
+"#,
+        events = events.display().to_string(),
+        state = state.display().to_string(),
+        mode = mode.display().to_string(),
         session = OBSERVER_SESSION_ID,
     );
     write_executable(&path, &body);
@@ -979,6 +1451,39 @@ fn wait_for_unobserved_mailbox_attempt(mailbox_path: &Path) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("timed out waiting for unobserved mailbox attempt release")
+}
+
+fn wait_for_body_count(path: &Path, expected: usize, timeout: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if read_length_prefixed_records(path).len() >= expected {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for {expected} mailbox bodies at {}",
+        path.display()
+    );
+}
+
+fn read_length_prefixed_records(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = fs::read(path).unwrap_or_default();
+    let mut records = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if offset + 8 > bytes.len() {
+            return records;
+        }
+        let length = u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        if offset + length > bytes.len() {
+            return records;
+        }
+        records.push(bytes[offset..offset + length].to_vec());
+        offset += length;
+    }
+    records
 }
 
 fn write_executable(path: &Path, body: &str) {

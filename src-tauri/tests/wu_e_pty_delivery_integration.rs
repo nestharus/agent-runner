@@ -5,8 +5,8 @@ use oulipoly_runtime::executor::cli::pty_broker::{
 };
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-    MAX_UNCONFIRMED_DELIVERY_ATTEMPTS, MailboxDb, MailboxRow, SessionRuntimeRunningUpdate,
-    WAKE_SWEEP_ABANDONED_ERROR,
+    MAX_UNCONFIRMED_DELIVERY_ATTEMPTS, MailboxDb, MailboxDeliveryWindow, MailboxRow,
+    SessionRuntimeRunningUpdate, WAKE_SWEEP_ABANDONED_ERROR,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -282,6 +282,29 @@ flag = "--resume"
         .unwrap();
     }
 
+    fn write_interactive_model_with_provider_adapter(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        script: &Path,
+        adapter: &Path,
+    ) {
+        self.write_interactive_model(model_name, provider_name, script);
+        fs::write(
+            self.models_dir.join(format!("{model_name}.toml")),
+            format!(
+                r#"provider = {{ path = {} }}
+
+[[providers]]
+name = "{provider_name}"
+args = []
+"#,
+                toml_string(&path_string(adapter)),
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_session_source_from_received_log(&self, provider_name: &str, received_log: &Path) {
         let script = self.dir.path().join("fixture-session-turns.sh");
         fs::write(
@@ -295,6 +318,62 @@ if [ -n "$marker" ]; then
 fi
 "#,
                 received = shell_single_quote(&path_string(received_log))
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        fs::write(
+            self.app_config_dir.join("sessions.toml"),
+            format!(
+                "[{provider_name}]\nturn_script = {}\nstate_dir = {}\n",
+                toml_string(&path_string(&script)),
+                toml_string(&path_string(&self.dir.path().join("session-source-state")))
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_session_source_from_length_prefixed_log(
+        &self,
+        provider_name: &str,
+        received_log: &Path,
+    ) {
+        let script = self
+            .dir
+            .path()
+            .join("fixture-length-prefixed-session-turns.py");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+
+data = pathlib.Path({received:?}).read_bytes()
+offset = 0
+index = 0
+while offset < len(data):
+    if offset + 8 > len(data):
+        raise SystemExit("truncated record length")
+    length = int.from_bytes(data[offset:offset + 8], "big")
+    offset += 8
+    if offset + length > len(data):
+        raise SystemExit("truncated record body")
+    index += 1
+    body = data[offset:offset + length].decode("utf-8")
+    offset += length
+    print(json.dumps({{
+        "session_id": os.environ["SESSION_ID"],
+        "turn_id": f"scanned-delivery-turn-{{index}}",
+        "timestamp": f"2026-07-24T12:00:{{index:02}}Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": body}}],
+    }}))
+"#,
+                received = path_string(received_log),
             ),
         )
         .unwrap();
@@ -1051,6 +1130,222 @@ fn resumed_repl_waits_for_provider_readiness_before_retrying_pending_mailbox() {
 }
 
 #[test]
+fn resumed_opencode_style_tui_submits_large_mailbox_batch_as_provider_turn() {
+    let fixture = Fixture::new();
+    let transport_log = fixture
+        .dir
+        .path()
+        .join("opencode-large-batch-transport.log");
+    let editor_log = fixture.dir.path().join("opencode-large-batch-editor.log");
+    let provider_turn_log = fixture
+        .dir
+        .path()
+        .join("opencode-large-batch-provider-turn.log");
+    let events = fixture.dir.path().join("opencode-large-batch-events.log");
+    let script = fixture_opencode_style_large_paste(
+        fixture.dir.path(),
+        &transport_log,
+        &editor_log,
+        &provider_turn_log,
+        &events,
+    );
+    let adapter =
+        fixture_length_prefixed_observer_adapter(fixture.dir.path(), &provider_turn_log, &events);
+    fixture.write_interactive_model_with_provider_adapter(
+        "fixture-opencode-large-batch",
+        "fixture-provider",
+        &script,
+        &adapter,
+    );
+    fixture.write_session_source_from_length_prefixed_log("fixture-provider", &provider_turn_log);
+    fixture.seed_active_chain(
+        "34343434-3434-4434-8434-343434343434",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-opencode-large-batch",
+    );
+    fixture.ingest_turn(
+        "fixture-provider",
+        SESSION_A,
+        "pre-resume-assistant-turn",
+        "assistant",
+        "durable work before the resumed mailbox batch",
+    );
+    fixture.mark_live_pty_runtime(
+        &ProcessIdentity {
+            os_pid: 999_999_003,
+            os_boot_id: "opencode-large-batch-stale-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        },
+        &fixture.socket_path("opencode-large-batch-stale.sock"),
+    );
+    for index in 1..=30 {
+        fixture.seed_mailbox(&format!("h-opencode-large-batch-{index:02}"));
+    }
+
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-opencode-large-batch", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+
+    let dropped = wait_for_large_paste_event(
+        &events,
+        "dropped-before-editor-or-provider-turn:1",
+        Duration::from_secs(8),
+    );
+    let initial_transport = read_length_prefixed_records(&transport_log);
+    let accepted = wait_for_accepted_delivery_windows(&fixture, 1, Duration::from_secs(3));
+    assert_eq!(accepted.len(), 1, "accepted attempts were {accepted:?}");
+    assert_eq!(
+        accepted[0].rows.len(),
+        20,
+        "accepted attempt was {accepted:?}"
+    );
+    assert_eq!(accepted[0].remaining_count, 10);
+    assert!(accepted[0].acknowledged_at.is_some());
+    let first_attempt_id = accepted[0].attempt_id.clone();
+    let first_acknowledged_at = accepted[0].acknowledged_at.clone().unwrap();
+    let first_marker = format!("[OULIPOLY-DELIVERY {first_attempt_id}]");
+    let initial_rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    let initial_pending = fixture.mailbox().list_pending(SESSION_A).unwrap();
+    let initially_observed = StateDb::open(&fixture.state_path())
+        .unwrap()
+        .has_session_user_turn_containing("fixture-provider", SESSION_A, &first_marker)
+        .unwrap();
+
+    assert_eq!(initial_transport.len(), 1, "events were {dropped:?}");
+    let first_body = std::str::from_utf8(&initial_transport[0]).unwrap();
+    assert!(first_body.contains("[OULIPOLY NOTIFICATIONS]"));
+    assert!(first_body.contains("handle: h-opencode-large-batch-01"));
+    assert!(first_body.contains("handle: h-opencode-large-batch-20"));
+    assert!(!first_body.contains("handle: h-opencode-large-batch-21"));
+    assert!(first_body.contains(&first_marker));
+    assert!(
+        first_body.lines().count() > 30,
+        "transport was {first_body:?}"
+    );
+    assert_eq!(initial_rows.len(), 30, "mailbox rows were {initial_rows:?}");
+    assert!(initial_rows.iter().all(|row| {
+        row.delivered_at.is_none() && row.delivery_attempts == 0 && row.delivery_error.is_none()
+    }));
+    assert_eq!(initial_pending, initial_rows);
+    assert_eq!(
+        accepted[0]
+            .rows
+            .iter()
+            .map(|row| row.handle.as_str())
+            .collect::<Vec<_>>(),
+        (1..=20)
+            .map(|index| format!("h-opencode-large-batch-{index:02}"))
+            .collect::<Vec<_>>()
+    );
+    assert!(!initially_observed);
+    assert!(fs::read(&editor_log).unwrap().is_empty());
+    assert!(read_length_prefixed_records(&provider_turn_log).is_empty());
+    let sidecar = Connection::open(fixture.sidecar_path()).unwrap();
+    assert_eq!(
+        sidecar
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox_delivery_attempts",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        1,
+        "the suffix must not acquire an attempt during accepted silence"
+    );
+
+    wait_for_large_paste_event(
+        &events,
+        "submitted-provider-turn:2",
+        Duration::from_secs(40),
+    );
+    let retried_transport = read_length_prefixed_records(&transport_log);
+    assert!(
+        retried_transport.len() >= 2,
+        "events were {:?}",
+        fs::read_to_string(&events)
+    );
+    assert_eq!(retried_transport[0], retried_transport[1]);
+
+    wait_for_large_paste_event(
+        &events,
+        "submitted-provider-turn:3",
+        Duration::from_secs(12),
+    );
+    wait_for_pending_mailbox_count(&fixture, 0, Duration::from_secs(12));
+    thread::sleep(Duration::from_secs(4));
+
+    let transport = read_length_prefixed_records(&transport_log);
+    let provider_turns = read_length_prefixed_records(&provider_turn_log);
+    assert_eq!(
+        transport.len(),
+        3,
+        "events were {:?}",
+        fs::read_to_string(&events)
+    );
+    assert_eq!(transport[0], transport[1]);
+    assert_eq!(
+        provider_turns,
+        vec![transport[1].clone(), transport[2].clone()]
+    );
+    let suffix_body = std::str::from_utf8(&transport[2]).unwrap();
+    assert!(suffix_body.contains("handle: h-opencode-large-batch-21"));
+    assert!(suffix_body.contains("handle: h-opencode-large-batch-30"));
+    assert!(!suffix_body.contains("handle: h-opencode-large-batch-20"));
+    let suffix_attempt_id = delivery_attempt_id(suffix_body);
+    assert_ne!(suffix_attempt_id, first_attempt_id);
+
+    let final_rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(final_rows.len(), 30);
+    assert!(final_rows.iter().all(|row| {
+        row.delivered_at.is_some() && row.delivery_attempts == 1 && row.delivery_error.is_none()
+    }));
+    let event_text = fs::read_to_string(&events).unwrap();
+    assert!(event_text.contains("observer-read:1"), "{event_text}");
+    assert!(event_text.contains("observer-read:2"), "{event_text}");
+    assert_eq!(
+        sidecar
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox_delivery_attempts",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        2
+    );
+    let (final_acknowledged_at, first_resolved_at, first_membership): (
+        String,
+        Option<String>,
+        i64,
+    ) = sidecar
+        .query_row(
+            "SELECT attempts.acknowledged_at, attempts.resolved_at, COUNT(items.mailbox_seq)
+             FROM mailbox_delivery_attempts AS attempts
+             JOIN mailbox_delivery_attempt_items AS items USING (attempt_id)
+             WHERE attempts.attempt_id = ?1
+             GROUP BY attempts.attempt_id",
+            params![&first_attempt_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(final_acknowledged_at, first_acknowledged_at);
+    assert!(first_resolved_at.is_some());
+    assert_eq!(first_membership, 20);
+
+    (&pty.master).write_all(b"exit\r").unwrap();
+    assert!(repl.wait().unwrap().success());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn live_broker_confirmation_contracts_overlapping_attempts() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("overlap-received.log");
@@ -1300,12 +1595,11 @@ fn live_broker_rejects_registered_overlap_until_accepted_owner_confirms() {
     let first = render_mailbox_notification_envelope(&rows[..3], 3, "concurrent-overlap-attempt-1");
     let first_response = inject_control_envelope(&control_path, &first).unwrap();
     assert!(first_response.ack, "{first_response:?}");
-    let first_output = read_until(
-        pty.master.as_raw_fd(),
-        "GOT_NOTIFY_1",
+    wait_for_file_contains(
+        &received_log,
+        "[OULIPOLY-DELIVERY concurrent-overlap-attempt-1]",
         Duration::from_secs(5),
     );
-    assert!(first_output.contains("GOT_NOTIFY_1"), "{first_output:?}");
 
     let overlapping =
         render_mailbox_notification_envelope(&rows, 0, "concurrent-overlap-attempt-2");
@@ -1341,8 +1635,11 @@ fn live_broker_rejects_registered_overlap_until_accepted_owner_confirms() {
         .unwrap();
     let second_response = inject_control_envelope(&control_path, &overlapping).unwrap();
     assert!(second_response.ack, "{second_response:?}");
-    thread::sleep(Duration::from_millis(200));
-    let second_received = fs::read_to_string(&received_log).unwrap();
+    let second_received = wait_for_file_contains(
+        &received_log,
+        "handle: h-concurrent-overlap-6",
+        Duration::from_secs(5),
+    );
     assert!(
         second_received.contains("handle: h-concurrent-overlap-6"),
         "{second_received}"
@@ -1802,6 +2099,189 @@ done
     path
 }
 
+fn fixture_opencode_style_large_paste(
+    dir: &Path,
+    transport_log: &Path,
+    editor_log: &Path,
+    provider_turn_log: &Path,
+    events: &Path,
+) -> PathBuf {
+    let path = dir.join("fixture-opencode-large-paste.py");
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+import termios
+import tty
+
+transport = pathlib.Path({transport:?})
+editor = pathlib.Path({editor:?})
+provider_turn = pathlib.Path({provider_turn:?})
+events = pathlib.Path({events:?})
+for target in (transport, editor, provider_turn, events):
+    target.write_text("")
+
+if not os.isatty(0):
+    raise SystemExit(0)
+
+start = b"\x1b[200~"
+end = b"\x1b[201~"
+buffer = b""
+paste = None
+pending = None
+transport_count = 0
+submit_count = 0
+original = termios.tcgetattr(0)
+tty.setraw(0)
+os.write(1, b"\x1b[?1049h\x1b[?2004hREADY_FOR_NOTIFY\r\n")
+
+def record(value):
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write(value + "\n")
+
+def append_record(target, value):
+    with target.open("ab") as handle:
+        handle.write(len(value).to_bytes(8, "big") + value)
+
+try:
+    while True:
+        chunk = os.read(0, 4096)
+        if not chunk:
+            raise SystemExit(9)
+        buffer += chunk
+        while True:
+            if paste is not None:
+                offset = buffer.find(end)
+                if offset < 0:
+                    paste += buffer
+                    buffer = b""
+                    break
+                paste += buffer[:offset]
+                buffer = buffer[offset + len(end):]
+                pending = paste
+                paste = None
+                transport_count += 1
+                append_record(transport, pending)
+                record(f"paste-transport-complete:{{transport_count}}")
+                continue
+
+            offset = buffer.find(start)
+            if offset >= 0:
+                buffer = buffer[offset + len(start):]
+                paste = b""
+                continue
+
+            if buffer.startswith(b"exit\r"):
+                os.write(1, b"\x1b[?2004l\x1b[?1049l")
+                raise SystemExit(0)
+
+            if pending is not None and buffer.startswith(b"\r"):
+                buffer = buffer[1:]
+                submit_count += 1
+                if submit_count == 1:
+                    pending = None
+                    editor.write_text("")
+                    record("dropped-before-editor-or-provider-turn:1")
+                    continue
+                editor.write_bytes(pending)
+                append_record(provider_turn, pending)
+                pending = None
+                record(f"submitted-provider-turn:{{submit_count}}")
+                continue
+            break
+finally:
+    termios.tcsetattr(0, termios.TCSANOW, original)
+"#,
+        transport = path_string(transport_log),
+        editor = path_string(editor_log),
+        provider_turn = path_string(provider_turn_log),
+        events = path_string(events),
+    );
+    fs::write(&path, body).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+fn fixture_length_prefixed_observer_adapter(
+    dir: &Path,
+    provider_turn_log: &Path,
+    events: &Path,
+) -> PathBuf {
+    let path = dir.join("fixture-length-prefixed-observer-adapter.py");
+    let body = format!(
+        r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+CONTRACT = "oulipoly.provider/v1"
+provider_turns = pathlib.Path({provider_turns:?})
+events = pathlib.Path({events:?})
+subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
+request = json.loads(sys.stdin.read() or "{{}}")
+
+def envelope(result):
+    return {{
+        "contract": request.get("contract", CONTRACT),
+        "request_id": request.get("request_id", "large-batch-observer"),
+        "ok": True,
+        "result": result,
+    }}
+
+if subcommand == "describe":
+    print(json.dumps(envelope({{
+        "provider_id": "fixture-provider",
+        "display_name": "Fixture Provider",
+        "contract_versions": [CONTRACT],
+        "preferred_contract": CONTRACT,
+        "capabilities": {{
+            "launch": False, "policy": False, "quota": False, "session": True,
+            "terminal": False, "rotation": False, "discovery": False,
+            "settings": False, "setup_brain": False, "setup": False, "migration": False
+        }}
+    }})))
+    raise SystemExit(0)
+
+if subcommand != "session.read_turns":
+    raise SystemExit(4)
+
+data = provider_turns.read_bytes()
+offset = 0
+turns = []
+while offset < len(data):
+    if offset + 8 > len(data):
+        raise SystemExit("truncated record length")
+    length = int.from_bytes(data[offset:offset + 8], "big")
+    offset += 8
+    if offset + length > len(data):
+        raise SystemExit("truncated record body")
+    body = data[offset:offset + length].decode("utf-8")
+    offset += length
+    index = len(turns) + 1
+    turns.append({{
+        "session_id": request["params"]["session_id"],
+        "turn_id": f"provider-delivery-turn-{{index}}",
+        "timestamp": f"2026-07-24T12:00:{{index:02}}Z",
+        "role": "user",
+        "body": [{{"type": "text", "text": body}}],
+    }})
+with events.open("a", encoding="utf-8") as handle:
+    handle.write(f"observer-read:{{len(turns)}}\n")
+print(json.dumps(envelope({{"turns": turns, "turn_count": len(turns), "complete": True}})))
+"#,
+        provider_turns = path_string(provider_turn_log),
+        events = path_string(events),
+    );
+    fs::write(&path, body).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
 fn fixture_provider_with_continuous_redraw(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-continuous-redraw-provider.sh");
     fs::write(
@@ -1954,6 +2434,93 @@ fn wait_for_mailbox_unconfirmed_cap(fixture: &Fixture) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("timed out waiting for mailbox confirmation retry cap");
+}
+
+fn wait_for_large_paste_event(path: &Path, expected: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let events = fs::read_to_string(path).unwrap_or_default();
+        if events.contains(expected) {
+            return events;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for {expected:?} at {}: {:?}",
+        path.display(),
+        fs::read_to_string(path)
+    );
+}
+
+fn read_length_prefixed_records(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = fs::read(path).unwrap_or_default();
+    let mut offset = 0;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        assert!(
+            offset + 8 <= bytes.len(),
+            "truncated record length at {offset}"
+        );
+        let length = u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
+        offset += 8;
+        assert!(
+            offset + length <= bytes.len(),
+            "truncated record body at {offset}"
+        );
+        records.push(bytes[offset..offset + length].to_vec());
+        offset += length;
+    }
+    records
+}
+
+fn wait_for_pending_mailbox_count(fixture: &Fixture, expected: usize, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let pending = fixture.mailbox().list_pending(SESSION_A).unwrap();
+        if pending.len() == expected {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for {expected} pending mailbox rows: {:?}",
+        fixture.mailbox().list_mailbox(SESSION_A, true)
+    );
+}
+
+fn wait_for_accepted_delivery_windows(
+    fixture: &Fixture,
+    expected: usize,
+    timeout: Duration,
+) -> Vec<MailboxDeliveryWindow> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let accepted = fixture
+            .mailbox()
+            .accepted_delivery_attempt_windows(SESSION_A)
+            .unwrap();
+        if accepted.len() == expected {
+            return accepted;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {expected} accepted mailbox windows");
+}
+
+fn wait_for_file_contains(path: &Path, expected: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let contents = fs::read_to_string(path).unwrap_or_default();
+        if contents.contains(expected) {
+            return contents;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for {expected:?} at {}: {:?}",
+        path.display(),
+        fs::read_to_string(path)
+    );
 }
 
 fn read_until(fd: RawFd, needle: &str, timeout: Duration) -> String {
