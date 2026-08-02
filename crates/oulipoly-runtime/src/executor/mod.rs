@@ -19,6 +19,8 @@
 mod assistant_response;
 pub mod cli;
 mod external_provider;
+#[allow(dead_code)]
+mod output;
 mod provider_specific;
 pub mod providers;
 pub mod terminal_signal;
