@@ -37,6 +37,7 @@ pub struct Cli {
             "new",
             "resume",
             "rotate_provider",
+            "pin_provider",
             "input"
         ]
     )]
@@ -80,6 +81,14 @@ pub struct Cli {
         default_missing_value = "",
     )]
     pub(crate) rotate_provider: Option<String>,
+
+    /// Force a fresh run to use the named provider account if it is valid and eligible.
+    #[arg(
+        long = "pin-provider",
+        value_name = "TARGET",
+        conflicts_with_all = ["resume", "new", "rotate_provider"]
+    )]
+    pub(crate) pin_provider: Option<String>,
 
     /// Path to an agent .md file
     #[arg(short = 'a', long = "agent-file")]

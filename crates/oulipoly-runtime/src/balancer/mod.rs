@@ -27,7 +27,7 @@
 //!         submodule tree it declares and re-exports as the intrinsic internal
 //!         surface of the routing concern — burn_rate, context, density,
 //!         eligibility, forensics, invocation_fallback, live_load, migration,
-//!         projection, refresh_inputs, snapshot, topology, working_set
+//!         placement_pin, projection, refresh_inputs, snapshot, topology, working_set
 //!       - the RoutingError routing-failure type this hub defines and the
 //!         select_provider/score_routing_candidates selection orchestration
 //!       - intrinsic routing-input carriers subordinate to this domain, consumed by
@@ -88,6 +88,7 @@ pub mod forensics;
 mod invocation_fallback;
 mod live_load;
 mod migration;
+mod placement_pin;
 mod projection;
 mod refresh_inputs;
 mod snapshot;
@@ -134,6 +135,7 @@ use density::{
 use eligibility::eligible_provider_indices;
 use invocation_fallback::score_by_invocation_count;
 use live_load::restrict_to_least_loaded;
+use placement_pin::{fresh_run_pin_provider, select_pinned_provider};
 use refresh_inputs::refresh_routing_inputs;
 use snapshot::{QuotaSnapshot, load_quota_snapshot};
 use topology::repair_routing_topology;
@@ -157,6 +159,15 @@ pub enum RoutingError {
         model_name: String,
         provider_names: Vec<String>,
     },
+    PinnedProviderNotInModel {
+        model_name: String,
+        target_provider: String,
+        provider_names: Vec<String>,
+    },
+    PinnedProviderIneligible {
+        model_name: String,
+        target_provider: String,
+    },
 }
 
 impl fmt::Display for RoutingError {
@@ -165,27 +176,55 @@ impl fmt::Display for RoutingError {
             RoutingError::AllProvidersQuotaExhausted {
                 model_name,
                 provider_names,
-            } => {
-                let providers = if provider_names.is_empty() {
-                    "<empty>".to_string()
-                } else {
-                    provider_names.join(", ")
-                };
-                write!(
-                    f,
-                    "all providers in pool {model_name} are quota-exhausted: {providers}"
-                )
-            }
+            } => write!(
+                f,
+                "all providers in pool {model_name} are quota-exhausted: {}",
+                format_provider_names(provider_names)
+            ),
+            RoutingError::PinnedProviderNotInModel {
+                model_name,
+                target_provider,
+                provider_names,
+            } => write!(
+                f,
+                "pinned provider {target_provider:?} is not in model {model_name} provider list: {}",
+                format_provider_names(provider_names)
+            ),
+            RoutingError::PinnedProviderIneligible {
+                model_name,
+                target_provider,
+            } => write!(
+                f,
+                "pinned provider {target_provider:?} is not eligible for model {model_name}"
+            ),
         }
     }
 }
 
 impl std::error::Error for RoutingError {}
 
+fn format_provider_names(provider_names: &[String]) -> String {
+    if provider_names.is_empty() {
+        "<empty>".to_string()
+    } else {
+        provider_names.join(", ")
+    }
+}
+
 pub fn select_provider(
     model: &ModelConfig,
     state: &StateDb,
     ctx: Option<&BalanceContext<'_>>,
+) -> Result<usize, RoutingError> {
+    let provider_pin = fresh_run_pin_provider();
+    select_provider_with_pin(model, state, ctx, provider_pin.as_deref())
+}
+
+pub fn select_provider_with_pin(
+    model: &ModelConfig,
+    state: &StateDb,
+    ctx: Option<&BalanceContext<'_>>,
+    provider_pin: Option<&str>,
 ) -> Result<usize, RoutingError> {
     refresh_routing_inputs(model, state, ctx);
     let mut snapshot = load_quota_snapshot(model, state);
@@ -194,6 +233,9 @@ pub fn select_provider(
     }
 
     let filtered_indices = eligible_provider_indices(model, state, &snapshot, Utc::now());
+    if let Some(target_provider) = provider_pin {
+        return select_pinned_provider(model, filtered_indices.as_slice(), target_provider);
+    }
     if filtered_indices.is_empty() {
         return Err(all_providers_quota_exhausted_error(model));
     }
@@ -254,7 +296,7 @@ fn candidates_have_windows(snapshot: &QuotaSnapshot, candidates: &[usize]) -> bo
 
 #[cfg(test)]
 #[rustfmt::skip]
-pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 16] {
+pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 17] {
     macro_rules! source {
         ($path:literal, $file:literal) => { ($path, production_balancer_source($path, include_str!($file))) };
     }
@@ -270,6 +312,7 @@ pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 16
         source!("crates/oulipoly-runtime/src/balancer/density/trace.rs", "density/trace.rs"),
         source!("crates/oulipoly-runtime/src/balancer/invocation_fallback.rs", "invocation_fallback.rs"),
         source!("crates/oulipoly-runtime/src/balancer/live_load.rs", "live_load.rs"),
+        source!("crates/oulipoly-runtime/src/balancer/placement_pin.rs", "placement_pin.rs"),
         source!("crates/oulipoly-runtime/src/balancer/eligibility.rs", "eligibility.rs"),
         source!("crates/oulipoly-runtime/src/balancer/context.rs", "context.rs"),
         source!("crates/oulipoly-runtime/src/balancer/snapshot.rs", "snapshot.rs"),
