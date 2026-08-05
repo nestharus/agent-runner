@@ -211,6 +211,7 @@ fn fixture_command(fixture: &ScratchFixture) -> Command {
         .env("HOME", &fixture.root)
         .env("LD_PRELOAD", &fixture.preload_library)
         .env("AGE247_ENOSPC_CONTROL", &fixture.enospc_control)
+        .env("AGE247_ENOSPC_DB_PATH", &fixture.db_path)
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .arg("--models-dir")
         .arg(&fixture.models_dir)
@@ -431,9 +432,11 @@ fn failure_context(
 
 const ENOSPC_PRELOAD_SOURCE: &str = r#"
 #define _GNU_SOURCE
-#include <dlfcn.h>
-#include <errno.h>
-#include <stdlib.h>
+ #include <dlfcn.h>
+ #include <errno.h>
+ #include <limits.h>
+ #include <stdio.h>
+ #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -449,6 +452,28 @@ static int control_file_exists(const char *path) {
 
 static int fault_enabled(void) {
     return control_file_exists(control_path());
+}
+
+static int state_db_fd(int fd) {
+    const char *target = getenv("AGE247_ENOSPC_DB_PATH");
+    if (target == NULL) {
+        return 0;
+    }
+    char fd_path[64];
+    char actual_path[PATH_MAX];
+    int written = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+    if (written < 0 || (size_t)written >= sizeof(fd_path)) {
+        return 0;
+    }
+    ssize_t length = readlink(fd_path, actual_path, sizeof(actual_path) - 1);
+    if (length < 0) {
+        return 0;
+    }
+    actual_path[length] = '\0';
+    size_t target_length = strlen(target);
+    return strncmp(actual_path, target, target_length) == 0
+        && (actual_path[target_length] == '\0'
+            || strcmp(actual_path + target_length, "-wal") == 0);
 }
 
 static int claim_log_once(void) {
@@ -494,7 +519,7 @@ ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
     if (real == NULL) {
         real = (real_fn)dlsym(RTLD_NEXT, "pwrite");
     }
-    if (fault_enabled()) {
+    if (fault_enabled() && state_db_fd(fd)) {
         return fail_with_enospc(fd);
     }
     return real(fd, buf, count, offset);
@@ -506,7 +531,7 @@ ssize_t pwrite64(int fd, const void *buf, size_t count, off64_t offset) {
     if (real == NULL) {
         real = (real_fn)dlsym(RTLD_NEXT, "pwrite64");
     }
-    if (fault_enabled()) {
+    if (fault_enabled() && state_db_fd(fd)) {
         return fail_with_enospc(fd);
     }
     return real(fd, buf, count, offset);
@@ -518,7 +543,7 @@ ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
     if (real == NULL) {
         real = (real_fn)dlsym(RTLD_NEXT, "writev");
     }
-    if (fault_enabled()) {
+    if (fault_enabled() && state_db_fd(fd)) {
         return fail_with_enospc(fd);
     }
     return real(fd, iov, iovcnt);

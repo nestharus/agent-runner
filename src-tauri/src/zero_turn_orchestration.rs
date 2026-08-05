@@ -15,7 +15,7 @@
 //!       - ZeroTurnConfirmationState and ZeroTurnConfirmationKey
 //!       - completion scan baseline bookkeeping
 //!       - host-observed completion evidence
-//!       - assistant-turn delta and productivity classification
+//!       - baseline/delta classification for assistant-turn productivity
 //!       - exact-session accepted-provider-turn classification and cursor ordering
 //!       - same-provider verification action selection
 //!       - confirmed quota decision

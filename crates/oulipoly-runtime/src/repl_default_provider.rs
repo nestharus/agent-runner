@@ -50,6 +50,7 @@ pub(crate) trait InteractiveLauncher {
         provider: &ProviderConfig,
         working_dir: Option<&Path>,
         parent_invocation_env: Option<&str>,
+        state_db_path: Option<&Path>,
     ) -> Result<crate::executor::cli::InteractiveExecutionResult, String>;
 }
 
@@ -78,12 +79,14 @@ impl InteractiveLauncher for RuntimeLauncherService {
         provider: &ProviderConfig,
         working_dir: Option<&Path>,
         parent_invocation_env: Option<&str>,
+        state_db_path: Option<&Path>,
     ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
-        crate::executor::cli::execute_interactive_with_result(
+        crate::executor::cli::execute_interactive_with_result_and_state_db_path(
             provider,
             working_dir,
             parent_invocation_env,
             None,
+            state_db_path,
         )
     }
 }
@@ -203,6 +206,7 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
         input.launch_provider,
         input.services.working_dir.as_deref(),
         Some(&parent_invocation_env),
+        input.services.state_db_path.as_deref(),
     ) {
         Ok(result) => result,
         Err(err) => {
@@ -531,6 +535,7 @@ interactive_args = ["ok"]
             provider: &ProviderConfig,
             working_dir: Option<&Path>,
             parent_invocation_env: Option<&str>,
+            _state_db_path: Option<&Path>,
         ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
             self.calls.borrow_mut().push((
                 provider.name.clone(),
@@ -562,6 +567,7 @@ interactive_args = ["ok"]
             _provider: &ProviderConfig,
             _working_dir: Option<&Path>,
             _parent_invocation_env: Option<&str>,
+            _state_db_path: Option<&Path>,
         ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
             std::thread::sleep(std::time::Duration::from_millis(10));
             let timestamp = chrono::Utc::now().to_rfc3339();
@@ -669,7 +675,7 @@ exit 17"#,
             })
             .expect("service launch");
         let private_result = private_launcher
-            .launch(&provider, Some(working_dir.path()), None)
+            .launch(&provider, Some(working_dir.path()), None, None)
             .expect("private seam launch");
 
         assert_eq!(service_output.exit_code, private_result.exit_code);

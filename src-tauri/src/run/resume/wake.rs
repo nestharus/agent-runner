@@ -12,6 +12,13 @@ use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper};
 use crate::zero_turn_orchestration::ZeroTurnAction;
 
+#[derive(Clone, Copy)]
+pub(super) struct ResumeCompletionEvidence {
+    pub(super) zero_turn_action: ZeroTurnAction,
+    pub(super) recovered_generic_nonzero: bool,
+    pub(super) submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+}
+
 pub(super) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
     crate::wake_coordinator::validate_auto_wake_child(session_id)
 }
@@ -49,17 +56,13 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
-    recovered_generic_nonzero: bool,
-    submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+    completion_evidence: ResumeCompletionEvidence,
 ) {
-    if !mailbox_delivery_requires_turn_confirmation(input, result, recovered_generic_nonzero)
-        || mailbox_delivery_turn_confirmed(
-            input,
-            &provider.name,
-            zero_turn_action,
-            submitted_turn_confirmation,
-        )
+    if !mailbox_delivery_requires_turn_confirmation(
+        input,
+        result,
+        completion_evidence.recovered_generic_nonzero,
+    ) || mailbox_delivery_turn_confirmed(input, &provider.name, completion_evidence)
     {
         return;
     }
@@ -87,18 +90,9 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
-    recovered_generic_nonzero: bool,
-    submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+    completion_evidence: ResumeCompletionEvidence,
 ) -> Result<Option<ResumeAttemptLoopControl>, String> {
-    if !mailbox_delivery_unconfirmed(
-        input,
-        &provider.name,
-        result,
-        zero_turn_action,
-        recovered_generic_nonzero,
-        submitted_turn_confirmation,
-    ) {
+    if !mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
         return Ok(None);
     }
     record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
@@ -111,17 +105,13 @@ fn mailbox_delivery_unconfirmed(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
-    recovered_generic_nonzero: bool,
-    submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+    completion_evidence: ResumeCompletionEvidence,
 ) -> bool {
-    mailbox_delivery_requires_turn_confirmation(input, result, recovered_generic_nonzero)
-        && !mailbox_delivery_turn_confirmed(
-            input,
-            provider_name,
-            zero_turn_action,
-            submitted_turn_confirmation,
-        )
+    mailbox_delivery_requires_turn_confirmation(
+        input,
+        result,
+        completion_evidence.recovered_generic_nonzero,
+    ) && !mailbox_delivery_turn_confirmed(input, provider_name, completion_evidence)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
@@ -138,11 +128,12 @@ fn mailbox_delivery_requires_turn_confirmation(
 fn mailbox_delivery_turn_confirmed(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
-    zero_turn_action: ZeroTurnAction,
-    submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+    completion_evidence: ResumeCompletionEvidence,
 ) -> bool {
-    matches!(zero_turn_action, ZeroTurnAction::Continue)
-        || submitted_turn_confirmation.is_some()
+    matches!(
+        completion_evidence.zero_turn_action,
+        ZeroTurnAction::Continue
+    ) || completion_evidence.submitted_turn_confirmation.is_some()
         || ingested_user_turn_confirms_mailbox_delivery(input, provider_name)
 }
 
@@ -167,12 +158,8 @@ pub(super) fn validate_submitted_user_turn(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
 ) -> Option<ValidatedSubmittedUserTurn> {
-    let Some(submitted) = result.submitted_user_turn.as_ref() else {
-        return None;
-    };
-    let Some(answer) = input.answer else {
-        return None;
-    };
+    let submitted = result.submitted_user_turn.as_ref()?;
+    let answer = input.answer?;
     if submitted.provider_session_id != input.resolved.active_session_id {
         return None;
     }

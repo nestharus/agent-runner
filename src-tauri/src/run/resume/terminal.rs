@@ -56,15 +56,18 @@ pub(super) fn handle_resume_attempt_result(
     wake::project_validated_submitted_turn_acceptance(result, submitted_turn_confirmation);
     record_resume_acceptance_if_present(input, bound_attempt.attempt.invocation_row_id, result)?;
     emit_captured_child_marker_lines(&result.captured_child_invocations);
+    let completion_evidence = wake::ResumeCompletionEvidence {
+        zero_turn_action,
+        recovered_generic_nonzero,
+        submitted_turn_confirmation,
+    };
     handle_resume_attempt_terminal_signal(
         input,
         &mut bound_attempt.attempt,
         provider,
         &bound_attempt.provider_session_id,
         result,
-        zero_turn_action,
-        recovered_generic_nonzero,
-        submitted_turn_confirmation,
+        completion_evidence,
     )
 }
 
@@ -103,9 +106,7 @@ fn handle_resume_attempt_terminal_signal(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
-    recovered_generic_nonzero: bool,
-    submitted_turn_confirmation: Option<wake::ValidatedSubmittedUserTurn>,
+    completion_evidence: wake::ResumeCompletionEvidence,
 ) -> Result<ResumeAttemptLoopControl, String> {
     let terminal_signal_disposition = terminal_signal_disposition_for_result(
         &input.env.state,
@@ -113,8 +114,8 @@ fn handle_resume_attempt_terminal_signal(
         &provider.name,
         provider_session_id,
         result,
-        zero_turn_action,
-        recovered_generic_nonzero,
+        completion_evidence.zero_turn_action,
+        completion_evidence.recovered_generic_nonzero,
     );
     let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
         agent_runtime_services: input.agent_runtime_services,
@@ -123,8 +124,8 @@ fn handle_resume_attempt_terminal_signal(
         guard: &mut attempt.guard,
         result,
         terminal_signal_disposition,
-        zero_turn_action,
-        recovered_generic_nonzero,
+        zero_turn_action: completion_evidence.zero_turn_action,
+        recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
     })?;
     let outcome =
         mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
@@ -143,9 +144,7 @@ fn handle_resume_attempt_terminal_signal(
         input,
         provider,
         result,
-        zero_turn_action,
-        recovered_generic_nonzero,
-        submitted_turn_confirmation,
+        completion_evidence,
     );
     if let Some(control) = wake::handle_unconfirmed_mailbox_delivery_if_needed(
         input,
@@ -153,9 +152,7 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
-        zero_turn_action,
-        recovered_generic_nonzero,
-        submitted_turn_confirmation,
+        completion_evidence,
     )? {
         return Ok(control);
     }
@@ -165,7 +162,7 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
-        recovered_generic_nonzero,
+        completion_evidence.recovered_generic_nonzero,
     )
 }
 

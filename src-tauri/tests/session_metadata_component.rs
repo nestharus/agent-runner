@@ -151,38 +151,36 @@ fn locate_ambiguous_recent_multi_chain_returns_ambiguous_session() {
     }
 }
 
-/// Risk: T2 — D1 recency cannot select among distinct native lineages.
+/// Risk: T2 — D1 resume ranking must select the strongest native lineage.
 /// Level: component.
 /// Source: contract §6 row T2; A2.
-/// Observable: resume metadata lookup preserves multi-chain ambiguity.
+/// Observable: resume metadata lookup selects the most recent owner.
 /// Residual: time-window edges bounded by deterministic fixture timestamps.
 #[test]
-fn locate_resume_recent_multi_chain_returns_ambiguous_session() {
+fn locate_resume_recent_multi_chain_selects_most_recent_owner() {
     let prepared = component_ambiguous_session_fixture();
 
-    match locate_for_resume(&prepared) {
-        Err(MetadataError::AmbiguousSession { input }) => {
-            assert_eq!(input, prepared.session_id);
-        }
-        other => panic!("expected AmbiguousSession, got {other:?}"),
-    }
+    let metadata = locate_for_resume(&prepared).unwrap();
+
+    assert_eq!(metadata.session_id, prepared.session_id);
+    assert_eq!(metadata.chain_id, prepared.chain_id);
+    assert_eq!(metadata.provider_name, prepared.provider_name);
 }
 
-/// Risk: T2 — D1 stale sibling lineages remain distinct.
+/// Risk: T2 — D1 stale sibling lineages must not obscure the current owner.
 /// Level: component.
 /// Source: contract §6 row T2; A2.
-/// Observable: age differences do not collapse multi-chain ambiguity.
+/// Observable: a stale sibling collapses to the recent owner.
 /// Residual: time-window edges bounded by deterministic fixture timestamps.
 #[test]
-fn locate_stale_sibling_lineage_returns_ambiguous_session() {
+fn locate_stale_sibling_lineage_selects_recent_owner() {
     let prepared = component_recency_collapsed_fixture();
 
-    match locate(&prepared) {
-        Err(MetadataError::AmbiguousSession { input }) => {
-            assert_eq!(input, prepared.session_id);
-        }
-        other => panic!("expected AmbiguousSession, got {other:?}"),
-    }
+    let metadata = locate(&prepared).unwrap();
+
+    assert_eq!(metadata.session_id, prepared.session_id);
+    assert_eq!(metadata.chain_id, prepared.chain_id);
+    assert_eq!(metadata.provider_name, prepared.provider_name);
 }
 
 /// Risk: T3 — D2 storage mapping is stable at type level.

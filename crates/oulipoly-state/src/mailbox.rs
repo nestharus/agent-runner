@@ -663,6 +663,10 @@ enum BoundedMailboxRowsError {
 }
 
 impl MailboxDb {
+    pub fn path_for_state_db(state_db_path: &Path) -> PathBuf {
+        state_db_path.with_file_name("pid-identity.db")
+    }
+
     pub fn default_path() -> Result<PathBuf, String> {
         pid_identity::default_path()
     }
@@ -2134,8 +2138,8 @@ impl MailboxDb {
                          mailbox.state_dir, mailbox.meta_path, mailbox.log_path,
                          mailbox.rc_path, mailbox.rc, mailbox.payload_file_path,
                          mailbox.payload_sha256, mailbox.payload_byte_len,
-                         mailbox.payload_retention_policy, mailbox.submission_token,
-                         mailbox.target_kind, mailbox.target_id
+                         mailbox.payload_retention_policy, mailbox.payload_compacted_at,
+                         mailbox.submission_token, mailbox.target_kind, mailbox.target_id
                  FROM mailbox_delivery_attempt_items AS items
                  JOIN mailbox ON mailbox.seq = items.mailbox_seq
                  WHERE items.attempt_id = ?1 AND mailbox.delivered_at IS NULL

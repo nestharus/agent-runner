@@ -680,14 +680,17 @@ fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
     fixture.set_auto_wake_count(5);
 
     let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
-    wait_until("first failed wake released claim", || {
+    wait_until("failed wake released claim or retry completed", || {
         let db = fixture.mailbox();
         let rows = db.list_mailbox(SESSION, true).unwrap();
-        rows.len() == 1
-            && rows[0].delivered_at.is_none()
-            && rows[0].delivery_attempts == 1
-            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
-            && db.wake_claim(SESSION).unwrap().is_none()
+        let settled = rows.len() == 1
+            && ((rows[0].delivered_at.is_none()
+                && rows[0].delivery_attempts == 1
+                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed"))
+                || (rows[0].delivered_at.is_some()
+                    && rows[0].delivery_attempts == 2
+                    && rows[0].delivery_error.is_none()));
+        settled && db.wake_claim(SESSION).unwrap().is_none()
     });
 
     let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));

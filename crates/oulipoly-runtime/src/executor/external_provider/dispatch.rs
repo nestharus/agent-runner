@@ -164,24 +164,26 @@ fn attempt_account_dispatch(
             return Err(classify_provider_client_attempt_error(error));
         }
     };
-    require_recorded_external_generation(&recorded_generation).map_err(|_| {
-        terminal_attempt_error(protocol_service_error("runtime_generation_bind_failed"))
-    })?;
-    backfill_external_launch_session_id(
-        spawn_identity.as_ref(),
-        &recorded_generation,
-        &launch_result,
-    )
-    .map_err(|_| {
-        terminal_attempt_error(protocol_service_error("runtime_generation_attach_failed"))
-    })?;
-    mark_runtime_generation_orderly_completed(
-        spawn_identity.as_ref(),
-        launch_exit_code(&launch_result.exit.status),
-    )
-    .map_err(|_| {
-        terminal_attempt_error(protocol_service_error("runtime_generation_exit_failed"))
-    })?;
+    if spawn_identity.is_some() {
+        require_recorded_external_generation(&recorded_generation).map_err(|_| {
+            terminal_attempt_error(protocol_service_error("runtime_generation_bind_failed"))
+        })?;
+        backfill_external_launch_session_id(
+            spawn_identity.as_ref(),
+            &recorded_generation,
+            &launch_result,
+        )
+        .map_err(|_| {
+            terminal_attempt_error(protocol_service_error("runtime_generation_attach_failed"))
+        })?;
+        mark_runtime_generation_orderly_completed(
+            spawn_identity.as_ref(),
+            launch_exit_code(&launch_result.exit.status),
+        )
+        .map_err(|_| {
+            terminal_attempt_error(protocol_service_error("runtime_generation_exit_failed"))
+        })?;
+    }
     let classification = classify_after_launch_success(registry, context, &launch_result);
 
     Ok(map_launch_result_with_terminal_classification(

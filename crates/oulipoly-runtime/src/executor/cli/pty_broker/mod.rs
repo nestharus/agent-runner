@@ -1192,7 +1192,9 @@ impl Drop for SessionRuntimeIdleGuard {
         else {
             return;
         };
-        if let Ok(mut db) = MailboxDb::open_default() {
+        if let Some(context) = self.context.as_ref()
+            && let Ok(mut db) = context.open_mailbox()
+        {
             if db
                 .accepted_delivery_attempt_windows(session_id)
                 .is_ok_and(|windows| {

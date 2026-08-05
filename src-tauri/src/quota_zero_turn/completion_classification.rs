@@ -395,6 +395,28 @@ pub(crate) fn apply_zero_turn_classification_to_result(
     );
 }
 
+pub(crate) fn is_confirmed_zero_turn_exhaustion(
+    action: ZeroTurnAction,
+    signal: &Option<executor::TerminalSignal>,
+) -> bool {
+    matches!(action, ZeroTurnAction::ConfirmedExhaustion)
+        && zero_turn_completion_can_replace_signal(signal)
+}
+
+pub(crate) fn zero_turn_late_bind_baseline(
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    provider_name: &str,
+    session_id: &str,
+) -> ZeroTurnBaseline {
+    let has_source = has_session_source(sessions_cfg, provider_name);
+    record_baseline(
+        provider_name,
+        Some(session_id),
+        has_source.then(zero_turn_zero_counts),
+        !has_source,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::recovered_generic_nonzero;
@@ -485,26 +507,4 @@ mod tests {
             )
         ));
     }
-}
-
-pub(crate) fn is_confirmed_zero_turn_exhaustion(
-    action: ZeroTurnAction,
-    signal: &Option<executor::TerminalSignal>,
-) -> bool {
-    matches!(action, ZeroTurnAction::ConfirmedExhaustion)
-        && zero_turn_completion_can_replace_signal(signal)
-}
-
-pub(crate) fn zero_turn_late_bind_baseline(
-    sessions_cfg: &oulipoly_config::SessionsConfig,
-    provider_name: &str,
-    session_id: &str,
-) -> ZeroTurnBaseline {
-    let has_source = has_session_source(sessions_cfg, provider_name);
-    record_baseline(
-        provider_name,
-        Some(session_id),
-        has_source.then(zero_turn_zero_counts),
-        !has_source,
-    )
 }

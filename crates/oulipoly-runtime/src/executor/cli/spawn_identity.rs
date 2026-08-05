@@ -19,7 +19,7 @@ use oulipoly_state::mailbox::{
 use oulipoly_state::pid_identity::{
     self, ProcessIdentity, ProcessIdentityObservation, observe_live_process_identity,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
@@ -50,6 +50,7 @@ pub(crate) struct SpawnIdentityContext {
     pty_control_path: Option<String>,
     effective_cwd: Option<String>,
     models_dir: Option<String>,
+    mailbox_db_path: Option<PathBuf>,
 }
 
 impl SpawnIdentityContext {
@@ -142,6 +143,21 @@ fn spawn_identity_context_from_invocation(
         pty_control_path: None,
         effective_cwd: effective_cwd.map(|path| path.to_string_lossy().into_owned()),
         models_dir: models_dir.map(|path| path.to_string_lossy().into_owned()),
+        mailbox_db_path: None,
+    }
+}
+
+impl SpawnIdentityContext {
+    pub(super) fn with_mailbox_db_path(mut self, path: PathBuf) -> Self {
+        self.mailbox_db_path = Some(path);
+        self
+    }
+
+    pub(super) fn open_mailbox(&self) -> Result<MailboxDb, String> {
+        match self.mailbox_db_path.as_deref() {
+            Some(path) => MailboxDb::open(path),
+            None => MailboxDb::open_default(),
+        }
     }
 }
 
@@ -158,7 +174,7 @@ pub(crate) fn register_runtime_generation_starting(
     let Some(context) = context else {
         return Ok(());
     };
-    let mut db = MailboxDb::open_default()?;
+    let mut db = context.open_mailbox()?;
     recover_stale_session_generations(&mut db, context)?;
     match db
         .create_runtime_generation(CreateRuntimeGeneration {
@@ -243,7 +259,7 @@ pub(crate) fn record_child_identity(
             None
         }
     };
-    let mut db = MailboxDb::open_default()?;
+    let mut db = context.open_mailbox()?;
     let mutation = db
         .bind_runtime_generation_running(BindRuntimeGenerationRunning {
             fence: generation_fence(context),
@@ -283,7 +299,7 @@ pub(crate) fn backfill_captured_session_id(
     if generation.generation_id != context.generation_id {
         return Err("Captured session generation does not match its spawn context".to_string());
     }
-    let mut db = MailboxDb::open_default()?;
+    let mut db = context.open_mailbox()?;
     match db
         .attach_runtime_generation_session(AttachRuntimeGenerationSession {
             fence: generation_fence(context),
@@ -317,7 +333,7 @@ fn mark_session_running_with_session_id(
     session_id: &str,
     identity: &ProcessIdentity,
 ) {
-    match MailboxDb::open_default().and_then(|mut db| {
+    match context.open_mailbox().and_then(|mut db| {
         db.mark_session_running(session_runtime_running_update(
             context, session_id, identity,
         ))
@@ -352,7 +368,7 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
         return Ok(());
     };
     let drain_request_id = DrainRequestId::new();
-    let mut db = MailboxDb::open_default()?;
+    let mut db = context.open_mailbox()?;
     let handoff = match db
         .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
             fence: generation_fence(context),
@@ -426,7 +442,7 @@ fn exit_runtime_generation(
     let Some(context) = context else {
         return Ok(());
     };
-    let mut db = MailboxDb::open_default()?;
+    let mut db = context.open_mailbox()?;
     match db
         .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
             fence: generation_fence(context),

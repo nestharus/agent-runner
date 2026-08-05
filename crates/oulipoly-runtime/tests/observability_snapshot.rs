@@ -298,6 +298,8 @@ fn overlay_counts_live_logical_child_after_terminal_history_and_fails_closed() {
 #[test]
 fn delivered_wake_edge_keeps_live_workload_under_original_root() {
     let fixture = Fixture::new();
+    let wake_process = TestProcess::spawn();
+    let workload_process = TestProcess::spawn();
     let state = fixture.open_state();
     let root_id = seed_invocation(&state, ROOT_UUID, None);
     let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
@@ -313,21 +315,25 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
         .unwrap();
     drop(state);
 
-    let wake_identity = ProcessIdentity {
-        os_pid: 888_888_887,
-        os_boot_id: "boot-wake".to_string(),
-        os_pid_starttime_ticks: 87,
-    };
     let pid = fixture.open_pid();
     record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &current_identity());
-    record_identity(&pid, LIVE_CHILD_UUID, Some(SESSION_ID), &wake_identity);
+    record_identity(
+        &pid,
+        LIVE_CHILD_UUID,
+        Some(SESSION_ID),
+        wake_process.identity(),
+    );
     drop(pid);
 
     let handle = "ab_2_100_0000000000000003";
     write_agent_bash_meta(
         &fixture.agent_bash_root(),
         handle,
-        &agent_bash_meta(handle, "RUNNING", &wake_identity, Some(777), None),
+        &agent_bash_meta_with_workload_identity(
+            handle,
+            wake_process.identity(),
+            workload_process.identity(),
+        ),
         "wake workload running",
     );
     let mut mailbox = fixture.open_mailbox();
