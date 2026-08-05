@@ -297,6 +297,17 @@ impl<'a> OutputAllocationController<'a> {
                 )
             })?;
         let measured_capacity_max_bytes = site_measured_capacity_max_bytes(site, requested_bytes);
+        if requested_bytes > measured_capacity_max_bytes {
+            return Err(new_allocation_failure(
+                stream,
+                site,
+                OutputAllocationFailureKind::MeasuredCapacityLimit,
+                requested_elements,
+                logical_max_elements,
+                Some(requested_bytes),
+                measured_capacity_max_bytes,
+            ));
+        }
 
         if self.controls.injected_failure(stream, site) {
             return Err(new_allocation_failure(
@@ -1791,6 +1802,33 @@ mod tests {
             assert_eq!(controls.total_calls(), 0);
         });
 
+        run_case(FUNCTION, "requested_byte_limit", &mut executed, || {
+            let controls = FixedOutputAllocationControls::new().fail_reserve(
+                OutputStreamKind::Stdout,
+                OutputAllocationSite::RetainedPrefixWorking,
+            );
+            let mut controller = OutputAllocationController::controlled(&controls);
+            let failure = controller
+                .try_vec::<u16>(
+                    OutputStreamKind::Stdout,
+                    OutputAllocationSite::RetainedPrefixWorking,
+                    L,
+                )
+                .expect_err("requested bytes above the site ceiling are rejected");
+            let failure = assert_failure(
+                Some(failure),
+                OutputStreamKind::Stdout,
+                OutputAllocationSite::RetainedPrefixWorking,
+                OutputAllocationFailureKind::MeasuredCapacityLimit,
+            );
+            assert_eq!(failure.measured_capacity_bytes(), Some(2 * L as u64));
+            assert_eq!(
+                failure.measured_capacity_max_bytes(),
+                EXECUTION_OUTPUT_RETAINED_CAPACITY_MAX_BYTES
+            );
+            assert_eq!(controls.total_calls(), 0);
+        });
+
         run_case(FUNCTION, "reserve_failure", &mut executed, || {
             let controls = FixedOutputAllocationControls::new().fail_reserve(
                 OutputStreamKind::Stderr,
@@ -1976,7 +2014,7 @@ mod tests {
                 OutputAllocationFailureKind::FillLengthOverflow,
             );
         });
-        finish_cases(FUNCTION, 14, executed);
+        finish_cases(FUNCTION, 15, executed);
     }
 
     #[test]
