@@ -12,12 +12,13 @@ use crate::observability::invocation::{
     invocation_node_id, resolved_invocation_session_id, session_node_id,
 };
 use crate::observability::limits::SnapshotLimits;
-use crate::observability::liveness::unverified_pid_liveness;
+use crate::observability::liveness::{process_identity_liveness, unverified_pid_liveness};
 use crate::observability::mailbox::mailbox_state;
 use crate::observability::state_access::storage_diagnostic;
-use oulipoly_state::StateDb;
+use oulipoly_state::invocation_marker::INVOCATION_MARKER_PREFIX;
 use oulipoly_state::mailbox::{AGENT_BASH_COMPLETE_KIND, MailboxRow};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
+use oulipoly_state::{CompositeInvocationId, StateDb};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -26,6 +27,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
+
+const WORKLOAD_INVOCATION_MARKER_MAX_BYTES: u64 = 4096;
 
 pub(crate) struct AgentBashProjection {
     pub(crate) nodes: Vec<MonitorNode>,
@@ -63,6 +66,7 @@ struct AgentBashMeta {
     caller_chain: Vec<CallerIdentity>,
     supervisor_pid: Option<i64>,
     workload_pid: Option<i64>,
+    workload_identity: WorkloadIdentityEvidence,
     workload_pgid: Option<i64>,
     argv: Vec<String>,
     cwd: Option<String>,
@@ -75,6 +79,13 @@ struct AgentBashMeta {
 }
 
 #[derive(Debug, Clone)]
+enum WorkloadIdentityEvidence {
+    Exact(ProcessIdentity),
+    Legacy,
+    Incomplete,
+}
+
+#[derive(Debug, Clone)]
 struct CallerIdentity {
     chain_index: usize,
     identity: ProcessIdentity,
@@ -84,7 +95,7 @@ struct CallerIdentity {
 struct ResolvedOwner {
     session_id: Option<String>,
     invocation_uuid: String,
-    matched_chain_index: usize,
+    matched_chain_index: Option<usize>,
 }
 
 struct ProcessIdentityFields {
@@ -260,6 +271,10 @@ fn mailbox_workload_node(
     let meta_path = PathBuf::from(&row.meta_path);
     let meta = read_meta_for_node(cache, &state_dir, &meta_path, diagnostics);
     let log = mailbox_workload_log(row, meta.as_ref(), limits.log_tail_bytes);
+    let liveness = meta
+        .as_ref()
+        .map(meta_workload_liveness)
+        .unwrap_or(LivenessStatus::NotApplicable);
     MonitorNode {
         id: agent_bash_node_id(&row.handle),
         parent_id: workload_parent_id(
@@ -269,14 +284,16 @@ fn mailbox_workload_node(
             session_id,
         ),
         kind: MonitorNodeKind::AgentBashWorkload,
-        label: workload_label(&row.handle, meta.as_ref(), None),
-        status: mailbox_workload_status(row, meta.as_ref()),
+        label: workload_label(
+            &row.handle,
+            meta.as_ref(),
+            row.matched_chain_index
+                .and_then(|index| usize::try_from(index).ok()),
+        ),
+        status: mailbox_workload_status(row, meta.as_ref(), liveness),
         pid: meta.as_ref().and_then(|meta| meta.workload_pid),
         pgid: meta.as_ref().and_then(|meta| meta.workload_pgid),
-        liveness: meta
-            .as_ref()
-            .map(|meta| unverified_pid_liveness(meta.workload_pid))
-            .unwrap_or(LivenessStatus::NotApplicable),
+        liveness,
         started_at: meta.as_ref().and_then(|meta| meta.ready_at.clone()),
         updated_at: meta.as_ref().and_then(|meta| meta.completed_at.clone()),
         completed_at: meta.as_ref().and_then(|meta| meta.completed_at.clone()),
@@ -355,7 +372,8 @@ fn scanned_workload_node(
         return None;
     }
     remember_meta_handle(seen_handles, &meta);
-    let owner = resolve_owner(state, pid, &meta.caller_chain, diagnostics)?;
+    let owner = resolve_owner(state, pid, &meta.caller_chain, diagnostics)
+        .or_else(|| workload_marker_owner(state, state_dir, &meta, invocation_uuids))?;
     if !owner_matches_root(&owner, session_id, invocation_uuids) {
         return None;
     }
@@ -386,6 +404,7 @@ fn meta_workload_node(
     limits: SnapshotLimits,
 ) -> MonitorNode {
     let log = meta_workload_log(state_dir, meta, limits.log_tail_bytes);
+    let liveness = meta_workload_liveness(meta);
     MonitorNode {
         id: agent_bash_node_id(&meta.handle),
         parent_id: workload_parent_id(
@@ -395,11 +414,11 @@ fn meta_workload_node(
             session_id,
         ),
         kind: MonitorNodeKind::AgentBashWorkload,
-        label: workload_label(&meta.handle, Some(meta), Some(owner.matched_chain_index)),
-        status: meta_workload_status(meta),
+        label: workload_label(&meta.handle, Some(meta), owner.matched_chain_index),
+        status: meta_workload_status(meta, liveness),
         pid: meta.workload_pid,
         pgid: meta.workload_pgid,
-        liveness: unverified_pid_liveness(meta.workload_pid),
+        liveness,
         started_at: meta.ready_at.clone(),
         updated_at: meta.completed_at.clone(),
         completed_at: meta.completed_at.clone(),
@@ -702,12 +721,14 @@ fn agent_bash_meta(
     handle: String,
     caller_chain: Vec<CallerIdentity>,
 ) -> AgentBashMeta {
+    let workload_pid = optional_i64(value, &["workload_pid", "workloadPid"]);
     AgentBashMeta {
         handle,
         state: optional_string(value, &["state"]).unwrap_or_else(|| "UNKNOWN".to_string()),
         caller_chain,
         supervisor_pid: optional_i64(value, &["supervisor_pid", "supervisorPid"]),
-        workload_pid: optional_i64(value, &["workload_pid", "workloadPid"]),
+        workload_pid,
+        workload_identity: parse_workload_identity(value, workload_pid),
         workload_pgid: optional_i64(value, &["workload_pgid", "workloadPgid", "pgid"]),
         argv: optional_string_array(value, "argv"),
         cwd: optional_string(value, &["cwd"]),
@@ -717,6 +738,30 @@ fn agent_bash_meta(
         signal: optional_i64(value, &["signal"]).and_then(|value| i32::try_from(value).ok()),
         cgroup: optional_string(value, &["cgroup"]),
         log_path: optional_string(value, &["log_path", "logPath"]).map(PathBuf::from),
+    }
+}
+
+fn parse_workload_identity(value: &Value, workload_pid: Option<i64>) -> WorkloadIdentityEvidence {
+    let boot_id_names = ["process_boot_id", "processBootId"];
+    let starttime_names = ["workload_pid_starttime_ticks", "workloadPidStarttimeTicks"];
+    let has_boot_id = has_any_field(value, &boot_id_names);
+    let has_starttime = has_any_field(value, &starttime_names);
+    if !has_boot_id && !has_starttime {
+        return WorkloadIdentityEvidence::Legacy;
+    }
+    match (
+        workload_pid,
+        optional_string(value, &boot_id_names),
+        optional_i64(value, &starttime_names),
+    ) {
+        (Some(os_pid), Some(os_boot_id), Some(os_pid_starttime_ticks)) => {
+            WorkloadIdentityEvidence::Exact(ProcessIdentity {
+                os_pid,
+                os_boot_id,
+                os_pid_starttime_ticks,
+            })
+        }
+        _ => WorkloadIdentityEvidence::Incomplete,
     }
 }
 
@@ -834,8 +879,51 @@ fn resolved_owner_from_row(
     ResolvedOwner {
         session_id,
         invocation_uuid: row.invocation_uuid,
-        matched_chain_index,
+        matched_chain_index: Some(matched_chain_index),
     }
+}
+
+fn workload_marker_owner(
+    state: Option<&StateDb>,
+    state_dir: &Path,
+    meta: &AgentBashMeta,
+    invocation_uuids: &HashSet<String>,
+) -> Option<ResolvedOwner> {
+    let invocation_uuid = workload_marker_invocation_uuid(&meta_log_path(state_dir, meta))?;
+    if !invocation_uuids.contains(&invocation_uuid) {
+        return None;
+    }
+    Some(ResolvedOwner {
+        session_id: state_invocation_session(state, &invocation_uuid),
+        invocation_uuid,
+        matched_chain_index: None,
+    })
+}
+
+fn workload_marker_invocation_uuid(path: &Path) -> Option<String> {
+    let line = read_log_head_line(path)?;
+    let payload = line.strip_prefix(INVOCATION_MARKER_PREFIX)?;
+    // Ownership requires canonical JSON; the shared parser also accepts legacy
+    // shell-mangled markers after a JSON syntax failure.
+    serde_json::from_str::<Value>(payload).ok()?;
+    CompositeInvocationId::parse_marker_payload(payload)
+        .ok()
+        .map(|invocation| invocation.id)
+}
+
+fn read_log_head_line(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(WORKLOAD_INVOCATION_MARKER_MAX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let line_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..line_end])
+        .ok()
+        .map(|line| line.trim_end_matches('\r').to_string())
 }
 
 fn owner_session_id(state: Option<&StateDb>, row: &PidIdentityRow) -> Option<String> {
@@ -908,18 +996,8 @@ fn workload_label(
         .and_then(|meta| meta.supervisor_pid)
         .map(|pid| format!(" supervisor={pid}"))
         .unwrap_or_default();
-    let chain = meta
-        .map(|meta| {
-            format!(
-                " chain_index={}",
-                matched_chain_index.unwrap_or_else(|| {
-                    meta.caller_chain
-                        .first()
-                        .map(|entry| entry.chain_index)
-                        .unwrap_or(0)
-                })
-            )
-        })
+    let chain = matched_chain_index
+        .map(|index| format!(" chain_index={index}"))
         .unwrap_or_default();
     let signal = meta
         .and_then(|meta| meta.signal)
@@ -932,13 +1010,29 @@ fn workload_label(
     format!("agent-bash {handle} {state}: {argv}{cwd}{supervisor}{chain}{signal}{cgroup}")
 }
 
-fn mailbox_workload_status(row: &MailboxRow, meta: Option<&AgentBashMeta>) -> MonitorStatus {
-    meta.map(meta_workload_status)
-        .unwrap_or_else(|| rc_status(row.rc))
+fn mailbox_workload_status(
+    row: &MailboxRow,
+    meta: Option<&AgentBashMeta>,
+    liveness: LivenessStatus,
+) -> MonitorStatus {
+    match meta.map(|meta| meta_workload_status(meta, liveness)) {
+        Some(status) if is_terminal_meta_status(status) => status,
+        _ => rc_status(row.rc),
+    }
 }
 
-fn meta_workload_status(meta: &AgentBashMeta) -> MonitorStatus {
-    match meta.state.to_ascii_lowercase().as_str() {
+fn is_terminal_meta_status(status: MonitorStatus) -> bool {
+    matches!(
+        status,
+        MonitorStatus::Succeeded
+            | MonitorStatus::Failed
+            | MonitorStatus::Error
+            | MonitorStatus::Cancelled
+    )
+}
+
+fn meta_workload_status(meta: &AgentBashMeta, liveness: LivenessStatus) -> MonitorStatus {
+    let recorded_status = match meta.state.to_ascii_lowercase().as_str() {
         "running" | "ready" => MonitorStatus::Running,
         "pending" => MonitorStatus::Pending,
         "done" | "complete" | "completed" => {
@@ -949,6 +1043,22 @@ fn meta_workload_status(meta: &AgentBashMeta) -> MonitorStatus {
         "cancelling" => MonitorStatus::Cancelling,
         "cancelled" | "canceled" => MonitorStatus::Cancelled,
         _ => meta.rc.map(rc_status).unwrap_or(MonitorStatus::Unknown),
+    };
+    if recorded_status != MonitorStatus::Running {
+        return recorded_status;
+    }
+    match liveness {
+        LivenessStatus::VerifiedLive | LivenessStatus::UnverifiedLive => MonitorStatus::Running,
+        LivenessStatus::Dead | LivenessStatus::PidReused => MonitorStatus::Stale,
+        LivenessStatus::Unknown | LivenessStatus::NotApplicable => MonitorStatus::Unknown,
+    }
+}
+
+fn meta_workload_liveness(meta: &AgentBashMeta) -> LivenessStatus {
+    match &meta.workload_identity {
+        WorkloadIdentityEvidence::Exact(identity) => process_identity_liveness(identity),
+        WorkloadIdentityEvidence::Legacy => unverified_pid_liveness(meta.workload_pid),
+        WorkloadIdentityEvidence::Incomplete => LivenessStatus::Unknown,
     }
 }
 
@@ -1022,6 +1132,10 @@ fn optional_string(value: &Value, names: &[&str]) -> Option<String> {
     let value = optional_raw_string(value, names)?;
     let value = non_empty_string(value)?;
     Some(owned_string(value))
+}
+
+fn has_any_field(value: &Value, names: &[&str]) -> bool {
+    names.iter().any(|name| value.get(*name).is_some())
 }
 
 fn optional_raw_string<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
