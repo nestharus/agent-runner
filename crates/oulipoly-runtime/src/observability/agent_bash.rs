@@ -903,6 +903,8 @@ fn workload_marker_owner(
 fn workload_marker_invocation_uuid(path: &Path) -> Option<String> {
     let line = read_log_head_line(path)?;
     let payload = line.strip_prefix(INVOCATION_MARKER_PREFIX)?;
+    // Ownership requires canonical JSON; the shared parser also accepts legacy
+    // shell-mangled markers after a JSON syntax failure.
     serde_json::from_str::<Value>(payload).ok()?;
     CompositeInvocationId::parse_marker_payload(payload)
         .ok()

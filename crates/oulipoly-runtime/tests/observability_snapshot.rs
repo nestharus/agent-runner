@@ -876,6 +876,30 @@ fn agent_bash_scan_rejects_workload_marker_outside_active_invocation_subtree() {
 }
 
 #[test]
+fn agent_bash_scan_rejects_legacy_shell_mangled_workload_marker() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let unregistered_caller = dead_identity();
+    let live_workload = current_identity();
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        "legacy-marker-manual-launch",
+        &agent_bash_meta_with_workload_identity(
+            "legacy-marker-manual-launch",
+            &unregistered_caller,
+            &live_workload,
+        ),
+        &format!("OULIPOLY_INVOCATION={{source:'opencode',id:'{ROOT_UUID}'}}\nreview output"),
+    );
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert!(find_node(&snapshot, "agent-bash:legacy-marker-manual-launch").is_none());
+}
+
+#[test]
 fn agent_bash_running_status_is_reconciled_against_exact_workload_identity() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
@@ -1015,6 +1039,7 @@ fn agent_bash_mailbox_referenced_state_dir_is_included_even_outside_scan_limit()
     let mut mailbox = fixture.open_mailbox();
     mailbox
         .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            matched_chain_index: Some(7),
             state_dir: old_dir.to_str().unwrap(),
             meta_path: old_dir.join("meta.json").to_str().unwrap(),
             log_path: old_dir.join("log").to_str().unwrap(),
@@ -1037,6 +1062,11 @@ fn agent_bash_mailbox_referenced_state_dir_is_included_even_outside_scan_limit()
     assert_eq!(
         node(&snapshot, "agent-bash:aa-mailbox-old").status,
         MonitorStatus::Succeeded
+    );
+    assert!(
+        node(&snapshot, "agent-bash:aa-mailbox-old")
+            .label
+            .contains("chain_index=7")
     );
 }
 
