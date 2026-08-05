@@ -35,6 +35,7 @@ mod exhaustion;
 mod invocation_fallback;
 mod migration_nonalpha;
 mod migration_scoring;
+mod placement_pin;
 mod projections;
 mod refresh_topology;
 mod source_guard;
