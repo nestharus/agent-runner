@@ -16,7 +16,7 @@
 //! ```
 
 use super::context::ExternalProviderDispatchContext;
-use crate::executor::cli::{resolve_input_flags, shell_split};
+use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
 use oulipoly_config::PromptMode;
 use oulipoly_provider::generated::{
     BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LaunchParams, LaunchRequest,
@@ -24,10 +24,13 @@ use oulipoly_provider::generated::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const DATA_DIR_ENV: &str = oulipoly_state::paths::DATA_DIR_ENV;
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+// This is the OpenCode external-provider positional-prompt boundary, not a
+// universal provider or operating-system argv limit.
+const OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchCandidate {
@@ -116,14 +119,15 @@ pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
 ) -> Result<Value, serde_json::Error> {
+    let (argv, launch_stdin) = project_launch_carrier(context, candidate);
     let env = if candidate.env.is_empty() {
         None
     } else {
         Some(candidate.env.clone())
     };
-    let stdin = candidate.stdin.as_ref().map(|stdin| BytePayload {
+    let stdin = launch_stdin.map(|stdin| BytePayload {
         encoding: "utf8".to_string(),
-        data: stdin.clone(),
+        data: stdin,
     });
     serde_json::to_value(LaunchRequest {
         contract: CONTRACT_VERSION.to_string(),
@@ -138,13 +142,63 @@ pub(crate) fn build_launch_request(
                 &candidate.prompt,
                 &model_provider_args(context),
             ),
-            argv: candidate.argv.clone(),
+            argv,
             working_directory: candidate.working_directory.clone(),
             env,
             stdin,
             session: launch_session(context),
         },
     })
+}
+
+#[allow(clippy::needless_as_bytes)] // Keep the provider contract's byte unit explicit.
+fn project_launch_carrier(
+    context: &ExternalProviderDispatchContext,
+    candidate: &LaunchCandidate,
+) -> (Vec<String>, Option<String>) {
+    let mut argv = candidate.argv.clone();
+    let mut stdin = candidate.stdin.clone();
+    if context.model.provider.is_none()
+        || !is_opencode_provider(context)
+        || !matches!(candidate.prompt_mode, PromptMode::Arg)
+        || candidate.prompt.as_bytes().len()
+            < OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES
+    {
+        return (argv, stdin);
+    }
+
+    let mut prompt_positions = argv
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| *value == &candidate.prompt)
+        .map(|(index, _)| index);
+    let Some(prompt_index) = prompt_positions.next() else {
+        return (argv, stdin);
+    };
+    if prompt_positions.next().is_some() {
+        return (argv, stdin);
+    }
+
+    match stdin.as_ref() {
+        None => stdin = Some(candidate.prompt.clone()),
+        Some(existing) if existing == &candidate.prompt => {}
+        Some(_) => return (argv, stdin),
+    }
+    argv.remove(prompt_index);
+    (argv, stdin)
+}
+
+fn is_opencode_provider(context: &ExternalProviderDispatchContext) -> bool {
+    if context.provider.name.starts_with("opencode") {
+        return true;
+    }
+
+    let provider = provider_name(&context.provider.command);
+    Path::new(&provider)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(provider.as_str())
+        .starts_with("opencode")
 }
 
 fn provider_argv(context: &ExternalProviderDispatchContext, input_args: &[String]) -> Vec<String> {
