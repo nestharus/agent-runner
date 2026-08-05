@@ -199,6 +199,8 @@ mod tests {
             name: name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
             interactive_args: None,
             resume: Some(claude_resume_strategy()),
             session_capture: None,
