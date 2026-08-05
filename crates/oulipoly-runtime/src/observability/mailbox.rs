@@ -11,14 +11,14 @@ use crate::observability::dto::{
 use crate::observability::invocation::{invocation_node_id, session_node_id};
 use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::{
-    runtime_is_stale, runtime_liveness_status, stale_runtime_diagnostic, wake_claim_liveness,
-    wake_claim_no_pid_is_stale,
+    process_identity_liveness, runtime_is_stale, runtime_liveness_status, stale_runtime_diagnostic,
+    wake_claim_liveness, wake_claim_no_pid_is_stale,
 };
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::storage_diagnostic;
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxRow, SessionRuntimeReadOnlyLiveness, SessionRuntimeRow,
-    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
+    ExactProcessEvidence, MailboxDb, MailboxRow, RuntimeGenerationRow, SessionGenerationProjection,
+    SessionRuntimeReadOnlyLiveness, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
 };
 use oulipoly_state::pid_identity::PidIdentityDb;
 use std::collections::HashSet;
@@ -44,6 +44,7 @@ pub(crate) fn project_mailbox(
         return projection;
     };
     let runtime = runtime_row(mailbox, session_id, &mut projection.diagnostics);
+    let generation = generation_projection(mailbox, session_id, &mut projection.diagnostics);
     let runtime_liveness = runtime_liveness(mailbox, session_id, &mut projection.diagnostics);
     push_session_node(
         &mut projection,
@@ -51,6 +52,7 @@ pub(crate) fn project_mailbox(
         root,
         root_invocation_uuid,
         runtime.as_ref(),
+        generation.as_ref(),
         runtime_liveness,
     );
     if runtime_liveness_is_stale(runtime_liveness) {
@@ -99,6 +101,7 @@ fn push_session_node(
     root: &ObservabilityRoot,
     root_invocation_uuid: Option<&str>,
     runtime: Option<&SessionRuntimeRow>,
+    generation: Option<&SessionGenerationProjection>,
     runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
 ) {
     projection.nodes.push(session_node(
@@ -106,8 +109,27 @@ fn push_session_node(
         root,
         root_invocation_uuid,
         runtime,
+        generation,
         runtime_liveness,
     ));
+}
+
+fn generation_projection(
+    mailbox: Option<&MailboxDb>,
+    session_id: &str,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) -> Option<SessionGenerationProjection> {
+    let mailbox = mailbox?;
+    match mailbox.session_generation_projection(session_id) {
+        Ok(projection) => Some(projection),
+        Err(err) => {
+            diagnostics.push(storage_diagnostic(
+                "mailbox:generation-read",
+                err.to_string(),
+            ));
+            None
+        }
+    }
 }
 
 fn runtime_liveness_is_stale(liveness: Option<SessionRuntimeReadOnlyLiveness>) -> bool {
@@ -242,22 +264,34 @@ fn session_node(
     root: &ObservabilityRoot,
     root_invocation_uuid: Option<&str>,
     runtime: Option<&SessionRuntimeRow>,
+    generation: Option<&SessionGenerationProjection>,
     runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
 ) -> MonitorNode {
+    let exact_generation = one_generation(generation);
     MonitorNode {
         id: session_node_id(session_id),
         parent_id: None,
         kind: MonitorNodeKind::Session,
-        label: session_label(root, runtime),
-        status: session_status(runtime, runtime_liveness),
-        pid: runtime.and_then(|row| row.running_os_pid),
+        label: session_label(root, runtime, exact_generation),
+        status: session_status(runtime, generation, runtime_liveness),
+        pid: exact_generation
+            .and_then(|row| row.spawned_os_pid)
+            .or_else(|| runtime.and_then(|row| row.running_os_pid)),
         pgid: None,
-        liveness: runtime_liveness
-            .map(runtime_liveness_status)
-            .unwrap_or(LivenessStatus::Unknown),
-        started_at: runtime.and_then(|row| row.turn_started_at.clone()),
-        updated_at: runtime.map(|row| row.updated_at.clone()),
-        completed_at: runtime.and_then(|row| row.turn_ended_at.clone()),
+        liveness: generation_liveness(generation).unwrap_or_else(|| {
+            runtime_liveness
+                .map(runtime_liveness_status)
+                .unwrap_or(LivenessStatus::Unknown)
+        }),
+        started_at: exact_generation
+            .and_then(|row| row.running_at.clone())
+            .or_else(|| runtime.and_then(|row| row.turn_started_at.clone())),
+        updated_at: exact_generation
+            .map(|row| generation_updated_at(row).to_string())
+            .or_else(|| runtime.map(|row| row.updated_at.clone())),
+        completed_at: exact_generation
+            .and_then(|row| row.exited_at.clone())
+            .or_else(|| runtime.and_then(|row| row.turn_ended_at.clone())),
         last_output_excerpt: None,
         inspect_ref: None,
         cancel_ref: root_invocation_uuid.map(|uuid| CancelRef::ProviderSessionEnd {
@@ -266,6 +300,31 @@ fn session_node(
         wake: None,
         mailbox: None,
     }
+}
+
+fn one_generation(
+    projection: Option<&SessionGenerationProjection>,
+) -> Option<&RuntimeGenerationRow> {
+    match projection {
+        Some(SessionGenerationProjection::One(row)) => Some(row),
+        _ => None,
+    }
+}
+
+fn generation_liveness(projection: Option<&SessionGenerationProjection>) -> Option<LivenessStatus> {
+    let generation = one_generation(projection)?;
+    Some(match &generation.exact_process_evidence {
+        ExactProcessEvidence::Recorded(identity) => process_identity_liveness(identity),
+        ExactProcessEvidence::NotRecorded => LivenessStatus::Unknown,
+    })
+}
+
+fn generation_updated_at(row: &RuntimeGenerationRow) -> &str {
+    row.exited_at
+        .as_deref()
+        .or(row.draining_at.as_deref())
+        .or(row.running_at.as_deref())
+        .unwrap_or(&row.created_at)
 }
 
 fn mailbox_nodes(
@@ -521,13 +580,19 @@ fn mailbox_session_parent_id(session_id: &str) -> String {
     session_node_id(session_id)
 }
 
-fn session_label(root: &ObservabilityRoot, runtime: Option<&SessionRuntimeRow>) -> String {
+fn session_label(
+    root: &ObservabilityRoot,
+    runtime: Option<&SessionRuntimeRow>,
+    generation: Option<&RuntimeGenerationRow>,
+) -> String {
     let provider = runtime
         .and_then(|row| row.provider_name.as_deref())
+        .or_else(|| generation.map(|row| row.provider_name.as_str()))
         .or(root.provider_name.as_deref())
         .unwrap_or("unknown-provider");
     let model = runtime
         .and_then(|row| row.model_name.as_deref())
+        .or_else(|| generation.and_then(|row| row.model_name.as_deref()))
         .or(root.model_name.as_deref())
         .unwrap_or("unknown-model");
     format!("session {provider}/{model}")
@@ -535,8 +600,14 @@ fn session_label(root: &ObservabilityRoot, runtime: Option<&SessionRuntimeRow>) 
 
 fn session_status(
     runtime: Option<&SessionRuntimeRow>,
+    generation: Option<&SessionGenerationProjection>,
     runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
 ) -> MonitorStatus {
+    match generation {
+        Some(SessionGenerationProjection::One(_)) => return MonitorStatus::Running,
+        Some(SessionGenerationProjection::Multiple(_)) => return MonitorStatus::Unknown,
+        Some(SessionGenerationProjection::None) | None => {}
+    }
     if runtime_liveness.is_some_and(runtime_is_stale) {
         return MonitorStatus::Stale;
     }

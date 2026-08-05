@@ -7,7 +7,9 @@
 use crate::observability::dto::{LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity};
 use chrono::{DateTime, Duration, Utc};
 use oulipoly_state::mailbox::{SessionRuntimeReadOnlyLiveness, WakeClaimRow};
-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
+use oulipoly_state::pid_identity::{
+    PidIdentityDb, PidIdentityRow, ProcessIdentity, ProcessIdentityObservation,
+};
 
 pub(crate) fn pid_row_liveness(row: &PidIdentityRow) -> LivenessStatus {
     process_identity_liveness(&row.identity())
@@ -17,19 +19,23 @@ pub(crate) fn process_identity_liveness(identity: &ProcessIdentity) -> LivenessS
     live_process_identity_liveness(identity, read_process_identity(identity.os_pid))
 }
 
-fn read_process_identity(pid: i64) -> Result<Option<ProcessIdentity>, String> {
-    oulipoly_state::pid_identity::read_live_process_identity(pid)
+fn read_process_identity(pid: i64) -> ProcessIdentityObservation {
+    oulipoly_state::pid_identity::observe_live_process_identity(pid)
 }
 
 fn live_process_identity_liveness(
     identity: &ProcessIdentity,
-    live: Result<Option<ProcessIdentity>, String>,
+    live: ProcessIdentityObservation,
 ) -> LivenessStatus {
     match live {
-        Ok(Some(live)) if live == *identity => LivenessStatus::VerifiedLive,
-        Ok(Some(_)) => LivenessStatus::PidReused,
-        Ok(None) => LivenessStatus::Dead,
-        Err(_) => LivenessStatus::Unknown,
+        ProcessIdentityObservation::ExactLive(live) if live == *identity => {
+            LivenessStatus::VerifiedLive
+        }
+        ProcessIdentityObservation::ExactLive(_) => LivenessStatus::PidReused,
+        ProcessIdentityObservation::Dead => LivenessStatus::Dead,
+        ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => {
+            LivenessStatus::Unknown
+        }
     }
 }
 
@@ -40,13 +46,13 @@ pub(crate) fn unverified_pid_liveness(pid: Option<i64>) -> LivenessStatus {
     unverified_process_identity_liveness(read_process_identity(pid))
 }
 
-fn unverified_process_identity_liveness(
-    live: Result<Option<ProcessIdentity>, String>,
-) -> LivenessStatus {
+fn unverified_process_identity_liveness(live: ProcessIdentityObservation) -> LivenessStatus {
     match live {
-        Ok(Some(_)) => LivenessStatus::UnverifiedLive,
-        Ok(None) => LivenessStatus::Dead,
-        Err(_) => LivenessStatus::Unknown,
+        ProcessIdentityObservation::ExactLive(_) => LivenessStatus::UnverifiedLive,
+        ProcessIdentityObservation::Dead => LivenessStatus::Dead,
+        ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => {
+            LivenessStatus::Unknown
+        }
     }
 }
 
@@ -78,9 +84,7 @@ pub(crate) fn wake_claim_liveness(
     wake_claim_liveness_from_evidence(claim, pid_db, read_wake_claim_live_identity(claim))
 }
 
-fn read_wake_claim_live_identity(
-    claim: &WakeClaimRow,
-) -> Option<Result<Option<ProcessIdentity>, String>> {
+fn read_wake_claim_live_identity(claim: &WakeClaimRow) -> Option<ProcessIdentityObservation> {
     let wake_pid = wake_claim_pid(claim)?;
     Some(read_wake_live_identity(wake_pid))
 }
@@ -88,15 +92,17 @@ fn read_wake_claim_live_identity(
 fn wake_claim_liveness_from_evidence(
     claim: &WakeClaimRow,
     pid_db: Option<&PidIdentityDb>,
-    live: Option<Result<Option<ProcessIdentity>, String>>,
+    live: Option<ProcessIdentityObservation>,
 ) -> LivenessStatus {
     let Some(live) = live else {
         return LivenessStatus::NotApplicable;
     };
     let live = match live {
-        Ok(Some(live)) => live,
-        Ok(None) => return LivenessStatus::Dead,
-        Err(_) => return LivenessStatus::Unknown,
+        ProcessIdentityObservation::ExactLive(live) => live,
+        ProcessIdentityObservation::Dead => return LivenessStatus::Dead,
+        ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => {
+            return LivenessStatus::Unknown;
+        }
     };
     wake_claim_live_status(wake_live_identity_matches_claim(claim, pid_db, &live))
 }
@@ -105,8 +111,8 @@ fn wake_claim_pid(claim: &WakeClaimRow) -> Option<i64> {
     claim.wake_pid
 }
 
-fn read_wake_live_identity(pid: i64) -> Result<Option<ProcessIdentity>, String> {
-    oulipoly_state::pid_identity::read_live_process_identity(pid)
+fn read_wake_live_identity(pid: i64) -> ProcessIdentityObservation {
+    oulipoly_state::pid_identity::observe_live_process_identity(pid)
 }
 
 fn wake_claim_live_status(identity_matches: bool) -> LivenessStatus {

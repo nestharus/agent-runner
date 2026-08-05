@@ -12,14 +12,426 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
 pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
+pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
+pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RuntimeGenerationId(Uuid);
+
+impl RuntimeGenerationId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, GenerationStorageError> {
+        Uuid::parse_str(value).map(Self).map_err(|err| {
+            GenerationStorageError::new(format!("Invalid runtime generation UUID: {err}"))
+        })
+    }
+}
+
+impl Default for RuntimeGenerationId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for RuntimeGenerationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DeliveryClaimId(Uuid);
+
+impl DeliveryClaimId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, GenerationStorageError> {
+        Uuid::parse_str(value).map(Self).map_err(|err| {
+            GenerationStorageError::new(format!("Invalid delivery claim UUID: {err}"))
+        })
+    }
+}
+
+impl Default for DeliveryClaimId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DeliveryClaimId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DrainRequestId(Uuid);
+
+impl DrainRequestId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn parse(value: &str) -> Result<Self, GenerationStorageError> {
+        Uuid::parse_str(value).map(Self).map_err(|err| {
+            GenerationStorageError::new(format!("Invalid drain request UUID: {err}"))
+        })
+    }
+}
+
+impl Default for DrainRequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DrainRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeLifecycleState {
+    Starting,
+    Running,
+    Draining,
+    Exited,
+}
+
+impl RuntimeLifecycleState {
+    fn parse(value: &str) -> Result<Self, GenerationStorageError> {
+        match value {
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "draining" => Ok(Self::Draining),
+            "exited" => Ok(Self::Exited),
+            other => Err(GenerationStorageError::new(format!(
+                "Invalid runtime generation lifecycle state: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeTerminalReason {
+    StartupFailed,
+    OrderlyCompletion,
+    AbnormalTermination,
+    Cancelled,
+    RecoveredDead,
+}
+
+impl RuntimeTerminalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StartupFailed => "startup_failed",
+            Self::OrderlyCompletion => "orderly_completion",
+            Self::AbnormalTermination => "abnormal_termination",
+            Self::Cancelled => "cancelled",
+            Self::RecoveredDead => "recovered_dead",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, GenerationStorageError> {
+        match value {
+            "startup_failed" => Ok(Self::StartupFailed),
+            "orderly_completion" => Ok(Self::OrderlyCompletion),
+            "abnormal_termination" => Ok(Self::AbnormalTermination),
+            "cancelled" => Ok(Self::Cancelled),
+            "recovered_dead" => Ok(Self::RecoveredDead),
+            other => Err(GenerationStorageError::new(format!(
+                "Invalid runtime generation terminal reason: {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum ExactProcessEvidence {
+    Recorded(ProcessIdentity),
+    NotRecorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuntimeGenerationRow {
+    pub generation_id: RuntimeGenerationId,
+    pub lifecycle_state: RuntimeLifecycleState,
+    pub spawn_invocation_uuid: String,
+    pub session_id: Option<String>,
+    pub runtime_mode: String,
+    pub provider_name: String,
+    pub model_name: Option<String>,
+    pub pty_control_path: Option<String>,
+    pub models_dir: Option<String>,
+    pub effective_cwd: Option<String>,
+    pub spawned_os_pid: Option<i64>,
+    pub exact_process_evidence: ExactProcessEvidence,
+    pub created_at: String,
+    pub running_at: Option<String>,
+    pub draining_at: Option<String>,
+    pub exited_at: Option<String>,
+    pub terminal_reason: Option<RuntimeTerminalReason>,
+    pub exit_code: Option<i32>,
+    pub drain_request_id: Option<DrainRequestId>,
+    pub drain_requested_at: Option<String>,
+    pub drain_requested_by_invocation_uuid: Option<String>,
+    pub active_delivery_claim_id: Option<DeliveryClaimId>,
+    pub active_delivery_claimed_at: Option<String>,
+    pub active_delivery_seqs: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeGenerationFence<'a> {
+    pub generation_id: &'a RuntimeGenerationId,
+    pub spawn_invocation_uuid: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CreateRuntimeGeneration<'a> {
+    pub generation_id: &'a RuntimeGenerationId,
+    pub spawn_invocation_uuid: &'a str,
+    pub session_id: Option<&'a str>,
+    pub runtime_mode: &'a str,
+    pub provider_name: &'a str,
+    pub model_name: Option<&'a str>,
+    pub pty_control_path: Option<&'a str>,
+    pub models_dir: Option<&'a str>,
+    pub effective_cwd: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BindRuntimeGenerationRunning<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub spawned_os_pid: i64,
+    pub exact_process_identity: Option<&'a ProcessIdentity>,
+    pub os_pgid: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AttachRuntimeGenerationSession<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub session_id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RuntimeGenerationSelector<'a> {
+    Exact(RuntimeGenerationFence<'a>),
+    ProcessIdentity(&'a ProcessIdentity),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeGenerationResolution {
+    NotFound,
+    Found(Box<RuntimeGenerationRow>),
+    Ambiguous(Vec<RuntimeGenerationRow>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionGenerationProjection {
+    None,
+    One(Box<RuntimeGenerationRow>),
+    Multiple(Vec<RuntimeGenerationRow>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExitRuntimeGenerationNonOrderly<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub reason: RuntimeTerminalReason,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationMutation<T> {
+    Applied(T),
+    AlreadyApplied(T),
+    Rejected(GenerationRejection),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerationRejection {
+    NotFound,
+    FenceMismatch,
+    SessionConflict,
+    ProcessIdentityConflict,
+    DrainRequestConflict,
+    IllegalPredecessor {
+        expected: RuntimeLifecycleState,
+        actual: RuntimeLifecycleState,
+    },
+    InvariantViolation,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AcquireRuntimeGenerationDelivery<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub claim_id: &'a DeliveryClaimId,
+    pub seqs: &'a [i64],
+    pub stale_after_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryClaimAcquireResult {
+    Acquired(RuntimeGenerationRow),
+    Recovered(RuntimeGenerationRow),
+    AlreadyInFlight(RuntimeGenerationRow),
+    Rejected(GenerationRejection),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConfirmRuntimeGenerationDelivery<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub claim_id: &'a DeliveryClaimId,
+    pub seqs: &'a [i64],
+    pub delivered_by_invocation_uuid: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FailRuntimeGenerationDelivery<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub claim_id: &'a DeliveryClaimId,
+    pub seqs: &'a [i64],
+    pub delivery_error: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationStorageError {
+    message: String,
+}
+
+impl GenerationStorageError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl fmt::Display for GenerationStorageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl std::error::Error for GenerationStorageError {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RequestRuntimeGenerationDrain<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub drain_request_id: &'a DrainRequestId,
+    pub requested_by_invocation_uuid: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainHandoff {
+    Ready,
+    ClaimOutstanding {
+        generation_id: RuntimeGenerationId,
+        claim_id: DeliveryClaimId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainRequestResult {
+    Installed(RuntimeGenerationRow, DrainHandoff),
+    AlreadyInstalled(RuntimeGenerationRow, DrainHandoff),
+    Rejected(GenerationRejection),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AdvanceRuntimeGenerationDrain<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub drain_request_id: &'a DrainRequestId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainAdvanceResult {
+    Advanced(RuntimeGenerationRow),
+    AlreadyDraining(RuntimeGenerationRow),
+    AlreadyExited(RuntimeGenerationRow),
+    WaitingOnClaim(DeliveryClaimId),
+    Rejected(GenerationRejection),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FinishRuntimeGenerationDrain<'a> {
+    pub fence: RuntimeGenerationFence<'a>,
+    pub drain_request_id: &'a DrainRequestId,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainFinishResult {
+    Finished(RuntimeGenerationRow),
+    AlreadyExited(RuntimeGenerationRow),
+    NotDraining(RuntimeLifecycleState),
+    Rejected(GenerationRejection),
+}
+
+const MAILBOX_PAYLOAD_DIRECTORY: &str = "inbox-payloads";
+const MAILBOX_PAYLOAD_ADDRESS_VERSION: &str = "v1";
+const MAILBOX_PAYLOAD_ALGORITHM: &str = "sha256";
+const INPUT_IDENTITY_DOMAIN: &str = "oulipoly.inbox.input";
+const INPUT_IDENTITY_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxTargetKind {
+    Session,
+    Chain,
+}
+
+impl InboxTargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Chain => "chain",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxTarget<'a> {
+    pub kind: InboxTargetKind,
+    pub id: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SubmittedInputEnqueue<'a> {
+    pub submission_token: &'a str,
+    pub target: InboxTarget<'a>,
+    pub input: &'a [u8],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PublishedMailboxPayload {
+    pub address: String,
+    pub file_path: PathBuf,
+    pub sha256: String,
+    pub byte_len: u64,
+    pub retention_policy: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MailboxRow {
@@ -43,6 +455,13 @@ pub struct MailboxRow {
     pub log_path: String,
     pub rc_path: String,
     pub rc: i32,
+    pub payload_file_path: Option<String>,
+    pub payload_sha256: Option<String>,
+    pub payload_byte_len: Option<i64>,
+    pub payload_retention_policy: Option<String>,
+    pub submission_token: Option<String>,
+    pub target_kind: Option<String>,
+    pub target_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,22 +692,985 @@ impl MailboxDb {
         &self.conn
     }
 
+    pub fn create_runtime_generation(
+        &mut self,
+        request: CreateRuntimeGeneration<'_>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        validate_runtime_generation_create(&request)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start generation creation transaction",
+            ))?;
+        let changed = tx
+            .execute(
+                "INSERT OR IGNORE INTO runtime_generation (
+                    generation_uuid, lifecycle_state, spawn_invocation_uuid, session_id,
+                    runtime_mode, provider_name, model_name, pty_control_path, models_dir,
+                    effective_cwd, created_at
+                 ) VALUES (?1, 'starting', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    request.generation_id.to_string(),
+                    request.spawn_invocation_uuid,
+                    request.session_id,
+                    request.runtime_mode,
+                    request.provider_name,
+                    request.model_name,
+                    request.pty_control_path,
+                    request.models_dir,
+                    request.effective_cwd,
+                    &now,
+                ],
+            )
+            .map_err(generation_storage_error(
+                "insert starting runtime generation",
+            ))?;
+        let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
+            GenerationStorageError::new("Runtime generation missing after create".to_string())
+        })?;
+        let result = if changed == 1 {
+            GenerationMutation::Applied(row)
+        } else if runtime_generation_create_matches(&row, &request) {
+            GenerationMutation::AlreadyApplied(row)
+        } else {
+            GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
+        };
+        tx.commit().map_err(generation_storage_error(
+            "commit generation creation transaction",
+        ))?;
+        Ok(result)
+    }
+
+    pub fn bind_runtime_generation_running(
+        &mut self,
+        request: BindRuntimeGenerationRunning<'_>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        validate_runtime_generation_binding(&request)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start generation binding transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing generation binding transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected generation binding transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if before.lifecycle_state == RuntimeLifecycleState::Running {
+            let result = if runtime_generation_binding_matches(&before, &request) {
+                GenerationMutation::AlreadyApplied(before)
+            } else {
+                GenerationMutation::Rejected(GenerationRejection::ProcessIdentityConflict)
+            };
+            tx.commit().map_err(generation_storage_error(
+                "commit replayed generation binding transaction",
+            ))?;
+            return Ok(result);
+        }
+        if before.lifecycle_state != RuntimeLifecycleState::Starting {
+            let actual = before.lifecycle_state;
+            tx.commit().map_err(generation_storage_error(
+                "commit illegal generation binding transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Starting,
+                    actual,
+                },
+            ));
+        }
+        if let Some(identity) = request.exact_process_identity {
+            let record = pid_identity::PidIdentityRecord {
+                identity,
+                os_pgid: request.os_pgid,
+                invocation_uuid: request.fence.spawn_invocation_uuid,
+                session_id: before.session_id.as_deref(),
+                provider_name: Some(&before.provider_name),
+                model_name: before.model_name.as_deref(),
+                recorded_at: &now,
+            };
+            if !pid_identity::bind_identity_on(&tx, record).map_err(GenerationStorageError::new)? {
+                tx.commit().map_err(generation_storage_error(
+                    "commit conflicting process identity binding transaction",
+                ))?;
+                return Ok(GenerationMutation::Rejected(
+                    GenerationRejection::ProcessIdentityConflict,
+                ));
+            }
+        }
+        let identity = request.exact_process_identity;
+        let changed = tx
+            .execute(
+                "UPDATE runtime_generation
+                 SET lifecycle_state = 'running',
+                     spawned_os_pid = ?3,
+                     identity_os_pid = ?4,
+                     identity_os_boot_id = ?5,
+                     identity_os_pid_starttime_ticks = ?6,
+                     running_at = ?7
+                 WHERE generation_uuid = ?1
+                   AND spawn_invocation_uuid = ?2
+                   AND lifecycle_state = 'starting'",
+                params![
+                    request.fence.generation_id.to_string(),
+                    request.fence.spawn_invocation_uuid,
+                    request.spawned_os_pid,
+                    identity.map(|identity| identity.os_pid),
+                    identity.map(|identity| identity.os_boot_id.as_str()),
+                    identity.map(|identity| identity.os_pid_starttime_ticks),
+                    &now,
+                ],
+            )
+            .map_err(generation_storage_error("bind runtime generation running"))?;
+        if changed != 1 {
+            return Err(GenerationStorageError::new(
+                "Runtime generation predecessor changed during immediate binding transaction"
+                    .to_string(),
+            ));
+        }
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new("Runtime generation missing after binding".to_string())
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit generation binding transaction",
+        ))?;
+        Ok(GenerationMutation::Applied(row))
+    }
+
+    pub fn attach_runtime_generation_session(
+        &mut self,
+        request: AttachRuntimeGenerationSession<'_>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        if request.session_id.is_empty() {
+            return Err(GenerationStorageError::new(
+                "Runtime generation session_id must not be empty".to_string(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start generation session attachment transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing session attachment transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected session attachment transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if let Some(existing) = before.session_id.as_deref() {
+            let result = if existing == request.session_id {
+                GenerationMutation::AlreadyApplied(before)
+            } else {
+                GenerationMutation::Rejected(GenerationRejection::SessionConflict)
+            };
+            tx.commit().map_err(generation_storage_error(
+                "commit replayed session attachment transaction",
+            ))?;
+            return Ok(result);
+        }
+        tx.execute(
+            "UPDATE runtime_generation
+             SET session_id = ?3
+             WHERE generation_uuid = ?1
+               AND spawn_invocation_uuid = ?2
+               AND session_id IS NULL",
+            params![
+                request.fence.generation_id.to_string(),
+                request.fence.spawn_invocation_uuid,
+                request.session_id,
+            ],
+        )
+        .map_err(generation_storage_error(
+            "attach runtime generation session",
+        ))?;
+        if let ExactProcessEvidence::Recorded(identity) = &before.exact_process_evidence
+            && !pid_identity::attach_identity_session_on(&tx, identity, request.session_id)
+                .map_err(GenerationStorageError::new)?
+        {
+            tx.rollback().map_err(generation_storage_error(
+                "roll back inconsistent generation session attachment",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::InvariantViolation,
+            ));
+        }
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after session attachment".to_string(),
+                )
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit generation session attachment transaction",
+        ))?;
+        Ok(GenerationMutation::Applied(row))
+    }
+
+    pub fn resolve_runtime_generation(
+        &self,
+        selector: RuntimeGenerationSelector<'_>,
+    ) -> Result<RuntimeGenerationResolution, GenerationStorageError> {
+        let rows = match selector {
+            RuntimeGenerationSelector::Exact(fence) => {
+                runtime_generation_by_id_on(&self.conn, fence.generation_id)?
+                    .filter(|row| row.spawn_invocation_uuid == fence.spawn_invocation_uuid)
+                    .into_iter()
+                    .collect()
+            }
+            RuntimeGenerationSelector::ProcessIdentity(identity) => {
+                runtime_generations_by_process_identity_on(&self.conn, identity)?
+            }
+        };
+        Ok(match rows.len() {
+            0 => RuntimeGenerationResolution::NotFound,
+            1 => RuntimeGenerationResolution::Found(Box::new(
+                rows.into_iter().next().expect("length checked"),
+            )),
+            _ => RuntimeGenerationResolution::Ambiguous(rows),
+        })
+    }
+
+    pub fn runtime_generation(
+        &self,
+        generation_id: &RuntimeGenerationId,
+    ) -> Result<Option<RuntimeGenerationRow>, GenerationStorageError> {
+        runtime_generation_by_id_on(&self.conn, generation_id)
+    }
+
+    pub fn session_generation_projection(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionGenerationProjection, GenerationStorageError> {
+        let rows = runtime_generations_for_session_on(&self.conn, session_id, true)?;
+        Ok(match rows.len() {
+            0 => SessionGenerationProjection::None,
+            1 => SessionGenerationProjection::One(Box::new(
+                rows.into_iter().next().expect("length checked"),
+            )),
+            _ => SessionGenerationProjection::Multiple(rows),
+        })
+    }
+
+    pub fn runtime_generation_history(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
+        runtime_generations_for_session_on(&self.conn, session_id, false)
+    }
+
+    pub fn acquire_runtime_generation_delivery(
+        &mut self,
+        request: AcquireRuntimeGenerationDelivery<'_>,
+    ) -> Result<DeliveryClaimAcquireResult, GenerationStorageError> {
+        validate_delivery_claim_seqs(request.seqs)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start runtime generation delivery claim transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::NotFound,
+            ));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if before.active_delivery_claim_id.is_some() {
+            if before.active_delivery_seqs.is_empty() || before.active_delivery_claimed_at.is_none()
+            {
+                tx.commit().map_err(generation_storage_error(
+                    "commit invalid existing delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(
+                    GenerationRejection::InvariantViolation,
+                ));
+            }
+            if !runtime_delivery_claim_is_stale(&before, request.stale_after_seconds) {
+                tx.commit().map_err(generation_storage_error(
+                    "commit in-flight delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::AlreadyInFlight(before));
+            }
+            tx.execute(
+                "UPDATE runtime_generation
+                 SET active_delivery_claimed_at = ?3
+                 WHERE generation_uuid = ?1
+                   AND spawn_invocation_uuid = ?2
+                   AND lifecycle_state = 'running'
+                   AND active_delivery_claim_uuid IS NOT NULL",
+                params![
+                    request.fence.generation_id.to_string(),
+                    request.fence.spawn_invocation_uuid,
+                    &now,
+                ],
+            )
+            .map_err(generation_storage_error(
+                "renew stale runtime generation delivery claim",
+            ))?;
+            let row = runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(
+                || {
+                    GenerationStorageError::new(
+                        "Runtime generation missing after delivery claim recovery".to_string(),
+                    )
+                },
+            )?;
+            tx.commit().map_err(generation_storage_error(
+                "commit recovered delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Recovered(row));
+        }
+        if before.lifecycle_state != RuntimeLifecycleState::Running {
+            let actual = before.lifecycle_state;
+            tx.commit().map_err(generation_storage_error(
+                "commit illegal delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Running,
+                    actual,
+                },
+            ));
+        }
+        if before.drain_request_id.is_some() {
+            tx.commit().map_err(generation_storage_error(
+                "commit drain-blocked delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::DrainRequestConflict,
+            ));
+        }
+        if !mailbox_seqs_are_pending_on(&tx, request.seqs)?
+            || active_delivery_claim_overlaps_on(&tx, request.fence.generation_id, request.seqs)?
+        {
+            tx.commit().map_err(generation_storage_error(
+                "commit invalid delivery claim batch transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::InvariantViolation,
+            ));
+        }
+        let seqs_json = serialize_delivery_seqs(request.seqs)?;
+        let changed = tx
+            .execute(
+                "UPDATE runtime_generation
+                 SET active_delivery_claim_uuid = ?3,
+                     active_delivery_claimed_at = ?4,
+                     active_delivery_seqs_json = ?5
+                 WHERE generation_uuid = ?1
+                   AND spawn_invocation_uuid = ?2
+                   AND lifecycle_state = 'running'
+                   AND drain_request_uuid IS NULL
+                   AND active_delivery_claim_uuid IS NULL",
+                params![
+                    request.fence.generation_id.to_string(),
+                    request.fence.spawn_invocation_uuid,
+                    request.claim_id.to_string(),
+                    &now,
+                    &seqs_json,
+                ],
+            )
+            .map_err(generation_storage_error(
+                "acquire runtime generation delivery claim",
+            ))?;
+        if changed != 1 {
+            tx.commit().map_err(generation_storage_error(
+                "commit lost delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::InvariantViolation,
+            ));
+        }
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after delivery claim acquisition".to_string(),
+                )
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit acquired delivery claim transaction",
+        ))?;
+        Ok(DeliveryClaimAcquireResult::Acquired(row))
+    }
+
+    pub fn confirm_runtime_generation_delivery(
+        &mut self,
+        request: ConfirmRuntimeGenerationDelivery<'_>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        validate_delivery_claim_seqs(request.seqs)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start runtime generation delivery confirmation transaction",
+            ))?;
+        let before = match validated_active_delivery_claim_on(
+            &tx,
+            request.fence,
+            request.claim_id,
+            request.seqs,
+        )? {
+            Ok(row) => row,
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit rejected delivery confirmation transaction",
+                ))?;
+                return Ok(GenerationMutation::Rejected(rejection));
+            }
+        };
+        if before.lifecycle_state != RuntimeLifecycleState::Running {
+            let actual = before.lifecycle_state;
+            tx.commit().map_err(generation_storage_error(
+                "commit non-running delivery confirmation transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Running,
+                    actual,
+                },
+            ));
+        }
+        for seq in request.seqs {
+            let changed = tx
+                .execute(
+                    "UPDATE mailbox
+                     SET delivered_at = ?2,
+                         delivered_by_invocation_uuid = ?3,
+                         delivery_attempts = delivery_attempts + 1,
+                         delivery_error = NULL
+                     WHERE seq = ?1
+                       AND delivered_at IS NULL",
+                    params![seq, &now, request.delivered_by_invocation_uuid],
+                )
+                .map_err(generation_storage_error(
+                    "confirm claimed mailbox row delivery",
+                ))?;
+            if changed != 1 {
+                return Err(GenerationStorageError::new(format!(
+                    "Claimed mailbox row {seq} was not pending at confirmation"
+                )));
+            }
+        }
+        clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after delivery confirmation".to_string(),
+                )
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit delivery confirmation transaction",
+        ))?;
+        Ok(GenerationMutation::Applied(row))
+    }
+
+    pub fn fail_runtime_generation_delivery(
+        &mut self,
+        request: FailRuntimeGenerationDelivery<'_>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        validate_delivery_claim_seqs(request.seqs)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start runtime generation delivery failure transaction",
+            ))?;
+        if let Err(rejection) =
+            validated_active_delivery_claim_on(&tx, request.fence, request.claim_id, request.seqs)?
+        {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected delivery failure transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(rejection));
+        }
+        for seq in request.seqs {
+            tx.execute(
+                "UPDATE mailbox
+                 SET delivery_attempts = delivery_attempts + 1,
+                     delivery_error = ?2
+                 WHERE seq = ?1
+                   AND delivered_at IS NULL",
+                params![seq, request.delivery_error],
+            )
+            .map_err(generation_storage_error(
+                "record claimed mailbox row delivery failure",
+            ))?;
+        }
+        clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after delivery failure".to_string(),
+                )
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit delivery failure transaction",
+        ))?;
+        Ok(GenerationMutation::Applied(row))
+    }
+
+    pub fn exit_runtime_generation_non_orderly(
+        &mut self,
+        request: ExitRuntimeGenerationNonOrderly<'_>,
+    ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        if request.reason == RuntimeTerminalReason::OrderlyCompletion {
+            return Err(GenerationStorageError::new(
+                "Orderly completion must pass through draining".to_string(),
+            ));
+        }
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start non-orderly generation exit transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing generation exit transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected generation exit transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if before.lifecycle_state == RuntimeLifecycleState::Exited {
+            let result = if before.terminal_reason == Some(request.reason)
+                && before.exit_code == request.exit_code
+            {
+                GenerationMutation::AlreadyApplied(before)
+            } else {
+                GenerationMutation::Rejected(GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Running,
+                    actual: RuntimeLifecycleState::Exited,
+                })
+            };
+            tx.commit().map_err(generation_storage_error(
+                "commit replayed generation exit transaction",
+            ))?;
+            return Ok(result);
+        }
+        if !matches!(
+            before.lifecycle_state,
+            RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
+        ) {
+            let actual = before.lifecycle_state;
+            tx.commit().map_err(generation_storage_error(
+                "commit illegal generation exit transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Running,
+                    actual,
+                },
+            ));
+        }
+        tx.execute(
+            "UPDATE runtime_generation
+             SET lifecycle_state = 'exited', exited_at = ?3, terminal_reason = ?4, exit_code = ?5,
+                 active_delivery_claim_uuid = NULL,
+                 active_delivery_claimed_at = NULL,
+                 active_delivery_seqs_json = NULL
+             WHERE generation_uuid = ?1
+               AND spawn_invocation_uuid = ?2
+               AND lifecycle_state IN ('starting', 'running')",
+            params![
+                request.fence.generation_id.to_string(),
+                request.fence.spawn_invocation_uuid,
+                &now,
+                request.reason.as_str(),
+                request.exit_code
+            ],
+        )
+        .map_err(generation_storage_error(
+            "exit runtime generation non-orderly",
+        ))?;
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new("Runtime generation missing after exit".to_string())
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit non-orderly generation exit transaction",
+        ))?;
+        Ok(GenerationMutation::Applied(row))
+    }
+
+    pub fn request_runtime_generation_drain(
+        &mut self,
+        request: RequestRuntimeGenerationDrain<'_>,
+    ) -> Result<DrainRequestResult, GenerationStorageError> {
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start generation drain request transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing drain request transaction",
+            ))?;
+            return Ok(DrainRequestResult::Rejected(GenerationRejection::NotFound));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected drain request transaction",
+            ))?;
+            return Ok(DrainRequestResult::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if let Some(existing) = before.drain_request_id.as_ref() {
+            let handoff = drain_handoff(&before);
+            let result = if existing == request.drain_request_id {
+                DrainRequestResult::AlreadyInstalled(before, handoff)
+            } else {
+                DrainRequestResult::Rejected(GenerationRejection::DrainRequestConflict)
+            };
+            tx.commit().map_err(generation_storage_error(
+                "commit replayed drain request transaction",
+            ))?;
+            return Ok(result);
+        }
+        if before.lifecycle_state != RuntimeLifecycleState::Running {
+            let actual = before.lifecycle_state;
+            tx.commit().map_err(generation_storage_error(
+                "commit illegal drain request transaction",
+            ))?;
+            return Ok(DrainRequestResult::Rejected(
+                GenerationRejection::IllegalPredecessor {
+                    expected: RuntimeLifecycleState::Running,
+                    actual,
+                },
+            ));
+        }
+        tx.execute(
+            "UPDATE runtime_generation
+             SET drain_request_uuid = ?3, drain_requested_at = ?4,
+                 drain_requested_by_invocation_uuid = ?5
+             WHERE generation_uuid = ?1
+               AND spawn_invocation_uuid = ?2
+               AND lifecycle_state = 'running'
+               AND drain_request_uuid IS NULL",
+            params![
+                request.fence.generation_id.to_string(),
+                request.fence.spawn_invocation_uuid,
+                request.drain_request_id.to_string(),
+                &now,
+                request.requested_by_invocation_uuid
+            ],
+        )
+        .map_err(generation_storage_error(
+            "install runtime generation drain request",
+        ))?;
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after drain request".to_string(),
+                )
+            })?;
+        let handoff = drain_handoff(&row);
+        tx.commit().map_err(generation_storage_error(
+            "commit generation drain request transaction",
+        ))?;
+        Ok(DrainRequestResult::Installed(row, handoff))
+    }
+
+    pub fn advance_runtime_generation_drain(
+        &mut self,
+        request: AdvanceRuntimeGenerationDrain<'_>,
+    ) -> Result<DrainAdvanceResult, GenerationStorageError> {
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start generation drain advance transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing drain advance transaction",
+            ))?;
+            return Ok(DrainAdvanceResult::Rejected(GenerationRejection::NotFound));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected drain advance transaction",
+            ))?;
+            return Ok(DrainAdvanceResult::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if before.drain_request_id.as_ref() != Some(request.drain_request_id) {
+            tx.commit().map_err(generation_storage_error(
+                "commit mismatched drain advance transaction",
+            ))?;
+            return Ok(DrainAdvanceResult::Rejected(
+                GenerationRejection::DrainRequestConflict,
+            ));
+        }
+        if let Some(claim_id) = before.active_delivery_claim_id.clone() {
+            tx.commit().map_err(generation_storage_error(
+                "commit waiting drain advance transaction",
+            ))?;
+            return Ok(DrainAdvanceResult::WaitingOnClaim(claim_id));
+        }
+        match before.lifecycle_state {
+            RuntimeLifecycleState::Draining => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit replayed drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::AlreadyDraining(before));
+            }
+            RuntimeLifecycleState::Exited => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit exited drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::AlreadyExited(before));
+            }
+            RuntimeLifecycleState::Running => {}
+            actual => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit illegal drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::Rejected(
+                    GenerationRejection::IllegalPredecessor {
+                        expected: RuntimeLifecycleState::Running,
+                        actual,
+                    },
+                ));
+            }
+        }
+        tx.execute(
+            "UPDATE runtime_generation
+             SET lifecycle_state = 'draining', draining_at = ?4
+             WHERE generation_uuid = ?1
+               AND spawn_invocation_uuid = ?2
+               AND lifecycle_state = 'running'
+               AND drain_request_uuid = ?3
+               AND active_delivery_claim_uuid IS NULL",
+            params![
+                request.fence.generation_id.to_string(),
+                request.fence.spawn_invocation_uuid,
+                request.drain_request_id.to_string(),
+                &now
+            ],
+        )
+        .map_err(generation_storage_error("advance runtime generation drain"))?;
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after drain advance".to_string(),
+                )
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit generation drain advance transaction",
+        ))?;
+        Ok(DrainAdvanceResult::Advanced(row))
+    }
+
+    pub fn finish_runtime_generation_drain(
+        &mut self,
+        request: FinishRuntimeGenerationDrain<'_>,
+    ) -> Result<DrainFinishResult, GenerationStorageError> {
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start generation drain finish transaction",
+            ))?;
+        let Some(before) = runtime_generation_by_id_on(&tx, request.fence.generation_id)? else {
+            tx.commit().map_err(generation_storage_error(
+                "commit missing drain finish transaction",
+            ))?;
+            return Ok(DrainFinishResult::Rejected(GenerationRejection::NotFound));
+        };
+        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected drain finish transaction",
+            ))?;
+            return Ok(DrainFinishResult::Rejected(
+                GenerationRejection::FenceMismatch,
+            ));
+        }
+        if before.drain_request_id.as_ref() != Some(request.drain_request_id) {
+            tx.commit().map_err(generation_storage_error(
+                "commit mismatched drain finish transaction",
+            ))?;
+            return Ok(DrainFinishResult::Rejected(
+                GenerationRejection::DrainRequestConflict,
+            ));
+        }
+        if before.lifecycle_state == RuntimeLifecycleState::Exited {
+            tx.commit().map_err(generation_storage_error(
+                "commit replayed drain finish transaction",
+            ))?;
+            return Ok(DrainFinishResult::AlreadyExited(before));
+        }
+        if before.lifecycle_state != RuntimeLifecycleState::Draining {
+            let actual = before.lifecycle_state;
+            tx.commit().map_err(generation_storage_error(
+                "commit premature drain finish transaction",
+            ))?;
+            return Ok(DrainFinishResult::NotDraining(actual));
+        }
+        if before.active_delivery_claim_id.is_some() {
+            tx.commit().map_err(generation_storage_error(
+                "commit withheld drain finish transaction",
+            ))?;
+            return Ok(DrainFinishResult::Rejected(
+                GenerationRejection::InvariantViolation,
+            ));
+        }
+        tx.execute(
+            "UPDATE runtime_generation
+             SET lifecycle_state = 'exited', exited_at = ?4,
+                 terminal_reason = 'orderly_completion', exit_code = ?5
+             WHERE generation_uuid = ?1
+               AND spawn_invocation_uuid = ?2
+               AND lifecycle_state = 'draining'
+               AND drain_request_uuid = ?3
+               AND active_delivery_claim_uuid IS NULL",
+            params![
+                request.fence.generation_id.to_string(),
+                request.fence.spawn_invocation_uuid,
+                request.drain_request_id.to_string(),
+                &now,
+                request.exit_code
+            ],
+        )
+        .map_err(generation_storage_error("finish runtime generation drain"))?;
+        let row =
+            runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
+                GenerationStorageError::new(
+                    "Runtime generation missing after drain finish".to_string(),
+                )
+            })?;
+        tx.commit().map_err(generation_storage_error(
+            "commit generation drain finish transaction",
+        ))?;
+        Ok(DrainFinishResult::Finished(row))
+    }
+
     pub fn enqueue_agent_bash_complete(
         &mut self,
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
+        let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction()
             .map_err(|err| format!("Failed to start mailbox enqueue transaction: {err}"))?;
-        let result = enqueue_agent_bash_complete_in_tx(&tx, input, &now)?;
+        let result = enqueue_agent_bash_complete_in_tx(&tx, input, &published, &now)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox enqueue transaction: {err}"))?;
         Ok(result)
     }
 
+    pub fn enqueue_submitted_input(
+        &mut self,
+        input: &SubmittedInputEnqueue<'_>,
+    ) -> Result<EnqueueResult, String> {
+        validate_submitted_input(input)?;
+        let published = self.publish_immutable_payload(input.input)?;
+        let handle = submitted_input_handle(input.submission_token, input.target)?;
+        let payload_json = submitted_input_payload_json(input, &published)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| format!("Failed to start input enqueue transaction: {err}"))?;
+        let result =
+            enqueue_submitted_input_in_tx(&tx, input, &handle, &payload_json, &published, &now)?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit input enqueue transaction: {err}"))?;
+        Ok(result)
+    }
+
+    /// Publishes bytes before their acceptance metadata is committed. A caller
+    /// must treat a later metadata failure as non-accepting; the immutable,
+    /// unreferenced file is retained for safe retry or governed cleanup.
+    pub fn publish_immutable_payload(
+        &self,
+        bytes: &[u8],
+    ) -> Result<PublishedMailboxPayload, String> {
+        let payload = self.payload_reference(bytes)?;
+        publish_payload_file(&payload.file_path, bytes)?;
+        verify_published_payload(&payload)?;
+        Ok(payload)
+    }
+
+    pub fn verify_published_payload(
+        &self,
+        payload: &PublishedMailboxPayload,
+    ) -> Result<(), String> {
+        let expected_path = self.payload_path_for_sha256(&payload.sha256)?;
+        if payload.file_path != expected_path {
+            return Err(format!(
+                "Mailbox payload address does not resolve inside the runner-owned store: {}",
+                payload.file_path.display()
+            ));
+        }
+        verify_published_payload(payload)
+    }
+
+    pub fn verify_mailbox_row_payload(&self, row: &MailboxRow) -> Result<(), String> {
+        let Some(payload) = published_payload_from_row(row)? else {
+            return Ok(());
+        };
+        self.verify_published_payload(&payload)
+    }
+
     pub fn list_pending(&self, session_id: &str) -> Result<Vec<MailboxRow>, String> {
+        self.list_pending_for_delivery(session_id, None)
+    }
+
+    pub fn list_pending_for_delivery(
+        &self,
+        session_id: &str,
+        chain_id: Option<&str>,
+    ) -> Result<Vec<MailboxRow>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -296,14 +1678,21 @@ impl MailboxDb {
                         delivered_at, delivered_by_invocation_uuid, delivery_attempts,
                         delivery_error, owner_invocation_uuid, matched_os_pid,
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
-                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc
+                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
+                        payload_file_path, payload_sha256, payload_byte_len,
+                        payload_retention_policy, submission_token, target_kind, target_id
                  FROM mailbox
-                 WHERE session_id = ?1 AND delivered_at IS NULL
+                 WHERE delivered_at IS NULL
+                   AND (
+                       (target_kind IS NULL AND session_id = ?1)
+                       OR (target_kind = 'session' AND target_id = ?1)
+                       OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
+                   )
                  ORDER BY seq ASC",
             )
             .map_err(|err| format!("Failed to prepare pending mailbox query: {err}"))?;
         let rows = stmt
-            .query_map(params![session_id], map_mailbox_row)
+            .query_map(params![session_id, chain_id], map_mailbox_row)
             .map_err(|err| format!("Failed to query pending mailbox rows: {err}"))?;
         collect_rows(rows)
     }
@@ -408,7 +1797,9 @@ impl MailboxDb {
                         delivered_at, delivered_by_invocation_uuid, delivery_attempts,
                         delivery_error, owner_invocation_uuid, matched_os_pid,
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
-                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc
+                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
+                        payload_file_path, payload_sha256, payload_byte_len,
+                        payload_retention_policy, submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE session_id = ?1
                  ORDER BY CASE WHEN delivered_at IS NULL THEN 0 ELSE 1 END, seq DESC
@@ -443,10 +1834,14 @@ impl MailboxDb {
                      delivered_by_invocation_uuid = ?4,
                      delivery_attempts = delivery_attempts + 1,
                      delivery_error = NULL
-                 WHERE session_id = ?1
-                   AND seq = ?2
+                 WHERE seq = ?2
                    AND delivered_at IS NULL",
-                params![session_id, seq, &now, delivered_by_invocation_uuid],
+                params![
+                    rusqlite::types::Null,
+                    seq,
+                    &now,
+                    delivered_by_invocation_uuid
+                ],
             )
             .map_err(|err| format!("Failed to mark mailbox row delivered: {err}"))?;
         }
@@ -680,9 +2075,12 @@ impl MailboxDb {
                         mailbox.delivered_by_invocation_uuid, mailbox.delivery_attempts,
                         mailbox.delivery_error, mailbox.owner_invocation_uuid,
                         mailbox.matched_os_pid, mailbox.matched_os_boot_id,
-                        mailbox.matched_os_pid_starttime_ticks, mailbox.matched_chain_index,
-                        mailbox.state_dir, mailbox.meta_path, mailbox.log_path,
-                        mailbox.rc_path, mailbox.rc
+                         mailbox.matched_os_pid_starttime_ticks, mailbox.matched_chain_index,
+                         mailbox.state_dir, mailbox.meta_path, mailbox.log_path,
+                         mailbox.rc_path, mailbox.rc, mailbox.payload_file_path,
+                         mailbox.payload_sha256, mailbox.payload_byte_len,
+                         mailbox.payload_retention_policy, mailbox.submission_token,
+                         mailbox.target_kind, mailbox.target_id
                  FROM mailbox_delivery_attempt_items AS items
                  JOIN mailbox ON mailbox.seq = items.mailbox_seq
                  WHERE items.attempt_id = ?1 AND mailbox.delivered_at IS NULL
@@ -887,7 +2285,7 @@ impl MailboxDb {
 
     pub fn mark_delivery_failed(
         &mut self,
-        session_id: &str,
+        _session_id: &str,
         seqs: &[i64],
         delivery_error: &str,
     ) -> Result<(), String> {
@@ -902,10 +2300,9 @@ impl MailboxDb {
                 "UPDATE mailbox
                  SET delivery_attempts = delivery_attempts + 1,
                      delivery_error = ?3
-                 WHERE session_id = ?1
-                   AND seq = ?2
+                 WHERE seq = ?2
                    AND delivered_at IS NULL",
-                params![session_id, seq, delivery_error],
+                params![rusqlite::types::Null, seq, delivery_error],
             )
             .map_err(|err| format!("Failed to mark mailbox row delivery failed: {err}"))?;
         }
@@ -1311,7 +2708,9 @@ impl MailboxDb {
                         delivered_at, delivered_by_invocation_uuid, delivery_attempts,
                         delivery_error, owner_invocation_uuid, matched_os_pid,
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
-                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc
+                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
+                        payload_file_path, payload_sha256, payload_byte_len,
+                        payload_retention_policy, submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE session_id = ?1
                  ORDER BY seq ASC",
@@ -1382,13 +2781,42 @@ impl MailboxDb {
         &mut self,
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<(), String> {
+        let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction()
             .map_err(|err| format!("Failed to start mailbox rollback test transaction: {err}"))?;
-        let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &now)?;
+        let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &published, &now)?;
         Err("forced rollback before commit".to_string())
+    }
+
+    fn payload_reference(&self, bytes: &[u8]) -> Result<PublishedMailboxPayload, String> {
+        let byte_len = u64::try_from(bytes.len())
+            .map_err(|_| "Mailbox payload length does not fit u64".to_string())?;
+        let sha256 = sha256_hex(bytes);
+        Ok(PublishedMailboxPayload {
+            address: payload_address(&sha256),
+            file_path: self.payload_path_for_sha256(&sha256)?,
+            sha256,
+            byte_len,
+            retention_policy: MAILBOX_PAYLOAD_RETENTION_POLICY.to_string(),
+        })
+    }
+
+    fn payload_path_for_sha256(&self, sha256: &str) -> Result<PathBuf, String> {
+        validate_sha256_hex(sha256)?;
+        let root = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Ok(root
+            .join(MAILBOX_PAYLOAD_DIRECTORY)
+            .join(MAILBOX_PAYLOAD_ADDRESS_VERSION)
+            .join(MAILBOX_PAYLOAD_ALGORITHM)
+            .join(&sha256[..2])
+            .join(sha256))
     }
 
     fn max_mailbox_seq(&self, session_id: &str) -> Result<Option<i64>, String> {
@@ -1518,6 +2946,218 @@ fn resolve_completed_delivery_attempts(
     )
     .map(|_| ())
     .map_err(|err| format!("Failed to resolve completed mailbox delivery attempts: {err}"))
+}
+
+fn payload_address(sha256: &str) -> String {
+    format!("{MAILBOX_PAYLOAD_ADDRESS_VERSION}:{MAILBOX_PAYLOAD_ALGORITHM}:{sha256}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_sha256_hex(value: &str) -> Result<(), String> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    Err("Mailbox payload SHA-256 must be 64 hexadecimal characters".to_string())
+}
+
+fn publish_payload_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Mailbox payload path has no parent directory".to_string())?;
+    ensure_durable_directory(directory)?;
+    if path.exists() {
+        return Ok(());
+    }
+
+    let temp_path = directory.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("payload"),
+        Uuid::new_v4()
+    ));
+    write_payload_temp_file(&temp_path, bytes)?;
+    match fs::hard_link(&temp_path, path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!(
+                "Failed to publish immutable mailbox payload: {err}"
+            ));
+        }
+    }
+    fs::remove_file(&temp_path)
+        .map_err(|err| format!("Failed to remove mailbox payload temporary file: {err}"))?;
+    sync_directory(directory)?;
+    Ok(())
+}
+
+fn write_payload_temp_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| format!("Failed to create mailbox payload temporary file: {err}"))?;
+    file.write_all(bytes)
+        .map_err(|err| format!("Failed to write mailbox payload temporary file: {err}"))?;
+    let mut permissions = file
+        .metadata()
+        .map_err(|err| format!("Failed to inspect mailbox payload temporary file: {err}"))?
+        .permissions();
+    permissions.set_readonly(true);
+    file.set_permissions(permissions)
+        .map_err(|err| format!("Failed to make mailbox payload immutable: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("Failed to sync mailbox payload file: {err}"))
+}
+
+fn verify_published_payload(payload: &PublishedMailboxPayload) -> Result<(), String> {
+    if payload.address != payload_address(&payload.sha256) {
+        return Err("Mailbox payload address does not match its SHA-256".to_string());
+    }
+    if payload.retention_policy != MAILBOX_PAYLOAD_RETENTION_POLICY {
+        return Err(format!(
+            "Unsupported mailbox payload retention policy: {}",
+            payload.retention_policy
+        ));
+    }
+    let metadata = fs::symlink_metadata(&payload.file_path).map_err(|err| {
+        format!(
+            "Failed to access immutable mailbox payload {}: {err}",
+            payload.file_path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() != payload.byte_len {
+        return Err(format!(
+            "Mailbox payload length mismatch for {}: expected {}, found {}",
+            payload.file_path.display(),
+            payload.byte_len,
+            metadata.len()
+        ));
+    }
+    if !metadata.permissions().readonly() {
+        return Err(format!(
+            "Mailbox payload is not immutable: {}",
+            payload.file_path.display()
+        ));
+    }
+    let actual_sha256 = sha256_file(&payload.file_path)?;
+    if actual_sha256 != payload.sha256 {
+        return Err(format!(
+            "Mailbox payload integrity mismatch for {}",
+            payload.file_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|err| format!("Failed to open mailbox payload for verification: {err}"))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("Failed to read mailbox payload for verification: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn published_payload_from_row(row: &MailboxRow) -> Result<Option<PublishedMailboxPayload>, String> {
+    match (
+        row.payload_file_path.as_deref(),
+        row.payload_sha256.as_deref(),
+        row.payload_byte_len,
+        row.payload_retention_policy.as_deref(),
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(file_path), Some(sha256), Some(byte_len), Some(retention_policy)) => {
+            let byte_len = u64::try_from(byte_len)
+                .map_err(|_| "Mailbox payload byte length must not be negative".to_string())?;
+            Ok(Some(PublishedMailboxPayload {
+                address: payload_address(sha256),
+                file_path: PathBuf::from(file_path),
+                sha256: sha256.to_string(),
+                byte_len,
+                retention_policy: retention_policy.to_string(),
+            }))
+        }
+        _ => Err(format!(
+            "Mailbox row {} has incomplete immutable payload metadata",
+            row.seq
+        )),
+    }
+}
+
+fn ensure_durable_directory(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    if path.exists() {
+        return Err(format!("Path is not a directory: {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        ensure_durable_directory(parent)?;
+    }
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::AlreadyExists && path.is_dir() => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "Failed to create directory {}: {err}",
+                path.display()
+            ));
+        }
+    }
+    sync_directory(path)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("Failed to sync directory {}: {err}", path.display()))
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|err| format!("Failed to sync directory {}: {err}", path.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> Result<(), String> {
+    Err(format!(
+        "Durable mailbox payload directory publication is unsupported on this platform: {}",
+        path.display()
+    ))
 }
 
 fn wake_claim_pid_identity_record<'a>(
@@ -1676,20 +3316,206 @@ fn format_bounded_mailbox_rows_error(err: BoundedMailboxRowsError) -> String {
     }
 }
 
+#[derive(Serialize)]
+struct CanonicalSubmittedInputIdentity<'a> {
+    domain: &'static str,
+    v: u8,
+    submission_id: &'a str,
+    target: CanonicalInboxTarget<'a>,
+}
+
+#[derive(Serialize)]
+struct CanonicalInboxTarget<'a> {
+    kind: &'static str,
+    id: &'a str,
+}
+
+#[derive(Serialize)]
+struct SubmittedInputPayloadMetadata<'a> {
+    schema_version: u8,
+    kind: &'static str,
+    submission_token: &'a str,
+    target: CanonicalInboxTarget<'a>,
+    payload: SubmittedInputPayloadReference<'a>,
+}
+
+#[derive(Serialize)]
+struct SubmittedInputPayloadReference<'a> {
+    address: &'a str,
+    file_path: &'a Path,
+    sha256: &'a str,
+    byte_len: u64,
+    retention_policy: &'a str,
+}
+
+pub fn submitted_input_handle(
+    submission_token: &str,
+    target: InboxTarget<'_>,
+) -> Result<String, String> {
+    validate_submission_token(submission_token)?;
+    validate_inbox_target(target)?;
+    let canonical = CanonicalSubmittedInputIdentity {
+        domain: INPUT_IDENTITY_DOMAIN,
+        v: INPUT_IDENTITY_VERSION,
+        submission_id: submission_token,
+        target: canonical_inbox_target(target),
+    };
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|err| format!("Failed to encode canonical input identity: {err}"))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn validate_submitted_input(input: &SubmittedInputEnqueue<'_>) -> Result<(), String> {
+    validate_submission_token(input.submission_token)?;
+    validate_inbox_target(input.target)
+}
+
+fn validate_submission_token(submission_token: &str) -> Result<(), String> {
+    if submission_token.is_empty() {
+        return Err("Submission token must not be empty".to_string());
+    }
+    Ok(())
+}
+
+fn validate_inbox_target(target: InboxTarget<'_>) -> Result<(), String> {
+    if target.id.is_empty() {
+        return Err("Inbox target id must not be empty".to_string());
+    }
+    Ok(())
+}
+
+fn canonical_inbox_target(target: InboxTarget<'_>) -> CanonicalInboxTarget<'_> {
+    CanonicalInboxTarget {
+        kind: target.kind.as_str(),
+        id: target.id,
+    }
+}
+
+fn submitted_input_payload_json(
+    input: &SubmittedInputEnqueue<'_>,
+    published: &PublishedMailboxPayload,
+) -> Result<String, String> {
+    serde_json::to_string(&SubmittedInputPayloadMetadata {
+        schema_version: 1,
+        kind: SUBMITTED_INPUT_KIND,
+        submission_token: input.submission_token,
+        target: canonical_inbox_target(input.target),
+        payload: SubmittedInputPayloadReference {
+            address: &published.address,
+            file_path: &published.file_path,
+            sha256: &published.sha256,
+            byte_len: published.byte_len,
+            retention_policy: &published.retention_policy,
+        },
+    })
+    .map_err(|err| format!("Failed to encode submitted input metadata: {err}"))
+}
+
+fn enqueue_submitted_input_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &SubmittedInputEnqueue<'_>,
+    handle: &str,
+    payload_json: &str,
+    published: &PublishedMailboxPayload,
+    now: &str,
+) -> Result<EnqueueResult, String> {
+    let changed = insert_submitted_input_tx(tx, input, handle, payload_json, published, now)?;
+    let row = query_mailbox_by_kind_handle_tx(tx, SUBMITTED_INPUT_KIND, handle)?
+        .ok_or_else(|| "Input row missing after enqueue conflict check".to_string())?;
+    Ok(submitted_input_enqueue_result(
+        changed, row, input, published,
+    ))
+}
+
+fn insert_submitted_input_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &SubmittedInputEnqueue<'_>,
+    handle: &str,
+    payload_json: &str,
+    published: &PublishedMailboxPayload,
+    now: &str,
+) -> Result<usize, String> {
+    let payload_path = published.file_path.to_string_lossy();
+    let payload_dir = published
+        .file_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_string_lossy();
+    // The predecessor table requires notification artifact columns. For input
+    // rows they are non-authoritative compatibility carriers: kind-aware readers
+    // use target_kind/target_id and payload_file_path, and must not interpret
+    // session_id, rc, or notification paths as input facts.
+    tx.execute(
+        "INSERT OR IGNORE INTO mailbox (
+            session_id, kind, handle, payload_json, enqueued_at,
+            state_dir, meta_path, log_path, rc_path, rc,
+            payload_file_path, payload_sha256, payload_byte_len,
+            payload_retention_policy, submission_token, target_kind, target_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            input.target.id,
+            SUBMITTED_INPUT_KIND,
+            handle,
+            payload_json,
+            now,
+            payload_dir.as_ref(),
+            payload_path.as_ref(),
+            published.sha256,
+            i64::try_from(published.byte_len)
+                .map_err(|_| "Input payload length does not fit SQLite INTEGER".to_string())?,
+            published.retention_policy,
+            input.submission_token,
+            input.target.kind.as_str(),
+            input.target.id,
+        ],
+    )
+    .map_err(|err| format!("Failed to insert submitted input row: {err}"))
+}
+
+fn submitted_input_enqueue_result(
+    changed: usize,
+    row: MailboxRow,
+    input: &SubmittedInputEnqueue<'_>,
+    published: &PublishedMailboxPayload,
+) -> EnqueueResult {
+    if changed > 0 {
+        return EnqueueResult::Inserted(row);
+    }
+    if submitted_input_row_matches(&row, input, published) {
+        EnqueueResult::AlreadyEnqueued(row)
+    } else {
+        EnqueueResult::Conflict { existing: row }
+    }
+}
+
+fn submitted_input_row_matches(
+    row: &MailboxRow,
+    input: &SubmittedInputEnqueue<'_>,
+    published: &PublishedMailboxPayload,
+) -> bool {
+    row.submission_token.as_deref() == Some(input.submission_token)
+        && row.target_kind.as_deref() == Some(input.target.kind.as_str())
+        && row.target_id.as_deref() == Some(input.target.id)
+        && row.payload_sha256.as_deref() == Some(published.sha256.as_str())
+        && row.payload_byte_len == i64::try_from(published.byte_len).ok()
+}
+
 fn enqueue_agent_bash_complete_in_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
+    published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<EnqueueResult, String> {
-    let changed = insert_agent_bash_complete_tx(tx, input, now)?;
+    let changed = insert_agent_bash_complete_tx(tx, input, published, now)?;
     let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, input.handle)?
         .ok_or_else(|| "Mailbox row missing after enqueue conflict check".to_string())?;
-    Ok(agent_bash_enqueue_result(changed, row, input))
+    Ok(agent_bash_enqueue_result(changed, row, input, published))
 }
 
 fn insert_agent_bash_complete_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
+    published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<usize, String> {
     tx.execute(
@@ -1708,8 +3534,12 @@ fn insert_agent_bash_complete_tx(
             meta_path,
             log_path,
             rc_path,
-            rc
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rc,
+            payload_file_path,
+            payload_sha256,
+            payload_byte_len,
+            payload_retention_policy
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             input.session_id,
             AGENT_BASH_COMPLETE_KIND,
@@ -1726,6 +3556,11 @@ fn insert_agent_bash_complete_tx(
             input.log_path,
             input.rc_path,
             input.rc,
+            published.file_path.to_string_lossy().as_ref(),
+            published.sha256,
+            i64::try_from(published.byte_len)
+                .map_err(|_| "Mailbox payload length does not fit SQLite INTEGER".to_string())?,
+            published.retention_policy,
         ],
     )
     .map_err(|err| format!("Failed to insert mailbox row: {err}"))
@@ -1735,15 +3570,451 @@ fn agent_bash_enqueue_result(
     changed: usize,
     row: MailboxRow,
     input: &AgentBashCompleteEnqueue<'_>,
+    published: &PublishedMailboxPayload,
 ) -> EnqueueResult {
     if changed > 0 {
         return EnqueueResult::Inserted(row);
     }
-    if row.session_id == input.session_id {
+    if row.session_id == input.session_id && row_payload_matches(&row, input, published) {
         EnqueueResult::AlreadyEnqueued(row)
     } else {
         EnqueueResult::Conflict { existing: row }
     }
+}
+
+fn row_payload_matches(
+    row: &MailboxRow,
+    input: &AgentBashCompleteEnqueue<'_>,
+    published: &PublishedMailboxPayload,
+) -> bool {
+    match (&row.payload_sha256, row.payload_byte_len) {
+        (Some(sha256), Some(byte_len)) => {
+            sha256 == &published.sha256 && byte_len == published.byte_len as i64
+        }
+        (None, None) => row.payload_json == input.payload_json,
+        _ => false,
+    }
+}
+
+fn validate_runtime_generation_create(
+    request: &CreateRuntimeGeneration<'_>,
+) -> Result<(), GenerationStorageError> {
+    if request.spawn_invocation_uuid.is_empty() {
+        return Err(GenerationStorageError::new(
+            "Runtime generation spawn invocation UUID must not be empty".to_string(),
+        ));
+    }
+    if request.provider_name.is_empty() {
+        return Err(GenerationStorageError::new(
+            "Runtime generation provider name must not be empty".to_string(),
+        ));
+    }
+    validate_runtime_mode(request.runtime_mode)
+}
+
+fn validate_runtime_mode(mode: &str) -> Result<(), GenerationStorageError> {
+    match mode {
+        "headless" | "pty_interactive" => Ok(()),
+        other => Err(GenerationStorageError::new(format!(
+            "Invalid runtime generation mode: {other}"
+        ))),
+    }
+}
+
+fn validate_runtime_generation_binding(
+    request: &BindRuntimeGenerationRunning<'_>,
+) -> Result<(), GenerationStorageError> {
+    if request.spawned_os_pid <= 0 {
+        return Err(GenerationStorageError::new(
+            "Runtime generation spawned OS PID must be positive".to_string(),
+        ));
+    }
+    if request
+        .exact_process_identity
+        .is_some_and(|identity| identity.os_pid != request.spawned_os_pid)
+    {
+        return Err(GenerationStorageError::new(
+            "Exact process identity PID does not match spawned OS PID".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn runtime_generation_create_matches(
+    row: &RuntimeGenerationRow,
+    request: &CreateRuntimeGeneration<'_>,
+) -> bool {
+    row.lifecycle_state == RuntimeLifecycleState::Starting
+        && row.spawn_invocation_uuid == request.spawn_invocation_uuid
+        && row.session_id.as_deref() == request.session_id
+        && row.runtime_mode == request.runtime_mode
+        && row.provider_name == request.provider_name
+        && row.model_name.as_deref() == request.model_name
+        && row.pty_control_path.as_deref() == request.pty_control_path
+        && row.models_dir.as_deref() == request.models_dir
+        && row.effective_cwd.as_deref() == request.effective_cwd
+}
+
+fn runtime_generation_binding_matches(
+    row: &RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+) -> bool {
+    row.spawned_os_pid == Some(request.spawned_os_pid)
+        && match (&row.exact_process_evidence, request.exact_process_identity) {
+            (ExactProcessEvidence::NotRecorded, None) => true,
+            (ExactProcessEvidence::Recorded(recorded), Some(requested)) => recorded == requested,
+            _ => false,
+        }
+}
+
+fn generation_storage_error(
+    action: &'static str,
+) -> impl FnOnce(rusqlite::Error) -> GenerationStorageError {
+    move |err| GenerationStorageError::new(format!("Failed to {action}: {err}"))
+}
+
+fn runtime_generation_by_id_on(
+    conn: &Connection,
+    generation_id: &RuntimeGenerationId,
+) -> Result<Option<RuntimeGenerationRow>, GenerationStorageError> {
+    conn.query_row(
+        &runtime_generation_select_sql("generation_uuid = ?1"),
+        params![generation_id.to_string()],
+        map_runtime_generation_row,
+    )
+    .optional()
+    .map_err(generation_storage_error("read runtime generation by UUID"))
+}
+
+fn runtime_generations_by_process_identity_on(
+    conn: &Connection,
+    identity: &ProcessIdentity,
+) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
+    let mut statement = conn
+        .prepare(&runtime_generation_select_sql(
+            "identity_os_pid = ?1 AND identity_os_boot_id = ?2 AND identity_os_pid_starttime_ticks = ?3",
+        ))
+        .map_err(generation_storage_error("prepare exact runtime generation lookup"))?;
+    let rows = statement
+        .query_map(
+            params![
+                identity.os_pid,
+                &identity.os_boot_id,
+                identity.os_pid_starttime_ticks,
+            ],
+            map_runtime_generation_row,
+        )
+        .map_err(generation_storage_error(
+            "query exact runtime generation lookup",
+        ))?;
+    collect_runtime_generation_rows(rows)
+}
+
+fn runtime_generations_for_session_on(
+    conn: &Connection,
+    session_id: &str,
+    nonterminal_only: bool,
+) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
+    let predicate = if nonterminal_only {
+        "session_id = ?1 AND lifecycle_state != 'exited'"
+    } else {
+        "session_id = ?1"
+    };
+    let sql = format!(
+        "{} ORDER BY created_at ASC, generation_uuid ASC",
+        runtime_generation_select_sql(predicate)
+    );
+    let mut statement = conn.prepare(&sql).map_err(generation_storage_error(
+        "prepare session runtime generation lookup",
+    ))?;
+    let rows = statement
+        .query_map(params![session_id], map_runtime_generation_row)
+        .map_err(generation_storage_error(
+            "query session runtime generations",
+        ))?;
+    collect_runtime_generation_rows(rows)
+}
+
+fn runtime_generation_select_sql(predicate: &str) -> String {
+    format!(
+        "SELECT generation_uuid, lifecycle_state, spawn_invocation_uuid, session_id,
+                runtime_mode, provider_name, model_name, pty_control_path, models_dir,
+                effective_cwd, spawned_os_pid, identity_os_pid, identity_os_boot_id,
+                identity_os_pid_starttime_ticks, created_at, running_at, draining_at,
+                exited_at, terminal_reason, exit_code, drain_request_uuid,
+                drain_requested_at, drain_requested_by_invocation_uuid,
+                active_delivery_claim_uuid, active_delivery_claimed_at,
+                active_delivery_seqs_json
+         FROM runtime_generation
+         WHERE {predicate}"
+    )
+}
+
+fn collect_runtime_generation_rows<F>(
+    rows: rusqlite::MappedRows<'_, F>,
+) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RuntimeGenerationRow>,
+{
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(generation_storage_error("read runtime generation row"))
+}
+
+fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeGenerationRow> {
+    let generation_uuid: String = row.get(0)?;
+    let lifecycle_state: String = row.get(1)?;
+    let identity_os_pid: Option<i64> = row.get(11)?;
+    let identity_os_boot_id: Option<String> = row.get(12)?;
+    let identity_os_pid_starttime_ticks: Option<i64> = row.get(13)?;
+    let terminal_reason: Option<String> = row.get(18)?;
+    let drain_request_uuid: Option<String> = row.get(20)?;
+    let active_delivery_claim_uuid: Option<String> = row.get(23)?;
+    let active_delivery_claimed_at: Option<String> = row.get(24)?;
+    let active_delivery_seqs_json: Option<String> = row.get(25)?;
+    Ok(RuntimeGenerationRow {
+        generation_id: RuntimeGenerationId::parse(&generation_uuid)
+            .map_err(to_sql_conversion_error)?,
+        lifecycle_state: RuntimeLifecycleState::parse(&lifecycle_state)
+            .map_err(to_sql_conversion_error)?,
+        spawn_invocation_uuid: row.get(2)?,
+        session_id: row.get(3)?,
+        runtime_mode: row.get(4)?,
+        provider_name: row.get(5)?,
+        model_name: row.get(6)?,
+        pty_control_path: row.get(7)?,
+        models_dir: row.get(8)?,
+        effective_cwd: row.get(9)?,
+        spawned_os_pid: row.get(10)?,
+        exact_process_evidence: exact_process_evidence_from_columns(
+            identity_os_pid,
+            identity_os_boot_id,
+            identity_os_pid_starttime_ticks,
+        )?,
+        created_at: row.get(14)?,
+        running_at: row.get(15)?,
+        draining_at: row.get(16)?,
+        exited_at: row.get(17)?,
+        terminal_reason: terminal_reason
+            .as_deref()
+            .map(RuntimeTerminalReason::parse)
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
+        exit_code: row.get(19)?,
+        drain_request_id: drain_request_uuid
+            .as_deref()
+            .map(DrainRequestId::parse)
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
+        drain_requested_at: row.get(21)?,
+        drain_requested_by_invocation_uuid: row.get(22)?,
+        active_delivery_claim_id: active_delivery_claim_uuid
+            .as_deref()
+            .map(DeliveryClaimId::parse)
+            .transpose()
+            .map_err(to_sql_conversion_error)?,
+        active_delivery_claimed_at,
+        active_delivery_seqs: active_delivery_seqs_json
+            .as_deref()
+            .map(parse_delivery_seqs)
+            .transpose()
+            .map_err(to_sql_conversion_error)?
+            .unwrap_or_default(),
+    })
+}
+
+fn exact_process_evidence_from_columns(
+    os_pid: Option<i64>,
+    os_boot_id: Option<String>,
+    os_pid_starttime_ticks: Option<i64>,
+) -> rusqlite::Result<ExactProcessEvidence> {
+    match (os_pid, os_boot_id, os_pid_starttime_ticks) {
+        (None, None, None) => Ok(ExactProcessEvidence::NotRecorded),
+        (Some(os_pid), Some(os_boot_id), Some(os_pid_starttime_ticks)) => {
+            Ok(ExactProcessEvidence::Recorded(ProcessIdentity {
+                os_pid,
+                os_boot_id,
+                os_pid_starttime_ticks,
+            }))
+        }
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            11,
+            rusqlite::types::Type::Null,
+            Box::new(GenerationStorageError::new(
+                "Runtime generation has partial exact process identity evidence".to_string(),
+            )),
+        )),
+    }
+}
+
+fn to_sql_conversion_error(error: GenerationStorageError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
+
+fn drain_handoff(row: &RuntimeGenerationRow) -> DrainHandoff {
+    match row.active_delivery_claim_id.clone() {
+        Some(claim_id) => DrainHandoff::ClaimOutstanding {
+            generation_id: row.generation_id.clone(),
+            claim_id,
+        },
+        None => DrainHandoff::Ready,
+    }
+}
+
+fn validate_delivery_claim_seqs(seqs: &[i64]) -> Result<(), GenerationStorageError> {
+    if seqs.is_empty() || seqs.iter().any(|seq| *seq <= 0) {
+        return Err(GenerationStorageError::new(
+            "Delivery claim requires positive mailbox sequence numbers".to_string(),
+        ));
+    }
+    if seqs.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(GenerationStorageError::new(
+            "Delivery claim mailbox sequence numbers must be strictly increasing".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn serialize_delivery_seqs(seqs: &[i64]) -> Result<String, GenerationStorageError> {
+    serde_json::to_string(seqs).map_err(|err| {
+        GenerationStorageError::new(format!(
+            "Failed to serialize runtime generation delivery batch: {err}"
+        ))
+    })
+}
+
+fn parse_delivery_seqs(value: &str) -> Result<Vec<i64>, GenerationStorageError> {
+    let seqs = serde_json::from_str::<Vec<i64>>(value).map_err(|err| {
+        GenerationStorageError::new(format!(
+            "Failed to parse runtime generation delivery batch: {err}"
+        ))
+    })?;
+    validate_delivery_claim_seqs(&seqs)?;
+    Ok(seqs)
+}
+
+fn runtime_delivery_claim_is_stale(row: &RuntimeGenerationRow, stale_after_seconds: i64) -> bool {
+    let Some(claimed_at) = row
+        .active_delivery_claimed_at
+        .as_deref()
+        .and_then(parse_claimed_at)
+    else {
+        return true;
+    };
+    claim_age_exceeds_stale_after(claimed_at, stale_after_seconds)
+}
+
+fn mailbox_seqs_are_pending_on(
+    conn: &Connection,
+    seqs: &[i64],
+) -> Result<bool, GenerationStorageError> {
+    for seq in seqs {
+        let delivered_at = conn
+            .query_row(
+                "SELECT delivered_at FROM mailbox WHERE seq = ?1",
+                params![seq],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(generation_storage_error(
+                "verify pending mailbox delivery claim row",
+            ))?;
+        if !matches!(delivered_at, Some(None)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn active_delivery_claim_overlaps_on(
+    conn: &Connection,
+    generation_id: &RuntimeGenerationId,
+    requested_seqs: &[i64],
+) -> Result<bool, GenerationStorageError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT active_delivery_seqs_json
+             FROM runtime_generation
+             WHERE generation_uuid != ?1
+               AND active_delivery_claim_uuid IS NOT NULL",
+        )
+        .map_err(generation_storage_error(
+            "prepare active delivery claim overlap query",
+        ))?;
+    let rows = statement
+        .query_map(params![generation_id.to_string()], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .map_err(generation_storage_error(
+            "query active delivery claim overlap",
+        ))?;
+    for value in rows {
+        let Some(value) = value.map_err(generation_storage_error(
+            "read active delivery claim overlap row",
+        ))?
+        else {
+            return Ok(true);
+        };
+        let claimed_seqs = parse_delivery_seqs(&value)?;
+        if claimed_seqs
+            .iter()
+            .any(|seq| requested_seqs.binary_search(seq).is_ok())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validated_active_delivery_claim_on(
+    conn: &Connection,
+    fence: RuntimeGenerationFence<'_>,
+    claim_id: &DeliveryClaimId,
+    seqs: &[i64],
+) -> Result<Result<RuntimeGenerationRow, GenerationRejection>, GenerationStorageError> {
+    let Some(row) = runtime_generation_by_id_on(conn, fence.generation_id)? else {
+        return Ok(Err(GenerationRejection::NotFound));
+    };
+    if row.spawn_invocation_uuid != fence.spawn_invocation_uuid {
+        return Ok(Err(GenerationRejection::FenceMismatch));
+    }
+    if row.active_delivery_claim_id.as_ref() != Some(claim_id)
+        || row.active_delivery_seqs != seqs
+        || row.active_delivery_claimed_at.is_none()
+    {
+        return Ok(Err(GenerationRejection::InvariantViolation));
+    }
+    Ok(Ok(row))
+}
+
+fn clear_runtime_delivery_claim_on(
+    conn: &Connection,
+    fence: RuntimeGenerationFence<'_>,
+    claim_id: &DeliveryClaimId,
+) -> Result<(), GenerationStorageError> {
+    let changed = conn
+        .execute(
+            "UPDATE runtime_generation
+             SET active_delivery_claim_uuid = NULL,
+                 active_delivery_claimed_at = NULL,
+                 active_delivery_seqs_json = NULL
+             WHERE generation_uuid = ?1
+               AND spawn_invocation_uuid = ?2
+               AND active_delivery_claim_uuid = ?3",
+            params![
+                fence.generation_id.to_string(),
+                fence.spawn_invocation_uuid,
+                claim_id.to_string(),
+            ],
+        )
+        .map_err(generation_storage_error(
+            "clear runtime generation delivery claim",
+        ))?;
+    if changed != 1 {
+        return Err(GenerationStorageError::new(
+            "Runtime generation delivery claim changed before settlement".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn mark_session_running_row(
@@ -1876,15 +4147,15 @@ fn validate_session_runtime_row(row: Option<&SessionRuntimeRow>) -> Result<(), S
     let Some(row) = row else {
         return Ok(());
     };
-    validate_run_state(&row.run_state)
+    validate_legacy_run_state(&row.run_state)
 }
 
 fn validate_running_run_state() -> Result<(), String> {
-    validate_run_state("running")
+    validate_legacy_run_state("running")
 }
 
 fn validate_idle_run_state() -> Result<(), String> {
-    validate_run_state("idle")
+    validate_legacy_run_state("idle")
 }
 
 fn runtime_row_is_idle(row: &SessionRuntimeRow) -> bool {
@@ -2246,7 +4517,9 @@ fn query_mailbox_by_kind_handle_tx(
                 delivered_at, delivered_by_invocation_uuid, delivery_attempts,
                 delivery_error, owner_invocation_uuid, matched_os_pid,
                 matched_os_boot_id, matched_os_pid_starttime_ticks,
-                matched_chain_index, state_dir, meta_path, log_path, rc_path, rc
+                matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
+                payload_file_path, payload_sha256, payload_byte_len,
+                payload_retention_policy, submission_token, target_kind, target_id
          FROM mailbox
          WHERE kind = ?1 AND handle = ?2",
         params![kind, handle],
@@ -2257,16 +4530,19 @@ fn query_mailbox_by_kind_handle_tx(
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_durable_directory(parent)
             .map_err(|err| format!("Failed to create PID mailbox sidecar directory: {err}"))?;
     }
     Ok(())
 }
 
 fn set_wal_mode(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA journal_mode=WAL;")
-        .map_err(|err| format!("Failed to set PID mailbox sidecar WAL mode: {err}"))
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+        .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
 }
 
 fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
@@ -2292,6 +4568,13 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             log_path                     TEXT    NOT NULL,
             rc_path                      TEXT    NOT NULL,
             rc                           INTEGER NOT NULL,
+            payload_file_path            TEXT,
+            payload_sha256               TEXT,
+            payload_byte_len             INTEGER,
+            payload_retention_policy     TEXT,
+            submission_token             TEXT,
+            target_kind                  TEXT,
+            target_id                    TEXT,
             UNIQUE(kind, handle)
         );
 
@@ -2325,6 +4608,90 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             paused                       INTEGER NOT NULL DEFAULT 0,
             updated_at                   TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS runtime_generation (
+            generation_uuid                    TEXT PRIMARY KEY,
+            lifecycle_state                   TEXT NOT NULL CHECK(lifecycle_state IN ('starting', 'running', 'draining', 'exited')),
+            spawn_invocation_uuid              TEXT NOT NULL,
+            session_id                         TEXT,
+            runtime_mode                       TEXT NOT NULL CHECK(runtime_mode IN ('headless', 'pty_interactive')),
+            provider_name                      TEXT NOT NULL,
+            model_name                         TEXT,
+            pty_control_path                    TEXT,
+            models_dir                         TEXT,
+            effective_cwd                      TEXT,
+            spawned_os_pid                     INTEGER,
+            identity_os_pid                    INTEGER,
+            identity_os_boot_id                TEXT,
+            identity_os_pid_starttime_ticks    INTEGER,
+            created_at                         TEXT NOT NULL,
+            running_at                         TEXT,
+            draining_at                        TEXT,
+            exited_at                          TEXT,
+            terminal_reason                    TEXT CHECK(terminal_reason IS NULL OR terminal_reason IN ('startup_failed', 'orderly_completion', 'abnormal_termination', 'cancelled', 'recovered_dead')),
+            exit_code                          INTEGER,
+            drain_request_uuid                 TEXT,
+            drain_requested_at                 TEXT,
+            drain_requested_by_invocation_uuid TEXT,
+            active_delivery_claim_uuid         TEXT,
+            active_delivery_claimed_at          TEXT,
+            active_delivery_seqs_json           TEXT,
+            CHECK (
+                (identity_os_pid IS NULL AND identity_os_boot_id IS NULL AND identity_os_pid_starttime_ticks IS NULL)
+                OR
+                (identity_os_pid IS NOT NULL AND identity_os_boot_id IS NOT NULL AND identity_os_pid_starttime_ticks IS NOT NULL)
+            ),
+            CHECK (identity_os_pid IS NULL OR identity_os_pid = spawned_os_pid),
+            CHECK (
+                (active_delivery_claim_uuid IS NULL
+                    AND active_delivery_claimed_at IS NULL
+                    AND active_delivery_seqs_json IS NULL)
+                OR
+                (active_delivery_claim_uuid IS NOT NULL
+                    AND active_delivery_claimed_at IS NOT NULL
+                    AND active_delivery_seqs_json IS NOT NULL)
+            ),
+            CHECK (
+                lifecycle_state != 'starting'
+                OR (running_at IS NULL AND draining_at IS NULL AND exited_at IS NULL
+                    AND terminal_reason IS NULL AND drain_request_uuid IS NULL
+                    AND active_delivery_claim_uuid IS NULL)
+            ),
+            CHECK (
+                lifecycle_state != 'running'
+                OR (spawned_os_pid IS NOT NULL AND running_at IS NOT NULL
+                    AND draining_at IS NULL AND exited_at IS NULL AND terminal_reason IS NULL)
+            ),
+            CHECK (
+                lifecycle_state != 'draining'
+                OR (running_at IS NOT NULL AND drain_request_uuid IS NOT NULL
+                    AND drain_requested_at IS NOT NULL AND draining_at IS NOT NULL
+                    AND exited_at IS NULL AND terminal_reason IS NULL
+                    AND active_delivery_claim_uuid IS NULL)
+            ),
+            CHECK (
+                lifecycle_state != 'exited'
+                OR (exited_at IS NOT NULL AND terminal_reason IS NOT NULL)
+            )
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_generation_exact_identity
+            ON runtime_generation(identity_os_pid, identity_os_boot_id, identity_os_pid_starttime_ticks)
+            WHERE identity_os_pid IS NOT NULL
+              AND identity_os_boot_id IS NOT NULL
+              AND identity_os_pid_starttime_ticks IS NOT NULL;
+
+        CREATE INDEX IF NOT EXISTS idx_runtime_generation_spawn_invocation
+            ON runtime_generation(spawn_invocation_uuid);
+
+        CREATE INDEX IF NOT EXISTS idx_runtime_generation_session_lifecycle
+            ON runtime_generation(session_id, lifecycle_state);
+
+        CREATE INDEX IF NOT EXISTS idx_runtime_generation_drain_request
+            ON runtime_generation(drain_request_uuid);
+
+        CREATE INDEX IF NOT EXISTS idx_runtime_generation_active_claim
+            ON runtime_generation(active_delivery_claim_uuid);
 
         CREATE TABLE IF NOT EXISTS session_runtime (
             session_id                       TEXT PRIMARY KEY,
@@ -2364,7 +4731,45 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             ON session_wake_claim(claimed_at);",
     )
     .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
-    ensure_session_runtime_columns(conn)
+    ensure_mailbox_columns(conn)?;
+    ensure_mailbox_target_index(conn)?;
+    ensure_session_runtime_columns(conn)?;
+    ensure_runtime_generation_columns(conn)
+}
+
+fn ensure_mailbox_columns(conn: &Connection) -> Result<(), String> {
+    let columns = table_columns(conn, "mailbox")?;
+    for (name, definition) in missing_mailbox_columns(&columns) {
+        add_sidecar_column(conn, "mailbox", name, definition)?;
+    }
+    Ok(())
+}
+
+fn mailbox_column_additions() -> [(&'static str, &'static str); 7] {
+    [
+        ("payload_file_path", "TEXT"),
+        ("payload_sha256", "TEXT"),
+        ("payload_byte_len", "INTEGER"),
+        ("payload_retention_policy", "TEXT"),
+        ("submission_token", "TEXT"),
+        ("target_kind", "TEXT"),
+        ("target_id", "TEXT"),
+    ]
+}
+
+fn missing_mailbox_columns(columns: &[String]) -> Vec<(&'static str, &'static str)> {
+    mailbox_column_additions()
+        .into_iter()
+        .filter(|(name, _)| !columns.iter().any(|column| column == name))
+        .collect()
+}
+
+fn ensure_mailbox_target_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_pending_target
+             ON mailbox(target_kind, target_id, delivered_at, seq);",
+    )
+    .map_err(|err| format!("Failed to ensure mailbox target index: {err}"))
 }
 
 fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
@@ -2373,6 +4778,28 @@ fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
         add_session_runtime_column(conn, name, definition)?;
     }
     Ok(())
+}
+
+fn ensure_runtime_generation_columns(conn: &Connection) -> Result<(), String> {
+    let columns = table_columns(conn, "runtime_generation")?;
+    for (name, definition) in missing_runtime_generation_columns(&columns) {
+        add_sidecar_column(conn, "runtime_generation", name, definition)?;
+    }
+    Ok(())
+}
+
+fn runtime_generation_column_additions() -> [(&'static str, &'static str); 2] {
+    [
+        ("active_delivery_claimed_at", "TEXT"),
+        ("active_delivery_seqs_json", "TEXT"),
+    ]
+}
+
+fn missing_runtime_generation_columns(columns: &[String]) -> Vec<(&'static str, &'static str)> {
+    runtime_generation_column_additions()
+        .into_iter()
+        .filter(|(name, _)| !columns.iter().any(|column| column == name))
+        .collect()
 }
 
 fn session_runtime_column_additions() -> [(&'static str, &'static str); 12] {
@@ -2404,12 +4831,21 @@ fn add_session_runtime_column(
     name: &str,
     definition: &str,
 ) -> Result<(), String> {
-    conn.execute_batch(&session_runtime_add_column_sql(name, definition))
-        .map_err(|err| format!("Failed to add session_runtime.{name}: {err}"))
+    add_sidecar_column(conn, "session_runtime", name, definition)
 }
 
-fn session_runtime_add_column_sql(name: &str, definition: &str) -> String {
-    format!("ALTER TABLE session_runtime ADD COLUMN {name} {definition};")
+fn add_sidecar_column(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+    definition: &str,
+) -> Result<(), String> {
+    conn.execute_batch(&sidecar_add_column_sql(table, name, definition))
+        .map_err(|err| format!("Failed to add {table}.{name}: {err}"))
+}
+
+fn sidecar_add_column_sql(table: &str, name: &str, definition: &str) -> String {
+    format!("ALTER TABLE {table} ADD COLUMN {name} {definition};")
 }
 
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
@@ -2423,7 +4859,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> 
         .map_err(|err| format!("Failed to read {table} column: {err}"))
 }
 
-fn validate_run_state(run_state: &str) -> Result<(), String> {
+fn validate_legacy_run_state(run_state: &str) -> Result<(), String> {
     match run_state {
         "idle" | "running" => Ok(()),
         other => Err(format!("Invalid session_runtime.run_state value: {other}")),
@@ -2585,6 +5021,13 @@ fn map_mailbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxRow> {
         log_path: row.get(17)?,
         rc_path: row.get(18)?,
         rc: row.get(19)?,
+        payload_file_path: row.get(20)?,
+        payload_sha256: row.get(21)?,
+        payload_byte_len: row.get(22)?,
+        payload_retention_policy: row.get(23)?,
+        submission_token: row.get(24)?,
+        target_kind: row.get(25)?,
+        target_id: row.get(26)?,
     })
 }
 
@@ -2623,17 +5066,218 @@ mod tests {
         }
     }
 
+    fn submitted_input<'a>(
+        submission_token: &'a str,
+        target_kind: InboxTargetKind,
+        target_id: &'a str,
+        payload: &'a [u8],
+    ) -> SubmittedInputEnqueue<'a> {
+        SubmittedInputEnqueue {
+            submission_token,
+            target: InboxTarget {
+                kind: target_kind,
+                id: target_id,
+            },
+            input: payload,
+        }
+    }
+
     #[test]
     fn enqueue_transaction_rollback_has_no_partial_row() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let input = input("handle-a", "session-a");
+        let payload = db.payload_reference(input.payload_json.as_bytes()).unwrap();
 
         let err = db
-            .enqueue_agent_bash_complete_then_rollback(&input("handle-a", "session-a"))
+            .enqueue_agent_bash_complete_then_rollback(&input)
             .unwrap_err();
 
         assert_eq!(err, "forced rollback before commit");
         assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+        assert!(payload.file_path.exists());
+        db.verify_published_payload(&payload).unwrap();
+    }
+
+    #[test]
+    fn immutable_payload_publication_is_content_addressed_and_detects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let first = db.publish_immutable_payload(b"payload-a").unwrap();
+        let second = db.publish_immutable_payload(b"payload-a").unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read(&first.file_path).unwrap(), b"payload-a");
+        let mut permissions = fs::metadata(&first.file_path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        fs::set_permissions(&first.file_path, permissions).unwrap();
+        fs::write(&first.file_path, b"payload-b").unwrap();
+
+        assert!(db.verify_published_payload(&first).is_err());
+    }
+
+    #[test]
+    fn submitted_input_key_is_stable_and_target_domain_separated() {
+        let session = submitted_input_handle(
+            "caller-token",
+            InboxTarget {
+                kind: InboxTargetKind::Session,
+                id: "same-id",
+            },
+        )
+        .unwrap();
+        let session_retry = submitted_input_handle(
+            "caller-token",
+            InboxTarget {
+                kind: InboxTargetKind::Session,
+                id: "same-id",
+            },
+        )
+        .unwrap();
+        let chain = submitted_input_handle(
+            "caller-token",
+            InboxTarget {
+                kind: InboxTargetKind::Chain,
+                id: "same-id",
+            },
+        )
+        .unwrap();
+        let separate_submission = submitted_input_handle(
+            "different-token",
+            InboxTarget {
+                kind: InboxTargetKind::Session,
+                id: "same-id",
+            },
+        )
+        .unwrap();
+
+        assert_eq!(session, session_retry);
+        assert_ne!(session, chain);
+        assert_ne!(session, separate_submission);
+        assert_eq!(session.len(), 64);
+    }
+
+    #[test]
+    fn submitted_input_retry_returns_original_row_and_payload_collision_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let first = db
+            .enqueue_submitted_input(&submitted_input(
+                "caller-token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"first payload",
+            ))
+            .unwrap();
+        let EnqueueResult::Inserted(first_row) = first else {
+            panic!("expected inserted input row, got {first:?}");
+        };
+
+        let retry = db
+            .enqueue_submitted_input(&submitted_input(
+                "caller-token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"first payload",
+            ))
+            .unwrap();
+        let EnqueueResult::AlreadyEnqueued(retry_row) = retry else {
+            panic!("expected duplicate input row, got {retry:?}");
+        };
+        assert_eq!(retry_row.seq, first_row.seq);
+        assert_eq!(retry_row.kind, SUBMITTED_INPUT_KIND);
+        assert_eq!(retry_row.submission_token.as_deref(), Some("caller-token"));
+        assert_eq!(retry_row.target_kind.as_deref(), Some("chain"));
+        assert_eq!(retry_row.target_id.as_deref(), Some("chain-a"));
+
+        let conflict = db
+            .enqueue_submitted_input(&submitted_input(
+                "caller-token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"different payload",
+            ))
+            .unwrap();
+        assert!(matches!(conflict, EnqueueResult::Conflict { .. }));
+        assert_eq!(
+            db.list_pending_for_delivery("session-b", Some("chain-a"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_notification_rows_have_no_input_identity_or_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+
+        assert!(row.submission_token.is_none());
+        assert!(row.target_kind.is_none());
+        assert!(row.target_id.is_none());
+        assert_eq!(
+            db.list_pending_for_delivery("session-a", Some("chain-a"))
+                .unwrap(),
+            vec![row]
+        );
+    }
+
+    #[test]
+    fn predecessor_notification_row_remains_readable_after_input_columns_are_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE mailbox (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                handle TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                enqueued_at TEXT NOT NULL,
+                delivered_at TEXT,
+                delivered_by_invocation_uuid TEXT,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                delivery_error TEXT,
+                owner_invocation_uuid TEXT,
+                matched_os_pid INTEGER,
+                matched_os_boot_id TEXT,
+                matched_os_pid_starttime_ticks INTEGER,
+                matched_chain_index INTEGER,
+                state_dir TEXT NOT NULL,
+                meta_path TEXT NOT NULL,
+                log_path TEXT NOT NULL,
+                rc_path TEXT NOT NULL,
+                rc INTEGER NOT NULL,
+                UNIQUE(kind, handle)
+             );
+             INSERT INTO mailbox (
+                session_id, kind, handle, payload_json, enqueued_at,
+                state_dir, meta_path, log_path, rc_path, rc
+             ) VALUES (
+                'session-a', 'agent_bash_complete', 'legacy-handle', '{}',
+                '2026-07-16T00:00:00Z', '/tmp/state', '/tmp/meta', '/tmp/log', '/tmp/rc', 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = MailboxDb::open(&path).unwrap();
+        let rows = db.list_pending("session-a").unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].handle, "legacy-handle");
+        assert!(rows[0].payload_file_path.is_none());
+        assert!(rows[0].submission_token.is_none());
+        assert!(rows[0].target_kind.is_none());
+        assert!(rows[0].target_id.is_none());
     }
 
     #[test]
@@ -3755,6 +6399,330 @@ mod tests {
             panic!("expected live identity-matched claim to remain in flight, got {result:?}");
         };
         assert_eq!(claim.claim_token, "token-a");
+    }
+
+    #[test]
+    fn runtime_generations_preserve_overlap_exact_lookup_and_late_session_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let first_id = RuntimeGenerationId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let second_id = RuntimeGenerationId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        let first_identity = ProcessIdentity {
+            os_pid: 101,
+            os_boot_id: "boot-a".to_string(),
+            os_pid_starttime_ticks: 1001,
+        };
+        let second_identity = ProcessIdentity {
+            os_pid: 102,
+            os_boot_id: "boot-a".to_string(),
+            os_pid_starttime_ticks: 1002,
+        };
+
+        for (generation_id, invocation_uuid, session_id) in [
+            (&first_id, "invocation-a", None),
+            (&second_id, "invocation-b", Some("session-a")),
+        ] {
+            assert!(matches!(
+                db.create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id,
+                    spawn_invocation_uuid: invocation_uuid,
+                    session_id,
+                    runtime_mode: "headless",
+                    provider_name: "provider-a",
+                    model_name: Some("model-a"),
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                })
+                .unwrap(),
+                GenerationMutation::Applied(_)
+            ));
+        }
+        for (generation_id, invocation_uuid, identity) in [
+            (&first_id, "invocation-a", &first_identity),
+            (&second_id, "invocation-b", &second_identity),
+        ] {
+            assert!(matches!(
+                db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                    fence: RuntimeGenerationFence {
+                        generation_id,
+                        spawn_invocation_uuid: invocation_uuid,
+                    },
+                    spawned_os_pid: identity.os_pid,
+                    exact_process_identity: Some(identity),
+                    os_pgid: None,
+                })
+                .unwrap(),
+                GenerationMutation::Applied(_)
+            ));
+        }
+        assert!(matches!(
+            db.attach_runtime_generation_session(AttachRuntimeGenerationSession {
+                fence: RuntimeGenerationFence {
+                    generation_id: &first_id,
+                    spawn_invocation_uuid: "invocation-a",
+                },
+                session_id: "session-a",
+            })
+            .unwrap(),
+            GenerationMutation::Applied(_)
+        ));
+
+        let SessionGenerationProjection::Multiple(rows) =
+            db.session_generation_projection("session-a").unwrap()
+        else {
+            panic!("overlapping generations must remain explicit");
+        };
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(
+            db.resolve_runtime_generation(RuntimeGenerationSelector::ProcessIdentity(
+                &first_identity
+            ))
+            .unwrap(),
+            RuntimeGenerationResolution::Found(row) if row.generation_id == first_id
+        ));
+    }
+
+    #[test]
+    fn generation_drain_is_a_durable_two_step_predecessor_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("33333333-3333-4333-8333-333333333333").unwrap();
+        let drain_request_id =
+            DrainRequestId::parse("44444444-4444-4444-8444-444444444444").unwrap();
+        db.create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+            session_id: Some("session-a"),
+            runtime_mode: "headless",
+            provider_name: "provider-a",
+            model_name: None,
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "invocation-a",
+            },
+            spawned_os_pid: 103,
+            exact_process_identity: None,
+            os_pgid: None,
+        })
+        .unwrap();
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+
+        assert!(matches!(
+            db.request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+                requested_by_invocation_uuid: "drainer-a",
+            })
+            .unwrap(),
+            DrainRequestResult::Installed(_, DrainHandoff::Ready)
+        ));
+        assert!(matches!(
+            db.advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+            })
+            .unwrap(),
+            DrainAdvanceResult::Advanced(ref row)
+                if row.lifecycle_state == RuntimeLifecycleState::Draining
+        ));
+        assert!(matches!(
+            db.finish_runtime_generation_drain(FinishRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+                exit_code: Some(0),
+            })
+            .unwrap(),
+            DrainFinishResult::Finished(ref row)
+                if row.lifecycle_state == RuntimeLifecycleState::Exited
+                    && row.terminal_reason == Some(RuntimeTerminalReason::OrderlyCompletion)
+        ));
+    }
+
+    #[test]
+    fn delivery_claim_wins_drain_race_then_confirmation_hands_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("55555555-5555-4555-8555-555555555555").unwrap();
+        let claim_id = DeliveryClaimId::parse("66666666-6666-4666-8666-666666666666").unwrap();
+        let drain_request_id =
+            DrainRequestId::parse("77777777-7777-4777-8777-777777777777").unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("claimed", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+
+        assert!(matches!(
+            db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[row.seq],
+                stale_after_seconds: 30,
+            })
+            .unwrap(),
+            DeliveryClaimAcquireResult::Acquired(_)
+        ));
+        assert!(matches!(
+            db.request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+                requested_by_invocation_uuid: "drainer-a",
+            })
+            .unwrap(),
+            DrainRequestResult::Installed(_, DrainHandoff::ClaimOutstanding { .. })
+        ));
+        assert_eq!(
+            db.advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+            })
+            .unwrap(),
+            DrainAdvanceResult::WaitingOnClaim(claim_id.clone())
+        );
+        assert!(matches!(
+            db.confirm_runtime_generation_delivery(ConfirmRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[row.seq],
+                delivered_by_invocation_uuid: "invocation-a",
+            })
+            .unwrap(),
+            GenerationMutation::Applied(_)
+        ));
+        assert!(matches!(
+            db.advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+            })
+            .unwrap(),
+            DrainAdvanceResult::Advanced(_)
+        ));
+        assert!(db.list_pending("session-a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn drain_request_wins_race_and_rejects_new_delivery_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("88888888-8888-4888-8888-888888888888").unwrap();
+        let claim_id = DeliveryClaimId::parse("99999999-9999-4999-8999-999999999999").unwrap();
+        let drain_request_id =
+            DrainRequestId::parse("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("pending", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+
+        db.request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+            fence,
+            drain_request_id: &drain_request_id,
+            requested_by_invocation_uuid: "drainer-a",
+        })
+        .unwrap();
+        assert_eq!(
+            db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[row.seq],
+                stale_after_seconds: 30,
+            })
+            .unwrap(),
+            DeliveryClaimAcquireResult::Rejected(GenerationRejection::DrainRequestConflict)
+        );
+        assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stale_delivery_claim_recovery_reuses_nonce_and_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let first_claim = DeliveryClaimId::parse("cccccccc-cccc-4ccc-8ccc-cccccccccccc").unwrap();
+        let replacement_claim =
+            DeliveryClaimId::parse("dddddddd-dddd-4ddd-8ddd-dddddddddddd").unwrap();
+        let first = inserted_row(db.enqueue_agent_bash_complete(&input("first", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+        db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+            fence,
+            claim_id: &first_claim,
+            seqs: &[first.seq],
+            stale_after_seconds: 30,
+        })
+        .unwrap();
+        let second = inserted_row(db.enqueue_agent_bash_complete(&input("second", "session-a")));
+        db.connection()
+            .execute(
+                "UPDATE runtime_generation
+                 SET active_delivery_claimed_at = '2000-01-01T00:00:00Z'
+                 WHERE generation_uuid = ?1",
+                params![generation_id.to_string()],
+            )
+            .unwrap();
+
+        let DeliveryClaimAcquireResult::Recovered(recovered) = db
+            .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                fence,
+                claim_id: &replacement_claim,
+                seqs: &[first.seq, second.seq],
+                stale_after_seconds: 30,
+            })
+            .unwrap()
+        else {
+            panic!("expected stale claim recovery");
+        };
+        assert_eq!(recovered.active_delivery_claim_id, Some(first_claim));
+        assert_eq!(recovered.active_delivery_seqs, vec![first.seq]);
+    }
+
+    fn create_running_generation(
+        db: &mut MailboxDb,
+        generation_id: &RuntimeGenerationId,
+        invocation_uuid: &str,
+        session_id: &str,
+    ) {
+        db.create_runtime_generation(CreateRuntimeGeneration {
+            generation_id,
+            spawn_invocation_uuid: invocation_uuid,
+            session_id: Some(session_id),
+            runtime_mode: "pty_interactive",
+            provider_name: "provider-a",
+            model_name: None,
+            pty_control_path: Some("/tmp/control.sock"),
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id,
+                spawn_invocation_uuid: invocation_uuid,
+            },
+            spawned_os_pid: 103,
+            exact_process_identity: None,
+            os_pgid: None,
+        })
+        .unwrap();
     }
 
     #[test]

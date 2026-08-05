@@ -8,9 +8,16 @@
 //!   payload threaded through executor launches.
 
 use oulipoly_state::CompositeInvocationId;
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRunningUpdate};
+use oulipoly_state::mailbox::{
+    AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
+    CreateRuntimeGeneration, DrainAdvanceResult, DrainFinishResult, DrainHandoff, DrainRequestId,
+    DrainRequestResult, ExactProcessEvidence, ExitRuntimeGenerationNonOrderly,
+    FinishRuntimeGenerationDrain, GenerationMutation, MailboxDb, RequestRuntimeGenerationDrain,
+    RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
+    SessionRuntimeRunningUpdate,
+};
 use oulipoly_state::pid_identity::{
-    self, LiveProcessIdentityRecord, PidIdentityDb, ProcessIdentity,
+    self, ProcessIdentity, ProcessIdentityObservation, observe_live_process_identity,
 };
 use std::path::Path;
 
@@ -31,6 +38,7 @@ impl SpawnRuntimeMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SpawnIdentityContext {
+    generation_id: RuntimeGenerationId,
     invocation_uuid: String,
     provider_name: String,
     model_name: Option<String>,
@@ -102,6 +110,7 @@ fn spawn_identity_context_from_invocation(
     models_dir: Option<&Path>,
 ) -> SpawnIdentityContext {
     SpawnIdentityContext {
+        generation_id: RuntimeGenerationId::new(),
         invocation_uuid: invocation.id,
         provider_name: provider_name.to_string(),
         model_name: model_name.map(str::to_string),
@@ -113,50 +122,163 @@ fn spawn_identity_context_from_invocation(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunningRuntimeGeneration {
+    pub generation_id: RuntimeGenerationId,
+    pub spawned_os_pid: i64,
+    pub exact_process_identity: Option<ProcessIdentity>,
+}
+
+pub(crate) fn register_runtime_generation_starting(
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), String> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let mut db = MailboxDb::open_default()?;
+    recover_stale_session_generations(&mut db, context)?;
+    match db
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &context.generation_id,
+            spawn_invocation_uuid: &context.invocation_uuid,
+            session_id: context.session_id.as_deref(),
+            runtime_mode: context.mode.as_str(),
+            provider_name: &context.provider_name,
+            model_name: context.model_name.as_deref(),
+            pty_control_path: context.pty_control_path.as_deref(),
+            models_dir: context.models_dir.as_deref(),
+            effective_cwd: context.effective_cwd.as_deref(),
+        })
+        .map_err(|err| err.to_string())?
+    {
+        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => Ok(()),
+        GenerationMutation::Rejected(rejection) => Err(format!(
+            "Runtime generation starting registration rejected: {rejection:?}"
+        )),
+    }
+}
+
+fn recover_stale_session_generations(
+    db: &mut MailboxDb,
+    context: &SpawnIdentityContext,
+) -> Result<(), String> {
+    let Some(session_id) = context.session_id() else {
+        return Ok(());
+    };
+    let generations = db
+        .runtime_generation_history(session_id)
+        .map_err(|err| err.to_string())?;
+    for generation in generations {
+        if generation.lifecycle_state == RuntimeLifecycleState::Exited {
+            continue;
+        }
+        let ExactProcessEvidence::Recorded(identity) = &generation.exact_process_evidence else {
+            continue;
+        };
+        let stale = match observe_live_process_identity(identity.os_pid) {
+            ProcessIdentityObservation::ExactLive(live) => live != *identity,
+            ProcessIdentityObservation::Dead => true,
+            ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => {
+                false
+            }
+        };
+        if !stale {
+            continue;
+        }
+        let mutation = db
+            .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation.generation_id,
+                    spawn_invocation_uuid: &generation.spawn_invocation_uuid,
+                },
+                reason: RuntimeTerminalReason::RecoveredDead,
+                exit_code: None,
+            })
+            .map_err(|err| err.to_string())?;
+        if let GenerationMutation::Rejected(rejection) = mutation {
+            return Err(format!(
+                "Stale runtime generation recovery rejected: {rejection:?}"
+            ));
+        }
+    }
+    let _ = db.session_liveness(session_id)?;
+    Ok(())
+}
+
 pub(crate) fn record_child_identity(
     child_id: u32,
     context: Option<&SpawnIdentityContext>,
-) -> Option<ProcessIdentity> {
-    let context = context?;
-    match pid_identity::record_live_process_identity(live_process_identity_record(
-        child_id, context,
-    )) {
-        Ok(Some(row)) => {
-            let identity = row.identity();
-            mark_session_running(context, &identity);
-            Some(identity)
-        }
-        Ok(None) => None,
+) -> Result<Option<RunningRuntimeGeneration>, String> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    let os_pid = i64::from(child_id);
+    let exact_process_identity = match pid_identity::read_live_process_identity(os_pid) {
+        Ok(identity) => identity,
         Err(err) => {
             warn_child_identity_record_failed(context, child_id, &err);
             None
         }
+    };
+    let mut db = MailboxDb::open_default()?;
+    let mutation = db
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: generation_fence(context),
+            spawned_os_pid: os_pid,
+            exact_process_identity: exact_process_identity.as_ref(),
+            os_pgid: None,
+        })
+        .map_err(|err| err.to_string())?;
+    match mutation {
+        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => {
+            if let (Some(session_id), Some(identity)) = (
+                context.session_id.as_deref(),
+                exact_process_identity.as_ref(),
+            ) {
+                mark_session_running_with_session_id(context, session_id, identity);
+            }
+            Ok(Some(RunningRuntimeGeneration {
+                generation_id: context.generation_id.clone(),
+                spawned_os_pid: os_pid,
+                exact_process_identity,
+            }))
+        }
+        GenerationMutation::Rejected(rejection) => Err(format!(
+            "Runtime generation child binding rejected: {rejection:?}"
+        )),
     }
 }
 
 pub(crate) fn backfill_captured_session_id(
     context: Option<&SpawnIdentityContext>,
-    identity: Option<&ProcessIdentity>,
+    generation: Option<&RunningRuntimeGeneration>,
     session_id: &str,
-) {
-    let (Some(context), Some(identity)) = (context, identity) else {
-        return;
+) -> Result<(), String> {
+    let (Some(context), Some(generation)) = (context, generation) else {
+        return Ok(());
     };
-    backfill_pid_identity_session_id(context, identity, session_id);
-    mark_session_running_with_session_id(context, session_id, identity);
-}
-
-fn live_process_identity_record<'a>(
-    child_id: u32,
-    context: &'a SpawnIdentityContext,
-) -> LiveProcessIdentityRecord<'a> {
-    LiveProcessIdentityRecord {
-        os_pid: i64::from(child_id),
-        invocation_uuid: &context.invocation_uuid,
-        session_id: context.session_id.as_deref(),
-        provider_name: Some(&context.provider_name),
-        model_name: context.model_name.as_deref(),
+    if generation.generation_id != context.generation_id {
+        return Err("Captured session generation does not match its spawn context".to_string());
     }
+    let mut db = MailboxDb::open_default()?;
+    match db
+        .attach_runtime_generation_session(AttachRuntimeGenerationSession {
+            fence: generation_fence(context),
+            session_id,
+        })
+        .map_err(|err| err.to_string())?
+    {
+        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => {}
+        GenerationMutation::Rejected(rejection) => {
+            return Err(format!(
+                "Runtime generation session attachment rejected: {rejection:?}"
+            ));
+        }
+    }
+    if let Some(identity) = generation.exact_process_identity.as_ref() {
+        mark_session_running_with_session_id(context, session_id, identity);
+    }
+    Ok(())
 }
 
 fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u32, err: &str) {
@@ -165,13 +287,6 @@ fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u
         child_pid = child_id,
         "Failed to record PID identity sidecar row: {err}"
     );
-}
-
-fn mark_session_running(context: &SpawnIdentityContext, identity: &ProcessIdentity) {
-    let Some(session_id) = context.session_id.as_deref() else {
-        return;
-    };
-    mark_session_running_with_session_id(context, session_id, identity);
 }
 
 fn mark_session_running_with_session_id(
@@ -186,6 +301,128 @@ fn mark_session_running_with_session_id(
     }) {
         Ok(()) => {}
         Err(err) => warn_mark_session_running_failed(context, session_id, &err),
+    }
+}
+
+pub(crate) fn mark_runtime_generation_spawn_failed(
+    context: Option<&SpawnIdentityContext>,
+) -> Result<(), String> {
+    exit_runtime_generation(context, RuntimeTerminalReason::StartupFailed, None)
+}
+
+pub(crate) fn mark_runtime_generation_exited(
+    context: Option<&SpawnIdentityContext>,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    exit_runtime_generation(
+        context,
+        RuntimeTerminalReason::AbnormalTermination,
+        exit_code,
+    )
+}
+
+pub(crate) fn mark_runtime_generation_orderly_completed(
+    context: Option<&SpawnIdentityContext>,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let drain_request_id = DrainRequestId::new();
+    let mut db = MailboxDb::open_default()?;
+    let handoff = match db
+        .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+            fence: generation_fence(context),
+            drain_request_id: &drain_request_id,
+            requested_by_invocation_uuid: &context.invocation_uuid,
+        })
+        .map_err(|err| err.to_string())?
+    {
+        DrainRequestResult::Installed(_, handoff)
+        | DrainRequestResult::AlreadyInstalled(_, handoff) => handoff,
+        DrainRequestResult::Rejected(rejection) => {
+            return Err(format!(
+                "Runtime generation drain request rejected: {rejection:?}"
+            ));
+        }
+    };
+    if matches!(handoff, DrainHandoff::ClaimOutstanding { .. }) {
+        drop(db);
+        return exit_runtime_generation(
+            Some(context),
+            RuntimeTerminalReason::AbnormalTermination,
+            exit_code,
+        );
+    }
+    match db
+        .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+            fence: generation_fence(context),
+            drain_request_id: &drain_request_id,
+        })
+        .map_err(|err| err.to_string())?
+    {
+        DrainAdvanceResult::Advanced(_) | DrainAdvanceResult::AlreadyDraining(_) => {}
+        DrainAdvanceResult::WaitingOnClaim(_) => {
+            drop(db);
+            return exit_runtime_generation(
+                Some(context),
+                RuntimeTerminalReason::AbnormalTermination,
+                exit_code,
+            );
+        }
+        DrainAdvanceResult::AlreadyExited(_) => return Ok(()),
+        DrainAdvanceResult::Rejected(rejection) => {
+            return Err(format!(
+                "Runtime generation drain advance rejected: {rejection:?}"
+            ));
+        }
+    }
+    match db
+        .finish_runtime_generation_drain(FinishRuntimeGenerationDrain {
+            fence: generation_fence(context),
+            drain_request_id: &drain_request_id,
+            exit_code,
+        })
+        .map_err(|err| err.to_string())?
+    {
+        DrainFinishResult::Finished(_) | DrainFinishResult::AlreadyExited(_) => Ok(()),
+        DrainFinishResult::NotDraining(actual) => Err(format!(
+            "Runtime generation was {actual:?} while finishing orderly drain"
+        )),
+        DrainFinishResult::Rejected(rejection) => Err(format!(
+            "Runtime generation drain finish rejected: {rejection:?}"
+        )),
+    }
+}
+
+fn exit_runtime_generation(
+    context: Option<&SpawnIdentityContext>,
+    reason: RuntimeTerminalReason,
+    exit_code: Option<i32>,
+) -> Result<(), String> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let mut db = MailboxDb::open_default()?;
+    match db
+        .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+            fence: generation_fence(context),
+            reason,
+            exit_code,
+        })
+        .map_err(|err| err.to_string())?
+    {
+        GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => Ok(()),
+        GenerationMutation::Rejected(rejection) => {
+            Err(format!("Runtime generation exit rejected: {rejection:?}"))
+        }
+    }
+}
+
+fn generation_fence(context: &SpawnIdentityContext) -> RuntimeGenerationFence<'_> {
+    RuntimeGenerationFence {
+        generation_id: &context.generation_id,
+        spawn_invocation_uuid: &context.invocation_uuid,
     }
 }
 
@@ -213,45 +450,6 @@ fn warn_mark_session_running_failed(context: &SpawnIdentityContext, session_id: 
         invocation_uuid = %context.invocation_uuid,
         session_id,
         "Failed to mark session runtime running: {err}"
-    );
-}
-
-fn backfill_pid_identity_session_id(
-    context: &SpawnIdentityContext,
-    identity: &ProcessIdentity,
-    session_id: &str,
-) {
-    match PidIdentityDb::open_default().and_then(|db| db.set_session_id(identity, session_id)) {
-        Ok(true) => {}
-        Ok(false) => warn_pid_identity_session_backfill_missing(context, identity, session_id),
-        Err(err) => warn_pid_identity_session_backfill_failed(context, identity, session_id, &err),
-    }
-}
-
-fn warn_pid_identity_session_backfill_missing(
-    context: &SpawnIdentityContext,
-    identity: &ProcessIdentity,
-    session_id: &str,
-) {
-    tracing::warn!(
-        invocation_uuid = %context.invocation_uuid,
-        session_id,
-        os_pid = identity.os_pid,
-        "PID identity sidecar row was missing during captured session_id backfill"
-    );
-}
-
-fn warn_pid_identity_session_backfill_failed(
-    context: &SpawnIdentityContext,
-    identity: &ProcessIdentity,
-    session_id: &str,
-    err: &str,
-) {
-    tracing::warn!(
-        invocation_uuid = %context.invocation_uuid,
-        session_id,
-        os_pid = identity.os_pid,
-        "Failed to backfill PID identity sidecar session_id: {err}"
     );
 }
 

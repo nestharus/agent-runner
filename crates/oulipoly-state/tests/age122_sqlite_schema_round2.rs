@@ -26,6 +26,9 @@
 //!       - std::path::{Path, PathBuf} migration-directory support surface
 //! ```
 
+use oulipoly_state::mailbox::MailboxDb;
+use rusqlite::Connection;
+
 const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS invocations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             invocation_uuid TEXT NOT NULL UNIQUE,
@@ -102,6 +105,47 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
             "0010_imported_session_display_metadata.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
+    );
+}
+
+#[test]
+fn runtime_generation_is_generation_keyed_sidecar_state_not_state_db_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let state = oulipoly_state::StateDb::open(&state_path).unwrap();
+    let state_version: i64 = state
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    drop(state);
+
+    let sidecar_path = dir.path().join("pid-identity.db");
+    drop(MailboxDb::open(&sidecar_path).unwrap());
+    let sidecar = Connection::open(&sidecar_path).unwrap();
+    let primary_key: i64 = sidecar
+        .query_row(
+            "SELECT pk FROM pragma_table_info('runtime_generation') WHERE name = 'generation_uuid'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let session_primary_key: i64 = sidecar
+        .query_row(
+            "SELECT pk FROM pragma_table_info('runtime_generation') WHERE name = 'session_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(primary_key, 1);
+    assert_eq!(session_primary_key, 0);
+    let state = oulipoly_state::StateDb::open(&state_path).unwrap();
+    assert_eq!(
+        state
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        state_version
     );
 }
 

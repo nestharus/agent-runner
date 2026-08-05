@@ -11,7 +11,11 @@
 //! helpers decode control frames, and mapper/filter helpers project low-level
 //! protocol values into runner records.
 
-use super::spawn_identity::{SpawnIdentityContext, record_child_identity};
+use super::spawn_identity::{
+    SpawnIdentityContext, mark_runtime_generation_exited,
+    mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
+    record_child_identity, register_runtime_generation_starting,
+};
 use super::terminal_signal::{InteractiveSignalGuard, exit_code_from_status};
 use crate::observability::{
     ObservabilityRoot, ObservabilitySnapshotPort, ProductionObservabilitySnapshotService,
@@ -59,6 +63,7 @@ const INJECT_WAIT_LIMIT: Duration = Duration::from_millis(1500);
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const DELIVERY_ATTEMPT_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_ATTEMPT_SUFFIX: char = ']';
+const DELIVERY_ACK_PREFIX: &str = "delivery_ack:";
 const UNIX_SOCKET_PATH_LIMIT: usize = 100;
 const NOTIFY_TRACE_MAX_BYTES: u64 = 1024 * 1024;
 const NOTIFY_TRACE_FILE: &str = "notify-trace.log";
@@ -121,6 +126,10 @@ pub fn inject_control_envelope(
         .map_err(protocol_error)?;
     write_inject_frame(&mut stream, bytes).map_err(protocol_error)?;
     read_control_response(&mut stream)
+}
+
+pub fn pty_delivery_ack_message(delivery_nonce: &str) -> String {
+    format!("{DELIVERY_ACK_PREFIX}{delivery_nonce}")
 }
 
 pub fn render_mailbox_notification_envelope(
@@ -197,14 +206,25 @@ pub(super) fn execute_interactive_child(
     let pty = PtyPair::open(&winsize, &real_tty.original)?;
     let control = ControlSocket::bind_for(context)?;
     configure_child_pty(&mut cmd, &pty)?;
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format_provider_spawn_error(&provider.command, err))?;
     let recorded_context = control.as_ref().and_then(|control| {
         context.map(|context| context.with_pty_control_path(control.path_string()))
     });
-    let _ = record_child_identity(child.id(), recorded_context.as_ref().or(context));
-    let mut idle_guard = SessionRuntimeIdleGuard::new(context);
+    let generation_context = recorded_context.as_ref().or(context);
+    register_runtime_generation_starting(generation_context)?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = mark_runtime_generation_spawn_failed(generation_context);
+            return Err(format_provider_spawn_error(&provider.command, err));
+        }
+    };
+    if let Err(err) = record_child_identity(child.id(), generation_context) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = mark_runtime_generation_exited(generation_context, None);
+        return Err(err);
+    }
+    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context);
     drop(pty.slave);
 
     let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
@@ -241,14 +261,25 @@ pub(super) fn execute_interactive_child_observed(
         provider_session.as_ref().ok(),
     ));
     let outbound_source = outbound_observer_source(provider_session);
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format_provider_spawn_error(&provider.command, err))?;
     let recorded_context = control.as_ref().and_then(|control| {
         context.map(|context| context.with_pty_control_path(control.path_string()))
     });
-    let _ = record_child_identity(child.id(), recorded_context.as_ref().or(context));
-    let mut idle_guard = SessionRuntimeIdleGuard::new(context);
+    let generation_context = recorded_context.as_ref().or(context);
+    register_runtime_generation_starting(generation_context)?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = mark_runtime_generation_spawn_failed(generation_context);
+            return Err(format_provider_spawn_error(&provider.command, err));
+        }
+    };
+    if let Err(err) = record_child_identity(child.id(), generation_context) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = mark_runtime_generation_exited(generation_context, None);
+        return Err(err);
+    }
+    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context);
     drop(pty.slave);
 
     let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
@@ -1130,6 +1161,7 @@ fn unlink_owned_socket(path: &Path, owned_dir: &Path) {
 }
 
 struct SessionRuntimeIdleGuard {
+    context: Option<SpawnIdentityContext>,
     session_id: Option<String>,
     invocation_uuid: Option<String>,
     exit_code: Option<i32>,
@@ -1138,6 +1170,7 @@ struct SessionRuntimeIdleGuard {
 impl SessionRuntimeIdleGuard {
     fn new(context: Option<&SpawnIdentityContext>) -> Self {
         Self {
+            context: context.cloned(),
             session_id: context
                 .and_then(SpawnIdentityContext::session_id)
                 .map(str::to_string),
@@ -1149,6 +1182,12 @@ impl SessionRuntimeIdleGuard {
 
 impl Drop for SessionRuntimeIdleGuard {
     fn drop(&mut self) {
+        if self.exit_code.is_some() {
+            let _ =
+                mark_runtime_generation_orderly_completed(self.context.as_ref(), self.exit_code);
+        } else {
+            let _ = mark_runtime_generation_exited(self.context.as_ref(), self.exit_code);
+        }
         let (Some(session_id), Some(invocation_uuid)) = (&self.session_id, &self.invocation_uuid)
         else {
             return;
@@ -2029,9 +2068,10 @@ fn format_control_write_timeout_error(err: io::Error) -> String {
     format!("Failed to set PTY control write timeout: {err}")
 }
 
-fn control_response_parts(response: Result<(), String>) -> (bool, String) {
+fn control_response_parts(response: Result<Option<String>, String>) -> (bool, String) {
     match response {
-        Ok(()) => (true, "ok".to_string()),
+        Ok(Some(delivery_nonce)) => (true, pty_delivery_ack_message(&delivery_nonce)),
+        Ok(None) => (true, "ok".to_string()),
         Err(message) => (false, message),
     }
 }
@@ -2065,18 +2105,19 @@ fn process_control_request(
     if result.is_ok() {
         flush_pending_child_input_to_completion(master_fd, &mut pending_child_input)?;
     }
-    result
+    result.map(|_| ())
 }
 
 fn process_control_request_with_pending(
     stream: &mut UnixStream,
     io: &mut ControlRequestIo<'_>,
     expected_target: Option<(&str, &str)>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     validate_control_request_peer(stream)?;
     let payload = prepare_control_payload(read_control_request_payload(stream)?, expected_target)?;
     if payload.bytes.is_empty() {
-        return acknowledge_control_payload(&payload);
+        acknowledge_control_payload(&payload)?;
+        return Ok(payload.delivery_attempt_id);
     }
     // Prefer a short child-output quiet window. After the bounded wait, a TUI
     // that continuously redraws may still receive delivery only at a verified
@@ -2092,7 +2133,8 @@ fn process_control_request_with_pending(
     )?;
     submit_control_request_payload(io.pending_child_input, &payload.bytes);
     io.line_state.mark_submitted();
-    acknowledge_control_payload(&payload)
+    acknowledge_control_payload(&payload)?;
+    Ok(payload.delivery_attempt_id)
 }
 
 fn prepare_control_payload(
@@ -3436,7 +3478,7 @@ print(json.dumps({
             process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(None));
         assert!(
             started.elapsed() < Duration::from_millis(800),
             "idle redraws must not require the old long quiet window"
@@ -3491,7 +3533,7 @@ print(json.dumps({
         };
 
         writer.join().unwrap();
-        assert_eq!(result, Ok(()));
+        assert_eq!(result, Ok(None));
         assert!(started.elapsed() >= INJECT_WAIT_LIMIT);
         set_nonblocking(child_reader.as_raw_fd());
         let mut injected = Vec::new();

@@ -3,7 +3,10 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
 //! `validator`
 
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow, RuntimeGenerationResolution,
+    RuntimeGenerationSelector,
+};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
 use oulipoly_state::{InvocationRecord, StateDb};
 use serde::Serialize;
@@ -22,13 +25,17 @@ struct NotifyResponse {
     matched_chain_index: Option<usize>,
     matched_pid: Option<i64>,
     owner_invocation_uuid: Option<String>,
+    owner_generation_uuid: Option<String>,
     owner_session_id: Option<String>,
     session_source: Option<String>,
     seq: Option<i64>,
     pty_delivery: Option<PtyMailboxDeliveryDiagnostic>,
+    payload_file_path: Option<String>,
+    payload_sha256: Option<String>,
+    payload_byte_len: Option<i64>,
+    payload_retention_policy: Option<String>,
     wake: Option<WakeDiagnostic>,
 }
-
 #[derive(Debug, Clone)]
 struct CallerIdentity {
     chain_index: usize,
@@ -39,6 +46,7 @@ struct CallerIdentity {
 struct ResolvedOwner {
     session_id: String,
     invocation_uuid: String,
+    generation_uuid: Option<String>,
     matched_chain_index: usize,
     matched_identity: ProcessIdentity,
     source: OwnerSessionSource,
@@ -434,7 +442,34 @@ fn resolve_owner_for_chain_entry(
     let Some(row) = lookup_chain_entry_pid_row(sidecar, entry)? else {
         return Ok(None);
     };
-    owner_from_pid_row(entry, &row)
+    let generation_uuid = generation_for_pid_row(sidecar, entry, &row)?;
+    owner_from_pid_row(entry, &row, generation_uuid)
+}
+
+fn generation_for_pid_row(
+    sidecar: &PidIdentityDb,
+    entry: &CallerIdentity,
+    row: &PidIdentityRow,
+) -> Result<Option<String>, NotifyError> {
+    let mailbox = MailboxDb::open_read_only(sidecar.path()).map_err(NotifyError::Storage)?;
+    match mailbox
+        .resolve_runtime_generation(RuntimeGenerationSelector::ProcessIdentity(&entry.identity))
+        .map_err(|err| NotifyError::Storage(err.to_string()))?
+    {
+        RuntimeGenerationResolution::NotFound => Ok(None),
+        RuntimeGenerationResolution::Found(generation) => {
+            if generation.spawn_invocation_uuid != row.invocation_uuid {
+                return Err(NotifyError::Storage(
+                    "Runtime generation invocation evidence conflicts with exact PID owner"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(generation.generation_id.to_string()))
+        }
+        RuntimeGenerationResolution::Ambiguous(_) => Err(NotifyError::Storage(
+            "Ambiguous runtime generations for exact process identity".to_string(),
+        )),
+    }
 }
 
 fn lookup_chain_entry_pid_row(
@@ -449,31 +484,41 @@ fn lookup_chain_entry_pid_row(
 fn owner_from_pid_row(
     entry: &CallerIdentity,
     row: &PidIdentityRow,
+    generation_uuid: Option<String>,
 ) -> Result<Option<ResolvedOwner>, NotifyError> {
-    if let Some(owner) = owner_from_sidecar_session(entry, row) {
+    if let Some(owner) = owner_from_sidecar_session(entry, row, generation_uuid.clone()) {
         return Ok(Some(owner));
     }
-    owner_from_state_invocation(entry, row)
+    owner_from_state_invocation(entry, row, generation_uuid)
 }
 
 fn owner_from_sidecar_session(
     entry: &CallerIdentity,
     row: &PidIdentityRow,
+    generation_uuid: Option<String>,
 ) -> Option<ResolvedOwner> {
     row.session_id.clone().map(|session_id| {
-        resolved_owner(entry, row, session_id, OwnerSessionSource::SidecarSessionId)
+        resolved_owner(
+            entry,
+            row,
+            session_id,
+            generation_uuid,
+            OwnerSessionSource::SidecarSessionId,
+        )
     })
 }
 
 fn owner_from_state_invocation(
     entry: &CallerIdentity,
     row: &PidIdentityRow,
+    generation_uuid: Option<String>,
 ) -> Result<Option<ResolvedOwner>, NotifyError> {
     Ok(resolve_state_invocation_session(row)?.map(|session_id| {
         resolved_owner(
             entry,
             row,
             session_id,
+            generation_uuid,
             OwnerSessionSource::StateDbInvocationJoin,
         )
     }))
@@ -483,11 +528,13 @@ fn resolved_owner(
     entry: &CallerIdentity,
     row: &PidIdentityRow,
     session_id: String,
+    generation_uuid: Option<String>,
     source: OwnerSessionSource,
 ) -> ResolvedOwner {
     ResolvedOwner {
         session_id,
         invocation_uuid: row.invocation_uuid.clone(),
+        generation_uuid,
         matched_chain_index: entry.chain_index,
         matched_identity: entry.identity.clone(),
         source,
@@ -601,7 +648,7 @@ fn notify_success_response(
             "enqueued",
             true,
             Some(&owner),
-            Some(row.seq),
+            Some(&row),
             Some(pty_delivery),
             Some(wake),
         ),
@@ -615,7 +662,7 @@ fn notify_success_response(
             "already_enqueued",
             true,
             Some(&owner),
-            Some(row.seq),
+            Some(&row),
             Some(pty_delivery),
             Some(wake),
         ),
@@ -688,7 +735,7 @@ fn notify_response(
     status: &str,
     enqueued: bool,
     owner: Option<&ResolvedOwner>,
-    seq: Option<i64>,
+    row: Option<&MailboxRow>,
     pty_delivery: Option<PtyMailboxDeliveryDiagnostic>,
     wake: Option<Option<WakeDiagnostic>>,
 ) -> NotifyResponse {
@@ -700,9 +747,14 @@ fn notify_response(
         matched_chain_index: owner.map(|owner| owner.matched_chain_index),
         matched_pid: owner.map(|owner| owner.matched_identity.os_pid),
         owner_invocation_uuid: owner.map(|owner| owner.invocation_uuid.clone()),
+        owner_generation_uuid: owner.and_then(|owner| owner.generation_uuid.clone()),
         owner_session_id: owner.map(|owner| owner.session_id.clone()),
         session_source: owner.map(|owner| owner.source.as_str().to_string()),
-        seq,
+        seq: row.map(|row| row.seq),
+        payload_file_path: row.and_then(|row| row.payload_file_path.clone()),
+        payload_sha256: row.and_then(|row| row.payload_sha256.clone()),
+        payload_byte_len: row.and_then(|row| row.payload_byte_len),
+        payload_retention_policy: row.and_then(|row| row.payload_retention_policy.clone()),
         pty_delivery,
         wake: wake.flatten(),
     }

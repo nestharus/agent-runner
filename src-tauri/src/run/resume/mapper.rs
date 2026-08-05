@@ -23,6 +23,7 @@ pub(super) fn prepared_headless_resume_execution(
         mailbox_session_id: mailbox_delivery.session_id,
         mailbox_delivery_seqs: mailbox_delivery.seqs,
         mailbox_delivery_nonce: mailbox_delivery.delivery_nonce,
+        mailbox_delivery_requires_turn_confirmation: mailbox_delivery.requires_turn_confirmation,
         env,
         resolved,
         effective_spawn_cwd,

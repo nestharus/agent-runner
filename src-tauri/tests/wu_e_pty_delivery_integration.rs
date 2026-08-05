@@ -4,9 +4,11 @@ use oulipoly_runtime::executor::cli::pty_broker::{
     inject_control_envelope, render_mailbox_notification_envelope,
 };
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, EnqueueResult, MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-    MAX_UNCONFIRMED_DELIVERY_ATTEMPTS, MailboxDb, MailboxDeliveryWindow, MailboxRow,
-    SessionRuntimeRunningUpdate, WAKE_SWEEP_ABANDONED_ERROR,
+    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
+    MAILBOX_DELIVERY_UNCONFIRMED_ERROR, MAX_UNCONFIRMED_DELIVERY_ATTEMPTS, MailboxDb,
+    MailboxDeliveryWindow, MailboxRow, RuntimeGenerationFence, RuntimeGenerationId,
+    RuntimeLifecycleState, RuntimeTerminalReason, SessionRuntimeRunningUpdate,
+    WAKE_SWEEP_ABANDONED_ERROR,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -193,6 +195,31 @@ impl Fixture {
 
     fn mark_live_pty_runtime(&self, identity: &ProcessIdentity, control_path: &Path) {
         let mut mailbox = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let generation_id = RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap();
+        mailbox
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: INVOCATION_A,
+                session_id: Some(SESSION_A),
+                runtime_mode: "pty_interactive",
+                provider_name: "fixture-provider",
+                model_name: Some("fixture-model"),
+                pty_control_path: Some(&path_string(control_path)),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        mailbox
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: INVOCATION_A,
+                },
+                spawned_os_pid: identity.os_pid,
+                exact_process_identity: Some(identity),
+                os_pgid: None,
+            })
+            .unwrap();
         mailbox
             .mark_session_running(SessionRuntimeRunningUpdate {
                 session_id: SESSION_A,
@@ -445,7 +472,7 @@ fn notify_control_ack_before_provider_observation_leaves_mailbox_recoverable() {
     fixture.record_owner_identity(&identity);
     let socket = fixture.socket_path("ack.sock");
     let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
+    let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
     let output = fixture.run_notify("h-live-ack", caller_chain(&identity));
@@ -513,7 +540,7 @@ fn pty_reconciliation_requires_exact_provider_user_turn_marker() {
         fixture.record_owner_identity(&identity);
         let socket = fixture.socket_path(&format!("reconcile-{evidence}.sock"));
         let captured = Arc::new(Mutex::new(String::new()));
-        let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
+        let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
         fixture.mark_live_pty_runtime(&identity, &socket);
         let handle = format!("h-reconcile-{evidence}");
 
@@ -562,7 +589,7 @@ fn pty_reconciliation_requires_exact_provider_user_turn_marker() {
             assert_eq!(delivered[0].delivery_attempts, 1);
             assert_eq!(
                 delivered[0].delivered_by_invocation_uuid.as_deref(),
-                Some(LIVE_INVOCATION)
+                Some(INVOCATION_A)
             );
         } else {
             assert_eq!(
@@ -585,7 +612,7 @@ fn accepted_pty_attempt_suppresses_repeated_notify_and_newer_overtake() {
     fixture.record_owner_identity(&identity);
     let socket = fixture.socket_path("accepted-owner.sock");
     let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
+    let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
     let first = fixture.run_notify("h-owned-prefix", caller_chain(&identity));
@@ -724,7 +751,7 @@ fn undeliverable_older_rows_do_not_hide_accepted_pty_owner() {
     drop(mailbox);
     let socket = fixture.socket_path("deliverable-owner.sock");
     let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
+    let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
     let first = fixture.run_notify("h-deliverable-owner", caller_chain(&identity));
@@ -756,6 +783,35 @@ fn undeliverable_older_rows_do_not_hide_accepted_pty_owner() {
     assert_eq!(mailbox.list_pending(SESSION_A).unwrap().len(), 3);
     assert!(!captured.lock().unwrap().contains(&abandoned.handle));
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
+    let fixture = Fixture::new();
+    let identity = current_identity();
+    fixture.record_owner_identity(&identity);
+    let socket = fixture.socket_path("generic-ack.sock");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
+    fixture.mark_live_pty_runtime(&identity, &socket);
+
+    let output = fixture.run_notify("h-generic-ack", caller_chain(&identity));
+    server.join().unwrap();
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["pty_delivery"]["status"], "unconfirmed_ack");
+    assert_eq!(value["wake"]["status"], "busy");
+    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered_at.is_none());
+    assert_eq!(rows[0].delivery_attempts, 1);
+    let generation = fixture
+        .mailbox()
+        .runtime_generation(&RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap())
+        .unwrap()
+        .unwrap();
+    assert!(generation.active_delivery_claim_id.is_none());
 }
 
 #[test]
@@ -863,7 +919,7 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
 
     assert_success(&output);
     let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "connect_error");
+    assert_eq!(value["pty_delivery"]["status"], "stale_generation");
     assert_ne!(value["wake"]["status"], "busy");
     let runtime = fixture
         .mailbox()
@@ -944,6 +1000,16 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
         .unwrap();
     assert_eq!(runtime.run_state, "idle");
     assert!(runtime.pty_control_path.is_none());
+    let history = fixture
+        .mailbox()
+        .runtime_generation_history(SESSION_A)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].lifecycle_state, RuntimeLifecycleState::Exited);
+    assert_eq!(
+        history[0].terminal_reason,
+        Some(RuntimeTerminalReason::OrderlyCompletion)
+    );
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -1935,8 +2001,13 @@ fn spawn_control_server(
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let payload = read_inject_payload(&mut stream);
+        let response_message = if message == "$delivery_nonce" {
+            format!("delivery_ack:{}", delivery_nonce_from_payload(&payload))
+        } else {
+            message.to_string()
+        };
         *captured.lock().unwrap() = payload;
-        write_response(&mut stream, ack, message);
+        write_response(&mut stream, ack, &response_message);
     })
 }
 
@@ -1955,12 +2026,20 @@ fn spawn_timeout_then_ack_control_server(
         drop(first);
 
         let (mut retry, _) = listener.accept().unwrap();
-        captured
-            .lock()
-            .unwrap()
-            .push(read_inject_payload(&mut retry));
-        write_response(&mut retry, true, "ok");
+        let payload = read_inject_payload(&mut retry);
+        captured.lock().unwrap().push(payload.clone());
+        write_response(
+            &mut retry,
+            true,
+            &format!("delivery_ack:{}", delivery_nonce_from_payload(&payload)),
+        );
     })
+}
+
+fn delivery_nonce_from_payload(payload: &str) -> &str {
+    let start = payload.rfind("[OULIPOLY-DELIVERY ").unwrap() + "[OULIPOLY-DELIVERY ".len();
+    let tail = &payload[start..];
+    &tail[..tail.find(']').unwrap()]
 }
 
 struct OuterPty {

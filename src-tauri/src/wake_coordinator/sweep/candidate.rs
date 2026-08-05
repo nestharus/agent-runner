@@ -3,7 +3,9 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `predicate`, `orchestration`
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeRow, WakeSweepCandidate};
+use oulipoly_state::mailbox::{
+    MailboxDb, MailboxRow, SessionGenerationProjection, SessionRuntimeRow, WakeSweepCandidate,
+};
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
 use super::{WakeSweepDisposition, consumed};
@@ -117,6 +119,13 @@ fn wake_sweep_candidate_is_resumable(
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<bool, String> {
+    if !matches!(
+        db.session_generation_projection(&candidate.session_id)
+            .map_err(|err| err.to_string())?,
+        SessionGenerationProjection::None
+    ) {
+        return Ok(false);
+    }
     let Some(runtime) = wake_sweep_candidate_runtime(db, candidate)? else {
         return Ok(false);
     };

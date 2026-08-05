@@ -6,7 +6,8 @@ mod claim;
 mod liveness;
 
 use oulipoly_state::mailbox::{
-    MailboxDb, SessionLiveness, SessionRuntimeRow, WakeClaimAcquireResult, WakeClaimRow,
+    MailboxDb, SessionGenerationProjection, SessionLiveness, SessionRuntimeRow,
+    WakeClaimAcquireResult, WakeClaimRow,
 };
 use uuid::Uuid;
 
@@ -71,6 +72,9 @@ fn prepare_wake_start_context<'a>(
     claim_token: &str,
 ) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
     let mut db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
+    if generation_authority_blocks_wake(&db, input.session_id)? {
+        return Err(busy_diagnostic());
+    }
     let runtime =
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
@@ -91,6 +95,15 @@ fn validate_wake_has_deliverable_pending(session_id: &str) -> Result<(), WakeDia
         Ok(_) => Ok(()),
         Err(err) => Err(storage_error_diagnostic(err)),
     }
+}
+
+fn generation_authority_blocks_wake(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<bool, WakeDiagnostic> {
+    db.session_generation_projection(session_id)
+        .map(|projection| !matches!(projection, SessionGenerationProjection::None))
+        .map_err(|err| storage_error_diagnostic(err.to_string()))
 }
 
 fn wake_start_context<'a>(

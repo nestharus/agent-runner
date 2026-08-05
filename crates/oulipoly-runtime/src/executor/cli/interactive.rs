@@ -34,7 +34,9 @@ use super::pty_broker;
 use super::resume::{ResumePayload, compose_resume_provider_args};
 use super::spawn_identity::{
     SpawnIdentityContext, SpawnRuntimeMode, context_from_parent_invocation_env,
-    record_child_identity,
+    mark_runtime_generation_exited, mark_runtime_generation_orderly_completed,
+    mark_runtime_generation_spawn_failed, record_child_identity,
+    register_runtime_generation_starting,
 };
 use super::terminal_signal;
 use crate::provider_registry::ProviderRegistry;
@@ -127,7 +129,7 @@ fn execute_interactive_with_result_and_monitor_context(
         model_name,
         resume_session_id,
         working_dir,
-    );
+    )?;
     #[cfg(unix)]
     if pty_broker::controlling_terminal_available() {
         let cmd =
@@ -150,13 +152,29 @@ fn execute_interactive_with_result_and_monitor_context(
     let mut cmd =
         interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
     configure_interactive_stdio(&mut cmd);
-    let mut child = spawn_interactive_child(cmd, provider)?;
+    register_runtime_generation_starting(spawn_identity.as_ref())?;
+    let mut child = match spawn_interactive_child(cmd, provider) {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = mark_runtime_generation_spawn_failed(spawn_identity.as_ref());
+            return Err(err);
+        }
+    };
 
     #[cfg(unix)]
     let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-    let _ = record_child_identity(child.id(), spawn_identity.as_ref());
+    if let Err(err) = record_child_identity(child.id(), spawn_identity.as_ref()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = mark_runtime_generation_exited(spawn_identity.as_ref(), None);
+        return Err(err);
+    }
 
     let status = wait_for_interactive_child(&mut child)?;
+    mark_runtime_generation_orderly_completed(
+        spawn_identity.as_ref(),
+        Some(crate::executor::cli::terminal_signal::exit_code_from_status(&status)),
+    )?;
 
     #[cfg(unix)]
     drop(signal_guard);
@@ -213,8 +231,8 @@ fn interactive_spawn_identity_context(
     model_name: Option<&str>,
     resume_session_id: Option<&str>,
     working_dir: Option<&Path>,
-) -> Option<SpawnIdentityContext> {
-    context_from_parent_invocation_env(
+) -> Result<Option<SpawnIdentityContext>, String> {
+    Ok(context_from_parent_invocation_env(
         parent_invocation_env,
         &provider.name,
         model_name,
@@ -222,7 +240,7 @@ fn interactive_spawn_identity_context(
         SpawnRuntimeMode::PtyInteractive,
         working_dir,
         None,
-    )
+    ))
 }
 
 fn wait_for_interactive_child(child: &mut Child) -> Result<ExitStatus, String> {

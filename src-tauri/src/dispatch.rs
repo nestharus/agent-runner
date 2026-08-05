@@ -74,7 +74,7 @@ pub(crate) use clock::utc_now;
 pub(crate) use formatter::format_timestamp_rfc3339;
 pub(crate) use parent_invocation::resolve_parent_invocation_id;
 pub(crate) use parser::provider_session_marker_uuid;
-use parser::resume_target_arg;
+use parser::{resume_target_arg, resume_target_kind};
 pub(crate) use pre_invocation_failure::emit_pre_invocation_failure;
 pub(crate) use predicate::{
     diagnostics_model_configured, execution_succeeded, should_emit_resume_short_line,
@@ -228,6 +228,7 @@ fn dispatch_subcommand(
             rotate_provider,
             prompt,
             file,
+            submission_token,
             project,
             models_dir,
         } => dispatch_resume_subcommand(
@@ -238,6 +239,7 @@ fn dispatch_subcommand(
                 rotate_provider: rotate_provider.as_deref(),
                 prompt: prompt.as_deref(),
                 file: file.as_deref(),
+                submission_token: submission_token.as_deref(),
                 project: project.as_deref(),
                 models_dir: models_dir.as_deref(),
             },
@@ -378,6 +380,7 @@ struct ResumeDispatchArgs<'a> {
     rotate_provider: Option<&'a str>,
     prompt: Option<&'a str>,
     file: Option<&'a std::path::Path>,
+    submission_token: Option<&'a str>,
     project: Option<&'a std::path::Path>,
     models_dir: Option<&'a std::path::Path>,
 }
@@ -390,9 +393,11 @@ fn dispatch_resume_subcommand(
         agent_runtime_services,
         args.model,
         resume_target_arg(args.session_id, args.chain_id),
+        resume_target_kind(args.session_id, args.chain_id),
         args.rotate_provider,
         args.prompt,
         args.file,
+        args.submission_token,
         args.project,
         args.models_dir,
     )
@@ -510,9 +515,11 @@ fn dispatch_headless_top_level_resume(
         agent_runtime_services,
         cli.model.as_deref(),
         session_id,
+        oulipoly_state::InboxTargetKind::Session,
         cli.rotate_provider.as_deref(),
         positional_or_stdin_prompt,
         cli.file.as_deref(),
+        cli.submission_token.as_deref(),
         cli.project.as_deref(),
         cli.models_dir.as_deref(),
     )
@@ -890,6 +897,33 @@ mod tests {
         ]);
 
         assert_resume_debug_contains_option_field(command, "session_id", session_id);
+    }
+
+    #[test]
+    fn resume_forms_preserve_caller_submission_token() {
+        let session_id = "5169694d-de0f-40d1-890c-6e28e55bab27";
+        let token = "caller-stable-token";
+        let top_level = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "--resume",
+            session_id,
+            "--submission-token",
+            token,
+            "payload",
+        ])
+        .unwrap();
+        assert_eq!(top_level.submission_token.as_deref(), Some(token));
+
+        let nested = parse_resume_subcommand([
+            "oulipoly-agent-runner",
+            "resume",
+            session_id,
+            "--submission-token",
+            token,
+            "--prompt",
+            "payload",
+        ]);
+        assert_resume_debug_contains_option_field(nested, "submission_token", token);
     }
 
     #[test]

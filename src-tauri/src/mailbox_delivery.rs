@@ -6,9 +6,12 @@ use oulipoly_config::SessionsConfig;
 use oulipoly_runtime::sessions;
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxDeliveryWindow, MailboxRow, SessionRuntimeRow, SessionRuntimeUpsert,
-    mailbox_row_is_deliverable_pending,
+    ExactProcessEvidence, ExitRuntimeGenerationNonOrderly, GenerationMutation, MailboxDb,
+    MailboxDeliveryWindow, MailboxRow, RuntimeGenerationFence, RuntimeLifecycleState,
+    RuntimeTerminalReason, SUBMITTED_INPUT_KIND, SessionGenerationProjection, SessionRuntimeRow,
+    SessionRuntimeUpsert, mailbox_row_is_deliverable_pending,
 };
+use oulipoly_state::pid_identity::{ProcessIdentityObservation, observe_live_process_identity};
 use serde::Serialize;
 use std::path::Path;
 use uuid::Uuid;
@@ -17,11 +20,13 @@ use uuid::Uuid;
 use oulipoly_runtime::executor::cli::pty_broker::{
     PtyControlClientErrorKind, USER_INPUT_IDLE_INJECT_MS, append_notify_trace_record,
     inject_control_envelope, notify_trace_decision, notify_trace_inject_status,
-    render_mailbox_notification_envelope, trace_token,
+    pty_delivery_ack_message, trace_token, unlink_control_socket_if_owned,
 };
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
 const MAILBOX_PREFIX_MAX_BYTES: usize = 64 * 1024;
+const DELIVERY_NONCE_PREFIX: &str = "[OULIPOLY-DELIVERY ";
+const DELIVERY_NONCE_SUFFIX: &str = "]";
 const DELIVERY_NONCE_LENGTH_PLACEHOLDER: &str = "00000000-0000-4000-8000-000000000000";
 
 pub(crate) struct PreparedMailboxDelivery {
@@ -29,6 +34,7 @@ pub(crate) struct PreparedMailboxDelivery {
     pub session_id: String,
     pub seqs: Vec<i64>,
     pub delivery_nonce: Option<String>,
+    pub requires_turn_confirmation: bool,
 }
 
 pub(crate) struct PreparedPtyMailboxDelivery {
@@ -45,6 +51,13 @@ pub(crate) struct PtyMailboxDeliveryDiagnostic {
     pub(crate) delivered_seqs: Vec<i64>,
     pub(crate) remaining_pending: Option<usize>,
     pub(crate) message: Option<String>,
+}
+
+#[cfg(unix)]
+struct PtyRuntimeAuthority {
+    provider_name: Option<String>,
+    control_path: String,
+    delivery_invocation_uuid: String,
 }
 
 #[cfg(unix)]
@@ -73,50 +86,12 @@ fn attempt_pty_mailbox_delivery_inner(
             None,
         );
     }
-    let runtime = match mailbox.session_runtime(session_id) {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => {
-            return pty_status(
-                false,
-                "no_runtime",
-                None,
-                Vec::new(),
-                pending_count(mailbox, session_id),
-                None,
-            );
-        }
-        Err(err) => return pty_status(false, "no_runtime", None, Vec::new(), None, Some(err)),
+    let authority = match pty_runtime_authority(mailbox, session_id) {
+        Ok(authority) => authority,
+        Err(diagnostic) => return diagnostic,
     };
-    if runtime.mode != "pty_interactive" {
-        return pty_status(
-            false,
-            "not_pty",
-            None,
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            None,
-        );
-    }
-    let Some(control_path) = live_pty_control_path(&runtime) else {
-        return pty_status(
-            false,
-            "no_socket",
-            runtime.pty_control_path,
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            None,
-        );
-    };
-    let Some(delivery_invocation_uuid) = runtime.running_invocation_uuid.as_deref() else {
-        return pty_status(
-            false,
-            "protocol_error",
-            Some(control_path),
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            Some("running invocation missing".to_string()),
-        );
-    };
+    let control_path = authority.control_path;
+    let delivery_invocation_uuid = authority.delivery_invocation_uuid;
     let state = match open_default_state_read_only_if_exists() {
         Ok(state) => state,
         Err(err) => {
@@ -130,7 +105,7 @@ fn attempt_pty_mailbox_delivery_inner(
     if let Err(err) = reconcile_accepted_pty_delivery_attempts(
         mailbox,
         state.as_ref(),
-        runtime.provider_name.as_deref(),
+        authority.provider_name.as_deref(),
         session_id,
     ) {
         tracing::warn!(
@@ -162,7 +137,7 @@ fn attempt_pty_mailbox_delivery_inner(
         }
     }
     let Some(prepared) =
-        (match prepare_pty_mailbox_delivery(mailbox, session_id, delivery_invocation_uuid) {
+        (match prepare_pty_mailbox_delivery(mailbox, session_id, &delivery_invocation_uuid) {
             Ok(prepared) => prepared,
             Err(err) => {
                 return pty_status(
@@ -196,11 +171,23 @@ fn attempt_pty_mailbox_delivery_inner(
         );
     }
     match inject_control_envelope(&control_path, &prepared.envelope) {
-        Ok(response) if response.ack => mark_pty_batch_transport_accepted(
+        Ok(response)
+            if response.ack
+                && response.message == pty_delivery_ack_message(&prepared.attempt_id) =>
+        {
+            mark_pty_batch_transport_accepted(
+                mailbox,
+                session_id,
+                &prepared.attempt_id,
+                control_path,
+            )
+        }
+        Ok(response) if response.ack => mark_unconfirmed_pty_ack(
             mailbox,
             session_id,
             &prepared.attempt_id,
             control_path,
+            response.message,
         ),
         Ok(response) => {
             resolve_unacknowledged_pty_attempt_or_warn(mailbox, session_id, &prepared.attempt_id);
@@ -225,6 +212,152 @@ fn attempt_pty_mailbox_delivery_inner(
             pty_client_error_status(mailbox, session_id, control_path, err.kind, err.message)
         }
     }
+}
+
+#[cfg(unix)]
+fn pty_runtime_authority(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+) -> Result<PtyRuntimeAuthority, PtyMailboxDeliveryDiagnostic> {
+    match mailbox.session_generation_projection(session_id) {
+        Ok(SessionGenerationProjection::One(generation)) => {
+            let control_path = generation.pty_control_path.clone();
+            if terminalize_stale_runtime_generation(
+                mailbox,
+                session_id,
+                control_path.as_deref().unwrap_or_default(),
+            ) {
+                return Err(pty_status(
+                    false,
+                    "stale_generation",
+                    control_path,
+                    Vec::new(),
+                    pending_count(mailbox, session_id),
+                    Some("runtime generation process identity is no longer live".to_string()),
+                ));
+            }
+            if generation.runtime_mode != "pty_interactive" {
+                return Err(pty_status(
+                    false,
+                    "not_pty",
+                    None,
+                    Vec::new(),
+                    pending_count(mailbox, session_id),
+                    None,
+                ));
+            }
+            let Some(control_path) = control_path.filter(|path| !path.is_empty()) else {
+                return Err(pty_status(
+                    false,
+                    "no_socket",
+                    None,
+                    Vec::new(),
+                    pending_count(mailbox, session_id),
+                    None,
+                ));
+            };
+            if generation.lifecycle_state != RuntimeLifecycleState::Running {
+                return Err(pty_status(
+                    false,
+                    "no_socket",
+                    Some(control_path),
+                    Vec::new(),
+                    pending_count(mailbox, session_id),
+                    Some(format!(
+                        "runtime generation is {:?}",
+                        generation.lifecycle_state
+                    )),
+                ));
+            }
+            Ok(PtyRuntimeAuthority {
+                provider_name: Some(generation.provider_name.clone()),
+                control_path,
+                delivery_invocation_uuid: generation.spawn_invocation_uuid.clone(),
+            })
+        }
+        Ok(SessionGenerationProjection::Multiple(_)) => Err(pty_status(
+            false,
+            "ambiguous_runtime",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("multiple nonterminal runtime generations".to_string()),
+        )),
+        Ok(SessionGenerationProjection::None) => legacy_pty_runtime_authority(mailbox, session_id),
+        Err(err) => Err(pty_status(
+            false,
+            "no_runtime",
+            None,
+            Vec::new(),
+            None,
+            Some(err.to_string()),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn legacy_pty_runtime_authority(
+    mailbox: &MailboxDb,
+    session_id: &str,
+) -> Result<PtyRuntimeAuthority, PtyMailboxDeliveryDiagnostic> {
+    let runtime = match mailbox.session_runtime(session_id) {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => {
+            return Err(pty_status(
+                false,
+                "no_runtime",
+                None,
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                None,
+            ));
+        }
+        Err(err) => {
+            return Err(pty_status(
+                false,
+                "no_runtime",
+                None,
+                Vec::new(),
+                None,
+                Some(err),
+            ));
+        }
+    };
+    if runtime.mode != "pty_interactive" {
+        return Err(pty_status(
+            false,
+            "not_pty",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        ));
+    }
+    let Some(control_path) = live_pty_control_path(&runtime) else {
+        return Err(pty_status(
+            false,
+            "no_socket",
+            runtime.pty_control_path,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        ));
+    };
+    let Some(delivery_invocation_uuid) = runtime.running_invocation_uuid else {
+        return Err(pty_status(
+            false,
+            "protocol_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some("running invocation missing".to_string()),
+        ));
+    };
+    Ok(PtyRuntimeAuthority {
+        provider_name: runtime.provider_name,
+        control_path,
+        delivery_invocation_uuid,
+    })
 }
 
 #[cfg(unix)]
@@ -256,7 +389,7 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     session_id: &str,
     delivery_invocation_uuid: &str,
 ) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
-    let pending = pending_mailbox_rows(db, session_id)?;
+    let pending = pending_mailbox_rows(db, session_id, None)?;
     if !has_pending_rows(&pending) {
         return Ok(None);
     }
@@ -276,7 +409,7 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     if window.rows.is_empty() {
         return Ok(None);
     }
-    let envelope = render_notification_prefix(&window.rows, window.remaining_count, &attempt_id);
+    let envelope = render_mailbox_prefix(&window.rows, window.remaining_count, &attempt_id)?;
     Ok(Some(PreparedPtyMailboxDelivery {
         envelope,
         attempt_id,
@@ -332,14 +465,57 @@ fn mark_pty_batch_transport_accepted(
 }
 
 #[cfg(unix)]
+fn mark_unconfirmed_pty_ack(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    attempt_id: &str,
+    control_path: String,
+    message: String,
+) -> PtyMailboxDeliveryDiagnostic {
+    let seqs = mailbox
+        .delivery_attempt_window(attempt_id)
+        .ok()
+        .flatten()
+        .map(|window| {
+            window
+                .rows
+                .into_iter()
+                .map(|row| row.seq)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    resolve_unacknowledged_pty_attempt_or_warn(mailbox, session_id, attempt_id);
+    let failure = mailbox
+        .mark_delivery_failed(session_id, &seqs, "mailbox_delivery_unconfirmed")
+        .err();
+    pty_status(
+        true,
+        "unconfirmed_ack",
+        Some(control_path),
+        Vec::new(),
+        pending_count(mailbox, session_id),
+        Some(
+            failure
+                .map(|failure| format!("{message}; {failure}"))
+                .unwrap_or(message),
+        ),
+    )
+}
+
+#[cfg(unix)]
 fn pty_client_error_status(
-    mailbox: &MailboxDb,
+    mailbox: &mut MailboxDb,
     session_id: &str,
     control_path: String,
     kind: PtyControlClientErrorKind,
     message: String,
 ) -> PtyMailboxDeliveryDiagnostic {
     let status = match kind {
+        PtyControlClientErrorKind::Connect
+            if terminalize_stale_runtime_generation(mailbox, session_id, &control_path) =>
+        {
+            "stale_generation"
+        }
         PtyControlClientErrorKind::Connect => "connect_error",
         PtyControlClientErrorKind::Protocol
         | PtyControlClientErrorKind::Oversize
@@ -356,12 +532,55 @@ fn pty_client_error_status(
 }
 
 #[cfg(unix)]
+fn terminalize_stale_runtime_generation(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    control_path: &str,
+) -> bool {
+    let generation = match mailbox.session_generation_projection(session_id) {
+        Ok(SessionGenerationProjection::One(generation)) => generation,
+        Ok(SessionGenerationProjection::None | SessionGenerationProjection::Multiple(_))
+        | Err(_) => return false,
+    };
+    let ExactProcessEvidence::Recorded(identity) = &generation.exact_process_evidence else {
+        return false;
+    };
+    let stale = match observe_live_process_identity(identity.os_pid) {
+        ProcessIdentityObservation::ExactLive(live) => live != *identity,
+        ProcessIdentityObservation::Dead => true,
+        ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => false,
+    };
+    if !stale {
+        return false;
+    }
+    let fence = RuntimeGenerationFence {
+        generation_id: &generation.generation_id,
+        spawn_invocation_uuid: &generation.spawn_invocation_uuid,
+    };
+    let terminalized = mailbox
+        .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+            fence,
+            reason: RuntimeTerminalReason::RecoveredDead,
+            exit_code: None,
+        })
+        .is_ok_and(|result| {
+            matches!(
+                result,
+                GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_)
+            )
+        });
+    let _ = mailbox.session_liveness(session_id);
+    let _ = unlink_control_socket_if_owned(control_path);
+    terminalized
+}
+
+#[cfg(unix)]
 fn pty_client_error_may_have_reached_broker(kind: &PtyControlClientErrorKind) -> bool {
     matches!(kind, PtyControlClientErrorKind::Protocol)
 }
 
 fn pending_count(mailbox: &MailboxDb, session_id: &str) -> Option<usize> {
-    pending_mailbox_rows(mailbox, session_id)
+    pending_mailbox_rows(mailbox, session_id, None)
         .map(|rows| rows.len())
         .ok()
 }
@@ -512,7 +731,7 @@ pub(crate) fn finalize_pty_mailbox_delivery_handoff(
             );
         }
     }
-    let pending_rows = pending_mailbox_rows(&mailbox, session_id)?.len();
+    let pending_rows = pending_mailbox_rows(&mailbox, session_id, None)?.len();
     drop(mailbox);
     crate::wake_coordinator::mark_session_idle_after_turn(
         session_id,
@@ -554,7 +773,12 @@ fn trace_notify_pty_attempt(
     } else {
         "skip"
     };
-    let inject_status = notify_trace_inject_status(base_decision, &diagnostic.status);
+    let trace_status = if diagnostic.status == "stale_generation" {
+        "connect_error"
+    } else {
+        &diagnostic.status
+    };
+    let inject_status = notify_trace_inject_status(base_decision, trace_status);
     let reason = notify_trace_summary_reason(&diagnostic.status);
     let record = format!(
         "trigger={} session_id={} attempted={} input_empty=unknown at_boundary=unknown \
@@ -619,8 +843,8 @@ pub(crate) fn prepare_headless_resume_delivery(
     if db.notifications_paused(&session_id)? {
         return Ok(empty_delivery(answer, session_id));
     }
-    let pending = pending_mailbox_rows(&db, &session_id)?;
-    Ok(delivery_for_pending(session_id, pending, answer))
+    let pending = pending_mailbox_rows(&db, &session_id, Some(&resolved.chain_id))?;
+    delivery_for_pending(session_id, pending, answer)
 }
 
 pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, String> {
@@ -630,15 +854,24 @@ pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, Strin
     if db.notifications_paused(session_id)? {
         return Ok(0);
     }
-    pending_mailbox_rows(&db, session_id).map(|rows| rows.len())
+    pending_mailbox_rows(&db, session_id, None).map(|rows| rows.len())
 }
 
 fn delivery_session_id(resolved: &oulipoly_state::ResolvedResume) -> String {
     resolved.active_session_id.clone()
 }
 
-fn pending_mailbox_rows(db: &MailboxDb, session_id: &str) -> Result<Vec<MailboxRow>, String> {
-    db.list_pending(session_id).map(deliverable_pending_rows)
+fn pending_mailbox_rows(
+    db: &MailboxDb,
+    session_id: &str,
+    chain_id: Option<&str>,
+) -> Result<Vec<MailboxRow>, String> {
+    let rows = db.list_pending_for_delivery(session_id, chain_id)?;
+    for row in &rows {
+        db.verify_mailbox_row_payload(row)
+            .map_err(|err| format!("Mailbox row {} payload unavailable: {err}", row.seq))?;
+    }
+    Ok(deliverable_pending_rows(rows))
 }
 
 fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
@@ -651,9 +884,9 @@ fn delivery_for_pending(
     session_id: String,
     pending: Vec<MailboxRow>,
     answer: Option<String>,
-) -> PreparedMailboxDelivery {
+) -> Result<PreparedMailboxDelivery, String> {
     if !has_pending_rows(&pending) {
-        return empty_delivery(answer, session_id);
+        return Ok(empty_delivery(answer, session_id));
     }
 
     let batch = select_batch(&pending);
@@ -670,6 +903,7 @@ fn empty_delivery(answer: Option<String>, session_id: String) -> PreparedMailbox
         session_id,
         seqs: Vec::new(),
         delivery_nonce: None,
+        requires_turn_confirmation: false,
     }
 }
 
@@ -685,11 +919,22 @@ fn delivery_for_batch(
     session_id: String,
     batch: MailboxBatch,
     answer: Option<String>,
-) -> PreparedMailboxDelivery {
+) -> Result<PreparedMailboxDelivery, String> {
     let seqs = batch_seqs(&batch);
+    let requires_turn_confirmation = batch
+        .rows
+        .iter()
+        .any(|row| row.kind != SUBMITTED_INPUT_KIND);
     let delivery_nonce = new_delivery_nonce();
-    let prefix = render_notification_prefix(&batch.rows, batch.remaining_count, &delivery_nonce);
-    prepared_delivery(session_id, seqs, prefix, answer, delivery_nonce)
+    let prefix = render_mailbox_prefix(&batch.rows, batch.remaining_count, &delivery_nonce)?;
+    Ok(prepared_delivery(
+        session_id,
+        seqs,
+        prefix,
+        answer,
+        delivery_nonce,
+        requires_turn_confirmation,
+    ))
 }
 
 fn prepared_delivery(
@@ -698,12 +943,14 @@ fn prepared_delivery(
     prefix: String,
     answer: Option<String>,
     delivery_nonce: String,
+    requires_turn_confirmation: bool,
 ) -> PreparedMailboxDelivery {
     PreparedMailboxDelivery {
         answer: Some(compose_answer(prefix, answer)),
         session_id,
         seqs,
         delivery_nonce: Some(delivery_nonce),
+        requires_turn_confirmation,
     }
 }
 
@@ -822,15 +1069,93 @@ fn selected_len_before_limit(row_count: usize) -> usize {
 }
 
 fn notification_prefix_len(rows: &[MailboxRow], remaining_count: usize) -> usize {
-    render_notification_prefix(rows, remaining_count, DELIVERY_NONCE_LENGTH_PLACEHOLDER).len()
+    render_mailbox_prefix(rows, remaining_count, DELIVERY_NONCE_LENGTH_PLACEHOLDER)
+        .map(|prefix| prefix.len())
+        .unwrap_or_else(|_| MAILBOX_PREFIX_MAX_BYTES.saturating_add(1))
 }
 
-fn render_notification_prefix(
+fn render_mailbox_prefix(
     rows: &[MailboxRow],
     remaining_count: usize,
     delivery_nonce: &str,
-) -> String {
-    render_mailbox_notification_envelope(rows, remaining_count, delivery_nonce)
+) -> Result<String, String> {
+    let mut rendered = String::new();
+    let contains_input = rows.iter().any(|row| row.kind == SUBMITTED_INPUT_KIND);
+    if contains_input {
+        rendered.push_str("[OULIPOLY INBOX]\n");
+        rendered.push_str("The following accepted inbox items are pending delivery.\n\n");
+    } else {
+        rendered.push_str("[OULIPOLY NOTIFICATIONS]\n");
+        rendered.push_str(
+            "The following background agent-bash workloads completed while this session was inactive.\n\n",
+        );
+    }
+    for (index, row) in rows.iter().enumerate() {
+        if row.kind == SUBMITTED_INPUT_KIND {
+            render_submitted_input(&mut rendered, index, row)?;
+        } else {
+            render_notification(&mut rendered, index, row);
+        }
+    }
+    if remaining_count > 0 {
+        rendered.push_str(&format!(
+            "{remaining_count} additional notification(s) remain queued for the next resume.\n\n"
+        ));
+    }
+    if !contains_input {
+        rendered.push_str("Use the paths above if you need details. Do not assume log content unless you inspect it.\n");
+    }
+    rendered.push_str(DELIVERY_NONCE_PREFIX);
+    rendered.push_str(delivery_nonce);
+    rendered.push_str(DELIVERY_NONCE_SUFFIX);
+    rendered.push('\n');
+    rendered.push_str(if contains_input {
+        "[END OULIPOLY INBOX]"
+    } else {
+        "[END OULIPOLY NOTIFICATIONS]"
+    });
+    Ok(rendered)
+}
+
+fn render_notification(rendered: &mut String, index: usize, row: &MailboxRow) {
+    rendered.push_str(&format!(
+        "{}. kind: {}\n   handle: {}\n   rc: {}\n   state_dir: {}\n   meta: {}\n   log: {}\n   rc_file: {}\n\n",
+        index + 1,
+        sanitize(&row.kind),
+        sanitize(&row.handle),
+        row.rc,
+        quote_path(&row.state_dir),
+        quote_path(&row.meta_path),
+        quote_path(&row.log_path),
+        quote_path(&row.rc_path),
+    ));
+}
+
+fn render_submitted_input(
+    rendered: &mut String,
+    index: usize,
+    row: &MailboxRow,
+) -> Result<(), String> {
+    let path = row
+        .payload_file_path
+        .as_deref()
+        .ok_or_else(|| format!("Input mailbox row {} has no payload file", row.seq))?;
+    let payload = std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "Failed to read input mailbox row {} payload: {err}",
+            row.seq
+        )
+    })?;
+    rendered.push_str(&format!(
+        "{}. kind: {}\n   item_id: {}\n   target: {}:{}\n   payload:\n{}\n\n",
+        index + 1,
+        sanitize(&row.kind),
+        sanitize(&row.handle),
+        sanitize(row.target_kind.as_deref().unwrap_or("unknown")),
+        sanitize(row.target_id.as_deref().unwrap_or("unknown")),
+        payload,
+    ));
+    Ok(())
 }
 
 fn new_delivery_nonce() -> String {
@@ -842,6 +1167,14 @@ fn compose_answer(prefix: String, answer: Option<String>) -> String {
         Some(answer) => format!("{prefix}\n\n[USER RESUME PAYLOAD]\n{answer}"),
         None => prefix,
     }
+}
+
+fn quote_path(path: &str) -> String {
+    format!("\"{}\"", sanitize(path))
+}
+
+fn sanitize(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -857,6 +1190,7 @@ mod tests {
             session_id,
             seqs: Vec::new(),
             delivery_nonce: None,
+            requires_turn_confirmation: false,
         };
 
         assert_eq!(prepared.answer, original);
@@ -864,7 +1198,7 @@ mod tests {
 
     #[test]
     fn notification_prefix_includes_delivery_nonce_near_end() {
-        let prefix = render_notification_prefix(&[], 0, "nonce-123");
+        let prefix = render_mailbox_prefix(&[], 0, "nonce-123").unwrap();
 
         assert!(
             prefix.contains("[OULIPOLY-DELIVERY nonce-123]\n[END OULIPOLY NOTIFICATIONS]"),

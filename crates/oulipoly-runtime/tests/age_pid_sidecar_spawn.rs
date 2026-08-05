@@ -5,7 +5,10 @@ use oulipoly_config::{
 };
 use oulipoly_runtime::executor::{RuntimeExecutorService, SessionCaptureMethod};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest};
-use oulipoly_state::mailbox::{MailboxDb, SessionLiveness};
+use oulipoly_state::mailbox::{
+    MailboxDb, RuntimeGenerationResolution, RuntimeGenerationSelector, RuntimeLifecycleState,
+    RuntimeTerminalReason, SessionLiveness,
+};
 use oulipoly_state::pid_identity::PidIdentityDb;
 use oulipoly_state::{CompositeInvocationId, StateDb};
 use rusqlite::{Connection, OpenFlags};
@@ -105,6 +108,16 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
     assert_eq!(row.provider_name.as_deref(), Some("fixture-provider"));
     assert_eq!(row.model_name.as_deref(), Some("fixture-model"));
     let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+    let generation = mailbox
+        .resolve_runtime_generation(RuntimeGenerationSelector::ProcessIdentity(&row.identity()))
+        .unwrap();
+    assert!(matches!(
+        generation,
+        RuntimeGenerationResolution::Found(ref generation)
+            if generation.lifecycle_state == RuntimeLifecycleState::Exited
+                && generation.session_id.is_none()
+                && generation.terminal_reason == Some(RuntimeTerminalReason::OrderlyCompletion)
+    ));
     assert!(
         mailbox
             .session_runtime("fixture-missing-session")
@@ -165,6 +178,18 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
     assert_eq!(row.session_id.as_deref(), Some(CAPTURED_SESSION_ID));
 
     let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+    let generations = mailbox
+        .runtime_generation_history(CAPTURED_SESSION_ID)
+        .unwrap();
+    assert_eq!(generations.len(), 1);
+    assert_eq!(
+        generations[0].lifecycle_state,
+        RuntimeLifecycleState::Exited
+    );
+    assert_eq!(
+        generations[0].terminal_reason,
+        Some(RuntimeTerminalReason::OrderlyCompletion)
+    );
     let runtime = mailbox
         .session_runtime(CAPTURED_SESSION_ID)
         .unwrap()

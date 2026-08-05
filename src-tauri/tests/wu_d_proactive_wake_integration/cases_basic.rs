@@ -21,6 +21,7 @@ use crate::validators::{
     assert_single_wake_child_launch, assert_single_wake_claim_won, assert_xdg_isolated,
 };
 use crate::wake_claim_setup::acquire_seed_wake_claim;
+use oulipoly_state::mailbox::RuntimeLifecycleState;
 
 pub(crate) fn idle_wake_delivers() {
     let _guard = integration_test_guard();
@@ -149,6 +150,19 @@ sleep 0.2"#,
         &fixture.prompt_file("concurrent-wake-launches.log"),
     ));
     assert_no_wake_claim(&fixture, SESSION);
+    let generations = fixture
+        .mailbox()
+        .runtime_generation_history(SESSION)
+        .unwrap();
+    assert_eq!(
+        generations.len(),
+        1,
+        "concurrent notify spawned duplicate runtimes"
+    );
+    assert_eq!(
+        generations[0].lifecycle_state,
+        RuntimeLifecycleState::Exited
+    );
     assert_xdg_isolated(&fixture);
 }
 

@@ -29,20 +29,22 @@ use super::request_builder::{build_launch_candidate, build_launch_request, build
 use super::terminal_classify_handoff::classify_after_launch_success;
 use crate::executor::ExecutionResult;
 use crate::executor::cli::spawn_identity::{
-    SpawnIdentityContext, SpawnRuntimeMode, backfill_captured_session_id,
-    context_from_parent_invocation_env, record_child_identity,
+    RunningRuntimeGeneration, SpawnIdentityContext, SpawnRuntimeMode, backfill_captured_session_id,
+    context_from_parent_invocation_env, mark_runtime_generation_exited,
+    mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
+    record_child_identity, register_runtime_generation_starting,
 };
 use crate::provider_registry::ProviderRegistry;
 use crate::services::ServiceError;
 use oulipoly_provider::client::ProcessSpawnObserver;
 use oulipoly_provider::error::ProviderClientError;
+use oulipoly_provider::generated::ProcessStatus;
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::stream::LaunchResult;
 use oulipoly_provider::stream::{DecodedLaunchEvent, LaunchEventObserver};
-use oulipoly_state::pid_identity::ProcessIdentity;
 use std::sync::{Arc, Mutex};
 
-type RecordedLaunchIdentity = Arc<Mutex<Option<ProcessIdentity>>>;
+type RecordedLaunchGeneration = Arc<Mutex<Option<Result<RunningRuntimeGeneration, String>>>>;
 
 /// A single account attempt either succeeded, hit a deterministic terminal
 /// failure (fail fast), or hit a rotatable transport-class failure (try the
@@ -130,11 +132,11 @@ fn attempt_account_dispatch(
     context: &ExternalProviderDispatchContext,
 ) -> Result<ExecutionResult, AccountAttemptError> {
     let spawn_identity = external_launch_spawn_identity_context(context);
-    let recorded_identity = recorded_launch_identity();
+    let recorded_generation = recorded_launch_generation();
     let spawn_observer =
-        external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_identity));
+        external_launch_spawn_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
     let launch_event_observer =
-        external_launch_event_observer(spawn_identity.as_ref(), Arc::clone(&recorded_identity));
+        external_launch_event_observer(spawn_identity.as_ref(), Arc::clone(&recorded_generation));
     let client = registry.client_factory().client_for_with_observers(
         artifact.clone(),
         spawn_observer,
@@ -150,13 +152,36 @@ fn attempt_account_dispatch(
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
     let launch_request = build_launch_request(context, &candidate)
         .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
-    let launch_result = invoke_provider_launch(&client, launch_request)
-        .map_err(classify_provider_client_attempt_error)?;
+    register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
+        terminal_attempt_error(protocol_service_error(
+            "runtime_generation_registration_failed",
+        ))
+    })?;
+    let launch_result = match invoke_provider_launch(&client, launch_request) {
+        Ok(result) => result,
+        Err(error) => {
+            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(classify_provider_client_attempt_error(error));
+        }
+    };
+    require_recorded_external_generation(&recorded_generation).map_err(|_| {
+        terminal_attempt_error(protocol_service_error("runtime_generation_bind_failed"))
+    })?;
     backfill_external_launch_session_id(
         spawn_identity.as_ref(),
-        &recorded_identity,
+        &recorded_generation,
         &launch_result,
-    );
+    )
+    .map_err(|_| {
+        terminal_attempt_error(protocol_service_error("runtime_generation_attach_failed"))
+    })?;
+    mark_runtime_generation_orderly_completed(
+        spawn_identity.as_ref(),
+        launch_exit_code(&launch_result.exit.status),
+    )
+    .map_err(|_| {
+        terminal_attempt_error(protocol_service_error("runtime_generation_exit_failed"))
+    })?;
     let classification = classify_after_launch_success(registry, context, &launch_result);
 
     Ok(map_launch_result_with_terminal_classification(
@@ -165,6 +190,13 @@ fn attempt_account_dispatch(
         &context.provider.name,
         classification,
     ))
+}
+
+fn launch_exit_code(status: &ProcessStatus) -> Option<i32> {
+    match status {
+        ProcessStatus::Exited { code } => Some(*code),
+        _ => None,
+    }
 }
 
 fn external_launch_spawn_identity_context(
@@ -181,34 +213,36 @@ fn external_launch_spawn_identity_context(
     )
 }
 
-fn recorded_launch_identity() -> RecordedLaunchIdentity {
+fn recorded_launch_generation() -> RecordedLaunchGeneration {
     Arc::new(Mutex::new(None))
 }
 
 fn external_launch_spawn_observer(
     context: Option<&SpawnIdentityContext>,
-    recorded_identity: RecordedLaunchIdentity,
+    recorded_generation: RecordedLaunchGeneration,
 ) -> Option<ProcessSpawnObserver> {
     let context = context.cloned()?;
     Some(ProcessSpawnObserver::new(move |child_id| {
-        let identity = record_child_identity(child_id, Some(&context));
-        remember_recorded_launch_identity(&recorded_identity, identity);
+        let generation = record_child_identity(child_id, Some(&context)).and_then(|generation| {
+            generation.ok_or_else(|| "Missing external runtime generation".to_string())
+        });
+        remember_recorded_launch_generation(&recorded_generation, generation);
     }))
 }
 
 fn external_launch_event_observer(
     context: Option<&SpawnIdentityContext>,
-    recorded_identity: RecordedLaunchIdentity,
+    recorded_generation: RecordedLaunchGeneration,
 ) -> Option<LaunchEventObserver> {
     let context = context.cloned()?;
     Some(LaunchEventObserver::new(move |event| {
-        backfill_external_launch_session_marker(&context, &recorded_identity, event);
+        backfill_external_launch_session_marker(&context, &recorded_generation, event);
     }))
 }
 
 fn backfill_external_launch_session_marker(
     context: &SpawnIdentityContext,
-    recorded_identity: &RecordedLaunchIdentity,
+    recorded_generation: &RecordedLaunchGeneration,
     event: &DecodedLaunchEvent,
 ) {
     let DecodedLaunchEvent::Marker { name, value, .. } = event else {
@@ -220,33 +254,55 @@ fn backfill_external_launch_session_marker(
     let Some(session_id) = marker_provider_session_id(value) else {
         return;
     };
-    let identity = recorded_identity
+    let generation = recorded_generation
         .lock()
         .ok()
-        .and_then(|identity| identity.clone());
-    backfill_captured_session_id(Some(context), identity.as_ref(), &session_id);
+        .and_then(|generation| generation.as_ref()?.as_ref().ok().cloned());
+    let _ = backfill_captured_session_id(Some(context), generation.as_ref(), &session_id);
 }
 
-fn remember_recorded_launch_identity(
-    recorded_identity: &RecordedLaunchIdentity,
-    identity: Option<ProcessIdentity>,
+fn remember_recorded_launch_generation(
+    recorded_generation: &RecordedLaunchGeneration,
+    generation: Result<RunningRuntimeGeneration, String>,
 ) {
-    if let Ok(mut recorded_identity) = recorded_identity.lock() {
-        *recorded_identity = identity;
+    if let Ok(mut recorded_generation) = recorded_generation.lock() {
+        *recorded_generation = Some(generation);
+    }
+}
+
+fn require_recorded_external_generation(
+    recorded_generation: &RecordedLaunchGeneration,
+) -> Result<RunningRuntimeGeneration, String> {
+    recorded_generation
+        .lock()
+        .map_err(|_| "External runtime generation lock poisoned".to_string())?
+        .clone()
+        .ok_or_else(|| "External provider launch did not report a spawned process".to_string())?
+}
+
+fn finalize_failed_external_launch(
+    context: Option<&SpawnIdentityContext>,
+    recorded_generation: &RecordedLaunchGeneration,
+) {
+    let spawned = recorded_generation
+        .lock()
+        .ok()
+        .and_then(|generation| generation.as_ref().map(Result::is_ok));
+    if spawned == Some(true) {
+        let _ = mark_runtime_generation_exited(context, None);
+    } else {
+        let _ = mark_runtime_generation_spawn_failed(context);
     }
 }
 
 fn backfill_external_launch_session_id(
     context: Option<&SpawnIdentityContext>,
-    recorded_identity: &RecordedLaunchIdentity,
+    recorded_generation: &RecordedLaunchGeneration,
     result: &LaunchResult,
-) {
+) -> Result<(), String> {
     let Some(session_id) = launch_provider_session_id(result) else {
-        return;
+        return Ok(());
     };
-    let identity = recorded_identity
-        .lock()
-        .ok()
-        .and_then(|identity| identity.clone());
-    backfill_captured_session_id(context, identity.as_ref(), &session_id);
+    let generation = require_recorded_external_generation(recorded_generation)?;
+    backfill_captured_session_id(context, Some(&generation), &session_id)
 }

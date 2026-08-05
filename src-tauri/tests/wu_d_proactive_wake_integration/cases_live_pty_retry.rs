@@ -28,7 +28,10 @@ pub(crate) fn live_pty_nack_pending_is_retried_by_sweep() {
     let control = spawn_control_socket(
         &fixture,
         "live-pty-retry.sock",
-        vec![control_nack("unsafe_mid_line"), control_ack("ok")],
+        vec![
+            control_nack("unsafe_mid_line"),
+            control_ack("$delivery_nonce"),
+        ],
     );
     let identity = fixture.seed_live_pty_runtime(&control.path);
     fixture.record_identity(&identity);
@@ -76,7 +79,7 @@ pub(crate) fn live_pty_acked_pending_is_submitted_once_across_repeated_sweeps() 
     let control = spawn_control_socket(
         &fixture,
         "live-pty-submit-once.sock",
-        vec![control_ack("ok")],
+        vec![control_ack("$delivery_nonce")],
     );
     let identity = fixture.seed_live_pty_runtime(&control.path);
     fixture.record_identity(&identity);
@@ -154,7 +157,7 @@ sleep 10"#,
         "live-pty-owner-driver.sock",
         vec![
             control_nack("unsafe_mid_line"),
-            control_ack("ok"),
+            control_ack("$delivery_nonce"),
             control_ack("leaked"),
         ],
     );
@@ -269,11 +272,25 @@ fn control_socket_thread(
         for response in responses {
             let (mut stream, _) = listener.accept().unwrap();
             let payload = read_control_payload(&mut stream);
+            let response = resolve_control_response(response, &payload);
             payloads.lock().unwrap().push(payload);
             write_control_response(&mut stream, &response);
             accepted.fetch_add(1, Ordering::SeqCst);
         }
     }
+}
+
+fn resolve_control_response(mut response: ControlResponse, payload: &str) -> ControlResponse {
+    if response.message == "$delivery_nonce" {
+        response.message = format!("delivery_ack:{}", delivery_nonce_from_payload(payload));
+    }
+    response
+}
+
+fn delivery_nonce_from_payload(payload: &str) -> &str {
+    let start = payload.rfind("[OULIPOLY-DELIVERY ").unwrap() + "[OULIPOLY-DELIVERY ".len();
+    let tail = &payload[start..];
+    &tail[..tail.find(']').unwrap()]
 }
 
 fn read_control_payload(stream: &mut UnixStream) -> String {

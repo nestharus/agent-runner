@@ -5,7 +5,8 @@
 use chrono::{DateTime, Utc};
 use oulipoly_state::StateDb;
 use oulipoly_state::pid_identity::{
-    PidIdentityDb, PidIdentityRow, ProcessIdentity, read_live_process_identity,
+    PidIdentityDb, PidIdentityRow, ProcessIdentity, ProcessIdentityObservation,
+    observe_live_process_identity,
 };
 use std::path::Path;
 
@@ -214,10 +215,12 @@ fn pid_identity_row_liveness(row: &PidIdentityRow) -> Option<bool> {
 }
 
 fn live_process_identity_state(os_pid: i64) -> LiveProcessIdentityState {
-    match read_live_process_identity(os_pid) {
-        Ok(Some(identity)) => LiveProcessIdentityState::Live(identity),
-        Ok(None) => LiveProcessIdentityState::Dead,
-        Err(_) => LiveProcessIdentityState::Unknown,
+    match observe_live_process_identity(os_pid) {
+        ProcessIdentityObservation::ExactLive(identity) => LiveProcessIdentityState::Live(identity),
+        ProcessIdentityObservation::Dead => LiveProcessIdentityState::Dead,
+        ProcessIdentityObservation::Unsupported | ProcessIdentityObservation::ReadError(_) => {
+            LiveProcessIdentityState::Unknown
+        }
     }
 }
 
