@@ -172,7 +172,7 @@ fn interactive_provider_args(
     let mut no_prompt = None;
     apply_provider_policy(provider, &mut provider_args, &mut no_prompt)?;
     match resume {
-        Some(resume) => compose_resume_provider_args(provider_args, resume),
+        Some(resume) => compose_resume_provider_args(provider, provider_args, resume),
         None => Ok(provider_args),
     }
 }

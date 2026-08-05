@@ -266,9 +266,9 @@ impl StateDb {
         latest_invocation: Option<String>,
         chain_model: Option<String>,
     ) -> Option<String> {
-        latest_invocation
+        chain_model
             .filter(|name| Self::resume_model_name_is_known(name))
-            .or(chain_model.filter(|name| Self::resume_model_name_is_known(name)))
+            .or(latest_invocation.filter(|name| Self::resume_model_name_is_known(name)))
     }
 
     pub(super) fn resume_model_name_is_known(model_name: &str) -> bool {
