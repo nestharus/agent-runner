@@ -89,6 +89,14 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
         return crate::commands::session_list::run_session_list(*json);
     }
 
+    // Maintenance must not trigger wake recovery before it inspects or compacts storage.
+    if let Some(Subcommands::Mailbox {
+        command: command @ MailboxSubcommands::CompactDelivered { .. },
+    }) = &cli.command
+    {
+        return dispatch_mailbox_subcommand(command.clone());
+    }
+
     if let Err(err) = recover_pending_session_replaces() {
         return Ok(handle_pending_session_replace_error(&err));
     }
@@ -355,6 +363,9 @@ fn dispatch_mailbox_subcommand(command: MailboxSubcommands) -> Result<i32, Strin
             delivered_by,
             json,
         } => crate::commands::mailbox::run_ack(&session_id, from_seq, to_seq, &delivered_by, json),
+        MailboxSubcommands::CompactDelivered { limit, apply, json } => {
+            crate::commands::mailbox::run_compact_delivered(limit, apply, json)
+        }
     }
 }
 

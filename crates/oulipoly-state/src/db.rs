@@ -179,7 +179,8 @@ pub use self::resume_types::{
     ResumeNativeCandidate, TurnPreview, WrongIdKindInput,
 };
 use self::resume_types::{
-    ParsedTurnPreviewTimestamp, RecentTurnRow, WrongIdKindInvocationMatch, WrongIdKindInvocationRow,
+    ParsedTurnPreviewTimestamp, RecentTurnRow, ResumeChainCandidate, WrongIdKindInvocationMatch,
+    WrongIdKindInvocationRow,
 };
 use self::returned_artifacts_codec::{
     InvocationIdentity, ParsedReturnedArtifactFieldValues, ReturnedArtifactFieldError,

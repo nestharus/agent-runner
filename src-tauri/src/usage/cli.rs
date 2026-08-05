@@ -439,6 +439,20 @@ pub(crate) enum MailboxSubcommands {
         #[arg(long)]
         json: bool,
     },
+    /// Move delivered notification payloads from inline SQLite rows into the immutable payload store.
+    CompactDelivered {
+        /// Maximum delivered rows to compact in this invocation.
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+
+        /// Apply compaction. Without this flag the command only reports eligible rows.
+        #[arg(long)]
+        apply: bool,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]

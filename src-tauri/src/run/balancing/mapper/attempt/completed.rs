@@ -32,6 +32,7 @@ pub(in crate::run::balancing) struct CompletedAttemptInputSource<'a, 'state, 'ct
     pub(in crate::run::balancing) zero_turn_provider_session_id: Option<&'a str>,
     pub(in crate::run::balancing) attempts: usize,
     pub(in crate::run::balancing) max_attempts: usize,
+    pub(in crate::run::balancing) recovered_generic_nonzero: bool,
 }
 
 pub(in crate::run::balancing) fn completed_attempt_input<'a, 'state, 'ctx>(
@@ -54,6 +55,7 @@ pub(in crate::run::balancing) fn completed_attempt_input<'a, 'state, 'ctx>(
         zero_turn_provider_session_id: source.zero_turn_provider_session_id,
         attempts: source.attempts,
         max_attempts: source.max_attempts,
+        recovered_generic_nonzero: source.recovered_generic_nonzero,
     }
 }
 
@@ -69,6 +71,7 @@ pub(in crate::run::balancing) fn completed_attempt_input_for_attempt<'a, 'state,
     terminal: AttemptTerminalInput<'a, 'ctx>,
     run_input: CompletedAttemptRunInput<'a>,
     budget: AttemptBudgetInput,
+    recovered_generic_nonzero: bool,
 ) -> CompletedAttemptInput<'a, 'state, 'ctx> {
     let (agent_runtime_services, env, invocation, invocation_row_id, guard) = lifecycle;
     let (provider_name, provider_index, zero_turn_provider_session_id) = provider;
@@ -92,5 +95,6 @@ pub(in crate::run::balancing) fn completed_attempt_input_for_attempt<'a, 'state,
         zero_turn_provider_session_id,
         attempts,
         max_attempts,
+        recovered_generic_nonzero,
     })
 }

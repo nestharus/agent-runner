@@ -9,12 +9,14 @@
 //!
 //! `orchestration`, `mapper`, `predicate`, `accessor`, `formatter`
 //!
-//! - `orchestration`: `zero_turn_record_baseline` / `zero_turn_classify_after_completion`
-//!   sequence the session scan + turn-count read + core classification.
-//! - `mapper`: `zero_turn_classification_for_action` / `apply_zero_turn_classification_to_*`
-//!   map a classification onto the executor `terminal_signal` / `terminal_reason` fields.
-//! - `predicate`: `zero_turn_completion_can_replace_signal`,
-//!   `zero_turn_classification_is_non_productive`, `is_confirmed_zero_turn_exhaustion`.
+//! - `orchestration`: `zero_turn_record_baseline` / `classify_after_completion`
+//!   sequence execution, session scans, turn-count reads, and core classification.
+//! - `mapper`: `apply_resume_completion_action` / `completion_classification` /
+//!   `zero_turn_classification_for_action` / `apply_zero_turn_classification_to_*`
+//!   project classifications onto assessment and executor fields.
+//! - `predicate`: `recovered_generic_nonzero` /
+//!   `zero_turn_completion_can_replace_signal` /
+//!   `zero_turn_classification_is_non_productive` / `is_confirmed_zero_turn_exhaustion`.
 //! - `accessor`: `provider_has_no_session_source` / `has_session_source` /
 //!   `baseline_turn_count_from_scan` read session-source + turn-count state.
 //! - `formatter`: `maybe_quota_exhausted_reason` builds the terminal-reason string.
@@ -45,9 +47,9 @@ use oulipoly_state::StateDb;
 
 use crate::zero_turn_orchestration::{
     HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
-    ZeroTurnEvidence, classify_completion, classify_completion_delta, record_baseline,
+    ZeroTurnEvidence, classify_accepted_provider_turn, classify_completion,
+    classify_completion_delta, record_baseline, record_baseline_with_completion,
 };
-
 fn zero_turn_zero_counts() -> oulipoly_state::SessionTurnCounts {
     session_turn_counts(0, 0, 0)
 }
@@ -92,33 +94,10 @@ fn baseline_turn_count_from_scan(
     }
 }
 
-fn classify_from_turn_count_result<E>(
-    baseline: &ZeroTurnBaseline,
-    count_result: Result<oulipoly_state::SessionTurnCounts, E>,
-    host_observed: HostObservedCompletion,
-) -> ZeroTurnClassification {
-    classify_turn_counts_or_scan_failed(
-        baseline,
-        turn_counts_or_scan_failed(count_result),
-        host_observed,
-    )
-}
-
 fn turn_counts_or_scan_failed<E>(
     count_result: Result<oulipoly_state::SessionTurnCounts, E>,
 ) -> Option<oulipoly_state::SessionTurnCounts> {
     count_result.ok()
-}
-
-fn classify_turn_counts_or_scan_failed(
-    baseline: &ZeroTurnBaseline,
-    counts: Option<oulipoly_state::SessionTurnCounts>,
-    host_observed: HostObservedCompletion,
-) -> ZeroTurnClassification {
-    counts.map_or_else(
-        || classify_completion(baseline, zero_turn_zero_counts(), host_observed),
-        |counts| classify_completion(baseline, counts, host_observed),
-    )
 }
 
 pub(crate) fn zero_turn_record_baseline(
@@ -133,11 +112,23 @@ pub(crate) fn zero_turn_record_baseline(
     if provider_has_no_session_source(sessions_cfg, provider_name) {
         return record_baseline(provider_name, Some(session_id), None, true);
     }
-    let report = oulipoly_runtime::sessions::scan_provider(provider_name, sessions_cfg, state);
+    let report = oulipoly_runtime::sessions::scan_provider_session(
+        provider_name,
+        sessions_cfg,
+        state,
+        session_id,
+    );
     let scan_failed = scan_report_has_errors(&report);
     let baseline_count =
         baseline_turn_count_from_scan(state, provider_name, session_id, scan_failed);
-    record_baseline(provider_name, Some(session_id), baseline_count, scan_failed)
+    let baseline_completion = report.assistant_completions.get(session_id).cloned();
+    record_baseline_with_completion(
+        provider_name,
+        Some(session_id),
+        baseline_count,
+        baseline_completion,
+        scan_failed,
+    )
 }
 
 pub(crate) fn zero_turn_classify_after_completion(
@@ -146,22 +137,95 @@ pub(crate) fn zero_turn_classify_after_completion(
     baseline: &ZeroTurnBaseline,
     host_observed: HostObservedCompletion,
 ) -> ZeroTurnClassification {
+    classify_after_completion(state, sessions_cfg, baseline, host_observed).classification
+}
+
+pub(crate) fn zero_turn_classify_after_completion_with_recovery(
+    state: &StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    baseline: &ZeroTurnBaseline,
+    host_observed: HostObservedCompletion,
+    result: &executor::ExecutionResult,
+) -> (ZeroTurnClassification, bool) {
+    let completion = classify_after_completion(state, sessions_cfg, baseline, host_observed);
+    let recovered = recovered_generic_nonzero(completion.accepted_provider_turn, result);
+    (completion.classification, recovered)
+}
+
+struct CompletionClassification {
+    classification: ZeroTurnClassification,
+    accepted_provider_turn: bool,
+}
+
+fn classify_after_completion(
+    state: &StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    baseline: &ZeroTurnBaseline,
+    host_observed: HostObservedCompletion,
+) -> CompletionClassification {
     let Some(session_id) = baseline.provider_session_id.as_deref() else {
-        return classify_completion(baseline, zero_turn_zero_counts(), host_observed);
+        return completion_classification(
+            classify_completion(baseline, zero_turn_zero_counts(), host_observed),
+            false,
+        );
     };
     if baseline.scan_failed {
-        return classify_completion(baseline, zero_turn_zero_counts(), host_observed);
+        return completion_classification(
+            classify_completion(baseline, zero_turn_zero_counts(), host_observed),
+            false,
+        );
     }
-    let report =
-        oulipoly_runtime::sessions::scan_provider(&baseline.provider_name, sessions_cfg, state);
+    let report = oulipoly_runtime::sessions::scan_provider_session(
+        &baseline.provider_name,
+        sessions_cfg,
+        state,
+        session_id,
+    );
     if scan_report_has_errors(&report) {
-        return ZeroTurnClassification::UnclassifiedScanFailed;
+        return completion_classification(ZeroTurnClassification::UnclassifiedScanFailed, false);
     }
-    classify_from_turn_count_result(
+    let Some(counts) =
+        turn_counts_or_scan_failed(state.count_session_turns(&baseline.provider_name, session_id))
+    else {
+        return completion_classification(
+            classify_completion(baseline, zero_turn_zero_counts(), host_observed),
+            false,
+        );
+    };
+    let accepted_provider_turn = classify_accepted_provider_turn(
         baseline,
-        state.count_session_turns(&baseline.provider_name, session_id),
-        host_observed,
+        counts.clone(),
+        false,
+        report.assistant_completions.get(session_id),
     )
+    .is_some();
+    completion_classification(
+        classify_completion(baseline, counts, host_observed),
+        accepted_provider_turn,
+    )
+}
+
+fn completion_classification(
+    classification: ZeroTurnClassification,
+    accepted_provider_turn: bool,
+) -> CompletionClassification {
+    CompletionClassification {
+        classification,
+        accepted_provider_turn,
+    }
+}
+
+fn recovered_generic_nonzero(
+    accepted_provider_turn: bool,
+    result: &executor::ExecutionResult,
+) -> bool {
+    accepted_provider_turn
+        && result.exit_code != 0
+        && result.terminal_reason.as_deref() == Some("exit_nonzero")
+        && result
+            .terminal_signal
+            .as_ref()
+            .is_some_and(|signal| signal.kind == TerminalSignalKind::NonzeroExit)
 }
 
 pub(crate) fn host_observed_completion_from_result(
@@ -351,4 +415,96 @@ pub(crate) fn zero_turn_late_bind_baseline(
         has_source.then(zero_turn_zero_counts),
         !has_source,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::recovered_generic_nonzero;
+    use oulipoly_runtime::executor::{
+        CapturedChildInvocation, ExecutionResult, SessionCaptureMethod, SessionCaptureResult,
+        TerminalSignal,
+    };
+    use std::time::SystemTime;
+
+    fn result(
+        kind: Option<super::TerminalSignalKind>,
+        exit_code: i32,
+        reason: &str,
+    ) -> ExecutionResult {
+        ExecutionResult {
+            stdout: Vec::new(),
+            stderr: "physical provider error".to_string(),
+            exit_code,
+            provider_index: 0,
+            session_capture: SessionCaptureResult {
+                session_id: Some("session-1".to_string()),
+                method: SessionCaptureMethod::ForcedFlagVerified,
+            },
+            resume_acceptance: None,
+            terminal_reason: Some(reason.to_string()),
+            terminal_signal: kind.map(|kind| TerminalSignal {
+                kind,
+                provider_name: "provider-a".to_string(),
+                evidence: "typed evidence".to_string(),
+                observed_at: SystemTime::UNIX_EPOCH,
+            }),
+            produced_assistant_response: false,
+            submitted_user_turn: None,
+            captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
+            returned_artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepted_turn_recovers_only_exact_generic_physical_nonzero() {
+        assert!(recovered_generic_nonzero(
+            true,
+            &result(
+                Some(super::TerminalSignalKind::NonzeroExit),
+                1,
+                "exit_nonzero"
+            )
+        ));
+
+        for kind in [
+            super::TerminalSignalKind::CleanExit,
+            super::TerminalSignalKind::SignalExit,
+            super::TerminalSignalKind::SpawnError,
+            super::TerminalSignalKind::QuotaExhaustedInband,
+            super::TerminalSignalKind::MaybeQuotaExhausted,
+            super::TerminalSignalKind::RateLimited,
+            super::TerminalSignalKind::ProviderStorageContention,
+            super::TerminalSignalKind::ProlongedSilence,
+            super::TerminalSignalKind::Unknown,
+        ] {
+            assert!(!recovered_generic_nonzero(
+                true,
+                &result(Some(kind), 1, "exit_nonzero")
+            ));
+        }
+        assert!(!recovered_generic_nonzero(
+            true,
+            &result(None, 1, "exit_nonzero")
+        ));
+        assert!(!recovered_generic_nonzero(
+            true,
+            &result(
+                Some(super::TerminalSignalKind::NonzeroExit),
+                0,
+                "exit_nonzero"
+            )
+        ));
+        assert!(!recovered_generic_nonzero(
+            true,
+            &result(Some(super::TerminalSignalKind::NonzeroExit), 1, "unknown")
+        ));
+        assert!(!recovered_generic_nonzero(
+            false,
+            &result(
+                Some(super::TerminalSignalKind::NonzeroExit),
+                1,
+                "exit_nonzero"
+            )
+        ));
+    }
 }

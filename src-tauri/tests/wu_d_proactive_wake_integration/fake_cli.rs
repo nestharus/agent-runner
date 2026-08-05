@@ -52,6 +52,7 @@ pub(crate) fn notify_command(
         .env("AGENT_BASH_AGENT_RUNNER_BIN", runner_bin())
         .env("WU_D_WORK_DIR", &fixture.work_dir)
         .env_remove("OULIPOLY_DATA_DIR")
+        .env_remove("OULIPOLY_AUTO_WAKE_MAX")
         .env_remove("OULIPOLY_PARENT_INVOCATION")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

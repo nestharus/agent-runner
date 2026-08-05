@@ -39,13 +39,17 @@ pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) effective_spawn_cwd: &'a Path,
     pub(super) attempts: usize,
     pub(super) max_attempts: usize,
+    pub(super) recovered_generic_nonzero: bool,
 }
 
 pub(super) fn finalize_completed_attempt(
     mut input: CompletedAttemptInput<'_, '_>,
 ) -> Result<CompletedAttemptControl, String> {
-    let success = super::predicate::completed_attempt_success(input.result);
-    let error_category = completed_attempt_error_category(&input);
+    let success = input.recovered_generic_nonzero
+        || super::predicate::completed_attempt_success(input.result);
+    let error_category = (!input.recovered_generic_nonzero)
+        .then(|| completed_attempt_error_category(&input))
+        .flatten();
     let quota_exhausted =
         super::predicate::completed_attempt_quota_exhausted(error_category.as_deref());
 
@@ -148,7 +152,11 @@ fn handle_completed_success(input: &CompletedAttemptInput<'_, '_>) -> CompletedA
         },
     );
     let _ = std::io::stdout().write_all(&input.result.stdout);
-    CompletedAttemptControl::Return(input.result.exit_code)
+    CompletedAttemptControl::Return(if input.recovered_generic_nonzero {
+        0
+    } else {
+        input.result.exit_code
+    })
 }
 
 fn handle_quota_exhausted(input: &CompletedAttemptInput<'_, '_>) -> CompletedAttemptControl {

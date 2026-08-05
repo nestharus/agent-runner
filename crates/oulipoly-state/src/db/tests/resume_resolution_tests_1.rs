@@ -21,6 +21,65 @@
 
 use super::common::*;
 use super::*;
+
+const SHARED_NATIVE_ID: &str = "opaque-shared-session";
+const RESUME_MODEL: &str = "provider-neutral-resume";
+
+fn provider_neutral_model_store() -> std::collections::HashMap<String, oulipoly_config::ModelConfig>
+{
+    model_store_from_toml(&[(
+        RESUME_MODEL,
+        r#"
+[[providers]]
+name = "provider-a"
+interactive_args = ["launch"]
+
+[[providers]]
+name = "provider-b"
+interactive_args = ["launch"]
+"#,
+    )])
+}
+
+fn seed_ranked_chain(db: &StateDb, chain_id: &str, provider_name: &str, last_used_at: &str) {
+    seed_test_chain(
+        db,
+        chain_id,
+        provider_name,
+        SHARED_NATIVE_ID,
+        RESUME_MODEL,
+        last_used_at,
+    );
+}
+
+fn seed_owner_evidence(
+    db: &StateDb,
+    invocation_uuid: &str,
+    provider_name: &str,
+    provider_session_id: &str,
+    status: &str,
+    success: Option<i64>,
+    finished_at: Option<&str>,
+) {
+    db.conn
+        .execute(
+            "INSERT INTO invocations
+                 (invocation_uuid, model_name, provider_name, provider_index, status, success,
+                  provider_session_id, created_at, finished_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, '2026-04-17T07:00:00Z', ?7)",
+            sqlite::params![
+                invocation_uuid,
+                RESUME_MODEL,
+                provider_name,
+                status,
+                success,
+                provider_session_id,
+                finished_at
+            ],
+        )
+        .unwrap();
+}
+
 #[test]
 fn resolve_resume_returns_active_segment_for_single_chain() {
     let db = test_db();
@@ -169,7 +228,227 @@ fn resolve_resume_treats_multiple_matching_segments_in_one_chain_as_one_lineage(
 }
 
 #[test]
-fn resolve_resume_rejects_multiple_native_chains_without_ordering_them() {
+fn resolve_resume_prefers_qualified_success_over_chain_recency() {
+    let db = test_db();
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", "2026-04-17T08:00:00Z");
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", "2026-04-17T10:00:00Z");
+    seed_owner_evidence(
+        &db,
+        "success-provider-a",
+        "provider-a",
+        SHARED_NATIVE_ID,
+        "succeeded",
+        Some(1),
+        Some("2026-04-17T08:30:00Z"),
+    );
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_A);
+}
+
+#[test]
+fn resolve_resume_does_not_transfer_success_across_provider_names() {
+    let db = test_db();
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", "2026-04-17T08:00:00Z");
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", "2026-04-17T10:00:00Z");
+    seed_owner_evidence(
+        &db,
+        "success-provider-c",
+        "provider-c",
+        SHARED_NATIVE_ID,
+        "succeeded",
+        Some(1),
+        Some("2026-04-17T11:00:00Z"),
+    );
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_B);
+}
+
+#[test]
+fn resolve_resume_ignores_non_successful_owner_rows() {
+    let db = test_db();
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", "2026-04-17T08:00:00Z");
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", "2026-04-17T10:00:00Z");
+    for (uuid, status, success, finished_at) in [
+        (
+            "failed-provider-a",
+            "failed",
+            Some(0),
+            Some("2026-04-17T11:00:00Z"),
+        ),
+        ("running-provider-a", "running", None, None),
+        (
+            "legacy-provider-a",
+            "legacy",
+            Some(1),
+            Some("2026-04-17T12:00:00Z"),
+        ),
+        ("incomplete-provider-a", "succeeded", Some(1), None),
+    ] {
+        seed_owner_evidence(
+            &db,
+            uuid,
+            "provider-a",
+            SHARED_NATIVE_ID,
+            status,
+            success,
+            finished_at,
+        );
+    }
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_B);
+}
+
+#[test]
+fn resolve_resume_prefers_most_recent_qualified_success() {
+    let db = test_db();
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", "2026-04-17T10:00:00Z");
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", "2026-04-17T08:00:00Z");
+    seed_owner_evidence(
+        &db,
+        "earlier-success-provider-a",
+        "provider-a",
+        SHARED_NATIVE_ID,
+        "succeeded",
+        Some(1),
+        Some("2026-04-17T10:30:00Z"),
+    );
+    seed_owner_evidence(
+        &db,
+        "later-success-provider-b",
+        "provider-b",
+        SHARED_NATIVE_ID,
+        "succeeded",
+        Some(1),
+        Some("2026-04-17T11:00:00Z"),
+    );
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_B);
+}
+
+#[test]
+fn resolve_resume_uses_recency_when_qualified_successes_are_equivalent() {
+    let db = test_db();
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", "2026-04-17T08:00:00Z");
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", "2026-04-17T10:00:00Z");
+    for (uuid, provider_name) in [
+        ("equal-success-provider-a", "provider-a"),
+        ("equal-success-provider-b", "provider-b"),
+    ] {
+        seed_owner_evidence(
+            &db,
+            uuid,
+            provider_name,
+            SHARED_NATIVE_ID,
+            "succeeded",
+            Some(1),
+            Some("2026-04-17T11:00:00Z"),
+        );
+    }
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_B);
+}
+
+#[test]
+fn resolve_resume_keeps_stable_chain_id_fallback() {
+    let db = test_db();
+    let tied_at = "2026-04-17T10:00:00Z";
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", tied_at);
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", tied_at);
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_A);
+}
+
+#[test]
+fn resolve_resume_keeps_explicit_chain_selection_exact() {
+    let db = test_db();
+    seed_test_chain(
+        &db,
+        CHAIN_A,
+        "provider-a",
+        "provider-a-native-session",
+        RESUME_MODEL,
+        "2026-04-17T08:00:00Z",
+    );
+    seed_test_chain(
+        &db,
+        CHAIN_B,
+        "provider-b",
+        CHAIN_A,
+        RESUME_MODEL,
+        "2026-04-17T10:00:00Z",
+    );
+    seed_owner_evidence(
+        &db,
+        "success-provider-b-chain-id-collision",
+        "provider-b",
+        CHAIN_A,
+        "succeeded",
+        Some(1),
+        Some("2026-04-17T11:00:00Z"),
+    );
+
+    let resolved = db
+        .resolve_resume(&provider_neutral_model_store(), CHAIN_A, None)
+        .unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_A);
+    assert_eq!(resolved.active_provider, "provider-a");
+}
+
+#[test]
+fn resolve_resume_rejects_malformed_qualified_success_completion() {
+    let db = test_db();
+    seed_ranked_chain(&db, CHAIN_A, "provider-a", "2026-04-17T08:00:00Z");
+    seed_ranked_chain(&db, CHAIN_B, "provider-b", "2026-04-17T10:00:00Z");
+    seed_owner_evidence(
+        &db,
+        "malformed-success-provider-a",
+        "provider-a",
+        SHARED_NATIVE_ID,
+        "succeeded",
+        Some(1),
+        Some("not-a-timestamp"),
+    );
+
+    let error = db
+        .resolve_resume(&provider_neutral_model_store(), SHARED_NATIVE_ID, None)
+        .unwrap_err();
+
+    match error {
+        ResumeError::Db { message } => assert!(
+            message.contains("Bad invocation successful owner finished_at not-a-timestamp"),
+            "unexpected state error: {message}"
+        ),
+        other => panic!("expected malformed durable state error, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_resume_chooses_most_recent_chain_without_ambiguous_halt() {
     let db = test_db();
     seed_test_chain(
         &db,
@@ -185,21 +464,52 @@ fn resolve_resume_rejects_multiple_native_chains_without_ordering_them() {
         "provider-a2",
         SESSION_A,
         "provider-a-opus",
+        "2026-04-17T09:00:00Z",
+    );
+    seed_test_chain(
+        &db,
+        CHAIN_C,
+        "provider-a",
+        SESSION_A,
+        "provider-a-opus",
         "2026-04-17T10:00:00Z",
     );
     let models = resolver_model_store();
 
-    let error = db.resolve_resume(&models, SESSION_A, None).unwrap_err();
+    let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
 
-    match error {
-        ResumeError::Ambiguous { input, previews } => {
-            assert_eq!(input, SESSION_A);
-            assert_eq!(previews.len(), 2);
-            assert!(previews.iter().any(|preview| preview.chain_id == CHAIN_A));
-            assert!(previews.iter().any(|preview| preview.chain_id == CHAIN_B));
-        }
-        other => panic!("expected ambiguous native resume, got {other:?}"),
-    }
+    assert_eq!(resolved.chain_id, CHAIN_C);
+}
+
+#[test]
+fn resolve_resume_breaks_equal_last_used_tie_by_latest_segment_start() {
+    let db = test_db();
+    let last_used_at = "2026-04-17T10:00:00Z";
+    seed_chain_row(&db, CHAIN_A, "provider-a-opus", last_used_at);
+    seed_segment_row(
+        &db,
+        CHAIN_A,
+        "provider-a",
+        SESSION_A,
+        "2026-04-17T08:00:00Z",
+        None,
+        "initial",
+    );
+    seed_chain_row(&db, CHAIN_B, "provider-a-opus", last_used_at);
+    seed_segment_row(
+        &db,
+        CHAIN_B,
+        "provider-a2",
+        SESSION_A,
+        "2026-04-17T09:00:00Z",
+        None,
+        "initial",
+    );
+    let models = resolver_model_store();
+
+    let resolved = db.resolve_resume(&models, SESSION_A, None).unwrap();
+
+    assert_eq!(resolved.chain_id, CHAIN_B);
 }
 
 #[test]

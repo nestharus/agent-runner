@@ -6,23 +6,39 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
    e.g. opencode-turns ~/.local/share/opencode ses_abc123
 
 Session IDs and message content are read through the public OpenCode CLI.
-The command defaults to `opencode`, or to `opencodeN` when BASE_DIR contains
-`.opencodeN`; `OPENCODE_BIN` overrides this:
+The command is `opencode`, or `opencodeN` when BASE_DIR contains `.opencodeN`.
+Every child process is bound to BASE_DIR's parent through `XDG_DATA_HOME`:
   opencode session list --json
   opencode export <sessionID>
 
 When SESSION_ID arguments are supplied, they are used directly. If no
 SESSION_ID arguments are supplied, the SESSION_ID environment variable is used
-as the direct target list. BASE_DIR is accepted for compatibility with existing
-session source configuration; implicit discovery uses `opencode session list
---json`, not OpenCode's private storage layout.
+as the direct target list. BASE_DIR determines the OpenCode storage root used by
+both implicit discovery and direct export. Discovery uses `opencode session
+list --json`, not OpenCode's private storage layout.
 
 Implicit discovery is bounded to the recent quota-balancing window. If the
 session list does not expose timestamps, the adapter falls back to a small cap
 of most-recent CLI-listed sessions.
 
+## Declared roles
+`accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator`
+
 Emits one JSON object per line on stdout:
-  {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"user|assistant","body":[{"type":"text","text":"..."}]}
+  {"session_id":"ses_...","turn_id":"msg_...","timestamp":"<rfc3339>","role":"assistant","completion_outcome":"stop","body":[{"type":"text","text":"..."}]}
+
+`completion_outcome` is an optional string member of the
+`runner-normalized-turn-script-jsonl-contract`. The OpenCode adapter emits it
+only on assistant turns when public `info.finish` is a non-empty string,
+preserving every non-empty value verbatim (including `stop`, `tool-calls`, and
+`error`). User turns and assistant turns with a missing or empty outcome omit
+the member; adapters must not emit JSON `null`. Runtime ingestion retains the
+value only as scan-local completion evidence and does not persist it in
+`session_turns` or decide acceptance. Only the pure classifier accepts exact
+`stop`, and only with a usable pre-scan baseline, an error-free post-scan, a
+positive non-regressing assistant delta, exact-session equality, and a newer
+cursor. Text, role, exit code, count delta alone, missing/empty outcomes, and
+other non-empty outcomes never prove acceptance.
 
 If an OpenCode CLI call times out, the adapter emits every turn collected so far
 and then appends:
@@ -34,7 +50,6 @@ selection.
 import json
 import os
 import re
-import shlex
 import signal
 import subprocess
 import sys
@@ -525,6 +540,19 @@ def role_from_obj(obj: dict) -> str | None:
     return None
 
 
+def completion_outcome_from_obj(obj: dict) -> str | None:
+    candidates = map(finish_from_mapping, metadata_mappings_from_obj(obj))
+    return next(filter(has_non_empty_completion_outcome, candidates), None)
+
+
+def finish_from_mapping(mapping: dict):
+    return mapping.get("finish")
+
+
+def has_non_empty_completion_outcome(value) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
 def turn_id_from_obj(obj: dict, default_session_id: str, index: int) -> str:
     return turn_id_field_from_obj(obj) or fallback_turn_id(default_session_id, index)
 
@@ -550,26 +578,7 @@ def fallback_turn_id(default_session_id: str, index: int) -> str:
 
 
 def opencode_command() -> list[str]:
-    configured = configured_opencode_command()
-    if configured is None:
-        return default_opencode_command(sys.argv)
-    return command_tokens_or_default(configured_command_tokens(configured))
-
-
-def configured_opencode_command() -> str | None:
-    return os.environ.get("OPENCODE_BIN")
-
-
-def configured_command_tokens(configured: str) -> list[str]:
-    return shlex.split(configured)
-
-
-def command_tokens_or_default(tokens: list[str]) -> list[str]:
-    return tokens or ["opencode"]
-
-
-def default_opencode_command(argv: list[str]) -> list[str]:
-    return [opencode_command_name_from_base_dir(base_dir_arg(argv))]
+    return [opencode_command_name_from_base_dir(base_dir_arg(sys.argv))]
 
 
 def opencode_command_name_from_base_dir(base_dir: str) -> str:
@@ -587,6 +596,18 @@ def formatted_opencode_command_name(suffix: str | None) -> str:
     if suffix is None:
         return "opencode"
     return f"opencode{suffix}"
+
+
+def opencode_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("OPENCODE_BIN", None)
+    environment["XDG_DATA_HOME"] = opencode_data_home(base_dir_arg(sys.argv))
+    return environment
+
+
+def opencode_data_home(base_dir: str) -> str:
+    expanded_base_dir = os.path.normpath(os.path.expanduser(base_dir))
+    return os.path.dirname(expanded_base_dir)
 
 
 def run_opencode(
@@ -622,6 +643,7 @@ def spawn_opencode_process(args: list[str]) -> subprocess.Popen:
         stdin=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
+        env=opencode_environment(),
     )
 
 
@@ -719,6 +741,7 @@ def record_from_message(default_session_id: str, index: int, obj: dict) -> dict 
     record = message_record_from_fields(
         fields, turn_id_from_obj(obj, default_session_id, index)
     )
+    record = record_with_optional_completion_outcome(record, obj)
     return record_with_optional_body(record, message_body_chunks(obj))
 
 
@@ -741,6 +764,15 @@ def message_record_from_fields(fields: dict, turn_id: str) -> dict:
         "timestamp": fields["timestamp"],
         "role": fields["role"],
     }
+
+
+def record_with_optional_completion_outcome(record: dict, obj: dict) -> dict:
+    if record.get("role") != "assistant":
+        return record
+    outcome = completion_outcome_from_obj(obj)
+    if outcome is None:
+        return record
+    return {**record, "completion_outcome": outcome}
 
 
 def record_with_optional_body(record: dict, body: list) -> dict:

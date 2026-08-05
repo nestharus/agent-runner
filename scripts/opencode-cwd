@@ -375,6 +375,14 @@ def capture_step(process, selector, state, deadline, stdout_capture, stdout_limi
     stdout_limited = stdout_capture_exceeded(stdout_capture, stdout_limit) or (
         state["error"] == "opencode_export_stdout_limit"
     )
+    if stdout_limited:
+        grace = max(0, min(0.05, deadline - time.monotonic()))
+        for key, _ in selector.select(timeout=grace):
+            read_stream(selector, key.fd, state)
+        if state["error"] not in (None, "opencode_export_stdout_limit"):
+            terminate_process_group(process)
+            map_failed_capture_state(state, state["error"])
+            return
     if stdout_limited and complete_from_info_proof(process, state, stdout_capture):
         return
     if stdout_limited:

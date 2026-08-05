@@ -126,6 +126,23 @@ impl Fixture {
         self.run(cmd)
     }
 
+    fn run_resume_with_env(&self, prompt: &str, envs: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(runner_bin());
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.arg("resume")
+            .arg("--models-dir")
+            .arg(&self.models_dir)
+            .arg("--model")
+            .arg(MODEL)
+            .arg("--session-id")
+            .arg(SESSION)
+            .arg("--prompt")
+            .arg(prompt);
+        self.run(cmd)
+    }
+
     fn write_external_provider(&self) {
         let provider_path = self.write_external_provider_script();
         let turn_script_path = self.write_turn_script();
@@ -206,6 +223,45 @@ turn_script = {}
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    fn latest_resume_acceptance(&self) -> (Option<String>, Option<String>) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT resume_acceptance_status, resume_acceptance_evidence
+                 FROM invocations
+                 WHERE session_capture_method = 'resumed'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn latest_resumed_terminal(&self) -> (String, i64, Option<String>) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT status, exit_code, terminal_reason
+                 FROM invocations
+                 WHERE session_capture_method = 'resumed'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn set_auto_wake_count(&self, count: i64) {
+        self.sidecar_conn()
+            .execute(
+                "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",
+                params![SESSION, count],
+            )
+            .unwrap();
     }
 
     fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> Option<String> {
@@ -315,6 +371,7 @@ fn external_provider_launch_notify_uses_captured_sidecar_owner_and_wakes() {
         Some(expected_models_dir.as_str()),
         "detached wake must reload the same models directory as the original external launch"
     );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -417,6 +474,7 @@ fn external_provider_wake_does_not_mark_delivered_when_resume_produces_no_turn()
         !fixture.prompt_file("external-wake-resumed.txt").exists(),
         "drop mode must not write the payload-bearing resume file"
     );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -476,6 +534,7 @@ fn external_provider_wake_confirms_delivery_from_host_observed_assistant_respons
                 && db.wake_claim(SESSION).unwrap().is_none()
         },
     );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -509,41 +568,98 @@ fn external_provider_wake_confirms_delivery_from_submitted_turn_marker() {
             && rows[0].delivery_error.is_none()
             && db.wake_claim(SESSION).unwrap().is_none()
     });
+    let (status, evidence) = fixture.latest_resume_acceptance();
+    assert_eq!(status.as_deref(), Some("accepted"));
+    assert!(
+        evidence
+            .as_deref()
+            .is_some_and(|value| value.contains("exact session and delivery nonce")),
+        "{evidence:?}"
+    );
     fixture.assert_xdg_isolated();
 }
 
 #[test]
-fn external_provider_wake_ignores_submitted_turn_marker_for_different_payload() {
+fn external_provider_wake_rejects_wrong_session_or_delivery_nonce_markers() {
+    for mismatch in [
+        "S11_MARKER_SESSION_MISMATCH",
+        "S11_MARKER_DELIVERY_NONCE_MISMATCH",
+    ] {
+        let fixture = Fixture::new();
+        fixture.write_external_provider();
+
+        let output = fixture.run_agent_with_env(
+            "dispatch external provider wake mismatched marker",
+            &[
+                ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+                ("S11_SKIP_SCAN_WAKE_TURN", "1"),
+                ("OULIPOLY_AUTO_WAKE_MAX", "1"),
+                (mismatch, "1"),
+            ],
+        );
+        assert_success(&output);
+
+        let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+        assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
+        wait_until(
+            "mismatched submitted-turn marker leaves mailbox pending",
+            || {
+                let db = fixture.mailbox();
+                let rows = db.list_mailbox(SESSION, true).unwrap();
+                rows.len() == 1
+                    && rows[0].delivered_at.is_none()
+                    && rows[0].delivery_attempts == 1
+                    && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
+                    && db.wake_claim(SESSION).unwrap().is_none()
+            },
+        );
+        assert_eq!(
+            fixture.latest_resume_acceptance(),
+            (None, None),
+            "{mismatch}"
+        );
+        fixture.assert_xdg_isolated();
+    }
+}
+
+#[test]
+fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_delivery_nonce() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env("seed manual resume", &[("S11_NO_NOTIFY", "1")]));
 
-    let output = fixture.run_agent_with_env(
-        "dispatch external provider wake mismatched marker",
+    let output = fixture.run_resume_with_env(
+        "manual exact payload",
+        &[("S11_EMIT_SUBMITTED_TURN_MARKER", "1")],
+    );
+
+    assert_success(&output);
+    let (status, evidence) = fixture.latest_resume_acceptance();
+    assert_eq!(status.as_deref(), Some("accepted"));
+    assert!(
+        evidence
+            .as_deref()
+            .is_some_and(|value| value.contains("exact session and prompt SHA-256")),
+        "{evidence:?}"
+    );
+
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env("seed hash mismatch", &[("S11_NO_NOTIFY", "1")]));
+    let output = fixture.run_resume_with_env(
+        "manual hash mismatch",
         &[
             ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
-            ("S11_MARKER_DELIVERY_NONCE_MISMATCH", "1"),
-            ("S11_SKIP_SCAN_WAKE_TURN", "1"),
-            ("OULIPOLY_AUTO_WAKE_MAX", "1"),
         ],
     );
-    assert_success(&output);
 
-    let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
-    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
-    wait_until(
-        "mismatched submitted-turn marker leaves mailbox pending",
-        || {
-            let db = fixture.mailbox();
-            let rows = db.list_mailbox(SESSION, true).unwrap();
-            rows.len() == 1
-                && rows[0].delivered_at.is_none()
-                && rows[0].delivery_attempts == 1
-                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
-                && db.wake_claim(SESSION).unwrap().is_none()
-        },
+    assert_success(&output);
+    assert_eq!(
+        fixture.latest_resume_acceptance(),
+        (None, None),
+        "prompt hash mismatch without a nonce"
     );
-    fixture.assert_xdg_isolated();
 }
 
 #[test]
@@ -555,20 +671,26 @@ fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
         "dispatch external provider wake first dropped payload",
         &[
             ("S11_DROP_FIRST_RESUME_PAYLOAD", "1"),
-            ("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS", "1000"),
+            ("OULIPOLY_AUTO_WAKE_RETRY_BASE_MS", "1"),
+            ("OULIPOLY_AUTO_WAKE_MAX", "32"),
+            ("S11_NOTIFY_DELAY_SECONDS", "4"),
         ],
     );
     assert_success(&output);
+    fixture.set_auto_wake_count(5);
 
     let _dropped = wait_for_file(&fixture.prompt_file("external-wake-dropped.txt"));
-    wait_until("first failed wake released claim", || {
+    wait_until("failed wake released claim or retry completed", || {
         let db = fixture.mailbox();
         let rows = db.list_mailbox(SESSION, true).unwrap();
-        rows.len() == 1
-            && rows[0].delivered_at.is_none()
-            && rows[0].delivery_attempts == 1
-            && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed")
-            && db.wake_claim(SESSION).unwrap().is_none()
+        let settled = rows.len() == 1
+            && ((rows[0].delivered_at.is_none()
+                && rows[0].delivery_attempts == 1
+                && rows[0].delivery_error.as_deref() == Some("mailbox_delivery_unconfirmed"))
+                || (rows[0].delivered_at.is_some()
+                    && rows[0].delivery_attempts == 2
+                    && rows[0].delivery_error.is_none()));
+        settled && db.wake_claim(SESSION).unwrap().is_none()
     });
 
     let prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
@@ -582,6 +704,67 @@ fn external_provider_failed_wake_releases_claim_and_retries_pending_mailbox() {
             && rows[0].delivery_error.is_none()
             && db.wake_claim(SESSION).unwrap().is_none()
     });
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.selected_auto_wake_max, Some(32));
+    assert!(runtime.auto_wake_count >= 7, "{runtime:?}");
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn external_provider_persists_selected_max_across_environment_empty_notifier_and_detached_resume() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch external provider persisted wake policy",
+        &[("OULIPOLY_AUTO_WAKE_MAX", "32")],
+    );
+    assert_success(&output);
+
+    let (_, notify_env) =
+        wait_for_json_file(&fixture.work_dir.join(HANDLE).join("notify-env.json"));
+    assert_eq!(
+        notify_env
+            .get("oulipoly_auto_wake_max")
+            .and_then(Value::as_str),
+        None,
+        "notifier fixture must explicitly remove ambient wake max"
+    );
+    let _prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    assert_eq!(
+        wait_for_file(&fixture.prompt_file("external-wake-max.txt")),
+        "32"
+    );
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.selected_auto_wake_max, Some(32));
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn resumed_physical_nonzero_with_new_stop_is_logically_successful_and_delivers_mailbox() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+
+    let output = fixture.run_agent_with_env(
+        "dispatch recovered external provider wake",
+        &[("S11_NONZERO_RESUME_AFTER_STOP", "1")],
+    );
+    assert_success(&output);
+
+    let _prompt = wait_for_file(&fixture.prompt_file("external-wake-resumed.txt"));
+    wait_until("recovered resumed attempt delivered mailbox", || {
+        let db = fixture.mailbox();
+        let rows = db.list_mailbox(SESSION, true).unwrap();
+        rows.len() == 1
+            && rows[0].delivered_at.is_some()
+            && db.wake_claim(SESSION).unwrap().is_none()
+    });
+    assert_eq!(
+        fixture.latest_resumed_terminal(),
+        ("succeeded".to_string(), 1, Some("exit_nonzero".to_string()))
+    );
+    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    assert_eq!(runtime.last_exit_code, Some(1));
     fixture.assert_xdg_isolated();
 }
 
@@ -782,7 +965,7 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
     if os.environ.get("S11_MARKER_DELIVERY_NONCE_MISMATCH") == "1":
         nonce = "different-delivery-nonce"
     value = {
-        "provider_session_id": session_id,
+        "provider_session_id": "ses-wrong" if os.environ.get("S11_MARKER_SESSION_MISMATCH") == "1" else session_id,
         "prompt_sha256": prompt_sha,
         "source": "s11.fixture",
         "message_id": "msg-s11-submitted",
@@ -810,17 +993,18 @@ def produced_assistant_response_marker_event(request, seq):
         "value": True,
     }
 
-def exit_event(request, seq, session_id):
+def exit_event(request, seq, session_id, is_resume=False):
+    recovered_nonzero = is_resume and os.environ.get("S11_NONZERO_RESUME_AFTER_STOP") == "1"
     event = {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
         "time_unix_ms": 1000 + seq,
         "kind": "exit",
-        "status": {"kind": "exited", "code": 0},
+        "status": {"kind": "exited", "code": 1 if recovered_nonzero else 0},
         "terminal_signal": {
-            "kind": "clean_exit",
-            "evidence": "fixture clean exit",
+            "kind": "nonzero_exit" if recovered_nonzero else "clean_exit",
+            "evidence": "fixture retained physical nonzero" if recovered_nonzero else "fixture clean exit",
             "observed_at_unix_ms": 1000 + seq,
         },
     }
@@ -883,6 +1067,9 @@ def launch(request):
             return
         target = pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-resumed.txt"
         target.write_text(prompt, encoding="utf-8")
+        (pathlib.Path(os.environ["S11_WORK_DIR"]) / "external-wake-max.txt").write_text(
+            os.environ.get("OULIPOLY_AUTO_WAKE_MAX", "missing"), encoding="utf-8"
+        )
         emit(stdout_event(request, 1, "resumed\n"))
         seq = 2
         if os.environ.get("S11_EMIT_ASSISTANT_RESPONSE_MARKER") == "1":
@@ -893,7 +1080,7 @@ def launch(request):
         if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
             emit(submitted_turn_marker_event(request, seq, known, prompt))
             seq += 1
-        emit(exit_event(request, seq, known))
+        emit(exit_event(request, seq, known, True))
         return
     session_id = None if os.environ.get("S11_OMIT_EXIT_SESSION") == "1" else SESSION
     seq = 1
@@ -973,12 +1160,14 @@ def notify_helper():
     runner = os.environ["AGENT_BASH_AGENT_RUNNER_BIN"]
     child_env = os.environ.copy()
     child_env["OULIPOLY_DATA_DIR"] = str(pathlib.Path(os.environ["XDG_DATA_HOME"]) / "oulipoly-agent-runner")
+    child_env.pop("OULIPOLY_AUTO_WAKE_MAX", None)
     child_env.pop("XDG_CONFIG_HOME", None)
     child_env.pop("XDG_DATA_HOME", None)
     (state / "notify-env.json").write_text(json.dumps({
         "xdg_config_home": child_env.get("XDG_CONFIG_HOME"),
         "xdg_data_home": child_env.get("XDG_DATA_HOME"),
         "oulipoly_data_dir": child_env.get("OULIPOLY_DATA_DIR"),
+        "oulipoly_auto_wake_max": child_env.get("OULIPOLY_AUTO_WAKE_MAX"),
     }, separators=(",", ":")), encoding="utf-8")
     with (state / "notify.json").open("w", encoding="utf-8") as out, \
          (state / "notify.err").open("w", encoding="utf-8") as err:
@@ -1049,6 +1238,7 @@ def emit(turn_id, text):
         "turn_id": turn_id,
         "timestamp": "2026-06-06T00:00:00Z",
         "role": "assistant",
+        "completion_outcome": "stop",
         "body": [{"type": "text", "text": text}],
     }, separators=(",", ":")))
 

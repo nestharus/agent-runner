@@ -13,8 +13,8 @@ use oulipoly_runtime::observability::{
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
-    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
+    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, SessionRuntimeRunningUpdate,
+    SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
@@ -292,6 +292,79 @@ fn overlay_counts_live_logical_child_after_terminal_history_and_fails_closed() {
     assert_invocation_absent(&snapshot, MISSING_CHILD_UUID);
     assert_invocation_absent(&snapshot, MISMATCHED_CHILD_UUID);
     assert_invocation_absent(&snapshot, UNRELATED_UUID);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delivered_wake_edge_keeps_live_workload_under_original_root() {
+    let fixture = Fixture::new();
+    let wake_process = TestProcess::spawn();
+    let workload_process = TestProcess::spawn();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    let owner_id = seed_invocation(&state, CHILD_UUID, Some(root_id));
+    state
+        .finalize_invocation(owner_id, true, 0, None, Some("completed"))
+        .unwrap();
+    let wake_id = seed_invocation(&state, LIVE_CHILD_UUID, None);
+    state
+        .finalize_invocation(wake_id, true, 0, None, Some("completed"))
+        .unwrap();
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    drop(state);
+
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &current_identity());
+    record_identity(
+        &pid,
+        LIVE_CHILD_UUID,
+        Some(SESSION_ID),
+        wake_process.identity(),
+    );
+    drop(pid);
+
+    let handle = "ab_2_100_0000000000000003";
+    write_agent_bash_meta(
+        &fixture.agent_bash_root(),
+        handle,
+        &agent_bash_meta_with_workload_identity(
+            handle,
+            wake_process.identity(),
+            workload_process.identity(),
+        ),
+        "wake workload running",
+    );
+    let mut mailbox = fixture.open_mailbox();
+    let row = match mailbox
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            owner_invocation_uuid: Some(CHILD_UUID),
+            ..mailbox_input("wake-edge", SESSION_ID)
+        })
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        result => panic!("unexpected enqueue result: {result:?}"),
+    };
+    mailbox
+        .mark_delivered(SESSION_ID, &[row.seq], LIVE_CHILD_UUID)
+        .unwrap();
+    drop(mailbox);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    let owner_node_id = format!("invocation:{CHILD_UUID}");
+    let wake_node_id = format!("invocation:{LIVE_CHILD_UUID}");
+    assert_eq!(
+        node(&snapshot, &wake_node_id).parent_id.as_deref(),
+        Some(owner_node_id.as_str())
+    );
+    let workload = node(&snapshot, &format!("agent-bash:{handle}"));
+    assert_eq!(workload.status, MonitorStatus::Running);
+    assert_eq!(workload.parent_id.as_deref(), Some(wake_node_id.as_str()));
 }
 
 #[test]
@@ -579,6 +652,7 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
             pty_control_path: Some("/tmp/oulipoly-observe.sock"),
             models_dir: None,
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
     mailbox
@@ -1013,6 +1087,55 @@ fn agent_bash_running_status_is_reconciled_against_exact_workload_identity() {
         assert_eq!(malformed_node.liveness, LivenessStatus::Unknown);
     }
     assert_eq!(snapshot.summary.running_agent_bash_count, 2);
+}
+
+#[test]
+fn agent_bash_scan_orders_canonical_handles_without_directory_mtime() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let pid = fixture.open_pid();
+    let owner = current_identity();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), &owner);
+    drop(pid);
+    let root = fixture.agent_bash_root();
+    let older_handle = "ab_1_100_0000000000000001";
+    let newer_handle = "ab_2_100_0000000000000002";
+    let older_dir = write_agent_bash_meta(
+        &root,
+        older_handle,
+        &agent_bash_meta(older_handle, "RUNNING", &owner, Some(700), None),
+        "older",
+    );
+    let newer_dir = write_agent_bash_meta(
+        &root,
+        newer_handle,
+        &agent_bash_meta(newer_handle, "RUNNING", &owner, Some(701), None),
+        "newer",
+    );
+    set_dir_mtime(&older_dir, 60);
+    set_dir_mtime(&newer_dir, 10);
+
+    let snapshot = fixture.service().snapshot(
+        &fixture.root(),
+        SnapshotLimits {
+            include_terminal: true,
+            agent_bash_scan_dirs: 1,
+            ..SnapshotLimits::default()
+        },
+    );
+
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .any(|node| node.id == format!("agent-bash:{newer_handle}"))
+    );
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| node.id != format!("agent-bash:{older_handle}"))
+    );
 }
 
 #[test]

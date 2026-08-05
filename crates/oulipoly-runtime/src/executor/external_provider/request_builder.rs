@@ -16,6 +16,7 @@
 //! ```
 
 use super::context::ExternalProviderDispatchContext;
+use crate::executor::cli::spawn_identity::provider_parent_invocation_env;
 use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
 use oulipoly_config::PromptMode;
 use oulipoly_provider::generated::{
@@ -62,8 +63,8 @@ fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<St
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
     insert_pinned_agent_data_dir(&mut env);
-    if let Some(parent) = &context.parent_invocation_env {
-        env.insert(PARENT_INVOCATION_ENV.to_string(), parent.clone());
+    if let Some(parent) = provider_parent_invocation_env(context.parent_invocation_env.as_deref()) {
+        env.insert(PARENT_INVOCATION_ENV.to_string(), parent);
     }
     env
 }

@@ -2,7 +2,9 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`
 
-use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{
+    DeliveredPayloadCompactionReport, DeliveredPayloadCompactionStats, MailboxDb, MailboxRow,
+};
 use serde::Serialize;
 use std::fs::File;
 use std::io::Read;
@@ -46,6 +48,15 @@ struct MailboxAckResponse {
     to_seq: i64,
     acknowledged_count: usize,
     remaining_pending: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct MailboxCompactionResponse {
+    applied: bool,
+    limit: usize,
+    before: DeliveredPayloadCompactionStats,
+    report: Option<DeliveredPayloadCompactionReport>,
+    after: DeliveredPayloadCompactionStats,
 }
 
 pub(crate) fn run_list(session_id: &str, all: bool, json: bool) -> Result<i32, String> {
@@ -258,7 +269,68 @@ fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(Vec::new());
     };
-    db.list_mailbox(session_id, all)
+    let mut rows = db.list_mailbox(session_id, all)?;
+    for row in &mut rows {
+        row.payload_json = db.hydrate_agent_bash_payload_json(row)?;
+    }
+    Ok(rows)
+}
+
+pub(crate) fn run_compact_delivered(limit: usize, apply: bool, json: bool) -> Result<i32, String> {
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        let empty = DeliveredPayloadCompactionStats::default();
+        render_compaction(
+            MailboxCompactionResponse {
+                applied: apply,
+                limit,
+                before: empty,
+                report: apply.then(DeliveredPayloadCompactionReport::default),
+                after: empty,
+            },
+            json,
+        )?;
+        return Ok(0);
+    };
+    let before = db.delivered_payload_compaction_stats()?;
+    let report = apply
+        .then(|| db.compact_delivered_payloads(limit))
+        .transpose()?;
+    let after = db.delivered_payload_compaction_stats()?;
+    render_compaction(
+        MailboxCompactionResponse {
+            applied: apply,
+            limit,
+            before,
+            report,
+            after,
+        },
+        json,
+    )?;
+    Ok(0)
+}
+
+fn render_compaction(response: MailboxCompactionResponse, json: bool) -> Result<(), String> {
+    if json {
+        return print_json(&response);
+    }
+    println!(
+        "applied={} limit={} eligible_rows={} inline_bytes={} compacted_rows={} reclaimed_bytes={} remaining_rows={} remaining_inline_bytes={}",
+        response.applied,
+        response.limit,
+        response.before.eligible_rows,
+        response.before.inline_bytes,
+        response
+            .report
+            .map(|report| report.compacted_rows)
+            .unwrap_or(0),
+        response
+            .report
+            .map(|report| report.inline_bytes_reclaimed)
+            .unwrap_or(0),
+        response.after.eligible_rows,
+        response.after.inline_bytes,
+    );
+    Ok(())
 }
 
 fn print_human_rows(rows: &[MailboxRow]) {

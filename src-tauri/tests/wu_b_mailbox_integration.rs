@@ -139,6 +139,19 @@ impl Fixture {
         self.run(cmd)
     }
 
+    fn run_mailbox_compact(&self, limit: usize, apply: bool) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("mailbox")
+            .arg("compact-delivered")
+            .arg("--limit")
+            .arg(limit.to_string())
+            .arg("--json");
+        if apply {
+            cmd.arg("--apply");
+        }
+        self.run(cmd)
+    }
+
     fn base_resume_command(&self, model_name: &str, session_id: &str) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("resume")
@@ -555,17 +568,19 @@ fn notify_idempotent_retried_handle() {
         rows[0].payload_byte_len.unwrap()
     );
     let payload_path = Path::new(rows[0].payload_file_path.as_deref().unwrap());
+    let retained_payload = fs::read_to_string(payload_path).unwrap();
+    assert_ne!(retained_payload, rows[0].payload_json);
     assert_eq!(
-        fs::read_to_string(payload_path).unwrap(),
-        rows[0].payload_json
+        serde_json::from_str::<Value>(&retained_payload).unwrap()["handle"],
+        "h-idem"
     );
     assert_eq!(
         rows[0].payload_sha256.as_deref(),
-        Some(sha256_hex(rows[0].payload_json.as_bytes()).as_str())
+        Some(sha256_hex(retained_payload.as_bytes()).as_str())
     );
     assert_eq!(
         rows[0].payload_byte_len,
-        Some(rows[0].payload_json.len() as i64)
+        Some(retained_payload.len() as i64)
     );
     assert_eq!(
         rows[0].payload_retention_policy.as_deref(),
@@ -649,6 +664,59 @@ fn notify_ordering_by_seq() {
     let json = stdout_json(&output);
     let handles = row_handles(&json);
     assert_eq!(handles, vec!["h-a", "h-b", "h-c"]);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
+    let fixture = Fixture::new();
+    let row = fixture.seed_mailbox(SESSION_A, "h-compact", 0);
+    let original_payload = fs::read_to_string(row.payload_file_path.as_deref().unwrap()).unwrap();
+    let mut db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE mailbox
+             SET payload_json = ?2, payload_compacted_at = NULL
+             WHERE seq = ?1",
+            params![row.seq, &original_payload],
+        )
+        .unwrap();
+    db.mark_delivered(SESSION_A, &[row.seq], INVOCATION_A)
+        .unwrap();
+    drop(db);
+
+    let dry_run = fixture.run_mailbox_compact(1, false);
+    assert!(dry_run.status.success(), "{dry_run:?}");
+    let dry_run_json = stdout_json(&dry_run);
+    assert_eq!(dry_run_json["applied"], false);
+    assert_eq!(dry_run_json["before"]["eligible_rows"], 1);
+    assert!(dry_run_json["report"].is_null());
+    let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    assert_eq!(
+        db.connection()
+            .query_row(
+                "SELECT payload_compacted_at FROM mailbox WHERE seq = ?1",
+                params![row.seq],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap(),
+        None
+    );
+    drop(db);
+
+    let apply = fixture.run_mailbox_compact(1, true);
+    assert!(apply.status.success(), "{apply:?}");
+    let apply_json = stdout_json(&apply);
+    assert_eq!(apply_json["applied"], true);
+    assert_eq!(apply_json["report"]["compacted_rows"], 1);
+    assert_eq!(apply_json["after"]["eligible_rows"], 0);
+
+    let listed = fixture.run_mailbox_list(SESSION_A, true);
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(
+        stdout_json(&listed)["rows"][0]["payload_json"],
+        original_payload
+    );
     fixture.assert_default_user_paths_untouched();
 }
 

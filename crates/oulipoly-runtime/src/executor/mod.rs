@@ -524,6 +524,7 @@ pub fn execute_effective_with_inputs_and_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::lock_env;
     use oulipoly_config::{InputDef, InputType, PromptMode, ProviderConfig};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -532,6 +533,39 @@ mod tests {
     struct FixtureScript {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    struct IsolatedDataDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        old_data_dir: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl IsolatedDataDir {
+        fn new(path: &Path) -> Self {
+            let lock = lock_env();
+            let old_data_dir = std::env::var_os(oulipoly_state::paths::DATA_DIR_ENV);
+            unsafe {
+                std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, path);
+            }
+            Self {
+                _lock: lock,
+                old_data_dir,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for IsolatedDataDir {
+        fn drop(&mut self) {
+            unsafe {
+                match self.old_data_dir.take() {
+                    Some(value) => std::env::set_var(oulipoly_state::paths::DATA_DIR_ENV, value),
+                    None => std::env::remove_var(oulipoly_state::paths::DATA_DIR_ENV),
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -626,6 +660,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn execute_with_inputs_and_env_wrapper_delegates_parent_invocation_env() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let _data_dir = IsolatedDataDir::new(data_dir.path());
         let env_dump = tempfile::NamedTempFile::new().unwrap();
         let env_dump_path = env_dump.path().to_path_buf();
         let script = fixture_script(&format!(

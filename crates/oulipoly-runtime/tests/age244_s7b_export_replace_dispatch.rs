@@ -36,7 +36,7 @@ use std::time::Duration;
 // Post-WU5a characterization baseline. The guard still catches any genuinely
 // new concrete provider-name reference introduced after the manager-approved
 // AGE-245 S7c rebaseline point. Bump on intentional structural relocations.
-const BASE_REF: &str = "d807db935388ce9e56e73e210632665dc2df68b2";
+const BASE_REF: &str = "f0844a90d73c9196fc6fe53d510caf4d2c56c076";
 const MODEL: &str = "model-alpha";
 const UNRELATED_MODEL: &str = "model-unrelated";
 const PROVIDER_NAME: &str = "provider-alpha-account";

@@ -27,6 +27,7 @@ pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
+const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -433,6 +434,20 @@ pub struct PublishedMailboxPayload {
     pub retention_policy: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeliveredPayloadCompactionStats {
+    pub eligible_rows: usize,
+    pub inline_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DeliveredPayloadCompactionReport {
+    pub scanned_rows: usize,
+    pub compacted_rows: usize,
+    pub retained_payload_bytes: u64,
+    pub inline_bytes_reclaimed: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MailboxRow {
     pub seq: i64,
@@ -459,6 +474,7 @@ pub struct MailboxRow {
     pub payload_sha256: Option<String>,
     pub payload_byte_len: Option<i64>,
     pub payload_retention_policy: Option<String>,
+    pub payload_compacted_at: Option<String>,
     pub submission_token: Option<String>,
     pub target_kind: Option<String>,
     pub target_id: Option<String>,
@@ -498,6 +514,7 @@ pub struct SessionRuntimeUpsert<'a> {
     pub pty_control_path: Option<&'a str>,
     pub models_dir: Option<&'a str>,
     pub effective_cwd: Option<&'a str>,
+    pub selected_auto_wake_max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -542,6 +559,7 @@ pub struct SessionRuntimeRow {
     pub models_dir: Option<String>,
     pub effective_cwd: Option<String>,
     pub auto_wake_count: i64,
+    pub selected_auto_wake_max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,6 +663,10 @@ enum BoundedMailboxRowsError {
 }
 
 impl MailboxDb {
+    pub fn path_for_state_db(state_db_path: &Path) -> PathBuf {
+        state_db_path.with_file_name("pid-identity.db")
+    }
+
     pub fn default_path() -> Result<PathBuf, String> {
         pid_identity::default_path()
     }
@@ -730,13 +752,7 @@ impl MailboxDb {
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
         })?;
-        let result = if changed == 1 {
-            GenerationMutation::Applied(row)
-        } else if runtime_generation_create_matches(&row, &request) {
-            GenerationMutation::AlreadyApplied(row)
-        } else {
-            GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
-        };
+        let result = map_runtime_generation_create(changed, row, &request);
         tx.commit().map_err(generation_storage_error(
             "commit generation creation transaction",
         ))?;
@@ -761,55 +777,32 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_binding_fence(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected generation binding transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
         if before.lifecycle_state == RuntimeLifecycleState::Running {
-            let result = if runtime_generation_binding_matches(&before, &request) {
-                GenerationMutation::AlreadyApplied(before)
-            } else {
-                GenerationMutation::Rejected(GenerationRejection::ProcessIdentityConflict)
-            };
+            let result = map_running_generation_binding_replay(before, &request);
             tx.commit().map_err(generation_storage_error(
                 "commit replayed generation binding transaction",
             ))?;
             return Ok(result);
         }
-        if before.lifecycle_state != RuntimeLifecycleState::Starting {
-            let actual = before.lifecycle_state;
+        if let Err(rejection) = validate_generation_binding_predecessor(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal generation binding transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Starting,
-                    actual,
-                },
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
-        if let Some(identity) = request.exact_process_identity {
-            let record = pid_identity::PidIdentityRecord {
-                identity,
-                os_pgid: request.os_pgid,
-                invocation_uuid: request.fence.spawn_invocation_uuid,
-                session_id: before.session_id.as_deref(),
-                provider_name: Some(&before.provider_name),
-                model_name: before.model_name.as_deref(),
-                recorded_at: &now,
-            };
-            if !pid_identity::bind_identity_on(&tx, record).map_err(GenerationStorageError::new)? {
-                tx.commit().map_err(generation_storage_error(
-                    "commit conflicting process identity binding transaction",
-                ))?;
-                return Ok(GenerationMutation::Rejected(
-                    GenerationRejection::ProcessIdentityConflict,
-                ));
-            }
+        if !bind_generation_process_identity(&tx, &before, &request, &now)? {
+            tx.commit().map_err(generation_storage_error(
+                "commit conflicting process identity binding transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(
+                GenerationRejection::ProcessIdentityConflict,
+            ));
         }
         let identity = request.exact_process_identity;
         let changed = tx
@@ -855,11 +848,7 @@ impl MailboxDb {
         &mut self,
         request: AttachRuntimeGenerationSession<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
-        if request.session_id.is_empty() {
-            return Err(GenerationStorageError::new(
-                "Runtime generation session_id must not be empty".to_string(),
-            ));
-        }
+        validate_generation_attachment_session_id(&request)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -872,20 +861,14 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_attachment_fence(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected session attachment transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
-        if let Some(existing) = before.session_id.as_deref() {
-            let result = if existing == request.session_id {
-                GenerationMutation::AlreadyApplied(before)
-            } else {
-                GenerationMutation::Rejected(GenerationRejection::SessionConflict)
-            };
+        if before.session_id.is_some() {
+            let result = map_generation_attachment_replay(before, &request);
             tx.commit().map_err(generation_storage_error(
                 "commit replayed session attachment transaction",
             ))?;
@@ -964,7 +947,8 @@ impl MailboxDb {
         &self,
         session_id: &str,
     ) -> Result<SessionGenerationProjection, GenerationStorageError> {
-        let rows = runtime_generations_for_session_on(&self.conn, session_id, true)?;
+        let sql = format_runtime_generations_for_session_sql(true);
+        let rows = runtime_generations_for_session_on(&self.conn, session_id, &sql)?;
         Ok(match rows.len() {
             0 => SessionGenerationProjection::None,
             1 => SessionGenerationProjection::One(Box::new(
@@ -978,7 +962,8 @@ impl MailboxDb {
         &self,
         session_id: &str,
     ) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
-        runtime_generations_for_session_on(&self.conn, session_id, false)
+        let sql = format_runtime_generations_for_session_sql(false);
+        runtime_generations_for_session_on(&self.conn, session_id, &sql)
     }
 
     pub fn acquire_runtime_generation_delivery(
@@ -1001,30 +986,33 @@ impl MailboxDb {
                 GenerationRejection::NotFound,
             ));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_fence(&before, request.fence) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected delivery claim transaction",
             ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+        }
+        let has_existing_claim = before.active_delivery_claim_id.is_some();
+        if has_existing_claim && validate_existing_delivery_claim(&before).is_err() {
+            tx.commit().map_err(generation_storage_error(
+                "commit invalid existing delivery claim transaction",
+            ))?;
             return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::FenceMismatch,
+                GenerationRejection::InvariantViolation,
             ));
         }
-        if before.active_delivery_claim_id.is_some() {
-            if before.active_delivery_seqs.is_empty() || before.active_delivery_claimed_at.is_none()
-            {
-                tx.commit().map_err(generation_storage_error(
-                    "commit invalid existing delivery claim transaction",
-                ))?;
-                return Ok(DeliveryClaimAcquireResult::Rejected(
-                    GenerationRejection::InvariantViolation,
-                ));
-            }
-            if !runtime_delivery_claim_is_stale(&before, request.stale_after_seconds) {
-                tx.commit().map_err(generation_storage_error(
-                    "commit in-flight delivery claim transaction",
-                ))?;
-                return Ok(DeliveryClaimAcquireResult::AlreadyInFlight(before));
-            }
+        let existing_claim_stale =
+            runtime_delivery_claim_is_stale(&before, request.stale_after_seconds);
+        if has_existing_claim
+            && map_existing_delivery_claim(&before, existing_claim_stale)
+                == ExistingDeliveryClaimDisposition::AlreadyInFlight
+        {
+            tx.commit().map_err(generation_storage_error(
+                "commit in-flight delivery claim transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::AlreadyInFlight(before));
+        }
+        if has_existing_claim {
             tx.execute(
                 "UPDATE runtime_generation
                  SET active_delivery_claimed_at = ?3
@@ -1053,35 +1041,37 @@ impl MailboxDb {
             ))?;
             return Ok(DeliveryClaimAcquireResult::Recovered(row));
         }
-        if before.lifecycle_state != RuntimeLifecycleState::Running {
-            let actual = before.lifecycle_state;
-            tx.commit().map_err(generation_storage_error(
-                "commit illegal delivery claim transaction",
-            ))?;
-            return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+        match validate_new_delivery_claim(&before, true, false) {
+            Ok(()) => {}
+            Err(rejection @ GenerationRejection::IllegalPredecessor { .. }) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit illegal delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
+            Err(rejection @ GenerationRejection::DrainRequestConflict) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit drain-blocked delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit invalid delivery claim batch transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
         }
-        if before.drain_request_id.is_some() {
-            tx.commit().map_err(generation_storage_error(
-                "commit drain-blocked delivery claim transaction",
-            ))?;
-            return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::DrainRequestConflict,
-            ));
-        }
-        if !mailbox_seqs_are_pending_on(&tx, request.seqs)?
-            || active_delivery_claim_overlaps_on(&tx, request.fence.generation_id, request.seqs)?
-        {
+        let delivery_states = mailbox_delivery_states_on(&tx, request.seqs)?;
+        let rows_pending = all_mailbox_seqs_pending(&delivery_states);
+        let claim_encodings = active_delivery_claim_encodings_on(&tx, request.fence.generation_id)?;
+        let claim_batches = parse_active_delivery_claim_batches(claim_encodings)?;
+        let overlaps = delivery_claim_batches_overlap(&claim_batches, request.seqs);
+        if let Err(rejection) = validate_new_delivery_claim(&before, rows_pending, overlaps) {
             tx.commit().map_err(generation_storage_error(
                 "commit invalid delivery claim batch transaction",
             ))?;
-            return Ok(DeliveryClaimAcquireResult::Rejected(
-                GenerationRejection::InvariantViolation,
-            ));
+            return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
         }
         let seqs_json = serialize_delivery_seqs(request.seqs)?;
         let changed = tx
@@ -1123,7 +1113,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit acquired delivery claim transaction",
         ))?;
-        Ok(DeliveryClaimAcquireResult::Acquired(row))
+        Ok(map_acquired_delivery_claim(row))
     }
 
     pub fn confirm_runtime_generation_delivery(
@@ -1138,31 +1128,24 @@ impl MailboxDb {
             .map_err(generation_storage_error(
                 "start runtime generation delivery confirmation transaction",
             ))?;
-        let before = match validated_active_delivery_claim_on(
-            &tx,
+        let before = runtime_generation_by_id_on(&tx, request.fence.generation_id)?;
+        if let Err(rejection) = validate_active_delivery_claim(
+            before.as_ref(),
             request.fence,
             request.claim_id,
             request.seqs,
-        )? {
-            Ok(row) => row,
-            Err(rejection) => {
-                tx.commit().map_err(generation_storage_error(
-                    "commit rejected delivery confirmation transaction",
-                ))?;
-                return Ok(GenerationMutation::Rejected(rejection));
-            }
-        };
-        if before.lifecycle_state != RuntimeLifecycleState::Running {
-            let actual = before.lifecycle_state;
+        ) {
+            tx.commit().map_err(generation_storage_error(
+                "commit rejected delivery confirmation transaction",
+            ))?;
+            return Ok(GenerationMutation::Rejected(rejection));
+        }
+        let before = before.expect("validated active claim requires a generation row");
+        if let Err(rejection) = validate_running_delivery_confirmation(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit non-running delivery confirmation transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
         for seq in request.seqs {
             let changed = tx
@@ -1179,11 +1162,7 @@ impl MailboxDb {
                 .map_err(generation_storage_error(
                     "confirm claimed mailbox row delivery",
                 ))?;
-            if changed != 1 {
-                return Err(GenerationStorageError::new(format!(
-                    "Claimed mailbox row {seq} was not pending at confirmation"
-                )));
-            }
+            validate_confirmed_mailbox_row_change(*seq, changed)?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -1195,7 +1174,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit delivery confirmation transaction",
         ))?;
-        Ok(GenerationMutation::Applied(row))
+        Ok(map_applied_generation(row))
     }
 
     pub fn fail_runtime_generation_delivery(
@@ -1209,9 +1188,13 @@ impl MailboxDb {
             .map_err(generation_storage_error(
                 "start runtime generation delivery failure transaction",
             ))?;
-        if let Err(rejection) =
-            validated_active_delivery_claim_on(&tx, request.fence, request.claim_id, request.seqs)?
-        {
+        let before = runtime_generation_by_id_on(&tx, request.fence.generation_id)?;
+        if let Err(rejection) = validate_active_delivery_claim(
+            before.as_ref(),
+            request.fence,
+            request.claim_id,
+            request.seqs,
+        ) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected delivery failure transaction",
             ))?;
@@ -1240,18 +1223,14 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit delivery failure transaction",
         ))?;
-        Ok(GenerationMutation::Applied(row))
+        Ok(map_failed_delivery_generation(row))
     }
 
     pub fn exit_runtime_generation_non_orderly(
         &mut self,
         request: ExitRuntimeGenerationNonOrderly<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
-        if request.reason == RuntimeTerminalReason::OrderlyCompletion {
-            return Err(GenerationStorageError::new(
-                "Orderly completion must pass through draining".to_string(),
-            ));
-        }
+        validate_non_orderly_reason(&request)?;
         let now = now_rfc3339();
         let tx = self
             .conn
@@ -1265,44 +1244,23 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_generation_fence(&before, request.fence) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected generation exit transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
-        if before.lifecycle_state == RuntimeLifecycleState::Exited {
-            let result = if before.terminal_reason == Some(request.reason)
-                && before.exit_code == request.exit_code
-            {
-                GenerationMutation::AlreadyApplied(before)
-            } else {
-                GenerationMutation::Rejected(GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual: RuntimeLifecycleState::Exited,
-                })
-            };
+        if let Some(result) = map_non_orderly_exit_replay(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit replayed generation exit transaction",
             ))?;
             return Ok(result);
         }
-        if !matches!(
-            before.lifecycle_state,
-            RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
-        ) {
-            let actual = before.lifecycle_state;
+        if let Err(rejection) = validate_non_orderly_predecessor(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal generation exit transaction",
             ))?;
-            return Ok(GenerationMutation::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+            return Ok(GenerationMutation::Rejected(rejection));
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1331,7 +1289,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit non-orderly generation exit transaction",
         ))?;
-        Ok(GenerationMutation::Applied(row))
+        Ok(map_applied_generation(row))
     }
 
     pub fn request_runtime_generation_drain(
@@ -1351,37 +1309,23 @@ impl MailboxDb {
             ))?;
             return Ok(DrainRequestResult::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
+        if let Err(rejection) = validate_drain_request_fence(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit rejected drain request transaction",
             ))?;
-            return Ok(DrainRequestResult::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+            return Ok(DrainRequestResult::Rejected(rejection));
         }
-        if let Some(existing) = before.drain_request_id.as_ref() {
-            let handoff = drain_handoff(&before);
-            let result = if existing == request.drain_request_id {
-                DrainRequestResult::AlreadyInstalled(before, handoff)
-            } else {
-                DrainRequestResult::Rejected(GenerationRejection::DrainRequestConflict)
-            };
+        if let Some(result) = map_drain_request_replay(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit replayed drain request transaction",
             ))?;
             return Ok(result);
         }
-        if before.lifecycle_state != RuntimeLifecycleState::Running {
-            let actual = before.lifecycle_state;
+        if let Err(rejection) = validate_drain_request_predecessor(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal drain request transaction",
             ))?;
-            return Ok(DrainRequestResult::Rejected(
-                GenerationRejection::IllegalPredecessor {
-                    expected: RuntimeLifecycleState::Running,
-                    actual,
-                },
-            ));
+            return Ok(DrainRequestResult::Rejected(rejection));
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1408,11 +1352,10 @@ impl MailboxDb {
                     "Runtime generation missing after drain request".to_string(),
                 )
             })?;
-        let handoff = drain_handoff(&row);
         tx.commit().map_err(generation_storage_error(
             "commit generation drain request transaction",
         ))?;
-        Ok(DrainRequestResult::Installed(row, handoff))
+        Ok(map_installed_drain_request(row))
     }
 
     pub fn advance_runtime_generation_drain(
@@ -1432,53 +1375,50 @@ impl MailboxDb {
             ))?;
             return Ok(DrainAdvanceResult::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
-            tx.commit().map_err(generation_storage_error(
-                "commit rejected drain advance transaction",
-            ))?;
-            return Ok(DrainAdvanceResult::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+        match validate_drain_advance_identity(&before, &request) {
+            Ok(()) => {}
+            Err(GenerationRejection::FenceMismatch) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit rejected drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::Rejected(
+                    GenerationRejection::FenceMismatch,
+                ));
+            }
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit mismatched drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::Rejected(rejection));
+            }
         }
-        if before.drain_request_id.as_ref() != Some(request.drain_request_id) {
-            tx.commit().map_err(generation_storage_error(
-                "commit mismatched drain advance transaction",
-            ))?;
-            return Ok(DrainAdvanceResult::Rejected(
-                GenerationRejection::DrainRequestConflict,
-            ));
-        }
-        if let Some(claim_id) = before.active_delivery_claim_id.clone() {
-            tx.commit().map_err(generation_storage_error(
-                "commit waiting drain advance transaction",
-            ))?;
-            return Ok(DrainAdvanceResult::WaitingOnClaim(claim_id));
-        }
-        match before.lifecycle_state {
-            RuntimeLifecycleState::Draining => {
+        match map_drain_advance_blocker(&before) {
+            None => {}
+            Some(DrainAdvanceResult::WaitingOnClaim(claim_id)) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit waiting drain advance transaction",
+                ))?;
+                return Ok(DrainAdvanceResult::WaitingOnClaim(claim_id));
+            }
+            Some(DrainAdvanceResult::AlreadyDraining(row)) => {
                 tx.commit().map_err(generation_storage_error(
                     "commit replayed drain advance transaction",
                 ))?;
-                return Ok(DrainAdvanceResult::AlreadyDraining(before));
+                return Ok(DrainAdvanceResult::AlreadyDraining(row));
             }
-            RuntimeLifecycleState::Exited => {
+            Some(DrainAdvanceResult::AlreadyExited(row)) => {
                 tx.commit().map_err(generation_storage_error(
                     "commit exited drain advance transaction",
                 ))?;
-                return Ok(DrainAdvanceResult::AlreadyExited(before));
+                return Ok(DrainAdvanceResult::AlreadyExited(row));
             }
-            RuntimeLifecycleState::Running => {}
-            actual => {
+            Some(DrainAdvanceResult::Rejected(rejection)) => {
                 tx.commit().map_err(generation_storage_error(
                     "commit illegal drain advance transaction",
                 ))?;
-                return Ok(DrainAdvanceResult::Rejected(
-                    GenerationRejection::IllegalPredecessor {
-                        expected: RuntimeLifecycleState::Running,
-                        actual,
-                    },
-                ));
+                return Ok(DrainAdvanceResult::Rejected(rejection));
             }
+            Some(DrainAdvanceResult::Advanced(_)) => unreachable!("advanced rows are not blockers"),
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1505,7 +1445,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit generation drain advance transaction",
         ))?;
-        Ok(DrainAdvanceResult::Advanced(row))
+        Ok(map_advanced_drain(row))
     }
 
     pub fn finish_runtime_generation_drain(
@@ -1525,42 +1465,44 @@ impl MailboxDb {
             ))?;
             return Ok(DrainFinishResult::Rejected(GenerationRejection::NotFound));
         };
-        if before.spawn_invocation_uuid != request.fence.spawn_invocation_uuid {
-            tx.commit().map_err(generation_storage_error(
-                "commit rejected drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::FenceMismatch,
-            ));
+        match validate_drain_finish_identity(&before, &request) {
+            Ok(()) => {}
+            Err(GenerationRejection::FenceMismatch) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit rejected drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::Rejected(
+                    GenerationRejection::FenceMismatch,
+                ));
+            }
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit mismatched drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::Rejected(rejection));
+            }
         }
-        if before.drain_request_id.as_ref() != Some(request.drain_request_id) {
-            tx.commit().map_err(generation_storage_error(
-                "commit mismatched drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::DrainRequestConflict,
-            ));
+        match map_drain_finish_predecessor(&before) {
+            None => {}
+            Some(DrainFinishResult::AlreadyExited(row)) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit replayed drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::AlreadyExited(row));
+            }
+            Some(DrainFinishResult::NotDraining(actual)) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit premature drain finish transaction",
+                ))?;
+                return Ok(DrainFinishResult::NotDraining(actual));
+            }
+            Some(_) => unreachable!("only predecessor dispositions are mapped"),
         }
-        if before.lifecycle_state == RuntimeLifecycleState::Exited {
-            tx.commit().map_err(generation_storage_error(
-                "commit replayed drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::AlreadyExited(before));
-        }
-        if before.lifecycle_state != RuntimeLifecycleState::Draining {
-            let actual = before.lifecycle_state;
-            tx.commit().map_err(generation_storage_error(
-                "commit premature drain finish transaction",
-            ))?;
-            return Ok(DrainFinishResult::NotDraining(actual));
-        }
-        if before.active_delivery_claim_id.is_some() {
+        if let Err(rejection) = validate_drain_finish_claim(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit withheld drain finish transaction",
             ))?;
-            return Ok(DrainFinishResult::Rejected(
-                GenerationRejection::InvariantViolation,
-            ));
+            return Ok(DrainFinishResult::Rejected(rejection));
         }
         tx.execute(
             "UPDATE runtime_generation
@@ -1589,7 +1531,7 @@ impl MailboxDb {
         tx.commit().map_err(generation_storage_error(
             "commit generation drain finish transaction",
         ))?;
-        Ok(DrainFinishResult::Finished(row))
+        Ok(map_finished_drain(row))
     }
 
     pub fn enqueue_agent_bash_complete(
@@ -1597,12 +1539,14 @@ impl MailboxDb {
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
         let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction()
             .map_err(|err| format!("Failed to start mailbox enqueue transaction: {err}"))?;
-        let result = enqueue_agent_bash_complete_in_tx(&tx, input, &published, &now)?;
+        let result =
+            enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox enqueue transaction: {err}"))?;
         Ok(result)
@@ -1662,6 +1606,88 @@ impl MailboxDb {
         self.verify_published_payload(&payload)
     }
 
+    pub fn hydrate_agent_bash_payload_json(&self, row: &MailboxRow) -> Result<String, String> {
+        if row.kind != AGENT_BASH_COMPLETE_KIND || row.payload_compacted_at.is_none() {
+            return Ok(row.payload_json.clone());
+        }
+        self.verify_mailbox_row_payload(row)?;
+        let path = row
+            .payload_file_path
+            .as_deref()
+            .ok_or_else(|| format!("Mailbox row {} has no retained payload path", row.seq))?;
+        fs::read_to_string(path).map_err(|err| {
+            format!(
+                "Failed to read mailbox row {} retained payload: {err}",
+                row.seq
+            )
+        })
+    }
+
+    pub fn delivered_payload_compaction_stats(
+        &self,
+    ) -> Result<DeliveredPayloadCompactionStats, String> {
+        let (eligible_rows, inline_bytes) = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(length(CAST(payload_json AS BLOB))), 0)
+                 FROM mailbox
+                 WHERE kind = ?1
+                   AND delivered_at IS NOT NULL
+                   AND payload_compacted_at IS NULL",
+                params![AGENT_BASH_COMPLETE_KIND],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|err| format!("Failed to read delivered payload compaction stats: {err}"))?;
+        Ok(DeliveredPayloadCompactionStats {
+            eligible_rows: usize::try_from(eligible_rows)
+                .map_err(|_| "Delivered payload row count does not fit usize".to_string())?,
+            inline_bytes: u64::try_from(inline_bytes)
+                .map_err(|_| "Delivered payload byte count must not be negative".to_string())?,
+        })
+    }
+
+    pub fn compact_delivered_payloads(
+        &mut self,
+        limit: usize,
+    ) -> Result<DeliveredPayloadCompactionReport, String> {
+        if limit == 0 {
+            return Ok(DeliveredPayloadCompactionReport::default());
+        }
+        let candidates = delivered_payload_compaction_candidates(&self.conn, limit)?;
+        let mut report = DeliveredPayloadCompactionReport {
+            scanned_rows: candidates.len(),
+            ..DeliveredPayloadCompactionReport::default()
+        };
+        for candidate in candidates {
+            let original_len = candidate.payload_json.len() as u64;
+            let published = self.retained_payload_for_compaction(&candidate)?;
+            let compacted_json = compacted_payload_json(&candidate.kind, &published)?;
+            let changed =
+                mark_payload_compacted(&self.conn, &candidate, &published, &compacted_json)?;
+            let delta = map_compaction_report_delta(
+                original_len,
+                &published,
+                compacted_json.len(),
+                changed,
+            );
+            merge_compaction_report(&mut report, delta);
+        }
+        Ok(report)
+    }
+
+    fn retained_payload_for_compaction(
+        &self,
+        candidate: &DeliveredPayloadCompactionCandidate,
+    ) -> Result<PublishedMailboxPayload, String> {
+        match candidate.published_payload()? {
+            Some(payload) => {
+                self.verify_published_payload(&payload)?;
+                Ok(payload)
+            }
+            None => self.publish_immutable_payload(candidate.payload_json.as_bytes()),
+        }
+    }
+
     pub fn list_pending(&self, session_id: &str) -> Result<Vec<MailboxRow>, String> {
         self.list_pending_for_delivery(session_id, None)
     }
@@ -1680,7 +1706,8 @@ impl MailboxDb {
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
                         matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                         payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, submission_token, target_kind, target_id
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE delivered_at IS NULL
                    AND (
@@ -1785,6 +1812,37 @@ impl MailboxDb {
             .map_err(format_bounded_mailbox_rows_error)
     }
 
+    pub fn list_delivery_invocation_children(
+        &self,
+        owner_invocation_uuid: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT delivered_by_invocation_uuid
+                 FROM mailbox
+                 WHERE owner_invocation_uuid = ?1
+                   AND delivered_by_invocation_uuid IS NOT NULL
+                   AND delivered_by_invocation_uuid != owner_invocation_uuid
+                 GROUP BY delivered_by_invocation_uuid
+                 ORDER BY MIN(seq), delivered_by_invocation_uuid
+                 LIMIT ?2",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox delivery-child query: {err}"))?;
+        let rows = stmt
+            .query_map(
+                params![owner_invocation_uuid, bounded_mailbox_sql_limit(limit)],
+                |row| row.get(0),
+            )
+            .map_err(|err| format!("Failed to query mailbox delivery children: {err}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to map mailbox delivery children: {err}"))
+    }
+
     fn bounded_mailbox_rows(
         &self,
         session_id: &str,
@@ -1799,7 +1857,8 @@ impl MailboxDb {
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
                         matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                         payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, submission_token, target_kind, target_id
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE session_id = ?1
                  ORDER BY CASE WHEN delivered_at IS NULL THEN 0 ELSE 1 END, seq DESC
@@ -2079,8 +2138,8 @@ impl MailboxDb {
                          mailbox.state_dir, mailbox.meta_path, mailbox.log_path,
                          mailbox.rc_path, mailbox.rc, mailbox.payload_file_path,
                          mailbox.payload_sha256, mailbox.payload_byte_len,
-                         mailbox.payload_retention_policy, mailbox.submission_token,
-                         mailbox.target_kind, mailbox.target_id
+                         mailbox.payload_retention_policy, mailbox.payload_compacted_at,
+                         mailbox.submission_token, mailbox.target_kind, mailbox.target_id
                  FROM mailbox_delivery_attempt_items AS items
                  JOIN mailbox ON mailbox.seq = items.mailbox_seq
                  WHERE items.attempt_id = ?1 AND mailbox.delivered_at IS NULL
@@ -2367,18 +2426,23 @@ impl MailboxDb {
                     pty_control_path,
                     updated_at,
                     models_dir,
-                    effective_cwd
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    effective_cwd,
+                    selected_auto_wake_max
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(session_id)
                  DO UPDATE SET
                     mode = excluded.mode,
-                    invocation_uuid = excluded.invocation_uuid,
+                    invocation_uuid = COALESCE(excluded.invocation_uuid, session_runtime.invocation_uuid),
                     provider_name = excluded.provider_name,
                     model_name = excluded.model_name,
                     pty_control_path = excluded.pty_control_path,
                     updated_at = excluded.updated_at,
                     models_dir = COALESCE(excluded.models_dir, session_runtime.models_dir),
-                    effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd)",
+                    effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd),
+                    selected_auto_wake_max = COALESCE(
+                        session_runtime.selected_auto_wake_max,
+                        excluded.selected_auto_wake_max
+                    )",
                 params![
                     input.session_id,
                     input.mode,
@@ -2389,6 +2453,7 @@ impl MailboxDb {
                     &now,
                     input.models_dir,
                     input.effective_cwd,
+                    input.selected_auto_wake_max,
                 ],
             )
             .map_err(|err| format!("Failed to upsert session runtime row: {err}"))?;
@@ -2710,7 +2775,8 @@ impl MailboxDb {
                         matched_os_boot_id, matched_os_pid_starttime_ticks,
                         matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                         payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, submission_token, target_kind, target_id
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
                  FROM mailbox
                  WHERE session_id = ?1
                  ORDER BY seq ASC",
@@ -2782,12 +2848,13 @@ impl MailboxDb {
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<(), String> {
         let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
             .conn
             .transaction()
             .map_err(|err| format!("Failed to start mailbox rollback test transaction: {err}"))?;
-        let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &published, &now)?;
+        let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         Err("forced rollback before commit".to_string())
     }
 
@@ -2966,14 +3033,52 @@ fn validate_sha256_hex(value: &str) -> Result<(), String> {
     Err("Mailbox payload SHA-256 must be 64 hexadecimal characters".to_string())
 }
 
-fn publish_payload_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn map_compaction_report_delta(
+    original_len: u64,
+    published: &PublishedMailboxPayload,
+    compacted_len: usize,
+    changed: bool,
+) -> DeliveredPayloadCompactionReport {
+    if !changed {
+        return DeliveredPayloadCompactionReport::default();
+    }
+    DeliveredPayloadCompactionReport {
+        scanned_rows: 0,
+        compacted_rows: 1,
+        retained_payload_bytes: published.byte_len,
+        inline_bytes_reclaimed: original_len.saturating_sub(compacted_len as u64),
+    }
+}
+
+fn merge_compaction_report(
+    report: &mut DeliveredPayloadCompactionReport,
+    delta: DeliveredPayloadCompactionReport,
+) {
+    report.compacted_rows += delta.compacted_rows;
+    report.retained_payload_bytes = report
+        .retained_payload_bytes
+        .saturating_add(delta.retained_payload_bytes);
+    report.inline_bytes_reclaimed = report
+        .inline_bytes_reclaimed
+        .saturating_add(delta.inline_bytes_reclaimed);
+}
+
+fn validate_payload_publication(path: &Path) -> Result<Option<&Path>, String> {
     let directory = path
         .parent()
         .ok_or_else(|| "Mailbox payload path has no parent directory".to_string())?;
-    ensure_durable_directory(directory)?;
     if path.exists() {
-        return Ok(());
+        Ok(None)
+    } else {
+        Ok(Some(directory))
     }
+}
+
+fn publish_payload_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let Some(directory) = validate_payload_publication(path)? else {
+        return Ok(());
+    };
+    ensure_durable_directory(directory)?;
 
     let temp_path = directory.join(format!(
         ".{}.{}.tmp",
@@ -3048,7 +3153,7 @@ fn verify_published_payload(payload: &PublishedMailboxPayload) -> Result<(), Str
             payload.file_path.display()
         ));
     }
-    let actual_sha256 = sha256_file(&payload.file_path)?;
+    let actual_sha256 = format_sha256_digest(&sha256_file(&payload.file_path)?);
     if actual_sha256 != payload.sha256 {
         return Err(format!(
             "Mailbox payload integrity mismatch for {}",
@@ -3058,7 +3163,7 @@ fn verify_published_payload(payload: &PublishedMailboxPayload) -> Result<(), Str
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
     let mut file = File::open(path)
         .map_err(|err| format!("Failed to open mailbox payload for verification: {err}"))?;
     let mut digest = Sha256::new();
@@ -3072,11 +3177,11 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(digest.finalize().into())
+}
+
+fn format_sha256_digest(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn published_payload_from_row(row: &MailboxRow) -> Result<Option<PublishedMailboxPayload>, String> {
@@ -3105,12 +3210,26 @@ fn published_payload_from_row(row: &MailboxRow) -> Result<Option<PublishedMailbo
     }
 }
 
-fn ensure_durable_directory(path: &Path) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableDirectoryState {
+    Existing,
+    Missing,
+}
+
+fn validate_durable_directory_state(path: &Path) -> Result<DurableDirectoryState, String> {
     if path.is_dir() {
-        return Ok(());
+        return Ok(DurableDirectoryState::Existing);
     }
     if path.exists() {
-        return Err(format!("Path is not a directory: {}", path.display()));
+        Err(format!("Path is not a directory: {}", path.display()))
+    } else {
+        Ok(DurableDirectoryState::Missing)
+    }
+}
+
+fn ensure_durable_directory(path: &Path) -> Result<(), String> {
+    if validate_durable_directory_state(path)? == DurableDirectoryState::Existing {
+        return Ok(());
     }
     if let Some(parent) = path.parent() {
         ensure_durable_directory(parent)?;
@@ -3348,12 +3467,68 @@ struct SubmittedInputPayloadReference<'a> {
     retention_policy: &'a str,
 }
 
+#[derive(Serialize)]
+struct CompactedMailboxPayloadMetadata<'a> {
+    schema_version: u8,
+    kind: &'a str,
+    payload: SubmittedInputPayloadReference<'a>,
+}
+
+struct DeliveredPayloadCompactionCandidate {
+    seq: i64,
+    kind: String,
+    payload_json: String,
+    payload_file_path: Option<String>,
+    payload_sha256: Option<String>,
+    payload_byte_len: Option<i64>,
+    payload_retention_policy: Option<String>,
+}
+
+impl DeliveredPayloadCompactionCandidate {
+    fn published_payload(&self) -> Result<Option<PublishedMailboxPayload>, String> {
+        match (
+            self.payload_file_path.as_deref(),
+            self.payload_sha256.as_deref(),
+            self.payload_byte_len,
+            self.payload_retention_policy.as_deref(),
+        ) {
+            (None, None, None, None) => Ok(None),
+            (Some(file_path), Some(sha256), Some(byte_len), Some(retention_policy)) => {
+                let byte_len = u64::try_from(byte_len).map_err(|_| {
+                    format!(
+                        "Mailbox row {} has a negative payload byte length",
+                        self.seq
+                    )
+                })?;
+                Ok(Some(PublishedMailboxPayload {
+                    address: payload_address(sha256),
+                    file_path: PathBuf::from(file_path),
+                    sha256: sha256.to_string(),
+                    byte_len,
+                    retention_policy: retention_policy.to_string(),
+                }))
+            }
+            _ => Err(format!(
+                "Mailbox row {} has incomplete retained payload metadata",
+                self.seq
+            )),
+        }
+    }
+}
+
 pub fn submitted_input_handle(
     submission_token: &str,
     target: InboxTarget<'_>,
 ) -> Result<String, String> {
     validate_submission_token(submission_token)?;
     validate_inbox_target(target)?;
+    format_submitted_input_handle(submission_token, target)
+}
+
+fn format_submitted_input_handle(
+    submission_token: &str,
+    target: InboxTarget<'_>,
+) -> Result<String, String> {
     let canonical = CanonicalSubmittedInputIdentity {
         domain: INPUT_IDENTITY_DOMAIN,
         v: INPUT_IDENTITY_VERSION,
@@ -3409,6 +3584,103 @@ fn submitted_input_payload_json(
         },
     })
     .map_err(|err| format!("Failed to encode submitted input metadata: {err}"))
+}
+
+fn compacted_payload_json(
+    kind: &str,
+    published: &PublishedMailboxPayload,
+) -> Result<String, String> {
+    serde_json::to_string(&CompactedMailboxPayloadMetadata {
+        schema_version: COMPACTED_PAYLOAD_SCHEMA_VERSION,
+        kind,
+        payload: SubmittedInputPayloadReference {
+            address: &published.address,
+            file_path: &published.file_path,
+            sha256: &published.sha256,
+            byte_len: published.byte_len,
+            retention_policy: &published.retention_policy,
+        },
+    })
+    .map_err(|err| format!("Failed to encode compacted mailbox payload metadata: {err}"))
+}
+
+fn delivered_payload_compaction_candidates(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<DeliveredPayloadCompactionCandidate>, String> {
+    let limit = i64::try_from(limit).map_err(|_| {
+        "Delivered payload compaction limit does not fit SQLite INTEGER".to_string()
+    })?;
+    let mut statement = conn
+        .prepare(
+            "SELECT seq, kind, payload_json, payload_file_path, payload_sha256,
+                    payload_byte_len, payload_retention_policy
+             FROM mailbox
+             WHERE kind = ?1
+               AND delivered_at IS NOT NULL
+               AND payload_compacted_at IS NULL
+             ORDER BY seq ASC
+             LIMIT ?2",
+        )
+        .map_err(|err| format!("Failed to prepare delivered payload compaction query: {err}"))?;
+    let rows = statement
+        .query_map(params![AGENT_BASH_COMPLETE_KIND, limit], |row| {
+            Ok(DeliveredPayloadCompactionCandidate {
+                seq: row.get(0)?,
+                kind: row.get(1)?,
+                payload_json: row.get(2)?,
+                payload_file_path: row.get(3)?,
+                payload_sha256: row.get(4)?,
+                payload_byte_len: row.get(5)?,
+                payload_retention_policy: row.get(6)?,
+            })
+        })
+        .map_err(|err| format!("Failed to query delivered payload compaction rows: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read delivered payload compaction row: {err}"))
+}
+
+fn mark_payload_compacted(
+    conn: &Connection,
+    candidate: &DeliveredPayloadCompactionCandidate,
+    published: &PublishedMailboxPayload,
+    compacted_json: &str,
+) -> Result<bool, String> {
+    let compacted_at = now_rfc3339();
+    let byte_len = i64::try_from(published.byte_len)
+        .map_err(|_| "Compacted payload length does not fit SQLite INTEGER".to_string())?;
+    conn.execute(
+        "UPDATE mailbox
+         SET payload_json = ?2,
+             payload_file_path = ?3,
+             payload_sha256 = ?4,
+             payload_byte_len = ?5,
+             payload_retention_policy = ?6,
+             payload_compacted_at = ?7
+         WHERE seq = ?1
+           AND kind = ?8
+           AND delivered_at IS NOT NULL
+           AND payload_compacted_at IS NULL
+           AND payload_json = ?9",
+        params![
+            candidate.seq,
+            compacted_json,
+            published.file_path.to_string_lossy().as_ref(),
+            &published.sha256,
+            byte_len,
+            &published.retention_policy,
+            compacted_at,
+            AGENT_BASH_COMPLETE_KIND,
+            &candidate.payload_json,
+        ],
+    )
+    .map(|changed| changed == 1)
+    .map_err(|err| {
+        format!(
+            "Failed to compact delivered mailbox row {}: {err}",
+            candidate.seq
+        )
+    })
 }
 
 fn enqueue_submitted_input_in_tx(
@@ -3503,10 +3775,11 @@ fn submitted_input_row_matches(
 fn enqueue_agent_bash_complete_in_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
+    payload_json: &str,
     published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<EnqueueResult, String> {
-    let changed = insert_agent_bash_complete_tx(tx, input, published, now)?;
+    let changed = insert_agent_bash_complete_tx(tx, input, payload_json, published, now)?;
     let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, input.handle)?
         .ok_or_else(|| "Mailbox row missing after enqueue conflict check".to_string())?;
     Ok(agent_bash_enqueue_result(changed, row, input, published))
@@ -3515,6 +3788,7 @@ fn enqueue_agent_bash_complete_in_tx(
 fn insert_agent_bash_complete_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &AgentBashCompleteEnqueue<'_>,
+    payload_json: &str,
     published: &PublishedMailboxPayload,
     now: &str,
 ) -> Result<usize, String> {
@@ -3538,13 +3812,14 @@ fn insert_agent_bash_complete_tx(
             payload_file_path,
             payload_sha256,
             payload_byte_len,
-            payload_retention_policy
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            payload_retention_policy,
+            payload_compacted_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?5)",
         params![
             input.session_id,
             AGENT_BASH_COMPLETE_KIND,
             input.handle,
-            input.payload_json,
+            payload_json,
             now,
             input.owner_invocation_uuid,
             input.matched_os_pid,
@@ -3667,6 +3942,367 @@ fn runtime_generation_binding_matches(
         }
 }
 
+fn map_runtime_generation_create(
+    changed: usize,
+    row: RuntimeGenerationRow,
+    request: &CreateRuntimeGeneration<'_>,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    if changed == 1 {
+        return GenerationMutation::Applied(row);
+    }
+    if runtime_generation_create_matches(&row, request) {
+        GenerationMutation::AlreadyApplied(row)
+    } else {
+        GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
+    }
+}
+
+fn validate_generation_binding_fence(
+    before: &RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)
+}
+
+fn validate_generation_binding_predecessor(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if before.lifecycle_state == RuntimeLifecycleState::Starting {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Starting,
+        actual: before.lifecycle_state,
+    })
+}
+
+fn map_running_generation_binding_replay(
+    before: RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    if runtime_generation_binding_matches(&before, request) {
+        GenerationMutation::AlreadyApplied(before)
+    } else {
+        GenerationMutation::Rejected(GenerationRejection::ProcessIdentityConflict)
+    }
+}
+
+fn bind_generation_process_identity(
+    conn: &Connection,
+    before: &RuntimeGenerationRow,
+    request: &BindRuntimeGenerationRunning<'_>,
+    recorded_at: &str,
+) -> Result<bool, GenerationStorageError> {
+    let Some(identity) = request.exact_process_identity else {
+        return Ok(true);
+    };
+    pid_identity::bind_identity_on(
+        conn,
+        pid_identity::PidIdentityRecord {
+            identity,
+            os_pgid: request.os_pgid,
+            invocation_uuid: request.fence.spawn_invocation_uuid,
+            session_id: before.session_id.as_deref(),
+            provider_name: Some(&before.provider_name),
+            model_name: before.model_name.as_deref(),
+            recorded_at,
+        },
+    )
+    .map_err(GenerationStorageError::new)
+}
+
+fn validate_generation_attachment_session_id(
+    request: &AttachRuntimeGenerationSession<'_>,
+) -> Result<(), GenerationStorageError> {
+    if !request.session_id.is_empty() {
+        return Ok(());
+    }
+    Err(GenerationStorageError::new(
+        "Runtime generation session_id must not be empty".to_string(),
+    ))
+}
+
+fn validate_generation_attachment_fence(
+    before: &RuntimeGenerationRow,
+    request: &AttachRuntimeGenerationSession<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)
+}
+
+fn map_generation_attachment_replay(
+    before: RuntimeGenerationRow,
+    request: &AttachRuntimeGenerationSession<'_>,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    if before.session_id.as_deref() == Some(request.session_id) {
+        GenerationMutation::AlreadyApplied(before)
+    } else {
+        GenerationMutation::Rejected(GenerationRejection::SessionConflict)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingDeliveryClaimDisposition {
+    AlreadyInFlight,
+    Recover,
+}
+
+fn validate_existing_delivery_claim(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if !before.active_delivery_seqs.is_empty() && before.active_delivery_claimed_at.is_some() {
+        return Ok(());
+    }
+    Err(GenerationRejection::InvariantViolation)
+}
+
+fn map_existing_delivery_claim(
+    _before: &RuntimeGenerationRow,
+    stale: bool,
+) -> ExistingDeliveryClaimDisposition {
+    if stale {
+        ExistingDeliveryClaimDisposition::Recover
+    } else {
+        ExistingDeliveryClaimDisposition::AlreadyInFlight
+    }
+}
+
+fn validate_new_delivery_claim(
+    before: &RuntimeGenerationRow,
+    rows_pending: bool,
+    overlaps: bool,
+) -> Result<(), GenerationRejection> {
+    if before.lifecycle_state != RuntimeLifecycleState::Running {
+        return Err(GenerationRejection::IllegalPredecessor {
+            expected: RuntimeLifecycleState::Running,
+            actual: before.lifecycle_state,
+        });
+    }
+    if before.drain_request_id.is_some() {
+        return Err(GenerationRejection::DrainRequestConflict);
+    }
+    if !rows_pending || overlaps {
+        return Err(GenerationRejection::InvariantViolation);
+    }
+    Ok(())
+}
+
+fn map_acquired_delivery_claim(row: RuntimeGenerationRow) -> DeliveryClaimAcquireResult {
+    DeliveryClaimAcquireResult::Acquired(row)
+}
+
+fn validate_active_delivery_claim(
+    row: Option<&RuntimeGenerationRow>,
+    fence: RuntimeGenerationFence<'_>,
+    claim_id: &DeliveryClaimId,
+    seqs: &[i64],
+) -> Result<(), GenerationRejection> {
+    let Some(row) = row else {
+        return Err(GenerationRejection::NotFound);
+    };
+    validate_generation_fence(row, fence)?;
+    if row.active_delivery_claim_id.as_ref() != Some(claim_id)
+        || row.active_delivery_seqs != seqs
+        || row.active_delivery_claimed_at.is_none()
+    {
+        return Err(GenerationRejection::InvariantViolation);
+    }
+    Ok(())
+}
+
+fn validate_running_delivery_confirmation(
+    row: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if row.lifecycle_state == RuntimeLifecycleState::Running {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Running,
+        actual: row.lifecycle_state,
+    })
+}
+
+fn validate_confirmed_mailbox_row_change(
+    seq: i64,
+    changed: usize,
+) -> Result<(), GenerationStorageError> {
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(GenerationStorageError::new(format!(
+        "Claimed mailbox row {seq} was not pending at confirmation"
+    )))
+}
+
+fn map_applied_generation(row: RuntimeGenerationRow) -> GenerationMutation<RuntimeGenerationRow> {
+    GenerationMutation::Applied(row)
+}
+
+fn map_failed_delivery_generation(
+    row: RuntimeGenerationRow,
+) -> GenerationMutation<RuntimeGenerationRow> {
+    GenerationMutation::Applied(row)
+}
+
+fn validate_non_orderly_reason(
+    request: &ExitRuntimeGenerationNonOrderly<'_>,
+) -> Result<(), GenerationStorageError> {
+    if request.reason != RuntimeTerminalReason::OrderlyCompletion {
+        return Ok(());
+    }
+    Err(GenerationStorageError::new(
+        "Orderly completion must pass through draining".to_string(),
+    ))
+}
+
+fn validate_generation_fence(
+    before: &RuntimeGenerationRow,
+    fence: RuntimeGenerationFence<'_>,
+) -> Result<(), GenerationRejection> {
+    if before.spawn_invocation_uuid == fence.spawn_invocation_uuid {
+        return Ok(());
+    }
+    Err(GenerationRejection::FenceMismatch)
+}
+
+fn validate_non_orderly_predecessor(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if matches!(
+        before.lifecycle_state,
+        RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
+    ) {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Running,
+        actual: before.lifecycle_state,
+    })
+}
+
+fn map_non_orderly_exit_replay(
+    before: &RuntimeGenerationRow,
+    request: &ExitRuntimeGenerationNonOrderly<'_>,
+) -> Option<GenerationMutation<RuntimeGenerationRow>> {
+    if before.lifecycle_state != RuntimeLifecycleState::Exited {
+        return None;
+    }
+    if before.terminal_reason == Some(request.reason) && before.exit_code == request.exit_code {
+        Some(GenerationMutation::AlreadyApplied(before.clone()))
+    } else {
+        Some(GenerationMutation::Rejected(
+            GenerationRejection::IllegalPredecessor {
+                expected: RuntimeLifecycleState::Running,
+                actual: RuntimeLifecycleState::Exited,
+            },
+        ))
+    }
+}
+
+fn validate_drain_request_fence(
+    before: &RuntimeGenerationRow,
+    request: &RequestRuntimeGenerationDrain<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)
+}
+
+fn validate_drain_request_predecessor(
+    before: &RuntimeGenerationRow,
+) -> Result<(), GenerationRejection> {
+    if before.lifecycle_state == RuntimeLifecycleState::Running {
+        return Ok(());
+    }
+    Err(GenerationRejection::IllegalPredecessor {
+        expected: RuntimeLifecycleState::Running,
+        actual: before.lifecycle_state,
+    })
+}
+
+fn map_drain_request_replay(
+    before: &RuntimeGenerationRow,
+    request: &RequestRuntimeGenerationDrain<'_>,
+) -> Option<DrainRequestResult> {
+    let existing = before.drain_request_id.as_ref()?;
+    if existing == request.drain_request_id {
+        Some(DrainRequestResult::AlreadyInstalled(
+            before.clone(),
+            drain_handoff(before),
+        ))
+    } else {
+        Some(DrainRequestResult::Rejected(
+            GenerationRejection::DrainRequestConflict,
+        ))
+    }
+}
+
+fn map_installed_drain_request(row: RuntimeGenerationRow) -> DrainRequestResult {
+    let handoff = drain_handoff(&row);
+    DrainRequestResult::Installed(row, handoff)
+}
+
+fn validate_drain_advance_identity(
+    before: &RuntimeGenerationRow,
+    request: &AdvanceRuntimeGenerationDrain<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)?;
+    if before.drain_request_id.as_ref() == Some(request.drain_request_id) {
+        return Ok(());
+    }
+    Err(GenerationRejection::DrainRequestConflict)
+}
+
+fn map_drain_advance_blocker(before: &RuntimeGenerationRow) -> Option<DrainAdvanceResult> {
+    if let Some(claim_id) = before.active_delivery_claim_id.clone() {
+        return Some(DrainAdvanceResult::WaitingOnClaim(claim_id));
+    }
+    match before.lifecycle_state {
+        RuntimeLifecycleState::Running => None,
+        RuntimeLifecycleState::Draining => {
+            Some(DrainAdvanceResult::AlreadyDraining(before.clone()))
+        }
+        RuntimeLifecycleState::Exited => Some(DrainAdvanceResult::AlreadyExited(before.clone())),
+        actual => Some(DrainAdvanceResult::Rejected(
+            GenerationRejection::IllegalPredecessor {
+                expected: RuntimeLifecycleState::Running,
+                actual,
+            },
+        )),
+    }
+}
+
+fn map_advanced_drain(row: RuntimeGenerationRow) -> DrainAdvanceResult {
+    DrainAdvanceResult::Advanced(row)
+}
+
+fn validate_drain_finish_identity(
+    before: &RuntimeGenerationRow,
+    request: &FinishRuntimeGenerationDrain<'_>,
+) -> Result<(), GenerationRejection> {
+    validate_generation_fence(before, request.fence)?;
+    if before.drain_request_id.as_ref() == Some(request.drain_request_id) {
+        return Ok(());
+    }
+    Err(GenerationRejection::DrainRequestConflict)
+}
+
+fn validate_drain_finish_claim(before: &RuntimeGenerationRow) -> Result<(), GenerationRejection> {
+    if before.active_delivery_claim_id.is_none() {
+        return Ok(());
+    }
+    Err(GenerationRejection::InvariantViolation)
+}
+
+fn map_drain_finish_predecessor(before: &RuntimeGenerationRow) -> Option<DrainFinishResult> {
+    match before.lifecycle_state {
+        RuntimeLifecycleState::Draining => None,
+        RuntimeLifecycleState::Exited => Some(DrainFinishResult::AlreadyExited(before.clone())),
+        actual => Some(DrainFinishResult::NotDraining(actual)),
+    }
+}
+
+fn map_finished_drain(row: RuntimeGenerationRow) -> DrainFinishResult {
+    DrainFinishResult::Finished(row)
+}
+
 fn generation_storage_error(
     action: &'static str,
 ) -> impl FnOnce(rusqlite::Error) -> GenerationStorageError {
@@ -3710,21 +4346,24 @@ fn runtime_generations_by_process_identity_on(
     collect_runtime_generation_rows(rows)
 }
 
-fn runtime_generations_for_session_on(
-    conn: &Connection,
-    session_id: &str,
-    nonterminal_only: bool,
-) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
+fn format_runtime_generations_for_session_sql(nonterminal_only: bool) -> String {
     let predicate = if nonterminal_only {
         "session_id = ?1 AND lifecycle_state != 'exited'"
     } else {
         "session_id = ?1"
     };
-    let sql = format!(
+    format!(
         "{} ORDER BY created_at ASC, generation_uuid ASC",
         runtime_generation_select_sql(predicate)
-    );
-    let mut statement = conn.prepare(&sql).map_err(generation_storage_error(
+    )
+}
+
+fn runtime_generations_for_session_on(
+    conn: &Connection,
+    session_id: &str,
+    sql: &str,
+) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
+    let mut statement = conn.prepare(sql).map_err(generation_storage_error(
         "prepare session runtime generation lookup",
     ))?;
     let rows = statement
@@ -3760,22 +4399,96 @@ where
         .map_err(generation_storage_error("read runtime generation row"))
 }
 
+struct RawRuntimeGenerationFields {
+    generation_uuid: String,
+    lifecycle_state: String,
+    identity_os_pid: Option<i64>,
+    identity_os_boot_id: Option<String>,
+    identity_os_pid_starttime_ticks: Option<i64>,
+    terminal_reason: Option<String>,
+    drain_request_uuid: Option<String>,
+    active_delivery_claim_uuid: Option<String>,
+    active_delivery_seqs_json: Option<String>,
+}
+
+#[derive(Debug)]
+struct ParsedRuntimeGenerationFields {
+    generation_id: RuntimeGenerationId,
+    lifecycle_state: RuntimeLifecycleState,
+    exact_process_evidence: ExactProcessEvidence,
+    terminal_reason: Option<RuntimeTerminalReason>,
+    drain_request_id: Option<DrainRequestId>,
+    active_delivery_claim_id: Option<DeliveryClaimId>,
+    active_delivery_seqs: Vec<i64>,
+}
+
+fn parse_runtime_generation_fields(
+    raw: RawRuntimeGenerationFields,
+) -> rusqlite::Result<ParsedRuntimeGenerationFields> {
+    let generation_id =
+        RuntimeGenerationId::parse(&raw.generation_uuid).map_err(to_sql_conversion_error)?;
+    let lifecycle_state =
+        RuntimeLifecycleState::parse(&raw.lifecycle_state).map_err(to_sql_conversion_error)?;
+    let exact_process_evidence = exact_process_evidence_from_columns(
+        raw.identity_os_pid,
+        raw.identity_os_boot_id,
+        raw.identity_os_pid_starttime_ticks,
+    )?;
+    let terminal_reason = raw
+        .terminal_reason
+        .as_deref()
+        .map(RuntimeTerminalReason::parse)
+        .transpose()
+        .map_err(to_sql_conversion_error)?;
+    let drain_request_id = raw
+        .drain_request_uuid
+        .as_deref()
+        .map(DrainRequestId::parse)
+        .transpose()
+        .map_err(to_sql_conversion_error)?;
+    let active_delivery_claim_id = raw
+        .active_delivery_claim_uuid
+        .as_deref()
+        .map(DeliveryClaimId::parse)
+        .transpose()
+        .map_err(to_sql_conversion_error)?;
+    let has_active_delivery_seqs = raw.active_delivery_seqs_json.is_some();
+    let active_delivery_seqs = raw
+        .active_delivery_seqs_json
+        .as_deref()
+        .map(parse_delivery_seqs)
+        .transpose()
+        .map_err(to_sql_conversion_error)?
+        .unwrap_or_default();
+    if has_active_delivery_seqs {
+        validate_delivery_claim_seqs(&active_delivery_seqs).map_err(to_sql_conversion_error)?;
+    }
+    Ok(ParsedRuntimeGenerationFields {
+        generation_id,
+        lifecycle_state,
+        exact_process_evidence,
+        terminal_reason,
+        drain_request_id,
+        active_delivery_claim_id,
+        active_delivery_seqs,
+    })
+}
+
 fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeGenerationRow> {
-    let generation_uuid: String = row.get(0)?;
-    let lifecycle_state: String = row.get(1)?;
-    let identity_os_pid: Option<i64> = row.get(11)?;
-    let identity_os_boot_id: Option<String> = row.get(12)?;
-    let identity_os_pid_starttime_ticks: Option<i64> = row.get(13)?;
-    let terminal_reason: Option<String> = row.get(18)?;
-    let drain_request_uuid: Option<String> = row.get(20)?;
-    let active_delivery_claim_uuid: Option<String> = row.get(23)?;
-    let active_delivery_claimed_at: Option<String> = row.get(24)?;
-    let active_delivery_seqs_json: Option<String> = row.get(25)?;
+    let parsed = parse_runtime_generation_fields(RawRuntimeGenerationFields {
+        generation_uuid: row.get(0)?,
+        lifecycle_state: row.get(1)?,
+        identity_os_pid: row.get(11)?,
+        identity_os_boot_id: row.get(12)?,
+        identity_os_pid_starttime_ticks: row.get(13)?,
+        terminal_reason: row.get(18)?,
+        drain_request_uuid: row.get(20)?,
+        active_delivery_claim_uuid: row.get(23)?,
+        active_delivery_seqs_json: row.get(25)?,
+    })?;
     Ok(RuntimeGenerationRow {
-        generation_id: RuntimeGenerationId::parse(&generation_uuid)
-            .map_err(to_sql_conversion_error)?,
-        lifecycle_state: RuntimeLifecycleState::parse(&lifecycle_state)
-            .map_err(to_sql_conversion_error)?,
+        generation_id: parsed.generation_id,
+        lifecycle_state: parsed.lifecycle_state,
         spawn_invocation_uuid: row.get(2)?,
         session_id: row.get(3)?,
         runtime_mode: row.get(4)?,
@@ -3785,40 +4498,19 @@ fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Runti
         models_dir: row.get(8)?,
         effective_cwd: row.get(9)?,
         spawned_os_pid: row.get(10)?,
-        exact_process_evidence: exact_process_evidence_from_columns(
-            identity_os_pid,
-            identity_os_boot_id,
-            identity_os_pid_starttime_ticks,
-        )?,
+        exact_process_evidence: parsed.exact_process_evidence,
         created_at: row.get(14)?,
         running_at: row.get(15)?,
         draining_at: row.get(16)?,
         exited_at: row.get(17)?,
-        terminal_reason: terminal_reason
-            .as_deref()
-            .map(RuntimeTerminalReason::parse)
-            .transpose()
-            .map_err(to_sql_conversion_error)?,
+        terminal_reason: parsed.terminal_reason,
         exit_code: row.get(19)?,
-        drain_request_id: drain_request_uuid
-            .as_deref()
-            .map(DrainRequestId::parse)
-            .transpose()
-            .map_err(to_sql_conversion_error)?,
+        drain_request_id: parsed.drain_request_id,
         drain_requested_at: row.get(21)?,
         drain_requested_by_invocation_uuid: row.get(22)?,
-        active_delivery_claim_id: active_delivery_claim_uuid
-            .as_deref()
-            .map(DeliveryClaimId::parse)
-            .transpose()
-            .map_err(to_sql_conversion_error)?,
-        active_delivery_claimed_at,
-        active_delivery_seqs: active_delivery_seqs_json
-            .as_deref()
-            .map(parse_delivery_seqs)
-            .transpose()
-            .map_err(to_sql_conversion_error)?
-            .unwrap_or_default(),
+        active_delivery_claim_id: parsed.active_delivery_claim_id,
+        active_delivery_claimed_at: row.get(24)?,
+        active_delivery_seqs: parsed.active_delivery_seqs,
     })
 }
 
@@ -3883,13 +4575,11 @@ fn serialize_delivery_seqs(seqs: &[i64]) -> Result<String, GenerationStorageErro
 }
 
 fn parse_delivery_seqs(value: &str) -> Result<Vec<i64>, GenerationStorageError> {
-    let seqs = serde_json::from_str::<Vec<i64>>(value).map_err(|err| {
+    serde_json::from_str::<Vec<i64>>(value).map_err(|err| {
         GenerationStorageError::new(format!(
             "Failed to parse runtime generation delivery batch: {err}"
         ))
-    })?;
-    validate_delivery_claim_seqs(&seqs)?;
-    Ok(seqs)
+    })
 }
 
 fn runtime_delivery_claim_is_stale(row: &RuntimeGenerationRow, stale_after_seconds: i64) -> bool {
@@ -3903,12 +4593,13 @@ fn runtime_delivery_claim_is_stale(row: &RuntimeGenerationRow, stale_after_secon
     claim_age_exceeds_stale_after(claimed_at, stale_after_seconds)
 }
 
-fn mailbox_seqs_are_pending_on(
+fn mailbox_delivery_states_on(
     conn: &Connection,
     seqs: &[i64],
-) -> Result<bool, GenerationStorageError> {
+) -> Result<Vec<Option<Option<String>>>, GenerationStorageError> {
+    let mut states = Vec::with_capacity(seqs.len());
     for seq in seqs {
-        let delivered_at = conn
+        let state = conn
             .query_row(
                 "SELECT delivered_at FROM mailbox WHERE seq = ?1",
                 params![seq],
@@ -3918,18 +4609,19 @@ fn mailbox_seqs_are_pending_on(
             .map_err(generation_storage_error(
                 "verify pending mailbox delivery claim row",
             ))?;
-        if !matches!(delivered_at, Some(None)) {
-            return Ok(false);
-        }
+        states.push(state);
     }
-    Ok(true)
+    Ok(states)
 }
 
-fn active_delivery_claim_overlaps_on(
+fn all_mailbox_seqs_pending(states: &[Option<Option<String>>]) -> bool {
+    states.iter().all(|state| matches!(state, Some(None)))
+}
+
+fn active_delivery_claim_encodings_on(
     conn: &Connection,
     generation_id: &RuntimeGenerationId,
-    requested_seqs: &[i64],
-) -> Result<bool, GenerationStorageError> {
+) -> Result<Vec<Option<String>>, GenerationStorageError> {
     let mut statement = conn
         .prepare(
             "SELECT active_delivery_seqs_json
@@ -3947,43 +4639,41 @@ fn active_delivery_claim_overlaps_on(
         .map_err(generation_storage_error(
             "query active delivery claim overlap",
         ))?;
-    for value in rows {
-        let Some(value) = value.map_err(generation_storage_error(
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(generation_storage_error(
             "read active delivery claim overlap row",
-        ))?
-        else {
-            return Ok(true);
-        };
-        let claimed_seqs = parse_delivery_seqs(&value)?;
-        if claimed_seqs
-            .iter()
-            .any(|seq| requested_seqs.binary_search(seq).is_ok())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        ))
 }
 
-fn validated_active_delivery_claim_on(
-    conn: &Connection,
-    fence: RuntimeGenerationFence<'_>,
-    claim_id: &DeliveryClaimId,
-    seqs: &[i64],
-) -> Result<Result<RuntimeGenerationRow, GenerationRejection>, GenerationStorageError> {
-    let Some(row) = runtime_generation_by_id_on(conn, fence.generation_id)? else {
-        return Ok(Err(GenerationRejection::NotFound));
-    };
-    if row.spawn_invocation_uuid != fence.spawn_invocation_uuid {
-        return Ok(Err(GenerationRejection::FenceMismatch));
+fn parse_active_delivery_claim_batch(value: String) -> Result<Vec<i64>, GenerationStorageError> {
+    let seqs = parse_delivery_seqs(&value)?;
+    validate_delivery_claim_seqs(&seqs)?;
+    Ok(seqs)
+}
+
+fn parse_active_delivery_claim_batches(
+    values: Vec<Option<String>>,
+) -> Result<Vec<Vec<i64>>, GenerationStorageError> {
+    if values.iter().any(Option::is_none) {
+        return Ok(vec![Vec::new()]);
     }
-    if row.active_delivery_claim_id.as_ref() != Some(claim_id)
-        || row.active_delivery_seqs != seqs
-        || row.active_delivery_claimed_at.is_none()
-    {
-        return Ok(Err(GenerationRejection::InvariantViolation));
-    }
-    Ok(Ok(row))
+    values
+        .into_iter()
+        .map(|value| parse_active_delivery_claim_batch(value.expect("missing values returned")))
+        .collect()
+}
+
+fn delivery_claim_batches_overlap(batches: &[Vec<i64>], requested_seqs: &[i64]) -> bool {
+    batches
+        .iter()
+        .any(|claimed_seqs| delivery_claim_batch_overlaps(claimed_seqs, requested_seqs))
+}
+
+fn delivery_claim_batch_overlaps(claimed_seqs: &[i64], requested_seqs: &[i64]) -> bool {
+    claimed_seqs.is_empty()
+        || claimed_seqs
+            .iter()
+            .any(|seq| requested_seqs.binary_search(seq).is_ok())
 }
 
 fn clear_runtime_delivery_claim_on(
@@ -4047,7 +4737,16 @@ fn mark_session_running_row(
          ON CONFLICT(session_id)
          DO UPDATE SET
             mode = excluded.mode,
-            invocation_uuid = excluded.invocation_uuid,
+            invocation_uuid = CASE
+                WHEN session_runtime.invocation_uuid IS NOT NULL
+                 AND EXISTS (
+                    SELECT 1
+                    FROM session_wake_claim
+                    WHERE session_id = excluded.session_id
+                 )
+                THEN session_runtime.invocation_uuid
+                ELSE excluded.invocation_uuid
+            END,
             provider_name = excluded.provider_name,
             model_name = excluded.model_name,
             pty_control_path = excluded.pty_control_path,
@@ -4133,7 +4832,8 @@ fn session_runtime_row(
                 pty_control_path, updated_at, run_state, running_invocation_uuid,
                 running_os_pid, running_os_boot_id, running_os_pid_starttime_ticks,
                 turn_started_at, turn_ended_at, turn_start_max_mailbox_seq,
-                last_exit_code, models_dir, effective_cwd, auto_wake_count
+                last_exit_code, models_dir, effective_cwd, auto_wake_count,
+                selected_auto_wake_max
          FROM session_runtime
          WHERE session_id = ?1",
         params![session_id],
@@ -4519,7 +5219,8 @@ fn query_mailbox_by_kind_handle_tx(
                 matched_os_boot_id, matched_os_pid_starttime_ticks,
                 matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
                 payload_file_path, payload_sha256, payload_byte_len,
-                payload_retention_policy, submission_token, target_kind, target_id
+                payload_retention_policy, payload_compacted_at,
+                submission_token, target_kind, target_id
          FROM mailbox
          WHERE kind = ?1 AND handle = ?2",
         params![kind, handle],
@@ -4545,9 +5246,8 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
         .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
 }
 
-fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS mailbox (
+fn mailbox_schema_definition() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS mailbox (
             seq                          INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id                   TEXT    NOT NULL,
             kind                         TEXT    NOT NULL,
@@ -4572,6 +5272,7 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             payload_sha256               TEXT,
             payload_byte_len             INTEGER,
             payload_retention_policy     TEXT,
+            payload_compacted_at         TEXT,
             submission_token             TEXT,
             target_kind                  TEXT,
             target_id                    TEXT,
@@ -4712,7 +5413,8 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
             last_exit_code                   INTEGER,
             models_dir                       TEXT,
             effective_cwd                    TEXT,
-            auto_wake_count                  INTEGER NOT NULL DEFAULT 0
+            auto_wake_count                  INTEGER NOT NULL DEFAULT 0,
+            selected_auto_wake_max           INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS session_wake_claim (
@@ -4728,29 +5430,36 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_session_wake_claim_claimed_at
-            ON session_wake_claim(claimed_at);",
-    )
-    .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
+            ON session_wake_claim(claimed_at);"
+}
+
+fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(mailbox_schema_definition())
+        .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
     ensure_mailbox_columns(conn)?;
     ensure_mailbox_target_index(conn)?;
+    ensure_mailbox_compaction_index(conn)?;
+    ensure_mailbox_delivery_owner_index(conn)?;
     ensure_session_runtime_columns(conn)?;
     ensure_runtime_generation_columns(conn)
 }
 
 fn ensure_mailbox_columns(conn: &Connection) -> Result<(), String> {
-    let columns = table_columns(conn, "mailbox")?;
+    let sql = format_table_columns_pragma("mailbox");
+    let columns = table_columns(conn, "mailbox", &sql)?;
     for (name, definition) in missing_mailbox_columns(&columns) {
         add_sidecar_column(conn, "mailbox", name, definition)?;
     }
     Ok(())
 }
 
-fn mailbox_column_additions() -> [(&'static str, &'static str); 7] {
+fn mailbox_column_additions() -> [(&'static str, &'static str); 8] {
     [
         ("payload_file_path", "TEXT"),
         ("payload_sha256", "TEXT"),
         ("payload_byte_len", "INTEGER"),
         ("payload_retention_policy", "TEXT"),
+        ("payload_compacted_at", "TEXT"),
         ("submission_token", "TEXT"),
         ("target_kind", "TEXT"),
         ("target_id", "TEXT"),
@@ -4772,8 +5481,26 @@ fn ensure_mailbox_target_index(conn: &Connection) -> Result<(), String> {
     .map_err(|err| format!("Failed to ensure mailbox target index: {err}"))
 }
 
+fn ensure_mailbox_compaction_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_delivered_compaction
+             ON mailbox(kind, payload_compacted_at, delivered_at, seq);",
+    )
+    .map_err(|err| format!("Failed to ensure mailbox compaction index: {err}"))
+}
+
+fn ensure_mailbox_delivery_owner_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_mailbox_delivery_owner
+             ON mailbox(owner_invocation_uuid, delivered_by_invocation_uuid, seq)
+             WHERE delivered_by_invocation_uuid IS NOT NULL;",
+    )
+    .map_err(|err| format!("Failed to ensure mailbox delivery-owner index: {err}"))
+}
+
 fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
-    let columns = table_columns(conn, "session_runtime")?;
+    let sql = format_table_columns_pragma("session_runtime");
+    let columns = table_columns(conn, "session_runtime", &sql)?;
     for (name, definition) in missing_session_runtime_columns(&columns) {
         add_session_runtime_column(conn, name, definition)?;
     }
@@ -4781,7 +5508,8 @@ fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
 }
 
 fn ensure_runtime_generation_columns(conn: &Connection) -> Result<(), String> {
-    let columns = table_columns(conn, "runtime_generation")?;
+    let sql = format_table_columns_pragma("runtime_generation");
+    let columns = table_columns(conn, "runtime_generation", &sql)?;
     for (name, definition) in missing_runtime_generation_columns(&columns) {
         add_sidecar_column(conn, "runtime_generation", name, definition)?;
     }
@@ -4802,7 +5530,7 @@ fn missing_runtime_generation_columns(columns: &[String]) -> Vec<(&'static str, 
         .collect()
 }
 
-fn session_runtime_column_additions() -> [(&'static str, &'static str); 12] {
+fn session_runtime_column_additions() -> [(&'static str, &'static str); 13] {
     [
         ("run_state", "TEXT NOT NULL DEFAULT 'idle'"),
         ("running_invocation_uuid", "TEXT"),
@@ -4816,6 +5544,7 @@ fn session_runtime_column_additions() -> [(&'static str, &'static str); 12] {
         ("models_dir", "TEXT"),
         ("effective_cwd", "TEXT"),
         ("auto_wake_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("selected_auto_wake_max", "INTEGER"),
     ]
 }
 
@@ -4848,9 +5577,13 @@ fn sidecar_add_column_sql(table: &str, name: &str, definition: &str) -> String {
     format!("ALTER TABLE {table} ADD COLUMN {name} {definition};")
 }
 
-fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+fn format_table_columns_pragma(table: &str) -> String {
+    format!("PRAGMA table_info({table})")
+}
+
+fn table_columns(conn: &Connection, table: &str, sql: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
-        .prepare(&format!("PRAGMA table_info({table})"))
+        .prepare(sql)
         .map_err(|err| format!("Failed to inspect {table} columns: {err}"))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(1))
@@ -4982,6 +5715,7 @@ fn map_session_runtime_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         models_dir: row.get(16)?,
         effective_cwd: row.get(17)?,
         auto_wake_count: row.get(18)?,
+        selected_auto_wake_max: row.get(19)?,
     })
 }
 
@@ -5025,9 +5759,10 @@ fn map_mailbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailboxRow> {
         payload_sha256: row.get(21)?,
         payload_byte_len: row.get(22)?,
         payload_retention_policy: row.get(23)?,
-        submission_token: row.get(24)?,
-        target_kind: row.get(25)?,
-        target_id: row.get(26)?,
+        payload_compacted_at: row.get(24)?,
+        submission_token: row.get(25)?,
+        target_kind: row.get(26)?,
+        target_id: row.get(27)?,
     })
 }
 
@@ -5120,6 +5855,132 @@ mod tests {
         fs::write(&first.file_path, b"payload-b").unwrap();
 
         assert!(db.verify_published_payload(&first).is_err());
+    }
+
+    #[test]
+    fn digest_directory_and_publication_helpers_preserve_payload_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let digest_path = dir.path().join("digest.txt");
+        fs::write(&digest_path, b"abc").unwrap();
+        assert_eq!(
+            format_sha256_digest(&sha256_file(&digest_path).unwrap()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            validate_durable_directory_state(dir.path()).unwrap(),
+            DurableDirectoryState::Existing
+        );
+        assert_eq!(validate_payload_publication(&digest_path).unwrap(), None);
+        assert_eq!(
+            validate_durable_directory_state(&digest_path).unwrap_err(),
+            format!("Path is not a directory: {}", digest_path.display())
+        );
+    }
+
+    #[test]
+    fn delivery_sequence_parsing_and_claim_predicates_preserve_fail_closed_behavior() {
+        let decoded = parse_delivery_seqs("[0]").unwrap();
+        assert_eq!(decoded, vec![0]);
+        assert_eq!(
+            validate_delivery_claim_seqs(&decoded)
+                .unwrap_err()
+                .to_string(),
+            "Delivery claim requires positive mailbox sequence numbers"
+        );
+        assert!(parse_delivery_seqs("not-json").is_err());
+        let missing_encoding = parse_active_delivery_claim_batches(vec![None]).unwrap();
+        assert!(delivery_claim_batches_overlap(&missing_encoding, &[1]));
+        assert!(all_mailbox_seqs_pending(&[Some(None), Some(None)]));
+        assert!(!all_mailbox_seqs_pending(&[Some(None), None]));
+    }
+
+    #[test]
+    fn runtime_field_parser_rejects_malformed_encoded_fields() {
+        let malformed = RawRuntimeGenerationFields {
+            generation_uuid: "not-a-uuid".to_string(),
+            lifecycle_state: "starting".to_string(),
+            identity_os_pid: None,
+            identity_os_boot_id: None,
+            identity_os_pid_starttime_ticks: None,
+            terminal_reason: None,
+            drain_request_uuid: None,
+            active_delivery_claim_uuid: None,
+            active_delivery_seqs_json: None,
+        };
+        assert!(
+            format!(
+                "{:?}",
+                parse_runtime_generation_fields(malformed).unwrap_err()
+            )
+            .contains("Invalid runtime generation UUID")
+        );
+
+        let malformed = RawRuntimeGenerationFields {
+            generation_uuid: RuntimeGenerationId::new().to_string(),
+            lifecycle_state: "invalid".to_string(),
+            identity_os_pid: Some(42),
+            identity_os_boot_id: None,
+            identity_os_pid_starttime_ticks: None,
+            terminal_reason: None,
+            drain_request_uuid: None,
+            active_delivery_claim_uuid: None,
+            active_delivery_seqs_json: Some("[0]".to_string()),
+        };
+        assert!(parse_runtime_generation_fields(malformed).is_err());
+
+        let malformed = RawRuntimeGenerationFields {
+            generation_uuid: RuntimeGenerationId::new().to_string(),
+            lifecycle_state: "starting".to_string(),
+            identity_os_pid: Some(42),
+            identity_os_boot_id: None,
+            identity_os_pid_starttime_ticks: None,
+            terminal_reason: None,
+            drain_request_uuid: None,
+            active_delivery_claim_uuid: None,
+            active_delivery_seqs_json: None,
+        };
+        assert!(
+            format!(
+                "{:?}",
+                parse_runtime_generation_fields(malformed).unwrap_err()
+            )
+            .contains("partial exact process identity")
+        );
+
+        let malformed = RawRuntimeGenerationFields {
+            generation_uuid: RuntimeGenerationId::new().to_string(),
+            lifecycle_state: "starting".to_string(),
+            identity_os_pid: None,
+            identity_os_boot_id: None,
+            identity_os_pid_starttime_ticks: None,
+            terminal_reason: None,
+            drain_request_uuid: None,
+            active_delivery_claim_uuid: None,
+            active_delivery_seqs_json: Some("[0]".to_string()),
+        };
+        assert!(
+            format!(
+                "{:?}",
+                parse_runtime_generation_fields(malformed).unwrap_err()
+            )
+            .contains("positive mailbox sequence numbers")
+        );
+    }
+
+    #[test]
+    fn schema_mapper_and_table_accessor_cover_fresh_sidecar_and_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        assert!(mailbox_schema_definition().contains("CREATE TABLE IF NOT EXISTS mailbox"));
+        for table in ["mailbox", "runtime_generation", "session_runtime"] {
+            let sql = format_table_columns_pragma(table);
+            assert!(!table_columns(&db.conn, table, &sql).unwrap().is_empty());
+        }
+        assert!(
+            table_columns(&db.conn, "runtime_generation", "NOT VALID SQL")
+                .unwrap_err()
+                .starts_with("Failed to inspect runtime_generation columns:")
+        );
     }
 
     #[test]
@@ -5885,6 +6746,147 @@ mod tests {
     }
 
     #[test]
+    fn delivered_payload_compaction_preserves_bytes_and_leaves_pending_rows_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let delivered_payload = format!(
+            r#"{{"schema_version":1,"kind":"agent_bash_complete","padding":"{}"}}"#,
+            "é".repeat(4096)
+        );
+        let delivered_input = AgentBashCompleteEnqueue {
+            payload_json: &delivered_payload,
+            ..input("handle-delivered", "session-a")
+        };
+        let delivered = inserted_row(db.enqueue_agent_bash_complete(&delivered_input));
+        let pending =
+            inserted_row(db.enqueue_agent_bash_complete(&input("handle-pending", "session-a")));
+        db.connection()
+            .execute(
+                "UPDATE mailbox
+                 SET payload_json = ?2, payload_compacted_at = NULL
+                 WHERE seq = ?1",
+                params![delivered.seq, &delivered_payload],
+            )
+            .unwrap();
+        db.mark_delivered("session-a", &[delivered.seq], "resume-1")
+            .unwrap();
+
+        let before = db.delivered_payload_compaction_stats().unwrap();
+        assert_eq!(before.eligible_rows, 1);
+        assert_eq!(before.inline_bytes, delivered_payload.len() as u64);
+
+        let report = db.compact_delivered_payloads(1).unwrap();
+        assert_eq!(report.scanned_rows, 1);
+        assert_eq!(report.compacted_rows, 1);
+        assert_eq!(
+            report.retained_payload_bytes,
+            delivered_payload.len() as u64
+        );
+        assert!(report.inline_bytes_reclaimed > 0);
+
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        let compacted = rows.iter().find(|row| row.seq == delivered.seq).unwrap();
+        assert_ne!(compacted.payload_json, delivered_payload);
+        assert!(compacted.payload_compacted_at.is_some());
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(compacted).unwrap(),
+            delivered_payload
+        );
+        let still_pending = rows.iter().find(|row| row.seq == pending.seq).unwrap();
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(still_pending).unwrap(),
+            input("x", "y").payload_json
+        );
+        assert!(still_pending.delivered_at.is_none());
+        assert!(
+            db.connection()
+                .query_row(
+                    "SELECT payload_compacted_at FROM mailbox WHERE seq = ?1",
+                    params![delivered.seq],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            db.delivered_payload_compaction_stats().unwrap(),
+            DeliveredPayloadCompactionStats::default()
+        );
+        assert_eq!(
+            db.compact_delivered_payloads(1).unwrap(),
+            DeliveredPayloadCompactionReport::default()
+        );
+    }
+
+    #[test]
+    fn delivered_payload_compaction_externalizes_legacy_inline_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let payload = format!(r#"{{"legacy":"{}"}}"#, "y".repeat(2048));
+        let enqueue = AgentBashCompleteEnqueue {
+            payload_json: &payload,
+            ..input("legacy-delivered", "session-a")
+        };
+        let row = inserted_row(db.enqueue_agent_bash_complete(&enqueue));
+        db.connection()
+            .execute(
+                "UPDATE mailbox
+                 SET payload_json = ?2,
+                     payload_compacted_at = NULL,
+                     payload_file_path = NULL,
+                     payload_sha256 = NULL,
+                     payload_byte_len = NULL,
+                     payload_retention_policy = NULL
+                 WHERE seq = ?1",
+                params![row.seq, &payload],
+            )
+            .unwrap();
+        db.mark_delivered("session-a", &[row.seq], "resume-1")
+            .unwrap();
+
+        let report = db.compact_delivered_payloads(1).unwrap();
+        assert_eq!(report.compacted_rows, 1);
+        let compacted = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(
+            fs::read_to_string(compacted.payload_file_path.as_deref().unwrap()).unwrap(),
+            payload
+        );
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(&compacted).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn legacy_inline_payload_hydration_does_not_require_retained_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let payload = r#"{"schema_version":1,"kind":"agent_bash_complete","legacy":true}"#;
+        let enqueue = AgentBashCompleteEnqueue {
+            payload_json: payload,
+            ..input("legacy-inline", "session-a")
+        };
+        let row = inserted_row(db.enqueue_agent_bash_complete(&enqueue));
+        db.connection()
+            .execute(
+                "UPDATE mailbox
+                 SET payload_json = ?2, payload_compacted_at = NULL
+                 WHERE seq = ?1",
+                params![row.seq, payload],
+            )
+            .unwrap();
+        fs::remove_file(row.payload_file_path.as_deref().unwrap()).unwrap();
+
+        let legacy = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(legacy.payload_compacted_at, None);
+        assert_eq!(
+            db.hydrate_agent_bash_payload_json(&legacy).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
     fn notification_pause_state_defaults_false_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -5947,6 +6949,109 @@ mod tests {
     }
 
     #[test]
+    fn session_runtime_selected_auto_wake_max_round_trips_and_is_write_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-max",
+            mode: "headless",
+            invocation_uuid: Some("owner-invocation"),
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: Some(32),
+        })
+        .unwrap();
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-max",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: Some(99),
+        })
+        .unwrap();
+
+        let row = db.session_runtime("session-max").unwrap().unwrap();
+        assert_eq!(row.selected_auto_wake_max, Some(32));
+        assert_eq!(row.invocation_uuid.as_deref(), Some("owner-invocation"));
+    }
+
+    #[test]
+    fn session_runtime_legacy_null_accepts_first_selected_auto_wake_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-legacy",
+            mode: "headless",
+            invocation_uuid: Some("owner-invocation"),
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.session_runtime("session-legacy")
+                .unwrap()
+                .unwrap()
+                .selected_auto_wake_max,
+            None
+        );
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-legacy",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: Some(32),
+        })
+        .unwrap();
+        assert_eq!(
+            db.session_runtime("session-legacy")
+                .unwrap()
+                .unwrap()
+                .selected_auto_wake_max,
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn session_runtime_sidecar_repair_declares_selected_auto_wake_max() {
+        let legacy_columns = session_runtime_column_additions()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .filter(|name| name != "selected_auto_wake_max")
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            missing_session_runtime_columns(&legacy_columns),
+            vec![("selected_auto_wake_max", "INTEGER")]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let sql = format_table_columns_pragma("session_runtime");
+        assert!(
+            table_columns(&db.conn, "session_runtime", &sql)
+                .unwrap()
+                .contains(&"selected_auto_wake_max".to_string())
+        );
+    }
+
+    #[test]
     fn runtime_mark_running_records_pid_identity() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -5987,6 +7092,91 @@ mod tests {
         assert_eq!(row.effective_cwd.as_deref(), Some("/tmp/work"));
         assert!(row.turn_started_at.is_some());
         assert!(row.turn_ended_at.is_none());
+    }
+
+    #[test]
+    fn auto_wake_keeps_owner_separate_from_running_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let identity = current_identity();
+
+        db.mark_session_running(SessionRuntimeRunningUpdate {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: "owner-invocation",
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            identity: &identity,
+            pty_control_path: None,
+            turn_start_max_mailbox_seq: None,
+            models_dir: Some("/tmp/models"),
+            effective_cwd: Some("/tmp/work"),
+        })
+        .unwrap();
+        assert!(
+            db.mark_session_idle(SessionRuntimeIdleUpdate {
+                session_id: "session-a",
+                invocation_uuid: "owner-invocation",
+                last_exit_code: Some(0),
+            })
+            .unwrap()
+        );
+
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: None,
+        })
+        .unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        assert!(matches!(
+            db.try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "wake-token",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap(),
+            WakeClaimAcquireResult::Acquired(_)
+        ));
+
+        db.mark_session_running(SessionRuntimeRunningUpdate {
+            session_id: "session-a",
+            mode: "headless",
+            invocation_uuid: "wake-invocation",
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            identity: &identity,
+            pty_control_path: None,
+            turn_start_max_mailbox_seq: None,
+            models_dir: None,
+            effective_cwd: None,
+        })
+        .unwrap();
+
+        let running = db.session_runtime("session-a").unwrap().unwrap();
+        assert_eq!(running.invocation_uuid.as_deref(), Some("owner-invocation"));
+        assert_eq!(
+            running.running_invocation_uuid.as_deref(),
+            Some("wake-invocation")
+        );
+        assert!(
+            db.mark_session_idle(SessionRuntimeIdleUpdate {
+                session_id: "session-a",
+                invocation_uuid: "wake-invocation",
+                last_exit_code: Some(0),
+            })
+            .unwrap()
+        );
     }
 
     #[test]
@@ -6171,6 +7361,7 @@ mod tests {
             pty_control_path: None,
             models_dir: Some("/tmp/models"),
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))

@@ -20,6 +20,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use crate::executor::cli::spawn_identity::provider_parent_invocation_env;
+
 pub(super) fn command_from_parts(
     parts: &[String],
     provider_args: &[String],
@@ -44,7 +46,7 @@ pub(super) fn command_from_parts(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    if let Some(parent_invocation_env) = parent_invocation_env {
+    if let Some(parent_invocation_env) = provider_parent_invocation_env(parent_invocation_env) {
         cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
     }
     if let Some(return_channel) = return_channel {

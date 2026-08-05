@@ -12,6 +12,13 @@ use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper};
 use crate::zero_turn_orchestration::ZeroTurnAction;
 
+#[derive(Clone, Copy)]
+pub(super) struct ResumeCompletionEvidence {
+    pub(super) zero_turn_action: ZeroTurnAction,
+    pub(super) recovered_generic_nonzero: bool,
+    pub(super) submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+}
+
 pub(super) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
     crate::wake_coordinator::validate_auto_wake_child(session_id)
 }
@@ -49,10 +56,13 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
+    completion_evidence: ResumeCompletionEvidence,
 ) {
-    if !mailbox_delivery_requires_turn_confirmation(input, result)
-        || mailbox_delivery_turn_confirmed(input, &provider.name, result, zero_turn_action)
+    if !mailbox_delivery_requires_turn_confirmation(
+        input,
+        result,
+        completion_evidence.recovered_generic_nonzero,
+    ) || mailbox_delivery_turn_confirmed(input, &provider.name, completion_evidence)
     {
         return;
     }
@@ -80,9 +90,9 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
+    completion_evidence: ResumeCompletionEvidence,
 ) -> Result<Option<ResumeAttemptLoopControl>, String> {
-    if !mailbox_delivery_unconfirmed(input, &provider.name, result, zero_turn_action) {
+    if !mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
         return Ok(None);
     }
     record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
@@ -95,18 +105,22 @@ fn mailbox_delivery_unconfirmed(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
     result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
+    completion_evidence: ResumeCompletionEvidence,
 ) -> bool {
-    mailbox_delivery_requires_turn_confirmation(input, result)
-        && !mailbox_delivery_turn_confirmed(input, provider_name, result, zero_turn_action)
+    mailbox_delivery_requires_turn_confirmation(
+        input,
+        result,
+        completion_evidence.recovered_generic_nonzero,
+    ) && !mailbox_delivery_turn_confirmed(input, provider_name, completion_evidence)
 }
 
 fn mailbox_delivery_requires_turn_confirmation(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
+    recovered_generic_nonzero: bool,
 ) -> bool {
     input.mailbox_delivery_requires_turn_confirmation
-        && result.exit_code == 0
+        && (result.exit_code == 0 || recovered_generic_nonzero)
         && !input.mailbox_delivery_seqs.is_empty()
         && input.answer.is_some_and(|answer| !answer.trim().is_empty())
 }
@@ -114,37 +128,71 @@ fn mailbox_delivery_requires_turn_confirmation(
 fn mailbox_delivery_turn_confirmed(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
-    result: &executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
+    completion_evidence: ResumeCompletionEvidence,
 ) -> bool {
-    matches!(zero_turn_action, ZeroTurnAction::Continue)
-        || submitted_user_turn_confirms_mailbox_delivery(input, result)
+    matches!(
+        completion_evidence.zero_turn_action,
+        ZeroTurnAction::Continue
+    ) || completion_evidence.submitted_turn_confirmation.is_some()
         || ingested_user_turn_confirms_mailbox_delivery(input, provider_name)
 }
 
-fn submitted_user_turn_confirms_mailbox_delivery(
-    input: &ResumeAttemptInput<'_>,
-    result: &executor::ExecutionResult,
-) -> bool {
-    let Some(submitted) = result.submitted_user_turn.as_ref() else {
-        return false;
-    };
-    let Some(answer) = input.answer else {
-        return false;
-    };
-    submitted.provider_session_id == input.resolved.active_session_id
-        && submitted_user_turn_payload_confirms_mailbox_delivery(input, submitted, answer)
+#[derive(Clone, Copy)]
+pub(super) enum ValidatedSubmittedUserTurn {
+    DeliveryNonce,
+    PromptSha256,
 }
 
-fn submitted_user_turn_payload_confirms_mailbox_delivery(
+impl ValidatedSubmittedUserTurn {
+    fn evidence(self) -> &'static str {
+        match self {
+            Self::DeliveryNonce => {
+                "validated submitted user turn: exact session and delivery nonce"
+            }
+            Self::PromptSha256 => "validated submitted user turn: exact session and prompt SHA-256",
+        }
+    }
+}
+
+pub(super) fn validate_submitted_user_turn(
+    input: &ResumeAttemptInput<'_>,
+    result: &executor::ExecutionResult,
+) -> Option<ValidatedSubmittedUserTurn> {
+    let submitted = result.submitted_user_turn.as_ref()?;
+    let answer = input.answer?;
+    if submitted.provider_session_id != input.resolved.active_session_id {
+        return None;
+    }
+    validate_submitted_user_turn_payload(input, submitted, answer)
+}
+
+fn validate_submitted_user_turn_payload(
     input: &ResumeAttemptInput<'_>,
     submitted: &executor::SubmittedUserTurn,
     answer: &str,
-) -> bool {
+) -> Option<ValidatedSubmittedUserTurn> {
     if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
-        return submitted.delivery_nonce.as_deref() == Some(delivery_nonce);
+        return (submitted.delivery_nonce.as_deref() == Some(delivery_nonce))
+            .then_some(ValidatedSubmittedUserTurn::DeliveryNonce);
     }
-    submitted.prompt_sha256 == sha256_hex(answer.as_bytes())
+    (submitted.prompt_sha256 == sha256_hex(answer.as_bytes()))
+        .then_some(ValidatedSubmittedUserTurn::PromptSha256)
+}
+
+pub(super) fn project_validated_submitted_turn_acceptance(
+    result: &mut executor::ExecutionResult,
+    confirmation: Option<ValidatedSubmittedUserTurn>,
+) {
+    if result.resume_acceptance.is_some() {
+        return;
+    }
+    let Some(confirmation) = confirmation else {
+        return;
+    };
+    result.resume_acceptance = Some(executor::ResumeAcceptanceResult {
+        status: executor::ResumeAcceptanceStatus::Accepted,
+        evidence: Some(confirmation.evidence().to_string()),
+    });
 }
 
 fn ingested_user_turn_confirms_mailbox_delivery(

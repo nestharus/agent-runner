@@ -1489,13 +1489,24 @@ fn opencode_sessions_config(
     opencode_root: &Path,
     state_dir: &Path,
 ) -> SessionsConfig {
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let native_path = std::env::join_paths(
+        std::iter::once(
+            opencode_bin
+                .parent()
+                .expect("fake opencode parent")
+                .to_path_buf(),
+        )
+        .chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("fake opencode PATH");
     SessionsConfig {
         entries: HashMap::from([(
             "opencode".to_string(),
             SessionSourceEntry {
                 turn_script: format!(
-                    "OPENCODE_BIN={} {} {}",
-                    shell_single_quote_path(opencode_bin),
+                    "env -u OPENCODE_BIN PATH={} {} {}",
+                    shell_single_quote_path(Path::new(&native_path)),
                     shell_single_quote_path(script_path),
                     shell_single_quote_path(opencode_root)
                 ),

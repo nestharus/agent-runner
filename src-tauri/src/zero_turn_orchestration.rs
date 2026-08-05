@@ -12,16 +12,17 @@
 //!     role: intrinsic-surface
 //!     Domain: zero_turn_confirmation
 //!     Owns:
-//!       - ZeroTurnConfirmationState
-//!       - provider_session confirmation key
+//!       - ZeroTurnConfirmationState and ZeroTurnConfirmationKey
 //!       - completion scan baseline bookkeeping
 //!       - host-observed completion evidence
-//!       - baseline/delta classification
-//!       - same-provider verification planning
+//!       - baseline/delta classification for assistant-turn productivity
+//!       - exact-session accepted-provider-turn classification and cursor ordering
+//!       - same-provider verification action selection
 //!       - confirmed quota decision
 //! ```
 
 use oulipoly_runtime::executor::terminal_signal::build_zero_turn_evidence;
+use oulipoly_runtime::sessions::AssistantCompletionRecord;
 use oulipoly_state::SessionTurnCounts;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +58,7 @@ pub struct ZeroTurnBaseline {
     pub provider_name: String,
     pub provider_session_id: Option<String>,
     pub baseline_assistant_turns: Option<u64>,
+    pub baseline_assistant_completion: Option<AssistantCompletionRecord>,
     pub scan_failed: bool,
 }
 
@@ -68,6 +70,16 @@ pub struct ZeroTurnEvidence {
     pub current_assistant_turns: u64,
     pub new_assistant_turns: u64,
     pub evidence: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedProviderTurnEvidence {
+    pub provider_name: String,
+    pub provider_session_id: String,
+    pub baseline_assistant_turns: u64,
+    pub current_assistant_turns: u64,
+    pub baseline_completion: AssistantCompletionRecord,
+    pub accepted_completion: AssistantCompletionRecord,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,14 +127,32 @@ pub fn record_baseline(
     baseline_count: Option<SessionTurnCounts>,
     scan_failed: bool,
 ) -> ZeroTurnBaseline {
+    record_baseline_with_completion(
+        provider_name,
+        provider_session_id,
+        baseline_count,
+        None,
+        scan_failed,
+    )
+}
+
+pub fn record_baseline_with_completion(
+    provider_name: &str,
+    provider_session_id: Option<&str>,
+    baseline_count: Option<SessionTurnCounts>,
+    baseline_assistant_completion: Option<AssistantCompletionRecord>,
+    scan_failed: bool,
+) -> ZeroTurnBaseline {
+    let eligible = is_baseline_count_eligible(provider_session_id, scan_failed);
     ZeroTurnBaseline {
         provider_name: provider_name.to_string(),
         provider_session_id: provider_session_id.map(str::to_string),
-        baseline_assistant_turns: if is_baseline_count_eligible(provider_session_id, scan_failed) {
+        baseline_assistant_turns: if eligible {
             baseline_count.map(|counts| counts.assistant)
         } else {
             None
         },
+        baseline_assistant_completion: eligible.then_some(baseline_assistant_completion).flatten(),
         scan_failed,
     }
 }
@@ -235,6 +265,78 @@ pub fn classify_completion(
     classify_completion_delta(baseline, end_count)
 }
 
+pub fn classify_accepted_provider_turn(
+    baseline: &ZeroTurnBaseline,
+    end_count: SessionTurnCounts,
+    post_scan_failed: bool,
+    current_assistant_completion: Option<&AssistantCompletionRecord>,
+) -> Option<AcceptedProviderTurnEvidence> {
+    let validated = validate_accepted_provider_turn(
+        baseline,
+        end_count,
+        post_scan_failed,
+        current_assistant_completion,
+    )?;
+    Some(map_accepted_provider_turn_evidence(baseline, validated))
+}
+
+struct ValidatedAcceptedProviderTurn<'a> {
+    delta: ValidatedTurnDelta<'a>,
+    baseline_completion: &'a AssistantCompletionRecord,
+    current_completion: &'a AssistantCompletionRecord,
+}
+
+fn validate_accepted_provider_turn<'a>(
+    baseline: &'a ZeroTurnBaseline,
+    end_count: SessionTurnCounts,
+    post_scan_failed: bool,
+    current: Option<&'a AssistantCompletionRecord>,
+) -> Option<ValidatedAcceptedProviderTurn<'a>> {
+    if post_scan_failed {
+        return None;
+    }
+    let delta = validate_turn_delta(baseline, end_count).ok()?;
+    if delta.new_assistant_turns == 0 {
+        return None;
+    }
+    let baseline_completion = baseline.baseline_assistant_completion.as_ref()?;
+    let current = current?;
+    if baseline_completion.session_id != delta.provider_session_id
+        || current.session_id != delta.provider_session_id
+        || !assistant_completion_cursor_is_newer(current, baseline_completion)
+        || current.completion_outcome.as_deref() != Some("stop")
+    {
+        return None;
+    }
+    Some(ValidatedAcceptedProviderTurn {
+        delta,
+        baseline_completion,
+        current_completion: current,
+    })
+}
+
+fn map_accepted_provider_turn_evidence(
+    baseline: &ZeroTurnBaseline,
+    validated: ValidatedAcceptedProviderTurn<'_>,
+) -> AcceptedProviderTurnEvidence {
+    AcceptedProviderTurnEvidence {
+        provider_name: baseline.provider_name.clone(),
+        provider_session_id: validated.delta.provider_session_id.to_string(),
+        baseline_assistant_turns: validated.delta.baseline_assistant_turns,
+        current_assistant_turns: validated.delta.current_assistant_turns,
+        baseline_completion: validated.baseline_completion.clone(),
+        accepted_completion: validated.current_completion.clone(),
+    }
+}
+
+fn assistant_completion_cursor_is_newer(
+    current: &AssistantCompletionRecord,
+    baseline: &AssistantCompletionRecord,
+) -> bool {
+    current.timestamp > baseline.timestamp
+        || (current.timestamp == baseline.timestamp && current.turn_id != baseline.turn_id)
+}
+
 fn confirmation_key_from_evidence(evidence: ZeroTurnEvidence) -> ZeroTurnConfirmationKey {
     ZeroTurnConfirmationKey {
         provider_name: evidence.provider_name,
@@ -285,10 +387,12 @@ fn next_action_for_maybe_quota(
 mod tests {
     use super::{
         HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
-        ZeroTurnConfirmationKey, ZeroTurnConfirmationState, ZeroTurnEvidence, classify_completion,
-        classify_completion_delta, next_action, record_baseline,
+        ZeroTurnConfirmationKey, ZeroTurnConfirmationState, ZeroTurnEvidence,
+        classify_accepted_provider_turn, classify_completion, classify_completion_delta,
+        next_action, record_baseline, record_baseline_with_completion,
     };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
+    use oulipoly_runtime::sessions::AssistantCompletionRecord;
     use oulipoly_state::SessionTurnCounts;
 
     fn counts(assistant: u64) -> SessionTurnCounts {
@@ -308,6 +412,163 @@ mod tests {
         )
     }
 
+    fn completion(
+        session_id: &str,
+        turn_id: &str,
+        timestamp: &str,
+        outcome: Option<&str>,
+    ) -> AssistantCompletionRecord {
+        AssistantCompletionRecord {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            timestamp: chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            completion_outcome: outcome.map(str::to_string),
+        }
+    }
+
+    fn completion_baseline() -> ZeroTurnBaseline {
+        record_baseline_with_completion(
+            "provider-a",
+            Some("session-1"),
+            Some(counts(3)),
+            Some(completion(
+                "session-1",
+                "turn-3",
+                "2026-04-17T08:00:00Z",
+                None,
+            )),
+            false,
+        )
+    }
+
+    #[test]
+    fn accepted_provider_turn_requires_new_same_session_stop_cursor() {
+        let current = completion("session-1", "turn-4", "2026-04-17T08:00:01Z", Some("stop"));
+
+        let evidence = classify_accepted_provider_turn(
+            &completion_baseline(),
+            counts(4),
+            false,
+            Some(&current),
+        )
+        .expect("new exact-session stop should be accepted");
+
+        assert_eq!(evidence.provider_session_id, "session-1");
+        assert_eq!(evidence.baseline_completion.turn_id, "turn-3");
+        assert_eq!(evidence.accepted_completion.turn_id, "turn-4");
+        assert_eq!(
+            evidence.accepted_completion.completion_outcome.as_deref(),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn accepted_provider_turn_allows_distinct_cursor_at_equal_timestamp() {
+        let current = completion("session-1", "turn-4", "2026-04-17T08:00:00Z", Some("stop"));
+
+        let evidence = classify_accepted_provider_turn(
+            &completion_baseline(),
+            counts(4),
+            false,
+            Some(&current),
+        );
+
+        assert!(evidence.is_some());
+    }
+
+    #[test]
+    fn provider_turn_acceptance_fails_closed_for_scan_cursor_and_outcome_evidence() {
+        let baseline = completion_baseline();
+        let cases = [
+            None,
+            Some(completion(
+                "session-1",
+                "turn-3",
+                "2026-04-17T08:00:00Z",
+                Some("stop"),
+            )),
+            Some(completion(
+                "session-2",
+                "turn-4",
+                "2026-04-17T08:00:01Z",
+                Some("stop"),
+            )),
+            Some(completion(
+                "session-1",
+                "turn-4",
+                "2026-04-17T08:00:01Z",
+                None,
+            )),
+            Some(completion(
+                "session-1",
+                "turn-4",
+                "2026-04-17T08:00:01Z",
+                Some(""),
+            )),
+            Some(completion(
+                "session-1",
+                "turn-4",
+                "2026-04-17T08:00:01Z",
+                Some("tool-calls"),
+            )),
+            Some(completion(
+                "session-1",
+                "turn-4",
+                "2026-04-17T08:00:01Z",
+                Some("error"),
+            )),
+        ];
+
+        for current in cases {
+            let evidence =
+                classify_accepted_provider_turn(&baseline, counts(4), false, current.as_ref());
+            assert!(evidence.is_none(), "unexpected acceptance for {current:?}");
+        }
+
+        let current = completion("session-1", "turn-4", "2026-04-17T08:00:01Z", Some("stop"));
+        assert!(
+            classify_accepted_provider_turn(&baseline, counts(4), true, Some(&current)).is_none(),
+            "degraded post-scan must not be accepted"
+        );
+    }
+
+    #[test]
+    fn provider_turn_acceptance_requires_usable_baseline_and_positive_delta() {
+        let no_cursor_baseline = record_baseline_with_completion(
+            "provider-a",
+            Some("session-1"),
+            Some(counts(0)),
+            None,
+            false,
+        );
+        let current = completion("session-1", "turn-1", "2026-04-17T08:00:01Z", Some("stop"));
+
+        assert!(
+            classify_accepted_provider_turn(&no_cursor_baseline, counts(1), false, Some(&current))
+                .is_none()
+        );
+        assert!(
+            classify_accepted_provider_turn(
+                &completion_baseline(),
+                counts(3),
+                false,
+                Some(&current)
+            )
+            .is_none()
+        );
+        assert!(
+            classify_accepted_provider_turn(
+                &completion_baseline(),
+                counts(2),
+                false,
+                Some(&current)
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn record_baseline_captures_pre_session_assistant_count() {
         let baseline = record_baseline("claude-a", Some("session-1"), Some(counts(7)), false);
@@ -315,6 +576,7 @@ mod tests {
         assert_eq!(baseline.provider_name, "claude-a");
         assert_eq!(baseline.provider_session_id.as_deref(), Some("session-1"));
         assert_eq!(baseline.baseline_assistant_turns, Some(7));
+        assert_eq!(baseline.baseline_assistant_completion, None);
         assert!(!baseline.scan_failed);
     }
 

@@ -31,7 +31,8 @@ pub(crate) use completion_classification::{
     apply_zero_turn_classification_to_result, apply_zero_turn_classification_to_signal_fields,
     host_observed_completion_from_interactive_result, host_observed_completion_from_result,
     is_confirmed_zero_turn_exhaustion, zero_turn_classification_for_action,
-    zero_turn_classify_after_completion, zero_turn_late_bind_baseline, zero_turn_record_baseline,
+    zero_turn_classify_after_completion, zero_turn_classify_after_completion_with_recovery,
+    zero_turn_late_bind_baseline, zero_turn_record_baseline,
 };
 pub(crate) use error_category::{
     balanced_result_error_category, error_category_is_quota_exhausted,

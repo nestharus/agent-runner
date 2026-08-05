@@ -78,6 +78,24 @@ pub fn execute_interactive_with_result(
     )
 }
 
+pub(crate) fn execute_interactive_with_result_and_state_db_path(
+    provider: &ProviderConfig,
+    working_dir: Option<&Path>,
+    parent_invocation_env: Option<&str>,
+    resume: Option<ResumePayload<'_>>,
+    state_db_path: Option<&Path>,
+) -> Result<InteractiveExecutionResult, String> {
+    execute_interactive_with_result_and_monitor_context(
+        provider,
+        working_dir,
+        parent_invocation_env,
+        resume,
+        None,
+        None,
+        state_db_path,
+    )
+}
+
 pub fn execute_interactive_with_result_and_model_identity(
     provider: &ProviderConfig,
     working_dir: Option<&Path>,
@@ -91,6 +109,7 @@ pub fn execute_interactive_with_result_and_model_identity(
         parent_invocation_env,
         resume,
         model_name,
+        None,
         None,
     )
 }
@@ -110,6 +129,7 @@ pub fn execute_interactive_with_result_and_model_config(
         resume,
         Some(&model.name),
         Some(provider_registry),
+        None,
     )
 }
 
@@ -120,6 +140,7 @@ fn execute_interactive_with_result_and_monitor_context(
     resume: Option<ResumePayload<'_>>,
     model_name: Option<&str>,
     provider_registry: Option<Arc<ProviderRegistry>>,
+    state_db_path: Option<&Path>,
 ) -> Result<InteractiveExecutionResult, String> {
     let resume_session_id = resume.as_ref().map(|resume| resume.session_id);
     let provider_args = interactive_provider_args(provider, resume)?;
@@ -129,6 +150,7 @@ fn execute_interactive_with_result_and_monitor_context(
         model_name,
         resume_session_id,
         working_dir,
+        state_db_path,
     )?;
     #[cfg(unix)]
     if pty_broker::controlling_terminal_available() {
@@ -231,8 +253,10 @@ fn interactive_spawn_identity_context(
     model_name: Option<&str>,
     resume_session_id: Option<&str>,
     working_dir: Option<&Path>,
+    state_db_path: Option<&Path>,
 ) -> Result<Option<SpawnIdentityContext>, String> {
-    Ok(context_from_parent_invocation_env(
+    let mailbox_db_path = state_db_path.map(oulipoly_state::mailbox::MailboxDb::path_for_state_db);
+    let context = context_from_parent_invocation_env(
         parent_invocation_env,
         &provider.name,
         model_name,
@@ -240,7 +264,11 @@ fn interactive_spawn_identity_context(
         SpawnRuntimeMode::PtyInteractive,
         working_dir,
         None,
-    ))
+    );
+    Ok(context.map(|context| match mailbox_db_path {
+        Some(path) => context.with_mailbox_db_path(path),
+        None => context,
+    }))
 }
 
 fn wait_for_interactive_child(child: &mut Child) -> Result<ExitStatus, String> {

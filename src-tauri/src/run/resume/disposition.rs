@@ -25,11 +25,15 @@ pub(super) struct ResumeTerminalDispositionInput<'a, 'state> {
     pub(super) result: &'a oulipoly_runtime::executor::ExecutionResult,
     pub(super) terminal_signal_disposition: TerminalSignalDisposition,
     pub(super) zero_turn_action: ZeroTurnAction,
+    pub(super) recovered_generic_nonzero: bool,
 }
 
 pub(super) fn handle_terminal_signal_disposition(
     input: ResumeTerminalDispositionInput<'_, '_>,
 ) -> Result<ResumeLoopControl, String> {
+    if recovered_generic_nonzero_completed_attempt(&input) {
+        return Ok(ResumeLoopControl::CompletedAttempt);
+    }
     match input.terminal_signal_disposition {
         TerminalSignalDisposition::MaybeQuotaVerify => handle_maybe_quota_verify(
             input.result,
@@ -82,6 +86,20 @@ pub(super) fn handle_terminal_signal_disposition(
             Ok(ResumeLoopControl::CompletedAttempt)
         }
     }
+}
+
+fn recovered_generic_nonzero_completed_attempt(
+    input: &ResumeTerminalDispositionInput<'_, '_>,
+) -> bool {
+    input.recovered_generic_nonzero
+        && input.result.terminal_signal.as_ref().is_some_and(|signal| {
+            signal.kind
+                == oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::NonzeroExit
+        })
+        && matches!(
+            input.terminal_signal_disposition,
+            TerminalSignalDisposition::InteractiveFail
+        )
 }
 
 fn quota_retry_terminal_reason(result: &oulipoly_runtime::executor::ExecutionResult) -> &str {

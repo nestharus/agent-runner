@@ -12,8 +12,9 @@ use oulipoly_runtime::services::{
     ProductionSessionImportService, SessionImportProviderStatus, SessionImportProviderTarget,
     SessionImportServicePort, SessionImportServiceRequest,
 };
-use oulipoly_state::StateDb;
+use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ use std::sync::Arc;
 
 const SETTINGS_A: &str = "settings-a";
 const SETTINGS_B: &str = "settings-b";
+const INCIDENT_SESSION_ID: &str = "ses_0a151bb2cffese7DKbhwifCVXI";
+const INCIDENT_TIMESTAMP: &str = "2026-07-14T03:31:47.048+00:00";
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -28,6 +31,11 @@ struct Fixture {
     state_path: PathBuf,
     mode_path: PathBuf,
     provider_path: PathBuf,
+}
+
+struct DuplicateProviderSessionOwnerFixture {
+    runtime: Fixture,
+    models: HashMap<String, ModelConfig>,
 }
 
 impl Fixture {
@@ -99,6 +107,89 @@ fn request<'a>(
         since_unix_ms: None,
         effective_cwd: None,
         backfill_turns: false,
+    }
+}
+
+fn duplicate_provider_session_owner_fixture() -> DuplicateProviderSessionOwnerFixture {
+    let runtime = Fixture::new("incident-duplicate-owner");
+    let mut owner_model = model("model-a", "opencode3", &runtime.provider_path);
+    owner_model
+        .providers
+        .push(ProviderConfig::model_provider("opencode", Vec::new()));
+    let import_model = model("import-model", "opencode", &runtime.provider_path);
+    let registry = ProviderRegistry::from_model_configs(
+        &[owner_model.clone(), import_model],
+        ProviderRegistryOptions::default()
+            .with_config_root(runtime.dir.path().join("config"))
+            .with_data_root(runtime.dir.path().join("data")),
+    )
+    .unwrap();
+    seed_owned_segment(
+        &runtime.conn(),
+        "owner-chain",
+        "opencode3",
+        INCIDENT_SESSION_ID,
+    );
+    let invocation_id = runtime
+        .db
+        .start_invocation(&InvocationStart {
+            invocation_uuid: "6c4df77a-ce79-49d7-9d15-8e9027dc9d03".to_string(),
+            model_name: owner_model.name.clone(),
+            provider_name: "opencode3".to_string(),
+            provider_index: 2,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    runtime
+        .db
+        .bind_invocation_provider_session_start(
+            invocation_id,
+            &ProviderSessionBinding {
+                provider_session_id: INCIDENT_SESSION_ID.to_string(),
+                capture_method: "captured",
+                resume_input_id: None,
+                provider_session_resolved_account: Some("profile-3".to_string()),
+            },
+        )
+        .unwrap();
+    runtime
+        .db
+        .finalize_invocation(invocation_id, true, 0, None, Some("exit_zero"))
+        .unwrap();
+
+    let service = ProductionSessionImportService::with_registry_handle(
+        ProviderRegistryHandle::new(Arc::new(registry)),
+    );
+    let targets = [
+        target("import-model", "opencode", "opencode"),
+        target("model-a", "opencode3", "opencode3"),
+    ];
+    service
+        .import_sessions(request(&runtime.db, &targets, ts(INCIDENT_TIMESTAMP)))
+        .unwrap();
+
+    runtime
+        .conn()
+        .execute(
+            "UPDATE session_chains
+             SET created_at = ?2, last_used_at = ?2
+             WHERE chain_id IN (
+                 SELECT chain_id FROM session_chain_segments WHERE session_id = ?1
+             )",
+            params![INCIDENT_SESSION_ID, INCIDENT_TIMESTAMP],
+        )
+        .unwrap();
+    runtime
+        .conn()
+        .execute(
+            "UPDATE session_chain_segments SET started_at = ?2 WHERE session_id = ?1",
+            params![INCIDENT_SESSION_ID, INCIDENT_TIMESTAMP],
+        )
+        .unwrap();
+
+    DuplicateProviderSessionOwnerFixture {
+        runtime,
+        models: HashMap::from([(owner_model.name.clone(), owner_model)]),
     }
 }
 
@@ -310,6 +401,22 @@ fn fake_provider_import_lists_sessions_and_resume_resolves_provider_native_id() 
 }
 
 #[test]
+fn native_resume_selects_successful_provider_session_owner_after_duplicate_import() {
+    let fixture = duplicate_provider_session_owner_fixture();
+
+    let resolved = fixture
+        .runtime
+        .db
+        .resolve_resume(&fixture.models, INCIDENT_SESSION_ID, None)
+        .unwrap();
+
+    assert_eq!(
+        resolved.active_provider, "opencode3",
+        "native provider-session resume must select the provider that owns the session"
+    );
+}
+
+#[test]
 fn relative_cwd_is_reported_and_never_reaches_state() {
     let fixture = Fixture::new("relative-cwd");
     let service = fixture.service();
@@ -474,6 +581,8 @@ def enumerate_sessions():
         sessions = [session("provider-a-native", "Provider A native", CWD, 3)]
     elif mode == "opencode-one":
         sessions = [session("opencode-native", "OpenCode native", CWD, 5)]
+    elif mode == "incident-duplicate-owner":
+        sessions = [session("ses_0a151bb2cffese7DKbhwifCVXI", "Incident session", CWD, 43)]
     elif mode == "two-v2":
         sessions = [
             session("native-one", "Native one refreshed", CWD, 7),

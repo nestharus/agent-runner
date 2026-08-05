@@ -248,4 +248,199 @@ impl StateDb {
     fn format_wrong_id_match_chain_resolution_error(err: DbError) -> String {
         format!("Failed to resolve chain for wrong-id-kind match: {err}")
     }
+    pub(super) fn choose_resume_chain(
+        &self,
+        input: &str,
+        mut chain_ids: Vec<String>,
+    ) -> Result<Option<String>, String> {
+        if chain_ids.iter().any(|chain_id| chain_id == input) {
+            return Ok(Some(input.to_string()));
+        }
+        if let Some(chain_id) = Self::only_resume_chain(&mut chain_ids) {
+            return Ok(Some(chain_id));
+        }
+        let mut rows = self.load_resume_chain_candidates(input, chain_ids)?;
+        Ok(Self::select_resume_chain(&mut rows))
+    }
+
+    fn only_resume_chain(chain_ids: &mut Vec<String>) -> Option<String> {
+        if chain_ids.len() == 1 {
+            chain_ids.pop()
+        } else {
+            None
+        }
+    }
+
+    fn load_resume_chain_candidates(
+        &self,
+        input: &str,
+        chain_ids: Vec<String>,
+    ) -> Result<Vec<ResumeChainCandidate>, String> {
+        let mut rows = Vec::new();
+        for chain_id in chain_ids {
+            rows.push(self.load_resume_chain_candidate(chain_id, input)?);
+        }
+        Ok(rows)
+    }
+
+    fn select_resume_chain(rows: &mut [ResumeChainCandidate]) -> Option<String> {
+        Self::sort_resume_chain_candidates(rows);
+        rows.first().map(Self::map_resume_chain_candidate_id)
+    }
+
+    fn map_resume_chain_candidate_id(row: &ResumeChainCandidate) -> String {
+        row.chain_id.clone()
+    }
+
+    pub(super) fn load_resume_chain_candidate(
+        &self,
+        chain_id: String,
+        provider_session_id: &str,
+    ) -> Result<ResumeChainCandidate, String> {
+        let latest_successful_owner_finished_at =
+            self.read_latest_successful_owner_finished_at(&chain_id, provider_session_id)?;
+        let last_used_at = self.read_chain_last_used_at(&chain_id)?;
+        let latest_segment_started_at = self.read_latest_segment_started_at(&chain_id)?;
+        Ok(Self::map_resume_chain_candidate(
+            chain_id,
+            latest_successful_owner_finished_at,
+            last_used_at,
+            latest_segment_started_at,
+        ))
+    }
+
+    fn map_resume_chain_candidate(
+        chain_id: String,
+        latest_successful_owner_finished_at: Option<DateTime<Utc>>,
+        last_used_at: DateTime<Utc>,
+        latest_segment_started_at: DateTime<Utc>,
+    ) -> ResumeChainCandidate {
+        ResumeChainCandidate {
+            chain_id,
+            latest_successful_owner_finished_at,
+            last_used_at,
+            latest_segment_started_at,
+        }
+    }
+
+    fn read_latest_successful_owner_finished_at(
+        &self,
+        chain_id: &str,
+        provider_session_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.finished_at
+                 FROM invocations AS i
+                 JOIN session_chain_segments AS s
+                   ON s.provider_name = i.provider_name
+                  AND s.session_id = i.provider_session_id
+                 WHERE s.chain_id = ?1
+                   AND s.session_id = ?2
+                   AND i.status = 'succeeded'
+                   AND i.success = 1
+                   AND i.finished_at IS NOT NULL",
+            )
+            .map_err(Self::format_successful_owner_lookup_prepare_error)?;
+        let rows = stmt
+            .query_map(
+                sqlite::params![chain_id, provider_session_id],
+                Self::map_chain_timestamp_row,
+            )
+            .map_err(Self::format_successful_owner_lookup_query_error)?;
+        let mut latest = None;
+        for row in rows {
+            let raw = row.map_err(Self::format_successful_owner_lookup_read_error)?;
+            let finished_at =
+                Self::strict_rfc3339_message(&raw, "invocation successful owner finished_at")?;
+            latest = match latest {
+                Some(current) => Some(std::cmp::max(current, finished_at)),
+                None => Some(finished_at),
+            };
+        }
+        Ok(latest)
+    }
+
+    fn format_successful_owner_lookup_prepare_error(err: sqlite::Error) -> String {
+        format!("Failed to prepare successful invocation owner lookup: {err}")
+    }
+
+    fn format_successful_owner_lookup_query_error(err: sqlite::Error) -> String {
+        format!("Failed to query successful invocation owner lookup: {err}")
+    }
+
+    fn format_successful_owner_lookup_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read successful invocation owner lookup: {err}")
+    }
+
+    pub(super) fn read_chain_last_used_at(&self, chain_id: &str) -> Result<DateTime<Utc>, String> {
+        let raw = self.read_chain_last_used_at_raw(chain_id)?;
+        Self::parse_chain_last_used_at(&raw)
+    }
+
+    fn read_chain_last_used_at_raw(&self, chain_id: &str) -> Result<String, String> {
+        self.conn
+            .query_row(
+                "SELECT last_used_at FROM session_chains WHERE chain_id = ?1",
+                sqlite::params![chain_id],
+                Self::map_chain_timestamp_row,
+            )
+            .map_err(Self::format_chain_last_used_at_read_error)
+    }
+
+    fn parse_chain_last_used_at(raw: &str) -> Result<DateTime<Utc>, String> {
+        Self::strict_rfc3339_message(raw, "chain last_used_at")
+    }
+
+    fn format_chain_last_used_at_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read chain last_used_at: {err}")
+    }
+
+    pub(super) fn read_latest_segment_started_at(
+        &self,
+        chain_id: &str,
+    ) -> Result<DateTime<Utc>, String> {
+        let raw_started = self.read_latest_segment_started_at_raw(chain_id)?;
+        Self::parse_latest_segment_started_at(&raw_started)
+    }
+
+    fn read_latest_segment_started_at_raw(&self, chain_id: &str) -> Result<String, String> {
+        self.conn
+            .query_row(
+                "SELECT started_at
+                 FROM session_chain_segments
+                 WHERE chain_id = ?1
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT 1",
+                sqlite::params![chain_id],
+                Self::map_chain_timestamp_row,
+            )
+            .map_err(Self::format_latest_segment_started_at_read_error)
+    }
+
+    fn parse_latest_segment_started_at(raw_started: &str) -> Result<DateTime<Utc>, String> {
+        Self::strict_rfc3339_message(raw_started, "chain segment started_at")
+    }
+
+    fn map_chain_timestamp_row(row: &sqlite::Row<'_>) -> sqlite::Result<String> {
+        row.get(0)
+    }
+
+    fn format_latest_segment_started_at_read_error(err: sqlite::Error) -> String {
+        format!("Failed to read chain latest segment started_at: {err}")
+    }
+
+    pub(super) fn sort_resume_chain_candidates(rows: &mut [ResumeChainCandidate]) {
+        rows.sort_by(|a, b| {
+            b.latest_successful_owner_finished_at
+                .cmp(&a.latest_successful_owner_finished_at)
+                .then_with(|| b.last_used_at.cmp(&a.last_used_at))
+                .then_with(|| {
+                    b.latest_segment_started_at
+                        .cmp(&a.latest_segment_started_at)
+                })
+                .then_with(|| a.chain_id.cmp(&b.chain_id))
+        });
+    }
 }

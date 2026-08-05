@@ -2,7 +2,7 @@
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator`
 
-use oulipoly_state::mailbox::MailboxDb;
+use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRow};
 use std::time::Duration;
 
 use super::constants::{
@@ -160,6 +160,20 @@ pub(super) fn current_auto_wake() -> Option<AutoWakeEnv> {
 
 pub(super) fn auto_wake_max() -> i64 {
     validated_auto_wake_max(parsed_auto_wake_max())
+}
+
+pub(super) fn auto_wake_max_for_runtime(runtime: Option<&SessionRuntimeRow>) -> i64 {
+    runtime
+        .and_then(|runtime| runtime.selected_auto_wake_max)
+        .unwrap_or_else(auto_wake_max)
+}
+
+pub(super) fn auto_wake_max_for_session(session_id: &str) -> Result<i64, String> {
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(auto_wake_max());
+    };
+    let runtime = db.session_runtime(session_id)?;
+    Ok(auto_wake_max_for_runtime(runtime.as_ref()))
 }
 
 fn current_auto_wake_env() -> Option<AutoWakeEnv> {

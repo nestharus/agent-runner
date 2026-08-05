@@ -448,7 +448,8 @@ state_dir   = "~/.cache/oulipoly/claude3-cursor"
   "session_id": "...",
   "turn_id": "...",
   "timestamp": "<RFC 3339>",
-  "role": "user|assistant",
+  "role": "assistant",
+  "completion_outcome": "stop",
   "parent_turn_id": "<turn_id|null>",
   "is_sidechain": true,
   "body": [{"type": "text", "text": "..."}]
@@ -458,6 +459,19 @@ state_dir   = "~/.cache/oulipoly/claude3-cursor"
 `parent_turn_id` and `is_sidechain` are **optional**. Adapters that don't track within-session parentage emit only the first four fields; the runner treats those turns as linear with `is_sidechain = false`. The Claude Code reference adapter passes through the raw `parentUuid` and `isSidechain` fields it sees in Claude's per-session JSONL — those surface as branch counts in `trace --json`'s `session.sidechain_turn_count`.
 
 Turn-script adapters also emit body content as JSON in the canonical content shape when available, and `state.db` stores this content directly in `session_turns.body`. Adapters that cannot extract content omit the `body` field, resulting in rows where `session_turns.body` is `NULL` (legacy-style rows without stored bodies).
+
+`completion_outcome` is an optional string member of the
+`runner-normalized-turn-script-jsonl-contract`. The OpenCode adapter emits it
+only on assistant turns when public `info.finish` is a non-empty string,
+preserving every non-empty value verbatim (including `stop`, `tool-calls`, and
+`error`). User turns and assistant turns with a missing or empty outcome omit
+the member; adapters must not emit JSON `null`. Runtime ingestion retains the
+value only as scan-local completion evidence and does not persist it in
+`session_turns` or decide acceptance. Only the pure classifier accepts exact
+`stop`, and only with a usable pre-scan baseline, an error-free post-scan, a
+positive non-regressing assistant delta, exact-session equality, and a newer
+cursor. Text, role, exit code, count delta alone, missing/empty outcomes, and
+other non-empty outcomes never prove acceptance.
 
 Idempotent — re-running with no source changes outputs nothing. The runner's `session_turns` table has `UNIQUE(provider, session_id, turn_id)` so duplicate emission is also tolerated.
 

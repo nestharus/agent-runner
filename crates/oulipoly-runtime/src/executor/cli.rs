@@ -88,6 +88,7 @@ pub use headless::{
     execute, execute_effective, execute_effective_with_start_known_provider_session_id,
 };
 pub(crate) use input_flags::resolve_input_flags;
+pub(crate) use interactive::execute_interactive_with_result_and_state_db_path;
 pub use interactive::{
     InteractiveExecutionResult, execute_interactive, execute_interactive_with_result,
     execute_interactive_with_result_and_model_config,

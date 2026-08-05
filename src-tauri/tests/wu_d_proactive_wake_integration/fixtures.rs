@@ -65,6 +65,12 @@ impl Fixture {
         cmd.output().unwrap()
     }
 
+    pub(crate) fn run_without_auto_wake_max(&self, mut cmd: Command) -> Output {
+        self.prepare_command(&mut cmd);
+        cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
+        cmd.output().unwrap()
+    }
+
     pub(crate) fn spawn_agent(&self, prompt: &str) -> Child {
         let mut cmd = self.agent_command(prompt);
         self.prepare_command(&mut cmd);
@@ -101,7 +107,7 @@ impl Fixture {
 
     pub(crate) fn run_agent(&self, prompt: &str) -> Output {
         let cmd = self.agent_command(prompt);
-        self.run(cmd)
+        self.run_without_auto_wake_max(cmd)
     }
 
     fn agent_command(&self, prompt: &str) -> Command {

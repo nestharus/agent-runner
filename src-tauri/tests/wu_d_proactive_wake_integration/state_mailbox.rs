@@ -11,7 +11,8 @@ use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb,
+    RuntimeGenerationFence, RuntimeGenerationId, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{SessionTurnIngest, StateDb};
@@ -55,6 +56,38 @@ impl Fixture {
 
     pub(crate) fn state(&self) -> StateDb {
         StateDb::open(&self.state_path()).unwrap()
+    }
+
+    pub(crate) fn assert_delivery_invocation_is_child_of_owner(&self, session_id: &str) {
+        let rows = self.mailbox().list_mailbox(session_id, true).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.delivered_by_invocation_uuid.is_some())
+            .expect("delivered mailbox row");
+        let owner_uuid = row
+            .owner_invocation_uuid
+            .as_deref()
+            .expect("mailbox owner invocation");
+        let delivery_uuid = row
+            .delivered_by_invocation_uuid
+            .as_deref()
+            .expect("mailbox delivery invocation");
+        let conn = Connection::open(self.state_path()).unwrap();
+        let parent_uuid: Option<String> = conn
+            .query_row(
+                "SELECT parent.invocation_uuid
+                 FROM invocations AS delivery
+                 LEFT JOIN invocations AS parent ON parent.id = delivery.parent_invocation_id
+                 WHERE delivery.invocation_uuid = ?1",
+                rusqlite::params![delivery_uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent_uuid.as_deref(),
+            Some(owner_uuid),
+            "auto-wake delivery invocation must remain a logical child of the invocation whose work caused the wake"
+        );
     }
 
     pub(crate) fn seed_session_turn(&self) {
@@ -123,6 +156,7 @@ impl Fixture {
             pty_control_path: None,
             models_dir: Some(&models_dir),
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
     }
@@ -138,8 +172,37 @@ impl Fixture {
             pty_control_path: None,
             models_dir: None,
             effective_cwd: None,
+            selected_auto_wake_max: None,
         })
         .unwrap();
+    }
+
+    pub(crate) fn seed_idle_runtime_with_wake_policy(
+        &self,
+        session_id: &str,
+        selected_auto_wake_max: i64,
+        auto_wake_count: i64,
+    ) {
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        let models_dir = path_string(&self.models_dir);
+        db.upsert_session_runtime(SessionRuntimeUpsert {
+            session_id,
+            mode: "headless",
+            invocation_uuid: Some(INVOCATION),
+            provider_name: Some(PROVIDER),
+            model_name: Some(MODEL),
+            pty_control_path: None,
+            models_dir: Some(&models_dir),
+            effective_cwd: None,
+            selected_auto_wake_max: Some(selected_auto_wake_max),
+        })
+        .unwrap();
+        self.sidecar_conn()
+            .execute(
+                "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",
+                rusqlite::params![session_id, auto_wake_count],
+            )
+            .unwrap();
     }
 
     pub(crate) fn seed_live_pty_runtime(&self, control_path: &Path) -> ProcessIdentity {
@@ -147,6 +210,29 @@ impl Fixture {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
         let control_path = path_string(control_path);
+        let generation_id = RuntimeGenerationId::parse(INVOCATION).unwrap();
+        db.create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: INVOCATION,
+            session_id: Some(SESSION),
+            runtime_mode: "pty_interactive",
+            provider_name: PROVIDER,
+            model_name: Some(MODEL),
+            pty_control_path: Some(&control_path),
+            models_dir: Some(&models_dir),
+            effective_cwd: None,
+        })
+        .unwrap();
+        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: INVOCATION,
+            },
+            spawned_os_pid: identity.os_pid,
+            exact_process_identity: Some(&identity),
+            os_pgid: None,
+        })
+        .unwrap();
         db.mark_session_running(SessionRuntimeRunningUpdate {
             session_id: SESSION,
             mode: "pty_interactive",

@@ -14,6 +14,7 @@
 //!     Owns:
 //!       - adapter-script scan/ingest
 //!       - ScanReport.new_turns
+//!       - ScanReport.assistant_completions
 //! ```
 //!
 //! Mirrors the `quota_script` pattern in `providers.toml`: the application
@@ -25,9 +26,22 @@
 //!   - Run as `sh -c <turn_script>` with `STATE_DIR` env set to a writable dir
 //!     the script may use for incremental cursor bookkeeping.
 //!   - Stdout: one JSON object per line per turn (in any order):
-//!     `{"session_id":"...","turn_id":"...","timestamp":"<ISO8601>","role":"user"|"assistant","parent_turn_id":"...","is_sidechain":true}`
+//!     `{"session_id":"...","turn_id":"...","timestamp":"<ISO8601>","role":"assistant","completion_outcome":"stop","parent_turn_id":"...","is_sidechain":true}`
 //!   - Empty stdout = no new turns. Non-zero exit = error.
 //!   - Idempotent: re-running with no source changes outputs nothing.
+//!
+//! `completion_outcome` is an optional string member of the
+//! `runner-normalized-turn-script-jsonl-contract`. The OpenCode adapter emits it
+//! only on assistant turns when public `info.finish` is a non-empty string,
+//! preserving every non-empty value verbatim (including `stop`, `tool-calls`, and
+//! `error`). User turns and assistant turns with a missing or empty outcome omit
+//! the member; adapters must not emit JSON `null`. Runtime ingestion retains the
+//! value only as scan-local completion evidence and does not persist it in
+//! `session_turns` or decide acceptance. Only the pure classifier accepts exact
+//! `stop`, and only with a usable pre-scan baseline, an error-free post-scan, a
+//! positive non-regressing assistant delta, exact-session equality, and a newer
+//! cursor. Text, role, exit code, count delta alone, missing/empty outcomes, and
+//! other non-empty outcomes never prove acceptance.
 //!
 //! The unified `session_turns` table stores everything across CLIs. The
 //! UNIQUE constraint on `(provider, session_id, turn_id)` makes ingestion
@@ -38,6 +52,7 @@ use oulipoly_config::{SessionSourceEntry, SessionsConfig};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
@@ -56,6 +71,8 @@ pub struct ScriptTurn {
     pub timestamp: String,
     pub role: String,
     #[serde(default)]
+    pub completion_outcome: Option<String>,
+    #[serde(default)]
     pub parent_turn_id: Option<String>,
     #[serde(default)]
     pub is_sidechain: Option<bool>,
@@ -65,12 +82,21 @@ pub struct ScriptTurn {
     pub body: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantCompletionRecord {
+    pub session_id: String,
+    pub turn_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub completion_outcome: Option<String>,
+}
+
 /// Outcome of scanning one provider's session source.
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
     pub new_turns: u64,
     pub script_lines: u64,
     pub errors: Vec<String>,
+    pub assistant_completions: HashMap<String, AssistantCompletionRecord>,
 }
 
 pub(crate) fn is_canonical_body_shape(body: &Value) -> bool {
@@ -216,6 +242,7 @@ fn collect_turn_script_batch(
         match script_line_to_ingest(provider_name, line, line_number) {
             Ok(parsed) => {
                 record_optional_scan_error(report, parsed.body_error);
+                record_assistant_completion(report, parsed.assistant_completion);
                 push_script_turn_ingest(&mut batch, parsed.ingest);
             }
             Err(error) => record_scan_error(report, error),
@@ -307,6 +334,7 @@ fn script_line_to_ingest(
 struct ParsedScriptTurnIngest {
     ingest: SessionTurnIngest,
     body_error: Option<String>,
+    assistant_completion: Option<AssistantCompletionRecord>,
 }
 
 enum ValidatedScriptTurnBody<'a> {
@@ -317,8 +345,13 @@ enum ValidatedScriptTurnBody<'a> {
 fn parsed_script_turn_ingest(
     ingest: SessionTurnIngest,
     body_error: Option<String>,
+    assistant_completion: Option<AssistantCompletionRecord>,
 ) -> ParsedScriptTurnIngest {
-    ParsedScriptTurnIngest { ingest, body_error }
+    ParsedScriptTurnIngest {
+        ingest,
+        body_error,
+        assistant_completion,
+    }
 }
 
 fn parse_script_turn_line(trimmed: &str) -> Result<ScriptTurn, String> {
@@ -429,7 +462,80 @@ fn script_turn_ingest_from_parts(
     body: Option<String>,
     body_error: Option<String>,
 ) -> ParsedScriptTurnIngest {
-    parsed_script_turn_ingest(script_turn_to_ingest(turn, timestamp, body), body_error)
+    let assistant_completion = assistant_completion_record(&turn, timestamp);
+    parsed_script_turn_ingest(
+        script_turn_to_ingest(turn, timestamp, body),
+        body_error,
+        assistant_completion,
+    )
+}
+
+fn assistant_completion_record(
+    turn: &ScriptTurn,
+    timestamp: DateTime<Utc>,
+) -> Option<AssistantCompletionRecord> {
+    Some(map_assistant_completion_record(
+        assistant_turn(turn)?,
+        timestamp,
+    ))
+}
+
+fn assistant_turn(turn: &ScriptTurn) -> Option<&ScriptTurn> {
+    if turn.role == "assistant" {
+        return Some(turn);
+    }
+    None
+}
+
+fn map_assistant_completion_record(
+    turn: &ScriptTurn,
+    timestamp: DateTime<Utc>,
+) -> AssistantCompletionRecord {
+    AssistantCompletionRecord {
+        session_id: turn.session_id.clone(),
+        turn_id: turn.turn_id.clone(),
+        timestamp,
+        completion_outcome: turn.completion_outcome.clone(),
+    }
+}
+
+fn record_assistant_completion(
+    report: &mut ScanReport,
+    completion: Option<AssistantCompletionRecord>,
+) {
+    let Some(completion) = completion else {
+        return;
+    };
+    if !assistant_completion_should_replace(
+        current_assistant_completion(report, &completion.session_id),
+        &completion,
+    ) {
+        return;
+    }
+    insert_assistant_completion(report, completion);
+}
+
+fn current_assistant_completion<'a>(
+    report: &'a ScanReport,
+    session_id: &str,
+) -> Option<&'a AssistantCompletionRecord> {
+    report.assistant_completions.get(session_id)
+}
+
+fn assistant_completion_should_replace(
+    current: Option<&AssistantCompletionRecord>,
+    candidate: &AssistantCompletionRecord,
+) -> bool {
+    match current {
+        Some(current) => candidate.timestamp >= current.timestamp,
+        None => true,
+    }
+}
+
+fn insert_assistant_completion(report: &mut ScanReport, completion: AssistantCompletionRecord) {
+    report
+        .assistant_completions
+        .insert(completion.session_id.clone(), completion);
 }
 
 fn script_turn_body_error(body_validation: &ValidatedScriptTurnBody<'_>) -> Option<String> {
@@ -458,17 +564,24 @@ fn persist_imported_chains(
     report: &mut ScanReport,
     new_turns: u64,
 ) {
-    report.new_turns = new_turns;
+    let mut errors = Vec::new();
     for turn in batch {
-        if let Err(error) = db.mint_imported_chain_if_absent(
-            provider_name,
-            &turn.session_id,
-            &turn.timestamp,
-            "<unknown>",
-        ) {
-            report.errors.push(error);
-        }
+        errors.extend(
+            db.mint_imported_chain_if_absent(
+                provider_name,
+                &turn.session_id,
+                &turn.timestamp,
+                "<unknown>",
+            )
+            .err(),
+        );
     }
+    apply_imported_chain_report(report, new_turns, errors);
+}
+
+fn apply_imported_chain_report(report: &mut ScanReport, new_turns: u64, errors: Vec<String>) {
+    report.new_turns = new_turns;
+    report.errors.extend(errors);
 }
 
 /// Scan every provider listed in `sessions_cfg`. Failures in one provider
@@ -479,8 +592,12 @@ pub fn scan_all(sessions_cfg: &SessionsConfig, db: &StateDb) -> Vec<(String, Sca
         let report = scan_provider(name, sessions_cfg, db);
         out.push((name.clone(), report));
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
+    sort_provider_scan_reports(out)
+}
+
+fn sort_provider_scan_reports(mut reports: Vec<(String, ScanReport)>) -> Vec<(String, ScanReport)> {
+    reports.sort_by(|a, b| a.0.cmp(&b.0));
+    reports
 }
 
 fn resolve_state_dir(provider_name: &str, entry: &SessionSourceEntry) -> PathBuf {
@@ -887,6 +1004,49 @@ mod tests {
         SessionsConfig { entries }
     }
 
+    #[test]
+    fn imported_chain_report_mapping_preserves_existing_and_ordered_errors() {
+        let mut report = ScanReport {
+            new_turns: 1,
+            errors: vec!["ingest error".to_string()],
+            ..ScanReport::default()
+        };
+
+        apply_imported_chain_report(
+            &mut report,
+            3,
+            vec![
+                "first mint error".to_string(),
+                "second mint error".to_string(),
+            ],
+        );
+
+        assert_eq!(report.new_turns, 3);
+        assert_eq!(
+            report.errors,
+            vec!["ingest error", "first mint error", "second mint error"]
+        );
+    }
+
+    #[test]
+    fn provider_scan_report_mapping_sorts_by_provider_name() {
+        let reports = vec![
+            ("provider-z".to_string(), ScanReport::default()),
+            ("provider-a".to_string(), ScanReport::default()),
+            ("provider-m".to_string(), ScanReport::default()),
+        ];
+
+        let sorted = sort_provider_scan_reports(reports);
+
+        assert_eq!(
+            sorted
+                .into_iter()
+                .map(|(provider, _report)| provider)
+                .collect::<Vec<_>>(),
+            vec!["provider-a", "provider-m", "provider-z"]
+        );
+    }
+
     fn stored_turn_body(
         db: &StateDb,
         provider_name: &str,
@@ -1066,6 +1226,7 @@ EOF"#,
         assert_eq!(turn.session_id, "S1");
         assert_eq!(turn.turn_id, "t1");
         assert_eq!(turn.role, "assistant");
+        assert_eq!(turn.completion_outcome, None);
         assert_eq!(turn.parent_turn_id, None);
         assert_eq!(turn.is_sidechain, None);
         assert_eq!(turn.body, None);
@@ -1074,14 +1235,60 @@ EOF"#,
     #[test]
     fn script_turn_full_json_deserializes_parent_and_sidechain_fields() {
         let turn: ScriptTurn = serde_json::from_str(
-            r#"{"session_id":"S1","turn_id":"t2","timestamp":"2026-04-17T08:00:01Z","role":"assistant","parent_turn_id":"t1","is_sidechain":true}"#,
+            r#"{"session_id":"S1","turn_id":"t2","timestamp":"2026-04-17T08:00:01Z","role":"assistant","completion_outcome":"tool-calls","parent_turn_id":"t1","is_sidechain":true}"#,
         )
         .unwrap();
 
         assert_eq!(turn.session_id, "S1");
         assert_eq!(turn.turn_id, "t2");
+        assert_eq!(turn.completion_outcome.as_deref(), Some("tool-calls"));
         assert_eq!(turn.parent_turn_id.as_deref(), Some("t1"));
         assert_eq!(turn.is_sidechain, Some(true));
+    }
+
+    #[test]
+    fn scan_report_retains_newest_assistant_completion_per_session() {
+        let db = db();
+        let script = fixture_script(
+            r#"cat <<'EOF'
+{"session_id":"S1","turn_id":"s1-old","timestamp":"2026-04-17T08:00:00Z","role":"assistant","completion_outcome":"stop"}
+{"session_id":"S2","turn_id":"s2-only","timestamp":"2026-04-17T08:00:01Z","role":"assistant","completion_outcome":"error"}
+{"session_id":"S1","turn_id":"s1-new","timestamp":"2026-04-17T08:00:02Z","role":"assistant","completion_outcome":"tool-calls"}
+{"session_id":"S1","turn_id":"s1-user","timestamp":"2026-04-17T08:00:03Z","role":"user","completion_outcome":"stop"}
+EOF"#,
+        );
+        let cfg = cfg_with("p", &script.path);
+
+        let report = scan_provider("p", &cfg, &db);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let s1 = report.assistant_completions.get("S1").unwrap();
+        assert_eq!(s1.turn_id, "s1-new");
+        assert_eq!(s1.completion_outcome.as_deref(), Some("tool-calls"));
+        let s2 = report.assistant_completions.get("S2").unwrap();
+        assert_eq!(s2.turn_id, "s2-only");
+        assert_eq!(s2.completion_outcome.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn assistant_completion_without_outcome_remains_scan_local() {
+        let db = db();
+        let script = fixture_script(
+            r#"printf '%s\n' '{"session_id":"S1","turn_id":"missing","timestamp":"2026-04-17T08:00:00Z","role":"assistant"}'"#,
+        );
+        let cfg = cfg_with("p", &script.path);
+
+        let report = scan_provider("p", &cfg, &db);
+
+        assert_eq!(
+            report
+                .assistant_completions
+                .get("S1")
+                .unwrap()
+                .completion_outcome,
+            None
+        );
+        assert_session_turn_total(&db, "p", "S1", 1);
     }
 
     #[test]
@@ -1197,6 +1404,30 @@ EOF"#,
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("degraded"), "{:?}", r.errors);
         assert!(!r.errors[0].contains("malformed"), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn degraded_scan_retains_completion_cursor_but_reports_failure() {
+        let db = db();
+        let script = fixture_script(
+            r#"cat <<'EOF'
+{"session_id":"S1","turn_id":"partial","timestamp":"2026-04-17T08:00:00Z","role":"assistant","completion_outcome":"stop"}
+{"degraded":true,"count":1}
+EOF"#,
+        );
+        let cfg = cfg_with("p", &script.path);
+
+        let report = scan_provider("p", &cfg, &db);
+
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("degraded"));
+        assert_eq!(
+            report
+                .assistant_completions
+                .get("S1")
+                .and_then(|completion| completion.completion_outcome.as_deref()),
+            Some("stop")
+        );
     }
 
     #[test]
