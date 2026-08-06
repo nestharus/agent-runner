@@ -103,7 +103,7 @@ fn unsuffixed_opencode_scan_does_not_mint_inherited_profile_session_owner() {
     assert_eq!(
         fixture.native_command_log(),
         format!(
-            "opencode|{}|session list --json\n",
+            "opencode|{}|session list --format json\n",
             fixture.default_data_home.display()
         ),
         "the scan must call only the default command with the configured root's data home"
@@ -142,7 +142,7 @@ if [ "${{XDG_DATA_HOME:-}}" != "$EXPECTED_PROFILE3_ROOT" ]; then
     exit 0
 fi
 
-if [ "$*" = "session list --json" ]; then
+if [ "$*" = "session list --format json" ]; then
     printf '[{{"id":"{session_id}"}}]\n'
     exit 0
 fi

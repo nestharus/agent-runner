@@ -1527,7 +1527,7 @@ import sys
 
 args = sys.argv[1:]
 
-if args == ["session", "list", "--json"]:
+if args == ["session", "list", "--format", "json"]:
     print(json.dumps([{"id": "ses_fixture"}], separators=(",", ":")))
     sys.exit(0)
 

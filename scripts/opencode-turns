@@ -8,14 +8,14 @@ Usage: opencode-turns BASE_DIR [SESSION_ID ...]
 Session IDs and message content are read through the public OpenCode CLI.
 The command is `opencode`, or `opencodeN` when BASE_DIR contains `.opencodeN`.
 Every child process is bound to BASE_DIR's parent through `XDG_DATA_HOME`:
-  opencode session list --json
+  opencode session list --format json
   opencode export <sessionID>
 
 When SESSION_ID arguments are supplied, they are used directly. If no
 SESSION_ID arguments are supplied, the SESSION_ID environment variable is used
 as the direct target list. BASE_DIR determines the OpenCode storage root used by
 both implicit discovery and direct export. Discovery uses `opencode session
-list --json`, not OpenCode's private storage layout.
+list --format json`, not OpenCode's private storage layout.
 
 Implicit discovery is bounded to the recent quota-balancing window. If the
 session list does not expose timestamps, the adapter falls back to a small cap
@@ -53,6 +53,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -261,10 +262,35 @@ def parse_session_list_stdout(stdout: str, options: Options) -> list[str]:
 
 
 def parse_session_list_json(stdout: str):
+    parsed = parse_json_stdout(stdout)
+    if parsed is not JSON_PARSE_FAILED:
+        return parsed
+    return JSON_PARSE_FAILED
+
+
+def parse_json_stdout(stdout: str):
     try:
         return json.loads(stdout)
     except json.JSONDecodeError:
+        pass
+
+    offset = first_json_offset(stdout)
+    if offset is None:
         return JSON_PARSE_FAILED
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(stdout[offset:])
+    except json.JSONDecodeError:
+        return JSON_PARSE_FAILED
+    if stdout[offset + end :].strip():
+        return JSON_PARSE_FAILED
+    return parsed
+
+
+def first_json_offset(stdout: str) -> int | None:
+    offsets = [index for index in (stdout.find("{"), stdout.find("[")) if index >= 0]
+    if not offsets:
+        return None
+    return min(offsets)
 
 
 def capped_session_ids_from_value(value: Any, max_sessions: int) -> list[str]:
@@ -459,7 +485,9 @@ def numeric_timestamp_datetime(value: int | float) -> datetime | None:
 
 
 def discover_session_ids(options: Options, deadline: Deadline) -> tuple[list[str], bool]:
-    stdout, timed_out = run_opencode(["session", "list", "--json"], options, deadline)
+    stdout, timed_out = run_opencode(
+        ["session", "list", "--format", "json"], options, deadline
+    )
     if timed_out:
         return [], True
     if stdout is None:
@@ -617,29 +645,29 @@ def run_opencode(
     if opencode_deadline_expired(timeout):
         return degraded_opencode_result()
     try:
-        process = spawn_opencode_process(args)
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as stdout:
+            process = spawn_opencode_process(args, stdout)
+            timed_out = wait_opencode_process(process, timeout)
+            if timed_out:
+                kill_process_group(process)
+                return degraded_opencode_result()
+
+            if opencode_process_failed(process):
+                return failed_opencode_result()
+            return successful_opencode_result(read_opencode_stdout(stdout))
     except OSError:
         return failed_opencode_result()
-
-    stdout, timed_out = communicate_opencode_process(process, timeout)
-    if timed_out:
-        kill_process_group(process)
-        return degraded_opencode_result()
-
-    if opencode_process_failed(process):
-        return failed_opencode_result()
-    return successful_opencode_result(stdout)
 
 
 def opencode_deadline_expired(timeout: float) -> bool:
     return timeout <= 0
 
 
-def spawn_opencode_process(args: list[str]) -> subprocess.Popen:
+def spawn_opencode_process(args: list[str], stdout) -> subprocess.Popen:
     return subprocess.Popen(
         opencode_command() + args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=stdout,
+        stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         text=True,
         start_new_session=True,
@@ -647,14 +675,17 @@ def spawn_opencode_process(args: list[str]) -> subprocess.Popen:
     )
 
 
-def communicate_opencode_process(
-    process: subprocess.Popen, timeout: float
-) -> tuple[str | None, bool]:
+def wait_opencode_process(process: subprocess.Popen, timeout: float) -> bool:
     try:
-        stdout, _stderr = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None, True
-    return stdout, False
+        return True
+    return False
+
+
+def read_opencode_stdout(stdout) -> str:
+    stdout.seek(0)
+    return stdout.read()
 
 
 def opencode_process_failed(process: subprocess.Popen) -> bool:
@@ -692,10 +723,10 @@ def kill_process_group(process: subprocess.Popen) -> None:
 
 
 def parse_export_stdout(stdout: str) -> Any | None:
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
+    parsed = parse_json_stdout(stdout)
+    if parsed is JSON_PARSE_FAILED:
         return None
+    return parsed
 
 
 def export_session(

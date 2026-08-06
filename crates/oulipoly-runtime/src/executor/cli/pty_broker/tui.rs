@@ -103,6 +103,10 @@ const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
 /// dropped, leaving the notification unsent until the operator presses Enter themselves.
 /// Waiting lets the paste commit land first so the Enter actually submits.
 const CONTROL_SUBMIT_DELAY: Duration = Duration::from_millis(400);
+/// Plain line-oriented providers may never advertise bracketed-paste mode. Keep
+/// their startup delivery bounded without overriding a full-screen TUI that is
+/// still initializing its input handler.
+const CONTROL_PRIMARY_SCREEN_READY_FALLBACK: Duration = Duration::from_secs(10);
 const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
 const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
 const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
@@ -5671,10 +5675,29 @@ fn inject_control_payload(
         acknowledge_control_payload(&payload)?;
         return Ok(payload.delivery_attempt_id);
     }
+    validate_control_input_ready(
+        io.parser.screen().bracketed_paste(),
+        io.parser.screen().alternate_screen(),
+        control.age(),
+    )?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload.bytes, bracketed_paste)?;
     acknowledge_control_payload(&payload)?;
     Ok(payload.delivery_attempt_id)
+}
+
+fn validate_control_input_ready(
+    bracketed_paste: bool,
+    alternate_screen: bool,
+    control_age: Duration,
+) -> Result<(), String> {
+    if bracketed_paste
+        || (!alternate_screen && control_age >= CONTROL_PRIMARY_SCREEN_READY_FALLBACK)
+    {
+        Ok(())
+    } else {
+        Err("unsafe_provider_starting".to_string())
+    }
 }
 
 fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
@@ -6470,6 +6493,22 @@ mod tests {
         let error = drain_control_payload(&mut io, ControlSubmitDrainPhase::Delimiter)
             .expect_err("a delimiter drain failure must not report success");
         assert!(error.starts_with("control_submit_delimiter_"), "{error}");
+    }
+
+    #[test]
+    fn control_input_waits_for_harness_readiness_without_terminal_idle_checks() {
+        assert_eq!(
+            validate_control_input_ready(false, true, Duration::from_secs(30)),
+            Err("unsafe_provider_starting".to_string())
+        );
+        assert_eq!(
+            validate_control_input_ready(true, true, Duration::ZERO),
+            Ok(())
+        );
+        assert_eq!(
+            validate_control_input_ready(false, false, CONTROL_PRIMARY_SCREEN_READY_FALLBACK,),
+            Ok(())
+        );
     }
 
     #[test]

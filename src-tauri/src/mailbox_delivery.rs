@@ -631,8 +631,11 @@ pub(crate) fn finalize_pty_mailbox_delivery_handoff(
     Ok(true)
 }
 
-fn pty_nack_status(_message: &str) -> &str {
-    "protocol_error"
+fn pty_nack_status(message: &str) -> &str {
+    match message {
+        "unsafe_provider_starting" => message,
+        _ => "protocol_error",
+    }
 }
 
 pub(crate) fn trace_notify_enabled() -> bool {
@@ -1079,5 +1082,14 @@ mod tests {
             prefix.contains("[OULIPOLY-DELIVERY nonce-123]\n[END OULIPOLY NOTIFICATIONS]"),
             "{prefix}"
         );
+    }
+
+    #[test]
+    fn harness_startup_nack_remains_retryable_and_precise() {
+        assert_eq!(
+            pty_nack_status("unsafe_provider_starting"),
+            "unsafe_provider_starting"
+        );
+        assert_eq!(pty_nack_status("broker_rejected"), "protocol_error");
     }
 }
