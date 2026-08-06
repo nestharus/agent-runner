@@ -497,6 +497,77 @@ pub struct AgentBashCompleteEnqueue<'a> {
     pub rc: i32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CompletionEventRegistrationInput<'a> {
+    pub event_id: &'a str,
+    pub delivery_mode: &'a str,
+    pub owner_session_id: Option<&'a str>,
+    pub owner_invocation_uuid: Option<&'a str>,
+    pub state_dir: &'a str,
+    pub meta_path: &'a str,
+    pub log_path: &'a str,
+    pub rc_path: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompletionEventTriggerInput<'a> {
+    pub event_id: &'a str,
+    pub payload_json: &'a str,
+    pub state_dir: &'a str,
+    pub meta_path: &'a str,
+    pub log_path: &'a str,
+    pub rc_path: &'a str,
+    pub rc: i32,
+    pub consumed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompletionEventRow {
+    pub event_id: String,
+    pub kind: String,
+    pub state: String,
+    pub delivery_mode: String,
+    pub state_dir: String,
+    pub meta_path: String,
+    pub log_path: String,
+    pub rc_path: String,
+    pub rc: Option<i32>,
+    pub payload_json: Option<String>,
+    pub payload_file_path: Option<String>,
+    pub payload_sha256: Option<String>,
+    pub payload_byte_len: Option<i64>,
+    pub payload_retention_policy: Option<String>,
+    pub created_at: String,
+    pub triggered_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompletionEventListenerRow {
+    pub event_id: String,
+    pub listener_id: String,
+    pub session_id: String,
+    pub owner_invocation_uuid: String,
+    pub active: bool,
+    pub mailbox_seq: Option<i64>,
+    pub acknowledged_at: Option<String>,
+    pub acknowledgement_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompletionEventRegistrationResult {
+    pub inserted: bool,
+    pub event: CompletionEventRow,
+    pub listeners: Vec<CompletionEventListenerRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompletionEventTriggerResult {
+    pub triggered: bool,
+    pub event: CompletionEventRow,
+    pub listeners: Vec<CompletionEventListenerRow>,
+    pub mailbox_rows: Vec<MailboxRow>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueResult {
     Inserted(MailboxRow),
@@ -1534,6 +1605,140 @@ impl MailboxDb {
         Ok(map_finished_drain(row))
     }
 
+    pub fn register_completion_event(
+        &mut self,
+        input: CompletionEventRegistrationInput<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        validate_completion_event_registration(&input)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start completion event registration transaction: {err}")
+            })?;
+        let existing = completion_event_by_id_on(&tx, input.event_id)?;
+        let inserted = if let Some(existing) = existing.as_ref() {
+            validate_completion_event_registration_replay(existing, &input)?;
+            false
+        } else {
+            insert_completion_event(&tx, &input, &now)?;
+            true
+        };
+        register_completion_event_listener(&tx, &input, &now)?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
+        self.completion_event_registration(input.event_id, inserted)
+    }
+
+    pub fn activate_completion_event_listeners(
+        &mut self,
+        event_id: &str,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start completion listener activation transaction: {err}")
+            })?;
+        let event = completion_event_by_id_on(&tx, event_id)?
+            .ok_or_else(|| format!("Completion event {event_id} is not registered"))?;
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET active = 1
+             WHERE event_id = ?1 AND acknowledged_at IS NULL",
+            params![event_id],
+        )
+        .map_err(|err| format!("Failed to activate completion event listeners: {err}"))?;
+        if event.state == "triggered" {
+            materialize_completion_event_listeners(&tx, &event, &now)?;
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit completion listener activation: {err}"))?;
+        self.completion_event_trigger_result(event_id, false)
+    }
+
+    pub fn trigger_completion_event(
+        &mut self,
+        input: CompletionEventTriggerInput<'_>,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        validate_completion_event_trigger(&input)?;
+        let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
+        let now = now_rfc3339();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start completion event trigger transaction: {err}")
+            })?;
+        let event = completion_event_by_id_on(&tx, input.event_id)?
+            .ok_or_else(|| format!("Completion event {} is not registered", input.event_id))?;
+        validate_completion_event_trigger_source(&event, &input)?;
+        let triggered = if event.state == "pending" {
+            trigger_completion_event_row(&tx, &input, &payload_json, &published, &now)?;
+            true
+        } else {
+            validate_completion_event_trigger_replay(&event, &input, &published)?;
+            false
+        };
+        if input.consumed {
+            acknowledge_consumed_completion_event_listeners(&tx, input.event_id, &now)?;
+        }
+        let event = completion_event_by_id_on(&tx, input.event_id)?
+            .ok_or_else(|| format!("Completion event {} disappeared", input.event_id))?;
+        materialize_completion_event_listeners(&tx, &event, &now)?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit completion event trigger: {err}"))?;
+        self.completion_event_trigger_result(input.event_id, triggered)
+    }
+
+    pub fn completion_event(&self, event_id: &str) -> Result<Option<CompletionEventRow>, String> {
+        completion_event_by_id_on(&self.conn, event_id)
+    }
+
+    pub fn completion_event_listeners(
+        &self,
+        event_id: &str,
+    ) -> Result<Vec<CompletionEventListenerRow>, String> {
+        completion_event_listeners_on(&self.conn, event_id)
+    }
+
+    fn completion_event_registration(
+        &self,
+        event_id: &str,
+        inserted: bool,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        let event = self
+            .completion_event(event_id)?
+            .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
+        let listeners = self.completion_event_listeners(event_id)?;
+        Ok(CompletionEventRegistrationResult {
+            inserted,
+            event,
+            listeners,
+        })
+    }
+
+    fn completion_event_trigger_result(
+        &self,
+        event_id: &str,
+        triggered: bool,
+    ) -> Result<CompletionEventTriggerResult, String> {
+        let event = self
+            .completion_event(event_id)?
+            .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
+        let listeners = self.completion_event_listeners(event_id)?;
+        let mailbox_rows = completion_event_mailbox_rows_on(&self.conn, event_id)?;
+        Ok(CompletionEventTriggerResult {
+            triggered,
+            event,
+            listeners,
+            mailbox_rows,
+        })
+    }
+
     pub fn enqueue_agent_bash_complete(
         &mut self,
         input: &AgentBashCompleteEnqueue<'_>,
@@ -1793,6 +1998,17 @@ impl MailboxDb {
                 params![session_id, from_seq, to_seq, &now, delivered_by],
             )
             .map_err(|err| format!("Failed to acknowledge mailbox range: {err}"))?;
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET acknowledged_at = COALESCE(acknowledged_at, ?4),
+                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'manual_ack')
+             WHERE mailbox_seq IN (
+                 SELECT seq FROM mailbox
+                 WHERE session_id = ?1 AND seq >= ?2 AND seq <= ?3 AND delivered_at IS NOT NULL
+             )",
+            params![session_id, from_seq, to_seq, &now],
+        )
+        .map_err(|err| format!("Failed to acknowledge completion listeners in range: {err}"))?;
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit().map_err(|err| {
             format!("Failed to commit mailbox range acknowledgement transaction: {err}")
@@ -1904,6 +2120,7 @@ impl MailboxDb {
             )
             .map_err(|err| format!("Failed to mark mailbox row delivered: {err}"))?;
         }
+        acknowledge_completion_event_listeners_for_seqs(&tx, seqs, &now)?;
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))
@@ -2286,6 +2503,16 @@ impl MailboxDb {
             params![&session_id, attempt_id, &now, &delivery_invocation_uuid],
         )
         .map_err(|err| format!("Failed to confirm mailbox delivery items: {err}"))?;
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
+                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
+             WHERE mailbox_seq IN (
+                 SELECT mailbox_seq FROM mailbox_delivery_attempt_items WHERE attempt_id = ?1
+             )",
+            params![attempt_id, &now],
+        )
+        .map_err(|err| format!("Failed to acknowledge injected completion listeners: {err}"))?;
         resolve_completed_delivery_attempts(&tx, &session_id, &now, Some(attempt_id))?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery confirmation: {err}"))?;
@@ -5207,6 +5434,474 @@ fn wake_claim_is_valid_for_child(claim: Option<&WakeClaimRow>, claim_token: &str
     claim.is_some_and(|claim| wake_claim_matches_child(claim, claim_token))
 }
 
+fn validate_completion_event_registration(
+    input: &CompletionEventRegistrationInput<'_>,
+) -> Result<(), String> {
+    if input.event_id.is_empty() {
+        return Err("Completion event ID must not be empty".to_string());
+    }
+    if !matches!(input.delivery_mode, "sync" | "async") {
+        return Err(format!(
+            "Invalid completion event delivery mode: {}",
+            input.delivery_mode
+        ));
+    }
+    if [
+        input.state_dir,
+        input.meta_path,
+        input.log_path,
+        input.rc_path,
+    ]
+    .iter()
+    .any(|value| value.is_empty())
+    {
+        return Err("Completion event artifact paths must not be empty".to_string());
+    }
+    match (input.owner_session_id, input.owner_invocation_uuid) {
+        (Some(session_id), Some(invocation_uuid))
+            if !session_id.is_empty() && !invocation_uuid.is_empty() =>
+        {
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        _ => Err(
+            "Completion event owner session and invocation must be supplied together".to_string(),
+        ),
+    }
+}
+
+fn validate_completion_event_trigger(
+    input: &CompletionEventTriggerInput<'_>,
+) -> Result<(), String> {
+    if input.event_id.is_empty() {
+        return Err("Completion event ID must not be empty".to_string());
+    }
+    if input.payload_json.is_empty() {
+        return Err("Completion event payload must not be empty".to_string());
+    }
+    Ok(())
+}
+
+fn completion_event_by_id_on(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Option<CompletionEventRow>, String> {
+    conn.query_row(
+        "SELECT event_id, kind, state, delivery_mode, state_dir, meta_path, log_path,
+                rc_path, rc, payload_json, payload_file_path, payload_sha256,
+                payload_byte_len, payload_retention_policy, created_at, triggered_at
+         FROM completion_event
+         WHERE event_id = ?1",
+        params![event_id],
+        |row| {
+            Ok(CompletionEventRow {
+                event_id: row.get(0)?,
+                kind: row.get(1)?,
+                state: row.get(2)?,
+                delivery_mode: row.get(3)?,
+                state_dir: row.get(4)?,
+                meta_path: row.get(5)?,
+                log_path: row.get(6)?,
+                rc_path: row.get(7)?,
+                rc: row.get(8)?,
+                payload_json: row.get(9)?,
+                payload_file_path: row.get(10)?,
+                payload_sha256: row.get(11)?,
+                payload_byte_len: row.get(12)?,
+                payload_retention_policy: row.get(13)?,
+                created_at: row.get(14)?,
+                triggered_at: row.get(15)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read completion event: {err}"))
+}
+
+fn completion_event_listeners_on(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Vec<CompletionEventListenerRow>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT event_id, listener_id, session_id, owner_invocation_uuid, active,
+                    mailbox_seq, acknowledged_at, acknowledgement_reason
+             FROM completion_event_listener
+             WHERE event_id = ?1
+             ORDER BY listener_id",
+        )
+        .map_err(|err| format!("Failed to prepare completion event listener query: {err}"))?;
+    let rows = statement
+        .query_map(params![event_id], |row| {
+            Ok(CompletionEventListenerRow {
+                event_id: row.get(0)?,
+                listener_id: row.get(1)?,
+                session_id: row.get(2)?,
+                owner_invocation_uuid: row.get(3)?,
+                active: row.get(4)?,
+                mailbox_seq: row.get(5)?,
+                acknowledged_at: row.get(6)?,
+                acknowledgement_reason: row.get(7)?,
+            })
+        })
+        .map_err(|err| format!("Failed to query completion event listeners: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read completion event listener: {err}"))
+}
+
+fn insert_completion_event(
+    tx: &Transaction<'_>,
+    input: &CompletionEventRegistrationInput<'_>,
+    now: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO completion_event (
+            event_id, kind, state, delivery_mode, state_dir, meta_path, log_path,
+            rc_path, created_at
+         ) VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            input.event_id,
+            AGENT_BASH_COMPLETE_KIND,
+            input.delivery_mode,
+            input.state_dir,
+            input.meta_path,
+            input.log_path,
+            input.rc_path,
+            now,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|err| format!("Failed to insert completion event: {err}"))
+}
+
+fn validate_completion_event_registration_replay(
+    event: &CompletionEventRow,
+    input: &CompletionEventRegistrationInput<'_>,
+) -> Result<(), String> {
+    let matches = event.kind == AGENT_BASH_COMPLETE_KIND
+        && event.delivery_mode == input.delivery_mode
+        && event.state_dir == input.state_dir
+        && event.meta_path == input.meta_path
+        && event.log_path == input.log_path
+        && event.rc_path == input.rc_path;
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "Completion event {} registration conflicts with its durable identity",
+            input.event_id
+        ))
+    }
+}
+
+fn register_completion_event_listener(
+    tx: &Transaction<'_>,
+    input: &CompletionEventRegistrationInput<'_>,
+    now: &str,
+) -> Result<(), String> {
+    let (Some(session_id), Some(invocation_uuid)) =
+        (input.owner_session_id, input.owner_invocation_uuid)
+    else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT OR IGNORE INTO completion_event_listener (
+            event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
+         ) VALUES (?1, ?2, ?3, ?2, ?4, ?5)",
+        params![
+            input.event_id,
+            invocation_uuid,
+            session_id,
+            input.delivery_mode == "async",
+            now,
+        ],
+    )
+    .map_err(|err| format!("Failed to register completion event listener: {err}"))?;
+    let listener = tx
+        .query_row(
+            "SELECT event_id, listener_id, session_id, owner_invocation_uuid, active,
+                    mailbox_seq, acknowledged_at, acknowledgement_reason
+             FROM completion_event_listener
+             WHERE event_id = ?1 AND listener_id = ?2",
+            params![input.event_id, invocation_uuid],
+            |row| {
+                Ok(CompletionEventListenerRow {
+                    event_id: row.get(0)?,
+                    listener_id: row.get(1)?,
+                    session_id: row.get(2)?,
+                    owner_invocation_uuid: row.get(3)?,
+                    active: row.get(4)?,
+                    mailbox_seq: row.get(5)?,
+                    acknowledged_at: row.get(6)?,
+                    acknowledgement_reason: row.get(7)?,
+                })
+            },
+        )
+        .map_err(|err| format!("Failed to read registered completion listener: {err}"))?;
+    if listener.session_id == session_id && listener.owner_invocation_uuid == invocation_uuid {
+        Ok(())
+    } else {
+        Err(format!(
+            "Completion event {} listener registration conflicts with its durable identity",
+            input.event_id
+        ))
+    }
+}
+
+fn validate_completion_event_trigger_source(
+    event: &CompletionEventRow,
+    input: &CompletionEventTriggerInput<'_>,
+) -> Result<(), String> {
+    if event.kind == AGENT_BASH_COMPLETE_KIND
+        && event.state_dir == input.state_dir
+        && event.meta_path == input.meta_path
+        && event.log_path == input.log_path
+        && event.rc_path == input.rc_path
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Completion event {} trigger does not match its registered source",
+            input.event_id
+        ))
+    }
+}
+
+fn trigger_completion_event_row(
+    tx: &Transaction<'_>,
+    input: &CompletionEventTriggerInput<'_>,
+    payload_json: &str,
+    published: &PublishedMailboxPayload,
+    now: &str,
+) -> Result<(), String> {
+    let payload_len = i64::try_from(published.byte_len)
+        .map_err(|_| "Completion event payload length does not fit SQLite INTEGER".to_string())?;
+    let changed = tx
+        .execute(
+            "UPDATE completion_event
+             SET state = 'triggered', rc = ?2, payload_json = ?3,
+                 payload_file_path = ?4, payload_sha256 = ?5, payload_byte_len = ?6,
+                 payload_retention_policy = ?7, triggered_at = ?8
+             WHERE event_id = ?1 AND state = 'pending'",
+            params![
+                input.event_id,
+                input.rc,
+                payload_json,
+                published.file_path.to_string_lossy().as_ref(),
+                published.sha256,
+                payload_len,
+                published.retention_policy,
+                now,
+            ],
+        )
+        .map_err(|err| format!("Failed to trigger completion event: {err}"))?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Completion event {} changed while it was being triggered",
+            input.event_id
+        ))
+    }
+}
+
+fn validate_completion_event_trigger_replay(
+    event: &CompletionEventRow,
+    input: &CompletionEventTriggerInput<'_>,
+    published: &PublishedMailboxPayload,
+) -> Result<(), String> {
+    if event.rc == Some(input.rc)
+        && event.payload_sha256.as_deref() == Some(published.sha256.as_str())
+        && event.payload_byte_len == i64::try_from(published.byte_len).ok()
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Completion event {} was already triggered with a different payload",
+            input.event_id
+        ))
+    }
+}
+
+fn acknowledge_consumed_completion_event_listeners(
+    tx: &Transaction<'_>,
+    event_id: &str,
+    now: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE mailbox
+         SET delivered_at = COALESCE(delivered_at, ?2),
+             delivered_by_invocation_uuid = COALESCE(
+                 delivered_by_invocation_uuid,
+                 (SELECT owner_invocation_uuid
+                  FROM completion_event_listener
+                  WHERE completion_event_listener.mailbox_seq = mailbox.seq)
+             )
+         WHERE seq IN (
+             SELECT mailbox_seq
+             FROM completion_event_listener
+             WHERE event_id = ?1 AND mailbox_seq IS NOT NULL
+         )",
+        params![event_id, now],
+    )
+    .map_err(|err| format!("Failed to consume completion event mailbox rows: {err}"))?;
+    tx.execute(
+        "UPDATE completion_event_listener
+         SET active = 0,
+             acknowledged_at = COALESCE(acknowledged_at, ?2),
+             acknowledgement_reason = COALESCE(acknowledgement_reason, 'consumed_in_call')
+         WHERE event_id = ?1",
+        params![event_id, now],
+    )
+    .map(|_| ())
+    .map_err(|err| format!("Failed to acknowledge consumed completion listeners: {err}"))
+}
+
+fn materialize_completion_event_listeners(
+    tx: &Transaction<'_>,
+    event: &CompletionEventRow,
+    now: &str,
+) -> Result<(), String> {
+    if event.state != "triggered" {
+        return Ok(());
+    }
+    let listeners = completion_event_listeners_on(tx, &event.event_id)?;
+    let listener_count = listeners.len();
+    for listener in listeners.into_iter().filter(|listener| {
+        listener.active && listener.acknowledged_at.is_none() && listener.mailbox_seq.is_none()
+    }) {
+        let handle = completion_listener_mailbox_handle(event, &listener, listener_count);
+        let changed = insert_completion_listener_mailbox_row(tx, event, &listener, &handle, now)?;
+        let row = query_mailbox_by_kind_handle_tx(tx, AGENT_BASH_COMPLETE_KIND, &handle)?
+            .ok_or_else(|| "Completion listener mailbox row disappeared".to_string())?;
+        if changed == 0
+            && (row.session_id != listener.session_id
+                || row.owner_invocation_uuid.as_deref()
+                    != Some(listener.owner_invocation_uuid.as_str())
+                || row.payload_sha256 != event.payload_sha256)
+        {
+            return Err(format!(
+                "Completion event {} mailbox identity conflicts with an existing row",
+                event.event_id
+            ));
+        }
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET mailbox_seq = ?3
+             WHERE event_id = ?1 AND listener_id = ?2 AND mailbox_seq IS NULL",
+            params![event.event_id, listener.listener_id, row.seq],
+        )
+        .map_err(|err| format!("Failed to bind completion listener mailbox row: {err}"))?;
+    }
+    Ok(())
+}
+
+fn completion_listener_mailbox_handle(
+    event: &CompletionEventRow,
+    listener: &CompletionEventListenerRow,
+    listener_count: usize,
+) -> String {
+    if listener_count == 1 {
+        event.event_id.clone()
+    } else {
+        format!("{}:{}", event.event_id, listener.listener_id)
+    }
+}
+
+fn insert_completion_listener_mailbox_row(
+    tx: &Transaction<'_>,
+    event: &CompletionEventRow,
+    listener: &CompletionEventListenerRow,
+    handle: &str,
+    now: &str,
+) -> Result<usize, String> {
+    tx.execute(
+        "INSERT OR IGNORE INTO mailbox (
+            session_id, kind, handle, payload_json, enqueued_at,
+            owner_invocation_uuid, state_dir, meta_path, log_path, rc_path, rc,
+            payload_file_path, payload_sha256, payload_byte_len,
+            payload_retention_policy, payload_compacted_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            listener.session_id,
+            AGENT_BASH_COMPLETE_KIND,
+            handle,
+            event.payload_json.as_deref().ok_or_else(|| {
+                format!(
+                    "Triggered completion event {} has no payload",
+                    event.event_id
+                )
+            })?,
+            now,
+            listener.owner_invocation_uuid,
+            event.state_dir,
+            event.meta_path,
+            event.log_path,
+            event.rc_path,
+            event.rc.ok_or_else(|| {
+                format!(
+                    "Triggered completion event {} has no exit code",
+                    event.event_id
+                )
+            })?,
+            event.payload_file_path,
+            event.payload_sha256,
+            event.payload_byte_len,
+            event.payload_retention_policy,
+            event.triggered_at,
+        ],
+    )
+    .map_err(|err| format!("Failed to materialize completion event listener: {err}"))
+}
+
+fn completion_event_mailbox_rows_on(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Vec<MailboxRow>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT mailbox.seq, mailbox.session_id, mailbox.kind, mailbox.handle,
+                    mailbox.payload_json, mailbox.enqueued_at, mailbox.delivered_at,
+                    mailbox.delivered_by_invocation_uuid, mailbox.delivery_attempts,
+                    mailbox.delivery_error, mailbox.owner_invocation_uuid,
+                    mailbox.matched_os_pid, mailbox.matched_os_boot_id,
+                    mailbox.matched_os_pid_starttime_ticks, mailbox.matched_chain_index,
+                    mailbox.state_dir, mailbox.meta_path, mailbox.log_path, mailbox.rc_path,
+                    mailbox.rc, mailbox.payload_file_path, mailbox.payload_sha256,
+                    mailbox.payload_byte_len, mailbox.payload_retention_policy,
+                    mailbox.payload_compacted_at, mailbox.submission_token,
+                    mailbox.target_kind, mailbox.target_id
+             FROM completion_event_listener
+             JOIN mailbox ON mailbox.seq = completion_event_listener.mailbox_seq
+             WHERE completion_event_listener.event_id = ?1
+             ORDER BY mailbox.seq",
+        )
+        .map_err(|err| format!("Failed to prepare completion event mailbox query: {err}"))?;
+    let rows = statement
+        .query_map(params![event_id], map_mailbox_row)
+        .map_err(|err| format!("Failed to query completion event mailbox rows: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read completion event mailbox row: {err}"))
+}
+
+fn acknowledge_completion_event_listeners_for_seqs(
+    tx: &Transaction<'_>,
+    seqs: &[i64],
+    now: &str,
+) -> Result<(), String> {
+    for seq in seqs {
+        tx.execute(
+            "UPDATE completion_event_listener
+             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
+                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
+             WHERE mailbox_seq = ?1",
+            params![seq, now],
+        )
+        .map_err(|err| format!("Failed to acknowledge completion event listener: {err}"))?;
+    }
+    Ok(())
+}
+
 fn query_mailbox_by_kind_handle_tx(
     tx: &rusqlite::Transaction<'_>,
     kind: &str,
@@ -5303,6 +5998,59 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_mailbox_delivery_attempt_items_seq
             ON mailbox_delivery_attempt_items(mailbox_seq, attempt_id);
+
+        CREATE TABLE IF NOT EXISTS completion_event (
+            event_id                 TEXT PRIMARY KEY,
+            kind                     TEXT NOT NULL,
+            state                    TEXT NOT NULL CHECK(state IN ('pending', 'triggered')),
+            delivery_mode            TEXT NOT NULL CHECK(delivery_mode IN ('sync', 'async')),
+            state_dir                TEXT NOT NULL,
+            meta_path                TEXT NOT NULL,
+            log_path                 TEXT NOT NULL,
+            rc_path                  TEXT NOT NULL,
+            rc                       INTEGER,
+            payload_json             TEXT,
+            payload_file_path        TEXT,
+            payload_sha256           TEXT,
+            payload_byte_len         INTEGER,
+            payload_retention_policy TEXT,
+            created_at               TEXT NOT NULL,
+            triggered_at             TEXT,
+            CHECK (
+                (state = 'pending' AND rc IS NULL AND payload_json IS NULL
+                    AND payload_file_path IS NULL AND payload_sha256 IS NULL
+                    AND payload_byte_len IS NULL AND payload_retention_policy IS NULL
+                    AND triggered_at IS NULL)
+                OR
+                (state = 'triggered' AND rc IS NOT NULL AND payload_json IS NOT NULL
+                    AND payload_file_path IS NOT NULL AND payload_sha256 IS NOT NULL
+                    AND payload_byte_len IS NOT NULL AND payload_retention_policy IS NOT NULL
+                    AND triggered_at IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS completion_event_listener (
+            event_id                    TEXT NOT NULL,
+            listener_id                 TEXT NOT NULL,
+            session_id                  TEXT NOT NULL,
+            owner_invocation_uuid       TEXT NOT NULL,
+            active                      INTEGER NOT NULL CHECK(active IN (0, 1)),
+            mailbox_seq                 INTEGER UNIQUE,
+            acknowledged_at             TEXT,
+            acknowledgement_reason      TEXT,
+            created_at                  TEXT NOT NULL,
+            PRIMARY KEY(event_id, listener_id),
+            FOREIGN KEY(event_id) REFERENCES completion_event(event_id),
+            FOREIGN KEY(mailbox_seq) REFERENCES mailbox(seq),
+            CHECK (
+                (acknowledged_at IS NULL AND acknowledgement_reason IS NULL)
+                OR
+                (acknowledged_at IS NOT NULL AND acknowledgement_reason IS NOT NULL)
+            )
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_completion_event_listener_pending
+            ON completion_event_listener(session_id, active, acknowledged_at, event_id);
 
         CREATE TABLE IF NOT EXISTS mailbox_notification_control (
             session_id                    TEXT PRIMARY KEY,
@@ -5801,6 +6549,41 @@ mod tests {
         }
     }
 
+    fn completion_registration<'a>(
+        event_id: &'a str,
+        delivery_mode: &'a str,
+        session_id: &'a str,
+        invocation_uuid: &'a str,
+    ) -> CompletionEventRegistrationInput<'a> {
+        CompletionEventRegistrationInput {
+            event_id,
+            delivery_mode,
+            owner_session_id: Some(session_id),
+            owner_invocation_uuid: Some(invocation_uuid),
+            state_dir: "/tmp/state",
+            meta_path: "/tmp/state/meta.json",
+            log_path: "/tmp/state/log",
+            rc_path: "/tmp/state/rc",
+        }
+    }
+
+    fn completion_trigger<'a>(
+        event_id: &'a str,
+        payload_json: &'a str,
+        consumed: bool,
+    ) -> CompletionEventTriggerInput<'a> {
+        CompletionEventTriggerInput {
+            event_id,
+            payload_json,
+            state_dir: "/tmp/state",
+            meta_path: "/tmp/state/meta.json",
+            log_path: "/tmp/state/log",
+            rc_path: "/tmp/state/rc",
+            rc: 0,
+            consumed,
+        }
+    }
+
     fn submitted_input<'a>(
         submission_token: &'a str,
         target_kind: InboxTargetKind,
@@ -5855,6 +6638,159 @@ mod tests {
         fs::write(&first.file_path, b"payload-b").unwrap();
 
         assert!(db.verify_published_payload(&first).is_err());
+    }
+
+    #[test]
+    fn completion_event_trigger_is_idempotent_and_acknowledges_each_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "ab_event";
+        let first_invocation = "11111111-1111-4111-8111-111111111111";
+        let second_invocation = "22222222-2222-4222-8222-222222222222";
+
+        let first = db
+            .register_completion_event(completion_registration(
+                event_id,
+                "async",
+                "session-a",
+                first_invocation,
+            ))
+            .unwrap();
+        assert!(first.inserted);
+        let replay = db
+            .register_completion_event(completion_registration(
+                event_id,
+                "async",
+                "session-b",
+                second_invocation,
+            ))
+            .unwrap();
+        assert!(!replay.inserted);
+        assert_eq!(replay.listeners.len(), 2);
+
+        let triggered = db
+            .trigger_completion_event(completion_trigger(
+                event_id,
+                r#"{"schema_version":2,"handle":"ab_event"}"#,
+                false,
+            ))
+            .unwrap();
+        assert!(triggered.triggered);
+        assert_eq!(triggered.event.state, "triggered");
+        assert_eq!(triggered.mailbox_rows.len(), 2);
+        assert_ne!(
+            triggered.mailbox_rows[0].handle,
+            triggered.mailbox_rows[1].handle
+        );
+
+        let duplicate = db
+            .trigger_completion_event(completion_trigger(
+                event_id,
+                r#"{"schema_version":2,"handle":"ab_event"}"#,
+                false,
+            ))
+            .unwrap();
+        assert!(!duplicate.triggered);
+        assert_eq!(
+            duplicate
+                .mailbox_rows
+                .iter()
+                .map(|row| row.seq)
+                .collect::<Vec<_>>(),
+            triggered
+                .mailbox_rows
+                .iter()
+                .map(|row| row.seq)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            db.trigger_completion_event(completion_trigger(
+                event_id,
+                r#"{"schema_version":2,"handle":"different"}"#,
+                false,
+            ))
+            .is_err()
+        );
+
+        let session_a_seq = triggered
+            .mailbox_rows
+            .iter()
+            .find(|row| row.session_id == "session-a")
+            .unwrap()
+            .seq;
+        db.mark_delivered("session-a", &[session_a_seq], "delivery-a")
+            .unwrap();
+        let listeners = db.completion_event_listeners(event_id).unwrap();
+        let first = listeners
+            .iter()
+            .find(|listener| listener.session_id == "session-a")
+            .unwrap();
+        let second = listeners
+            .iter()
+            .find(|listener| listener.session_id == "session-b")
+            .unwrap();
+        assert!(first.acknowledged_at.is_some());
+        assert_eq!(first.acknowledgement_reason.as_deref(), Some("injected"));
+        assert!(second.acknowledged_at.is_none());
+    }
+
+    #[test]
+    fn sync_completion_waits_for_activation_before_materializing_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "ab_sync";
+        db.register_completion_event(completion_registration(
+            event_id,
+            "sync",
+            "session-a",
+            "11111111-1111-4111-8111-111111111111",
+        ))
+        .unwrap();
+
+        let triggered = db
+            .trigger_completion_event(completion_trigger(
+                event_id,
+                r#"{"schema_version":2,"handle":"ab_sync"}"#,
+                false,
+            ))
+            .unwrap();
+        assert!(triggered.triggered);
+        assert!(triggered.mailbox_rows.is_empty());
+        assert!(!triggered.listeners[0].active);
+
+        let activated = db.activate_completion_event_listeners(event_id).unwrap();
+        assert_eq!(activated.mailbox_rows.len(), 1);
+        assert!(activated.listeners[0].active);
+    }
+
+    #[test]
+    fn consumed_completion_acknowledges_listener_without_mailbox_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "ab_consumed";
+        db.register_completion_event(completion_registration(
+            event_id,
+            "async",
+            "session-a",
+            "11111111-1111-4111-8111-111111111111",
+        ))
+        .unwrap();
+
+        let triggered = db
+            .trigger_completion_event(completion_trigger(
+                event_id,
+                r#"{"schema_version":2,"handle":"ab_consumed"}"#,
+                true,
+            ))
+            .unwrap();
+        assert!(triggered.triggered);
+        assert!(triggered.mailbox_rows.is_empty());
+        assert!(!triggered.listeners[0].active);
+        assert!(triggered.listeners[0].acknowledged_at.is_some());
+        assert_eq!(
+            triggered.listeners[0].acknowledgement_reason.as_deref(),
+            Some("consumed_in_call")
+        );
     }
 
     #[test]
@@ -5972,7 +6908,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         assert!(mailbox_schema_definition().contains("CREATE TABLE IF NOT EXISTS mailbox"));
-        for table in ["mailbox", "runtime_generation", "session_runtime"] {
+        for table in [
+            "mailbox",
+            "runtime_generation",
+            "session_runtime",
+            "completion_event",
+            "completion_event_listener",
+        ] {
             let sql = format_table_columns_pragma(table);
             assert!(!table_columns(&db.conn, table, &sql).unwrap().is_empty());
         }

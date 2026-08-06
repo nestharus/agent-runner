@@ -5,15 +5,13 @@ use oulipoly_runtime::executor::cli::pty_broker::{
 };
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
-    MAILBOX_DELIVERY_UNCONFIRMED_ERROR, MAX_UNCONFIRMED_DELIVERY_ATTEMPTS, MailboxDb,
-    MailboxDeliveryWindow, MailboxRow, RuntimeGenerationFence, RuntimeGenerationId,
-    RuntimeLifecycleState, RuntimeTerminalReason, SessionRuntimeRunningUpdate,
-    WAKE_SWEEP_ABANDONED_ERROR,
+    MailboxDb, MailboxRow, RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState,
+    RuntimeTerminalReason, SessionRuntimeRunningUpdate,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
 };
-use oulipoly_state::{SessionTurnIngest, StateDb};
+use oulipoly_state::{InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -108,17 +106,33 @@ impl Fixture {
     }
 
     fn run_notify(&self, handle: &str, metadata: Value) -> Output {
-        self.run(self.notify_command(handle, metadata))
-    }
-
-    fn run_notify_with_trace(&self, handle: &str, metadata: Value) -> Output {
-        let mut cmd = self.notify_command(handle, metadata);
-        cmd.env("OULIPOLY_TRACE_NOTIFY", "1");
-        self.run(cmd)
-    }
-
-    fn notify_command(&self, handle: &str, metadata: Value) -> Command {
         let artifacts = self.write_notify_artifacts(handle, metadata, 0);
+        let registration = self.run(self.register_command(handle, &artifacts));
+        assert!(registration.status.success(), "{registration:?}");
+        self.run(self.notify_command(handle, &artifacts))
+    }
+
+    fn register_command(&self, handle: &str, artifacts: &NotifyArtifacts) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("notify")
+            .arg("agent-bash-register")
+            .arg("--handle")
+            .arg(handle)
+            .arg("--delivery-mode")
+            .arg("async")
+            .arg("--state-dir")
+            .arg(&artifacts.state_dir)
+            .arg("--meta")
+            .arg(&artifacts.meta)
+            .arg("--log")
+            .arg(&artifacts.log)
+            .arg("--rc")
+            .arg(&artifacts.rc)
+            .arg("--json");
+        cmd
+    }
+
+    fn notify_command(&self, handle: &str, artifacts: &NotifyArtifacts) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("notify")
             .arg("agent-bash-complete")
@@ -179,6 +193,27 @@ impl Fixture {
     }
 
     fn record_owner_identity(&self, identity: &ProcessIdentity) {
+        let state = StateDb::open(&self.state_path()).unwrap();
+        let invocation_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_A.to_string(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                invocation_id,
+                &ProviderSessionBinding {
+                    provider_session_id: SESSION_A.to_string(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
         let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
         sidecar
             .record_identity(PidIdentityRecord {
@@ -309,115 +344,6 @@ flag = "--resume"
         .unwrap();
     }
 
-    fn write_interactive_model_with_provider_adapter(
-        &self,
-        model_name: &str,
-        provider_name: &str,
-        script: &Path,
-        adapter: &Path,
-    ) {
-        self.write_interactive_model(model_name, provider_name, script);
-        fs::write(
-            self.models_dir.join(format!("{model_name}.toml")),
-            format!(
-                r#"provider = {{ path = {} }}
-
-[[providers]]
-name = "{provider_name}"
-args = []
-"#,
-                toml_string(&path_string(adapter)),
-            ),
-        )
-        .unwrap();
-    }
-
-    fn write_session_source_from_received_log(&self, provider_name: &str, received_log: &Path) {
-        let script = self.dir.path().join("fixture-session-turns.sh");
-        fs::write(
-            &script,
-            format!(
-                r#"#!/usr/bin/env bash
-set -euo pipefail
-marker=$(sed -n 's/.*\(\[OULIPOLY-DELIVERY [^]]*\]\).*/\1/p' {received} | head -n 1)
-if [ -n "$marker" ]; then
-  printf '{{"session_id":"%s","turn_id":"scanned-delivery-turn","timestamp":"2026-07-24T12:00:00Z","role":"user","body":[{{"type":"text","text":"%s"}}]}}\n' "$SESSION_ID" "$marker"
-fi
-"#,
-                received = shell_single_quote(&path_string(received_log))
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-        fs::write(
-            self.app_config_dir.join("sessions.toml"),
-            format!(
-                "[{provider_name}]\nturn_script = {}\nstate_dir = {}\n",
-                toml_string(&path_string(&script)),
-                toml_string(&path_string(&self.dir.path().join("session-source-state")))
-            ),
-        )
-        .unwrap();
-    }
-
-    fn write_session_source_from_length_prefixed_log(
-        &self,
-        provider_name: &str,
-        received_log: &Path,
-    ) {
-        let script = self
-            .dir
-            .path()
-            .join("fixture-length-prefixed-session-turns.py");
-        fs::write(
-            &script,
-            format!(
-                r#"#!/usr/bin/env python3
-import json
-import os
-import pathlib
-
-data = pathlib.Path({received:?}).read_bytes()
-offset = 0
-index = 0
-while offset < len(data):
-    if offset + 8 > len(data):
-        raise SystemExit("truncated record length")
-    length = int.from_bytes(data[offset:offset + 8], "big")
-    offset += 8
-    if offset + length > len(data):
-        raise SystemExit("truncated record body")
-    index += 1
-    body = data[offset:offset + length].decode("utf-8")
-    offset += length
-    print(json.dumps({{
-        "session_id": os.environ["SESSION_ID"],
-        "turn_id": f"scanned-delivery-turn-{{index}}",
-        "timestamp": f"2026-07-24T12:00:{{index:02}}Z",
-        "role": "user",
-        "body": [{{"type": "text", "text": body}}],
-    }}))
-"#,
-                received = path_string(received_log),
-            ),
-        )
-        .unwrap();
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-        fs::write(
-            self.app_config_dir.join("sessions.toml"),
-            format!(
-                "[{provider_name}]\nturn_script = {}\nstate_dir = {}\n",
-                toml_string(&path_string(&script)),
-                toml_string(&path_string(&self.dir.path().join("session-source-state")))
-            ),
-        )
-        .unwrap();
-    }
-
     fn seed_active_chain(&self, chain_id: &str, provider: &str, session_id: &str, model: &str) {
         let conn = self.conn();
         conn.execute(
@@ -466,7 +392,7 @@ while offset < len(data):
 }
 
 #[test]
-fn notify_control_ack_before_provider_observation_leaves_mailbox_recoverable() {
+fn notify_control_ack_immediately_delivers_without_provider_observation() {
     let fixture = Fixture::new();
     let identity = current_identity();
     fixture.record_owner_identity(&identity);
@@ -475,35 +401,43 @@ fn notify_control_ack_before_provider_observation_leaves_mailbox_recoverable() {
     let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
-    let output = fixture.run_notify("h-live-ack", caller_chain(&identity));
+    let output = fixture.run_notify("h-live-ack", owner_metadata(SESSION_A, INVOCATION_A));
     server.join().unwrap();
 
     assert_success(&output);
     let value = stdout_json(&output);
-    assert_eq!(value["status"], "enqueued");
+    assert_eq!(value["status"], "triggered");
     assert_eq!(value["pty_delivery"]["status"], "acked");
     assert_eq!(value["pty_delivery"]["submitted"], true);
-    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([]));
+    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([1]));
     assert!(value["wake"].is_null());
     let payload = captured.lock().unwrap().clone();
     assert!(payload.contains("[OULIPOLY NOTIFICATIONS]"));
     assert!(payload.contains("handle: h-live-ack"));
     assert!(!payload.contains("log for h-live-ack"));
     let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
-    assert!(trace.contains("trigger=notify-time"), "trace was {trace}");
+    assert!(
+        trace.contains("trigger=completion-event"),
+        "trace was {trace}"
+    );
     assert!(trace.contains("decision=inject"), "trace was {trace}");
     assert!(trace.contains("inject_status=acked"), "trace was {trace}");
 
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
-    assert!(
-        rows[0].delivered_at.is_none(),
-        "control ACK preceded provider observation but persisted delivered_at={:?}",
-        rows[0].delivered_at
+    assert!(rows[0].delivered_at.is_some());
+    assert_eq!(
+        rows[0].delivered_by_invocation_uuid.as_deref(),
+        Some(INVOCATION_A)
     );
-    assert!(rows[0].delivered_by_invocation_uuid.is_none());
-    assert_eq!(rows[0].delivery_attempts, 0);
-    assert_eq!(fixture.mailbox().list_pending(SESSION_A).unwrap(), rows);
+    assert_eq!(rows[0].delivery_attempts, 1);
+    assert!(
+        fixture
+            .mailbox()
+            .list_pending(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
     let attempt_id = delivery_attempt_id(&payload);
     let attempt = fixture
         .mailbox()
@@ -520,268 +454,17 @@ fn notify_control_ack_before_provider_observation_leaves_mailbox_recoverable() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(resolved_at.is_none());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn pty_reconciliation_requires_exact_provider_user_turn_marker() {
-    for evidence in [
-        "exact",
-        "wrong_nonce",
-        "assistant",
-        "wrong_provider",
-        "wrong_session",
-        "handle_only",
-        "header_only",
-    ] {
-        let fixture = Fixture::new();
-        let identity = current_identity();
-        fixture.record_owner_identity(&identity);
-        let socket = fixture.socket_path(&format!("reconcile-{evidence}.sock"));
-        let captured = Arc::new(Mutex::new(String::new()));
-        let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
-        fixture.mark_live_pty_runtime(&identity, &socket);
-        let handle = format!("h-reconcile-{evidence}");
-
-        let first = fixture.run_notify(&handle, caller_chain(&identity));
-        server.join().unwrap();
-        assert_success(&first);
-        let payload = captured.lock().unwrap().clone();
-        let attempt_id = delivery_attempt_id(&payload);
-        let exact_marker = format!("[OULIPOLY-DELIVERY {attempt_id}]");
-        let provider = if evidence == "wrong_provider" {
-            "other-provider"
-        } else {
-            "fixture-provider"
-        };
-        let session_id = if evidence == "wrong_session" {
-            "other-session"
-        } else {
-            SESSION_A
-        };
-        let role = if evidence == "assistant" {
-            "assistant"
-        } else {
-            "user"
-        };
-        let body = match evidence {
-            "wrong_nonce" => "[OULIPOLY-DELIVERY 00000000-0000-4000-8000-000000000000]",
-            "handle_only" => handle.as_str(),
-            "header_only" => "[OULIPOLY NOTIFICATIONS]",
-            _ => exact_marker.as_str(),
-        };
-        fixture.ingest_turn(
-            provider,
-            session_id,
-            &format!("turn-{evidence}"),
-            role,
-            body,
-        );
-
-        let second = fixture.run_notify(&handle, caller_chain(&identity));
-        assert_success(&second);
-        let diagnostic = stdout_json(&second);
-        let delivered = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-        if evidence == "exact" {
-            assert_eq!(diagnostic["pty_delivery"]["status"], "no_pending");
-            assert!(delivered[0].delivered_at.is_some(), "evidence={evidence}");
-            assert_eq!(delivered[0].delivery_attempts, 1);
-            assert_eq!(
-                delivered[0].delivered_by_invocation_uuid.as_deref(),
-                Some(INVOCATION_A)
-            );
-        } else {
-            assert_eq!(
-                diagnostic["pty_delivery"]["status"], "awaiting_observation",
-                "evidence={evidence}, diagnostic={diagnostic}"
-            );
-            assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
-            assert!(diagnostic["wake"].is_null());
-            assert!(delivered[0].delivered_at.is_none(), "evidence={evidence}");
-            assert_eq!(delivered[0].delivery_attempts, 0);
-        }
-        fixture.assert_default_user_paths_untouched();
-    }
-}
-
-#[test]
-fn accepted_pty_attempt_suppresses_repeated_notify_and_newer_overtake() {
-    let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("accepted-owner.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let first = fixture.run_notify("h-owned-prefix", caller_chain(&identity));
-    server.join().unwrap();
-    assert_success(&first);
-    for handle in ["h-newer", "h-newer"] {
-        let repeated = fixture.run_notify(handle, caller_chain(&identity));
-        assert_success(&repeated);
-        let diagnostic = stdout_json(&repeated);
-        assert_eq!(diagnostic["pty_delivery"]["status"], "awaiting_observation");
-        assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
-        assert_eq!(diagnostic["pty_delivery"]["delivered_seqs"], json!([]));
-        assert!(diagnostic["wake"].is_null());
-    }
-
-    let payload = captured.lock().unwrap().clone();
-    assert!(payload.contains("handle: h-owned-prefix"));
-    assert!(!payload.contains("handle: h-newer"));
-    let mailbox = fixture.mailbox();
-    let pending = mailbox.list_pending(SESSION_A).unwrap();
-    assert_eq!(pending.len(), 2);
-    assert!(pending.iter().all(|row| row.delivered_at.is_none()));
-    let owners = mailbox
-        .accepted_delivery_attempt_windows(SESSION_A)
-        .unwrap();
-    assert_eq!(owners.len(), 1);
-    assert_eq!(owners[0].rows.len(), 1);
-    assert_eq!(owners[0].rows[0].handle, "h-owned-prefix");
-    assert_eq!(owners[0].remaining_count, 1);
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn accepted_previous_invocation_prefix_suppresses_redelivery() {
-    let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("previous-owner.sock");
-    fixture.mark_live_pty_runtime(&identity, &socket);
-    let previous = fixture.seed_mailbox("h-previous-owner");
-    let mut mailbox = fixture.mailbox();
-    mailbox
-        .register_delivery_attempt(
-            "previous-owner-attempt",
-            SESSION_A,
-            "previous-invocation",
-            &[previous.seq],
-            0,
-        )
-        .unwrap();
-    mailbox
-        .record_delivery_attempt_transport_ack("previous-owner-attempt")
-        .unwrap();
-    drop(mailbox);
-
-    let output = fixture.run_notify("h-current-newer", caller_chain(&identity));
-    assert_success(&output);
-    let diagnostic = stdout_json(&output);
-    assert_eq!(diagnostic["pty_delivery"]["status"], "awaiting_observation");
-    assert_eq!(diagnostic["pty_delivery"]["attempted"], false);
-    assert_eq!(diagnostic["pty_delivery"]["remaining_pending"], 2);
-    let pending = fixture.mailbox().list_pending(SESSION_A).unwrap();
-    assert_eq!(pending.len(), 2);
-    assert!(pending.iter().all(|row| row.delivery_attempts == 0));
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn pty_protocol_timeout_reuses_one_unresolved_attempt() {
-    let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("timeout-retry.sock");
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let server = spawn_timeout_then_ack_control_server(&socket, Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let first = fixture.run_notify("h-timeout-retry", caller_chain(&identity));
-    assert_success(&first);
-    let first_diagnostic = stdout_json(&first);
-    assert_eq!(first_diagnostic["pty_delivery"]["status"], "protocol_error");
-    assert_eq!(unresolved_delivery_attempt_count(&fixture), 1);
-
-    let retry = fixture.run_notify("h-timeout-retry", caller_chain(&identity));
-    server.join().unwrap();
-    assert_success(&retry);
-    let retry_diagnostic = stdout_json(&retry);
-    assert!(
-        matches!(
-            retry_diagnostic["pty_delivery"]["status"].as_str(),
-            Some("acked" | "awaiting_observation")
-        ),
-        "diagnostic was {retry_diagnostic}"
-    );
-
-    let payloads = captured.lock().unwrap();
-    assert_eq!(payloads.len(), 2);
-    assert_eq!(
-        delivery_attempt_id(&payloads[0]),
-        delivery_attempt_id(&payloads[1])
-    );
-    let attempt_count: i64 = fixture
+    assert!(resolved_at.is_some());
+    let listeners = fixture
         .mailbox()
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM mailbox_delivery_attempts",
-            [],
-            |row| row.get(0),
-        )
+        .completion_event_listeners("h-live-ack")
         .unwrap();
-    assert_eq!(attempt_count, 1);
-    assert_eq!(unresolved_delivery_attempt_count(&fixture), 1);
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn undeliverable_older_rows_do_not_hide_accepted_pty_owner() {
-    let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let abandoned = fixture.seed_mailbox("h-abandoned-prefix");
-    let exhausted = fixture.seed_mailbox("h-exhausted-prefix");
-    let mut mailbox = fixture.mailbox();
-    mailbox
-        .mark_pending_abandoned(SESSION_A, WAKE_SWEEP_ABANDONED_ERROR, 1)
-        .unwrap();
-    for _ in 0..MAX_UNCONFIRMED_DELIVERY_ATTEMPTS {
-        mailbox
-            .mark_delivery_failed(
-                SESSION_A,
-                &[exhausted.seq],
-                MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-            )
-            .unwrap();
-    }
-    drop(mailbox);
-    let socket = fixture.socket_path("deliverable-owner.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let first = fixture.run_notify("h-deliverable-owner", caller_chain(&identity));
-    server.join().unwrap();
-    assert_success(&first);
-    let first_diagnostic = stdout_json(&first);
-    assert_eq!(first_diagnostic["pty_delivery"]["status"], "acked");
-    assert_eq!(first_diagnostic["pty_delivery"]["remaining_pending"], 1);
-
-    let repeated = fixture.run_notify("h-deliverable-owner", caller_chain(&identity));
-    assert_success(&repeated);
-    let repeated_diagnostic = stdout_json(&repeated);
+    assert_eq!(listeners.len(), 1);
+    assert!(listeners[0].acknowledged_at.is_some());
     assert_eq!(
-        repeated_diagnostic["pty_delivery"]["status"],
-        "awaiting_observation"
+        listeners[0].acknowledgement_reason.as_deref(),
+        Some("injected")
     );
-    assert_eq!(repeated_diagnostic["pty_delivery"]["submitted"], true);
-    assert_eq!(repeated_diagnostic["pty_delivery"]["remaining_pending"], 1);
-    assert!(repeated_diagnostic["wake"].is_null());
-
-    let mailbox = fixture.mailbox();
-    let owners = mailbox
-        .accepted_delivery_attempt_windows(SESSION_A)
-        .unwrap();
-    assert_eq!(owners.len(), 1);
-    assert_eq!(owners[0].rows.len(), 1);
-    assert_eq!(owners[0].rows[0].handle, "h-deliverable-owner");
-    assert_eq!(owners[0].remaining_count, 0);
-    assert_eq!(mailbox.list_pending(SESSION_A).unwrap().len(), 3);
-    assert!(!captured.lock().unwrap().contains(&abandoned.handle));
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -795,13 +478,13 @@ fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
     let server = spawn_control_server(&socket, true, "ok", Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
-    let output = fixture.run_notify("h-generic-ack", caller_chain(&identity));
+    let output = fixture.run_notify("h-generic-ack", owner_metadata(SESSION_A, INVOCATION_A));
     server.join().unwrap();
 
     assert_success(&output);
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "unconfirmed_ack");
-    assert_eq!(value["wake"]["status"], "busy");
+    assert!(value["wake"].is_null());
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
@@ -815,89 +498,37 @@ fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
 }
 
 #[test]
-fn notify_live_pty_failure_leaves_pending_and_wake_busy() {
+fn notify_live_pty_nack_leaves_pending_without_direct_wake() {
     let fixture = Fixture::new();
     let identity = current_identity();
     fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("unsafe.sock");
+    let socket = fixture.socket_path("nack.sock");
     let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, false, "unsafe_mid_line", Arc::clone(&captured));
+    let server = spawn_control_server(&socket, false, "broker_rejected", Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
-    let output = fixture.run_notify("h-unsafe", caller_chain(&identity));
+    let output = fixture.run_notify("h-nack", owner_metadata(SESSION_A, INVOCATION_A));
     server.join().unwrap();
 
     assert_success(&output);
     let value = stdout_json(&output);
-    assert_eq!(value["pty_delivery"]["status"], "unsafe_mid_line");
+    assert_eq!(value["pty_delivery"]["status"], "protocol_error");
     assert_eq!(value["pty_delivery"]["submitted"], false);
-    assert_eq!(value["wake"]["status"], "busy");
+    assert!(value["wake"].is_null());
     let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
     assert!(
-        trace.contains("decision=skip-unsafe_mid_line"),
+        trace.contains("decision=skip-protocol_error"),
         "trace was {trace}"
     );
     assert!(
-        trace.contains("inject_status=unsafe_mid_line"),
+        trace.contains("inject_status=protocol_error"),
         "trace was {trace}"
     );
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
-    assert!(captured.lock().unwrap().contains("h-unsafe"));
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn notify_live_pty_child_output_active_is_precise_nack_and_traced() {
-    let fixture = Fixture::new();
-    let identity = current_identity();
-    fixture.record_owner_identity(&identity);
-    let socket = fixture.socket_path("child-output-active.sock");
-    let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(
-        &socket,
-        false,
-        "unsafe_child_output_active",
-        Arc::clone(&captured),
-    );
-    fixture.mark_live_pty_runtime(&identity, &socket);
-
-    let output = fixture.run_notify_with_trace("h-child-output-active", caller_chain(&identity));
-    server.join().unwrap();
-
-    assert_success(&output);
-    let value = stdout_json(&output);
-    assert_eq!(
-        value["pty_delivery"]["status"],
-        "unsafe_child_output_active"
-    );
-    assert_eq!(value["pty_delivery"]["submitted"], false);
-    assert_eq!(value["wake"]["status"], "busy");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("oulipoly_notify_trace trigger=notify-time"),
-        "stderr was {stderr}"
-    );
-    assert!(
-        stderr.contains("inject_status=unsafe_child_output_active"),
-        "stderr was {stderr}"
-    );
-    let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
-    assert!(
-        trace.contains("decision=skip-unsafe_child_output_active"),
-        "trace was {trace}"
-    );
-    assert!(
-        trace.contains("inject_status=unsafe_child_output_active"),
-        "trace was {trace}"
-    );
-    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].delivered_at.is_none());
-    assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
-    assert!(captured.lock().unwrap().contains("h-child-output-active"));
+    assert!(captured.lock().unwrap().contains("h-nack"));
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -915,7 +546,7 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     fs::write(&stale_socket, "stale").unwrap();
     fixture.mark_live_pty_runtime(&stale_identity, &stale_socket);
 
-    let output = fixture.run_notify("h-stale", caller_chain(&owner_identity));
+    let output = fixture.run_notify("h-stale", owner_metadata(SESSION_A, INVOCATION_A));
 
     assert_success(&output);
     let value = stdout_json(&output);
@@ -966,9 +597,9 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
-    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
-    let output = fixture.run_notify("h-e2e-live", caller_chain(&child_identity));
+    let output = fixture.run_notify("h-e2e-live", owner_metadata(SESSION_A, &invocation_uuid));
     assert_success(&output);
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "acked");
@@ -1037,9 +668,12 @@ fn observed_tui_delivers_live_notification_during_continuous_child_redraw() {
         "startup was {startup:?}"
     );
     let invocation_uuid = wait_for_running_invocation(&fixture);
-    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
 
-    let notify = fixture.run_notify("h-continuous-redraw", caller_chain(&child_identity));
+    let notify = fixture.run_notify(
+        "h-continuous-redraw",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
     let diagnostic = stdout_json(&notify);
     if diagnostic["pty_delivery"]["status"] != "acked" {
         let _ = repl.kill();
@@ -1124,289 +758,6 @@ fn resumed_repl_retries_pending_mailbox_after_replacing_stale_runtime() {
         "user",
         &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
     );
-    assert!(repl.wait().unwrap().success());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn resumed_repl_waits_for_provider_readiness_before_retrying_pending_mailbox() {
-    let fixture = Fixture::new();
-    let received_log = fixture.dir.path().join("startup-flush-received.log");
-    let script = fixture_provider_flushing_startup_input(fixture.dir.path(), &received_log);
-    fixture.write_interactive_model("fixture-startup-flush", "fixture-provider", &script);
-    fixture.seed_active_chain(
-        "abababab-abab-4bab-8bab-abababababab",
-        "fixture-provider",
-        SESSION_A,
-        "fixture-startup-flush",
-    );
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "pre-restart-assistant-turn",
-        "assistant",
-        "durable work before restart",
-    );
-    fixture.mark_live_pty_runtime(
-        &ProcessIdentity {
-            os_pid: 999_999_002,
-            os_boot_id: "startup-flush-stale-boot".to_string(),
-            os_pid_starttime_ticks: 1,
-        },
-        &fixture.socket_path("startup-flush-stale.sock"),
-    );
-    fixture.seed_mailbox("h-startup-flush-pending");
-
-    let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-startup-flush", SESSION_A);
-    let startup = read_until(
-        pty.master.as_raw_fd(),
-        "READY_FOR_NOTIFY",
-        Duration::from_secs(7),
-    );
-    assert!(
-        startup.contains("READY_FOR_NOTIFY"),
-        "startup was {startup:?}"
-    );
-
-    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(8));
-    if !output.contains("GOT_NOTIFY") {
-        let received = fs::read_to_string(&received_log).unwrap_or_default();
-        let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-        let _ = repl.kill();
-        let _ = repl.wait();
-        panic!(
-            "startup-flushed mailbox delivery was not retried: output={output:?} received={received:?} rows={rows:?}"
-        );
-    }
-    let received = fs::read_to_string(&received_log).unwrap();
-    assert!(
-        received.contains("handle: h-startup-flush-pending"),
-        "{received}"
-    );
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "startup-flush-notification-turn",
-        "user",
-        &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
-    );
-    assert!(repl.wait().unwrap().success());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn resumed_opencode_style_tui_submits_large_mailbox_batch_as_provider_turn() {
-    let fixture = Fixture::new();
-    let transport_log = fixture
-        .dir
-        .path()
-        .join("opencode-large-batch-transport.log");
-    let editor_log = fixture.dir.path().join("opencode-large-batch-editor.log");
-    let provider_turn_log = fixture
-        .dir
-        .path()
-        .join("opencode-large-batch-provider-turn.log");
-    let events = fixture.dir.path().join("opencode-large-batch-events.log");
-    let script = fixture_opencode_style_large_paste(
-        fixture.dir.path(),
-        &transport_log,
-        &editor_log,
-        &provider_turn_log,
-        &events,
-    );
-    let adapter =
-        fixture_length_prefixed_observer_adapter(fixture.dir.path(), &provider_turn_log, &events);
-    fixture.write_interactive_model_with_provider_adapter(
-        "fixture-opencode-large-batch",
-        "fixture-provider",
-        &script,
-        &adapter,
-    );
-    fixture.write_session_source_from_length_prefixed_log("fixture-provider", &provider_turn_log);
-    fixture.seed_active_chain(
-        "34343434-3434-4434-8434-343434343434",
-        "fixture-provider",
-        SESSION_A,
-        "fixture-opencode-large-batch",
-    );
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "pre-resume-assistant-turn",
-        "assistant",
-        "durable work before the resumed mailbox batch",
-    );
-    fixture.mark_live_pty_runtime(
-        &ProcessIdentity {
-            os_pid: 999_999_003,
-            os_boot_id: "opencode-large-batch-stale-boot".to_string(),
-            os_pid_starttime_ticks: 1,
-        },
-        &fixture.socket_path("opencode-large-batch-stale.sock"),
-    );
-    for index in 1..=30 {
-        fixture.seed_mailbox(&format!("h-opencode-large-batch-{index:02}"));
-    }
-
-    let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-opencode-large-batch", SESSION_A);
-    let startup = read_until(
-        pty.master.as_raw_fd(),
-        "READY_FOR_NOTIFY",
-        Duration::from_secs(5),
-    );
-    assert!(
-        startup.contains("READY_FOR_NOTIFY"),
-        "startup was {startup:?}"
-    );
-
-    let dropped = wait_for_large_paste_event(
-        &events,
-        "dropped-before-editor-or-provider-turn:1",
-        Duration::from_secs(8),
-    );
-    let initial_transport = read_length_prefixed_records(&transport_log);
-    let accepted = wait_for_accepted_delivery_windows(&fixture, 1, Duration::from_secs(3));
-    assert_eq!(accepted.len(), 1, "accepted attempts were {accepted:?}");
-    assert_eq!(
-        accepted[0].rows.len(),
-        20,
-        "accepted attempt was {accepted:?}"
-    );
-    assert_eq!(accepted[0].remaining_count, 10);
-    assert!(accepted[0].acknowledged_at.is_some());
-    let first_attempt_id = accepted[0].attempt_id.clone();
-    let first_acknowledged_at = accepted[0].acknowledged_at.clone().unwrap();
-    let first_marker = format!("[OULIPOLY-DELIVERY {first_attempt_id}]");
-    let initial_rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    let initial_pending = fixture.mailbox().list_pending(SESSION_A).unwrap();
-    let initially_observed = StateDb::open(&fixture.state_path())
-        .unwrap()
-        .has_session_user_turn_containing("fixture-provider", SESSION_A, &first_marker)
-        .unwrap();
-
-    assert_eq!(initial_transport.len(), 1, "events were {dropped:?}");
-    let first_body = std::str::from_utf8(&initial_transport[0]).unwrap();
-    assert!(first_body.contains("[OULIPOLY NOTIFICATIONS]"));
-    assert!(first_body.contains("handle: h-opencode-large-batch-01"));
-    assert!(first_body.contains("handle: h-opencode-large-batch-20"));
-    assert!(!first_body.contains("handle: h-opencode-large-batch-21"));
-    assert!(first_body.contains(&first_marker));
-    assert!(
-        first_body.lines().count() > 30,
-        "transport was {first_body:?}"
-    );
-    assert_eq!(initial_rows.len(), 30, "mailbox rows were {initial_rows:?}");
-    assert!(initial_rows.iter().all(|row| {
-        row.delivered_at.is_none() && row.delivery_attempts == 0 && row.delivery_error.is_none()
-    }));
-    assert_eq!(initial_pending, initial_rows);
-    assert_eq!(
-        accepted[0]
-            .rows
-            .iter()
-            .map(|row| row.handle.as_str())
-            .collect::<Vec<_>>(),
-        (1..=20)
-            .map(|index| format!("h-opencode-large-batch-{index:02}"))
-            .collect::<Vec<_>>()
-    );
-    assert!(!initially_observed);
-    assert!(fs::read(&editor_log).unwrap().is_empty());
-    assert!(read_length_prefixed_records(&provider_turn_log).is_empty());
-    let sidecar = Connection::open(fixture.sidecar_path()).unwrap();
-    assert_eq!(
-        sidecar
-            .query_row(
-                "SELECT COUNT(*) FROM mailbox_delivery_attempts",
-                [],
-                |row| { row.get::<_, i64>(0) }
-            )
-            .unwrap(),
-        1,
-        "the suffix must not acquire an attempt during accepted silence"
-    );
-
-    wait_for_large_paste_event(
-        &events,
-        "submitted-provider-turn:2",
-        Duration::from_secs(40),
-    );
-    let retried_transport = read_length_prefixed_records(&transport_log);
-    assert!(
-        retried_transport.len() >= 2,
-        "events were {:?}",
-        fs::read_to_string(&events)
-    );
-    assert_eq!(retried_transport[0], retried_transport[1]);
-
-    wait_for_large_paste_event(
-        &events,
-        "submitted-provider-turn:3",
-        Duration::from_secs(12),
-    );
-    wait_for_pending_mailbox_count(&fixture, 0, Duration::from_secs(12));
-    thread::sleep(Duration::from_secs(4));
-
-    let transport = read_length_prefixed_records(&transport_log);
-    let provider_turns = read_length_prefixed_records(&provider_turn_log);
-    assert_eq!(
-        transport.len(),
-        3,
-        "events were {:?}",
-        fs::read_to_string(&events)
-    );
-    assert_eq!(transport[0], transport[1]);
-    assert_eq!(
-        provider_turns,
-        vec![transport[1].clone(), transport[2].clone()]
-    );
-    let suffix_body = std::str::from_utf8(&transport[2]).unwrap();
-    assert!(suffix_body.contains("handle: h-opencode-large-batch-21"));
-    assert!(suffix_body.contains("handle: h-opencode-large-batch-30"));
-    assert!(!suffix_body.contains("handle: h-opencode-large-batch-20"));
-    let suffix_attempt_id = delivery_attempt_id(suffix_body);
-    assert_ne!(suffix_attempt_id, first_attempt_id);
-
-    let final_rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    assert_eq!(final_rows.len(), 30);
-    assert!(final_rows.iter().all(|row| {
-        row.delivered_at.is_some() && row.delivery_attempts == 1 && row.delivery_error.is_none()
-    }));
-    let event_text = fs::read_to_string(&events).unwrap();
-    assert!(event_text.contains("observer-read:1"), "{event_text}");
-    assert!(event_text.contains("observer-read:2"), "{event_text}");
-    assert_eq!(
-        sidecar
-            .query_row(
-                "SELECT COUNT(*) FROM mailbox_delivery_attempts",
-                [],
-                |row| { row.get::<_, i64>(0) }
-            )
-            .unwrap(),
-        2
-    );
-    let (final_acknowledged_at, first_resolved_at, first_membership): (
-        String,
-        Option<String>,
-        i64,
-    ) = sidecar
-        .query_row(
-            "SELECT attempts.acknowledged_at, attempts.resolved_at, COUNT(items.mailbox_seq)
-             FROM mailbox_delivery_attempts AS attempts
-             JOIN mailbox_delivery_attempt_items AS items USING (attempt_id)
-             WHERE attempts.attempt_id = ?1
-             GROUP BY attempts.attempt_id",
-            params![&first_attempt_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    assert_eq!(final_acknowledged_at, first_acknowledged_at);
-    assert!(first_resolved_at.is_some());
-    assert_eq!(first_membership, 20);
-
-    (&pty.master).write_all(b"exit\r").unwrap();
     assert!(repl.wait().unwrap().success());
     fixture.assert_default_user_paths_untouched();
 }
@@ -1608,7 +959,7 @@ fn live_broker_rejects_attempt_resolved_before_socket_acceptance() {
 }
 
 #[test]
-fn live_broker_rejects_registered_overlap_until_accepted_owner_confirms() {
+fn live_broker_contracts_registered_overlap_after_each_injection() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("concurrent-overlap-received.log");
     let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
@@ -1669,36 +1020,6 @@ fn live_broker_rejects_registered_overlap_until_accepted_owner_confirms() {
 
     let overlapping =
         render_mailbox_notification_envelope(&rows, 0, "concurrent-overlap-attempt-2");
-    let blocked = inject_control_envelope(&control_path, &overlapping).unwrap();
-    assert!(!blocked.ack, "{blocked:?}");
-    assert_eq!(blocked.message, "mailbox_delivery_owned");
-    let blocked_output = read_until(
-        pty.master.as_raw_fd(),
-        "GOT_NOTIFY_2",
-        Duration::from_millis(250),
-    );
-    assert!(
-        !blocked_output.contains("GOT_NOTIFY_2"),
-        "{blocked_output:?}"
-    );
-    let second_window = fixture
-        .mailbox()
-        .delivery_attempt_window("concurrent-overlap-attempt-2")
-        .unwrap()
-        .unwrap();
-    assert!(second_window.acknowledged_at.is_none());
-
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "concurrent-overlap-first-confirmation",
-        "user",
-        "[OULIPOLY-DELIVERY concurrent-overlap-attempt-1]",
-    );
-    fixture
-        .mailbox()
-        .confirm_delivery_attempt("concurrent-overlap-attempt-1")
-        .unwrap();
     let second_response = inject_control_envelope(&control_path, &overlapping).unwrap();
     assert!(second_response.ack, "{second_response:?}");
     let second_received = wait_for_file_contains(
@@ -1710,13 +1031,13 @@ fn live_broker_rejects_registered_overlap_until_accepted_owner_confirms() {
         second_received.contains("handle: h-concurrent-overlap-6"),
         "{second_received}"
     );
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "concurrent-overlap-second-confirmation",
-        "user",
-        "[OULIPOLY-DELIVERY concurrent-overlap-attempt-2]",
-    );
+    let second_window = fixture
+        .mailbox()
+        .delivery_attempt_window("concurrent-overlap-attempt-2")
+        .unwrap()
+        .unwrap();
+    assert!(second_window.acknowledged_at.is_some());
+    assert!(second_window.resolved_at.is_some());
     assert!(repl.wait().unwrap().success());
 
     let received = fs::read_to_string(&received_log).unwrap();
@@ -1733,7 +1054,7 @@ fn live_broker_rejects_registered_overlap_until_accepted_owner_confirms() {
 }
 
 #[test]
-fn live_broker_transport_ack_survives_unread_response_without_terminal_delivery() {
+fn live_broker_transport_ack_completes_delivery_when_response_is_unread() {
     let fixture = Fixture::new();
     let received_log = fixture.dir.path().join("lost-ack-received.log");
     let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
@@ -1779,215 +1100,25 @@ fn live_broker_transport_ack_survives_unread_response_without_terminal_delivery(
     assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
-    assert!(rows[0].delivered_at.is_none());
-    assert!(rows[0].delivered_by_invocation_uuid.is_none());
-    assert_eq!(rows[0].delivery_attempts, 0);
+    assert!(rows[0].delivered_at.is_some());
+    assert_eq!(
+        rows[0].delivered_by_invocation_uuid.as_deref(),
+        Some(invocation_uuid.as_str())
+    );
+    assert_eq!(rows[0].delivery_attempts, 1);
     let attempt = fixture
         .mailbox()
         .delivery_attempt_window("lost-ack-attempt")
         .unwrap()
         .unwrap();
     assert!(attempt.acknowledged_at.is_some());
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "lost-response-confirmation",
-        "user",
-        "[OULIPOLY-DELIVERY lost-ack-attempt]",
-    );
+    assert!(attempt.resolved_at.is_some());
     assert!(repl.wait().unwrap().success());
     assert!(
         fs::read_to_string(&received_log)
             .unwrap()
             .contains("handle: h-lost-ack")
     );
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn pty_exit_confirmed_marker_resolves_without_headless_wake() {
-    let fixture = Fixture::new();
-    let received_log = fixture.dir.path().join("confirmed-exit-received.log");
-    let release = fixture.dir.path().join("confirmed-exit-release");
-    let launches = fixture.dir.path().join("confirmed-exit-launches.log");
-    let script = fixture_provider_gated_after_notification(
-        fixture.dir.path(),
-        &received_log,
-        &release,
-        &launches,
-    );
-    fixture.write_interactive_model("fixture-confirmed-exit", "fixture-provider", &script);
-    fixture.seed_active_chain(
-        "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        "fixture-provider",
-        SESSION_A,
-        "fixture-confirmed-exit",
-    );
-    let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-confirmed-exit", SESSION_A);
-    let startup = read_until(
-        pty.master.as_raw_fd(),
-        "READY_FOR_NOTIFY",
-        Duration::from_secs(5),
-    );
-    assert!(
-        startup.contains("READY_FOR_NOTIFY"),
-        "startup was {startup:?}"
-    );
-    let invocation_uuid = wait_for_running_invocation(&fixture);
-    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
-
-    let notify = fixture.run_notify("h-confirmed-exit", caller_chain(&child_identity));
-    assert_success(&notify);
-    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
-    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
-    let received = fs::read_to_string(&received_log).unwrap();
-    fixture.ingest_turn(
-        "fixture-provider",
-        SESSION_A,
-        "confirmed-exit-turn",
-        "user",
-        &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
-    );
-    fs::write(&release, "release\n").unwrap();
-
-    assert!(repl.wait().unwrap().success());
-    thread::sleep(Duration::from_millis(300));
-    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].delivered_at.is_some(), "rows={rows:?}");
-    assert_eq!(
-        rows[0].delivered_by_invocation_uuid.as_deref(),
-        Some(invocation_uuid.as_str())
-    );
-    assert!(
-        fixture
-            .mailbox()
-            .list_pending(SESSION_A)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(fixture.mailbox().wake_claim(SESSION_A).unwrap().is_none());
-    assert_eq!(fs::read_to_string(&launches).unwrap(), "interactive\n");
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn pty_exit_session_scan_confirms_marker_without_preingested_turn() {
-    let fixture = Fixture::new();
-    let received_log = fixture.dir.path().join("scanned-exit-received.log");
-    let release = fixture.dir.path().join("scanned-exit-release");
-    let launches = fixture.dir.path().join("scanned-exit-launches.log");
-    let script = fixture_provider_gated_after_notification(
-        fixture.dir.path(),
-        &received_log,
-        &release,
-        &launches,
-    );
-    fixture.write_interactive_model("fixture-scanned-exit", "fixture-provider", &script);
-    fixture.write_session_source_from_received_log("fixture-provider", &received_log);
-    fixture.seed_active_chain(
-        "12121212-1212-4212-8212-121212121212",
-        "fixture-provider",
-        SESSION_A,
-        "fixture-scanned-exit",
-    );
-    let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-scanned-exit", SESSION_A);
-    let startup = read_until(
-        pty.master.as_raw_fd(),
-        "READY_FOR_NOTIFY",
-        Duration::from_secs(5),
-    );
-    assert!(
-        startup.contains("READY_FOR_NOTIFY"),
-        "startup was {startup:?}"
-    );
-    let invocation_uuid = wait_for_running_invocation(&fixture);
-    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
-
-    let notify = fixture.run_notify("h-scanned-exit", caller_chain(&child_identity));
-    assert_success(&notify);
-    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
-    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
-    let received = fs::read_to_string(&received_log).unwrap();
-    let marker = format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received));
-    let state = StateDb::open(&fixture.state_path()).unwrap();
-    assert!(
-        !state
-            .has_session_user_turn_containing("fixture-provider", SESSION_A, &marker)
-            .unwrap()
-    );
-    fs::write(&release, "release\n").unwrap();
-
-    assert!(repl.wait().unwrap().success());
-    let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].delivered_at.is_some(), "rows={rows:?}");
-    assert!(
-        state
-            .has_session_user_turn_containing("fixture-provider", SESSION_A, &marker)
-            .unwrap()
-    );
-    assert!(fixture.mailbox().wake_claim(SESSION_A).unwrap().is_none());
-    assert_eq!(fs::read_to_string(&launches).unwrap(), "interactive\n");
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn pty_exit_unconfirmed_marker_retries_headless_until_confirmation_cap() {
-    let fixture = Fixture::new();
-    let received_log = fixture.dir.path().join("unconfirmed-exit-received.log");
-    let release = fixture.dir.path().join("unconfirmed-exit-release");
-    let launches = fixture.dir.path().join("unconfirmed-exit-launches.log");
-    let script = fixture_provider_gated_after_notification(
-        fixture.dir.path(),
-        &received_log,
-        &release,
-        &launches,
-    );
-    fixture.write_interactive_model("fixture-unconfirmed-exit", "fixture-provider", &script);
-    fixture.seed_active_chain(
-        "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
-        "fixture-provider",
-        SESSION_A,
-        "fixture-unconfirmed-exit",
-    );
-    let pty = OuterPty::open(30, 100);
-    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-unconfirmed-exit", SESSION_A);
-    let startup = read_until(
-        pty.master.as_raw_fd(),
-        "READY_FOR_NOTIFY",
-        Duration::from_secs(5),
-    );
-    assert!(
-        startup.contains("READY_FOR_NOTIFY"),
-        "startup was {startup:?}"
-    );
-    let invocation_uuid = wait_for_running_invocation(&fixture);
-    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
-
-    let notify = fixture.run_notify("h-unconfirmed-exit", caller_chain(&child_identity));
-    assert_success(&notify);
-    let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
-    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
-    fs::write(&release, "release\n").unwrap();
-
-    assert!(repl.wait().unwrap().success());
-    wait_for_launch_count(&launches, 1 + MAX_UNCONFIRMED_DELIVERY_ATTEMPTS as usize);
-    wait_for_mailbox_unconfirmed_cap(&fixture);
-    let launch_log = fs::read_to_string(&launches).unwrap();
-    assert_eq!(
-        launch_log.matches("interactive\n").count(),
-        1,
-        "{launch_log}"
-    );
-    assert_eq!(
-        launch_log.matches("headless\n").count(),
-        MAX_UNCONFIRMED_DELIVERY_ATTEMPTS as usize,
-        "{launch_log}"
-    );
-    assert!(fixture.mailbox().wake_claim(SESSION_A).unwrap().is_none());
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -2008,31 +1139,6 @@ fn spawn_control_server(
         };
         *captured.lock().unwrap() = payload;
         write_response(&mut stream, ack, &response_message);
-    })
-}
-
-fn spawn_timeout_then_ack_control_server(
-    path: &Path,
-    captured: Arc<Mutex<Vec<String>>>,
-) -> thread::JoinHandle<()> {
-    let listener = UnixListener::bind(path).unwrap();
-    thread::spawn(move || {
-        let (mut first, _) = listener.accept().unwrap();
-        captured
-            .lock()
-            .unwrap()
-            .push(read_inject_payload(&mut first));
-        thread::sleep(Duration::from_millis(2_300));
-        drop(first);
-
-        let (mut retry, _) = listener.accept().unwrap();
-        let payload = read_inject_payload(&mut retry);
-        captured.lock().unwrap().push(payload.clone());
-        write_response(
-            &mut retry,
-            true,
-            &format!("delivery_ack:{}", delivery_nonce_from_payload(&payload)),
-        );
     })
 }
 
@@ -2142,225 +1248,6 @@ done
     path
 }
 
-fn fixture_provider_flushing_startup_input(dir: &Path, received_log: &Path) -> PathBuf {
-    let path = dir.join("fixture-startup-flush-provider.sh");
-    fs::write(
-        &path,
-        format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-: > {received}
-test -t 0
-test -t 1
-test -t 2
-printf 'BOOTSTRAPPING\n'
-sleep 4
-python3 -c 'import termios; termios.tcflush(0, termios.TCIFLUSH)'
-printf '\033[?2004hREADY_FOR_NOTIFY\n'
-while IFS= read -r line; do
-  line="${{line//$'\033[200~'/}}"
-  line="${{line//$'\033[201~'/}}"
-  printf '%s\n' "$line" >> {received}
-  if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
-    printf 'GOT_NOTIFY\n'
-    sleep 1
-    exit 0
-  fi
-done
-"#,
-            received = shell_single_quote(&path_string(received_log))
-        ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
-    path
-}
-
-fn fixture_opencode_style_large_paste(
-    dir: &Path,
-    transport_log: &Path,
-    editor_log: &Path,
-    provider_turn_log: &Path,
-    events: &Path,
-) -> PathBuf {
-    let path = dir.join("fixture-opencode-large-paste.py");
-    let body = format!(
-        r#"#!/usr/bin/env python3
-import os
-import pathlib
-import sys
-import termios
-import tty
-
-transport = pathlib.Path({transport:?})
-editor = pathlib.Path({editor:?})
-provider_turn = pathlib.Path({provider_turn:?})
-events = pathlib.Path({events:?})
-for target in (transport, editor, provider_turn, events):
-    target.write_text("")
-
-if not os.isatty(0):
-    raise SystemExit(0)
-
-start = b"\x1b[200~"
-end = b"\x1b[201~"
-buffer = b""
-paste = None
-pending = None
-transport_count = 0
-submit_count = 0
-original = termios.tcgetattr(0)
-tty.setraw(0)
-os.write(1, b"\x1b[?1049h\x1b[?2004hREADY_FOR_NOTIFY\r\n")
-
-def record(value):
-    with events.open("a", encoding="utf-8") as handle:
-        handle.write(value + "\n")
-
-def append_record(target, value):
-    with target.open("ab") as handle:
-        handle.write(len(value).to_bytes(8, "big") + value)
-
-try:
-    while True:
-        chunk = os.read(0, 4096)
-        if not chunk:
-            raise SystemExit(9)
-        buffer += chunk
-        while True:
-            if paste is not None:
-                offset = buffer.find(end)
-                if offset < 0:
-                    paste += buffer
-                    buffer = b""
-                    break
-                paste += buffer[:offset]
-                buffer = buffer[offset + len(end):]
-                pending = paste
-                paste = None
-                transport_count += 1
-                append_record(transport, pending)
-                record(f"paste-transport-complete:{{transport_count}}")
-                continue
-
-            offset = buffer.find(start)
-            if offset >= 0:
-                buffer = buffer[offset + len(start):]
-                paste = b""
-                continue
-
-            if buffer.startswith(b"exit\r"):
-                os.write(1, b"\x1b[?2004l\x1b[?1049l")
-                raise SystemExit(0)
-
-            if pending is not None and buffer.startswith(b"\r"):
-                buffer = buffer[1:]
-                submit_count += 1
-                if submit_count == 1:
-                    pending = None
-                    editor.write_text("")
-                    record("dropped-before-editor-or-provider-turn:1")
-                    continue
-                editor.write_bytes(pending)
-                append_record(provider_turn, pending)
-                pending = None
-                record(f"submitted-provider-turn:{{submit_count}}")
-                continue
-            break
-finally:
-    termios.tcsetattr(0, termios.TCSANOW, original)
-"#,
-        transport = path_string(transport_log),
-        editor = path_string(editor_log),
-        provider_turn = path_string(provider_turn_log),
-        events = path_string(events),
-    );
-    fs::write(&path, body).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
-    path
-}
-
-fn fixture_length_prefixed_observer_adapter(
-    dir: &Path,
-    provider_turn_log: &Path,
-    events: &Path,
-) -> PathBuf {
-    let path = dir.join("fixture-length-prefixed-observer-adapter.py");
-    let body = format!(
-        r#"#!/usr/bin/env python3
-import json
-import pathlib
-import sys
-
-CONTRACT = "oulipoly.provider/v1"
-provider_turns = pathlib.Path({provider_turns:?})
-events = pathlib.Path({events:?})
-subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
-request = json.loads(sys.stdin.read() or "{{}}")
-
-def envelope(result):
-    return {{
-        "contract": request.get("contract", CONTRACT),
-        "request_id": request.get("request_id", "large-batch-observer"),
-        "ok": True,
-        "result": result,
-    }}
-
-if subcommand == "describe":
-    print(json.dumps(envelope({{
-        "provider_id": "fixture-provider",
-        "display_name": "Fixture Provider",
-        "contract_versions": [CONTRACT],
-        "preferred_contract": CONTRACT,
-        "capabilities": {{
-            "launch": False, "policy": False, "quota": False, "session": True,
-            "terminal": False, "rotation": False, "discovery": False,
-            "settings": False, "setup_brain": False, "setup": False, "migration": False
-        }}
-    }})))
-    raise SystemExit(0)
-
-if subcommand != "session.read_turns":
-    raise SystemExit(4)
-
-data = provider_turns.read_bytes()
-offset = 0
-turns = []
-while offset < len(data):
-    if offset + 8 > len(data):
-        raise SystemExit("truncated record length")
-    length = int.from_bytes(data[offset:offset + 8], "big")
-    offset += 8
-    if offset + length > len(data):
-        raise SystemExit("truncated record body")
-    body = data[offset:offset + length].decode("utf-8")
-    offset += length
-    index = len(turns) + 1
-    turns.append({{
-        "session_id": request["params"]["session_id"],
-        "turn_id": f"provider-delivery-turn-{{index}}",
-        "timestamp": f"2026-07-24T12:00:{{index:02}}Z",
-        "role": "user",
-        "body": [{{"type": "text", "text": body}}],
-    }})
-with events.open("a", encoding="utf-8") as handle:
-    handle.write(f"observer-read:{{len(turns)}}\n")
-print(json.dumps(envelope({{"turns": turns, "turn_count": len(turns), "complete": True}})))
-"#,
-        provider_turns = path_string(provider_turn_log),
-        events = path_string(events),
-    );
-    fs::write(&path, body).unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
-    path
-}
-
 fn fixture_provider_with_continuous_redraw(dir: &Path, received_log: &Path) -> PathBuf {
     let path = dir.join("fixture-continuous-redraw-provider.sh");
     fs::write(
@@ -2433,157 +1320,6 @@ done
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms).unwrap();
     path
-}
-
-fn fixture_provider_gated_after_notification(
-    dir: &Path,
-    received_log: &Path,
-    release: &Path,
-    launches: &Path,
-) -> PathBuf {
-    let path = dir.join("fixture-gated-provider.sh");
-    fs::write(
-        &path,
-        format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-# Registry capability probes are not headless provider launches.
-if [ "${{1-}}" = "describe" ]; then
-  exit 3
-fi
-if test -t 0; then
-  printf 'interactive\n' >> {launches}
-else
-  printf 'headless\n' >> {launches}
-  exit 0
-fi
-: > {received}
-printf '\033[?2004hREADY_FOR_NOTIFY\n'
-while IFS= read -r line; do
-  line="${{line//$'\033[200~'/}}"
-  line="${{line//$'\033[201~'/}}"
-  printf '%s\n' "$line" >> {received}
-  if [ "$line" = "[END OULIPOLY NOTIFICATIONS]" ]; then
-    printf 'GOT_NOTIFY\n'
-    while [ ! -f {release} ]; do sleep 0.02; done
-    exit 0
-  fi
-done
-"#,
-            launches = shell_single_quote(&path_string(launches)),
-            received = shell_single_quote(&path_string(received_log)),
-            release = shell_single_quote(&path_string(release)),
-        ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).unwrap();
-    path
-}
-
-fn wait_for_launch_count(path: &Path, expected: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let count = fs::read_to_string(path).unwrap_or_default().lines().count();
-        if count >= expected {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
-        "timed out waiting for {expected} launches at {}",
-        path.display()
-    );
-}
-
-fn wait_for_mailbox_unconfirmed_cap(fixture: &Fixture) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let mailbox = fixture.mailbox();
-        let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
-        if rows.len() == 1
-            && rows[0].delivered_at.is_none()
-            && rows[0].delivery_attempts == MAX_UNCONFIRMED_DELIVERY_ATTEMPTS
-            && rows[0].delivery_error.as_deref() == Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
-            && mailbox.wake_claim(SESSION_A).unwrap().is_none()
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for mailbox confirmation retry cap");
-}
-
-fn wait_for_large_paste_event(path: &Path, expected: &str, timeout: Duration) -> String {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let events = fs::read_to_string(path).unwrap_or_default();
-        if events.contains(expected) {
-            return events;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
-        "timed out waiting for {expected:?} at {}: {:?}",
-        path.display(),
-        fs::read_to_string(path)
-    );
-}
-
-fn read_length_prefixed_records(path: &Path) -> Vec<Vec<u8>> {
-    let bytes = fs::read(path).unwrap_or_default();
-    let mut offset = 0;
-    let mut records = Vec::new();
-    while offset < bytes.len() {
-        assert!(
-            offset + 8 <= bytes.len(),
-            "truncated record length at {offset}"
-        );
-        let length = u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap()) as usize;
-        offset += 8;
-        assert!(
-            offset + length <= bytes.len(),
-            "truncated record body at {offset}"
-        );
-        records.push(bytes[offset..offset + length].to_vec());
-        offset += length;
-    }
-    records
-}
-
-fn wait_for_pending_mailbox_count(fixture: &Fixture, expected: usize, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let pending = fixture.mailbox().list_pending(SESSION_A).unwrap();
-        if pending.len() == expected {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!(
-        "timed out waiting for {expected} pending mailbox rows: {:?}",
-        fixture.mailbox().list_mailbox(SESSION_A, true)
-    );
-}
-
-fn wait_for_accepted_delivery_windows(
-    fixture: &Fixture,
-    expected: usize,
-    timeout: Duration,
-) -> Vec<MailboxDeliveryWindow> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let accepted = fixture
-            .mailbox()
-            .accepted_delivery_attempt_windows(SESSION_A)
-            .unwrap();
-        if accepted.len() == expected {
-            return accepted;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("timed out waiting for {expected} accepted mailbox windows");
 }
 
 fn wait_for_file_contains(path: &Path, expected: &str, timeout: Duration) -> String {
@@ -2732,13 +1468,10 @@ fn unresolved_delivery_attempt_count(fixture: &Fixture) -> i64 {
         .unwrap()
 }
 
-fn caller_chain(identity: &ProcessIdentity) -> Value {
+fn owner_metadata(session_id: &str, invocation_uuid: &str) -> Value {
     json!({
-        "caller_chain": [{
-            "pid": identity.os_pid,
-            "starttime_ticks": identity.os_pid_starttime_ticks,
-            "boot_id": identity.os_boot_id,
-        }]
+        "owner_session_id": session_id,
+        "owner_invocation_uuid": invocation_uuid,
     })
 }
 

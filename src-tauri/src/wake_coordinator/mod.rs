@@ -27,10 +27,6 @@ pub(crate) fn mark_session_idle_after_turn(
     idle::mark_session_idle_after_turn(session_id, invocation_uuid, exit_code)
 }
 
-pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
-    wake_start::trigger_notify_wake(session_id)
-}
-
 pub(crate) fn run_startup_wake_reclaim_sweep() {
     sweep::run_startup_wake_reclaim_sweep();
 }

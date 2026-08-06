@@ -9,7 +9,7 @@ use crate::{MODEL, SESSION};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output};
 
 pub(crate) struct Fixture {
     pub(crate) dir: tempfile::TempDir,
@@ -56,10 +56,6 @@ impl Fixture {
             .join("state.db")
     }
 
-    pub(crate) fn pinned_data_dir(&self) -> PathBuf {
-        self.data_home.join("oulipoly-agent-runner")
-    }
-
     pub(crate) fn run(&self, mut cmd: Command) -> Output {
         self.prepare_command(&mut cmd);
         cmd.output().unwrap()
@@ -69,25 +65,6 @@ impl Fixture {
         self.prepare_command(&mut cmd);
         cmd.env_remove("OULIPOLY_AUTO_WAKE_MAX");
         cmd.output().unwrap()
-    }
-
-    pub(crate) fn spawn_agent(&self, prompt: &str) -> Child {
-        let mut cmd = self.agent_command(prompt);
-        self.prepare_command(&mut cmd);
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    }
-
-    pub(crate) fn spawn_agent_as_auto_wake(&self, prompt: &str) -> Child {
-        let mut cmd = self.agent_command(prompt);
-        self.prepare_command(&mut cmd);
-        cmd.env("OULIPOLY_AUTO_WAKE", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
     }
 
     fn prepare_command(&self, cmd: &mut Command) {
@@ -118,17 +95,6 @@ impl Fixture {
             .arg(&self.models_dir)
             .arg(prompt);
         cmd
-    }
-
-    pub(crate) fn run_agent_with_auto_wake_max(&self, prompt: &str, max: &str) -> Output {
-        let mut cmd = Command::new(crate::parse::runner_bin());
-        cmd.arg("-m")
-            .arg(MODEL)
-            .arg("--models-dir")
-            .arg(&self.models_dir)
-            .arg(prompt)
-            .env("OULIPOLY_AUTO_WAKE_MAX", max);
-        self.run(cmd)
     }
 
     pub(crate) fn run_resume(&self) -> Output {

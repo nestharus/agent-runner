@@ -300,8 +300,53 @@ pub(crate) enum Subcommands {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum NotifySubcommands {
-    /// Queue an agent-bash completion notification for the owning session.
-    AgentBashComplete {
+    /// Register an agent-bash completion event and its owner listener before launch.
+    #[command(name = "agent-bash-register")]
+    Register {
+        /// Stable workload handle used as the completion event ID.
+        #[arg(long)]
+        handle: String,
+
+        /// Initial completion delivery policy.
+        #[arg(long = "delivery-mode", value_parser = ["sync", "async"])]
+        delivery_mode: String,
+
+        /// Spooler state directory.
+        #[arg(long = "state-dir")]
+        state_dir: PathBuf,
+
+        /// Path to pre-launch meta.json containing the explicit owner binding.
+        #[arg(long)]
+        meta: PathBuf,
+
+        /// Path to retained workload log.
+        #[arg(long)]
+        log: PathBuf,
+
+        /// Path to workload rc file.
+        #[arg(long)]
+        rc: PathBuf,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Activate a registered event listener when a synchronous workload detaches.
+    #[command(name = "agent-bash-activate")]
+    Activate {
+        /// Stable completion event ID.
+        #[arg(long)]
+        handle: String,
+
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Trigger a pre-registered agent-bash completion event.
+    #[command(name = "agent-bash-complete")]
+    Complete {
         /// Diagnostic producer caller PID; not used for owner identity.
         #[arg(long = "caller-ppid")]
         caller_ppid: u32,
@@ -314,7 +359,7 @@ pub(crate) enum NotifySubcommands {
         #[arg(long = "state-dir")]
         state_dir: PathBuf,
 
-        /// Path to meta.json containing caller_chain.
+        /// Path to the registered workload metadata.
         #[arg(long)]
         meta: PathBuf,
 
@@ -325,6 +370,10 @@ pub(crate) enum NotifySubcommands {
         /// Path to workload rc file.
         #[arg(long)]
         rc: PathBuf,
+
+        /// The caller already consumed the terminal result in-band.
+        #[arg(long)]
+        consumed: bool,
 
         /// Emit structured JSON.
         #[arg(long)]

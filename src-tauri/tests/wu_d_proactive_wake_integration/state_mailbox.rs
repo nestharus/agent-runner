@@ -10,15 +10,10 @@ use crate::model_config::path_string;
 use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
-use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb,
-    RuntimeGenerationFence, RuntimeGenerationId, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
-};
-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
+use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert};
 use oulipoly_state::{SessionTurnIngest, StateDb};
 use rusqlite::Connection;
 use std::fs;
-use std::path::Path;
 use std::path::PathBuf;
 
 struct SeedMailboxArtifacts {
@@ -33,19 +28,6 @@ struct SeedMailboxArtifacts {
 }
 
 impl Fixture {
-    pub(crate) fn pid_identity_session_id_for_provider(&self, provider_name: &str) -> String {
-        self.sidecar_conn()
-            .query_row(
-                "SELECT session_id
-                 FROM pid_identity
-                 WHERE provider_name = ?1
-                 ORDER BY recorded_at DESC, os_pid DESC
-                 LIMIT 1",
-                rusqlite::params![provider_name],
-                |row| row.get(0),
-            )
-            .unwrap()
-    }
     pub(crate) fn mailbox(&self) -> MailboxDb {
         MailboxDb::open(&self.sidecar_path()).unwrap()
     }
@@ -56,38 +38,6 @@ impl Fixture {
 
     pub(crate) fn state(&self) -> StateDb {
         StateDb::open(&self.state_path()).unwrap()
-    }
-
-    pub(crate) fn assert_delivery_invocation_is_child_of_owner(&self, session_id: &str) {
-        let rows = self.mailbox().list_mailbox(session_id, true).unwrap();
-        let row = rows
-            .iter()
-            .find(|row| row.delivered_by_invocation_uuid.is_some())
-            .expect("delivered mailbox row");
-        let owner_uuid = row
-            .owner_invocation_uuid
-            .as_deref()
-            .expect("mailbox owner invocation");
-        let delivery_uuid = row
-            .delivered_by_invocation_uuid
-            .as_deref()
-            .expect("mailbox delivery invocation");
-        let conn = Connection::open(self.state_path()).unwrap();
-        let parent_uuid: Option<String> = conn
-            .query_row(
-                "SELECT parent.invocation_uuid
-                 FROM invocations AS delivery
-                 LEFT JOIN invocations AS parent ON parent.id = delivery.parent_invocation_id
-                 WHERE delivery.invocation_uuid = ?1",
-                rusqlite::params![delivery_uuid],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            parent_uuid.as_deref(),
-            Some(owner_uuid),
-            "auto-wake delivery invocation must remain a logical child of the invocation whose work caused the wake"
-        );
     }
 
     pub(crate) fn seed_session_turn(&self) {
@@ -205,50 +155,6 @@ impl Fixture {
             .unwrap();
     }
 
-    pub(crate) fn seed_live_pty_runtime(&self, control_path: &Path) -> ProcessIdentity {
-        let identity = crate::wake_claim_setup::current_process_identity();
-        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
-        let models_dir = path_string(&self.models_dir);
-        let control_path = path_string(control_path);
-        let generation_id = RuntimeGenerationId::parse(INVOCATION).unwrap();
-        db.create_runtime_generation(CreateRuntimeGeneration {
-            generation_id: &generation_id,
-            spawn_invocation_uuid: INVOCATION,
-            session_id: Some(SESSION),
-            runtime_mode: "pty_interactive",
-            provider_name: PROVIDER,
-            model_name: Some(MODEL),
-            pty_control_path: Some(&control_path),
-            models_dir: Some(&models_dir),
-            effective_cwd: None,
-        })
-        .unwrap();
-        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
-            fence: RuntimeGenerationFence {
-                generation_id: &generation_id,
-                spawn_invocation_uuid: INVOCATION,
-            },
-            spawned_os_pid: identity.os_pid,
-            exact_process_identity: Some(&identity),
-            os_pgid: None,
-        })
-        .unwrap();
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: SESSION,
-            mode: "pty_interactive",
-            invocation_uuid: INVOCATION,
-            provider_name: Some(PROVIDER),
-            model_name: Some(MODEL),
-            identity: &identity,
-            pty_control_path: Some(&control_path),
-            turn_start_max_mailbox_seq: None,
-            models_dir: Some(&models_dir),
-            effective_cwd: None,
-        })
-        .unwrap();
-        identity
-    }
-
     pub(crate) fn seed_active_chain_for(
         &self,
         chain_id: &str,
@@ -309,31 +215,6 @@ impl Fixture {
         let mut db = self.mailbox();
         let seq = mailbox_seq_for_handle(&db, session_id, handle);
         mark_delivery_failed_twice(&mut db, session_id, seq);
-    }
-
-    pub(crate) fn record_identity(&self, identity: &ProcessIdentity) {
-        self.record_identity_for(identity, SESSION, PROVIDER, MODEL);
-    }
-
-    pub(crate) fn record_identity_for(
-        &self,
-        identity: &ProcessIdentity,
-        session_id: &str,
-        provider_name: &str,
-        model_name: &str,
-    ) {
-        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
-        sidecar
-            .record_identity(PidIdentityRecord {
-                identity,
-                os_pgid: None,
-                invocation_uuid: INVOCATION,
-                session_id: Some(session_id),
-                provider_name: Some(provider_name),
-                model_name: Some(model_name),
-                recorded_at: "2026-06-04T12:00:00Z",
-            })
-            .unwrap();
     }
 
     pub(crate) fn seed_dead_owner_backlog(&self) -> Vec<String> {

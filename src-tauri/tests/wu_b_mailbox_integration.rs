@@ -5,7 +5,6 @@ use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
     RuntimeLifecycleState, RuntimeTerminalReason, SubmittedInputEnqueue,
 };
-use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
 };
@@ -21,7 +20,6 @@ const INVOCATION_A: &str = "11111111-1111-4111-8111-111111111111";
 const INVOCATION_B: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const SESSION_B: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
-const SESSION_OTHER: &str = "7169694d-de0f-40d1-890c-6e28e55bab29";
 const CHAIN_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 struct Fixture {
@@ -95,9 +93,36 @@ impl Fixture {
         cmd.output().unwrap()
     }
 
-    fn run_notify(&self, handle: &str, metadata: Value) -> Output {
+    fn register_and_notify(&self, handle: &str, metadata: Value) -> Output {
         let artifacts = self.write_notify_artifacts(handle, metadata, 0);
+        let registration = self.run_register_artifacts(handle, "async", &artifacts);
+        assert!(registration.status.success(), "{registration:?}");
         self.run_notify_artifacts(handle, &artifacts)
+    }
+
+    fn run_register_artifacts(
+        &self,
+        handle: &str,
+        delivery_mode: &str,
+        artifacts: &NotifyArtifacts,
+    ) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("notify")
+            .arg("agent-bash-register")
+            .arg("--handle")
+            .arg(handle)
+            .arg("--delivery-mode")
+            .arg(delivery_mode)
+            .arg("--state-dir")
+            .arg(&artifacts.state_dir)
+            .arg("--meta")
+            .arg(&artifacts.meta)
+            .arg("--log")
+            .arg(&artifacts.log)
+            .arg("--rc")
+            .arg(&artifacts.rc)
+            .arg("--json");
+        self.run(cmd)
     }
 
     fn run_notify_artifacts(&self, handle: &str, artifacts: &NotifyArtifacts) -> Output {
@@ -184,26 +209,6 @@ impl Fixture {
         fs::write(&artifacts.log, notify_log_content(handle)).unwrap();
         fs::write(&artifacts.rc, notify_rc_content(rc)).unwrap();
         artifacts
-    }
-
-    fn record_identity(
-        &self,
-        identity: &ProcessIdentity,
-        invocation_uuid: &str,
-        session_id: Option<&str>,
-    ) {
-        let sidecar = PidIdentityDb::open(&self.sidecar_path()).unwrap();
-        sidecar
-            .record_identity(PidIdentityRecord {
-                identity,
-                os_pgid: None,
-                invocation_uuid,
-                session_id,
-                provider_name: Some("fixture-provider"),
-                model_name: Some("fixture-model"),
-                recorded_at: "2026-06-04T12:00:00Z",
-            })
-            .unwrap();
     }
 
     fn seed_state_invocation_with_provider_session(
@@ -433,115 +438,108 @@ turn_script = {}
 }
 
 #[test]
-fn notify_resolves_nearest_ancestor_sidecar_session() {
+fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     let fixture = Fixture::new();
-    let nearest = identity(9001, "boot-a", 11);
-    let older = identity(9002, "boot-b", 22);
-    fixture.record_identity(&older, INVOCATION_A, Some(SESSION_A));
-    fixture.record_identity(&nearest, INVOCATION_B, Some(SESSION_B));
-
-    let output = fixture.run_notify("h-nearest", caller_chain(&[&nearest, &older]));
-
-    assert!(output.status.success(), "{output:?}");
-    let json = stdout_json(&output);
-    assert_eq!(json["status"], "enqueued");
-    assert_eq!(json["owner_session_id"], SESSION_B);
-    assert_eq!(json["owner_invocation_uuid"], INVOCATION_B);
-    assert_eq!(json["matched_chain_index"], 0);
-    assert_eq!(
-        fixture.mailbox_rows(SESSION_B, false)[0].handle,
-        "h-nearest"
-    );
-    assert!(fixture.mailbox_rows(SESSION_A, false).is_empty());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn notify_resolves_from_state_when_sidecar_session_null() {
-    let fixture = Fixture::new();
-    let caller = identity(9010, "boot-state", 33);
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
-    fixture.record_identity(&caller, INVOCATION_A, None);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-explicit-owner",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
 
-    let output = fixture.run_notify("h-state", caller_chain(&[&caller]));
+    let registration = fixture.run_register_artifacts("h-explicit-owner", "async", &artifacts);
+    let completion = fixture.run_notify_artifacts("h-explicit-owner", &artifacts);
 
-    assert!(output.status.success(), "{output:?}");
+    assert!(registration.status.success(), "{registration:?}");
+    let registered = stdout_json(&registration);
+    assert_eq!(registered["status"], "registered");
+    assert_eq!(registered["owner_session_id"], SESSION_A);
+    assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+    assert!(completion.status.success(), "{completion:?}");
+    let completed = stdout_json(&completion);
+    assert_eq!(completed["status"], "triggered");
+    assert_eq!(completed["session_source"], "completion_event_listener");
+    assert_eq!(
+        fixture.mailbox_rows(SESSION_A, false)[0].handle,
+        "h-explicit-owner"
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_rejects_an_unbound_session() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-wrong-session",
+        owner_metadata(SESSION_B, INVOCATION_A),
+        0,
+    );
+
+    let output = fixture.run_register_artifacts("h-wrong-session", "async", &artifacts);
+
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
     let json = stdout_json(&output);
-    assert_eq!(json["owner_session_id"], SESSION_A);
-    assert_eq!(json["session_source"], "state_db_invocation_join");
-    assert_eq!(fixture.mailbox_rows(SESSION_A, false)[0].handle, "h-state");
+    assert_eq!(json["status"], "notification_event_error");
+    assert!(json["message"].as_str().unwrap().contains("is not bound"));
+    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
     fixture.assert_default_user_paths_untouched();
 }
 
 #[test]
-fn notify_works_after_caller_dead() {
+fn completion_trigger_requires_prior_registration() {
     let fixture = Fixture::new();
-    let dead = identity(999_999_001, "dead-boot", 44);
-    fixture.record_identity(&dead, INVOCATION_A, Some(SESSION_A));
+    let artifacts = fixture.write_notify_artifacts(
+        "h-unregistered",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
 
-    let output = fixture.run_notify("h-dead", caller_chain(&[&dead]));
+    let output = fixture.run_notify_artifacts("h-unregistered", &artifacts);
 
-    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
     let json = stdout_json(&output);
-    assert_eq!(json["matched_pid"], dead.os_pid);
-    assert_eq!(json["owner_session_id"], SESSION_A);
+    assert_eq!(json["status"], "notification_event_error");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not registered")
+    );
     fixture.assert_default_user_paths_untouched();
 }
 
 #[test]
-fn notify_rejects_reuse_mismatch() {
+fn completion_registration_requires_both_owner_fields() {
     let fixture = Fixture::new();
-    let recorded = identity(9020, "boot-reuse", 55);
-    let reused = identity(9020, "boot-reuse", 56);
-    fixture.record_identity(&recorded, INVOCATION_A, Some(SESSION_A));
+    let artifacts = fixture.write_notify_artifacts(
+        "h-partial-owner",
+        json!({"owner_session_id": SESSION_A}),
+        0,
+    );
 
-    let output = fixture.run_notify("h-reuse", caller_chain(&[&reused]));
+    let output = fixture.run_register_artifacts("h-partial-owner", "async", &artifacts);
 
-    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
     let json = stdout_json(&output);
-    assert_eq!(json["status"], "no_owner");
-    assert!(fixture.mailbox_rows(SESSION_A, false).is_empty());
+    assert_eq!(json["status"], "notification_event_error");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("supplied together")
+    );
     fixture.assert_default_user_paths_untouched();
 }
 
 #[test]
-fn notify_no_owner_valid_chain_returns_zero() {
+fn completion_trigger_is_idempotent_for_the_registered_handle() {
     let fixture = Fixture::new();
-    let caller = identity(9030, "boot-none", 66);
-
-    let output = fixture.run_notify("h-none", caller_chain(&[&caller]));
-
-    assert!(output.status.success(), "{output:?}");
-    let json = stdout_json(&output);
-    assert_eq!(json["status"], "no_owner");
-    assert_eq!(json["enqueued"], false);
-    assert!(fixture.mailbox_rows(SESSION_A, false).is_empty());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn notify_missing_chain_is_usage_error() {
-    let fixture = Fixture::new();
-    for (handle, metadata) in [
-        ("h-missing", json!({"extra": true})),
-        ("h-empty", json!({"caller_chain": []})),
-        ("h-malformed", json!({"caller_chain": [{"pid": "not-int"}]})),
-    ] {
-        let output = fixture.run_notify(handle, metadata);
-        assert_eq!(output.status.code(), Some(64), "{output:?}");
-        let json = stdout_json(&output);
-        assert_eq!(json["status"], "malformed_metadata");
-    }
-    assert!(fixture.mailbox_rows(SESSION_A, false).is_empty());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
-fn notify_idempotent_retried_handle() {
-    let fixture = Fixture::new();
-    let caller = identity(9040, "boot-idem", 77);
-    fixture.record_identity(&caller, INVOCATION_A, Some(SESSION_A));
-    let artifacts = fixture.write_notify_artifacts("h-idem", caller_chain(&[&caller]), 0);
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts =
+        fixture.write_notify_artifacts("h-idem", owner_metadata(SESSION_A, INVOCATION_A), 0);
+    let registration = fixture.run_register_artifacts("h-idem", "async", &artifacts);
+    assert!(registration.status.success(), "{registration:?}");
 
     let first = fixture.run_notify_artifacts("h-idem", &artifacts);
     let second = fixture.run_notify_artifacts("h-idem", &artifacts);
@@ -550,7 +548,8 @@ fn notify_idempotent_retried_handle() {
     assert!(second.status.success(), "{second:?}");
     let first_json = stdout_json(&first);
     let second_json = stdout_json(&second);
-    assert_eq!(second_json["status"], "already_enqueued");
+    assert_eq!(first_json["status"], "triggered");
+    assert_eq!(second_json["status"], "already_triggered");
     assert_eq!(second_json["seq"], first_json["seq"]);
     let rows = fixture.mailbox_rows(SESSION_A, true);
     assert_eq!(rows.len(), 1);
@@ -632,29 +631,11 @@ fn published_payload_without_metadata_commit_is_not_accepted() {
 }
 
 #[test]
-fn notify_handle_conflict_different_session() {
-    let fixture = Fixture::new();
-    let caller = identity(9050, "boot-conflict", 88);
-    fixture.seed_mailbox(SESSION_OTHER, "h-conflict", 0);
-    fixture.record_identity(&caller, INVOCATION_A, Some(SESSION_A));
-
-    let output = fixture.run_notify("h-conflict", caller_chain(&[&caller]));
-
-    assert_eq!(output.status.code(), Some(73), "{output:?}");
-    let json = stdout_json(&output);
-    assert_eq!(json["status"], "idempotency_conflict");
-    assert_eq!(fixture.mailbox_rows(SESSION_OTHER, true).len(), 1);
-    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
-    fixture.assert_default_user_paths_untouched();
-}
-
-#[test]
 fn notify_ordering_by_seq() {
     let fixture = Fixture::new();
-    let caller = identity(9060, "boot-order", 99);
-    fixture.record_identity(&caller, INVOCATION_A, Some(SESSION_A));
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
     for handle in ["h-a", "h-b", "h-c"] {
-        let output = fixture.run_notify(handle, caller_chain(&[&caller]));
+        let output = fixture.register_and_notify(handle, owner_metadata(SESSION_A, INVOCATION_A));
         assert!(output.status.success(), "{output:?}");
     }
 
@@ -723,19 +704,17 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
 #[test]
 fn mailbox_isolation() {
     let fixture = Fixture::new();
-    let caller_a = identity(9070, "boot-iso-a", 100);
-    let caller_b = identity(9071, "boot-iso-b", 101);
-    fixture.record_identity(&caller_a, INVOCATION_A, Some(SESSION_A));
-    fixture.record_identity(&caller_b, INVOCATION_B, Some(SESSION_B));
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_B, SESSION_B);
     assert!(
         fixture
-            .run_notify("h-a", caller_chain(&[&caller_a]))
+            .register_and_notify("h-a", owner_metadata(SESSION_A, INVOCATION_A))
             .status
             .success()
     );
     assert!(
         fixture
-            .run_notify("h-b", caller_chain(&[&caller_b]))
+            .register_and_notify("h-b", owner_metadata(SESSION_B, INVOCATION_B))
             .status
             .success()
     );
@@ -813,8 +792,7 @@ fn mailbox_recovery_commands_search_show_and_ack_bounded_range() {
 #[test]
 fn mailbox_pause_suppresses_notify_delivery_and_wake_until_resume() {
     let fixture = Fixture::new();
-    let caller = identity(9072, "boot-pause", 102);
-    fixture.record_identity(&caller, INVOCATION_A, Some(SESSION_A));
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
     let pause = fixture.run_mailbox(&[
         "pause".to_string(),
         "--session-id".to_string(),
@@ -824,7 +802,7 @@ fn mailbox_pause_suppresses_notify_delivery_and_wake_until_resume() {
     assert!(pause.status.success(), "{pause:?}");
     assert_eq!(stdout_json(&pause)["paused"], true);
 
-    let notify = fixture.run_notify("h-paused", caller_chain(&[&caller]));
+    let notify = fixture.register_and_notify("h-paused", owner_metadata(SESSION_A, INVOCATION_A));
 
     assert!(notify.status.success(), "{notify:?}");
     let notified = stdout_json(&notify);
@@ -1266,35 +1244,12 @@ fn resume_uses_resolved_active_session_id() {
     fixture.assert_default_user_paths_untouched();
 }
 
-fn identity(os_pid: i64, os_boot_id: &str, os_pid_starttime_ticks: i64) -> ProcessIdentity {
-    ProcessIdentity {
-        os_pid,
-        os_boot_id: os_boot_id.to_string(),
-        os_pid_starttime_ticks,
-    }
-}
-
-fn caller_chain(identities: &[&ProcessIdentity]) -> Value {
-    caller_chain_payload(caller_chain_entries(identities))
-}
-
-fn caller_chain_entries(identities: &[&ProcessIdentity]) -> Vec<Value> {
-    identities
-        .iter()
-        .map(|identity| process_identity_json(identity))
-        .collect()
-}
-
-fn process_identity_json(identity: &ProcessIdentity) -> Value {
+fn owner_metadata(session_id: &str, invocation_uuid: &str) -> Value {
     json!({
-        "pid": identity.os_pid,
-        "boot_id": identity.os_boot_id,
-        "starttime_ticks": identity.os_pid_starttime_ticks,
+        "owner_session_id": session_id,
+        "owner_invocation_uuid": invocation_uuid,
+        "spooler_extra": "preserve-me",
     })
-}
-
-fn caller_chain_payload(caller_chain: Vec<Value>) -> Value {
-    json!({"caller_chain": caller_chain, "spooler_extra": "preserve-me"})
 }
 
 fn stdout_json(output: &Output) -> Value {

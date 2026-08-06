@@ -854,7 +854,6 @@ struct ControlSocket {
     owned_dir: PathBuf,
     session_id: String,
     invocation_uuid: String,
-    bound_at: Instant,
 }
 
 impl ControlSocket {
@@ -873,7 +872,6 @@ impl ControlSocket {
             owned_dir: dir,
             session_id: session_id.to_string(),
             invocation_uuid: invocation_uuid.to_string(),
-            bound_at: Instant::now(),
         }))
     }
 
@@ -891,10 +889,6 @@ impl ControlSocket {
 
     fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
-    }
-
-    fn age(&self) -> Duration {
-        self.bound_at.elapsed()
     }
 }
 
@@ -1257,13 +1251,11 @@ fn relay_until_exit(
             && let Some(control) = control
         {
             let mut request_io = ControlRequestIo {
-                real_fd: real_tty.fd(),
                 master_fd: master.as_raw_fd(),
                 child_pid: Some(child.id()),
                 line_state: &mut line_state,
                 child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
-                buffer: &mut buffer,
             };
             let _ = handle_control_request(control, &mut request_io);
         }
@@ -1743,14 +1735,6 @@ enum ForegroundOwnerState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InjectionUnsafeReason {
-    MidLine,
-    ChildOutputActive,
-    ForegroundOther,
-    ForegroundUnknown,
-}
-
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 enum EnterEscapeState {
     #[default]
@@ -1921,10 +1905,6 @@ impl InputLineState {
         self.mouse_skipped_count = self.mouse_skipped_count.saturating_add(1);
     }
 
-    fn is_safe_to_inject(&self) -> bool {
-        !self.mid_escape() && (self.at_line_boundary || self.user_input_idle())
-    }
-
     fn input_empty(&self) -> bool {
         self.at_line_boundary && self.enter_escape_state == EnterEscapeState::None
     }
@@ -2012,13 +1992,11 @@ fn line_boundary_after_input_byte(byte: u8) -> bool {
 }
 
 struct ControlRequestIo<'a> {
-    real_fd: RawFd,
     master_fd: RawFd,
     child_pid: Option<u32>,
     line_state: &'a mut InputLineState,
     child_output_state: &'a mut ChildOutputState,
     pending_child_input: &'a mut PendingChildInput,
-    buffer: &'a mut [u8],
 }
 
 struct PreparedControlPayload {
@@ -2085,22 +2063,20 @@ fn format_control_response_write_error(err: io::Error) -> String {
 #[cfg(test)]
 fn process_control_request(
     stream: &mut UnixStream,
-    real_fd: RawFd,
+    _real_fd: RawFd,
     master_fd: RawFd,
     line_state: &mut InputLineState,
-    buffer: &mut [u8],
+    _buffer: &mut [u8],
 ) -> Result<(), String> {
     let mut pending_child_input = PendingChildInput::new();
     let mut child_output_state = ChildOutputState::default();
     let result = {
         let mut request_io = ControlRequestIo {
-            real_fd,
             master_fd,
             child_pid: None,
             line_state,
             child_output_state: &mut child_output_state,
             pending_child_input: &mut pending_child_input,
-            buffer,
         };
         process_control_request_with_pending(stream, &mut request_io, None)
     };
@@ -2121,18 +2097,6 @@ fn process_control_request_with_pending(
         acknowledge_control_payload(&payload)?;
         return Ok(payload.delivery_attempt_id);
     }
-    // Prefer a short child-output quiet window. After the bounded wait, a TUI
-    // that continuously redraws may still receive delivery only at a verified
-    // empty input boundary with the agent retaining foreground ownership.
-    wait_until_safe_to_inject(
-        io.real_fd,
-        io.master_fd,
-        io.child_pid,
-        io.line_state,
-        io.child_output_state,
-        io.pending_child_input,
-        io.buffer,
-    )?;
     submit_control_request_payload(io.pending_child_input, &payload.bytes);
     io.line_state.mark_submitted();
     acknowledge_control_payload(&payload)?;
@@ -2202,11 +2166,15 @@ fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), S
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("Mailbox sidecar disappeared while acknowledging delivery".to_string());
     };
-    if db.record_delivery_attempt_transport_ack(attempt_id)? {
+    if !db.record_delivery_attempt_transport_ack(attempt_id)? {
+        Err(format!(
+            "Mailbox delivery attempt {attempt_id} is no longer registered"
+        ))
+    } else if db.confirm_delivery_attempt(attempt_id)? {
         Ok(())
     } else {
         Err(format!(
-            "Mailbox delivery attempt {attempt_id} is no longer registered"
+            "Mailbox delivery attempt {attempt_id} could not be confirmed"
         ))
     }
 }
@@ -2319,74 +2287,6 @@ fn invalid_utf8_error() -> String {
     "invalid_utf8".to_string()
 }
 
-fn wait_until_safe_to_inject(
-    real_fd: RawFd,
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &mut InputLineState,
-    child_output_state: &mut ChildOutputState,
-    pending_child_input: &mut PendingChildInput,
-    buffer: &mut [u8],
-) -> Result<(), String> {
-    pump_until_safe_to_inject(
-        real_fd,
-        master_fd,
-        child_pid,
-        line_state,
-        child_output_state,
-        pending_child_input,
-        buffer,
-    )?;
-    validate_safe_to_inject(master_fd, child_pid, line_state, child_output_state)
-}
-
-fn pump_until_safe_to_inject(
-    real_fd: RawFd,
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &mut InputLineState,
-    child_output_state: &mut ChildOutputState,
-    pending_child_input: &mut PendingChildInput,
-    buffer: &mut [u8],
-) -> Result<(), String> {
-    let start = Instant::now();
-    while start.elapsed() < INJECT_WAIT_LIMIT {
-        if safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok() {
-            return Ok(());
-        }
-        pump_injection_wait_io(
-            real_fd,
-            master_fd,
-            line_state,
-            child_output_state,
-            pending_child_input,
-            buffer,
-        )?;
-    }
-    Ok(())
-}
-
-fn pump_injection_wait_io(
-    real_fd: RawFd,
-    master_fd: RawFd,
-    line_state: &mut InputLineState,
-    child_output_state: &mut ChildOutputState,
-    pending_child_input: &mut PendingChildInput,
-    buffer: &mut [u8],
-) -> Result<(), String> {
-    let ready = poll_relay_fds(real_fd, master_fd, None, !pending_child_input.is_empty())?;
-    if ready.pty_writable {
-        flush_pending_child_input(master_fd, pending_child_input)?;
-    }
-    if ready.real_input {
-        relay_real_input(real_fd, line_state, pending_child_input, buffer)?;
-    }
-    if ready.pty_output && relay_pty_output(master_fd, real_fd, buffer)? {
-        child_output_state.observe_child_output();
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn flush_pending_child_input_to_completion(
     master_fd: RawFd,
@@ -2394,70 +2294,6 @@ fn flush_pending_child_input_to_completion(
 ) -> Result<(), String> {
     while !pending_child_input.is_empty() {
         flush_pending_child_input(master_fd, pending_child_input)?;
-    }
-    Ok(())
-}
-
-fn validate_safe_to_inject(
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-) -> Result<(), String> {
-    safe_to_inject_after_wait_for_foreground(
-        foreground_owner_state(master_fd, child_pid),
-        line_state,
-        child_output_state,
-    )
-    .map_err(unsafe_reason_message)
-}
-
-fn safe_to_inject_after_wait_for_foreground(
-    foreground: ForegroundOwnerState,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-) -> Result<(), InjectionUnsafeReason> {
-    match safe_to_inject_for_foreground(foreground, line_state, child_output_state) {
-        Err(InjectionUnsafeReason::ChildOutputActive)
-            if foreground == ForegroundOwnerState::Owner && line_state.input_empty() =>
-        {
-            Ok(())
-        }
-        result => result,
-    }
-}
-
-fn safe_to_inject(
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-) -> Result<(), InjectionUnsafeReason> {
-    safe_to_inject_for_foreground(
-        foreground_owner_state(master_fd, child_pid),
-        line_state,
-        child_output_state,
-    )
-}
-
-fn safe_to_inject_for_foreground(
-    foreground: ForegroundOwnerState,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-) -> Result<(), InjectionUnsafeReason> {
-    if line_state.mid_escape() {
-        return Err(InjectionUnsafeReason::MidLine);
-    }
-    match foreground {
-        ForegroundOwnerState::Owner => {}
-        ForegroundOwnerState::Other { .. } => return Err(InjectionUnsafeReason::ForegroundOther),
-        ForegroundOwnerState::Unknown => return Err(InjectionUnsafeReason::ForegroundUnknown),
-    }
-    if !child_output_state.is_quiescent() {
-        return Err(InjectionUnsafeReason::ChildOutputActive);
-    }
-    if !line_state.is_safe_to_inject() {
-        return Err(InjectionUnsafeReason::MidLine);
     }
     Ok(())
 }
@@ -2475,16 +2311,6 @@ fn foreground_owner_state(master_fd: RawFd, child_pid: Option<u32>) -> Foregroun
     } else {
         ForegroundOwnerState::Other { foreground_pgid }
     }
-}
-
-fn unsafe_reason_message(reason: InjectionUnsafeReason) -> String {
-    match reason {
-        InjectionUnsafeReason::MidLine => "unsafe_mid_line",
-        InjectionUnsafeReason::ChildOutputActive => "unsafe_child_output_active",
-        InjectionUnsafeReason::ForegroundOther => "unsafe_foreground_process",
-        InjectionUnsafeReason::ForegroundUnknown => "unsafe_foreground_unknown",
-    }
-    .to_string()
 }
 
 fn trace_notify_enabled() -> bool {
@@ -2680,7 +2506,6 @@ fn notify_trace_gate_reason(
 pub fn notify_trace_inject_status(decision: &str, status: &str) -> String {
     match (decision, status) {
         ("inject", "ok") => "acked".to_string(),
-        (_, "unsafe_foreground_process") => "foreground-not-child".to_string(),
         (_, value) => trace_token(value),
     }
 }
@@ -2889,23 +2714,22 @@ print(json.dumps({
     }
 
     #[test]
-    fn input_line_state_tracks_boundary_and_idle_fallback() {
+    fn input_line_state_tracks_boundary_and_idle_for_diagnostics() {
         let mut state = InputLineState::default();
-        assert!(state.is_safe_to_inject());
+        assert!(state.at_line_boundary);
 
         state.observe_user_input(b"abc");
         assert!(!state.at_line_boundary);
-        assert!(!state.is_safe_to_inject());
+        assert!(!state.user_input_idle());
 
         state.observe_user_input(b"\n");
         assert!(state.at_line_boundary);
-        assert!(state.is_safe_to_inject());
 
         state.observe_user_input(b"stale-midline");
         assert!(!state.at_line_boundary);
         state.last_user_input_at =
             Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
-        assert!(state.is_safe_to_inject());
+        assert!(state.user_input_idle());
     }
 
     #[test]
@@ -2935,7 +2759,7 @@ print(json.dumps({
         assert_eq!(state.enter_escape_state, EnterEscapeState::CsiOne);
         state.last_user_input_at =
             Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
-        assert!(!state.is_safe_to_inject());
+        assert!(state.mid_escape());
 
         state.observe_user_input(b"3u");
         assert!(state.at_line_boundary);
@@ -2962,7 +2786,6 @@ print(json.dumps({
         assert_eq!(state.enter_escape_state, EnterEscapeState::None);
         assert_eq!(state.last_user_input_at, None);
         assert_eq!(state.mouse_skipped_count, 2);
-        assert!(state.is_safe_to_inject());
         assert_eq!(state.trace_snapshot().mouse_skipped_count, 2);
     }
 
@@ -2996,7 +2819,6 @@ print(json.dumps({
         assert_eq!(state.enter_escape_state, EnterEscapeState::None);
         assert_eq!(state.last_user_input_at, None);
         assert_eq!(state.mouse_skipped_count, 2);
-        assert!(state.is_safe_to_inject());
     }
 
     #[test]
@@ -3012,7 +2834,6 @@ print(json.dumps({
         );
         assert_eq!(state.last_user_input_at, None);
         assert!(state.mid_escape());
-        assert!(!state.is_safe_to_inject());
 
         state.observe_user_input(b";79;1M");
 
@@ -3020,7 +2841,6 @@ print(json.dumps({
         assert_eq!(state.enter_escape_state, EnterEscapeState::None);
         assert_eq!(state.last_user_input_at, None);
         assert_eq!(state.mouse_skipped_count, 1);
-        assert!(state.is_safe_to_inject());
     }
 
     #[test]
@@ -3037,153 +2857,6 @@ print(json.dumps({
         };
         assert!(state.is_quiescent());
         assert!(INJECT_CHILD_OUTPUT_DEBOUNCE < Duration::from_millis(200));
-    }
-
-    #[test]
-    fn safe_to_inject_allows_idle_redraw_after_short_debounce() {
-        let line_state = InputLineState::default();
-        let output_state = ChildOutputState {
-            last_child_output_at: Some(
-                Instant::now() - INJECT_CHILD_OUTPUT_DEBOUNCE - Duration::from_millis(1),
-            ),
-        };
-
-        assert_eq!(
-            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_declines_during_short_output_debounce() {
-        let line_state = InputLineState::default();
-        let output_state = ChildOutputState {
-            last_child_output_at: Some(Instant::now()),
-        };
-
-        assert_eq!(
-            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
-            Err(InjectionUnsafeReason::ChildOutputActive)
-        );
-    }
-
-    #[test]
-    fn bounded_wait_fallback_allows_continuous_redraw_only_at_empty_input() {
-        let output_state = ChildOutputState {
-            last_child_output_at: Some(Instant::now()),
-        };
-        let empty = InputLineState::default();
-        assert_eq!(
-            safe_to_inject_after_wait_for_foreground(
-                ForegroundOwnerState::Owner,
-                &empty,
-                &output_state,
-            ),
-            Ok(())
-        );
-
-        let mut partial = InputLineState::default();
-        partial.observe_user_input(b"partial");
-        assert_eq!(
-            safe_to_inject_after_wait_for_foreground(
-                ForegroundOwnerState::Owner,
-                &partial,
-                &output_state,
-            ),
-            Err(InjectionUnsafeReason::ChildOutputActive)
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_keeps_foreground_process_group_guard() {
-        let line_state = InputLineState::default();
-        let output_state = ChildOutputState::default();
-
-        assert_eq!(
-            safe_to_inject_for_foreground(
-                ForegroundOwnerState::Other {
-                    foreground_pgid: 42
-                },
-                &line_state,
-                &output_state
-            ),
-            Err(InjectionUnsafeReason::ForegroundOther)
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_keeps_user_typing_guard() {
-        let mut line_state = InputLineState::default();
-        line_state.observe_user_input(b"partial");
-        let output_state = ChildOutputState::default();
-
-        assert_eq!(
-            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
-            Err(InjectionUnsafeReason::MidLine)
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_allows_idle_midline_when_owner_and_quiescent() {
-        let mut line_state = InputLineState::default();
-        line_state.observe_user_input(b"submitted-but-parser-missed-boundary");
-        line_state.last_user_input_at =
-            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
-        let output_state = ChildOutputState::default();
-
-        assert_eq!(
-            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_blocks_idle_midline_when_foreground_is_not_owner() {
-        let mut line_state = InputLineState::default();
-        line_state.observe_user_input(b"stale-midline");
-        line_state.last_user_input_at =
-            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
-        let output_state = ChildOutputState::default();
-
-        assert_eq!(
-            safe_to_inject_for_foreground(
-                ForegroundOwnerState::Other {
-                    foreground_pgid: 42
-                },
-                &line_state,
-                &output_state,
-            ),
-            Err(InjectionUnsafeReason::ForegroundOther)
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_keeps_mid_escape_as_hard_block_even_when_idle() {
-        let mut line_state = InputLineState::default();
-        line_state.observe_user_input(b"\x1b[13;");
-        line_state.last_user_input_at =
-            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
-        let output_state = ChildOutputState::default();
-
-        assert_eq!(
-            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
-            Err(InjectionUnsafeReason::MidLine)
-        );
-    }
-
-    #[test]
-    fn safe_to_inject_blocks_idle_midline_during_child_output_burst() {
-        let mut line_state = InputLineState::default();
-        line_state.observe_user_input(b"stale-midline");
-        line_state.last_user_input_at =
-            Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
-        let mut output_state = ChildOutputState::default();
-        output_state.observe_child_output();
-
-        assert_eq!(
-            safe_to_inject_for_foreground(ForegroundOwnerState::Owner, &line_state, &output_state),
-            Err(InjectionUnsafeReason::ChildOutputActive)
-        );
     }
 
     #[test]
@@ -3323,19 +2996,15 @@ print(json.dumps({
     }
 
     #[test]
-    fn control_request_wait_observes_newline_from_real_input() {
+    fn control_request_injects_immediately_with_partial_user_input() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
-        let (real_read_end, real_write_end) = pipe_files();
+        let (real_read_end, _real_write_end) = pipe_files();
         let (read_end, write_end) = pipe_files();
         let mut state = InputLineState::default();
         state.observe_user_input(b"partial");
         let mut buffer = [0_u8; 256];
-        let writer = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let mut real_write_end = real_write_end;
-            real_write_end.write_all(b"\n").unwrap();
-        });
+        let started = Instant::now();
 
         process_control_request(
             &mut server,
@@ -3345,17 +3014,17 @@ print(json.dumps({
             &mut buffer,
         )
         .unwrap();
-        writer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(200));
         drop(write_end);
 
         let mut read_end = read_end;
         let mut received = String::new();
         read_end.read_to_string(&mut received).unwrap();
-        assert_eq!(received, "\nnotify\r");
+        assert_eq!(received, "notify\r");
     }
 
     #[test]
-    fn control_request_idle_midline_injects_once_after_user_idle_threshold() {
+    fn control_request_marks_line_submitted_after_injection() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
         let (real_read_end, _real_write_end) = pipe_files();
@@ -3375,6 +3044,7 @@ print(json.dumps({
         )
         .unwrap();
 
+        assert!(state.at_line_boundary);
         drop(write_end);
         let mut read_end = read_end;
         let mut received = String::new();
@@ -3414,7 +3084,7 @@ print(json.dumps({
     }
 
     #[test]
-    fn control_request_mid_escape_returns_err() {
+    fn control_request_injects_immediately_during_partial_escape_input() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
         let (real_read_end, _real_write_end) = pipe_files();
@@ -3425,72 +3095,55 @@ print(json.dumps({
             Some(Instant::now() - USER_INPUT_IDLE_INJECT - Duration::from_millis(1));
         let mut buffer = [0_u8; 256];
 
-        let err = process_control_request(
+        process_control_request(
             &mut server,
             real_read_end.as_raw_fd(),
             write_end.as_raw_fd(),
             &mut state,
             &mut buffer,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(err, "unsafe_mid_line");
         drop(write_end);
         let mut read_end = read_end;
         let mut received = String::new();
         read_end.read_to_string(&mut received).unwrap();
-        assert!(received.is_empty(), "unsafe injection wrote: {received:?}");
+        assert_eq!(received, "notify\r");
     }
 
     #[test]
-    fn control_request_idle_redraw_output_injects_once_after_short_debounce() {
+    fn control_request_injects_immediately_while_child_output_is_active() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
-        let (real_fd, _real_peer) = socketpair_files();
+        let (_real_fd, _real_peer) = socketpair_files();
         let (master, child_peer) = socketpair_files();
-        let child_writer = child_peer.try_clone().unwrap();
         let child_reader = child_peer;
         let mut state = InputLineState::default();
         let mut output_state = ChildOutputState::default();
         output_state.observe_child_output();
         let mut pending = PendingChildInput::new();
-        let mut buffer = [0_u8; 256];
-        let writer = thread::spawn(move || {
-            let mut child_writer = child_writer;
-            thread::sleep(INJECT_CHILD_OUTPUT_DEBOUNCE + Duration::from_millis(175));
-            for _ in 0..6 {
-                if child_writer.write_all(b"child output\n").is_err() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(250));
-            }
-        });
         let started = Instant::now();
 
         let result = {
             let mut request_io = ControlRequestIo {
-                real_fd: real_fd.as_raw_fd(),
                 master_fd: master.as_raw_fd(),
                 child_pid: None,
                 line_state: &mut state,
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
-                buffer: &mut buffer,
             };
             process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
         assert_eq!(result, Ok(None));
         assert!(
-            started.elapsed() < Duration::from_millis(800),
-            "idle redraws must not require the old long quiet window"
+            started.elapsed() < Duration::from_millis(200),
+            "active child output must not delay control injection"
         );
         set_nonblocking(child_reader.as_raw_fd());
         let mut injected = Vec::new();
         flush_pending_child_input_to_completion(master.as_raw_fd(), &mut pending).unwrap();
         drain_available(child_reader.as_raw_fd(), &mut injected).unwrap();
-        drop(master);
-        writer.join().unwrap();
         assert_eq!(
             String::from_utf8_lossy(&injected).matches("notify").count(),
             1
@@ -3498,10 +3151,10 @@ print(json.dumps({
     }
 
     #[test]
-    fn control_request_continuous_redraw_injects_once_after_bounded_wait() {
+    fn control_request_continuous_redraw_injects_immediately_once() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
         write_inject_frame(&mut client, b"notify").unwrap();
-        let (real_fd, _real_peer) = socketpair_files();
+        let (_real_fd, _real_peer) = socketpair_files();
         let (master, child_peer) = socketpair_files();
         let child_writer = child_peer.try_clone().unwrap();
         let child_reader = child_peer;
@@ -3509,7 +3162,6 @@ print(json.dumps({
         let mut output_state = ChildOutputState::default();
         output_state.observe_child_output();
         let mut pending = PendingChildInput::new();
-        let mut buffer = [0_u8; 256];
         let writer = thread::spawn(move || {
             let mut child_writer = child_writer;
             for _ in 0..48 {
@@ -3523,20 +3175,17 @@ print(json.dumps({
         let started = Instant::now();
         let result = {
             let mut request_io = ControlRequestIo {
-                real_fd: real_fd.as_raw_fd(),
                 master_fd: master.as_raw_fd(),
                 child_pid: None,
                 line_state: &mut state,
                 child_output_state: &mut output_state,
                 pending_child_input: &mut pending,
-                buffer: &mut buffer,
             };
             process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
-        writer.join().unwrap();
         assert_eq!(result, Ok(None));
-        assert!(started.elapsed() >= INJECT_WAIT_LIMIT);
+        assert!(started.elapsed() < Duration::from_millis(200));
         set_nonblocking(child_reader.as_raw_fd());
         let mut injected = Vec::new();
         flush_pending_child_input_to_completion(master.as_raw_fd(), &mut pending).unwrap();
@@ -3545,6 +3194,8 @@ print(json.dumps({
             String::from_utf8_lossy(&injected).matches("notify").count(),
             1
         );
+        drop(master);
+        writer.join().unwrap();
     }
 
     #[test]
