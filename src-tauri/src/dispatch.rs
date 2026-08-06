@@ -296,13 +296,41 @@ fn dispatch_subcommand(
 
 fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String> {
     match command {
-        NotifySubcommands::AgentBashComplete {
+        NotifySubcommands::Register {
+            handle,
+            delivery_mode,
+            state_dir,
+            meta,
+            log,
+            rc,
+            json,
+        } => crate::commands::notify::run_agent_bash_register(
+            crate::commands::notify::AgentBashRegisterArgs {
+                handle: &handle,
+                delivery_mode: &delivery_mode,
+                state_dir: &state_dir,
+                meta: &meta,
+                log: &log,
+                rc: &rc,
+                json,
+            },
+        ),
+        NotifySubcommands::Activate { handle, json } => {
+            crate::commands::notify::run_agent_bash_activate(
+                crate::commands::notify::AgentBashActivateArgs {
+                    handle: &handle,
+                    json,
+                },
+            )
+        }
+        NotifySubcommands::Complete {
             caller_ppid,
             handle,
             state_dir,
             meta,
             log,
             rc,
+            consumed,
             json,
         } => crate::commands::notify::run_agent_bash_complete(
             crate::commands::notify::AgentBashCompleteArgs {
@@ -312,6 +340,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
                 meta: &meta,
                 log: &log,
                 rc: &rc,
+                consumed,
                 json,
             },
         ),

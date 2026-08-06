@@ -30,8 +30,6 @@
 
 mod cases_basic;
 mod cases_batch_sweep;
-mod cases_live_pty_retry;
-mod cases_opencode;
 mod cases_wake_backlog;
 mod fake_cli;
 mod fixtures;
@@ -46,18 +44,7 @@ mod wake_claim_setup;
 const MODEL: &str = "wu-d-fixture-model";
 const PROVIDER: &str = "wu-d-fixture-provider";
 const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
-const CAPTURED_OPENCODE_SESSION: &str = "ses_capturemidturn";
 const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
-
-#[test]
-fn idle_wake_delivers() {
-    cases_basic::idle_wake_delivers();
-}
-
-#[test]
-fn busy_then_turn_end_delivers() {
-    cases_basic::busy_then_turn_end_delivers();
-}
 
 #[test]
 fn no_undelivered_no_wake_and_loop_terminates() {
@@ -65,33 +52,8 @@ fn no_undelivered_no_wake_and_loop_terminates() {
 }
 
 #[test]
-fn auto_wake_cap_stops_self_replicating_session() {
-    cases_basic::auto_wake_cap_stops_self_replicating_session();
-}
-
-#[test]
-fn concurrent_notify_single_flight() {
-    cases_basic::concurrent_notify_single_flight();
-}
-
-#[test]
 fn manual_resume_race_is_safe() {
     cases_basic::manual_resume_race_is_safe();
-}
-
-#[test]
-fn persisted_wake_max_drives_environment_empty_notify_and_turn_end_recheck() {
-    cases_basic::persisted_wake_max_drives_environment_empty_notify_and_turn_end_recheck();
-}
-
-#[test]
-fn opencode_notify_idle_wakes_resume_with_ses_session() {
-    cases_opencode::opencode_notify_idle_wakes_resume_with_ses_session();
-}
-
-#[test]
-fn opencode_mid_turn_notify_resolves_capture_time_sidecar_owner() {
-    cases_opencode::opencode_mid_turn_notify_resolves_capture_time_sidecar_owner();
 }
 
 #[test]
@@ -156,36 +118,6 @@ fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() 
 }
 
 #[test]
-fn live_pty_nack_pending_is_retried_by_sweep() {
-    cases_live_pty_retry::live_pty_nack_pending_is_retried_by_sweep();
-}
-
-#[test]
-fn live_pty_acked_pending_is_submitted_once_across_repeated_sweeps() {
-    cases_live_pty_retry::live_pty_acked_pending_is_submitted_once_across_repeated_sweeps();
-}
-
-#[test]
-fn live_pty_repeated_nack_keeps_pending_without_claim() {
-    cases_live_pty_retry::live_pty_repeated_nack_keeps_pending_without_claim();
-}
-
-#[test]
-fn foreground_owner_retries_live_pty_without_second_command_and_stops() {
-    cases_live_pty_retry::foreground_owner_retries_live_pty_without_second_command_and_stops();
-}
-
-#[test]
-fn auto_wake_owner_does_not_host_live_pty_retry_driver() {
-    cases_live_pty_retry::auto_wake_owner_does_not_host_live_pty_retry_driver();
-}
-
-#[test]
 fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris() {
     cases_wake_backlog::wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris();
-}
-
-#[test]
-fn provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes() {
-    cases_opencode::provider_shadow_xdg_notify_uses_pinned_data_dir_and_wakes();
 }

@@ -18,10 +18,6 @@ pub(crate) fn wait_for_file(path: &Path) -> String {
     fs::read_to_string(path).unwrap()
 }
 
-pub(crate) fn wait_for_mailbox_session(fixture: &Fixture) -> String {
-    wait_for_sidecar_session(fixture, "mailbox")
-}
-
 pub(crate) fn wait_for_runtime_session(fixture: &Fixture) -> String {
     wait_for_sidecar_session(fixture, "session_runtime")
 }
@@ -101,22 +97,6 @@ pub(crate) fn delivered_single_row_without_error_or_claim(
         && wake_claim_is_absent(&wake_claim(fixture, session_id))
 }
 
-pub(crate) fn auto_wake_cap_left_pending(fixture: &Fixture, session_id: &str) -> bool {
-    pending_has_single_handle(&pending_rows(fixture, session_id), "h-auto-2")
-        && wake_claim_is_absent(&wake_claim(fixture, session_id))
-        && session_runtime_row(fixture, session_id).is_some_and(|row| auto_wake_count_is(&row, 2))
-}
-
-pub(crate) fn captured_opencode_mailbox_delivered(fixture: &Fixture, session_id: &str) -> bool {
-    captured_opencode_row_is_delivered(&mailbox_rows(fixture, session_id))
-        && wake_claim_is_absent(&wake_claim(fixture, session_id))
-}
-
-pub(crate) fn shadow_xdg_mailbox_delivered(fixture: &Fixture, session_id: &str) -> bool {
-    single_row_with_handle_is_delivered(&mailbox_rows(fixture, session_id), "h-shadow-xdg")
-        && wake_claim_is_absent(&wake_claim(fixture, session_id))
-}
-
 pub(crate) fn newer_mailbox_delivered_with_exhausted_old_pending(fixture: &Fixture) -> bool {
     let rows = mailbox_rows(fixture, crate::SESSION);
     old_mailbox_is_exhausted(row_with_handle(&rows, "h-unconfirmed-old"))
@@ -175,27 +155,6 @@ fn rows_are_empty(rows: &[MailboxRow]) -> bool {
 
 fn single_row_is_delivered_without_error(rows: &[MailboxRow]) -> bool {
     rows.len() == 1 && mailbox_row_has_delivery(&rows[0]) && rows[0].delivery_error.is_none()
-}
-
-fn pending_has_single_handle(rows: &[MailboxRow], handle: &str) -> bool {
-    rows.len() == 1 && rows[0].handle == handle
-}
-
-fn auto_wake_count_is(row: &SessionRuntimeRow, expected: i64) -> bool {
-    row.auto_wake_count == expected
-}
-
-fn captured_opencode_row_is_delivered(rows: &[MailboxRow]) -> bool {
-    rows.len() == 1
-        && rows[0].handle == "h-capture-midturn"
-        && mailbox_row_has_delivery(&rows[0])
-        && rows[0].owner_invocation_uuid.is_some()
-        && rows[0].matched_os_pid.is_some()
-        && rows[0].matched_chain_index == Some(0)
-}
-
-fn single_row_with_handle_is_delivered(rows: &[MailboxRow], handle: &str) -> bool {
-    rows.len() == 1 && rows[0].handle == handle && mailbox_row_has_delivery(&rows[0])
 }
 
 fn row_with_handle<'a>(rows: &'a [MailboxRow], handle: &str) -> Option<&'a MailboxRow> {

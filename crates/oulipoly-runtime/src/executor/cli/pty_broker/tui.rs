@@ -43,8 +43,8 @@ use super::{
     RELAY_BUFFER_BYTES, acknowledge_control_payload, flush_pending_child_input, is_pty_eof_error,
     poll_fds, poll_master_fd, poll_relay_fds, poll_single_fd, prepare_control_payload,
     pty_delivery_ack_message, queue_control_injection, read_control_request, read_fd, readable,
-    render_mailbox_notification_envelope, send_signal_to_child_group, set_pty_winsize,
-    terminal_winsize, validate_peer_uid, winsize_eq, writable, write_control_response,
+    send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq,
+    writable, write_control_response,
 };
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
@@ -53,10 +53,8 @@ use crate::observability::{
 #[cfg(test)]
 use crate::observability::{ObservabilitySnapshotPort, SnapshotLimits};
 use base64::Engine as _;
+#[cfg(test)]
 use chrono::{DateTime, Utc};
-use oulipoly_state::mailbox::{
-    MAILBOX_DELIVERY_UNCONFIRMED_ERROR, MailboxDb, MailboxDeliveryWindow,
-};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -105,14 +103,6 @@ const BRACKETED_PASTE_DISABLE: &[u8] = b"\x1b[?2004l";
 /// dropped, leaving the notification unsent until the operator presses Enter themselves.
 /// Waiting lets the paste commit land first so the Enter actually submits.
 const CONTROL_SUBMIT_DELAY: Duration = Duration::from_millis(400);
-/// Grace before the first provider-silence observation may authorize a same-attempt retry.
-const MAILBOX_INITIAL_RETRY_GRACE: Duration = Duration::from_secs(30);
-/// Retry ambiguity remains nonterminal, but increasingly backs off to this interval.
-const MAILBOX_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(300);
-/// Plain line-oriented providers may never advertise bracketed-paste mode. Keep
-/// their startup delivery bounded without overriding the readiness signal for a
-/// full-screen TUI that is still initializing its input handler.
-const CONTROL_PRIMARY_SCREEN_READY_FALLBACK: Duration = Duration::from_secs(10);
 const MOUSE_PRESS_ENABLE: &[u8] = b"\x1b[?9h";
 const MOUSE_PRESS_DISABLE: &[u8] = b"\x1b[?9l";
 const MOUSE_PRESS_RELEASE_ENABLE: &[u8] = b"\x1b[?1000h";
@@ -1293,194 +1283,6 @@ struct OutboundQueue {
     minimum_generation: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MailboxDeliveryObservationDisposition {
-    Confirm,
-    FailUnobserved,
-    Await,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MailboxRetryPhase {
-    AwaitingObservation,
-    Submitting,
-}
-
-#[derive(Debug)]
-struct MailboxRetryOwner {
-    window: MailboxDeliveryWindow,
-    last_submit_at: Instant,
-    next_retry_not_before: Instant,
-    retry_ordinal: u32,
-    fresh_observation_floor: Option<u64>,
-    phase: MailboxRetryPhase,
-}
-
-impl MailboxRetryOwner {
-    fn new(window: MailboxDeliveryWindow, now: Instant) -> Self {
-        Self {
-            window,
-            last_submit_at: now,
-            next_retry_not_before: now + mailbox_retry_delay(0),
-            retry_ordinal: 0,
-            fresh_observation_floor: None,
-            phase: MailboxRetryPhase::AwaitingObservation,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct MailboxDeliveryObservationState {
-    active: bool,
-    last_generation: Option<u64>,
-    session_id: Option<String>,
-    invocation_uuid: Option<String>,
-    retry_owner: Option<MailboxRetryOwner>,
-}
-
-impl MailboxDeliveryObservationState {
-    fn refresh(&mut self, control: Option<&ControlSocket>, now: Instant) {
-        if let Some(control) = control {
-            self.session_id = Some(control.session_id().to_string());
-            self.invocation_uuid = Some(control.invocation_uuid().to_string());
-        }
-        match accepted_mailbox_delivery_windows(self.session_id.as_deref()) {
-            Ok(windows) => self.adopt_windows(windows, now),
-            Err(err) => tracing::warn!("Failed to inspect accepted PTY mailbox delivery: {err}"),
-        }
-    }
-
-    fn adopt_windows(&mut self, windows: Vec<MailboxDeliveryWindow>, now: Instant) {
-        let was_active = self.active;
-        self.active = !windows.is_empty();
-        if self.active && !was_active {
-            self.last_generation = None;
-        }
-        let current_owner = windows.into_iter().find(|window| {
-            Some(window.session_id.as_str()) == self.session_id.as_deref()
-                && Some(window.delivery_invocation_uuid.as_str()) == self.invocation_uuid.as_deref()
-        });
-        match (self.retry_owner.as_mut(), current_owner) {
-            (Some(owner), Some(window)) if owner.window.attempt_id == window.attempt_id => {
-                owner.window = window;
-            }
-            (_, Some(window)) => self.retry_owner = Some(MailboxRetryOwner::new(window, now)),
-            (_, None) => self.retry_owner = None,
-        }
-    }
-
-    fn reconcile(&mut self, observation: Option<&OutboundObservationResult>, now: Instant) {
-        if !self.active {
-            return;
-        }
-        let Some(observation) = observation else {
-            return;
-        };
-        let generation = outbound_observation_generation(observation);
-        if self.last_generation == Some(generation) {
-            return;
-        }
-        self.last_generation = Some(generation);
-        if let Err(err) = reconcile_accepted_mailbox_delivery(
-            self.session_id.as_deref(),
-            self.invocation_uuid.as_deref(),
-            observation,
-        ) {
-            tracing::warn!("Failed to reconcile accepted PTY mailbox delivery: {err}");
-        }
-        self.refresh(None, now);
-    }
-
-    fn request_fresh_if_due<F>(&mut self, now: Instant, request: F) -> Option<u64>
-    where
-        F: FnOnce() -> u64,
-    {
-        let owner = self.retry_owner.as_mut()?;
-        if owner.phase != MailboxRetryPhase::AwaitingObservation
-            || owner.fresh_observation_floor.is_some()
-            || now < owner.next_retry_not_before
-        {
-            return None;
-        }
-        let floor = request();
-        owner.fresh_observation_floor = Some(floor);
-        Some(floor)
-    }
-
-    fn eligible_retry_attempt(
-        &self,
-        observation: Option<&OutboundObservationResult>,
-    ) -> Option<&str> {
-        let owner = self.retry_owner.as_ref()?;
-        if owner.phase != MailboxRetryPhase::AwaitingObservation
-            || !mailbox_retry_observation_is_qualified_silence(owner, observation?)
-        {
-            return None;
-        }
-        Some(owner.window.attempt_id.as_str())
-    }
-
-    fn begin_retry(
-        &mut self,
-        attempt_id: &str,
-        observation: Option<&OutboundObservationResult>,
-    ) -> bool {
-        if self.eligible_retry_attempt(observation) != Some(attempt_id) {
-            return false;
-        }
-        let owner = self.retry_owner.as_mut().expect("eligible owner exists");
-        owner.phase = MailboxRetryPhase::Submitting;
-        true
-    }
-
-    fn finish_retry(&mut self, now: Instant) {
-        let Some(owner) = self.retry_owner.as_mut() else {
-            return;
-        };
-        if owner.phase != MailboxRetryPhase::Submitting {
-            return;
-        }
-        owner.retry_ordinal = owner.retry_ordinal.saturating_add(1);
-        owner.last_submit_at = now;
-        owner.next_retry_not_before = now + mailbox_retry_delay(owner.retry_ordinal);
-        owner.fresh_observation_floor = None;
-        owner.phase = MailboxRetryPhase::AwaitingObservation;
-    }
-}
-
-fn mailbox_retry_delay(retry_ordinal: u32) -> Duration {
-    match retry_ordinal {
-        0 => MAILBOX_INITIAL_RETRY_GRACE,
-        1 => Duration::from_secs(60),
-        2 => Duration::from_secs(120),
-        3 => Duration::from_secs(240),
-        _ => MAILBOX_RETRY_BACKOFF_CAP,
-    }
-}
-
-fn mailbox_retry_observation_is_qualified_silence(
-    owner: &MailboxRetryOwner,
-    result: &OutboundObservationResult,
-) -> bool {
-    let Some(floor) = owner.fresh_observation_floor else {
-        return false;
-    };
-    let OutboundObservationResult::Available(observation) = result else {
-        return false;
-    };
-    if observation.generation < floor
-        || !observation.complete
-        || observation.identity.provider_session_id != owner.window.session_id
-        || observation.identity.invocation_uuid != owner.window.delivery_invocation_uuid
-    {
-        return false;
-    }
-    matches!(
-        mailbox_delivery_observation_disposition(&owner.window, observation),
-        Ok(MailboxDeliveryObservationDisposition::Await)
-    ) && matches!(mailbox_user_turns_after_ack(&owner.window, observation), Ok(turns) if turns.is_empty())
-}
-
 #[derive(Debug, Clone)]
 struct ActiveOutboundSend {
     message_id: u64,
@@ -1684,109 +1486,6 @@ impl OutboundQueue {
     fn status(&self, id: u64) -> Option<OutboundStatus> {
         self.message(id).map(|message| message.status)
     }
-}
-
-fn outbound_observation_generation(observation: &OutboundObservationResult) -> u64 {
-    match observation {
-        OutboundObservationResult::Available(observation) => observation.generation,
-        OutboundObservationResult::Unavailable { generation, .. }
-        | OutboundObservationResult::Failed { generation, .. } => *generation,
-    }
-}
-
-fn accepted_mailbox_delivery_windows(
-    session_id: Option<&str>,
-) -> Result<Vec<MailboxDeliveryWindow>, String> {
-    let Some(session_id) = session_id else {
-        return Ok(Vec::new());
-    };
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(Vec::new());
-    };
-    db.accepted_delivery_attempt_windows(session_id)
-}
-
-fn reconcile_accepted_mailbox_delivery(
-    session_id: Option<&str>,
-    invocation_uuid: Option<&str>,
-    result: &OutboundObservationResult,
-) -> Result<(), String> {
-    let (Some(session_id), Some(invocation_uuid)) = (session_id, invocation_uuid) else {
-        return Ok(());
-    };
-    let OutboundObservationResult::Available(observation) = result else {
-        return Ok(());
-    };
-    if !observation.complete
-        || observation.identity.provider_session_id != session_id
-        || observation.identity.invocation_uuid != invocation_uuid
-    {
-        return Ok(());
-    }
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(());
-    };
-    let windows = db.accepted_delivery_attempt_windows(session_id)?;
-    for window in windows {
-        match mailbox_delivery_observation_disposition(&window, observation)? {
-            MailboxDeliveryObservationDisposition::Confirm => {
-                db.confirm_delivery_attempt(&window.attempt_id)?;
-            }
-            MailboxDeliveryObservationDisposition::FailUnobserved => {
-                db.fail_unobserved_delivery_attempt(
-                    &window.attempt_id,
-                    MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
-                )?;
-            }
-            MailboxDeliveryObservationDisposition::Await => {}
-        }
-    }
-    Ok(())
-}
-
-fn mailbox_delivery_observation_disposition(
-    window: &MailboxDeliveryWindow,
-    observation: &OutboundObservation,
-) -> Result<MailboxDeliveryObservationDisposition, String> {
-    // The observer identity names the relay reading a session-wide transcript.
-    // A prior relay's exact marker therefore remains authoritative after restart.
-    let marker = format!("[OULIPOLY-DELIVERY {}]", window.attempt_id);
-    if observation.user_turns.iter().any(|turn| {
-        turn.body
-            .as_deref()
-            .is_some_and(|body| body.contains(&marker))
-    }) {
-        return Ok(MailboxDeliveryObservationDisposition::Confirm);
-    }
-    if window.delivery_invocation_uuid != observation.identity.invocation_uuid {
-        return Ok(MailboxDeliveryObservationDisposition::FailUnobserved);
-    }
-    if window.acknowledged_at.is_none() {
-        return Ok(MailboxDeliveryObservationDisposition::Await);
-    }
-    let turns_after_ack = mailbox_user_turns_after_ack(window, observation)?;
-    if !turns_after_ack.is_empty() && turns_after_ack.iter().all(|turn| turn.body.is_some()) {
-        Ok(MailboxDeliveryObservationDisposition::FailUnobserved)
-    } else {
-        Ok(MailboxDeliveryObservationDisposition::Await)
-    }
-}
-
-fn mailbox_user_turns_after_ack<'a>(
-    window: &MailboxDeliveryWindow,
-    observation: &'a OutboundObservation,
-) -> Result<Vec<&'a ObservedUserTurn>, String> {
-    let Some(acknowledged_at) = window.acknowledged_at.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let acknowledged_at = DateTime::parse_from_rfc3339(acknowledged_at)
-        .map_err(|err| format!("Invalid mailbox delivery acknowledgement timestamp: {err}"))?
-        .with_timezone(&Utc);
-    Ok(observation
-        .user_turns
-        .iter()
-        .filter(|turn| turn.timestamp > acknowledged_at)
-        .collect())
 }
 
 fn apply_outbound_observation(
@@ -4349,8 +4048,6 @@ pub(super) fn relay_until_exit_observed(
     let mut pane = MonitorPane::new();
     let snapshot_worker = MonitorSnapshotWorker::start(monitor, root, pane.refresh_interval())?;
     let outbound_worker = OutboundObserverWorker::start(outbound_source)?;
-    let mut mailbox_observation = MailboxDeliveryObservationState::default();
-    mailbox_observation.refresh(control, Instant::now());
     let initial = child_pane_winsize(real_fd, &pane, TypingProtection::for_focus(Focus::Top));
     let mut parser = vt100::Parser::new(initial.ws_row, initial.ws_col, TOP_PANE_SCROLLBACK_ROWS);
     let mut top_scrollback: usize = 0;
@@ -4423,40 +4120,9 @@ pub(super) fn relay_until_exit_observed(
                 &outbound_release_gate,
                 parser.screen().bracketed_paste(),
                 &outbound_worker,
-                &mut mailbox_observation,
             ),
             RenderPriority::Interactive,
         );
-        if let Some(control) = control {
-            let mut retry_io = ControlInjectionIo {
-                real_fd,
-                master_fd,
-                router: &mut router,
-                pane: &pane,
-                parser: &mut parser,
-                line_state: &mut line_state,
-                child_output_state: &mut child_output_state,
-                pending_child_input: &mut pending_child_input,
-                deferred_child_input: &mut deferred_child_input,
-                outbound_release_gate: &mut outbound_release_gate,
-                buffer: &mut buffer,
-                child_pid: Some(child.id()),
-            };
-            match retry_accepted_mailbox_delivery(
-                control,
-                &outbound_worker,
-                &mut mailbox_observation,
-                &mut retry_io,
-            ) {
-                Ok(retried) => mark_render_dirty(
-                    &mut dirty,
-                    &mut priority,
-                    retried,
-                    RenderPriority::Interactive,
-                ),
-                Err(err) => tracing::warn!("Failed to retry accepted PTY mailbox delivery: {err}"),
-            }
-        }
         let release_gate_was_awaiting_output = outbound_release_gate.awaiting_child_output();
         let ready = poll_relay_fds(
             real_fd,
@@ -4477,7 +4143,6 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
-                    &mut mailbox_observation,
                 ),
                 RenderPriority::Interactive,
             );
@@ -4524,7 +4189,6 @@ pub(super) fn relay_until_exit_observed(
                     &outbound_release_gate,
                     parser.screen().bracketed_paste(),
                     &outbound_worker,
-                    &mut mailbox_observation,
                 ),
                 RenderPriority::Interactive,
             );
@@ -4589,21 +4253,16 @@ pub(super) fn relay_until_exit_observed(
             && let Some(control) = control
         {
             let mut control_io = ControlInjectionIo {
-                real_fd,
                 master_fd,
-                router: &mut router,
-                pane: &pane,
                 parser: &mut parser,
                 line_state: &mut line_state,
                 child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
-                deferred_child_input: &mut deferred_child_input,
                 outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
                 child_pid: Some(child.id()),
             };
             let _ = service_control(control, &mut control_io);
-            mailbox_observation.refresh(Some(control), Instant::now());
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
         }
         // Re-assert the scrollback view each frame (clamped to retained history) so it
@@ -5692,16 +5351,12 @@ fn pump_outbound_queue_from_worker(
     release_gate: &OutboundReleaseGate,
     bracketed_paste: bool,
     worker: &OutboundObserverWorker,
-    mailbox_observation: &mut MailboxDeliveryObservationState,
 ) -> bool {
-    let observation_needed = pane.outbound.observation_needed() || mailbox_observation.active;
-    if let Some(generation_floor) = worker.set_demand(observation_needed) {
+    if let Some(generation_floor) = worker.set_demand(pane.outbound.observation_needed()) {
         pane.outbound.minimum_generation = pane.outbound.minimum_generation.max(generation_floor);
     }
     let latest = worker.latest_result();
     let now = Instant::now();
-    mailbox_observation.reconcile(latest.as_deref(), now);
-    mailbox_observation.request_fresh_if_due(now, || worker.request_fresh_generation());
     let dirty = pump_outbound_queue_with_gate(
         pane,
         pending_child_input,
@@ -5711,102 +5366,8 @@ fn pump_outbound_queue_from_worker(
         latest.as_deref(),
         now,
     );
-    let _ = worker.set_demand(pane.outbound.observation_needed() || mailbox_observation.active);
+    let _ = worker.set_demand(pane.outbound.observation_needed());
     dirty
-}
-
-fn retry_accepted_mailbox_delivery(
-    control: &ControlSocket,
-    worker: &OutboundObserverWorker,
-    mailbox_observation: &mut MailboxDeliveryObservationState,
-    io: &mut ControlInjectionIo<'_>,
-) -> Result<bool, String> {
-    let mut latest = worker.latest_result();
-    mailbox_observation.reconcile(latest.as_deref(), Instant::now());
-    let Some(attempt_id) = mailbox_observation
-        .eligible_retry_attempt(latest.as_deref())
-        .map(str::to_string)
-    else {
-        return Ok(false);
-    };
-
-    if validate_control_input_ready(
-        io.parser.screen().bracketed_paste(),
-        io.parser.screen().alternate_screen(),
-        control.age(),
-    )
-    .is_err()
-        || io.pane.outbound.has_unresolved_blocker()
-        || io.pane.outbound.next_sendable_id().is_some()
-        || !io.pending_child_input.is_empty()
-        || !io.deferred_child_input.is_empty()
-    {
-        return Ok(false);
-    }
-    if wait_until_safe_to_inject(io).is_err()
-        || !io.pending_child_input.is_empty()
-        || !io.deferred_child_input.is_empty()
-    {
-        return Ok(false);
-    }
-
-    latest = worker.latest_result();
-    mailbox_observation.reconcile(latest.as_deref(), Instant::now());
-    if mailbox_observation.eligible_retry_attempt(latest.as_deref()) != Some(attempt_id.as_str()) {
-        return Ok(false);
-    }
-    latest = worker.latest_result();
-    mailbox_observation.reconcile(latest.as_deref(), Instant::now());
-    if mailbox_observation.eligible_retry_attempt(latest.as_deref()) != Some(attempt_id.as_str()) {
-        return Ok(false);
-    }
-    let Some(window) = accepted_mailbox_retry_window(
-        control.session_id(),
-        control.invocation_uuid(),
-        &attempt_id,
-    )?
-    else {
-        mailbox_observation.refresh(Some(control), Instant::now());
-        return Ok(false);
-    };
-    if !mailbox_observation.begin_retry(&attempt_id, latest.as_deref()) {
-        return Ok(false);
-    }
-
-    let payload = render_mailbox_notification_envelope(
-        &window.rows,
-        window.remaining_count,
-        &window.attempt_id,
-    );
-    let bracketed_paste = io.parser.screen().bracketed_paste();
-    let result = submit_control_payload(io, payload.as_bytes(), bracketed_paste);
-    mailbox_observation.finish_retry(Instant::now());
-    result?;
-    Ok(true)
-}
-
-fn accepted_mailbox_retry_window(
-    session_id: &str,
-    invocation_uuid: &str,
-    attempt_id: &str,
-) -> Result<Option<MailboxDeliveryWindow>, String> {
-    let Some(db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(None);
-    };
-    if db.notifications_paused(session_id)? {
-        return Ok(None);
-    }
-    Ok(db
-        .accepted_delivery_attempt_windows(session_id)?
-        .into_iter()
-        .find(|window| {
-            window.attempt_id == attempt_id
-                && window.session_id == session_id
-                && window.delivery_invocation_uuid == invocation_uuid
-                && window.acknowledged_at.is_some()
-                && window.resolved_at.is_none()
-                && !window.rows.is_empty()
-        }))
 }
 
 fn mark_outbound_timeouts(outbound: &mut OutboundQueue, now: Instant) -> bool {
@@ -6044,23 +5605,17 @@ fn draw_snapshot(
 }
 
 struct ControlInjectionIo<'a> {
-    real_fd: RawFd,
     master_fd: RawFd,
-    router: &'a mut InputRouter,
-    pane: &'a MonitorPane,
     parser: &'a mut vt100::Parser,
     line_state: &'a mut InputLineState,
     child_output_state: &'a mut ChildOutputState,
     pending_child_input: &'a mut PendingChildInput,
-    deferred_child_input: &'a mut PendingChildInput,
     outbound_release_gate: &'a mut OutboundReleaseGate,
     buffer: &'a mut [u8],
     child_pid: Option<u32>,
 }
 
-/// Service a control-socket notify injection while the TUI owns the screen:
-/// inject the payload to the child at the next safe line boundary, pumping output
-/// into the virtual terminal (never to the real terminal) during the wait.
+/// Inject a control-socket notification immediately; the agent harness queues it.
 fn service_control(control: &ControlSocket, io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
     let mut stream = accept_control_stream(control).map_err(format_control_accept_error)?;
     let response = inject_control_payload(&mut stream, io, control);
@@ -6116,37 +5671,10 @@ fn inject_control_payload(
         acknowledge_control_payload(&payload)?;
         return Ok(payload.delivery_attempt_id);
     }
-    validate_control_input_ready(
-        io.parser.screen().bracketed_paste(),
-        io.parser.screen().alternate_screen(),
-        control.age(),
-    )?;
-    if io.pane.outbound.active.is_some() {
-        return Err("outbound_send_active".to_string());
-    }
-    // Match the non-TUI broker contract: only submit proactive control payloads
-    // when the agent owns the foreground process group, child output has cleared
-    // the short debounce, and the line is either at a parsed boundary or user
-    // input has been idle long enough for the submit-parser fallback.
-    wait_until_safe_to_inject(io)?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
     submit_control_payload(io, &payload.bytes, bracketed_paste)?;
     acknowledge_control_payload(&payload)?;
     Ok(payload.delivery_attempt_id)
-}
-
-fn validate_control_input_ready(
-    bracketed_paste: bool,
-    alternate_screen: bool,
-    control_age: Duration,
-) -> Result<(), String> {
-    if bracketed_paste
-        || (!alternate_screen && control_age >= CONTROL_PRIMARY_SCREEN_READY_FALLBACK)
-    {
-        Ok(())
-    } else {
-        Err("unsafe_provider_starting".to_string())
-    }
 }
 
 fn validate_control_peer(stream: &UnixStream) -> Result<(), String> {
@@ -6261,133 +5789,6 @@ fn wrap_real_terminal_paste(child_bytes: &[u8]) -> Vec<u8> {
 
 fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
     forward.to_vec()
-}
-
-/// Wait until proactive injection is safe, pumping output into the virtual
-/// terminal and routing real input meanwhile, bounded by the inject limit.
-fn wait_until_safe_to_inject(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
-    let start = Instant::now();
-    while injection_wait_should_pump(
-        start,
-        io.master_fd,
-        io.child_pid,
-        io.line_state,
-        io.child_output_state,
-        io.pending_child_input,
-        io.outbound_release_gate,
-    ) {
-        pump_inject_wait_io(io)?;
-    }
-    validate_safe_to_inject(
-        io.master_fd,
-        io.child_pid,
-        io.line_state,
-        io.child_output_state,
-        io.pending_child_input,
-        io.outbound_release_gate,
-    )
-}
-
-fn injection_wait_should_pump(
-    start: Instant,
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-    pending_child_input: &PendingChildInput,
-    outbound_release_gate: &OutboundReleaseGate,
-) -> bool {
-    inject_wait_remaining(start)
-        && !safe_to_inject_now(
-            master_fd,
-            child_pid,
-            line_state,
-            child_output_state,
-            pending_child_input,
-            outbound_release_gate,
-        )
-}
-
-fn inject_wait_remaining(start: Instant) -> bool {
-    start.elapsed() < INJECT_WAIT_LIMIT
-}
-
-fn safe_to_inject_now(
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-    pending_child_input: &PendingChildInput,
-    outbound_release_gate: &OutboundReleaseGate,
-) -> bool {
-    pending_child_input.is_empty()
-        && outbound_release_gate
-            .blocking_detail(Instant::now())
-            .is_none()
-        && super::safe_to_inject(master_fd, child_pid, line_state, child_output_state).is_ok()
-}
-
-fn validate_safe_to_inject(
-    master_fd: RawFd,
-    child_pid: Option<u32>,
-    line_state: &InputLineState,
-    child_output_state: &ChildOutputState,
-    pending_child_input: &PendingChildInput,
-    outbound_release_gate: &OutboundReleaseGate,
-) -> Result<(), String> {
-    if !pending_child_input.is_empty() {
-        return Err(unsafe_mid_line_error());
-    }
-    if let Some(detail) = outbound_release_gate.blocking_detail(Instant::now())
-        && detail != "awaiting_child_output_quiescence"
-    {
-        return Err(detail.to_string());
-    }
-    super::safe_to_inject_after_wait_for_foreground(
-        super::foreground_owner_state(master_fd, child_pid),
-        line_state,
-        child_output_state,
-    )
-    .map_err(super::unsafe_reason_message)
-}
-
-fn pump_inject_wait_io(io: &mut ControlInjectionIo<'_>) -> Result<(), String> {
-    let release_gate_was_awaiting_output = io.outbound_release_gate.awaiting_child_output();
-    let ready = poll_relay_fds(
-        io.real_fd,
-        io.master_fd,
-        None,
-        !io.pending_child_input.is_empty(),
-    )?;
-    if ready.pty_writable {
-        flush_pending_child_input(io.master_fd, io.pending_child_input)?;
-        io.outbound_release_gate
-            .observe_pending_write_drained(io.pending_child_input.is_empty());
-    }
-    if ready.real_input {
-        let mut input_io = RealInputForwardIo {
-            real_fd: io.real_fd,
-            router: io.router,
-            pane: io.pane,
-            mouse_request: mouse_request_from_screen(io.parser.screen()),
-            line_state: io.line_state,
-            pending_child_input: io.pending_child_input,
-            deferred_child_input: io.deferred_child_input,
-            outbound_release_gate: io.outbound_release_gate,
-            buffer: io.buffer,
-        };
-        forward_real_input(&mut input_io)?;
-    }
-    if ready.pty_output && pump_pty_output(io.master_fd, io.parser, io.buffer)? {
-        io.child_output_state.observe_child_output();
-        io.outbound_release_gate
-            .observe_child_output(release_gate_was_awaiting_output, Instant::now());
-    }
-    Ok(())
-}
-
-fn unsafe_mid_line_error() -> String {
-    "unsafe_mid_line".to_string()
 }
 
 #[cfg(test)]
@@ -7014,25 +6415,18 @@ mod tests {
     fn control_submit_drains_body_then_final_delimiter_before_returning() {
         for bracketed_paste in [false, true] {
             let (mut read_end, write_end) = pipe_files();
-            let mut router = InputRouter::new();
-            let pane = MonitorPane::new();
             let mut parser = vt100::Parser::new(10, 20, 0);
             let mut line_state = InputLineState::default();
             let mut child_output_state = ChildOutputState::default();
             let mut pending_child_input = PendingChildInput::new();
-            let mut deferred_child_input = PendingChildInput::new();
             let mut outbound_release_gate = OutboundReleaseGate::default();
             let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
             let mut io = ControlInjectionIo {
-                real_fd: read_end.as_raw_fd(),
                 master_fd: write_end.as_raw_fd(),
-                router: &mut router,
-                pane: &pane,
                 parser: &mut parser,
                 line_state: &mut line_state,
                 child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
-                deferred_child_input: &mut deferred_child_input,
                 outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
                 child_pid: None,
@@ -7055,27 +6449,20 @@ mod tests {
             assert_eq!(received, expected);
         }
 
-        let (read_end, _write_end) = pipe_files();
-        let mut router = InputRouter::new();
-        let pane = MonitorPane::new();
+        let (_read_end, _write_end) = pipe_files();
         let mut parser = vt100::Parser::new(10, 20, 0);
         let mut line_state = InputLineState::default();
         let mut child_output_state = ChildOutputState::default();
         let mut pending_child_input = PendingChildInput::new();
         pending_child_input.enqueue(b"\r");
-        let mut deferred_child_input = PendingChildInput::new();
         let mut outbound_release_gate = OutboundReleaseGate::default();
         let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
         let mut io = ControlInjectionIo {
-            real_fd: read_end.as_raw_fd(),
             master_fd: -1,
-            router: &mut router,
-            pane: &pane,
             parser: &mut parser,
             line_state: &mut line_state,
             child_output_state: &mut child_output_state,
             pending_child_input: &mut pending_child_input,
-            deferred_child_input: &mut deferred_child_input,
             outbound_release_gate: &mut outbound_release_gate,
             buffer: &mut buffer,
             child_pid: None,
@@ -7238,8 +6625,8 @@ mod tests {
         );
 
         assert!(
-            line_state.is_safe_to_inject(),
-            "generic idle fallback remains"
+            line_state.user_input_idle(),
+            "generic idle tracking remains"
         );
         assert!(!line_state.input_empty(), "draft has no submit boundary");
         assert!(pump_outbound_queue(
@@ -7781,344 +7168,10 @@ mod tests {
         assert_eq!(pane.outbound.status(2), Some(OutboundStatus::Sending));
     }
 
-    #[test]
-    fn mailbox_retry_requires_fresh_complete_silent_observation() {
-        let now = Instant::now();
-        let mut state = mailbox_retry_state(now);
-        let due = now + MAILBOX_INITIAL_RETRY_GRACE;
-        let stale = mailbox_observation_result(6, true, []);
-        let fresh = mailbox_observation_result(7, true, []);
-
-        assert_eq!(state.request_fresh_if_due(now, || 7), None);
-        assert_eq!(state.eligible_retry_attempt(Some(&fresh)), None);
-        assert_eq!(state.request_fresh_if_due(due, || 7), Some(7));
-        assert_eq!(state.eligible_retry_attempt(Some(&stale)), None);
-        assert_eq!(
-            state.eligible_retry_attempt(Some(&fresh)),
-            Some("attempt-1")
-        );
-    }
-
-    #[test]
-    fn mailbox_retry_fails_closed_when_observation_is_unavailable_incomplete_stale_or_unqualified()
-    {
-        let now = Instant::now();
-        let mut state = mailbox_retry_state(now);
-        state.request_fresh_if_due(now + MAILBOX_INITIAL_RETRY_GRACE, || 10);
-
-        let unavailable = OutboundObservationResult::Unavailable {
-            generation: 10,
-            detail: "session_capability_missing".to_string(),
-        };
-        let failed = OutboundObservationResult::Failed {
-            generation: 10,
-            detail: "observer_failed".to_string(),
-        };
-        let incomplete = mailbox_observation_result(10, false, []);
-        let stale = mailbox_observation_result(9, true, []);
-        let mut wrong_session = mailbox_observation([]);
-        wrong_session.generation = 10;
-        wrong_session.identity.provider_session_id = "other-session".to_string();
-        let wrong_session = OutboundObservationResult::Available(Box::new(wrong_session));
-        let mut wrong_invocation = mailbox_observation([]);
-        wrong_invocation.generation = 10;
-        wrong_invocation.identity.invocation_uuid = "other-invocation".to_string();
-        let wrong_invocation = OutboundObservationResult::Available(Box::new(wrong_invocation));
-        let projected_body_unavailable = mailbox_observation_result(
-            10,
-            true,
-            [("later-unprojected", "2026-07-26T00:00:00Z", None)],
-        );
-
-        for observation in [
-            unavailable,
-            failed,
-            incomplete,
-            stale,
-            wrong_session,
-            wrong_invocation,
-            projected_body_unavailable,
-        ] {
-            assert_eq!(state.eligible_retry_attempt(Some(&observation)), None);
-        }
-    }
-
-    #[test]
-    fn mailbox_retry_cancels_before_write_on_delayed_exact_marker() {
-        let now = Instant::now();
-        let mut state = mailbox_retry_state(now);
-        state.request_fresh_if_due(now + MAILBOX_INITIAL_RETRY_GRACE, || 2);
-        let silent = mailbox_observation_result(2, true, []);
-        assert_eq!(
-            state.eligible_retry_attempt(Some(&silent)),
-            Some("attempt-1")
-        );
-
-        let marker = mailbox_observation_result(
-            3,
-            true,
-            [(
-                "delayed-marker",
-                "2026-07-26T00:00:00Z",
-                Some("[OULIPOLY-DELIVERY attempt-1]"),
-            )],
-        );
-        assert!(!state.begin_retry("attempt-1", Some(&marker)));
-        assert_eq!(state.eligible_retry_attempt(Some(&marker)), None);
-    }
-
-    #[test]
-    fn mailbox_retry_preserves_later_unmarked_turn_release() {
-        let now = Instant::now();
-        let mut state = mailbox_retry_state(now);
-        state.request_fresh_if_due(now + MAILBOX_INITIAL_RETRY_GRACE, || 2);
-        let later_turn = mailbox_observation_result(
-            2,
-            true,
-            [(
-                "later-turn",
-                "2026-07-26T00:00:00Z",
-                Some("ordinary later user input"),
-            )],
-        );
-        let OutboundObservationResult::Available(observation) = &later_turn else {
-            unreachable!()
-        };
-        assert_eq!(
-            mailbox_delivery_observation_disposition(
-                &state.retry_owner.as_ref().unwrap().window,
-                observation,
-            )
-            .unwrap(),
-            MailboxDeliveryObservationDisposition::FailUnobserved
-        );
-        assert!(!state.begin_retry("attempt-1", Some(&later_turn)));
-    }
-
-    #[test]
-    fn mailbox_retry_backoff_is_capped_without_terminal_exhaustion() {
-        let now = Instant::now();
-        let mut state = mailbox_retry_state(now);
-        assert_eq!(
-            state.retry_owner.as_ref().unwrap().next_retry_not_before,
-            now + Duration::from_secs(30)
-        );
-
-        for (ordinal, expected_delay) in [60, 120, 240, 300, 300, 300].into_iter().enumerate() {
-            let due = state.retry_owner.as_ref().unwrap().next_retry_not_before;
-            let generation = ordinal as u64 + 1;
-            assert_eq!(
-                state.request_fresh_if_due(due, || generation),
-                Some(generation)
-            );
-            let observation = mailbox_observation_result(generation, true, []);
-            assert!(state.begin_retry("attempt-1", Some(&observation)));
-            state.finish_retry(due);
-            let owner = state.retry_owner.as_ref().unwrap();
-            assert_eq!(owner.last_submit_at, due);
-            assert_eq!(
-                owner.next_retry_not_before,
-                due + Duration::from_secs(expected_delay)
-            );
-        }
-        assert_eq!(state.retry_owner.as_ref().unwrap().retry_ordinal, 6);
-    }
-
-    #[test]
-    fn mailbox_retry_generation_and_phase_are_single_flight() {
-        let now = Instant::now();
-        let mut state = mailbox_retry_state(now);
-        let due = now + MAILBOX_INITIAL_RETRY_GRACE;
-        let mut requests = 0;
-        assert_eq!(
-            state.request_fresh_if_due(due, || {
-                requests += 1;
-                4
-            }),
-            Some(4)
-        );
-        assert_eq!(
-            state.request_fresh_if_due(due, || {
-                requests += 1;
-                5
-            }),
-            None
-        );
-        assert_eq!(requests, 1);
-
-        let observation = mailbox_observation_result(4, true, []);
-        assert!(state.begin_retry("attempt-1", Some(&observation)));
-        assert!(!state.begin_retry("attempt-1", Some(&observation)));
-        state.finish_retry(due);
-        assert_eq!(state.eligible_retry_attempt(Some(&observation)), None);
-        assert_eq!(
-            state.request_fresh_if_due(due + Duration::from_secs(60), || 5),
-            Some(5)
-        );
-    }
-
-    #[test]
-    fn mailbox_delivery_observation_confirms_exact_provider_marker() {
-        let window = mailbox_delivery_window("attempt-1", "2026-07-25T20:56:23Z");
-        let observation = mailbox_observation([(
-            "marker-turn",
-            "2026-07-25T20:56:24Z",
-            Some("prefix [OULIPOLY-DELIVERY attempt-1] suffix"),
-        )]);
-
-        assert_eq!(
-            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
-            MailboxDeliveryObservationDisposition::Confirm
-        );
-    }
-
-    #[test]
-    fn mailbox_delivery_observation_retries_after_complete_later_turn_without_marker() {
-        let window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
-        let observation = mailbox_observation([(
-            "later-turn",
-            "2026-07-25T19:57:25Z",
-            Some("ordinary user input"),
-        )]);
-
-        assert_eq!(
-            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
-            MailboxDeliveryObservationDisposition::FailUnobserved
-        );
-    }
-
-    #[test]
-    fn mailbox_delivery_observation_retries_unmarked_attempt_from_previous_invocation() {
-        let mut window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
-        window.delivery_invocation_uuid = "previous-invocation".to_string();
-        let observation = mailbox_observation([]);
-
-        assert_eq!(
-            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
-            MailboxDeliveryObservationDisposition::FailUnobserved
-        );
-    }
-
-    #[test]
-    fn mailbox_delivery_observation_confirms_previous_invocation_marker() {
-        let mut window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
-        window.delivery_invocation_uuid = "previous-invocation".to_string();
-        let observation = mailbox_observation([(
-            "marker-turn",
-            "2026-07-25T19:56:24Z",
-            Some("[OULIPOLY-DELIVERY attempt-1]"),
-        )]);
-
-        assert_eq!(
-            mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
-            MailboxDeliveryObservationDisposition::Confirm
-        );
-    }
-
-    #[test]
-    fn control_input_readiness_prefers_terminal_signal_with_bounded_fallback() {
-        assert!(validate_control_input_ready(true, true, Duration::ZERO).is_ok());
-        assert!(
-            validate_control_input_ready(false, false, CONTROL_PRIMARY_SCREEN_READY_FALLBACK)
-                .is_ok()
-        );
-        assert_eq!(
-            validate_control_input_ready(
-                false,
-                false,
-                CONTROL_PRIMARY_SCREEN_READY_FALLBACK - Duration::from_millis(1)
-            ),
-            Err("unsafe_provider_starting".to_string())
-        );
-        assert_eq!(
-            validate_control_input_ready(false, true, CONTROL_PRIMARY_SCREEN_READY_FALLBACK),
-            Err("unsafe_provider_starting".to_string())
-        );
-    }
-
-    #[test]
-    fn mailbox_delivery_observation_does_not_infer_loss_from_unprojected_or_older_turns() {
-        let window = mailbox_delivery_window("attempt-1", "2026-07-25T19:56:22Z");
-        for observation in [
-            mailbox_observation([("later-unprojected", "2026-07-25T19:57:25Z", None)]),
-            mailbox_observation([(
-                "older-turn",
-                "2026-07-25T19:55:25Z",
-                Some("ordinary user input"),
-            )]),
-        ] {
-            assert_eq!(
-                mailbox_delivery_observation_disposition(&window, &observation).unwrap(),
-                MailboxDeliveryObservationDisposition::Await
-            );
-        }
-    }
-
     fn queued_pane(body: &str, _now: Instant) -> MonitorPane {
         let mut pane = MonitorPane::new();
         pane.outbound.enqueue(body.to_string());
         pane
-    }
-
-    fn mailbox_delivery_window(attempt_id: &str, acknowledged_at: &str) -> MailboxDeliveryWindow {
-        MailboxDeliveryWindow {
-            attempt_id: attempt_id.to_string(),
-            session_id: "fixture-session".to_string(),
-            delivery_invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
-            acknowledged_at: Some(acknowledged_at.to_string()),
-            resolved_at: None,
-            rows: Vec::new(),
-            remaining_count: 0,
-        }
-    }
-
-    fn mailbox_retry_state(now: Instant) -> MailboxDeliveryObservationState {
-        let mut state = MailboxDeliveryObservationState {
-            session_id: Some("fixture-session".to_string()),
-            invocation_uuid: Some("11111111-1111-4111-8111-111111111111".to_string()),
-            ..MailboxDeliveryObservationState::default()
-        };
-        state.adopt_windows(
-            vec![mailbox_delivery_window("attempt-1", "2026-07-25T20:56:23Z")],
-            now,
-        );
-        state
-    }
-
-    fn mailbox_observation<const N: usize>(
-        turns: [(&str, &str, Option<&str>); N],
-    ) -> OutboundObservation {
-        OutboundObservation {
-            identity: outbound_identity(),
-            generation: 1,
-            complete: true,
-            turn_count: turns.len() as u64,
-            turn_ids: turns
-                .iter()
-                .map(|(turn_id, _, _)| (*turn_id).to_string())
-                .collect(),
-            user_turns: turns
-                .into_iter()
-                .map(|(turn_id, timestamp, body)| ObservedUserTurn {
-                    turn_id: turn_id.to_string(),
-                    timestamp: DateTime::parse_from_rfc3339(timestamp)
-                        .unwrap()
-                        .with_timezone(&Utc),
-                    body: body.map(str::to_string),
-                })
-                .collect(),
-        }
-    }
-
-    fn mailbox_observation_result<const N: usize>(
-        generation: u64,
-        complete: bool,
-        turns: [(&str, &str, Option<&str>); N],
-    ) -> OutboundObservationResult {
-        let mut observation = mailbox_observation(turns);
-        observation.generation = generation;
-        observation.complete = complete;
-        OutboundObservationResult::Available(Box::new(observation))
     }
 
     fn sent_pane<const N: usize>(
