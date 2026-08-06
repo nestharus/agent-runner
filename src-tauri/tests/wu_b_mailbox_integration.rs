@@ -570,12 +570,21 @@ fn completion_registration_requires_both_owner_fields() {
     assert_eq!(output.status.code(), Some(74), "{output:?}");
     let json = stdout_json(&output);
     assert_eq!(json["status"], "notification_event_error");
-    assert!(
-        json["message"]
-            .as_str()
-            .unwrap()
-            .contains("supplied together")
-    );
+    assert!(json["message"].as_str().unwrap().contains("both required"));
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_rejects_ownerless_metadata() {
+    let fixture = Fixture::new();
+    let artifacts = fixture.write_notify_artifacts("h-ownerless", json!({}), 0);
+
+    let output = fixture.run_register_artifacts("h-ownerless", "async", &artifacts);
+
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    let json = stdout_json(&output);
+    assert_eq!(json["status"], "notification_event_error");
+    assert!(json["message"].as_str().unwrap().contains("both required"));
     fixture.assert_default_user_paths_untouched();
 }
 

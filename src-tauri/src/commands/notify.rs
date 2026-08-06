@@ -199,16 +199,14 @@ fn register_completion_event(
 ) -> Result<CompletionEventRegistrationResult, String> {
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
-    if let Some(owner) = owner.as_ref() {
-        validate_owner_binding(owner)?;
-    }
+    validate_owner_binding(&owner)?;
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut mailbox = MailboxDb::open_default()?;
     mailbox.register_completion_event(CompletionEventRegistrationInput {
         event_id: args.handle,
         delivery_mode: args.delivery_mode,
-        owner_session_id: owner.as_ref().map(|owner| owner.session_id.as_str()),
-        owner_invocation_uuid: owner.as_ref().map(|owner| owner.invocation_uuid.as_str()),
+        owner_session_id: Some(owner.session_id.as_str()),
+        owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
         state_dir: &paths.state_dir,
         meta_path: &paths.meta_path,
         log_path: &paths.log_path,
@@ -291,18 +289,16 @@ fn deliver_event_listeners(
         .collect()
 }
 
-fn parse_owner_binding(metadata: &Value) -> Result<Option<OwnerBinding>, String> {
+fn parse_owner_binding(metadata: &Value) -> Result<OwnerBinding, String> {
     let session_id = optional_nonempty_string(metadata, "owner_session_id")?;
     let invocation_uuid = optional_nonempty_string(metadata, "owner_invocation_uuid")?;
     match (session_id, invocation_uuid) {
-        (Some(session_id), Some(invocation_uuid)) => Ok(Some(OwnerBinding {
+        (Some(session_id), Some(invocation_uuid)) => Ok(OwnerBinding {
             session_id,
             invocation_uuid,
-        })),
-        (None, None) => Ok(None),
+        }),
         _ => Err(
-            "meta.json owner_session_id and owner_invocation_uuid must be supplied together"
-                .to_string(),
+            "meta.json owner_session_id and owner_invocation_uuid are both required".to_string(),
         ),
     }
 }

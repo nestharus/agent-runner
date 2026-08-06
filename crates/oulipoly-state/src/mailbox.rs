@@ -5468,10 +5468,7 @@ fn validate_completion_event_registration(
         {
             Ok(())
         }
-        (None, None) => Ok(()),
-        _ => Err(
-            "Completion event owner session and invocation must be supplied together".to_string(),
-        ),
+        _ => Err("Completion event owner session and invocation are both required".to_string()),
     }
 }
 
@@ -5608,7 +5605,7 @@ fn register_completion_event_listener(
     let (Some(session_id), Some(invocation_uuid)) =
         (input.owner_session_id, input.owner_invocation_uuid)
     else {
-        return Ok(());
+        return Err("Completion event owner session and invocation are both required".to_string());
     };
     if let Some(listener) = completion_event_listener_on(tx, input.event_id, invocation_uuid)? {
         return validate_completion_event_listener_replay(&listener, session_id, invocation_uuid);
@@ -6841,6 +6838,29 @@ mod tests {
             "pending"
         );
         assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn completion_event_registration_requires_an_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "ab_ownerless";
+
+        let error = db
+            .register_completion_event(CompletionEventRegistrationInput {
+                owner_session_id: None,
+                owner_invocation_uuid: None,
+                ..completion_registration(
+                    event_id,
+                    "async",
+                    "session-a",
+                    "11111111-1111-4111-8111-111111111111",
+                )
+            })
+            .unwrap_err();
+
+        assert!(error.contains("both required"));
+        assert!(db.completion_event(event_id).unwrap().is_none());
     }
 
     #[test]
