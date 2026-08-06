@@ -205,7 +205,7 @@ pub(super) fn execute_interactive_child(
     let real_tty = RealTerminal::open()?;
     let winsize = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
     let pty = PtyPair::open(&winsize, &real_tty.original)?;
-    let control = ControlSocket::bind_for(context)?;
+    let mut control = ControlSocket::bind_for(context)?;
     configure_child_pty(&mut cmd, &pty)?;
     let recorded_context = control.as_ref().and_then(|control| {
         context.map(|context| context.with_pty_control_path(control.path_string()))
@@ -219,6 +219,9 @@ pub(super) fn execute_interactive_child(
             return Err(format_provider_spawn_error(&provider.command, err));
         }
     };
+    if let Some(control) = control.as_mut() {
+        control.mark_child_spawned();
+    }
     if let Err(err) = record_child_identity(child.id(), generation_context) {
         let _ = child.kill();
         let _ = child.wait();
@@ -252,7 +255,7 @@ pub(super) fn execute_interactive_child_observed(
     let full = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
     let child_winsize = tui::top_pane_winsize(&full);
     let pty = PtyPair::open(&child_winsize, &real_tty.original)?;
-    let control = ControlSocket::bind_for(context)?;
+    let mut control = ControlSocket::bind_for(context)?;
     configure_child_pty(&mut cmd, &pty)?;
     let provider_session =
         provider_session_observation_context(provider, context, provider_inspect);
@@ -274,6 +277,9 @@ pub(super) fn execute_interactive_child_observed(
             return Err(format_provider_spawn_error(&provider.command, err));
         }
     };
+    if let Some(control) = control.as_mut() {
+        control.mark_child_spawned();
+    }
     if let Err(err) = record_child_identity(child.id(), generation_context) {
         let _ = child.kill();
         let _ = child.wait();
@@ -855,7 +861,7 @@ struct ControlSocket {
     owned_dir: PathBuf,
     session_id: String,
     invocation_uuid: String,
-    started_at: Instant,
+    child_started_at: Instant,
 }
 
 impl ControlSocket {
@@ -874,7 +880,7 @@ impl ControlSocket {
             owned_dir: dir,
             session_id: session_id.to_string(),
             invocation_uuid: invocation_uuid.to_string(),
-            started_at: Instant::now(),
+            child_started_at: Instant::now(),
         }))
     }
 
@@ -894,8 +900,12 @@ impl ControlSocket {
         &self.invocation_uuid
     }
 
+    fn mark_child_spawned(&mut self) {
+        self.child_started_at = Instant::now();
+    }
+
     fn age(&self) -> Duration {
-        self.started_at.elapsed()
+        self.child_started_at.elapsed()
     }
 }
 
