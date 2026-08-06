@@ -48,7 +48,8 @@ use oulipoly_state::StateDb;
 use crate::zero_turn_orchestration::{
     HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
     ZeroTurnEvidence, classify_accepted_provider_turn, classify_completion,
-    classify_completion_delta, record_baseline, record_baseline_with_completion,
+    classify_completion_delta, is_incomplete_tool_boundary, record_baseline,
+    record_baseline_with_completion,
 };
 fn zero_turn_zero_counts() -> oulipoly_state::SessionTurnCounts {
     session_turn_counts(0, 0, 0)
@@ -146,15 +147,20 @@ pub(crate) fn zero_turn_classify_after_completion_with_recovery(
     baseline: &ZeroTurnBaseline,
     host_observed: HostObservedCompletion,
     result: &executor::ExecutionResult,
-) -> (ZeroTurnClassification, bool) {
+) -> (ZeroTurnClassification, bool, bool) {
     let completion = classify_after_completion(state, sessions_cfg, baseline, host_observed);
     let recovered = recovered_generic_nonzero(completion.accepted_provider_turn, result);
-    (completion.classification, recovered)
+    (
+        completion.classification,
+        recovered,
+        completion.incomplete_tool_boundary,
+    )
 }
 
 struct CompletionClassification {
     classification: ZeroTurnClassification,
     accepted_provider_turn: bool,
+    incomplete_tool_boundary: bool,
 }
 
 fn classify_after_completion(
@@ -167,11 +173,13 @@ fn classify_after_completion(
         return completion_classification(
             classify_completion(baseline, zero_turn_zero_counts(), host_observed),
             false,
+            false,
         );
     };
     if baseline.scan_failed {
         return completion_classification(
             classify_completion(baseline, zero_turn_zero_counts(), host_observed),
+            false,
             false,
         );
     }
@@ -182,7 +190,11 @@ fn classify_after_completion(
         session_id,
     );
     if scan_report_has_errors(&report) {
-        return completion_classification(ZeroTurnClassification::UnclassifiedScanFailed, false);
+        return completion_classification(
+            ZeroTurnClassification::UnclassifiedScanFailed,
+            false,
+            false,
+        );
     }
     let Some(counts) =
         turn_counts_or_scan_failed(state.count_session_turns(&baseline.provider_name, session_id))
@@ -190,28 +202,31 @@ fn classify_after_completion(
         return completion_classification(
             classify_completion(baseline, zero_turn_zero_counts(), host_observed),
             false,
+            false,
         );
     };
-    let accepted_provider_turn = classify_accepted_provider_turn(
-        baseline,
-        counts.clone(),
-        false,
-        report.assistant_completions.get(session_id),
-    )
-    .is_some();
+    let current_completion = report.assistant_completions.get(session_id);
+    let accepted_provider_turn =
+        classify_accepted_provider_turn(baseline, counts.clone(), false, current_completion)
+            .is_some();
+    let incomplete_tool_boundary =
+        is_incomplete_tool_boundary(baseline, counts.clone(), false, current_completion);
     completion_classification(
         classify_completion(baseline, counts, host_observed),
         accepted_provider_turn,
+        incomplete_tool_boundary,
     )
 }
 
 fn completion_classification(
     classification: ZeroTurnClassification,
     accepted_provider_turn: bool,
+    incomplete_tool_boundary: bool,
 ) -> CompletionClassification {
     CompletionClassification {
         classification,
         accepted_provider_turn,
+        incomplete_tool_boundary,
     }
 }
 

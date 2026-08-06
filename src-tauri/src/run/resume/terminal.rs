@@ -79,7 +79,7 @@ fn apply_resume_attempt_classification(
     result: &mut executor::ExecutionResult,
 ) -> (ZeroTurnAction, bool) {
     apply_age153_terminal_signal_fixture_override(result);
-    let (zero_turn_classification, recovered_generic_nonzero) =
+    let (zero_turn_classification, recovered_generic_nonzero, incomplete_tool_boundary) =
         zero_turn_classify_after_completion_with_recovery(
             &input.env.state,
             &input.env.sessions_cfg,
@@ -88,6 +88,9 @@ fn apply_resume_attempt_classification(
             result,
         );
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
+    if incomplete_tool_boundary {
+        apply_incomplete_tool_boundary_failure(result, provider_name);
+    }
     let action = next_action(
         input.zero_turn_confirmation,
         zero_turn_classification_for_action(
@@ -98,6 +101,27 @@ fn apply_resume_attempt_classification(
         ),
     );
     (action, recovered_generic_nonzero)
+}
+
+fn apply_incomplete_tool_boundary_failure(
+    result: &mut executor::ExecutionResult,
+    provider_name: &str,
+) {
+    const REASON: &str = "incomplete_tool_boundary";
+    result.terminal_reason = Some(REASON.to_string());
+    result.terminal_signal = Some(executor::TerminalSignal {
+        kind: oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::Unknown,
+        provider_name: provider_name.to_string(),
+        evidence:
+            "provider exited after a new assistant tool-calls boundary without a terminal stop"
+                .to_string(),
+        observed_at: std::time::SystemTime::now(),
+    });
+    result.produced_assistant_response = false;
+    result.resume_acceptance = Some(executor::ResumeAcceptanceResult {
+        status: executor::ResumeAcceptanceStatus::Rejected,
+        evidence: Some(REASON.to_string()),
+    });
 }
 
 fn handle_resume_attempt_terminal_signal(
@@ -257,4 +281,61 @@ fn emit_recovered_resume_terminal_signal_marker(
         terminal_signal_ctx.session_id,
         &mut terminal_signal_ctx.stderr,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_incomplete_tool_boundary_failure;
+    use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
+    use oulipoly_runtime::executor::{
+        ExecutionResult, ResumeAcceptanceStatus, SessionCaptureMethod, SessionCaptureResult,
+    };
+
+    fn clean_result() -> ExecutionResult {
+        ExecutionResult {
+            stdout: b"tool output".to_vec(),
+            stderr: String::new(),
+            exit_code: 0,
+            provider_index: 0,
+            session_capture: SessionCaptureResult {
+                session_id: None,
+                method: SessionCaptureMethod::None,
+            },
+            resume_acceptance: None,
+            terminal_reason: None,
+            terminal_signal: None,
+            produced_assistant_response: true,
+            submitted_user_turn: None,
+            captured_child_invocations: Vec::new(),
+            returned_artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn incomplete_tool_boundary_projects_non_success_resume_result() {
+        let mut result = clean_result();
+
+        apply_incomplete_tool_boundary_failure(&mut result, "opencode");
+
+        assert_eq!(
+            result.exit_code, 0,
+            "preserve the provider's physical exit code"
+        );
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("incomplete_tool_boundary")
+        );
+        assert!(!result.produced_assistant_response);
+        assert_eq!(
+            result.terminal_signal.as_ref().map(|signal| signal.kind),
+            Some(TerminalSignalKind::Unknown)
+        );
+        assert_eq!(
+            result
+                .resume_acceptance
+                .as_ref()
+                .map(|acceptance| acceptance.status),
+            Some(ResumeAcceptanceStatus::Rejected)
+        );
+    }
 }

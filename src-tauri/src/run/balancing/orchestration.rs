@@ -484,7 +484,7 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
         provider_session_id.as_deref(),
         input.zero_turn_baseline,
     );
-    let (zero_turn_classification, recovered_generic_nonzero) =
+    let (zero_turn_classification, recovered_generic_nonzero, _) =
         zero_turn_classify_after_completion_with_recovery(
             &input.env.state,
             &input.env.sessions_cfg,

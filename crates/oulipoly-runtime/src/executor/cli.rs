@@ -269,6 +269,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn provider_exit_cleans_same_group_service_children_before_drain_join() {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("leaked-service");
+        let script = fixture_script(&format!(
+            "(trap '' TERM; sleep 2; printf leaked > '{}') &\nprintf 'completed answer\\n'\nexit 0",
+            marker.display()
+        ));
+        let started = Instant::now();
+
+        let result = age141_execute_script_with_config(&script, age141_supervisor_config());
+
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "provider cleanup must not wait for a leaked service child to exit naturally"
+        );
+        assert!(
+            !marker.exists(),
+            "same-group provider service child survived normal root exit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn t08_terminal_signal_nonzero_exit() {
         let script = fixture_script("exit 42");
 

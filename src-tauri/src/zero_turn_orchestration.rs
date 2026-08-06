@@ -280,6 +280,30 @@ pub fn classify_accepted_provider_turn(
     Some(map_accepted_provider_turn_evidence(baseline, validated))
 }
 
+pub fn is_incomplete_tool_boundary(
+    baseline: &ZeroTurnBaseline,
+    end_count: SessionTurnCounts,
+    post_scan_failed: bool,
+    current: Option<&AssistantCompletionRecord>,
+) -> bool {
+    if post_scan_failed {
+        return false;
+    }
+    let Ok(delta) = validate_turn_delta(baseline, end_count) else {
+        return false;
+    };
+    let (Some(baseline_completion), Some(current)) =
+        (baseline.baseline_assistant_completion.as_ref(), current)
+    else {
+        return false;
+    };
+    delta.new_assistant_turns > 0
+        && baseline_completion.session_id == delta.provider_session_id
+        && current.session_id == delta.provider_session_id
+        && assistant_completion_cursor_is_newer(current, baseline_completion)
+        && current.completion_outcome.as_deref() == Some("tool-calls")
+}
+
 struct ValidatedAcceptedProviderTurn<'a> {
     delta: ValidatedTurnDelta<'a>,
     baseline_completion: &'a AssistantCompletionRecord,
@@ -389,7 +413,7 @@ mod tests {
         HostObservedCompletion, ZeroTurnAction, ZeroTurnBaseline, ZeroTurnClassification,
         ZeroTurnConfirmationKey, ZeroTurnConfirmationState, ZeroTurnEvidence,
         classify_accepted_provider_turn, classify_completion, classify_completion_delta,
-        next_action, record_baseline, record_baseline_with_completion,
+        is_incomplete_tool_boundary, next_action, record_baseline, record_baseline_with_completion,
     };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_runtime::sessions::AssistantCompletionRecord;
@@ -532,6 +556,35 @@ mod tests {
             classify_accepted_provider_turn(&baseline, counts(4), true, Some(&current)).is_none(),
             "degraded post-scan must not be accepted"
         );
+    }
+
+    #[test]
+    fn incomplete_tool_boundary_requires_new_exact_session_tool_call_cursor() {
+        let current = completion(
+            "session-1",
+            "turn-4",
+            "2026-04-17T08:00:01Z",
+            Some("tool-calls"),
+        );
+
+        assert!(is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(4),
+            false,
+            Some(&current),
+        ));
+        assert!(!is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(4),
+            true,
+            Some(&current),
+        ));
+        assert!(!is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(3),
+            false,
+            Some(&current),
+        ));
     }
 
     #[test]

@@ -148,6 +148,7 @@ fn execute_with_supervisor(
         }
     };
     let drains = drain::start_child_drains(&mut child)?;
+    let child_process_group = child.id();
     let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -198,6 +199,7 @@ fn execute_with_supervisor(
         );
     };
 
+    termination::cleanup_process_group_after_child_exit(child_process_group)?;
     drain::finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
     observe_streamed_session_id(
         capture_plan,
