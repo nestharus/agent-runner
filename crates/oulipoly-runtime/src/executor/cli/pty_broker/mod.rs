@@ -2166,17 +2166,19 @@ fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), S
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("Mailbox sidecar disappeared while acknowledging delivery".to_string());
     };
-    if !db.record_delivery_attempt_transport_ack(attempt_id)? {
-        Err(format!(
-            "Mailbox delivery attempt {attempt_id} is no longer registered"
-        ))
-    } else if db.confirm_delivery_attempt(attempt_id)? {
-        Ok(())
-    } else {
-        Err(format!(
-            "Mailbox delivery attempt {attempt_id} could not be confirmed"
-        ))
+    let acknowledged = db.record_delivery_attempt_transport_ack(attempt_id)?;
+    if acknowledged && db.confirm_delivery_attempt(attempt_id)? {
+        return Ok(());
     }
+    if matches!(
+        db.delivery_attempt_disposition(attempt_id)?,
+        Some(oulipoly_state::mailbox::MailboxDeliveryAttemptDisposition::Resolved)
+    ) {
+        return Ok(());
+    }
+    Err(format!(
+        "Mailbox delivery attempt {attempt_id} could not be confirmed"
+    ))
 }
 
 fn delivery_attempt_id(payload: &[u8]) -> Option<String> {

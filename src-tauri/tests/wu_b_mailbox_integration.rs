@@ -145,6 +145,16 @@ impl Fixture {
         self.run(cmd)
     }
 
+    fn run_activate(&self, handle: &str) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        cmd.arg("notify")
+            .arg("agent-bash-activate")
+            .arg("--handle")
+            .arg(handle)
+            .arg("--json");
+        self.run(cmd)
+    }
+
     fn run_mailbox_list(&self, session_id: &str, all: bool) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("mailbox")
@@ -467,6 +477,43 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
 }
 
 #[test]
+fn completion_response_reports_delivery_for_every_listener_session() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_B, SESSION_B);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-multi-listener",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
+    let first = fixture.run_register_artifacts("h-multi-listener", "async", &artifacts);
+    fs::write(
+        &artifacts.meta,
+        serde_json::to_string(&owner_metadata(SESSION_B, INVOCATION_B)).unwrap(),
+    )
+    .unwrap();
+    let second = fixture.run_register_artifacts("h-multi-listener", "async", &artifacts);
+
+    assert!(first.status.success(), "{first:?}");
+    assert!(second.status.success(), "{second:?}");
+    let completion = fixture.run_notify_artifacts("h-multi-listener", &artifacts);
+
+    assert!(completion.status.success(), "{completion:?}");
+    let completed = stdout_json(&completion);
+    assert_eq!(completed["pty_deliveries"].as_array().unwrap().len(), 2);
+    assert!(
+        completed["pty_deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["status"] == "no_runtime")
+    );
+    assert_eq!(fixture.mailbox_rows(SESSION_A, false).len(), 1);
+    assert_eq!(fixture.mailbox_rows(SESSION_B, false).len(), 1);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn completion_registration_rejects_an_unbound_session() {
     let fixture = Fixture::new();
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
@@ -533,6 +580,48 @@ fn completion_registration_requires_both_owner_fields() {
 }
 
 #[test]
+fn completion_registration_rejects_non_object_metadata() {
+    let fixture = Fixture::new();
+    let artifacts = fixture.write_notify_artifacts("h-invalid-meta", json!([]), 0);
+
+    let output = fixture.run_register_artifacts("h-invalid-meta", "async", &artifacts);
+
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    let json = stdout_json(&output);
+    assert_eq!(json["status"], "notification_event_error");
+    assert_eq!(json["message"], "meta.json must contain a JSON object");
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn synchronous_completion_materializes_only_after_activation() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-sync-activate",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
+    let registration = fixture.run_register_artifacts("h-sync-activate", "sync", &artifacts);
+    let completion = fixture.run_notify_artifacts("h-sync-activate", &artifacts);
+
+    assert!(registration.status.success(), "{registration:?}");
+    assert!(completion.status.success(), "{completion:?}");
+    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+
+    let activation = fixture.run_activate("h-sync-activate");
+
+    assert!(activation.status.success(), "{activation:?}");
+    let activated = stdout_json(&activation);
+    assert_eq!(activated["status"], "activated");
+    assert_eq!(activated["listener_count"], 1);
+    let rows = fixture.mailbox_rows(SESSION_A, true);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].handle, "h-sync-activate");
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
 fn completion_trigger_is_idempotent_for_the_registered_handle() {
     let fixture = Fixture::new();
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
@@ -572,6 +661,10 @@ fn completion_trigger_is_idempotent_for_the_registered_handle() {
     assert_eq!(
         serde_json::from_str::<Value>(&retained_payload).unwrap()["handle"],
         "h-idem"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&retained_payload).unwrap()["meta"]["spooler_extra"],
+        "preserve-me"
     );
     assert_eq!(
         rows[0].payload_sha256.as_deref(),

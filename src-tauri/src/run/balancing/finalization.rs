@@ -278,9 +278,6 @@ fn emit_completed_attempt_failure(
 
 fn mark_balanced_attempt_idle(input: &CompletedAttemptInput<'_, '_, '_>, exit_code: Option<i32>) {
     if finalize_balanced_pty_handoff(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        input.provider_name,
         input.zero_turn_provider_session_id,
         &input.invocation.id,
         exit_code,
@@ -308,9 +305,6 @@ fn mark_balanced_successful_attempt_idle_and_recheck(
     exit_code: i32,
 ) {
     if finalize_balanced_pty_handoff(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        input.provider_name,
         input.zero_turn_provider_session_id,
         &input.invocation.id,
         Some(exit_code),
@@ -334,9 +328,6 @@ fn mark_balanced_successful_attempt_idle_and_recheck(
 }
 
 fn finalize_balanced_pty_handoff(
-    state: &oulipoly_state::StateDb,
-    sessions_cfg: &oulipoly_config::SessionsConfig,
-    provider_name: &str,
     provider_session_id: Option<&str>,
     invocation_uuid: &str,
     exit_code: Option<i32>,
@@ -345,9 +336,6 @@ fn finalize_balanced_pty_handoff(
         return false;
     };
     match crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
-        state,
-        sessions_cfg,
-        provider_name,
         provider_session_id,
         invocation_uuid,
         exit_code,
@@ -380,14 +368,7 @@ fn finalize_returned_artifacts_persist_failure(input: mapper::ArtifactPersistFai
         Ok(_) => input.guard.mark_finalized(),
         Err(err) => formatter::emit_finalize_invocation_warning(err),
     }
-    if !finalize_balanced_pty_handoff(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        input.provider_name,
-        input.provider_session_id,
-        input.invocation_id,
-        Some(1),
-    ) {
+    if !finalize_balanced_pty_handoff(input.provider_session_id, input.invocation_id, Some(1)) {
         let Some(provider_session_id) = input.provider_session_id else {
             return;
         };

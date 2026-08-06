@@ -2,8 +2,6 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
-use oulipoly_config::SessionsConfig;
-use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     ExactProcessEvidence, ExitRuntimeGenerationNonOrderly, GenerationMutation, MailboxDb,
     MailboxRow, RuntimeGenerationFence, RuntimeLifecycleState, RuntimeTerminalReason,
@@ -334,6 +332,7 @@ pub(crate) fn attempt_pty_mailbox_delivery_with_trigger(
     _session_id: &str,
     _trigger: &str,
 ) -> PtyMailboxDeliveryDiagnostic {
+    // This platform has no Unix PTY control endpoint; durable listeners remain pending.
     pty_status(false, "not_pty", None, Vec::new(), None, None)
 }
 
@@ -602,9 +601,6 @@ fn acknowledge_injected_pty_delivery_attempts(
 }
 
 pub(crate) fn finalize_pty_mailbox_delivery_handoff(
-    _state: &StateDb,
-    _sessions_cfg: &SessionsConfig,
-    _provider_name: &str,
     session_id: Option<&str>,
     invocation_uuid: &str,
     exit_code: i32,
@@ -612,8 +608,20 @@ pub(crate) fn finalize_pty_mailbox_delivery_handoff(
     let Some(session_id) = session_id else {
         return Ok(false);
     };
-    if let Some(mut mailbox) = MailboxDb::open_default_if_exists()? {
-        acknowledge_injected_pty_delivery_attempts(&mut mailbox, session_id)?;
+    let Some(mut mailbox) = MailboxDb::open_default_if_exists()? else {
+        return Ok(false);
+    };
+    let attempt_ids = mailbox
+        .accepted_delivery_attempt_windows(session_id)?
+        .into_iter()
+        .filter(|window| window.delivery_invocation_uuid == invocation_uuid)
+        .map(|window| window.attempt_id)
+        .collect::<Vec<_>>();
+    if attempt_ids.is_empty() {
+        return Ok(false);
+    }
+    for attempt_id in attempt_ids {
+        mailbox.confirm_delivery_attempt(&attempt_id)?;
     }
     crate::wake_coordinator::mark_session_idle_after_turn(
         session_id,

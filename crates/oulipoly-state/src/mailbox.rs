@@ -1625,7 +1625,12 @@ impl MailboxDb {
             insert_completion_event(&tx, &input, &now)?;
             true
         };
-        register_completion_event_listener(&tx, &input, &now)?;
+        register_completion_event_listener(
+            &tx,
+            &input,
+            existing.is_some_and(|event| event.state == "triggered"),
+            &now,
+        )?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
         self.completion_event_registration(input.event_id, inserted)
@@ -5597,6 +5602,7 @@ fn validate_completion_event_registration_replay(
 fn register_completion_event_listener(
     tx: &Transaction<'_>,
     input: &CompletionEventRegistrationInput<'_>,
+    listeners_frozen: bool,
     now: &str,
 ) -> Result<(), String> {
     let (Some(session_id), Some(invocation_uuid)) =
@@ -5604,6 +5610,15 @@ fn register_completion_event_listener(
     else {
         return Ok(());
     };
+    if let Some(listener) = completion_event_listener_on(tx, input.event_id, invocation_uuid)? {
+        return validate_completion_event_listener_replay(&listener, session_id, invocation_uuid);
+    }
+    if listeners_frozen {
+        return Err(format!(
+            "Completion event {} cannot register a listener after it was triggered",
+            input.event_id
+        ));
+    }
     tx.execute(
         "INSERT OR IGNORE INTO completion_event_listener (
             event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
@@ -5617,33 +5632,50 @@ fn register_completion_event_listener(
         ],
     )
     .map_err(|err| format!("Failed to register completion event listener: {err}"))?;
-    let listener = tx
-        .query_row(
-            "SELECT event_id, listener_id, session_id, owner_invocation_uuid, active,
-                    mailbox_seq, acknowledged_at, acknowledgement_reason
-             FROM completion_event_listener
-             WHERE event_id = ?1 AND listener_id = ?2",
-            params![input.event_id, invocation_uuid],
-            |row| {
-                Ok(CompletionEventListenerRow {
-                    event_id: row.get(0)?,
-                    listener_id: row.get(1)?,
-                    session_id: row.get(2)?,
-                    owner_invocation_uuid: row.get(3)?,
-                    active: row.get(4)?,
-                    mailbox_seq: row.get(5)?,
-                    acknowledged_at: row.get(6)?,
-                    acknowledgement_reason: row.get(7)?,
-                })
-            },
-        )
-        .map_err(|err| format!("Failed to read registered completion listener: {err}"))?;
+    let listener = completion_event_listener_on(tx, input.event_id, invocation_uuid)?
+        .ok_or_else(|| "Registered completion listener disappeared".to_string())?;
+    validate_completion_event_listener_replay(&listener, session_id, invocation_uuid)
+}
+
+fn completion_event_listener_on(
+    conn: &Connection,
+    event_id: &str,
+    listener_id: &str,
+) -> Result<Option<CompletionEventListenerRow>, String> {
+    conn.query_row(
+        "SELECT event_id, listener_id, session_id, owner_invocation_uuid, active,
+                mailbox_seq, acknowledged_at, acknowledgement_reason
+         FROM completion_event_listener
+         WHERE event_id = ?1 AND listener_id = ?2",
+        params![event_id, listener_id],
+        |row| {
+            Ok(CompletionEventListenerRow {
+                event_id: row.get(0)?,
+                listener_id: row.get(1)?,
+                session_id: row.get(2)?,
+                owner_invocation_uuid: row.get(3)?,
+                active: row.get(4)?,
+                mailbox_seq: row.get(5)?,
+                acknowledged_at: row.get(6)?,
+                acknowledgement_reason: row.get(7)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read registered completion listener: {err}"))
+}
+
+fn validate_completion_event_listener_replay(
+    listener: &CompletionEventListenerRow,
+    session_id: &str,
+    invocation_uuid: &str,
+) -> Result<(), String> {
     if listener.session_id == session_id && listener.owner_invocation_uuid == invocation_uuid {
         Ok(())
     } else {
         Err(format!(
             "Completion event {} listener registration conflicts with its durable identity",
-            input.event_id
+            listener.event_id
         ))
     }
 }
@@ -5728,6 +5760,7 @@ fn acknowledge_consumed_completion_event_listeners(
     event_id: &str,
     now: &str,
 ) -> Result<(), String> {
+    let session_ids = completion_event_listener_session_ids(tx, event_id)?;
     tx.execute(
         "UPDATE mailbox
          SET delivered_at = COALESCE(delivered_at, ?2),
@@ -5736,12 +5769,14 @@ fn acknowledge_consumed_completion_event_listeners(
                  (SELECT owner_invocation_uuid
                   FROM completion_event_listener
                   WHERE completion_event_listener.mailbox_seq = mailbox.seq)
-             )
+             ),
+             delivery_attempts = delivery_attempts + 1,
+             delivery_error = NULL
          WHERE seq IN (
              SELECT mailbox_seq
              FROM completion_event_listener
              WHERE event_id = ?1 AND mailbox_seq IS NOT NULL
-         )",
+         ) AND delivered_at IS NULL",
         params![event_id, now],
     )
     .map_err(|err| format!("Failed to consume completion event mailbox rows: {err}"))?;
@@ -5753,8 +5788,29 @@ fn acknowledge_consumed_completion_event_listeners(
          WHERE event_id = ?1",
         params![event_id, now],
     )
-    .map(|_| ())
-    .map_err(|err| format!("Failed to acknowledge consumed completion listeners: {err}"))
+    .map_err(|err| format!("Failed to acknowledge consumed completion listeners: {err}"))?;
+    for session_id in session_ids {
+        resolve_completed_delivery_attempts(tx, &session_id, now, None)?;
+    }
+    Ok(())
+}
+
+fn completion_event_listener_session_ids(
+    conn: &Connection,
+    event_id: &str,
+) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT session_id
+             FROM completion_event_listener
+             WHERE event_id = ?1 AND mailbox_seq IS NOT NULL",
+        )
+        .map_err(|err| format!("Failed to prepare completion listener session query: {err}"))?;
+    let rows = statement
+        .query_map(params![event_id], |row| row.get(0))
+        .map_err(|err| format!("Failed to query completion listener sessions: {err}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read completion listener session: {err}"))
 }
 
 fn materialize_completion_event_listeners(
@@ -6732,6 +6788,59 @@ mod tests {
         assert!(first.acknowledged_at.is_some());
         assert_eq!(first.acknowledgement_reason.as_deref(), Some("injected"));
         assert!(second.acknowledged_at.is_none());
+        let late_listener = db
+            .register_completion_event(completion_registration(
+                event_id,
+                "async",
+                "session-c",
+                "33333333-3333-4333-8333-333333333333",
+            ))
+            .unwrap_err();
+        assert!(late_listener.contains("after it was triggered"));
+    }
+
+    #[test]
+    fn completion_event_rejects_registration_and_trigger_identity_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "ab_identity";
+        db.register_completion_event(completion_registration(
+            event_id,
+            "async",
+            "session-a",
+            "11111111-1111-4111-8111-111111111111",
+        ))
+        .unwrap();
+
+        let registration_error = db
+            .register_completion_event(CompletionEventRegistrationInput {
+                delivery_mode: "sync",
+                ..completion_registration(
+                    event_id,
+                    "async",
+                    "session-a",
+                    "11111111-1111-4111-8111-111111111111",
+                )
+            })
+            .unwrap_err();
+        assert!(registration_error.contains("conflicts with its durable identity"));
+
+        let trigger_error = db
+            .trigger_completion_event(CompletionEventTriggerInput {
+                state_dir: "/tmp/different-state",
+                ..completion_trigger(
+                    event_id,
+                    r#"{"schema_version":2,"handle":"ab_identity"}"#,
+                    false,
+                )
+            })
+            .unwrap_err();
+        assert!(trigger_error.contains("does not match its registered source"));
+        assert_eq!(
+            db.completion_event(event_id).unwrap().unwrap().state,
+            "pending"
+        );
+        assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
     }
 
     #[test]
@@ -6789,6 +6898,56 @@ mod tests {
         assert!(triggered.listeners[0].acknowledged_at.is_some());
         assert_eq!(
             triggered.listeners[0].acknowledgement_reason.as_deref(),
+            Some("consumed_in_call")
+        );
+    }
+
+    #[test]
+    fn consumed_completion_resolves_an_existing_delivery_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let event_id = "ab_consumed_replay";
+        let invocation_uuid = "11111111-1111-4111-8111-111111111111";
+        let payload = r#"{"schema_version":2,"handle":"ab_consumed_replay"}"#;
+        db.register_completion_event(completion_registration(
+            event_id,
+            "async",
+            "session-a",
+            invocation_uuid,
+        ))
+        .unwrap();
+        let triggered = db
+            .trigger_completion_event(completion_trigger(event_id, payload, false))
+            .unwrap();
+        let seq = triggered.mailbox_rows[0].seq;
+        db.register_delivery_attempt("attempt-consumed", "session-a", invocation_uuid, &[seq], 0)
+            .unwrap();
+        assert!(
+            db.record_delivery_attempt_transport_ack("attempt-consumed")
+                .unwrap()
+        );
+        db.conn
+            .execute(
+                "UPDATE mailbox SET delivery_attempts = 2, delivery_error = 'transport_error'
+                 WHERE seq = ?1",
+                params![seq],
+            )
+            .unwrap();
+
+        let consumed = db
+            .trigger_completion_event(completion_trigger(event_id, payload, true))
+            .unwrap();
+
+        let row = &consumed.mailbox_rows[0];
+        assert!(row.delivered_at.is_some());
+        assert_eq!(row.delivery_attempts, 3);
+        assert_eq!(row.delivery_error, None);
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-consumed").unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Resolved)
+        );
+        assert_eq!(
+            consumed.listeners[0].acknowledgement_reason.as_deref(),
             Some("consumed_in_call")
         );
     }

@@ -39,11 +39,13 @@ pub(crate) fn assert_additional_notifications_remain_queued(prompt: &str) {
 }
 
 pub(crate) fn assert_pending_mailbox_empty(fixture: &Fixture, session_id: &str) {
-    assert!(pending_mailbox_rows(fixture, session_id).is_empty());
+    let rows = pending_mailbox_rows(fixture, session_id);
+    assert!(rows.is_empty(), "unexpected pending rows: {rows:?}");
 }
 
 pub(crate) fn assert_pending_mailbox_count(fixture: &Fixture, session_id: &str, expected: usize) {
-    assert_eq!(pending_mailbox_rows(fixture, session_id).len(), expected);
+    let rows = pending_mailbox_rows(fixture, session_id);
+    assert_eq!(rows.len(), expected, "pending rows were {rows:?}");
 }
 
 pub(crate) fn assert_no_wake_claim(fixture: &Fixture, session_id: &str) {
@@ -60,9 +62,12 @@ pub(crate) fn assert_pending_handle_without_error(
     handle: &str,
 ) {
     let rows = pending_mailbox_rows(fixture, session_id);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].handle, handle);
-    assert!(rows[0].delivery_error.is_none());
+    assert_eq!(rows.len(), 1, "pending rows were {rows:?}");
+    assert_eq!(rows[0].handle, handle, "pending rows were {rows:?}");
+    assert!(
+        rows[0].delivery_error.is_none(),
+        "pending rows were {rows:?}"
+    );
 }
 
 pub(crate) fn assert_pending_handle_with_delivery_attempts(

@@ -8,7 +8,7 @@
 //! turn acceptance, and policy diagnostics.
 
 use oulipoly_state::mailbox::MailboxDb;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -186,7 +186,9 @@ turn_script = {}
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .unwrap()
+            .expect("expected a resumed invocation row")
     }
 
     fn assert_xdg_isolated(&self) {

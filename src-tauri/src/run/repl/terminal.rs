@@ -112,9 +112,6 @@ fn finalize_repl_execution_result(
         input.resume_session_id,
         result,
     );
-    let state = &input.env.state;
-    let sessions_cfg = &input.env.sessions_cfg;
-    let provider_name = input.provider.name.as_str();
     let session_id = input.resume_session_id;
     let invocation_uuid = input.invocation.id.as_str();
     let finalization = match handle_terminal_signal_disposition(ReplTerminalDispositionInput {
@@ -132,9 +129,6 @@ fn finalize_repl_execution_result(
         }
     };
     if let Err(err) = crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
-        state,
-        sessions_cfg,
-        provider_name,
         session_id,
         invocation_uuid,
         result.exit_code,
@@ -150,9 +144,6 @@ fn finalize_repl_execution_result(
 
 fn handoff_repl_pty_delivery(input: &ReplExecutionInput<'_, '_>, exit_code: i32) {
     if let Err(err) = crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        &input.provider.name,
         input.resume_session_id,
         &input.invocation.id,
         exit_code,

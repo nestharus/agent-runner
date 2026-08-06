@@ -6,8 +6,8 @@
 
 use oulipoly_state::mailbox::{
     CompletionEventListenerRow, CompletionEventRegistrationInput,
-    CompletionEventRegistrationResult, CompletionEventTriggerInput, CompletionEventTriggerResult,
-    MailboxDb, MailboxRow,
+    CompletionEventRegistrationResult, CompletionEventRow, CompletionEventTriggerInput,
+    CompletionEventTriggerResult, MailboxDb, MailboxRow,
 };
 use oulipoly_state::{InvocationRecord, StateDb};
 use serde::Serialize;
@@ -79,6 +79,7 @@ struct NotifyResponse {
     session_source: Option<String>,
     seq: Option<i64>,
     pty_delivery: Option<PtyMailboxDeliveryDiagnostic>,
+    pty_deliveries: Vec<PtyMailboxDeliveryDiagnostic>,
     payload_file_path: Option<String>,
     payload_sha256: Option<String>,
     payload_byte_len: Option<i64>,
@@ -154,9 +155,10 @@ pub(crate) fn run_agent_bash_activate(args: AgentBashActivateArgs<'_>) -> Result
 
 pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result<i32, String> {
     match trigger_completion_event(&args) {
-        Ok((result, pty_delivery)) => {
+        Ok((result, pty_deliveries)) => {
             let owner = result.listeners.first();
             let row = result.mailbox_rows.first();
+            let pty_delivery = pty_deliveries.first().cloned();
             render(
                 &NotifyResponse {
                     status: if result.triggered {
@@ -175,7 +177,8 @@ pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result
                     owner_session_id: owner.map(|listener| listener.session_id.clone()),
                     session_source: owner.map(|_| "completion_event_listener".to_string()),
                     seq: row.map(|row| row.seq),
-                    pty_delivery: pty_delivery.into_iter().next(),
+                    pty_delivery,
+                    pty_deliveries,
                     payload_file_path: row.and_then(|row| row.payload_file_path.clone()),
                     payload_sha256: row.and_then(|row| row.payload_sha256.clone()),
                     payload_byte_len: row.and_then(|row| row.payload_byte_len),
@@ -199,7 +202,7 @@ fn register_completion_event(
     if let Some(owner) = owner.as_ref() {
         validate_owner_binding(owner)?;
     }
-    let paths = registration_paths(args);
+    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut mailbox = MailboxDb::open_default()?;
     mailbox.register_completion_event(CompletionEventRegistrationInput {
         event_id: args.handle,
@@ -239,7 +242,7 @@ fn trigger_completion_event(
 > {
     let metadata = read_metadata(args.meta)?;
     let rc = read_rc(args.rc)?;
-    let paths = completion_paths(args);
+    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut mailbox = MailboxDb::open_default()?;
     let event = mailbox
         .completion_event(args.handle)?
@@ -352,7 +355,7 @@ fn payload_value(
     metadata: &Value,
     handle: &str,
     rc: i32,
-    event: &oulipoly_state::mailbox::CompletionEventRow,
+    event: &CompletionEventRow,
     listeners: &[CompletionEventListenerRow],
     paths: &NotifyPathStrings,
 ) -> Value {
@@ -378,7 +381,12 @@ fn payload_value(
 fn read_metadata(path: &Path) -> Result<Value, String> {
     let raw =
         std::fs::read_to_string(path).map_err(|err| format!("failed to read meta.json: {err}"))?;
-    serde_json::from_str(&raw).map_err(|err| format!("failed to parse meta.json: {err}"))
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|err| format!("failed to parse meta.json: {err}"))?;
+    if !value.is_object() {
+        return Err("meta.json must contain a JSON object".to_string());
+    }
+    Ok(value)
 }
 
 fn read_rc(path: &Path) -> Result<i32, String> {
@@ -392,14 +400,6 @@ fn read_rc(path: &Path) -> Result<i32, String> {
 fn render_payload_json(payload: &Value) -> Result<String, String> {
     serde_json::to_string(payload)
         .map_err(|err| format!("failed to serialize completion event payload: {err}"))
-}
-
-fn registration_paths(args: &AgentBashRegisterArgs<'_>) -> NotifyPathStrings {
-    notify_path_strings(args.state_dir, args.meta, args.log, args.rc)
-}
-
-fn completion_paths(args: &AgentBashCompleteArgs<'_>) -> NotifyPathStrings {
-    notify_path_strings(args.state_dir, args.meta, args.log, args.rc)
 }
 
 fn notify_path_strings(state_dir: &Path, meta: &Path, log: &Path, rc: &Path) -> NotifyPathStrings {

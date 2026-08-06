@@ -529,6 +529,12 @@ fn notify_live_pty_nack_leaves_pending_without_direct_wake() {
     assert!(rows[0].delivered_at.is_none());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     assert!(captured.lock().unwrap().contains("h-nack"));
+    let listeners = fixture
+        .mailbox()
+        .completion_event_listeners("h-nack")
+        .unwrap();
+    assert_eq!(listeners.len(), 1);
+    assert!(listeners[0].acknowledged_at.is_none());
     fixture.assert_default_user_paths_untouched();
 }
 

@@ -710,9 +710,6 @@ fn finalize_spawn_error(input: super::mapper::SpawnErrorInput<'_, '_>) {
         input.guard.mark_finalized();
     }
     let handed_off = match crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
-        &input.env.state,
-        &input.env.sessions_cfg,
-        input.provider_name,
         input.provider_session_id,
         input.invocation_id,
         1,
