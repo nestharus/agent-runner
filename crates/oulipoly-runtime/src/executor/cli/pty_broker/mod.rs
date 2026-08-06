@@ -60,7 +60,8 @@ pub const USER_INPUT_IDLE_INJECT_MS: u64 = 1500;
 /// of appending to a user's brief composing pause; higher values delay delivery.
 const USER_INPUT_IDLE_INJECT: Duration = Duration::from_millis(USER_INPUT_IDLE_INJECT_MS);
 const INJECT_WAIT_LIMIT: Duration = Duration::from_millis(1500);
-const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+// Covers body and delimiter drains plus the submit delay before the broker can ACK.
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DELIVERY_ATTEMPT_PREFIX: &str = "[OULIPOLY-DELIVERY ";
 const DELIVERY_ATTEMPT_SUFFIX: char = ']';
 const DELIVERY_ACK_PREFIX: &str = "delivery_ack:";
@@ -854,6 +855,7 @@ struct ControlSocket {
     owned_dir: PathBuf,
     session_id: String,
     invocation_uuid: String,
+    started_at: Instant,
 }
 
 impl ControlSocket {
@@ -872,6 +874,7 @@ impl ControlSocket {
             owned_dir: dir,
             session_id: session_id.to_string(),
             invocation_uuid: invocation_uuid.to_string(),
+            started_at: Instant::now(),
         }))
     }
 
@@ -889,6 +892,10 @@ impl ControlSocket {
 
     fn invocation_uuid(&self) -> &str {
         &self.invocation_uuid
+    }
+
+    fn age(&self) -> Duration {
+        self.started_at.elapsed()
     }
 }
 

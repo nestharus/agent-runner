@@ -296,7 +296,7 @@ fn age134_session_list_empty_outputs_clean_human_and_json() {
     assert!(output.stderr.is_empty(), "{output:?}");
     assert!(
         !fixture.db_path().exists(),
-        "session list --json must not create state.db"
+        "session list --format json must not create state.db"
     );
 }
 

@@ -319,7 +319,7 @@ emit_timestampless_cap_mock_body() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
   cat <<'JSON'
 [
   {"id":"ses_cap_one"},
@@ -355,7 +355,7 @@ emit_window_filter_mock_body() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
   python3 - <<'PY'
 import json
 from datetime import datetime, timedelta, timezone
@@ -395,7 +395,7 @@ emit_timeout_mock_body() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
   cat <<'JSON'
 [
   {"id":"ses_fast"},
@@ -431,7 +431,7 @@ emit_descendant_timeout_mock_body() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
   printf '[{"id":"ses_descendant"}]\n'
   exit 0
 fi
@@ -508,7 +508,7 @@ else
   exit 0
 fi
 
-if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
   printf '[{"id":"%s"}]\n' "$local_session_id"
   exit 0
 fi
@@ -540,7 +540,7 @@ emit_current_export_mock_body() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--json" ]]; then
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
   cat <<'JSON'
 [
   {"id":"ses_current_requested"}
@@ -552,6 +552,7 @@ fi
 if [[ "$1" == "export" ]]; then
   session_id="$2"
   printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  printf 'Exporting session: %s\n' "$session_id"
   cat <<'JSON'
 {
   "info": {
@@ -638,6 +639,53 @@ write_current_export_mock() {
   local path="$1"
 
   write_executable_mock "$path" emit_current_export_mock_body
+}
+
+emit_pipe_sensitive_export_mock_body() {
+  cat <<'MOCK_OPENCODE'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$1" == "session" && "$2" == "list" && "${3:-}" == "--format" && "${4:-}" == "json" ]]; then
+  printf '[{"id":"ses_pipe_sensitive"}]\n'
+  exit 0
+fi
+
+if [[ "$1" == "export" ]]; then
+  session_id="$2"
+  printf '%s\n' "$session_id" >>"$OPENCODE_TURNS_EXPORT_LOG"
+  if [[ -p /dev/stdout ]]; then
+    printf '{"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"partial'
+    exit 0
+  fi
+  printf 'Exporting session: %s\n' "$session_id"
+  cat <<'JSON'
+{
+  "info": {"id":"ses_pipe_sensitive","time":{"created":1700000000000}},
+  "messages": [
+    {
+      "info": {"role":"user","time":{"created":1700000000000},"id":"msg_pipe_user","sessionID":"ses_pipe_sensitive"},
+      "parts": [{"type":"text","text":"pipe-safe user"}]
+    },
+    {
+      "info": {"role":"assistant","finish":"stop","time":{"created":1700000005000},"id":"msg_pipe_assistant","sessionID":"ses_pipe_sensitive"},
+      "parts": [{"type":"text","text":"pipe-safe assistant"}]
+    }
+  ]
+}
+JSON
+  exit 0
+fi
+
+echo "unexpected opencode args: $*" >&2
+exit 64
+MOCK_OPENCODE
+}
+
+write_pipe_sensitive_export_mock() {
+  local path="$1"
+
+  write_executable_mock "$path" emit_pipe_sensitive_export_mock_body
 }
 
 emit_session_id_env_mock_body() {
@@ -919,7 +967,7 @@ test_default_root_discovery_ignores_hostile_ambient_profile() {
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
   assert_eq \
     "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" \
-    $'opencode|'"$tmpdir"$'/default-data|unset|session list --json\nopencode|'"$tmpdir"$'/default-data|unset|export ses_default_root' \
+    $'opencode|'"$tmpdir"$'/default-data|unset|session list --format json\nopencode|'"$tmpdir"$'/default-data|unset|export ses_default_root' \
     "$FUNCNAME commands"
   assert_stdout_contains '"session_id":"ses_default_root"' "$FUNCNAME default record"
   assert_stdout_not_contains 'ses_profile3_root' "$FUNCNAME profile-3 excluded"
@@ -962,7 +1010,7 @@ test_profile3_root_discovery_ignores_hostile_ambient_profile() {
   assert_status_zero "$RUN_STATUS" "$FUNCNAME"
   assert_eq \
     "$(cat "$OPENCODE_TURNS_COMMAND_LOG")" \
-    $'opencode3|'"$tmpdir"$'/.opencode3|unset|session list --json\nopencode3|'"$tmpdir"$'/.opencode3|unset|export ses_profile3_root' \
+    $'opencode3|'"$tmpdir"$'/.opencode3|unset|session list --format json\nopencode3|'"$tmpdir"$'/.opencode3|unset|export ses_profile3_root' \
     "$FUNCNAME commands"
   assert_stdout_contains '"session_id":"ses_profile3_root"' "$FUNCNAME profile-3 record"
   assert_stdout_not_contains 'ses_default_root' "$FUNCNAME default excluded"
@@ -1005,6 +1053,23 @@ test_current_export_info_metadata_emits_turns() {
   assert_current_export_records "$FUNCNAME"
 }
 
+test_export_stdout_uses_regular_file_not_pipe() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  mkdir -p "$tmpdir/bin"
+  write_pipe_sensitive_export_mock "$tmpdir/bin/opencode"
+
+  run_opencode_turns "$tmpdir" "$tmpdir/bin/opencode"
+
+  assert_status_zero "$RUN_STATUS" "$FUNCNAME"
+  assert_eq "$(cat "$OPENCODE_TURNS_EXPORT_LOG")" "ses_pipe_sensitive" "$FUNCNAME export"
+  assert_stdout_contains '"turn_id":"msg_pipe_user"' "$FUNCNAME user"
+  assert_stdout_contains '"turn_id":"msg_pipe_assistant"' "$FUNCNAME assistant"
+  assert_stdout_contains '"completion_outcome":"stop"' "$FUNCNAME completion"
+}
+
 test_session_id_env_used_when_no_positional_sessions() {
   local tmpdir
   tmpdir="$(mktemp -d)"
@@ -1030,6 +1095,7 @@ test_default_root_direct_export_ignores_hostile_ambient_profile
 test_profile3_root_discovery_ignores_hostile_ambient_profile
 test_profile3_root_direct_export_ignores_hostile_ambient_profile
 test_current_export_info_metadata_emits_turns
+test_export_stdout_uses_regular_file_not_pipe
 test_session_id_env_used_when_no_positional_sessions
 
 echo "opencode-turns tests passed"
