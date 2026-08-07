@@ -5,6 +5,9 @@ use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
     RuntimeLifecycleState, RuntimeTerminalReason, SessionRuntimeUpsert, SubmittedInputEnqueue,
 };
+use oulipoly_state::pid_identity::{
+    PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
+};
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
 };
@@ -248,6 +251,38 @@ impl Fixture {
         .unwrap();
     }
 
+    fn seed_running_invocation_with_live_session(
+        &self,
+        invocation_uuid: &str,
+        session_id: &str,
+    ) -> ProcessIdentity {
+        self.open_state()
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let identity = read_live_process_identity(i64::from(std::process::id()))
+            .unwrap()
+            .expect("test process identity");
+        PidIdentityDb::open(&self.sidecar_path())
+            .unwrap()
+            .record_identity(PidIdentityRecord {
+                identity: &identity,
+                os_pgid: None,
+                invocation_uuid,
+                session_id: Some(session_id),
+                provider_name: Some("fixture-provider"),
+                model_name: Some("fixture-model"),
+                recorded_at: "2026-08-07T12:00:00Z",
+            })
+            .unwrap();
+        identity
+    }
+
     fn mailbox_rows(&self, session_id: &str, all: bool) -> Vec<MailboxRow> {
         let db = MailboxDb::open(&self.sidecar_path()).unwrap();
         db.list_mailbox(session_id, all).unwrap()
@@ -472,6 +507,71 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     assert_eq!(
         fixture.mailbox_rows(SESSION_A, false)[0].handle,
         "h-explicit-owner"
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_accepts_running_owner_from_exact_live_pid_sidecar() {
+    let fixture = Fixture::new();
+    let identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-running-owner",
+        running_owner_metadata(SESSION_A, INVOCATION_A, &identity),
+        0,
+    );
+
+    let registration = fixture.run_register_artifacts("h-running-owner", "async", &artifacts);
+
+    assert!(registration.status.success(), "{registration:?}");
+    let registered = stdout_json(&registration);
+    assert_eq!(registered["owner_session_id"], SESSION_A);
+    assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_rejects_mismatched_running_owner_sidecar() {
+    let fixture = Fixture::new();
+    let identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-running-wrong-session",
+        running_owner_metadata(SESSION_B, INVOCATION_A, &identity),
+        0,
+    );
+
+    let registration =
+        fixture.run_register_artifacts("h-running-wrong-session", "async", &artifacts);
+
+    assert_eq!(registration.status.code(), Some(74), "{registration:?}");
+    assert!(
+        stdout_json(&registration)["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not bound")
+    );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_rejects_stale_running_owner_identity() {
+    let fixture = Fixture::new();
+    let mut identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
+    identity.os_pid_starttime_ticks += 1;
+    let artifacts = fixture.write_notify_artifacts(
+        "h-running-stale-owner",
+        running_owner_metadata(SESSION_A, INVOCATION_A, &identity),
+        0,
+    );
+
+    let registration = fixture.run_register_artifacts("h-running-stale-owner", "async", &artifacts);
+
+    assert_eq!(registration.status.code(), Some(74), "{registration:?}");
+    assert!(
+        stdout_json(&registration)["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not bound")
     );
     fixture.assert_default_user_paths_untouched();
 }
@@ -1471,6 +1571,22 @@ fn owner_metadata(session_id: &str, invocation_uuid: &str) -> Value {
         "owner_session_id": session_id,
         "owner_invocation_uuid": invocation_uuid,
         "spooler_extra": "preserve-me",
+    })
+}
+
+fn running_owner_metadata(
+    session_id: &str,
+    invocation_uuid: &str,
+    identity: &ProcessIdentity,
+) -> Value {
+    json!({
+        "owner_session_id": session_id,
+        "owner_invocation_uuid": invocation_uuid,
+        "caller_chain": [{
+            "pid": identity.os_pid,
+            "boot_id": identity.os_boot_id,
+            "starttime_ticks": identity.os_pid_starttime_ticks,
+        }],
     })
 }
 
