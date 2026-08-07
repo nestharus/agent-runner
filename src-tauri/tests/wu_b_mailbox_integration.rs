@@ -1327,7 +1327,7 @@ fn resume_typed_physical_zero_failure_keeps_selected_mailbox_outside_age270_seam
     assert_eq!(marker["kind"], "ProlongedSilence");
     assert_eq!(marker["invocation_id"], invocation.id);
     assert_eq!(marker["session_id"], SESSION_A);
-    assert_failed_invocation(&fixture, &invocation.id, "bounded_silence");
+    assert_failed_invocation(&fixture, &invocation.id, SESSION_A, "bounded_silence");
     let row = fixture
         .mailbox_rows(SESSION_A, true)
         .into_iter()
@@ -1622,7 +1622,12 @@ fn assert_unconfirmed_resume(output: &Output, provider_session_id: &str) -> Comp
     invocation
 }
 
-fn assert_failed_invocation(fixture: &Fixture, invocation_id: &str, terminal_reason: &str) {
+fn assert_failed_invocation(
+    fixture: &Fixture,
+    invocation_id: &str,
+    provider_session_id: &str,
+    terminal_reason: &str,
+) {
     let observed = fixture
         .conn()
         .query_row(
@@ -1651,7 +1656,7 @@ fn assert_failed_invocation(fixture: &Fixture, invocation_id: &str, terminal_rea
     assert_eq!(observed.3.as_deref(), Some(terminal_reason));
     assert_eq!(observed.4.as_deref(), Some(terminal_reason));
     assert_eq!(observed.5.as_deref(), Some("fixture-provider"));
-    assert_eq!(observed.6.as_deref(), Some(SESSION_A));
+    assert_eq!(observed.6.as_deref(), Some(provider_session_id));
     assert!(observed.7.is_some());
 }
 

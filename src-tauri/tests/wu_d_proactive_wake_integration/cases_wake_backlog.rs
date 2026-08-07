@@ -13,30 +13,10 @@ use crate::liveness::{
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
-    assert_dead_owner_prompts_missing, assert_prompt_contains_handle,
+    assert_age270_invocation, assert_dead_owner_prompts_missing, assert_prompt_contains_handle,
     assert_prompt_excludes_handle, assert_success, assert_xdg_isolated,
 };
 use crate::wake_claim_setup::seed_dead_wake_claim;
-
-fn assert_age270_invocation(fixture: &Fixture, invocation_id: &str) {
-    let row = fixture
-        .state()
-        .get_invocation_by_uuid(invocation_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.status, oulipoly_state::InvocationStatus::Failed);
-    assert_eq!(row.success, Some(false));
-    assert_eq!(row.exit_code, Some(0));
-    assert_eq!(
-        row.error_category.as_deref(),
-        Some("resume_completion_unconfirmed")
-    );
-    assert_eq!(
-        row.terminal_reason.as_deref(),
-        Some("resume_completion_unconfirmed")
-    );
-    assert!(row.finished_at.is_some());
-}
 
 pub(crate) fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() {
     let _guard = integration_test_guard();

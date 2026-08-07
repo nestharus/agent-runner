@@ -12,10 +12,10 @@ use crate::liveness::{
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
-    assert_additional_notifications_remain_queued, assert_live_claim_token, assert_no_wake_claim,
-    assert_pending_handle_with_delivery_attempts, assert_pending_handle_without_error,
-    assert_pending_mailbox_count, assert_prompt_contains_handle, assert_prompt_file_missing,
-    assert_success, assert_xdg_isolated,
+    assert_additional_notifications_remain_queued, assert_age270_invocation,
+    assert_live_claim_token, assert_no_wake_claim, assert_pending_handle_with_delivery_attempts,
+    assert_pending_handle_without_error, assert_pending_mailbox_count,
+    assert_prompt_contains_handle, assert_prompt_file_missing, assert_success, assert_xdg_isolated,
 };
 use crate::wake_claim_setup::{seed_dead_wake_claim, seed_live_wake_claim};
 use crate::{MODEL, PROVIDER, SESSION};
@@ -61,26 +61,6 @@ fn direct_unconfirmed_invocation(output: &std::process::Output) -> String {
     assert_eq!(result["provider_session_id"], SESSION);
     assert_eq!(result["agent_runner_invocation_id"], result["id"]);
     result["id"].as_str().unwrap().to_string()
-}
-
-fn assert_age270_invocation(fixture: &Fixture, invocation_id: &str) {
-    let row = fixture
-        .state()
-        .get_invocation_by_uuid(invocation_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(row.status, oulipoly_state::InvocationStatus::Failed);
-    assert_eq!(row.success, Some(false));
-    assert_eq!(row.exit_code, Some(0));
-    assert_eq!(
-        row.error_category.as_deref(),
-        Some("resume_completion_unconfirmed")
-    );
-    assert_eq!(
-        row.terminal_reason.as_deref(),
-        Some("resume_completion_unconfirmed")
-    );
-    assert!(row.finished_at.is_some());
 }
 
 fn assert_one_failed_delivery(fixture: &Fixture, session_id: &str) {
@@ -354,6 +334,7 @@ pub(crate) fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
     assert_xdg_isolated(&fixture);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn renewed_followup_claim_survives_old_failed_child_recheck() {
     use sha2::{Digest, Sha256};
@@ -529,6 +510,7 @@ fn shell_path(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+#[cfg(target_os = "linux")]
 fn process_start(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let tail = stat.rsplit_once(") ")?.1;

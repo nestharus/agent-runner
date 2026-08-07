@@ -23,6 +23,26 @@ pub(crate) fn assert_success(output: &Output) {
     );
 }
 
+pub(crate) fn assert_age270_invocation(fixture: &Fixture, invocation_id: &str) {
+    let row = fixture
+        .state()
+        .get_invocation_by_uuid(invocation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, oulipoly_state::InvocationStatus::Failed);
+    assert_eq!(row.success, Some(false));
+    assert_eq!(row.exit_code, Some(0));
+    assert_eq!(
+        row.error_category.as_deref(),
+        Some("resume_completion_unconfirmed")
+    );
+    assert_eq!(
+        row.terminal_reason.as_deref(),
+        Some("resume_completion_unconfirmed")
+    );
+    assert!(row.finished_at.is_some());
+}
+
 pub(crate) fn assert_prompt_contains_handle(prompt: &str, handle: &str) {
     assert!(prompt.contains(&format!("handle: {handle}")), "{prompt}");
 }

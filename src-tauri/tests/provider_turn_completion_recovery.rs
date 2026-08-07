@@ -258,10 +258,14 @@ fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
     let persisted = fixture.latest_persisted_invocation();
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(persisted.status, "failed");
     assert_eq!(persisted.success, 0);
     assert_eq!(persisted.exit_code, 0);
+    assert_eq!(
+        persisted.error_category.as_deref(),
+        Some("resume_completion_unconfirmed")
+    );
     assert_eq!(
         persisted.terminal_reason.as_deref(),
         Some("resume_completion_unconfirmed")
