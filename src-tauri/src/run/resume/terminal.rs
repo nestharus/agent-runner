@@ -146,7 +146,7 @@ fn apply_resume_attempt_classification(
     ResumeAttemptClassification {
         zero_turn_action: action,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
-        terminal_completion_confirmed,
+        terminal_completion_confirmed: terminal_completion_confirmed && !age270_failure_applied,
         age270_mailbox_provenance: Age270MailboxProvenance {
             physical_clean_exit_candidate,
             effective_clean_exit_candidate,
