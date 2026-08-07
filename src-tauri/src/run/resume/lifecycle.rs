@@ -157,14 +157,18 @@ pub(super) fn record_resume_acceptance_if_present(
     Ok(())
 }
 
+pub(super) struct ResumeCompletionClassification {
+    pub(super) recovered_generic_nonzero: bool,
+    pub(super) terminal_completion_confirmed: bool,
+}
+
 pub(super) fn finalize_completed_attempt_for_resume(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &oulipoly_runtime::executor::ExecutionResult,
-    recovered_generic_nonzero: bool,
-    terminal_completion_confirmed: bool,
+    completion: ResumeCompletionClassification,
 ) -> Result<ResumeAttemptLoopControl, String> {
     match finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
@@ -183,8 +187,8 @@ pub(super) fn finalize_completed_attempt_for_resume(
         effective_spawn_cwd: input.effective_spawn_cwd,
         attempts: input.attempts,
         max_attempts: input.max_attempts,
-        recovered_generic_nonzero,
-        terminal_completion_confirmed,
+        recovered_generic_nonzero: completion.recovered_generic_nonzero,
+        terminal_completion_confirmed: completion.terminal_completion_confirmed,
     })? {
         CompletedAttemptControl::Continue => {
             finalize_retrying_resume(input, attempt, provider_session_id, result)

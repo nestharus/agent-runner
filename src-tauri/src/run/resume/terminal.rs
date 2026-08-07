@@ -6,8 +6,8 @@ use oulipoly_runtime::executor;
 
 use super::disposition::{ResumeTerminalDispositionInput, handle_terminal_signal_disposition};
 use super::lifecycle::{
-    BoundResumeAttempt, ResumeInvocationAttempt, finalize_completed_attempt_for_resume,
-    record_resume_acceptance_if_present,
+    BoundResumeAttempt, ResumeCompletionClassification, ResumeInvocationAttempt,
+    finalize_completed_attempt_for_resume, record_resume_acceptance_if_present,
 };
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper, wake};
@@ -280,8 +280,10 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
-        completion_evidence.recovered_generic_nonzero,
-        terminal_completion_confirmed,
+        ResumeCompletionClassification {
+            recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
+            terminal_completion_confirmed,
+        },
     )
 }
 
