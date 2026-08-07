@@ -115,12 +115,13 @@ pub(super) fn resolve_mailbox_delivery_outcome(
     if input.mailbox_delivery_seqs.is_empty() {
         return MailboxDeliveryOutcome::Absent;
     }
-    let _ = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
+    let errors = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
         input,
         provider,
         result,
         completion_evidence,
     );
+    emit_session_ingest_warnings(&provider.name, &errors);
     if mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
         MailboxDeliveryOutcome::Unconfirmed
     } else {
