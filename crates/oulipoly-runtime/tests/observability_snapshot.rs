@@ -13,8 +13,9 @@ use oulipoly_runtime::observability::{
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, SessionRuntimeRunningUpdate,
-    SessionRuntimeUpsert, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
+    AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
+    RuntimeGenerationId, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
@@ -188,6 +189,71 @@ fn create_fixture_dirs(paths: &FixturePaths) {
     std::fs::create_dir_all(&paths.data_dir).unwrap();
     std::fs::create_dir_all(&paths.state_home).unwrap();
     std::fs::create_dir_all(&paths.home).unwrap();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PhysicalFileSnapshot {
+    directories: Vec<(PathBuf, std::time::SystemTime, bool)>,
+    files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn physical_file_snapshot(root: &Path) -> PhysicalFileSnapshot {
+    fn collect(root: &Path, current: &Path, snapshot: &mut PhysicalFileSnapshot) {
+        let metadata = std::fs::metadata(current).unwrap();
+        snapshot.directories.push((
+            current.strip_prefix(root).unwrap().to_path_buf(),
+            metadata.modified().unwrap(),
+            metadata.permissions().readonly(),
+        ));
+        for entry in std::fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                collect(root, &path, snapshot);
+            } else {
+                snapshot.files.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+
+    let mut snapshot = PhysicalFileSnapshot {
+        directories: Vec::new(),
+        files: Vec::new(),
+    };
+    collect(root, root, &mut snapshot);
+    snapshot
+        .directories
+        .sort_by(|left, right| left.0.cmp(&right.0));
+    snapshot.files.sort_by(|left, right| left.0.cmp(&right.0));
+    snapshot
+}
+
+fn assert_physical_files_unchanged(before: &PhysicalFileSnapshot, after: &PhysicalFileSnapshot) {
+    assert_eq!(after.directories, before.directories, "directories changed");
+    assert_eq!(
+        after.files.iter().map(|entry| &entry.0).collect::<Vec<_>>(),
+        before
+            .files
+            .iter()
+            .map(|entry| &entry.0)
+            .collect::<Vec<_>>(),
+        "physical file inventory changed"
+    );
+    for ((before_path, before_bytes), (after_path, after_bytes)) in
+        before.files.iter().zip(&after.files)
+    {
+        assert_eq!(after_path, before_path);
+        assert!(
+            after_bytes == before_bytes,
+            "physical bytes changed for {} (before={} after={})",
+            before_path.display(),
+            before_bytes.len(),
+            after_bytes.len()
+        );
+    }
 }
 
 #[test]
@@ -635,6 +701,99 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
         runtime_row_bytes(&fixture.sidecar_path(), SESSION_ID),
         before
     );
+}
+
+#[test]
+fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
+    let fixture = Fixture::new();
+    seed_root_session(&fixture);
+    let state = fixture.open_state();
+    state
+        .connection()
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
+    seed_invocation(&state, CHILD_UUID, Some(root_id));
+    let mut mailbox = fixture.open_mailbox();
+    mailbox
+        .connection()
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let row = match mailbox
+        .enqueue_agent_bash_complete(&mailbox_input("handle-physical-read-only", SESSION_ID))
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        other => panic!("unexpected enqueue result: {other:?}"),
+    };
+    mailbox
+        .register_delivery_attempt(
+            "attempt-physical-read-only",
+            SESSION_ID,
+            ROOT_UUID,
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+    assert!(
+        mailbox
+            .record_delivery_attempt_transport_ack("attempt-physical-read-only")
+            .unwrap()
+    );
+    let claim = mailbox
+        .try_acquire_wake_claim(WakeClaimRequest {
+            session_id: SESSION_ID,
+            claim_token: "claim-physical-read-only",
+            reason: "notify_idle",
+            auto_wake_count: 1,
+            wake_invocation_uuid: Some(ROOT_UUID),
+            stale_after_seconds: 600,
+        })
+        .unwrap();
+    assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
+    let generation = RuntimeGenerationId::parse("88888888-8888-4888-8888-888888888888").unwrap();
+    mailbox
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation,
+            spawn_invocation_uuid: ROOT_UUID,
+            session_id: Some(SESSION_ID),
+            runtime_mode: "headless",
+            provider_name: "provider-a",
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: Some("/models/observability-read-only"),
+            effective_cwd: Some("/work/observability-read-only"),
+        })
+        .unwrap();
+    mailbox
+        .upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: SESSION_ID,
+            mode: "headless",
+            invocation_uuid: Some(ROOT_UUID),
+            provider_name: Some("provider-a"),
+            model_name: Some("model-a"),
+            pty_control_path: None,
+            models_dir: Some("/models/observability-read-only"),
+            effective_cwd: Some("/work/observability-read-only"),
+            selected_auto_wake_max: Some(5),
+        })
+        .unwrap();
+    let before = physical_file_snapshot(&fixture.data_dir);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), full_snapshot_limits());
+
+    assert!(find_node(&snapshot, "mailbox:session-observe:1").is_some());
+    assert!(find_node(&snapshot, "wake:session-observe:claim-physical-read-only").is_some());
+    assert!(find_node(&snapshot, &format!("invocation:{ROOT_UUID}")).is_some());
+    assert!(find_node(&snapshot, &format!("invocation:{CHILD_UUID}")).is_some());
+    let session = node(&snapshot, "session:session-observe");
+    assert_eq!(session.status, MonitorStatus::Running);
+    assert_eq!(session.label, "session provider-a/model-a");
+    assert_physical_files_unchanged(&before, &physical_file_snapshot(&fixture.data_dir));
+    drop(mailbox);
+    drop(state);
 }
 
 #[test]
