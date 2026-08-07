@@ -20,8 +20,11 @@ pub(super) enum ResumeLoopControl {
 pub(super) struct ResumeTerminalDispositionInput<'a, 'state> {
     pub(super) agent_runtime_services: &'a wiring::AgentRuntimeServices,
     pub(super) env: &'a ResumeExecutionEnvironment,
+    pub(super) invocation_id: &'a str,
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
+    pub(super) provider_name: &'a str,
+    pub(super) provider_session_id: &'a str,
     pub(super) result: &'a oulipoly_runtime::executor::ExecutionResult,
     pub(super) terminal_signal_disposition: TerminalSignalDisposition,
     pub(super) zero_turn_action: ZeroTurnAction,
@@ -35,21 +38,7 @@ pub(super) fn handle_terminal_signal_disposition(
         return Ok(ResumeLoopControl::CompletedAttempt);
     }
     match input.terminal_signal_disposition {
-        TerminalSignalDisposition::MaybeQuotaVerify => handle_maybe_quota_verify(
-            input.result,
-            input.zero_turn_action,
-            |request| {
-                input
-                    .agent_runtime_services
-                    .invocation_lifecycle_service
-                    .finalize_invocation(request)
-                    .map_err(|err| err.to_string())?;
-                input.guard.mark_finalized();
-                Ok(())
-            },
-            &input.env.state,
-            input.invocation_row_id,
-        ),
+        TerminalSignalDisposition::MaybeQuotaVerify => handle_maybe_quota_verify(input),
         TerminalSignalDisposition::QuotaExhaustedRetry => {
             let terminal_reason = quota_retry_terminal_reason(input.result);
             input
@@ -67,18 +56,20 @@ pub(super) fn handle_terminal_signal_disposition(
         TerminalSignalDisposition::ProlongedSilenceFail
         | TerminalSignalDisposition::InteractiveFail => {
             let terminal_reason = typed_failure_terminal_reason(input.result);
+            let error_category =
+                terminal_signal_error_category(&input.result.terminal_signal, terminal_reason);
             input
                 .agent_runtime_services
                 .invocation_lifecycle_service
                 .finalize_invocation(terminal_disposition_finalize_request(
                     &input,
-                    terminal_signal_error_category(&input.result.terminal_signal, terminal_reason),
+                    error_category,
                     terminal_reason,
                 ))
                 .map_err(|err| err.to_string())?;
             input.guard.mark_finalized();
-            emit_resume_terminal_failure_output(input.result);
-            Ok(ResumeLoopControl::Return(failure_exit_code(
+            emit_resume_terminal_failure_output(&input, error_category, terminal_reason);
+            Ok(ResumeLoopControl::Return(mapper::failure_exit_code(
                 input.result.exit_code,
             )))
         }
@@ -133,32 +124,47 @@ fn terminal_disposition_finalize_request<'a>(
     )
 }
 
-fn emit_resume_terminal_failure_output(result: &oulipoly_runtime::executor::ExecutionResult) {
-    formatter::emit_stderr(&result.stderr);
+fn emit_resume_terminal_failure_output(
+    input: &ResumeTerminalDispositionInput<'_, '_>,
+    error_category: Option<&str>,
+    terminal_reason: &str,
+) {
+    formatter::emit_resume_failure_output(formatter::ResumeFailureOutputInput {
+        state: &input.env.state,
+        invocation_id: input.invocation_id,
+        provider_name: input.provider_name,
+        provider_session_id: input.provider_session_id,
+        exit_code: input.result.exit_code,
+        error_category,
+        terminal_reason: Some(terminal_reason),
+        stderr: &input.result.stderr,
+    });
 }
 
 fn handle_maybe_quota_verify(
-    result: &oulipoly_runtime::executor::ExecutionResult,
-    zero_turn_action: ZeroTurnAction,
-    mut finalize: impl FnMut(
-        oulipoly_runtime::services::InvocationLifecycleFinalizeRequest<'_>,
-    ) -> Result<(), String>,
-    state: &oulipoly_state::StateDb,
-    invocation_row_id: i64,
+    input: ResumeTerminalDispositionInput<'_, '_>,
 ) -> Result<ResumeLoopControl, String> {
-    let outcome = maybe_quota_action_outcome(zero_turn_action);
-    finalize(maybe_quota_finalize_request(
-        state,
-        invocation_row_id,
-        result,
-        outcome.error_category(),
-    ))?;
+    let outcome = maybe_quota_action_outcome(input.zero_turn_action);
+    let error_category = outcome.error_category();
+    let terminal_reason = maybe_quota_terminal_reason(input.result);
+    input
+        .agent_runtime_services
+        .invocation_lifecycle_service
+        .finalize_invocation(maybe_quota_finalize_request(
+            &input.env.state,
+            input.invocation_row_id,
+            input.result,
+            error_category,
+            terminal_reason,
+        ))
+        .map_err(|err| err.to_string())?;
+    input.guard.mark_finalized();
     match outcome {
         MaybeQuotaActionOutcome::Continue { .. } => Ok(ResumeLoopControl::Continue),
         MaybeQuotaActionOutcome::ReturnFailure { .. } => {
-            emit_maybe_quota_failure_output(result);
-            Ok(ResumeLoopControl::Return(failure_exit_code(
-                result.exit_code,
+            emit_resume_terminal_failure_output(&input, error_category, terminal_reason);
+            Ok(ResumeLoopControl::Return(mapper::failure_exit_code(
+                input.result.exit_code,
             )))
         }
     }
@@ -198,25 +204,13 @@ fn maybe_quota_action_outcome(zero_turn_action: ZeroTurnAction) -> MaybeQuotaAct
     }
 }
 
-fn emit_maybe_quota_failure_output(result: &oulipoly_runtime::executor::ExecutionResult) {
-    formatter::emit_stderr(&result.stderr);
-}
-
-fn failure_exit_code(exit_code: i32) -> i32 {
-    if exit_code == 0 { 1 } else { exit_code }
-}
-
 fn maybe_quota_finalize_request<'a>(
     state: &'a oulipoly_state::StateDb,
     invocation_row_id: i64,
     result: &'a oulipoly_runtime::executor::ExecutionResult,
     error_category: Option<&'a str>,
+    terminal_reason: &'a str,
 ) -> oulipoly_runtime::services::InvocationLifecycleFinalizeRequest<'a> {
-    let terminal_reason = crate::terminal_outcome_adapter::terminal_signal_reason(
-        &result.terminal_signal,
-        result.terminal_reason.as_deref(),
-    )
-    .unwrap_or("maybe_quota_exhausted");
     mapper::finalize_request(
         state,
         invocation_row_id,
@@ -225,4 +219,12 @@ fn maybe_quota_finalize_request<'a>(
         error_category,
         Some(terminal_reason),
     )
+}
+
+fn maybe_quota_terminal_reason(result: &oulipoly_runtime::executor::ExecutionResult) -> &str {
+    crate::terminal_outcome_adapter::terminal_signal_reason(
+        &result.terminal_signal,
+        result.terminal_reason.as_deref(),
+    )
+    .unwrap_or("maybe_quota_exhausted")
 }

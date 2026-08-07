@@ -16,8 +16,9 @@ pub(super) fn confirmed_zero_turn_maybe_quota(
 
 pub(super) fn completed_attempt_success(
     result: &oulipoly_runtime::executor::ExecutionResult,
+    terminal_completion_confirmed: bool,
 ) -> bool {
-    result.exit_code == 0
+    result.exit_code == 0 && terminal_completion_confirmed
 }
 
 pub(super) fn completed_attempt_quota_exhausted(error_category: Option<&str>) -> bool {

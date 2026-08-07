@@ -484,14 +484,14 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
         provider_session_id.as_deref(),
         input.zero_turn_baseline,
     );
-    let (zero_turn_classification, recovered_generic_nonzero, _) =
-        zero_turn_classify_after_completion_with_recovery(
-            &input.env.state,
-            &input.env.sessions_cfg,
-            input.zero_turn_baseline,
-            host_observed_completion_from_result(input.result),
-            input.result,
-        );
+    let completion = zero_turn_classify_after_completion_with_recovery(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        input.zero_turn_baseline,
+        host_observed_completion_from_result(input.result),
+        input.result,
+    );
+    let zero_turn_classification = completion.classification;
     apply_zero_turn_classification_to_result(
         input.result,
         input.provider_name,
@@ -509,7 +509,7 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
     BalancedZeroTurnOutcome {
         provider_session_id,
         action,
-        recovered_generic_nonzero,
+        recovered_generic_nonzero: completion.recovered_generic_nonzero,
     }
 }
 

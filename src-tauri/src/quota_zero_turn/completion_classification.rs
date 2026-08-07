@@ -147,14 +147,32 @@ pub(crate) fn zero_turn_classify_after_completion_with_recovery(
     baseline: &ZeroTurnBaseline,
     host_observed: HostObservedCompletion,
     result: &executor::ExecutionResult,
-) -> (ZeroTurnClassification, bool, bool) {
+) -> CompletionClassificationOutput {
+    classify_completion_with_recovery(state, sessions_cfg, baseline, host_observed, result)
+}
+
+pub(crate) struct CompletionClassificationOutput {
+    pub(crate) classification: ZeroTurnClassification,
+    pub(crate) recovered_generic_nonzero: bool,
+    pub(crate) incomplete_tool_boundary: bool,
+    pub(crate) accepted_provider_turn: bool,
+}
+
+fn classify_completion_with_recovery(
+    state: &StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    baseline: &ZeroTurnBaseline,
+    host_observed: HostObservedCompletion,
+    result: &executor::ExecutionResult,
+) -> CompletionClassificationOutput {
     let completion = classify_after_completion(state, sessions_cfg, baseline, host_observed);
     let recovered = recovered_generic_nonzero(completion.accepted_provider_turn, result);
-    (
-        completion.classification,
-        recovered,
-        completion.incomplete_tool_boundary,
-    )
+    CompletionClassificationOutput {
+        classification: completion.classification,
+        recovered_generic_nonzero: recovered,
+        incomplete_tool_boundary: completion.incomplete_tool_boundary,
+        accepted_provider_turn: completion.accepted_provider_turn,
+    }
 }
 
 struct CompletionClassification {

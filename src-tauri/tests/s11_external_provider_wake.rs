@@ -206,6 +206,49 @@ turn_script = {}
     }
 }
 
+fn assert_unconfirmed_resume(output: &Output) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let result: Value = serde_json::from_str(lines[0]).unwrap();
+    let mut keys = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "agent_runner_chain_id",
+            "agent_runner_invocation_id",
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "provider_name",
+            "provider_session_id",
+            "status",
+            "success",
+            "terminal_reason"
+        ]
+    );
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["success"], false);
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["error_category"], "resume_completion_unconfirmed");
+    assert_eq!(result["terminal_reason"], "resume_completion_unconfirmed");
+    assert_eq!(result["provider_name"], PROVIDER);
+    assert_eq!(result["provider_session_id"], SESSION);
+    assert_eq!(result["agent_runner_invocation_id"], result["id"]);
+}
+
 #[test]
 fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing() {
     let fixture = Fixture::new();
@@ -242,7 +285,7 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
         "manual exact payload",
         &[("S11_EMIT_SUBMITTED_TURN_MARKER", "1")],
     );
-    assert_success(&output);
+    assert_unconfirmed_resume(&output);
     let (status, evidence) = fixture.latest_resume_acceptance();
     assert_eq!(status.as_deref(), Some("accepted"));
     assert!(
@@ -262,7 +305,7 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
         ],
     );
-    assert_success(&output);
+    assert_unconfirmed_resume(&output);
     assert_eq!(
         fixture.latest_resume_acceptance(),
         (None, None),

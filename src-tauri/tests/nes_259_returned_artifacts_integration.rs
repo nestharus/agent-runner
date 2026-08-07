@@ -164,6 +164,43 @@ fn parse_invocation(stderr: &str) -> String {
         .to_string()
 }
 
+fn assert_resume_success_result(stdout: &[u8]) {
+    let stdout = String::from_utf8_lossy(stdout);
+    assert!(
+        stdout.starts_with("resume stdout\nOULIPOLY_RESULT="),
+        "{stdout}"
+    );
+    let raw = stdout
+        .strip_prefix("resume stdout\nOULIPOLY_RESULT=")
+        .unwrap()
+        .trim();
+    let result: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let mut keys = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "status",
+            "success",
+            "terminal_reason"
+        ]
+    );
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["error_category"].is_null());
+    assert!(result["terminal_reason"].is_null());
+}
+
 fn invocation_count(db: &StateDb) -> i64 {
     db.connection()
         .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
@@ -318,7 +355,7 @@ printf 'resume stdout'"#,
     let output = fixture.run_headless_resume(session_id);
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(output.stdout, b"resume stdout".to_vec());
+    assert_resume_success_result(&output.stdout);
     let invocation_id = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let db = fixture.open_db();
     let row = db.get_invocation_by_uuid(&invocation_id).unwrap().unwrap();

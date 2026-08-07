@@ -13,7 +13,7 @@ use crate::liveness::{
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
-    assert_dead_owner_prompts_missing, assert_prompt_contains_handle,
+    assert_age270_invocation, assert_dead_owner_prompts_missing, assert_prompt_contains_handle,
     assert_prompt_excludes_handle, assert_success, assert_xdg_isolated,
 };
 use crate::wake_claim_setup::seed_dead_wake_claim;
@@ -39,6 +39,28 @@ pub(crate) fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending
         "newer mailbox delivered while exhausted row remains pending",
         || newer_mailbox_delivered_with_exhausted_old_pending(&fixture),
     );
+    let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
+    let old = rows
+        .iter()
+        .find(|row| row.handle == "h-unconfirmed-old")
+        .unwrap();
+    assert!(old.delivered_at.is_none());
+    assert_eq!(old.delivery_attempts, 2);
+    assert_eq!(
+        old.delivery_error.as_deref(),
+        Some("mailbox_delivery_unconfirmed")
+    );
+    let newer = rows.iter().find(|row| row.handle == "h-newer").unwrap();
+    assert!(newer.delivered_at.is_some());
+    assert_eq!(newer.delivery_attempts, 1);
+    assert!(newer.delivery_error.is_none());
+    assert_age270_invocation(
+        &fixture,
+        newer.delivered_by_invocation_uuid.as_deref().unwrap(),
+    );
+    wait_until("unconfirmed wake claim released", || {
+        fixture.mailbox().wake_claim(SESSION).unwrap().is_none()
+    });
     assert_xdg_isolated(&fixture);
 }
 
@@ -94,5 +116,28 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debri
         },
     );
     assert_dead_owner_prompts_missing(&fixture, &dead_sessions);
+    for session_id in [idle_session, recent_session] {
+        let rows = fixture.mailbox().list_mailbox(session_id, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_some());
+        assert_eq!(rows[0].delivery_attempts, 1);
+        assert!(rows[0].delivery_error.is_none());
+        assert_age270_invocation(
+            &fixture,
+            rows[0].delivered_by_invocation_uuid.as_deref().unwrap(),
+        );
+        assert!(fixture.mailbox().wake_claim(session_id).unwrap().is_none());
+    }
+    for session_id in &dead_sessions {
+        let rows = fixture.mailbox().list_mailbox(session_id, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert_eq!(rows[0].delivery_attempts, 0);
+        assert_eq!(
+            rows[0].delivery_error.as_deref(),
+            Some(oulipoly_state::mailbox::WAKE_SWEEP_ABANDONED_ERROR)
+        );
+        assert!(fixture.mailbox().wake_claim(session_id).unwrap().is_none());
+    }
     assert_xdg_isolated(&fixture);
 }

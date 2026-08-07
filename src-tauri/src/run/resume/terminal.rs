@@ -6,8 +6,8 @@ use oulipoly_runtime::executor;
 
 use super::disposition::{ResumeTerminalDispositionInput, handle_terminal_signal_disposition};
 use super::lifecycle::{
-    BoundResumeAttempt, ResumeInvocationAttempt, finalize_completed_attempt_for_resume,
-    record_resume_acceptance_if_present,
+    BoundResumeAttempt, ResumeCompletionClassification, ResumeInvocationAttempt,
+    finalize_completed_attempt_for_resume, record_resume_acceptance_if_present,
 };
 use super::orchestration::{ResumeAttemptInput, ResumeAttemptLoopControl};
 use super::{formatter, mapper, wake};
@@ -21,6 +21,26 @@ use crate::terminal_outcome_adapter::{
     confirm_maybe_quota_exhausted, resume_terminal_signal_for_outcome,
 };
 use crate::zero_turn_orchestration::{ZeroTurnAction, next_action};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Age270MailboxEligibility {
+    Ineligible,
+    PreMutationCleanExit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Age270MailboxProvenance {
+    physical_clean_exit_candidate: bool,
+    effective_clean_exit_candidate: bool,
+    age270_failure_applied: bool,
+}
+
+struct ResumeAttemptClassification {
+    zero_turn_action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
+    terminal_completion_confirmed: bool,
+    age270_mailbox_provenance: Age270MailboxProvenance,
+}
 
 pub(super) fn resume_attempts_exhausted(attempts: usize, max_attempts: usize) -> bool {
     attempts >= max_attempts
@@ -45,7 +65,7 @@ pub(super) fn handle_resume_attempt_result(
     provider: &oulipoly_config::ProviderConfig,
     result: &mut executor::ExecutionResult,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    let (zero_turn_action, recovered_generic_nonzero) = apply_resume_attempt_classification(
+    let classification = apply_resume_attempt_classification(
         input,
         &provider.name,
         &bound_attempt.provider_session_id,
@@ -57,9 +77,20 @@ pub(super) fn handle_resume_attempt_result(
     record_resume_acceptance_if_present(input, bound_attempt.attempt.invocation_row_id, result)?;
     emit_captured_child_marker_lines(&result.captured_child_invocations);
     let completion_evidence = wake::ResumeCompletionEvidence {
-        zero_turn_action,
-        recovered_generic_nonzero,
+        zero_turn_action: classification.zero_turn_action,
+        recovered_generic_nonzero: classification.recovered_generic_nonzero,
         submitted_turn_confirmation,
+    };
+    let provenance = classification.age270_mailbox_provenance;
+    let mailbox_delivery_outcome = match age270_mailbox_eligibility_for_classification(
+        provenance.physical_clean_exit_candidate,
+        provenance.effective_clean_exit_candidate,
+        provenance.age270_failure_applied,
+    ) {
+        Age270MailboxEligibility::Ineligible => None,
+        Age270MailboxEligibility::PreMutationCleanExit => Some(
+            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
+        ),
     };
     handle_resume_attempt_terminal_signal(
         input,
@@ -68,6 +99,8 @@ pub(super) fn handle_resume_attempt_result(
         &bound_attempt.provider_session_id,
         result,
         completion_evidence,
+        classification.terminal_completion_confirmed,
+        mailbox_delivery_outcome,
     )
 }
 
@@ -77,19 +110,29 @@ fn apply_resume_attempt_classification(
     provider_session_id: &str,
     zero_turn_baseline: &crate::zero_turn_orchestration::ZeroTurnBaseline,
     result: &mut executor::ExecutionResult,
-) -> (ZeroTurnAction, bool) {
+) -> ResumeAttemptClassification {
+    let physical_clean_exit_candidate = clean_exit_completion_candidate(result);
     apply_age153_terminal_signal_fixture_override(result);
-    let (zero_turn_classification, recovered_generic_nonzero, incomplete_tool_boundary) =
-        zero_turn_classify_after_completion_with_recovery(
-            &input.env.state,
-            &input.env.sessions_cfg,
-            zero_turn_baseline,
-            host_observed_completion_from_result(result),
-            result,
-        );
+    let effective_clean_exit_candidate = clean_exit_completion_candidate(result);
+    let provider_confirmed_assistant_response = result.produced_assistant_response;
+    let completion = zero_turn_classify_after_completion_with_recovery(
+        &input.env.state,
+        &input.env.sessions_cfg,
+        zero_turn_baseline,
+        host_observed_completion_from_result(result),
+        result,
+    );
+    let terminal_completion_confirmed =
+        provider_confirmed_assistant_response || completion.accepted_provider_turn;
+    let zero_turn_classification = completion.classification;
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
-    if incomplete_tool_boundary {
+    let mut age270_failure_applied = false;
+    if completion.incomplete_tool_boundary {
         apply_incomplete_tool_boundary_failure(result, provider_name);
+        age270_failure_applied = true;
+    } else if effective_clean_exit_candidate && !terminal_completion_confirmed {
+        apply_unconfirmed_resume_completion_failure(result, provider_name);
+        age270_failure_applied = true;
     }
     let action = next_action(
         input.zero_turn_confirmation,
@@ -100,7 +143,36 @@ fn apply_resume_attempt_classification(
             Some(provider_session_id),
         ),
     );
-    (action, recovered_generic_nonzero)
+    ResumeAttemptClassification {
+        zero_turn_action: action,
+        recovered_generic_nonzero: completion.recovered_generic_nonzero,
+        terminal_completion_confirmed: terminal_completion_confirmed && !age270_failure_applied,
+        age270_mailbox_provenance: Age270MailboxProvenance {
+            physical_clean_exit_candidate,
+            effective_clean_exit_candidate,
+            age270_failure_applied,
+        },
+    }
+}
+
+fn age270_mailbox_eligibility_for_classification(
+    physical_clean_exit_candidate: bool,
+    effective_clean_exit_candidate: bool,
+    age270_failure_applied: bool,
+) -> Age270MailboxEligibility {
+    if physical_clean_exit_candidate && effective_clean_exit_candidate && age270_failure_applied {
+        Age270MailboxEligibility::PreMutationCleanExit
+    } else {
+        Age270MailboxEligibility::Ineligible
+    }
+}
+
+fn clean_exit_completion_candidate(result: &executor::ExecutionResult) -> bool {
+    result.exit_code == 0
+        && result.terminal_signal.as_ref().is_some_and(|signal| {
+            signal.kind
+                == oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::CleanExit
+        })
 }
 
 fn apply_incomplete_tool_boundary_failure(
@@ -124,6 +196,22 @@ fn apply_incomplete_tool_boundary_failure(
     });
 }
 
+fn apply_unconfirmed_resume_completion_failure(
+    result: &mut executor::ExecutionResult,
+    provider_name: &str,
+) {
+    const REASON: &str = "resume_completion_unconfirmed";
+    result.terminal_reason = Some(REASON.to_string());
+    result.terminal_signal = Some(executor::TerminalSignal {
+        kind: oulipoly_runtime::executor::terminal_signal::TerminalSignalKind::Unknown,
+        provider_name: provider_name.to_string(),
+        evidence: "provider exited cleanly without affirmative terminal assistant completion"
+            .to_string(),
+        observed_at: std::time::SystemTime::now(),
+    });
+    result.produced_assistant_response = false;
+}
+
 fn handle_resume_attempt_terminal_signal(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,
@@ -131,6 +219,8 @@ fn handle_resume_attempt_terminal_signal(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     completion_evidence: wake::ResumeCompletionEvidence,
+    terminal_completion_confirmed: bool,
+    mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<ResumeAttemptLoopControl, String> {
     let terminal_signal_disposition = terminal_signal_disposition_for_result(
         &input.env.state,
@@ -144,8 +234,11 @@ fn handle_resume_attempt_terminal_signal(
     let disposition_control = handle_terminal_signal_disposition(ResumeTerminalDispositionInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
+        invocation_id: &attempt.invocation.id,
         invocation_row_id: attempt.invocation_row_id,
         guard: &mut attempt.guard,
+        provider_name: &provider.name,
+        provider_session_id,
         result,
         terminal_signal_disposition,
         zero_turn_action: completion_evidence.zero_turn_action,
@@ -159,6 +252,7 @@ fn handle_resume_attempt_terminal_signal(
         provider_session_id,
         result,
         &outcome,
+        mailbox_delivery_outcome,
     )?;
     if let Some(control) = terminal_disposition_loop_control(outcome) {
         return Ok(control);
@@ -186,7 +280,10 @@ fn handle_resume_attempt_terminal_signal(
         provider,
         provider_session_id,
         result,
-        completion_evidence.recovered_generic_nonzero,
+        ResumeCompletionClassification {
+            recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
+            terminal_completion_confirmed,
+        },
     )
 }
 
@@ -202,7 +299,23 @@ fn apply_resume_terminal_disposition_effects(
     provider_session_id: &str,
     result: &executor::ExecutionResult,
     outcome: &ResumeTerminalDispositionOutcome,
+    mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<(), String> {
+    if let Some(mailbox_delivery_outcome) = mailbox_delivery_outcome {
+        let ResumeTerminalDispositionOutcome::Return(shell_exit_code) = outcome else {
+            return Err(
+                "AGE-270 mailbox outcome requires a terminal Return disposition".to_string(),
+            );
+        };
+        return wake::settle_age270_mailbox_delivery_outcome(
+            input,
+            provider_session_id,
+            &attempt.invocation.id,
+            result.exit_code,
+            *shell_exit_code,
+            mailbox_delivery_outcome,
+        );
+    }
     let (exit_code, fallback) = match outcome {
         ResumeTerminalDispositionOutcome::Continue(exit_code) => (*exit_code, "resume_retry"),
         ResumeTerminalDispositionOutcome::Return(exit_code) => (*exit_code, "resume_failed"),
@@ -285,7 +398,10 @@ fn emit_recovered_resume_terminal_signal_marker(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_incomplete_tool_boundary_failure;
+    use super::{
+        Age270MailboxEligibility, age270_mailbox_eligibility_for_classification,
+        apply_incomplete_tool_boundary_failure, apply_unconfirmed_resume_completion_failure,
+    };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_runtime::executor::{
         ExecutionResult, ResumeAcceptanceStatus, SessionCaptureMethod, SessionCaptureResult,
@@ -337,5 +453,50 @@ mod tests {
                 .map(|acceptance| acceptance.status),
             Some(ResumeAcceptanceStatus::Rejected)
         );
+    }
+
+    #[test]
+    fn unconfirmed_completion_preserves_physical_exit_without_rejecting_delivery() {
+        let mut result = clean_result();
+
+        apply_unconfirmed_resume_completion_failure(&mut result, "opencode");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            result.terminal_reason.as_deref(),
+            Some("resume_completion_unconfirmed")
+        );
+        assert!(!result.produced_assistant_response);
+        assert_eq!(
+            result.terminal_signal.as_ref().map(|signal| signal.kind),
+            Some(TerminalSignalKind::Unknown)
+        );
+        assert!(result.resume_acceptance.is_none());
+    }
+
+    #[test]
+    fn age270_mailbox_eligibility_requires_physical_effective_and_applied_provenance() {
+        let rows = [
+            (false, false, false, Age270MailboxEligibility::Ineligible),
+            (false, false, true, Age270MailboxEligibility::Ineligible),
+            (false, true, false, Age270MailboxEligibility::Ineligible),
+            (false, true, true, Age270MailboxEligibility::Ineligible),
+            (true, false, false, Age270MailboxEligibility::Ineligible),
+            (true, false, true, Age270MailboxEligibility::Ineligible),
+            (true, true, false, Age270MailboxEligibility::Ineligible),
+            (
+                true,
+                true,
+                true,
+                Age270MailboxEligibility::PreMutationCleanExit,
+            ),
+        ];
+        for (physical, effective, applied, expected) in rows {
+            assert_eq!(
+                age270_mailbox_eligibility_for_classification(physical, effective, applied),
+                expected,
+                "unexpected eligibility for P={physical}, E={effective}, A={applied}"
+            );
+        }
     }
 }

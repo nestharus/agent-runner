@@ -111,6 +111,10 @@ pub(super) fn resume_terminal_disposition_outcome(
     }
 }
 
+pub(super) fn failure_exit_code(exit_code: i32) -> i32 {
+    if exit_code == 0 { 1 } else { exit_code }
+}
+
 pub(super) fn resume_service_request<'a>(
     env: &'a ResumeExecutionEnvironment,
     session_id: &'a str,

@@ -19,6 +19,13 @@ pub(super) struct ResumeCompletionEvidence {
     pub(super) submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MailboxDeliveryOutcome {
+    Absent,
+    Confirmed,
+    Unconfirmed,
+}
+
 pub(super) fn validate_auto_wake_child(session_id: &str) -> Result<Option<i32>, String> {
     crate::wake_coordinator::validate_auto_wake_child(session_id)
 }
@@ -58,13 +65,28 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     result: &executor::ExecutionResult,
     completion_evidence: ResumeCompletionEvidence,
 ) {
+    let errors = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
+        input,
+        provider,
+        result,
+        completion_evidence,
+    );
+    emit_session_ingest_warnings(&provider.name, &errors);
+}
+
+fn ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    result: &executor::ExecutionResult,
+    completion_evidence: ResumeCompletionEvidence,
+) -> Vec<String> {
     if !mailbox_delivery_requires_turn_confirmation(
         input,
         result,
         completion_evidence.recovered_generic_nonzero,
     ) || mailbox_delivery_turn_confirmed(input, &provider.name, completion_evidence)
     {
-        return;
+        return Vec::new();
     }
     let report = sessions::scan_provider_session(
         &provider.name,
@@ -72,7 +94,7 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
         &input.env.state,
         &input.resolved.active_session_id,
     );
-    emit_session_ingest_warnings(&provider.name, &report.errors);
+    report.errors
 }
 
 fn emit_session_ingest_warnings(provider_name: &str, errors: &[String]) {
@@ -81,6 +103,29 @@ fn emit_session_ingest_warnings(provider_name: &str, errors: &[String]) {
             "Warning: Session ingest failed for {}: {error}",
             provider_name
         ));
+    }
+}
+
+pub(super) fn resolve_mailbox_delivery_outcome(
+    input: &ResumeAttemptInput<'_>,
+    provider: &oulipoly_config::ProviderConfig,
+    result: &executor::ExecutionResult,
+    completion_evidence: ResumeCompletionEvidence,
+) -> MailboxDeliveryOutcome {
+    if input.mailbox_delivery_seqs.is_empty() {
+        return MailboxDeliveryOutcome::Absent;
+    }
+    let errors = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
+        input,
+        provider,
+        result,
+        completion_evidence,
+    );
+    emit_session_ingest_warnings(&provider.name, &errors);
+    if mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
+        MailboxDeliveryOutcome::Unconfirmed
+    } else {
+        MailboxDeliveryOutcome::Confirmed
     }
 }
 
@@ -299,4 +344,29 @@ pub(super) fn complete_successful_mailbox_delivery(
         exit_code,
     )?;
     Ok(())
+}
+
+pub(super) fn settle_age270_mailbox_delivery_outcome(
+    input: &ResumeAttemptInput<'_>,
+    provider_session_id: &str,
+    invocation_uuid: &str,
+    physical_exit_code: i32,
+    shell_exit_code: i32,
+    outcome: MailboxDeliveryOutcome,
+) -> Result<(), String> {
+    match outcome {
+        MailboxDeliveryOutcome::Absent => {
+            mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
+        }
+        MailboxDeliveryOutcome::Confirmed => complete_successful_mailbox_delivery(
+            input,
+            provider_session_id,
+            invocation_uuid,
+            physical_exit_code,
+        ),
+        MailboxDeliveryOutcome::Unconfirmed => {
+            record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
+            mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))
+        }
+    }
 }
