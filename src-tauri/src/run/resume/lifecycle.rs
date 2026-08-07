@@ -164,6 +164,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
     provider_session_id: &str,
     result: &oulipoly_runtime::executor::ExecutionResult,
     recovered_generic_nonzero: bool,
+    terminal_completion_confirmed: bool,
 ) -> Result<ResumeAttemptLoopControl, String> {
     match finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
@@ -172,6 +173,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
         invocation_row_id: attempt.invocation_row_id,
         guard: &mut attempt.guard,
         provider_name: &provider.name,
+        provider_session_id,
         model: input.resolved.model.as_ref(),
         result,
         working_dir: input.working_dir,
@@ -182,6 +184,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
         attempts: input.attempts,
         max_attempts: input.max_attempts,
         recovered_generic_nonzero,
+        terminal_completion_confirmed,
     })? {
         CompletedAttemptControl::Continue => {
             finalize_retrying_resume(input, attempt, provider_session_id, result)

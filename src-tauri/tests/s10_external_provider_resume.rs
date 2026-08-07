@@ -776,6 +776,19 @@ fn parse_provider_record(line: &str) -> Value {
     serde_json::from_str(line).unwrap()
 }
 
+fn assert_unconfirmed_resume(output: &Output) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result = assert_result_envelope_shape(&String::from_utf8_lossy(&output.stdout));
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["success"], false);
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["error_category"], "resume_completion_unconfirmed");
+    assert_eq!(result["terminal_reason"], "resume_completion_unconfirmed");
+    assert_eq!(result["provider_name"], PROVIDER);
+    assert_eq!(result["provider_session_id"], SESSION_ID);
+    assert_eq!(result["agent_runner_invocation_id"], result["id"]);
+}
+
 #[test]
 fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd() {
     let fixture = Fixture::new();
@@ -784,7 +797,7 @@ fn external_provider_resume_without_rotate_uses_external_launch_and_recorded_cwd
     assert_success(&launch);
 
     let resume = fixture.run_resume();
-    assert_success(&resume);
+    assert_unconfirmed_resume(&resume);
     let resume_stderr = String::from_utf8_lossy(&resume.stderr);
     assert!(
         !resume_stderr.contains("migration failed"),
@@ -845,7 +858,7 @@ fn external_provider_ref_resume_launches_existing_headless_session_unbounded() {
 
     let resume = fixture.run_resume();
 
-    assert_success(&resume);
+    assert_unconfirmed_resume(&resume);
     let resume_stderr = String::from_utf8_lossy(&resume.stderr);
     assert!(
         !resume_stderr.contains("external rotation target requires an explicit manual target"),
@@ -921,7 +934,7 @@ fn assert_headless_non_rotated_provider_ref_resume(case: ProviderRefNonRotatedCa
 
     let resume = fixture.run_resume();
 
-    assert_success(&resume);
+    assert_unconfirmed_resume(&resume);
     let resume_stderr = String::from_utf8_lossy(&resume.stderr);
     assert!(
         !resume_stderr.contains("external rotation target requires an explicit manual target"),

@@ -2,6 +2,7 @@
 
 use oulipoly_state::{InvocationStatus, StateDb};
 use rusqlite::{Connection, params};
+use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -327,6 +328,85 @@ fn count_lines(content: Option<&str>) -> usize {
     content.map(|content| content.lines().count()).unwrap_or(0)
 }
 
+fn single_result(output: &Output) -> Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1, "{stdout}");
+    serde_json::from_str(results[0]).unwrap()
+}
+
+fn assert_success_result(output: &Output, provider_stdout: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with(&format!("{provider_stdout}\nOULIPOLY_RESULT=")),
+        "{stdout}"
+    );
+    let result = single_result(output);
+    let mut keys = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "status",
+            "success",
+            "terminal_reason"
+        ]
+    );
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
+    assert_eq!(result["exit_code"], 0);
+    assert!(result["error_category"].is_null());
+    assert!(result["terminal_reason"].is_null());
+}
+
+fn assert_nonzero_failure_result(output: &Output) {
+    let result = single_result(output);
+    let mut keys = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "agent_runner_chain_id",
+            "agent_runner_invocation_id",
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "provider_name",
+            "provider_session_id",
+            "status",
+            "success",
+            "terminal_reason"
+        ]
+    );
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["success"], false);
+    assert_eq!(result["exit_code"], 17);
+    assert_eq!(result["error_category"], "network_error");
+    assert_eq!(result["terminal_reason"], "exit_nonzero");
+    assert_eq!(result["provider_name"], ["cla", "ude-a"].concat());
+    assert_eq!(result["provider_session_id"], SESSION_ID);
+    assert_eq!(result["agent_runner_chain_id"], CHAIN_ID);
+    assert_eq!(result["agent_runner_invocation_id"], result["id"]);
+}
+
 fn seed_base_resume_fixture(
     providers: &[(&str, &Path, String)],
     use_heuristic_diagnostics: bool,
@@ -388,10 +468,7 @@ fn resume_quota_exhausted_marks_provider_and_migrates_to_next_pool_member() {
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "sibling resume stdout\n"
-    );
+    assert_success_result(&output, "sibling resume stdout");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("[migrate] claude-a -> claude-b reason=exhausted"),
@@ -441,10 +518,7 @@ fn resume_retries_n_minus_one_quota_exhausted_providers_then_succeeds() {
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "third resume stdout\n"
-    );
+    assert_success_result(&output, "third resume stdout");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("reason=exhausted").count(), 2, "{stderr}");
     assert_eq!(fixture.exhausted_row_count("claude-a"), 1);
@@ -537,13 +611,17 @@ fn resume_non_quota_failure_does_not_migrate_or_mark_exhausted() {
     let output = fixture.run_resume("age100-resume");
 
     assert_eq!(output.status.code(), Some(17), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_nonzero_failure_result(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("connection refused for active resume provider"),
         "{stderr}"
     );
     assert!(stderr.contains("[diagnostics: network_error]"), "{stderr}");
+    assert!(
+        stderr.lines().any(|line| line == "exit_nonzero"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("rotating to another provider"), "{stderr}");
     assert_eq!(line_count(&first_marker), 1);
     assert_eq!(line_count(&sibling_marker), 0);
@@ -593,10 +671,7 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
         Some(0),
         "{heuristic_output:?}"
     );
-    assert_eq!(
-        String::from_utf8_lossy(&heuristic_output.stdout),
-        "heuristic sibling stdout\n"
-    );
+    assert_success_result(&heuristic_output, "heuristic sibling stdout");
     let heuristic_stderr = String::from_utf8_lossy(&heuristic_output.stderr);
     assert!(
         heuristic_stderr.contains("OULIPOLY_TERMINAL_SIGNAL="),
@@ -642,10 +717,7 @@ fn resume_heuristic_stderr_quota_uses_same_path_as_diagnostic_model_quota() {
     );
 
     assert_eq!(model_output.status.code(), Some(0), "{model_output:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&model_output.stdout),
-        "diagnostic sibling stdout\n"
-    );
+    assert_success_result(&model_output, "diagnostic sibling stdout");
     let model_stderr = String::from_utf8_lossy(&model_output.stderr);
     assert!(
         model_stderr.contains("OULIPOLY_TERMINAL_SIGNAL="),

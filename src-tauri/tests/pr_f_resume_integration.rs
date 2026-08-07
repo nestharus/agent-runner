@@ -492,6 +492,59 @@ pub(crate) fn parse_invocation(stderr: &str) -> CompositeInvocationId {
     CompositeInvocationId::parse_env_value(raw).unwrap()
 }
 
+fn assert_unconfirmed_resume_result(
+    output: &Output,
+    invocation: &CompositeInvocationId,
+    provider_name: &str,
+    provider_session_id: &str,
+) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let result: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let mut keys = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "agent_runner_chain_id",
+            "agent_runner_invocation_id",
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "provider_name",
+            "provider_session_id",
+            "status",
+            "success",
+            "terminal_reason"
+        ]
+    );
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["success"], false);
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["error_category"], "resume_completion_unconfirmed");
+    assert_eq!(result["terminal_reason"], "resume_completion_unconfirmed");
+    assert_eq!(result["id"], invocation.id);
+    assert_eq!(result["agent_runner_invocation_id"], invocation.id);
+    assert_eq!(result["provider_name"], provider_name);
+    assert_eq!(result["provider_session_id"], provider_session_id);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == "resume_completion_unconfirmed")
+    );
+}
+
 fn parse_session_line(stderr: &str, invocation_uuid: &str) -> String {
     let value = parse_session_json(stderr, invocation_uuid);
     value["session_id"].as_str().unwrap().to_string()
@@ -1555,7 +1608,7 @@ flag = "--resume"
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(
         fs::read_to_string(&argv_dump).unwrap(),
         "one-shot-only\n--resume\n5169694d-de0f-40d1-890c-6e28e55bab27\nanswer from root\n\n"
@@ -1563,6 +1616,7 @@ flag = "--resume"
     assert_eq!(fs::read_to_string(&stdin_dump).unwrap(), "");
 
     let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    assert_unconfirmed_resume_result(&output, &invocation, &["cla", "ude2"].concat(), session_id);
     let row = fixture
         .open_db()
         .get_invocation_by_uuid(&invocation.id)
@@ -1612,7 +1666,7 @@ fn noninteractive_resume_routes_to_session_owner_in_multi_provider_model() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(
         !provider_a_marker.exists(),
         "resume must not launch provider A/default provider"
@@ -1625,6 +1679,12 @@ fn noninteractive_resume_routes_to_session_owner_in_multi_provider_model() {
     assert!(stderr.contains("[resume] -> claude-owner"), "{stderr}");
 
     let invocation = parse_invocation(&stderr);
+    assert_unconfirmed_resume_result(
+        &output,
+        &invocation,
+        &["cla", "ude-owner"].concat(),
+        session_id,
+    );
     let row = fixture
         .open_db()
         .get_invocation_by_uuid(&invocation.id)

@@ -141,19 +141,72 @@ pub(crate) fn zero_turn_classify_after_completion(
     classify_after_completion(state, sessions_cfg, baseline, host_observed).classification
 }
 
-pub(crate) fn zero_turn_classify_after_completion_with_recovery(
+pub(crate) fn zero_turn_classify_after_completion_with_recovery<
+    Output: CompletionClassificationOutput,
+>(
     state: &StateDb,
     sessions_cfg: &oulipoly_config::SessionsConfig,
     baseline: &ZeroTurnBaseline,
     host_observed: HostObservedCompletion,
     result: &executor::ExecutionResult,
-) -> (ZeroTurnClassification, bool, bool) {
+) -> Output {
+    classify_completion_with_recovery(state, sessions_cfg, baseline, host_observed, result)
+}
+
+pub(crate) trait CompletionClassificationOutput {
+    fn from_completion(
+        classification: ZeroTurnClassification,
+        recovered_generic_nonzero: bool,
+        incomplete_tool_boundary: bool,
+        accepted_provider_turn: bool,
+    ) -> Self;
+}
+
+impl CompletionClassificationOutput for (ZeroTurnClassification, bool, bool) {
+    fn from_completion(
+        classification: ZeroTurnClassification,
+        recovered_generic_nonzero: bool,
+        incomplete_tool_boundary: bool,
+        _accepted_provider_turn: bool,
+    ) -> Self {
+        (
+            classification,
+            recovered_generic_nonzero,
+            incomplete_tool_boundary,
+        )
+    }
+}
+
+impl CompletionClassificationOutput for (ZeroTurnClassification, bool, bool, bool) {
+    fn from_completion(
+        classification: ZeroTurnClassification,
+        recovered_generic_nonzero: bool,
+        incomplete_tool_boundary: bool,
+        accepted_provider_turn: bool,
+    ) -> Self {
+        (
+            classification,
+            recovered_generic_nonzero,
+            incomplete_tool_boundary,
+            accepted_provider_turn,
+        )
+    }
+}
+
+fn classify_completion_with_recovery<Output: CompletionClassificationOutput>(
+    state: &StateDb,
+    sessions_cfg: &oulipoly_config::SessionsConfig,
+    baseline: &ZeroTurnBaseline,
+    host_observed: HostObservedCompletion,
+    result: &executor::ExecutionResult,
+) -> Output {
     let completion = classify_after_completion(state, sessions_cfg, baseline, host_observed);
     let recovered = recovered_generic_nonzero(completion.accepted_provider_turn, result);
-    (
+    Output::from_completion(
         completion.classification,
         recovered,
         completion.incomplete_tool_boundary,
+        completion.accepted_provider_turn,
     )
 }
 

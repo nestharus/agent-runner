@@ -2,7 +2,6 @@
 //!
 //! `orchestration`, `accessor`, `mapper`, `predicate`, `formatter`
 
-use std::io::Write as _;
 use std::path::Path;
 
 use oulipoly_config::ModelConfig;
@@ -30,6 +29,7 @@ pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) invocation_row_id: i64,
     pub(super) guard: &'a mut FinalizerGuard<'state>,
     pub(super) provider_name: &'a str,
+    pub(super) provider_session_id: &'a str,
     pub(super) model: Option<&'a ModelConfig>,
     pub(super) result: &'a oulipoly_runtime::executor::ExecutionResult,
     pub(super) working_dir: Option<&'a Path>,
@@ -40,13 +40,17 @@ pub(super) struct CompletedAttemptInput<'a, 'state> {
     pub(super) attempts: usize,
     pub(super) max_attempts: usize,
     pub(super) recovered_generic_nonzero: bool,
+    pub(super) terminal_completion_confirmed: bool,
 }
 
 pub(super) fn finalize_completed_attempt(
     mut input: CompletedAttemptInput<'_, '_>,
 ) -> Result<CompletedAttemptControl, String> {
     let success = input.recovered_generic_nonzero
-        || super::predicate::completed_attempt_success(input.result);
+        || super::predicate::completed_attempt_success(
+            input.result,
+            input.terminal_completion_confirmed,
+        );
     let error_category = (!input.recovered_generic_nonzero)
         .then(|| completed_attempt_error_category(&input))
         .flatten();
@@ -60,7 +64,7 @@ pub(super) fn finalize_completed_attempt(
     finalize_regular_completed_attempt(&mut input, success, error_category.as_deref())?;
 
     if success {
-        return Ok(handle_completed_success(&input));
+        return Ok(handle_completed_success(&input, error_category.as_deref()));
     }
 
     if quota_exhausted {
@@ -126,7 +130,10 @@ fn finalize_regular_completed_attempt(
     Ok(())
 }
 
-fn handle_completed_success(input: &CompletedAttemptInput<'_, '_>) -> CompletedAttemptControl {
+fn handle_completed_success(
+    input: &CompletedAttemptInput<'_, '_>,
+    error_category: Option<&str>,
+) -> CompletedAttemptControl {
     ingest_and_emit_session_id_resume_aware(
         input.agent_runtime_services,
         SessionIngestRequest {
@@ -151,7 +158,13 @@ fn handle_completed_success(input: &CompletedAttemptInput<'_, '_>) -> CompletedA
             },
         },
     );
-    let _ = std::io::stdout().write_all(&input.result.stdout);
+    formatter::emit_resume_success_output(
+        &input.invocation.id,
+        input.result.exit_code,
+        error_category,
+        input.result.terminal_reason.as_deref(),
+        &input.result.stdout,
+    );
     CompletedAttemptControl::Return(if input.recovered_generic_nonzero {
         0
     } else {
@@ -170,9 +183,22 @@ fn handle_completed_failure(
     input: &CompletedAttemptInput<'_, '_>,
     error_category: Option<&str>,
 ) -> CompletedAttemptControl {
-    formatter::emit_stderr(&input.result.stderr);
+    formatter::emit_resume_failure_output(formatter::ResumeFailureOutputInput {
+        state: &input.env.state,
+        invocation_id: &input.invocation.id,
+        provider_name: input.provider_name,
+        provider_session_id: input.provider_session_id,
+        exit_code: input.result.exit_code,
+        error_category,
+        terminal_reason: input.result.terminal_reason.as_deref(),
+        stderr: &input.result.stderr,
+    });
     if let Some(category) = error_category {
         formatter::emit_diagnostics_category(category);
     }
-    CompletedAttemptControl::Return(input.result.exit_code)
+    CompletedAttemptControl::Return(failure_exit_code(input.result.exit_code))
+}
+
+fn failure_exit_code(exit_code: i32) -> i32 {
+    if exit_code == 0 { 1 } else { exit_code }
 }

@@ -1,11 +1,69 @@
-//! formatter
+//! Declared roles: `accessor`, `formatter`, `mapper`.
 
 use std::fmt::Display;
+use std::io::Write as _;
 
 use oulipoly_runtime::services::{RotationFailedReason, ServiceError};
+use oulipoly_state::{ResultEnvelopeFailureIdentity, StateDb};
+
+use crate::invocation::result_envelope::emit_result_envelope;
+
+pub(super) struct ResumeFailureOutputInput<'a> {
+    pub(super) state: &'a StateDb,
+    pub(super) invocation_id: &'a str,
+    pub(super) provider_name: &'a str,
+    pub(super) provider_session_id: &'a str,
+    pub(super) exit_code: i32,
+    pub(super) error_category: Option<&'a str>,
+    pub(super) terminal_reason: Option<&'a str>,
+    pub(super) stderr: &'a str,
+}
 
 pub(super) fn emit_stderr(message: &str) {
     eprintln!("{message}");
+}
+
+pub(super) fn emit_resume_success_output(
+    invocation_id: &str,
+    exit_code: i32,
+    error_category: Option<&str>,
+    terminal_reason: Option<&str>,
+    stdout: &[u8],
+) {
+    let _ = std::io::stdout().write_all(stdout);
+    emit_result_envelope(
+        invocation_id,
+        true,
+        exit_code,
+        error_category,
+        terminal_reason,
+        None,
+    );
+}
+
+pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {
+    let failure_identity = ResultEnvelopeFailureIdentity {
+        agent_runner_invocation_id: input.invocation_id.to_string(),
+        provider_name: Some(input.provider_name.to_string()),
+        provider_session_id: Some(input.provider_session_id.to_string()),
+        agent_runner_chain_id: input
+            .state
+            .chain_id_for_segment(input.provider_name, input.provider_session_id)
+            .ok()
+            .flatten(),
+    };
+    emit_result_envelope(
+        input.invocation_id,
+        false,
+        input.exit_code,
+        input.error_category,
+        input.terminal_reason,
+        Some(&failure_identity),
+    );
+    emit_stderr(input.stderr);
+    if let Some(terminal_reason) = input.terminal_reason {
+        emit_stderr(terminal_reason);
+    }
 }
 
 pub(super) fn emit_resume_short_line(selected_provider: &str) {

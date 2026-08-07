@@ -947,7 +947,7 @@ fn resume_with_pending_mailbox_prepends_notifications() {
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_A);
     assert!(prompt_dump.exists(), "{output:?}");
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
@@ -974,7 +974,7 @@ fn resume_without_mailbox_preserves_payload() {
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_A);
     assert_eq!(fs::read_to_string(&prompt_dump).unwrap(), "continue");
     assert!(fixture.mailbox_rows(SESSION_A, false).is_empty());
     fixture.assert_default_user_paths_untouched();
@@ -998,7 +998,7 @@ fn tokenized_session_resume_persists_input_before_shared_delivery() {
         .arg("logical-session-submit-1");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_A);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY INBOX]"), "{prompt}");
     assert!(prompt.contains("durable session input"), "{prompt}");
@@ -1039,7 +1039,7 @@ fn chain_input_remains_reachable_after_active_segment_reselection() {
 
     let output = fixture.run(fixture.base_chain_resume_command("fixture-model", CHAIN_ID));
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_B);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY INBOX]"), "{prompt}");
     assert!(prompt.contains("durable chain input"), "{prompt}");
@@ -1081,7 +1081,7 @@ fn resume_without_mailbox_and_without_prompt_preserves_native_resume() {
 
     let output = fixture.run(fixture.base_resume_command("fixture-model", SESSION_A));
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_A);
     assert_eq!(
         fs::read_to_string(&argv_dump).unwrap(),
         format!("one-shot-only\n--resume\n{SESSION_A}\n")
@@ -1100,7 +1100,7 @@ fn resume_with_only_mailbox_sends_notification_prompt() {
 
     let output = fixture.run(fixture.base_resume_command("fixture-model", SESSION_A));
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_A);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
     assert!(prompt.contains("handle: h-only"), "{prompt}");
@@ -1120,8 +1120,7 @@ fn resume_marks_delivered_after_exact_turn_confirmation() {
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
-    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let invocation = assert_unconfirmed_resume(&output, SESSION_A);
     let rows = fixture.mailbox_rows(SESSION_A, true);
     let delivered = rows
         .iter()
@@ -1200,10 +1199,9 @@ fn resume_marks_delivered_from_exact_ingested_user_turn_without_assistant_delta(
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let invocation = assert_unconfirmed_resume(&output, SESSION_A);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"), "{prompt}");
-    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
     let rows = fixture.mailbox_rows(SESSION_A, true);
     let delivered = rows
         .iter()
@@ -1268,6 +1266,88 @@ fn resume_rejects_different_ingested_user_turn_without_assistant_delta() {
 }
 
 #[test]
+fn resume_typed_physical_zero_failure_keeps_selected_mailbox_outside_age270_seam() {
+    let fixture = Fixture::new();
+    let prompt_dump = fixture.dir.path().join("prompt.txt");
+    let turns = fixture.dir.path().join("turns.jsonl");
+    let turn_script = fixture.write_script(
+        "turns-typed-zero.sh",
+        &format!(
+            "if [ -f {} ]; then cat {}; fi",
+            shell_path(&turns),
+            shell_path(&turns)
+        ),
+    );
+    let script = fixture.write_script(
+        "resume-typed-zero.sh",
+        &write_user_turn_script(
+            &prompt_dump,
+            &turns,
+            SESSION_A,
+            Some("different payload"),
+            0,
+        ),
+    );
+    fixture.write_single_provider_model("fixture-model", "fixture-provider", &script);
+    fixture.write_sessions_config("fixture-provider", &turn_script);
+    fixture.seed_session_turn("fixture-provider", SESSION_A);
+    let selected = fixture.seed_mailbox(SESSION_A, "h-typed-zero", 0);
+    let mut cmd = fixture.base_resume_command("fixture-model", SESSION_A);
+    cmd.arg("--prompt").arg("continue");
+    cmd.env_remove("OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_NONE");
+    cmd.env(
+        "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND",
+        "ProlongedSilence",
+    );
+    let output = fixture.run(cmd);
+    let prompt = fs::read_to_string(&prompt_dump).unwrap();
+    assert!(prompt.starts_with("[OULIPOLY NOTIFICATIONS]"));
+    assert!(prompt.contains("handle: h-typed-zero"));
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    let result = assert_failure_result(
+        &output,
+        &invocation,
+        "fixture-provider",
+        SESSION_A,
+        "bounded_silence",
+    );
+    assert!(
+        result["agent_runner_chain_id"].as_str().is_some(),
+        "{result}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("resume_completion_unconfirmed"));
+    assert!(!stderr.contains("incomplete_tool_boundary"));
+    let markers = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_TERMINAL_SIGNAL="))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1, "{stderr}");
+    let marker: Value = serde_json::from_str(markers[0]).unwrap();
+    assert_eq!(marker["kind"], "ProlongedSilence");
+    assert_eq!(marker["invocation_id"], invocation.id);
+    assert_eq!(marker["session_id"], SESSION_A);
+    assert_failed_invocation(&fixture, &invocation.id, "bounded_silence");
+    let row = fixture
+        .mailbox_rows(SESSION_A, true)
+        .into_iter()
+        .find(|row| row.seq == selected.seq)
+        .unwrap();
+    assert!(row.delivered_at.is_none());
+    assert!(row.delivered_by_invocation_uuid.is_none());
+    assert_eq!(row.delivery_attempts, 1);
+    assert_eq!(row.delivery_error.as_deref(), Some("bounded_silence"));
+    let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+    let runtime = mailbox.session_runtime(SESSION_A).unwrap().unwrap();
+    assert_eq!(runtime.run_state, "idle");
+    assert!(runtime.running_invocation_uuid.is_none());
+    assert!(runtime.running_os_pid.is_none());
+    assert_eq!(runtime.last_exit_code, Some(1));
+    assert!(mailbox.wake_claim(SESSION_A).unwrap().is_none());
+    assert_eq!(invocation_count(&fixture), 1);
+}
+
+#[test]
 fn resume_failure_leaves_pending() {
     let fixture = Fixture::new();
     let prompt_dump = fixture.dir.path().join("prompt.txt");
@@ -1304,7 +1384,7 @@ fn resume_drains_in_order_and_respects_batch_cap() {
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_A);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     for index in 1..=20 {
         assert!(
@@ -1338,7 +1418,7 @@ fn resume_uses_resolved_active_session_id() {
     cmd.arg("--prompt").arg("continue");
     let output = fixture.run(cmd);
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_unconfirmed_resume(&output, SESSION_B);
     let prompt = fs::read_to_string(&prompt_dump).unwrap();
     assert!(prompt.contains("handle: h-active"), "{prompt}");
     assert!(fixture.mailbox_rows(CHAIN_ID, false).is_empty());
@@ -1471,6 +1551,115 @@ exit {exit_code}"#,
         shell_path(prompt_dump),
         shell_path(turns),
     )
+}
+
+fn assert_failure_result(
+    output: &Output,
+    invocation: &CompositeInvocationId,
+    provider_name: &str,
+    provider_session_id: &str,
+    terminal_reason: &str,
+) -> Value {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{stdout}");
+    let result: Value = serde_json::from_str(lines[0]).unwrap();
+    let mut keys = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "agent_runner_chain_id",
+            "agent_runner_invocation_id",
+            "error_category",
+            "exit_code",
+            "finished_at",
+            "id",
+            "provider_name",
+            "provider_session_id",
+            "status",
+            "success",
+            "terminal_reason",
+        ]
+    );
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["success"], false);
+    assert_eq!(result["exit_code"], 0);
+    assert_eq!(result["error_category"], terminal_reason);
+    assert_eq!(result["terminal_reason"], terminal_reason);
+    assert_eq!(result["id"], invocation.id);
+    assert_eq!(result["agent_runner_invocation_id"], invocation.id);
+    assert_eq!(result["provider_name"], provider_name);
+    assert_eq!(result["provider_session_id"], provider_session_id);
+    assert!(result["finished_at"].as_str().is_some());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == terminal_reason),
+        "{output:?}"
+    );
+    result
+}
+
+fn assert_unconfirmed_resume(output: &Output, provider_session_id: &str) -> CompositeInvocationId {
+    let invocation = parse_invocation(&String::from_utf8_lossy(&output.stderr));
+    assert_failure_result(
+        output,
+        &invocation,
+        "fixture-provider",
+        provider_session_id,
+        "resume_completion_unconfirmed",
+    );
+    invocation
+}
+
+fn assert_failed_invocation(fixture: &Fixture, invocation_id: &str, terminal_reason: &str) {
+    let observed = fixture
+        .conn()
+        .query_row(
+            "SELECT status, success, exit_code, error_category, terminal_reason,
+                    provider_name, provider_session_id, finished_at
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            params![invocation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(observed.0, "failed");
+    assert_eq!(observed.1, 0);
+    assert_eq!(observed.2, 0);
+    assert_eq!(observed.3.as_deref(), Some(terminal_reason));
+    assert_eq!(observed.4.as_deref(), Some(terminal_reason));
+    assert_eq!(observed.5.as_deref(), Some("fixture-provider"));
+    assert_eq!(observed.6.as_deref(), Some(SESSION_A));
+    assert!(observed.7.is_some());
+}
+
+fn invocation_count(fixture: &Fixture) -> i64 {
+    fixture
+        .conn()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
 }
 
 fn parse_invocation(stderr: &str) -> CompositeInvocationId {
