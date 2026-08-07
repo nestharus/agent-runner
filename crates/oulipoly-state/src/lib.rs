@@ -37,6 +37,7 @@ pub mod mailbox;
 pub mod migrations;
 pub mod paths;
 pub mod pid_identity;
+mod read_only_snapshot;
 pub mod repositories;
 pub mod result_envelope;
 pub mod schema;

@@ -71,6 +71,7 @@ impl StateDb {
             conn,
             db_path: path.to_path_buf(),
             lifecycle_sink: Mutex::new(sink),
+            _read_only_snapshot: None,
         };
         db.complete_open_backfill()?;
 
@@ -148,13 +149,14 @@ impl StateDb {
 
     pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
         Self::validate_read_only_paths(path)?;
-        let conn = Self::open_read_only_connection(path)?;
+        let (conn, snapshot) = Self::open_read_only_connection(path)?;
         Self::probe_read_only_schema(path, &conn)?;
 
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
+            _read_only_snapshot: Some(snapshot),
         })
     }
 
