@@ -94,40 +94,6 @@ impl RecoveryFixture {
             .unwrap()
     }
 
-    fn latest_invocation_outcome(
-        &self,
-    ) -> (
-        String,
-        i64,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) {
-        self.base
-            .conn()
-            .query_row(
-                "SELECT status, success, exit_code, terminal_reason,
-                        resume_acceptance_status, resume_acceptance_evidence
-                 FROM invocations
-                 WHERE provider_name = ?1
-                 ORDER BY id DESC
-                 LIMIT 1",
-                params![PROVIDER],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .unwrap()
-    }
-
     fn latest_persisted_invocation(&self) -> PersistedInvocationOutcome {
         latest_persisted_invocation(&self.base, PROVIDER)
     }
@@ -221,6 +187,7 @@ fn resumed_clean_exit_after_new_tool_calls_boundary_is_non_success() {
     fixture.base.seed_active_chain(PROVIDER, MODEL);
 
     let output = fixture.run_resume();
+    let persisted = fixture.latest_persisted_invocation();
     let envelope = optional_result_envelope(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let observed = (
@@ -240,7 +207,6 @@ fn resumed_clean_exit_after_new_tool_calls_boundary_is_non_success() {
             .as_ref()
             .and_then(|result| result["terminal_reason"].as_str())
             .map(str::to_string),
-        fixture.latest_invocation_outcome(),
     );
     let expected = (
         false,
@@ -249,14 +215,6 @@ fn resumed_clean_exit_after_new_tool_calls_boundary_is_non_success() {
         Some(false),
         Some(0),
         Some("incomplete_tool_boundary".to_string()),
-        (
-            "failed".to_string(),
-            0,
-            0,
-            Some("incomplete_tool_boundary".to_string()),
-            Some("rejected".to_string()),
-            Some("incomplete_tool_boundary".to_string()),
-        ),
     );
 
     assert_eq!(
@@ -266,12 +224,25 @@ fn resumed_clean_exit_after_new_tool_calls_boundary_is_non_success() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(
+        persisted,
+        PersistedInvocationOutcome {
+            invocation_uuid: persisted.invocation_uuid.clone(),
+            status: "failed".to_string(),
+            success: 0,
+            exit_code: 0,
+            error_category: Some("incomplete_tool_boundary".to_string()),
+            terminal_reason: Some("incomplete_tool_boundary".to_string()),
+            resume_acceptance_status: Some("rejected".to_string()),
+            resume_acceptance_evidence: Some("incomplete_tool_boundary".to_string()),
+            provider_session_id: Some(SESSION_ID.to_string()),
+        }
+    );
 
     assert!(
         stderr.contains("earlier provider error evidence retained"),
         "{stderr}"
     );
-    let persisted = fixture.latest_persisted_invocation();
     let envelope = single_result_envelope(&output);
     assert_failure_envelope_matches(&envelope, &persisted, PROVIDER, SESSION_ID, CHAIN_ID);
 }
