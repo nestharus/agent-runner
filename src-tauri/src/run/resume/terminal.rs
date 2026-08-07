@@ -115,12 +115,7 @@ fn apply_resume_attempt_classification(
     apply_age153_terminal_signal_fixture_override(result);
     let effective_clean_exit_candidate = clean_exit_completion_candidate(result);
     let provider_confirmed_assistant_response = result.produced_assistant_response;
-    let (
-        zero_turn_classification,
-        recovered_generic_nonzero,
-        incomplete_tool_boundary,
-        accepted_provider_turn,
-    ) = zero_turn_classify_after_completion_with_recovery(
+    let completion = zero_turn_classify_after_completion_with_recovery(
         &input.env.state,
         &input.env.sessions_cfg,
         zero_turn_baseline,
@@ -128,10 +123,11 @@ fn apply_resume_attempt_classification(
         result,
     );
     let terminal_completion_confirmed =
-        provider_confirmed_assistant_response || accepted_provider_turn;
+        provider_confirmed_assistant_response || completion.accepted_provider_turn;
+    let zero_turn_classification = completion.classification;
     apply_zero_turn_classification_to_result(result, provider_name, &zero_turn_classification);
     let mut age270_failure_applied = false;
-    if incomplete_tool_boundary {
+    if completion.incomplete_tool_boundary {
         apply_incomplete_tool_boundary_failure(result, provider_name);
         age270_failure_applied = true;
     } else if effective_clean_exit_candidate && !terminal_completion_confirmed {
@@ -149,7 +145,7 @@ fn apply_resume_attempt_classification(
     );
     ResumeAttemptClassification {
         zero_turn_action: action,
-        recovered_generic_nonzero,
+        recovered_generic_nonzero: completion.recovered_generic_nonzero,
         terminal_completion_confirmed,
         age270_mailbox_provenance: Age270MailboxProvenance {
             physical_clean_exit_candidate,
