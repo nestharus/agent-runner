@@ -9,8 +9,9 @@ use oulipoly_state::mailbox::{
     CompletionEventRegistrationResult, CompletionEventRow, CompletionEventTriggerInput,
     CompletionEventTriggerResult, MailboxDb, MailboxRow,
 };
-use oulipoly_state::{InvocationRecord, StateDb};
-use serde::Serialize;
+use oulipoly_state::pid_identity::{PidIdentityDb, ProcessIdentity, read_live_process_identity};
+use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -99,6 +100,23 @@ struct ErrorResponse {
 struct OwnerBinding {
     session_id: String,
     invocation_uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CallerIdentity {
+    pid: i64,
+    boot_id: String,
+    starttime_ticks: i64,
+}
+
+impl CallerIdentity {
+    fn process_identity(self) -> ProcessIdentity {
+        ProcessIdentity {
+            os_pid: self.pid,
+            os_boot_id: self.boot_id,
+            os_pid_starttime_ticks: self.starttime_ticks,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,7 +218,7 @@ fn register_completion_event(
 ) -> Result<CompletionEventRegistrationResult, String> {
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
-    validate_owner_binding(&owner)?;
+    validate_owner_binding(&owner, &metadata)?;
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut mailbox = MailboxDb::open_default()?;
     mailbox.register_completion_event(CompletionEventRegistrationInput {
@@ -348,7 +366,7 @@ fn optional_nonempty_string(metadata: &Value, field: &str) -> Result<Option<Stri
         .ok_or_else(|| format!("meta.json {field} must be a non-empty string"))
 }
 
-fn validate_owner_binding(owner: &OwnerBinding) -> Result<(), String> {
+fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), String> {
     let path = StateDb::default_path()?;
     if !path.exists() {
         return Err("State DB is unavailable for completion listener validation".to_string());
@@ -363,14 +381,16 @@ fn validate_owner_binding(owner: &OwnerBinding) -> Result<(), String> {
                 owner.invocation_uuid
             )
         })?;
-    if resolved_invocation_session_id(&record).as_deref() == Some(owner.session_id.as_str()) {
-        Ok(())
-    } else {
-        Err(format!(
-            "Completion listener session {} is not bound to invocation {}",
-            owner.session_id, owner.invocation_uuid
-        ))
+    match resolved_invocation_session_id(&record) {
+        Some(session_id) if session_id == owner.session_id => return Ok(()),
+        Some(_) => return Err(owner_binding_error(owner)),
+        None => {}
     }
+    if record.status == InvocationStatus::Running && running_owner_binding_is_live(owner, metadata)?
+    {
+        return Ok(());
+    }
+    Err(owner_binding_error(owner))
 }
 
 fn resolved_invocation_session_id(record: &InvocationRecord) -> Option<String> {
@@ -378,6 +398,41 @@ fn resolved_invocation_session_id(record: &InvocationRecord) -> Option<String> {
         .provider_session_id
         .clone()
         .or_else(|| record.session_id.clone())
+}
+
+fn running_owner_binding_is_live(owner: &OwnerBinding, metadata: &Value) -> Result<bool, String> {
+    let caller_chain = metadata
+        .get("caller_chain")
+        .ok_or_else(|| "meta.json must contain caller_chain for a running owner".to_string())?;
+    let callers: Vec<CallerIdentity> = serde_json::from_value(caller_chain.clone())
+        .map_err(|err| format!("meta.json caller_chain is invalid: {err}"))?;
+    let sidecar_path = PidIdentityDb::default_path()?;
+    if !sidecar_path.exists() {
+        return Ok(false);
+    }
+    let sidecar = PidIdentityDb::open_read_only(&sidecar_path)?;
+    for caller in callers {
+        let identity = caller.process_identity();
+        let Some(row) = sidecar.lookup_by_identity(&identity)? else {
+            continue;
+        };
+        if row.invocation_uuid != owner.invocation_uuid
+            || row.session_id.as_deref() != Some(owner.session_id.as_str())
+        {
+            continue;
+        }
+        if read_live_process_identity(identity.os_pid)?.as_ref() == Some(&identity) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn owner_binding_error(owner: &OwnerBinding) -> String {
+    format!(
+        "Completion listener session {} is not bound to invocation {}",
+        owner.session_id, owner.invocation_uuid
+    )
 }
 
 fn payload_value(
