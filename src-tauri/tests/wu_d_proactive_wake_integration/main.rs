@@ -47,6 +47,11 @@ const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
 
 #[test]
+fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once() {
+    cases_basic::delayed_agent_bash_completion_wakes_inactive_headless_parent_once();
+}
+
+#[test]
 fn no_undelivered_no_wake_and_loop_terminates() {
     cases_basic::no_undelivered_no_wake_and_loop_terminates();
 }

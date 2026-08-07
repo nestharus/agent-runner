@@ -304,7 +304,7 @@ prompt_mode = "stdin"
         self.run(cmd)
     }
 
-    fn seed_auto_wake_claim(&self, session_id: &str, claim_token: &str) {
+    fn seed_pending_auto_wake_claim(&self, session_id: &str, claim_token: &str) -> i64 {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let row = match db
             .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
@@ -338,8 +338,20 @@ prompt_mode = "stdin"
             })
             .unwrap();
         assert!(matches!(result, WakeClaimAcquireResult::Acquired(_)));
-        db.mark_delivered(session_id, &[row.seq], "notification-boundary-test")
+        row.seq
+    }
+
+    fn seed_auto_wake_claim(&self, session_id: &str, claim_token: &str) {
+        let seq = self.seed_pending_auto_wake_claim(session_id, claim_token);
+        let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
+        db.mark_delivered(session_id, &[seq], "notification-boundary-test")
             .unwrap();
+    }
+
+    fn invocation_count(&self) -> i64 {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+            .unwrap()
     }
 
     fn run(&self, mut cmd: Command) -> Output {
@@ -610,4 +622,80 @@ fn notification_auto_wake_stays_bound_despite_explicit_rotation_target() {
     assert_eq!(row.provider_name, SOURCE);
     assert_eq!(row.provider_session_id.as_deref(), Some(SESSION_A));
     assert_eq!(row.status, InvocationStatus::Succeeded.as_str());
+}
+
+#[test]
+fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provider_execution() {
+    const PROVIDER: &str = "provider-poison";
+    const CLAIM_TOKEN: &str = "notification-boundary-claim";
+    const PROVIDER_CANARY_ENV: &str = "ACR329_PROVIDER_CANARY";
+
+    let invalid_markers = [
+        ("wrong-session", "wrong-session", CLAIM_TOKEN),
+        ("empty-token", CHAIN_ID, ""),
+        ("wrong-token", CHAIN_ID, "wrong-token"),
+    ];
+    for (case, expected_session, child_token) in invalid_markers {
+        let fixture = Fixture::new();
+        let canary = fixture.dir.path().join(format!("{case}-provider-ran"));
+        fixture.write_resume_pool(
+            "age123-resume",
+            &[ProviderFixture {
+                name: PROVIDER,
+                body: ": > \"${ACR329_PROVIDER_CANARY:?}\"\nprintf '%s\\n' 'provider must not run' >&2\nexit 99",
+            }],
+        );
+        fixture.seed_active_chain(PROVIDER, SESSION_A);
+        let seq = fixture.seed_pending_auto_wake_claim(CHAIN_ID, CLAIM_TOKEN);
+
+        let output = fixture.run_resume_with_env(
+            CHAIN_ID,
+            &[
+                ("OULIPOLY_AUTO_WAKE", "1"),
+                ("OULIPOLY_AUTO_WAKE_SESSION_ID", expected_session),
+                ("OULIPOLY_AUTO_WAKE_TOKEN", child_token),
+                (PROVIDER_CANARY_ENV, canary.to_str().unwrap()),
+            ],
+        );
+
+        assert_eq!(output.status.code(), Some(0), "{case}: {output:?}");
+        assert!(!canary.exists(), "{case}: provider executed");
+        assert_eq!(fixture.invocation_count(), 0, "{case}");
+        let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
+        let pending = db.list_pending(CHAIN_ID).unwrap();
+        assert_eq!(pending.len(), 1, "{case}");
+        assert_eq!(pending[0].seq, seq, "{case}");
+        assert_eq!(pending[0].delivery_attempts, 0, "{case}");
+        assert!(pending[0].delivered_at.is_none(), "{case}");
+        let claim = db.wake_claim(CHAIN_ID).unwrap().unwrap();
+        assert_eq!(claim.claim_token, CLAIM_TOKEN, "{case}");
+        assert_eq!(claim.auto_wake_count, 1, "{case}");
+    }
+
+    let fixture = Fixture::new();
+    let canary = fixture.dir.path().join("missing-sidecar-provider-ran");
+    fixture.write_resume_pool(
+        "age123-resume",
+        &[ProviderFixture {
+            name: PROVIDER,
+            body: ": > \"${ACR329_PROVIDER_CANARY:?}\"\nprintf '%s\\n' 'provider must not run' >&2\nexit 99",
+        }],
+    );
+    fixture.seed_active_chain(PROVIDER, SESSION_A);
+    assert!(!fixture.sidecar_path().exists());
+
+    let output = fixture.run_resume_with_env(
+        CHAIN_ID,
+        &[
+            ("OULIPOLY_AUTO_WAKE", "1"),
+            ("OULIPOLY_AUTO_WAKE_SESSION_ID", CHAIN_ID),
+            ("OULIPOLY_AUTO_WAKE_TOKEN", CLAIM_TOKEN),
+            (PROVIDER_CANARY_ENV, canary.to_str().unwrap()),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "missing-sidecar: {output:?}");
+    assert!(!canary.exists(), "missing-sidecar: provider executed");
+    assert_eq!(fixture.invocation_count(), 0);
+    assert!(!fixture.sidecar_path().exists());
 }

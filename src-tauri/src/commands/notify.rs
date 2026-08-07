@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
+use crate::wake_coordinator::WakeDiagnostic;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AgentBashRegisterArgs<'a> {
@@ -84,7 +85,7 @@ struct NotifyResponse {
     payload_sha256: Option<String>,
     payload_byte_len: Option<i64>,
     payload_retention_policy: Option<String>,
-    wake: Option<Value>,
+    wake: Option<WakeDiagnostic>,
 }
 
 #[derive(Debug, Serialize)]
@@ -155,7 +156,7 @@ pub(crate) fn run_agent_bash_activate(args: AgentBashActivateArgs<'_>) -> Result
 
 pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result<i32, String> {
     match trigger_completion_event(&args) {
-        Ok((result, pty_deliveries)) => {
+        Ok((result, pty_deliveries, wake)) => {
             let owner = result.listeners.first();
             let row = result.mailbox_rows.first();
             let pty_delivery = pty_deliveries.first().cloned();
@@ -184,7 +185,7 @@ pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result
                     payload_byte_len: row.and_then(|row| row.payload_byte_len),
                     payload_retention_policy: row
                         .and_then(|row| row.payload_retention_policy.clone()),
-                    wake: None,
+                    wake,
                 },
                 args.json,
             )?;
@@ -235,6 +236,7 @@ fn trigger_completion_event(
     (
         CompletionEventTriggerResult,
         Vec<PtyMailboxDeliveryDiagnostic>,
+        Option<WakeDiagnostic>,
     ),
     String,
 > {
@@ -264,20 +266,44 @@ fn trigger_completion_event(
         rc,
         consumed: args.consumed,
     })?;
-    let delivery = deliver_event_listeners(&mut mailbox, &result.mailbox_rows);
-    Ok((result, delivery))
+    let (delivery, wake) = deliver_and_wake_event_listeners(&mut mailbox, &result.mailbox_rows);
+    Ok((result, delivery, wake))
+}
+
+fn deliver_and_wake_event_listeners(
+    mailbox: &mut MailboxDb,
+    rows: &[MailboxRow],
+) -> (Vec<PtyMailboxDeliveryDiagnostic>, Option<WakeDiagnostic>) {
+    let mut deliveries = Vec::new();
+    let mut first_wake = None;
+    for session_id in undelivered_listener_session_ids(rows) {
+        let delivery = crate::mailbox_delivery::attempt_pty_mailbox_delivery_with_trigger(
+            mailbox,
+            &session_id,
+            "completion-event",
+        );
+        let wake = wake_after_unsubmitted_delivery(&session_id, &delivery);
+        if deliveries.is_empty() {
+            first_wake = wake;
+        }
+        deliveries.push(delivery);
+    }
+    (deliveries, first_wake)
+}
+
+fn wake_after_unsubmitted_delivery(
+    session_id: &str,
+    delivery: &PtyMailboxDeliveryDiagnostic,
+) -> Option<WakeDiagnostic> {
+    (!delivery.submitted && delivery.status != "paused")
+        .then(|| crate::wake_coordinator::trigger_notify_wake(session_id))
 }
 
 fn deliver_event_listeners(
     mailbox: &mut MailboxDb,
     rows: &[MailboxRow],
 ) -> Vec<PtyMailboxDeliveryDiagnostic> {
-    let session_ids = rows
-        .iter()
-        .filter(|row| row.delivered_at.is_none())
-        .map(|row| row.session_id.clone())
-        .collect::<BTreeSet<_>>();
-    session_ids
+    undelivered_listener_session_ids(rows)
         .into_iter()
         .map(|session_id| {
             crate::mailbox_delivery::attempt_pty_mailbox_delivery_with_trigger(
@@ -286,6 +312,13 @@ fn deliver_event_listeners(
                 "completion-event",
             )
         })
+        .collect()
+}
+
+fn undelivered_listener_session_ids(rows: &[MailboxRow]) -> BTreeSet<String> {
+    rows.iter()
+        .filter(|row| row.delivered_at.is_none())
+        .map(|row| row.session_id.clone())
         .collect()
 }
 

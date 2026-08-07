@@ -484,7 +484,9 @@ fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
     assert_success(&output);
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "unconfirmed_ack");
-    assert!(value["wake"].is_null());
+    assert_eq!(value["pty_delivery"]["submitted"], false);
+    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([]));
+    assert_eq!(value["wake"]["status"], "busy");
     let rows = fixture.mailbox().list_mailbox(SESSION_A, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].delivered_at.is_none());
@@ -498,7 +500,7 @@ fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
 }
 
 #[test]
-fn notify_live_pty_nack_leaves_pending_without_direct_wake() {
+fn notify_live_pty_nack_leaves_pending_and_reports_busy_wake() {
     let fixture = Fixture::new();
     let identity = current_identity();
     fixture.record_owner_identity(&identity);
@@ -514,7 +516,7 @@ fn notify_live_pty_nack_leaves_pending_without_direct_wake() {
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "protocol_error");
     assert_eq!(value["pty_delivery"]["submitted"], false);
-    assert!(value["wake"].is_null());
+    assert_eq!(value["wake"]["status"], "busy");
     let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
     assert!(
         trace.contains("decision=skip-protocol_error"),
@@ -557,7 +559,8 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     assert_success(&output);
     let value = stdout_json(&output);
     assert_eq!(value["pty_delivery"]["status"], "stale_generation");
-    assert_ne!(value["wake"]["status"], "busy");
+    assert_eq!(value["pty_delivery"]["submitted"], false);
+    assert_eq!(value["wake"]["status"], "spawned");
     let runtime = fixture
         .mailbox()
         .session_runtime(SESSION_A)
@@ -567,6 +570,10 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     assert!(runtime.pty_control_path.is_none());
     assert!(!stale_socket.exists());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
+    let rows = fixture.mailbox().list_pending(SESSION_A).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].handle, "h-stale");
+    assert_eq!(rows[0].delivery_attempts, 0);
     let trace = fs::read_to_string(fixture.notify_trace_path()).unwrap();
     assert!(
         trace.contains("decision=skip-connect_error"),

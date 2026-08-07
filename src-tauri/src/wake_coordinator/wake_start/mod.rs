@@ -36,6 +36,15 @@ struct WakeStartContext<'a> {
     auto_wake_max: i64,
 }
 
+pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
+    start_wake_chain(StartWakeInput {
+        session_id,
+        reason: "notify_idle",
+        auto_wake_count: 1,
+        renew_token: None,
+    })
+}
+
 pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
     let claim_token = Uuid::new_v4().to_string();
     let mut context = match prepare_wake_start_context(input, &claim_token) {

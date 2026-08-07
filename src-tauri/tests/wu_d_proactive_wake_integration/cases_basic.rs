@@ -5,7 +5,7 @@
 //! TEST: proactive wake integration orchestration cases (basic wake/resume flows).
 
 use crate::SESSION;
-use crate::fake_cli::provider_script;
+use crate::fake_cli::{delayed_agent_bash_provider_script, provider_script};
 use crate::fixtures::Fixture;
 use crate::liveness::{
     delivered_rows_without_claim, runtime_is_idle, wait_for_file, wait_for_runtime_session,
@@ -13,10 +13,88 @@ use crate::liveness::{
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
-    assert_exit_code_zero, assert_no_wake_claim, assert_pending_mailbox_empty,
-    assert_prompt_contains_handle, assert_prompt_file_missing, assert_xdg_isolated,
+    assert_age270_invocation, assert_exit_code_zero, assert_no_wake_claim,
+    assert_pending_mailbox_empty, assert_prompt_contains_handle, assert_prompt_file_missing,
+    assert_xdg_isolated,
 };
 use crate::wake_claim_setup::acquire_seed_wake_claim;
+use serde_json::Value;
+use std::path::PathBuf;
+use std::time::Duration;
+
+const OUTER_SESSION: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
+
+pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once() {
+    let _guard = integration_test_guard();
+    let fixture = Fixture::new();
+    fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash_bin()));
+
+    let initial = fixture.run_agent("dispatch delayed nested work");
+    assert_exit_code_zero(&initial);
+    assert_eq!(invocation_count(&fixture), 1);
+    let session_id = wait_for_runtime_session(&fixture);
+
+    let dispatch = wait_for_file(&fixture.prompt_file("agent-bash-dispatch.json"));
+    let dispatch: Value = serde_json::from_str(&dispatch).unwrap();
+    let handle = dispatch["handle"].as_str().unwrap();
+    let prompt = wait_for_file(&fixture.prompt_file("acr329-resumed-input.txt"));
+    assert_prompt_contains_handle(&prompt, handle);
+    wait_until("completion row delivered by automatic resume", || {
+        delivered_rows_without_claim(&fixture, &session_id, 1)
+    });
+
+    let rows = fixture.mailbox().list_mailbox(&session_id, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].handle, handle);
+    assert!(
+        fixture
+            .mailbox()
+            .list_mailbox(OUTER_SESSION, true)
+            .unwrap()
+            .is_empty()
+    );
+    let delivery_invocation = rows[0].delivered_by_invocation_uuid.as_deref().unwrap();
+    assert_age270_invocation(&fixture, delivery_invocation);
+    fixture.assert_delivery_invocation_is_child_of_owner(&session_id);
+    assert_eq!(invocation_count(&fixture), 2);
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fixture
+            .mailbox()
+            .list_mailbox(&session_id, true)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(invocation_count(&fixture), 2);
+    assert_no_wake_claim(&fixture, &session_id);
+    assert_xdg_isolated(&fixture);
+}
+
+fn agent_bash_bin() -> PathBuf {
+    std::env::var_os("AGENT_BASH_BIN")
+        .map(PathBuf::from)
+        .or_else(find_agent_bash_in_path)
+        .filter(|path| path.is_file())
+        .expect("AGENT_BASH_BIN must name an agent-bash binary or agent-bash must be on PATH")
+}
+
+fn find_agent_bash_in_path() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("agent-bash"))
+            .find(|path| path.is_file())
+    })
+}
+
+fn invocation_count(fixture: &Fixture) -> i64 {
+    fixture
+        .state()
+        .connection()
+        .query_row("SELECT COUNT(*) FROM invocations", [], |row| row.get(0))
+        .unwrap()
+}
 
 fn assert_direct_unconfirmed(output: &std::process::Output) -> String {
     assert_eq!(output.status.code(), Some(1), "{output:?}");

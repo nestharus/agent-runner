@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
-    RuntimeLifecycleState, RuntimeTerminalReason, SubmittedInputEnqueue,
+    RuntimeLifecycleState, RuntimeTerminalReason, SessionRuntimeUpsert, SubmittedInputEnqueue,
 };
 use oulipoly_state::{
     CompositeInvocationId, InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
@@ -501,15 +501,54 @@ fn completion_response_reports_delivery_for_every_listener_session() {
     assert!(completion.status.success(), "{completion:?}");
     let completed = stdout_json(&completion);
     assert_eq!(completed["pty_deliveries"].as_array().unwrap().len(), 2);
+    assert_eq!(completed["wake"]["status"], "spawned");
     assert!(
         completed["pty_deliveries"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|diagnostic| diagnostic["status"] == "no_runtime")
+            .all(|diagnostic| diagnostic["status"] == "no_runtime"
+                && diagnostic["submitted"] == false)
     );
     assert_eq!(fixture.mailbox_rows(SESSION_A, false).len(), 1);
     assert_eq!(fixture.mailbox_rows(SESSION_B, false).len(), 1);
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_for_headless_runtime_is_not_submitted_to_pty() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    MailboxDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .upsert_session_runtime(SessionRuntimeUpsert {
+            session_id: SESSION_A,
+            mode: "headless",
+            invocation_uuid: Some(INVOCATION_A),
+            provider_name: None,
+            model_name: None,
+            pty_control_path: None,
+            models_dir: None,
+            effective_cwd: None,
+            selected_auto_wake_max: None,
+        })
+        .unwrap();
+
+    let completion = fixture.register_and_notify(
+        "h-headless-not-pty",
+        owner_metadata(SESSION_A, INVOCATION_A),
+    );
+
+    assert!(completion.status.success(), "{completion:?}");
+    let completed = stdout_json(&completion);
+    assert_eq!(completed["pty_delivery"]["status"], "not_pty");
+    assert_eq!(completed["pty_delivery"]["submitted"], false);
+    assert_eq!(completed["wake"]["status"], "spawned");
+    let rows = fixture.mailbox_rows(SESSION_A, false);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].handle, "h-headless-not-pty");
+    assert!(rows[0].delivered_at.is_none());
+    assert_eq!(rows[0].delivery_attempts, 0);
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -909,6 +948,7 @@ fn mailbox_pause_suppresses_notify_delivery_and_wake_until_resume() {
     assert!(notify.status.success(), "{notify:?}");
     let notified = stdout_json(&notify);
     assert_eq!(notified["pty_delivery"]["status"], "paused");
+    assert_eq!(notified["pty_delivery"]["submitted"], false);
     assert!(notified["wake"].is_null());
     let paused_status = fixture.run_mailbox(&[
         "status".to_string(),
