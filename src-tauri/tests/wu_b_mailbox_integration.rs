@@ -558,6 +558,18 @@ fn completion_registration_rejects_stale_running_owner_identity() {
     let fixture = Fixture::new();
     let mut identity = fixture.seed_running_invocation_with_live_session(INVOCATION_A, SESSION_A);
     identity.os_pid_starttime_ticks += 1;
+    PidIdentityDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .record_identity(PidIdentityRecord {
+            identity: &identity,
+            os_pgid: None,
+            invocation_uuid: INVOCATION_A,
+            session_id: Some(SESSION_A),
+            provider_name: Some("fixture-provider"),
+            model_name: Some("fixture-model"),
+            recorded_at: "2026-08-07T12:00:00Z",
+        })
+        .unwrap();
     let artifacts = fixture.write_notify_artifacts(
         "h-running-stale-owner",
         running_owner_metadata(SESSION_A, INVOCATION_A, &identity),
