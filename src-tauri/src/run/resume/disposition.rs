@@ -69,7 +69,7 @@ pub(super) fn handle_terminal_signal_disposition(
                 .map_err(|err| err.to_string())?;
             input.guard.mark_finalized();
             emit_resume_terminal_failure_output(&input, error_category, terminal_reason);
-            Ok(ResumeLoopControl::Return(failure_exit_code(
+            Ok(ResumeLoopControl::Return(mapper::failure_exit_code(
                 input.result.exit_code,
             )))
         }
@@ -163,7 +163,7 @@ fn handle_maybe_quota_verify(
         MaybeQuotaActionOutcome::Continue { .. } => Ok(ResumeLoopControl::Continue),
         MaybeQuotaActionOutcome::ReturnFailure { .. } => {
             emit_resume_terminal_failure_output(&input, error_category, terminal_reason);
-            Ok(ResumeLoopControl::Return(failure_exit_code(
+            Ok(ResumeLoopControl::Return(mapper::failure_exit_code(
                 input.result.exit_code,
             )))
         }
@@ -202,10 +202,6 @@ fn maybe_quota_action_outcome(zero_turn_action: ZeroTurnAction) -> MaybeQuotaAct
             }
         }
     }
-}
-
-fn failure_exit_code(exit_code: i32) -> i32 {
-    if exit_code == 0 { 1 } else { exit_code }
 }
 
 fn maybe_quota_finalize_request<'a>(

@@ -196,9 +196,5 @@ fn handle_completed_failure(
     if let Some(category) = error_category {
         formatter::emit_diagnostics_category(category);
     }
-    CompletedAttemptControl::Return(failure_exit_code(input.result.exit_code))
-}
-
-fn failure_exit_code(exit_code: i32) -> i32 {
-    if exit_code == 0 { 1 } else { exit_code }
+    CompletedAttemptControl::Return(mapper::failure_exit_code(input.result.exit_code))
 }
