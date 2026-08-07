@@ -12,7 +12,6 @@ use oulipoly_state::mailbox::{
     WakeClaimRequest,
 };
 use std::fs;
-use std::path::PathBuf;
 
 const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const INVOCATION: &str = "11111111-1111-4111-8111-111111111111";
@@ -21,7 +20,6 @@ const MODEL: &str = "acr329-poison-model";
 
 struct Fixture {
     dir: tempfile::TempDir,
-    home: PathBuf,
 }
 
 impl Fixture {
@@ -47,7 +45,7 @@ impl Fixture {
             std::env::remove_var("OULIPOLY_AUTO_WAKE_COUNT");
             std::env::remove_var("OULIPOLY_AUTO_WAKE_MAX");
         }
-        Self { dir, home }
+        Self { dir }
     }
 
     fn mailbox(&self) -> MailboxDb {
@@ -104,17 +102,16 @@ impl Fixture {
             .unwrap();
     }
 
-    fn assert_pending_and_no_spawn(&self, db: &MailboxDb) {
+    fn assert_pending_without_spawn_attempt(
+        &self,
+        db: &MailboxDb,
+        diagnostic: &wake_coordinator::WakeDiagnostic,
+    ) {
+        assert!(!diagnostic.attempted);
         let pending = db.list_pending(SESSION).unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].delivered_at.is_none());
         assert_eq!(pending[0].delivery_attempts, 0);
-        assert!(
-            !self
-                .home
-                .join(".local/share/oulipoly-agent-runner")
-                .exists()
-        );
     }
 }
 
@@ -151,7 +148,7 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
             .unwrap(),
         SessionGenerationProjection::One(_)
     ));
-    generation_fixture.assert_pending_and_no_spawn(&generation_db);
+    generation_fixture.assert_pending_without_spawn_attempt(&generation_db, &generation);
 
     let cap_fixture = Fixture::new();
     let mut cap_db = cap_fixture.mailbox();
@@ -169,7 +166,7 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     let cap_runtime = cap_db.session_runtime(SESSION).unwrap().unwrap();
     assert_eq!(cap_runtime.selected_auto_wake_max, Some(3));
     assert_eq!(cap_runtime.auto_wake_count, 3);
-    cap_fixture.assert_pending_and_no_spawn(&cap_db);
+    cap_fixture.assert_pending_without_spawn_attempt(&cap_db, &cap);
 
     let claim_fixture = Fixture::new();
     let mut claim_db = claim_fixture.mailbox();
@@ -212,5 +209,5 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     let claim_runtime = claim_db.session_runtime(SESSION).unwrap().unwrap();
     assert_eq!(claim_runtime.selected_auto_wake_max, Some(8));
     assert_eq!(claim_runtime.auto_wake_count, 4);
-    claim_fixture.assert_pending_and_no_spawn(&claim_db);
+    claim_fixture.assert_pending_without_spawn_attempt(&claim_db, &in_flight);
 }

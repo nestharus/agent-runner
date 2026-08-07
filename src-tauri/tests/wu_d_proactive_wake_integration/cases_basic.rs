@@ -9,7 +9,7 @@ use crate::fake_cli::{delayed_agent_bash_provider_script, provider_script};
 use crate::fixtures::Fixture;
 use crate::liveness::{
     delivered_rows_without_claim, runtime_is_idle, wait_for_file, wait_for_runtime_session,
-    wait_until,
+    wait_for_sidecar_session, wait_until,
 };
 use crate::test_guard::integration_test_guard;
 use crate::validators::{
@@ -20,28 +20,29 @@ use crate::validators::{
 use crate::wake_claim_setup::acquire_seed_wake_claim;
 use serde_json::Value;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OUTER_SESSION: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
+const OUTER_INVOCATION: &str = "22222222-2222-4222-8222-222222222222";
+const OUTER_EVENT: &str = "h-outer-listener";
 
 pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
+    fixture.seed_outer_caller(OUTER_SESSION, OUTER_INVOCATION, OUTER_EVENT);
     fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash_bin()));
 
     let initial = fixture.run_agent("dispatch delayed nested work");
     assert_exit_code_zero(&initial);
-    assert_eq!(invocation_count(&fixture), 1);
-    let session_id = wait_for_runtime_session(&fixture);
+    assert_eq!(invocation_count(&fixture), 2);
 
     let dispatch = wait_for_file(&fixture.prompt_file("agent-bash-dispatch.json"));
     let dispatch: Value = serde_json::from_str(&dispatch).unwrap();
     let handle = dispatch["handle"].as_str().unwrap();
     let prompt = wait_for_file(&fixture.prompt_file("acr329-resumed-input.txt"));
     assert_prompt_contains_handle(&prompt, handle);
-    wait_until("completion row delivered by automatic resume", || {
-        delivered_rows_without_claim(&fixture, &session_id, 1)
-    });
+    let session_id = wait_for_sidecar_session(&fixture, "mailbox");
+    wait_for_automatic_delivery(&fixture, &session_id);
 
     let rows = fixture.mailbox().list_mailbox(&session_id, true).unwrap();
     assert_eq!(rows.len(), 1);
@@ -53,10 +54,18 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
             .unwrap()
             .is_empty()
     );
+    let outer_listeners = fixture
+        .mailbox()
+        .completion_event_listeners(OUTER_EVENT)
+        .unwrap();
+    assert_eq!(outer_listeners.len(), 1);
+    assert!(outer_listeners[0].active);
+    assert!(outer_listeners[0].mailbox_seq.is_none());
+    assert!(outer_listeners[0].acknowledged_at.is_none());
     let delivery_invocation = rows[0].delivered_by_invocation_uuid.as_deref().unwrap();
     assert_age270_invocation(&fixture, delivery_invocation);
     fixture.assert_delivery_invocation_is_child_of_owner(&session_id);
-    assert_eq!(invocation_count(&fixture), 2);
+    assert_eq!(invocation_count(&fixture), 3);
 
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
@@ -67,9 +76,25 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
             .len(),
         1
     );
-    assert_eq!(invocation_count(&fixture), 2);
+    assert_eq!(invocation_count(&fixture), 3);
     assert_no_wake_claim(&fixture, &session_id);
     assert_xdg_isolated(&fixture);
+}
+
+fn wait_for_automatic_delivery(fixture: &Fixture, session_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if delivered_rows_without_claim(fixture, session_id, 1) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "automatic delivery did not settle: rows={:?} claim={:?} runtime={:?}",
+        fixture.mailbox().list_mailbox(session_id, true),
+        fixture.mailbox().wake_claim(session_id),
+        fixture.mailbox().session_runtime(session_id),
+    );
 }
 
 fn agent_bash_bin() -> PathBuf {
