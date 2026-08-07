@@ -1158,6 +1158,13 @@ fn top_level_file_resume_preserves_supplied_session_id_when_provider_emits_fresh
         .unwrap();
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let result = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .expect("confirmed resume should emit OULIPOLY_RESULT");
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(result["success"], true);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let invocation = parse_invocation(&stderr);
     let emitted_session_id = parse_session_line(&stderr, &invocation.id);
