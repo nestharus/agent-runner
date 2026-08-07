@@ -30,7 +30,13 @@ pub(super) fn emit_resume_success_output(
     terminal_reason: Option<&str>,
     stdout: &[u8],
 ) {
-    let _ = std::io::stdout().write_all(stdout);
+    let mut output = std::io::stdout().lock();
+    let _ = output.write_all(stdout);
+    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
+        let _ = output.write_all(b"\n");
+    }
+    let _ = output.flush();
+    drop(output);
     emit_result_envelope(
         invocation_id,
         true,

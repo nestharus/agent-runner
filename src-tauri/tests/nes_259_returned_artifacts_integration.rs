@@ -167,11 +167,11 @@ fn parse_invocation(stderr: &str) -> String {
 fn assert_resume_success_result(stdout: &[u8]) {
     let stdout = String::from_utf8_lossy(stdout);
     assert!(
-        stdout.starts_with("resume stdoutOULIPOLY_RESULT="),
+        stdout.starts_with("resume stdout\nOULIPOLY_RESULT="),
         "{stdout}"
     );
     let raw = stdout
-        .strip_prefix("resume stdoutOULIPOLY_RESULT=")
+        .strip_prefix("resume stdout\nOULIPOLY_RESULT=")
         .unwrap()
         .trim();
     let result: serde_json::Value = serde_json::from_str(raw).unwrap();
