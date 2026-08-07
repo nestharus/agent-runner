@@ -52,11 +52,16 @@ pub(super) fn emit_resume_failure_output(input: ResumeFailureOutputInput<'_>) {
         agent_runner_invocation_id: input.invocation_id.to_string(),
         provider_name: Some(input.provider_name.to_string()),
         provider_session_id: Some(input.provider_session_id.to_string()),
-        agent_runner_chain_id: input
+        agent_runner_chain_id: match input
             .state
             .chain_id_for_segment(input.provider_name, input.provider_session_id)
-            .ok()
-            .flatten(),
+        {
+            Ok(chain_id) => chain_id,
+            Err(error) => {
+                emit_stderr(&format!("failed to look up chain ID: {error}"));
+                None
+            }
+        },
     };
     emit_result_envelope(
         input.invocation_id,
