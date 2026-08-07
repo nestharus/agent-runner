@@ -5,6 +5,8 @@
 //! TEST: fake provider CLI script formatter for proactive wake integration
 //! cases.
 
+use std::path::Path;
+
 pub(crate) fn provider_script(on_initial: &str, on_resume: &str, prompt_file: &str) -> String {
     let prompt_file = prompt_file.replace('"', "\\\"");
     format!(
@@ -58,4 +60,27 @@ fi
 exit 0
 "#
     )
+}
+
+pub(crate) fn delayed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+    let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
+    provider_script(
+        &format!(
+            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
+AGENT_BASH_OWNER_SESSION_ID="$session" \
+AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
+AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
+{agent_bash_bin} run --completion-scope tree --delivery async -- \
+  bash -lc '( sleep 1; printf nested-tree-complete ) &' \
+  > "$work/agent-bash-dispatch.json" \
+  2> "$work/agent-bash-dispatch.err""#,
+        ),
+        "",
+        "acr329-resumed-input.txt",
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

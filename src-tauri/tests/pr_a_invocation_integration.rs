@@ -65,6 +65,10 @@ name = "fixture-provider"
 command = "{}"
 args = []
 prompt_mode = "arg"
+
+[fixture-provider.session_capture]
+kind = "forced_flag_verified"
+flag = "--session-id"
 "#,
                 script_path.display()
             ),
@@ -115,12 +119,20 @@ prompt_mode = "arg"
 fn run_agent_bash_nested_child(
     fixture: &Fixture,
     parent_env: &str,
+    owner_session_id: &str,
+    owner_invocation_uuid: &str,
     agent_bash_bin: &Path,
 ) -> String {
     let command = nested_child_command(fixture);
     let mut run = Command::new(agent_bash_bin);
     run.arg("run").arg("--").arg("bash").arg("-lc").arg(command);
-    configure_agent_bash_env(&mut run, fixture, parent_env);
+    configure_agent_bash_env(
+        &mut run,
+        fixture,
+        parent_env,
+        owner_session_id,
+        owner_invocation_uuid,
+    );
     let output = run.output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let dispatch: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -140,11 +152,23 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn configure_agent_bash_env(command: &mut Command, fixture: &Fixture, parent_env: &str) {
+fn configure_agent_bash_env(
+    command: &mut Command,
+    fixture: &Fixture,
+    parent_env: &str,
+    owner_session_id: &str,
+    owner_invocation_uuid: &str,
+) {
     command.env("XDG_CONFIG_HOME", &fixture.config_home);
     command.env("XDG_DATA_HOME", &fixture.data_home);
     command.env("XDG_STATE_HOME", fixture.state_home());
     command.env("OULIPOLY_PARENT_INVOCATION", parent_env);
+    command.env("AGENT_BASH_OWNER_SESSION_ID", owner_session_id);
+    command.env("AGENT_BASH_OWNER_INVOCATION_UUID", owner_invocation_uuid);
+    command.env(
+        "AGENT_BASH_AGENT_RUNNER_BIN",
+        env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
+    );
     command.env_remove("OULIPOLY_DATA_DIR");
 }
 
@@ -354,9 +378,16 @@ fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
         .unwrap()
         .unwrap();
     assert_eq!(parent_row.status, InvocationStatus::Succeeded);
+    let owner_session_id = parent_row.provider_session_id.as_deref().unwrap();
     let parent_env = serde_json::to_string(&parent).unwrap();
 
-    let status = run_agent_bash_nested_child(&fixture, &parent_env, &agent_bash_bin);
+    let status = run_agent_bash_nested_child(
+        &fixture,
+        &parent_env,
+        owner_session_id,
+        &parent.id,
+        &agent_bash_bin,
+    );
 
     assert!(status.starts_with("DONE rc=0"), "{status}");
     let child = parse_valid_invocations(&status)

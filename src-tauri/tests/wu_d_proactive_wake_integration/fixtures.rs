@@ -15,6 +15,7 @@ pub(crate) struct Fixture {
     pub(crate) dir: tempfile::TempDir,
     pub(crate) config_home: PathBuf,
     pub(crate) data_home: PathBuf,
+    pub(crate) state_home: PathBuf,
     pub(crate) home_dir: PathBuf,
     pub(crate) app_config_dir: PathBuf,
     pub(crate) models_dir: PathBuf,
@@ -26,17 +27,20 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let config_home = dir.path().join("xdg-config");
         let data_home = dir.path().join("xdg-data");
+        let state_home = dir.path().join("xdg-state");
         let home_dir = dir.path().join("home");
         let app_config_dir = config_home.join("oulipoly-agent-runner");
         let models_dir = app_config_dir.join("models");
         let work_dir = dir.path().join("work");
         fs::create_dir_all(&models_dir).unwrap();
+        fs::create_dir_all(&state_home).unwrap();
         fs::create_dir_all(&home_dir).unwrap();
         fs::create_dir_all(&work_dir).unwrap();
         Self {
             dir,
             config_home,
             data_home,
+            state_home,
             home_dir,
             app_config_dir,
             models_dir,
@@ -70,6 +74,7 @@ impl Fixture {
     fn prepare_command(&self, cmd: &mut Command) {
         cmd.env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
+            .env("XDG_STATE_HOME", &self.state_home)
             .env("HOME", &self.home_dir)
             .env("AGENT_BASH_AGENT_RUNNER_BIN", crate::parse::runner_bin())
             .env("WU_D_WORK_DIR", &self.work_dir)

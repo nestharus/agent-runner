@@ -10,8 +10,12 @@ use crate::model_config::path_string;
 use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb, SessionRuntimeUpsert};
-use oulipoly_state::{SessionTurnIngest, StateDb};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, MailboxDb,
+    SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+};
+use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord};
+use oulipoly_state::{InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb};
 use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
@@ -38,6 +42,123 @@ impl Fixture {
 
     pub(crate) fn state(&self) -> StateDb {
         StateDb::open(&self.state_path()).unwrap()
+    }
+
+    pub(crate) fn assert_delivery_invocation_is_child_of_owner(&self, session_id: &str) {
+        let rows = self.mailbox().list_mailbox(session_id, true).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.delivered_by_invocation_uuid.is_some())
+            .expect("delivered mailbox row");
+        let owner_uuid = row
+            .owner_invocation_uuid
+            .as_deref()
+            .expect("mailbox owner invocation");
+        let delivery_uuid = row
+            .delivered_by_invocation_uuid
+            .as_deref()
+            .expect("mailbox delivery invocation");
+        let parent_uuid: Option<String> = self
+            .state()
+            .connection()
+            .query_row(
+                "SELECT parent.invocation_uuid
+                 FROM invocations AS delivery
+                 LEFT JOIN invocations AS parent ON parent.id = delivery.parent_invocation_id
+                 WHERE delivery.invocation_uuid = ?1",
+                rusqlite::params![delivery_uuid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_uuid.as_deref(), Some(owner_uuid));
+    }
+
+    pub(crate) fn seed_outer_caller(
+        &self,
+        session_id: &str,
+        invocation_uuid: &str,
+        event_id: &str,
+    ) {
+        let state = self.state();
+        let invocation_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: MODEL.to_string(),
+                provider_name: PROVIDER.to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                invocation_id,
+                &ProviderSessionBinding {
+                    provider_session_id: session_id.to_string(),
+                    capture_method: "fixture",
+                    resume_input_id: None,
+                    provider_session_resolved_account: None,
+                },
+            )
+            .unwrap();
+
+        let identity = crate::wake_claim_setup::current_process_identity();
+        PidIdentityDb::open(&self.sidecar_path())
+            .unwrap()
+            .record_identity(PidIdentityRecord {
+                identity: &identity,
+                os_pgid: None,
+                invocation_uuid,
+                session_id: Some(session_id),
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                recorded_at: "2026-06-04T12:00:00Z",
+            })
+            .unwrap();
+
+        let mut mailbox = self.mailbox();
+        let models_dir = path_string(&self.models_dir);
+        mailbox
+            .upsert_session_runtime(SessionRuntimeUpsert {
+                session_id,
+                mode: "pty_interactive",
+                invocation_uuid: Some(invocation_uuid),
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                pty_control_path: None,
+                models_dir: Some(&models_dir),
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
+        mailbox
+            .mark_session_running(SessionRuntimeRunningUpdate {
+                session_id,
+                mode: "pty_interactive",
+                invocation_uuid,
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                identity: &identity,
+                pty_control_path: None,
+                turn_start_max_mailbox_seq: None,
+                models_dir: Some(&models_dir),
+                effective_cwd: None,
+            })
+            .unwrap();
+
+        let artifacts = self.seed_mailbox_artifacts(event_id);
+        write_seed_mailbox_artifacts(&artifacts, event_id);
+        mailbox
+            .register_completion_event(CompletionEventRegistrationInput {
+                event_id,
+                delivery_mode: "async",
+                owner_session_id: Some(session_id),
+                owner_invocation_uuid: Some(invocation_uuid),
+                state_dir: &artifacts.state_dir_s,
+                meta_path: &artifacts.meta_s,
+                log_path: &artifacts.log_s,
+                rc_path: &artifacts.rc_s,
+            })
+            .unwrap();
     }
 
     pub(crate) fn seed_session_turn(&self) {
