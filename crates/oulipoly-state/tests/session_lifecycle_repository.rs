@@ -327,6 +327,20 @@ fn events_have_session_sequences_causality_and_replay_safe_dispositions() {
 }
 
 #[test]
+fn bounded_reads_reject_a_zero_limit() {
+    let (_dir, _path, mut db) = store();
+
+    assert!(matches!(
+        db.read_external_ingress("session-a", 0),
+        Err(SessionLifecycleError::Invalid("limit"))
+    ));
+    assert!(matches!(
+        db.reconstruct_session("session-a", "scheduler", 0),
+        Err(SessionLifecycleError::Invalid("limit"))
+    ));
+}
+
+#[test]
 fn external_ingress_cursor_is_monotonic_persisted_and_session_local() {
     let (dir, path, mut db) = store();
     for (session, sequence, id) in [

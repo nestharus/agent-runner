@@ -940,7 +940,10 @@ fn validate_acknowledgement_fence(
 }
 
 fn bounded_limit(limit: usize) -> SessionLifecycleResult<i64> {
-    i64::try_from(limit).map_err(|_| SessionLifecycleError::Invalid("limit"))
+    match i64::try_from(limit) {
+        Ok(limit) if limit > 0 => Ok(limit),
+        _ => Err(SessionLifecycleError::Invalid("limit")),
+    }
 }
 
 fn map_turn_insert_result(
