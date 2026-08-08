@@ -485,7 +485,10 @@ impl SessionLifecycleRepository for StateDb {
         validate_nonempty(generation_id, "generation_id")?;
         validate_nonempty(spawn_invocation_id, "spawn_invocation_id")?;
         validate_session_id(session_id)?;
-        let current = read_turn_by_generation(&self.conn, generation_id)?
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_turn_by_generation(&tx, generation_id)?
             .ok_or(SessionLifecycleError::Missing("provider turn generation"))?;
         if current.spawn_invocation_id != spawn_invocation_id {
             return Err(SessionLifecycleError::FenceMismatch);
@@ -497,12 +500,12 @@ impl SessionLifecycleRepository for StateDb {
                 Err(SessionLifecycleError::FenceMismatch)
             };
         }
-        let result = self.conn.execute(
+        let result = tx.execute(
             "UPDATE provider_turn_generations SET session_id = ?
              WHERE generation_id = ? AND spawn_invocation_id = ? AND session_id IS NULL",
             params![session_id, generation_id, spawn_invocation_id],
         );
-        map_turn_insert_result(&self.conn, result, Some(session_id), generation_id).and_then(
+        let result = map_turn_insert_result(&tx, result, Some(session_id), generation_id).and_then(
             |changed| {
                 if changed == 1 {
                     Ok(())
@@ -510,7 +513,9 @@ impl SessionLifecycleRepository for StateDb {
                     Err(SessionLifecycleError::FenceMismatch)
                 }
             },
-        )
+        );
+        tx.commit()?;
+        result
     }
 
     fn provider_turn(
