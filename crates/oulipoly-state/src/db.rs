@@ -198,8 +198,8 @@ pub use self::session_lifecycle::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DispositionWrite,
     EventDisposition, ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace,
     LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError,
-    SessionLifecycleRepository, SessionReconstruction, SupervisorFence, SupervisorLease, TurnFence,
-    TurnState,
+    SessionLifecycleRepository, SessionLifecycleResult, SessionReconstruction, SupervisorFence,
+    SupervisorLease, TurnFence, TurnState,
 };
 pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]

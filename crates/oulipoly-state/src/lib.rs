@@ -58,8 +58,8 @@ pub use db::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DispositionWrite,
     EventDisposition, ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace,
     LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError,
-    SessionLifecycleRepository, SessionReconstruction, SupervisorFence, SupervisorLease, TurnFence,
-    TurnState,
+    SessionLifecycleRepository, SessionLifecycleResult, SessionReconstruction, SupervisorFence,
+    SupervisorLease, TurnFence, TurnState,
 };
 pub use db::{
     ActiveChainSegmentSnapshot, ChainSegmentRotationInput, QuotaRecord, QuotaWindow,
