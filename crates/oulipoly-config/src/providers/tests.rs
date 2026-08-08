@@ -195,7 +195,9 @@ command = "env -u CLAUDECODE claude"
 args = ["-p"]
 system_prompt_override = """
 Do not use the Task tool.
-Use agents -m <model> -f <prompt-file>.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+Never combine -m with -a because -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 """
 
 [claude.tool_restrictions]
@@ -213,7 +215,9 @@ disable_slash_commands = true
 
     assert_eq!(
         entry.system_prompt_override.as_deref(),
-        Some("Do not use the Task tool.\nUse agents -m <model> -f <prompt-file>.\n")
+        Some(
+            "Do not use the Task tool.\nFor a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>\nNever combine -m with -a because -m shadows the operator frontmatter model selection.\nFor an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>\n"
+        )
     );
     assert_eq!(
         entry.tool_restrictions,

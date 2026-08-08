@@ -5,9 +5,10 @@ interactive_args = ["--dangerously-skip-permissions"]
 prompt_mode = "stdin"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [claude.resume]
@@ -31,9 +32,10 @@ interactive_args = ["--dangerously-skip-permissions"]
 prompt_mode = "stdin"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [claude2.resume]
@@ -57,9 +59,10 @@ interactive_args = ["--dangerously-skip-permissions"]
 prompt_mode = "stdin"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [claude3.resume]
@@ -83,9 +86,10 @@ interactive_args = ["--dangerously-skip-permissions"]
 prompt_mode = "stdin"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [claude4.resume]
@@ -109,9 +113,10 @@ interactive_args = ["--dangerously-skip-permissions"]
 prompt_mode = "stdin"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [claude5.resume]
@@ -135,9 +140,10 @@ interactive_args = ["--dangerously-skip-permissions"]
 prompt_mode = "stdin"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [claude6.resume]
@@ -161,9 +167,10 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
 prompt_mode = "arg"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [codex.resume]
@@ -180,9 +187,10 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
 prompt_mode = "arg"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [codex2.resume]
@@ -199,9 +207,10 @@ interactive_args = ["--dangerously-bypass-approvals-and-sandbox"]
 prompt_mode = "arg"
 system_prompt_override = """
 Do not use the host CLI built-in sub-agent or Task tool to spawn child invocations.
-Use agents -m <model> -f <prompt-file> for child work instead.
+For a defined operator, use: agents -a <agent.md> -p <worktree-path> -f <prompt-file>
+The agent file's model frontmatter selects the model. Never combine -m with -a; -m shadows the operator frontmatter model selection.
+For an ad-hoc child with no agent file, use: agents -m <model> -p <worktree-path> -f <prompt-file>
 Never call bare agents with no arguments because it launches an interactive UI on the user's machine.
-A valid child dispatch is: agents -m <model> -f <prompt-file>
 """
 
 [codex3.resume]

@@ -361,6 +361,59 @@ Use terse prose.
     );
 }
 
+#[test]
+fn defined_feature_orchestrator_agent_file_uses_frontmatter_model_identity() {
+    let fixture = Fixture::new();
+    let agent_file = fixture._dir.path().join("feature-orchestrator.md");
+    let prompt_file = fixture._dir.path().join("feature-orchestrator-prompt.md");
+    fs::write(
+        fixture.models_dir.join("gpt-xhigh.toml"),
+        r#"[[providers]]
+name = "fixture-provider"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &agent_file,
+        r#"---
+description: Feature orchestrator
+model: gpt-xhigh
+output_format: text
+---
+Coordinate the defined feature workflow.
+"#,
+    )
+    .unwrap();
+    fs::write(&prompt_file, "Execute the supplied feature handoff.").unwrap();
+
+    let output = fixture
+        .command()
+        .arg("--models-dir")
+        .arg(&fixture.models_dir)
+        .arg("-a")
+        .arg(&agent_file)
+        .arg("-p")
+        .arg(fixture._dir.path())
+        .arg("-f")
+        .arg(&prompt_file)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&fixture.prompt_dump).unwrap(),
+        "Coordinate the defined feature workflow.\n\n\nExecute the supplied feature handoff."
+    );
+    let invocation = parse_single_invocation(&String::from_utf8_lossy(&output.stderr));
+    let record = fixture
+        .open_db()
+        .get_invocation_by_uuid(&invocation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.model_name, "gpt-xhigh");
+    assert_eq!(record.provider_name.as_deref(), Some("fixture-provider"));
+}
+
 // Characterization test for AGE-194 — pins current behavior of named-agent execution
 // when the named agent's `model:` references a model not present in `--models-dir`.
 #[test]
