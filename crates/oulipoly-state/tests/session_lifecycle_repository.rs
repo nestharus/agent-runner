@@ -618,6 +618,7 @@ fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
     for table in [
         "session_supervisor_leases",
         "provider_turn_generations",
+        "session_lifecycle_sequences",
         "session_lifecycle_events",
         "session_lifecycle_event_dispositions",
         "session_external_ingress",
