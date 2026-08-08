@@ -30,12 +30,14 @@
 mod chain_segments;
 mod db;
 pub mod deployment;
+pub mod durable_lifecycle_prototype;
 pub mod invocation_marker;
 mod lifecycle_log;
 pub mod mailbox;
 pub mod migrations;
 pub mod paths;
 pub mod pid_identity;
+mod read_only_snapshot;
 pub mod repositories;
 pub mod result_envelope;
 pub mod schema;
