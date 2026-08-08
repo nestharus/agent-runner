@@ -380,7 +380,10 @@ impl SessionLifecycleRepository for StateDb {
         if expected.generation.checked_add(1) != Some(replacement.generation) {
             return Err(SessionLifecycleError::InvalidTransition);
         }
-        let changed = self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "UPDATE session_supervisor_leases
              SET supervisor_generation = ?, lease_token = ?, supervisor_pid = ?,
                  boot_id = ?, start_time_ticks = ?, acquired_at = ?
@@ -401,14 +404,15 @@ impl SessionLifecycleRepository for StateDb {
                 expected.process.start_time_ticks,
             ],
         )?;
-        if changed == 1 {
-            return Ok(LeaseReplace::Replaced);
-        }
-        if read_lease(&self.conn, session_id)?.is_some_and(|lease| lease.fence == *replacement) {
+        let result = if changed == 1 {
+            Ok(LeaseReplace::Replaced)
+        } else if read_lease(&tx, session_id)?.is_some_and(|lease| lease.fence == *replacement) {
             Ok(LeaseReplace::AlreadyReplaced)
         } else {
             Err(SessionLifecycleError::FenceMismatch)
-        }
+        };
+        tx.commit()?;
+        result
     }
 
     fn release_supervisor_lease(
