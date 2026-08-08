@@ -6,9 +6,10 @@ use oulipoly_config::repositories::{
     ProvidersConfigRepository, SessionsConfigRepository,
 };
 use oulipoly_config::{
-    ClaudeRestrictions, CodexRestrictions, InvocationMode, ModelConfig, PromptMode, ProviderConfig,
-    ProvidersConfig, SessionsConfig, ToolRestrictionKind, ToolRestrictions, load_agent_file,
-    load_agents, load_models,
+    ClaudeRestrictions, CodexRestrictions, DEFAULT_PROVIDER_SYSTEM_PROMPT_POLICY, InvocationMode,
+    MANAGED_SYSTEM_PROMPT_END, MANAGED_SYSTEM_PROMPT_START, ModelConfig, PromptMode,
+    ProviderConfig, ProvidersConfig, SessionsConfig, ToolRestrictionKind, ToolRestrictions,
+    load_agent_file, load_agents, load_models, materialize_managed_system_prompt,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -432,12 +433,13 @@ fn default_nestharus_policy_fixture_covers_bug1_and_bug2() {
         let entry = config
             .get(alias)
             .unwrap_or_else(|| panic!("missing parsed provider {alias}"));
-        assert!(
-            entry
-                .system_prompt_override
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty()),
-            "missing system_prompt_override for {alias}"
+        let (effective, _) = config
+            .runtime_provider(alias)
+            .unwrap_or_else(|error| panic!("missing effective provider {alias}: {error}"));
+        assert_eq!(
+            effective.system_prompt_override.as_deref(),
+            Some(DEFAULT_PROVIDER_SYSTEM_PROMPT_POLICY),
+            "wrong system_prompt_override for {alias}"
         );
         let restrictions = entry
             .tool_restrictions
@@ -454,8 +456,38 @@ fn default_nestharus_policy_fixture_covers_bug1_and_bug2() {
     let lower = content.to_ascii_lowercase();
     assert!(lower.contains("task tool"), "{content}");
     assert!(lower.contains("bare agents"), "{content}");
-    assert!(lower.contains("agents -m"), "{content}");
-    assert!(lower.contains("-f <prompt-file>"), "{content}");
+    assert!(
+        lower.contains("agents -a <agent.md> -p <worktree-path> -f <prompt-file>"),
+        "{content}"
+    );
+    assert!(
+        lower.contains("agents -m <model> -p <worktree-path> -f <prompt-file>"),
+        "{content}"
+    );
+    assert!(lower.contains("never combine -m with -a"), "{content}");
+    assert!(lower.contains("-m shadows"), "{content}");
+    assert!(
+        !lower.contains("use agents -m <model> -f <prompt-file> for child work instead"),
+        "{content}"
+    );
+}
+
+#[test]
+fn managed_provider_policy_update_preserves_unrelated_content_and_single_markers() {
+    let existing = format!(
+        "# User instructions\n\nKeep this line.\n\n{MANAGED_SYSTEM_PROMPT_START}\nstale policy\n{MANAGED_SYSTEM_PROMPT_END}\n\nUser footer.\n"
+    );
+
+    let updated =
+        materialize_managed_system_prompt(&existing, DEFAULT_PROVIDER_SYSTEM_PROMPT_POLICY)
+            .unwrap();
+
+    assert!(updated.starts_with("# User instructions\n\nKeep this line.\n\n"));
+    assert!(updated.ends_with("\n\nUser footer.\n"));
+    assert!(updated.contains(DEFAULT_PROVIDER_SYSTEM_PROMPT_POLICY.trim_end()));
+    assert!(!updated.contains("stale policy"));
+    assert_eq!(updated.matches(MANAGED_SYSTEM_PROMPT_START).count(), 1);
+    assert_eq!(updated.matches(MANAGED_SYSTEM_PROMPT_END).count(), 1);
 }
 
 #[test]
