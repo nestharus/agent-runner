@@ -452,7 +452,21 @@ impl SessionLifecycleRepository for StateDb {
 
     fn start_provider_turn(&mut self, turn: &ProviderTurnGeneration) -> SessionLifecycleResult<()> {
         validate_turn(turn)?;
-        let result = self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let identity_exists = tx.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM provider_turn_generations
+                WHERE generation_id = ? OR spawn_invocation_id = ?
+             )",
+            params![turn.generation_id, turn.spawn_invocation_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if identity_exists {
+            return Err(SessionLifecycleError::Conflict("provider turn identity"));
+        }
+        let result = tx.execute(
             "INSERT INTO provider_turn_generations (
                 generation_id, spawn_invocation_id, session_id, lifecycle_state,
                 child_pid, child_boot_id, child_start_time_ticks
@@ -467,13 +481,9 @@ impl SessionLifecycleRepository for StateDb {
                 turn.child.start_time_ticks,
             ],
         );
-        map_turn_insert_result(
-            &self.conn,
-            result,
-            turn.session_id.as_deref(),
-            &turn.generation_id,
-        )
-        .map(|_| ())
+        map_turn_insert_result(&tx, result, turn.session_id.as_deref(), &turn.generation_id)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn attach_provider_turn_session(

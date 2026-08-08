@@ -216,6 +216,30 @@ fn one_nonterminal_turn_is_enforced_for_known_and_late_attached_sessions() {
 }
 
 #[test]
+fn duplicate_turn_identity_takes_precedence_over_an_active_session_conflict() {
+    let (_dir, _path, mut db) = store();
+    db.start_provider_turn(&turn(
+        "generation-existing",
+        "invocation-existing",
+        Some("session-a"),
+        TurnState::Running,
+        process(304, "existing"),
+    ))
+    .unwrap();
+
+    assert!(matches!(
+        db.start_provider_turn(&turn(
+            "generation-duplicate",
+            "invocation-existing",
+            Some("session-a"),
+            TurnState::Starting,
+            process(305, "duplicate"),
+        )),
+        Err(SessionLifecycleError::Conflict("provider turn identity"))
+    ));
+}
+
+#[test]
 fn authoritative_transition_and_event_append_commit_or_roll_back_together() {
     let (_dir, _path, mut db) = store();
     db.start_provider_turn(&turn(
