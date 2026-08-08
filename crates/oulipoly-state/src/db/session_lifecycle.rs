@@ -813,9 +813,9 @@ impl SessionLifecycleRepository for StateDb {
         validate_session_id(session_id)?;
         validate_nonempty(consumer_id, "consumer_id")?;
         let limit = bounded_limit(limit)?;
-        let lease = read_lease(&self.conn, session_id)?;
-        let active_turn = self
-            .conn
+        let tx = self.conn.unchecked_transaction()?;
+        let lease = read_lease(&tx, session_id)?;
+        let active_turn = tx
             .query_row(
                 "SELECT generation_id, spawn_invocation_id, session_id, lifecycle_state,
                         child_pid, child_boot_id, child_start_time_ticks
@@ -825,9 +825,9 @@ impl SessionLifecycleRepository for StateDb {
                 map_turn,
             )
             .optional()?;
-        let ingress_cursor = read_cursor(&self.conn, session_id)?;
+        let ingress_cursor = read_cursor(&tx, session_id)?;
         let acknowledgements = {
-            let mut statement = self.conn.prepare(
+            let mut statement = tx.prepare(
                 "SELECT delivery_id, session_id, turn_generation_id, accepted_at,
                         submitted_at, submitted_evidence, confirmed_at, confirmed_evidence
                  FROM session_delivery_acknowledgements
@@ -840,7 +840,7 @@ impl SessionLifecycleRepository for StateDb {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let undisposed_events = {
-            let mut statement = self.conn.prepare(
+            let mut statement = tx.prepare(
                 "SELECT e.event_id, e.session_id, e.sequence, e.event_type, e.cause_event_id,
                         e.correlation_id, e.payload, e.created_at
                  FROM session_lifecycle_events e
@@ -854,6 +854,7 @@ impl SessionLifecycleRepository for StateDb {
                 .query_map(params![consumer_id, session_id, limit], map_event)?
                 .collect::<Result<Vec<_>, _>>()?
         };
+        tx.commit()?;
         Ok(SessionReconstruction {
             session_id: session_id.to_owned(),
             lease,
