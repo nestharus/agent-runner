@@ -219,6 +219,7 @@ pub struct StateDb {
     conn: sqlite::Connection,
     db_path: PathBuf,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
+    _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
 }
 
 #[derive(Debug, Clone)]
