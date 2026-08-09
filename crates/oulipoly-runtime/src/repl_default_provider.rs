@@ -181,8 +181,6 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
     let (provider, _prompt_mode) = providers.runtime_provider(member_name)?;
     let selected_provider_name = provider.name.clone();
     let launch_provider = ProviderConfig {
-        environment: Default::default(),
-        unset_environment: Default::default(),
         name: carrier_model.name.clone(),
         ..provider
     };
@@ -636,7 +634,13 @@ interactive_args = ["ok"]
         ProvidersConfig::load(&root.join("providers.toml")).unwrap()
     }
 
-    type LauncherCall = (String, Option<PathBuf>, Option<String>);
+    type LauncherCall = (
+        String,
+        Option<PathBuf>,
+        Option<String>,
+        std::collections::BTreeMap<String, String>,
+        Vec<String>,
+    );
 
     #[derive(Default)]
     struct RecordingLauncher {
@@ -656,6 +660,8 @@ interactive_args = ["ok"]
                 provider.name.clone(),
                 working_dir.map(Path::to_path_buf),
                 parent_invocation_env.map(str::to_string),
+                provider.environment.clone(),
+                provider.unset_environment.clone(),
             ));
             Ok(successful_interactive_result())
         }
@@ -1052,6 +1058,39 @@ interactive_args = ["ok"]
         assert_eq!(code, 0);
         assert_eq!(launcher.calls.borrow().len(), 1);
         assert_eq!(launcher.calls.borrow()[0].0, "<provider-family:claude>");
+    }
+
+    #[test]
+    fn preserves_selected_provider_environment_for_interactive_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "opencode""#);
+        write_providers(
+            temp.path(),
+            r#"[opencode]
+command = "printf"
+interactive_args = ["ok"]
+environment = { XDG_DATA_HOME = "/tmp/opencode-profile" }
+unset_environment = ["OPENAI_API_KEY"]
+"#,
+        );
+        let launcher = RecordingLauncher::default();
+
+        let code = run_repl_with_default_provider_with_launcher(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
+            &launcher,
+        )
+        .expect("selected provider environment should reach interactive launch");
+
+        assert_eq!(code, 0);
+        let calls = launcher.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3.get("XDG_DATA_HOME").map(String::as_str),
+            Some("/tmp/opencode-profile")
+        );
+        assert_eq!(calls[0].4, ["OPENAI_API_KEY"]);
     }
 
     #[test]
