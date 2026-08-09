@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -167,7 +168,31 @@ esac"#,
     let invocation_marker = marker_value(&stderr, "OULIPOLY_INVOCATION=");
     let invocation_uuid = invocation_marker["id"].as_str().unwrap();
     let marker = marker_value(&stderr, "OULIPOLY_SESSION=");
+    let expected_keys = BTreeSet::from([
+        "agent_runner_chain_id",
+        "agent_runner_invocation_id",
+        "id",
+        "provider_name",
+        "provider_session_id",
+        "resume_input_id",
+        "session_id",
+    ]);
+    assert_eq!(
+        marker
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected_keys,
+    );
+    assert_eq!(marker["id"], invocation_uuid);
+    assert_eq!(marker["agent_runner_invocation_id"], invocation_uuid);
+    assert_eq!(marker["session_id"], SESSION_ID);
     assert_eq!(marker["provider_session_id"], SESSION_ID);
+    assert_eq!(marker["provider_name"], "live1");
+    assert!(marker["agent_runner_chain_id"].is_string());
+    assert!(marker["resume_input_id"].is_null());
 
     let state_path = fixture
         .data_home

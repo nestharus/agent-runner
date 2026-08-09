@@ -590,7 +590,17 @@ fn completion_registration_waits_for_live_session_binding() {
         writeln!(
             stream,
             "{}",
-            json!({"ok": true, "session_id": SESSION_A, "error": null})
+            json!({
+                "ok": true,
+                "agent_runner_chain_id": null,
+                "agent_runner_invocation_id": INVOCATION_A,
+                "id": INVOCATION_A,
+                "provider_name": "fixture-provider",
+                "provider_session_id": SESSION_A,
+                "resume_input_id": null,
+                "session_id": SESSION_A,
+                "error": null,
+            })
         )
         .unwrap();
         assert_eq!(report["invocation_uuid"], INVOCATION_A);

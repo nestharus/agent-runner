@@ -41,11 +41,33 @@ pub(super) fn emit_known_session_id_for_service(
     session_id: &str,
     capture_method: &str,
 ) -> Result<SessionLifecycleOutput, ServiceError> {
+    let payload = emit_known_session_payload_for_service(
+        state,
+        stderr,
+        invocation_row_id,
+        invocation_uuid,
+        session_id,
+        capture_method,
+    )?;
+    Ok(match payload {
+        Some(_) => emitted_session_lifecycle_output(session_id),
+        None => not_emitted_session_lifecycle_output(),
+    })
+}
+
+pub(super) fn emit_known_session_payload_for_service(
+    state: &StateDb,
+    stderr: &mut dyn Write,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    session_id: &str,
+    capture_method: &str,
+) -> Result<Option<oulipoly_state::SessionMarkerPayload>, ServiceError> {
     if let Err(err) =
         update_session_capture_for_marker(state, invocation_row_id, session_id, capture_method)
     {
         write_session_capture_update_warning(stderr, err)?;
-        return Ok(not_emitted_session_lifecycle_output());
+        return Ok(None);
     }
     let record = invocation_record_for_marker(state, invocation_uuid);
     mint_chain_for_marker_if_needed(state, stderr, invocation_row_id, record.as_ref())?;
@@ -57,7 +79,7 @@ pub(super) fn emit_known_session_id_for_service(
         record.as_ref(),
     );
     write_session_marker(stderr, &payload)?;
-    Ok(emitted_session_lifecycle_output(session_id))
+    Ok(Some(payload))
 }
 
 fn update_session_capture_for_marker(

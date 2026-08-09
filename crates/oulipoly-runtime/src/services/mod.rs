@@ -35,9 +35,9 @@ pub(crate) fn emit_live_session_marker(
     invocation_uuid: &str,
     session_id: &str,
     capture_method: &str,
-) -> Result<SessionLifecycleOutput, String> {
+) -> Result<oulipoly_state::SessionMarkerPayload, String> {
     let mut stderr = std::io::stderr();
-    marker::emit_known_session_id_for_service(
+    marker::emit_known_session_payload_for_service(
         state,
         &mut stderr,
         invocation_row_id,
@@ -46,4 +46,5 @@ pub(crate) fn emit_live_session_marker(
         capture_method,
     )
     .map_err(|err| err.to_string())
+    .and_then(|payload| payload.ok_or_else(|| "Live-session marker was not emitted".to_string()))
 }
