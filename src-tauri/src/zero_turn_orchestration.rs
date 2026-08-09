@@ -306,7 +306,10 @@ pub fn is_incomplete_tool_boundary(
         && latest_tool_boundary.session_id == delta.provider_session_id
         && assistant_completion_cursor_is_newer(current, baseline_completion)
         && assistant_completion_cursor_is_newer(latest_tool_boundary, baseline_completion)
-        && current.timestamp >= latest_tool_boundary.timestamp
+        && latest_tool_boundary.completion_outcome.as_deref() == Some("tool-calls")
+        && (current.timestamp > latest_tool_boundary.timestamp
+            || (current.timestamp == latest_tool_boundary.timestamp
+                && current.turn_id == latest_tool_boundary.turn_id))
         && matches!(
             current.completion_outcome.as_deref(),
             None | Some("tool-calls")
@@ -609,6 +612,10 @@ mod tests {
         );
         let outcome_less = completion("session-1", "turn-5", "2026-04-17T08:00:02Z", None);
         let stop = completion("session-1", "turn-5", "2026-04-17T08:00:02Z", Some("stop"));
+        let same_time_outcome_less =
+            completion("session-1", "turn-5", "2026-04-17T08:00:01Z", None);
+        let invalid_boundary =
+            completion("session-1", "turn-4", "2026-04-17T08:00:01Z", Some("stop"));
 
         assert!(is_incomplete_tool_boundary(
             &completion_baseline(),
@@ -630,6 +637,20 @@ mod tests {
             false,
             Some(&outcome_less),
             None,
+        ));
+        assert!(!is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(5),
+            false,
+            Some(&same_time_outcome_less),
+            Some(&tool_boundary),
+        ));
+        assert!(!is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(5),
+            false,
+            Some(&outcome_less),
+            Some(&invalid_boundary),
         ));
     }
 
