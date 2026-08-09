@@ -942,7 +942,7 @@ fn failed_reconstructed_turn_reconciliation_releases_the_supervisor_lease() {
     let processes = FakeProcesses::default();
     processes.set(active.child.pid, ProcessObservation::Dead);
     let (turn_tx, _turn_rx) = mpsc::channel::<FakeTurn>();
-    let (event_tx, _events) = mpsc::channel();
+    let (event_tx, events) = mpsc::channel();
     let result = SessionSupervisor::start(
         "session-a",
         owner_fence,
@@ -955,6 +955,7 @@ fn failed_reconstructed_turn_reconciliation_releases_the_supervisor_lease() {
     );
 
     assert!(matches!(result, Err(SupervisorStartError::Repository(_))));
+    assert!(events.try_iter().next().is_none());
     let db = StateDb::open(&path).unwrap();
     assert_eq!(db.supervisor_lease("session-a").unwrap(), None);
 }
