@@ -55,9 +55,21 @@ fn start(
     SessionSupervisor<&'static str, &'static str>,
     Receiver<TurnResult<&'static str>>,
 ) {
-    static NEXT_OWNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    let (supervisor, results) = start_with_db(session, turns, db);
+    (dir, supervisor, results)
+}
+
+fn start_with_db(
+    session: &str,
+    turns: mpsc::Sender<FakeTurn>,
+    db: StateDb,
+) -> (
+    SessionSupervisor<&'static str, &'static str>,
+    Receiver<TurnResult<&'static str>>,
+) {
+    static NEXT_OWNER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
     let (event_tx, _event_rx) = mpsc::channel();
     let owner_suffix = format!(
         "{session}-{}",
@@ -74,7 +86,7 @@ fn start(
         event_tx,
     )
     .unwrap();
-    (dir, supervisor, results)
+    (supervisor, results)
 }
 
 fn notification(
@@ -170,8 +182,15 @@ fn owner_queues_active_notifications_and_stays_alive_across_turns() {
 #[test]
 fn notification_order_and_child_exits_are_isolated_per_session() {
     let (turn_tx, turn_rx) = mpsc::channel();
-    let (_dir_a, supervisor_a, results_a) = start("session-a", turn_tx.clone());
-    let (_dir_b, supervisor_b, results_b) = start("session-b", turn_tx);
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let (supervisor_a, results_a) = start_with_db(
+        "session-a",
+        turn_tx.clone(),
+        StateDb::open(&state_path).unwrap(),
+    );
+    let (supervisor_b, results_b) =
+        start_with_db("session-b", turn_tx, StateDb::open(&state_path).unwrap());
 
     supervisor_a
         .notify(notification("session-a", 10, "a-first"), 10)
