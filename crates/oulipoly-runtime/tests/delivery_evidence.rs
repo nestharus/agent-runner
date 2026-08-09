@@ -2,8 +2,8 @@ use oulipoly_runtime::delivery_evidence::{
     ManualAcknowledgementEvidence, PtyTransportAcknowledgementEvidence,
 };
 use oulipoly_state::{
-    AcknowledgementStage, AcknowledgementWrite, SessionLifecycleError, SessionLifecycleRepository,
-    StateDb,
+    AcknowledgementStage, AcknowledgementWrite, DeliveryEvidence, DeliveryEvidenceKind,
+    SessionLifecycleError, SessionLifecycleRepository, StateDb,
 };
 
 #[test]
@@ -34,6 +34,17 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
     assert_eq!(accepted.stage(), AcknowledgementStage::AcceptedPending);
     assert_eq!(accepted.submitted_at, None);
     assert_eq!(accepted.confirmed_at, None);
+    assert_eq!(
+        state.delivery_evidence("pty:attempt-a").unwrap(),
+        Some(DeliveryEvidence {
+            evidence_id: "pty:attempt-a".to_owned(),
+            kind: DeliveryEvidenceKind::PtyTransportAck,
+            delivery_id: "attempt-a".to_owned(),
+            session_id: "session-a".to_owned(),
+            turn_generation_id: "generation-a".to_owned(),
+            observed_at: 10,
+        })
+    );
 
     let stale_pty = PtyTransportAcknowledgementEvidence {
         evidence_id: "pty:stale".to_owned(),
@@ -71,6 +82,17 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
     assert_eq!(
         state.acknowledgement("attempt-a").unwrap().unwrap().stage(),
         AcknowledgementStage::AcceptedPending
+    );
+    assert_eq!(
+        state.delivery_evidence("manual:attempt-a").unwrap(),
+        Some(DeliveryEvidence {
+            evidence_id: "manual:attempt-a".to_owned(),
+            kind: DeliveryEvidenceKind::ManualAcknowledgement,
+            delivery_id: "attempt-a".to_owned(),
+            session_id: "session-a".to_owned(),
+            turn_generation_id: "generation-a".to_owned(),
+            observed_at: 14,
+        })
     );
 
     let stale = ManualAcknowledgementEvidence {
