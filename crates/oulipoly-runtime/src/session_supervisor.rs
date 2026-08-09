@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use oulipoly_state::{
-    DispositionWrite, EventDisposition, ExactProcessIdentity, LeaseAcquire, LifecycleEvent,
-    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError, SessionLifecycleRepository,
-    SessionReconstruction, SupervisorFence, TurnFence, TurnState,
+    DispositionWrite, EventDisposition, ExactProcessIdentity, ExternalIngress, LeaseAcquire,
+    LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError,
+    SessionLifecycleRepository, SessionReconstruction, SupervisorFence, TurnFence, TurnState,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,6 +214,7 @@ pub enum SupervisorError {
     DuplicateOrStaleSequence,
     MissingTurn,
     InvalidTurnFence,
+    IngressMismatch,
     StaleCommand,
     NotFound,
     Repository(SessionLifecycleError),
@@ -232,6 +233,9 @@ impl fmt::Display for SupervisorError {
             }
             Self::MissingTurn => formatter.write_str("session work has no provider turn"),
             Self::InvalidTurnFence => formatter.write_str("turn is not fenced to this session"),
+            Self::IngressMismatch => {
+                formatter.write_str("external ingress does not match the owner notification")
+            }
             Self::StaleCommand => formatter.write_str("command is stale for the active generation"),
             Self::NotFound => formatter.write_str("accepted work was not found"),
             Self::Repository(error) => write!(formatter, "durable lifecycle repository: {error}"),
@@ -415,9 +419,8 @@ where
             acquired_at,
             &mut startup_events,
         )
-        .map_err(|error| {
+        .inspect_err(|_| {
             let _ = repository.release_supervisor_lease(&session_id, &fence);
-            error
         })?;
 
         let (command_tx, command_rx) = mpsc::channel();
@@ -475,6 +478,20 @@ where
         accepted_at: i64,
     ) -> Result<AcceptedNotification, SupervisorError> {
         self.request(|reply| SupervisorCommand::Notification {
+            notification,
+            accepted_at,
+            reply,
+        })
+    }
+
+    pub fn notify_external(
+        &self,
+        ingress: ExternalIngress,
+        notification: SessionNotification<Input>,
+        accepted_at: i64,
+    ) -> Result<AcceptedNotification, SupervisorError> {
+        self.request(|reply| SupervisorCommand::ExternalNotification {
+            ingress,
             notification,
             accepted_at,
             reply,
@@ -592,6 +609,12 @@ enum ChildExit<Output> {
 
 enum SupervisorCommand<Input, Output> {
     Notification {
+        notification: SessionNotification<Input>,
+        accepted_at: i64,
+        reply: SyncSender<Result<AcceptedNotification, SupervisorError>>,
+    },
+    ExternalNotification {
+        ingress: ExternalIngress,
         notification: SessionNotification<Input>,
         accepted_at: i64,
         reply: SyncSender<Result<AcceptedNotification, SupervisorError>>,
@@ -740,6 +763,20 @@ fn run_owner<Input, Output>(
                 let _ = reply.send(state.accept(notification, accepted_at, command_tx));
                 true
             }
+            SupervisorCommand::ExternalNotification {
+                ingress,
+                notification,
+                accepted_at,
+                reply,
+            } => {
+                let _ = reply.send(state.accept_external(
+                    &ingress,
+                    notification,
+                    accepted_at,
+                    command_tx,
+                ));
+                true
+            }
             SupervisorCommand::ChildExited {
                 fence,
                 exit,
@@ -850,6 +887,41 @@ where
         accepted_at: i64,
         command_tx: &Sender<SupervisorCommand<Input, Output>>,
     ) -> Result<AcceptedNotification, SupervisorError> {
+        self.validate_acceptance(&notification, accepted_at)?;
+        self.accept_validated(notification, accepted_at, command_tx)
+    }
+
+    fn accept_external(
+        &mut self,
+        ingress: &ExternalIngress,
+        notification: SessionNotification<Input>,
+        accepted_at: i64,
+        command_tx: &Sender<SupervisorCommand<Input, Output>>,
+    ) -> Result<AcceptedNotification, SupervisorError> {
+        self.validate_acceptance(&notification, accepted_at)?;
+        if ingress.session_id != self.session_id || ingress.sequence != notification.sequence {
+            return Err(SupervisorError::IngressMismatch);
+        }
+        let generation_id = notification
+            .turns
+            .front()
+            .expect("notification turns validated above")
+            .generation_id
+            .clone();
+        self.repository.accept_external_ingress(
+            ingress,
+            &self.fence,
+            &generation_id,
+            accepted_at,
+        )?;
+        self.accept_validated(notification, accepted_at, command_tx)
+    }
+
+    fn validate_acceptance(
+        &self,
+        notification: &SessionNotification<Input>,
+        accepted_at: i64,
+    ) -> Result<(), SupervisorError> {
         if self.phase == SupervisorPhase::Draining {
             return Err(SupervisorError::Draining);
         }
@@ -869,8 +941,16 @@ where
         if self.queued.len() >= self.config.queue_capacity {
             return Err(SupervisorError::QueueFull);
         }
-        validate_notification(&self.session_id, &notification)?;
+        validate_notification(&self.session_id, notification)?;
+        Ok(())
+    }
 
+    fn accept_validated(
+        &mut self,
+        notification: SessionNotification<Input>,
+        accepted_at: i64,
+        command_tx: &Sender<SupervisorCommand<Input, Output>>,
+    ) -> Result<AcceptedNotification, SupervisorError> {
         self.append_and_publish(
             "supervisor_work_accepted",
             &format!("notification:{}", notification.sequence),

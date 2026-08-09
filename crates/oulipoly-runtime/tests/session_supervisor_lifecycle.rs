@@ -10,10 +10,11 @@ use oulipoly_runtime::session_supervisor::{
     TurnRequest, TurnResult,
 };
 use oulipoly_state::{
-    AcknowledgementWrite, DeliveryAcknowledgement, DispositionWrite, EventDisposition,
-    ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace, LifecycleEvent,
-    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleRepository, SessionLifecycleResult,
-    SessionReconstruction, StateDb, SupervisorFence, SupervisorLease, TurnFence, TurnState,
+    AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence, DispositionWrite,
+    EventDisposition, ExactProcessIdentity, ExternalIngress, ExternalIngressWrite, LeaseAcquire,
+    LeaseReplace, LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration,
+    SessionLifecycleRepository, SessionLifecycleResult, SessionReconstruction, StateDb,
+    SupervisorFence, SupervisorLease, TurnFence, TurnState,
 };
 use proc_macro2::{TokenStream, TokenTree};
 
@@ -186,6 +187,31 @@ impl SessionLifecycleRepository for FakeRepository {
         self.inner.read_external_ingress(session_id, limit)
     }
 
+    fn external_ingress_cursor(&self, session_id: &str) -> SessionLifecycleResult<i64> {
+        self.inner.external_ingress_cursor(session_id)
+    }
+
+    fn accept_external_ingress(
+        &mut self,
+        ingress: &ExternalIngress,
+        owner: &SupervisorFence,
+        turn_generation_id: &str,
+        accepted_at: i64,
+    ) -> SessionLifecycleResult<ExternalIngressWrite> {
+        self.inner
+            .accept_external_ingress(ingress, owner, turn_generation_id, accepted_at)
+    }
+
+    fn accepted_pending_external_ingress(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> SessionLifecycleResult<Vec<ExternalIngress>> {
+        self.inner
+            .accepted_pending_external_ingress(session_id, after_sequence, limit)
+    }
+
     fn accept_pending(
         &mut self,
         delivery_id: &str,
@@ -236,6 +262,20 @@ impl SessionLifecycleRepository for FakeRepository {
         delivery_id: &str,
     ) -> SessionLifecycleResult<Option<DeliveryAcknowledgement>> {
         self.inner.acknowledgement(delivery_id)
+    }
+
+    fn record_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite> {
+        self.inner.record_delivery_evidence(evidence)
+    }
+
+    fn delivery_evidence(
+        &self,
+        evidence_id: &str,
+    ) -> SessionLifecycleResult<Option<DeliveryEvidence>> {
+        self.inner.delivery_evidence(evidence_id)
     }
 
     fn reconstruct_session(
