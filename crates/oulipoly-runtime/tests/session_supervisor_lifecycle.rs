@@ -677,6 +677,13 @@ fn pause_queue_caps_and_expiry_are_command_driven_and_deterministic() {
 
     started.supervisor.resume(20).unwrap();
     assert!(matches!(started.turns.try_recv(), Err(TryRecvError::Empty)));
+    let expired = started.results.recv().unwrap();
+    assert_eq!(expired.notification_sequence, 1);
+    assert_eq!(expired.generation_id, "generation-session-a-1");
+    assert!(matches!(
+        expired.outcome,
+        TurnOutcome::Terminated(TerminalReason::Expired)
+    ));
     assert!(
         started
             .supervisor
@@ -746,9 +753,20 @@ fn active_and_queued_cancellation_drain_close_and_expiry_have_exact_terminal_out
         .supervisor
         .notify(notification("session-a", 1, [1]), 20)
         .unwrap();
+    explicit_close
+        .supervisor
+        .notify(notification("session-a", 2, [2]), 20)
+        .unwrap();
     explicit_close.supervisor.close(21).unwrap();
     assert!(matches!(
         explicit_close.results.recv().unwrap().outcome,
+        TurnOutcome::Terminated(TerminalReason::ExplicitClose)
+    ));
+    let queued = explicit_close.results.recv().unwrap();
+    assert_eq!(queued.notification_sequence, 2);
+    assert_eq!(queued.generation_id, "generation-session-a-2");
+    assert!(matches!(
+        queued.outcome,
         TurnOutcome::Terminated(TerminalReason::ExplicitClose)
     ));
 
@@ -762,6 +780,23 @@ fn active_and_queued_cancellation_drain_close_and_expiry_have_exact_terminal_out
         expiry.results.recv().unwrap().outcome,
         TurnOutcome::Terminated(TerminalReason::Expired)
     ));
+}
+
+#[test]
+fn notifications_without_a_provider_turn_are_rejected_before_acceptance() {
+    let started = start(SupervisorConfig::default());
+
+    assert!(matches!(
+        started
+            .supervisor
+            .notify(notification("session-a", 1, []), 10),
+        Err(SupervisorError::MissingTurn)
+    ));
+    assert!(matches!(
+        started.results.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    started.supervisor.close(11).unwrap();
 }
 
 #[test]

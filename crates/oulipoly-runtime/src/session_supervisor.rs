@@ -212,6 +212,7 @@ pub enum SupervisorError {
     QueueFull,
     Expired,
     DuplicateOrStaleSequence,
+    MissingTurn,
     InvalidTurnFence,
     StaleCommand,
     NotFound,
@@ -229,6 +230,7 @@ impl fmt::Display for SupervisorError {
             Self::DuplicateOrStaleSequence => {
                 formatter.write_str("notification sequence is duplicate or stale")
             }
+            Self::MissingTurn => formatter.write_str("session work has no provider turn"),
             Self::InvalidTurnFence => formatter.write_str("turn is not fenced to this session"),
             Self::StaleCommand => formatter.write_str("command is stale for the active generation"),
             Self::NotFound => formatter.write_str("accepted work was not found"),
@@ -922,6 +924,7 @@ where
                     &format!("sequence={}", work.notification.sequence),
                     at,
                 )?;
+                self.publish_queued_result(&work, TurnOutcome::Terminated(TerminalReason::Expired));
                 continue;
             }
             let Some(turn) = work.notification.turns.pop_front() else {
@@ -1257,6 +1260,15 @@ where
         });
     }
 
+    fn publish_queued_result(&self, work: &PendingWork<Input>, outcome: TurnOutcome<Output>) {
+        let turn = work
+            .notification
+            .turns
+            .front()
+            .expect("accepted queued work has at least one turn");
+        self.publish_result(turn, work, outcome);
+    }
+
     fn terminate(&mut self, reason: TerminalReason, at: i64) -> Result<(), SupervisorError> {
         if self.terminal {
             return Ok(());
@@ -1281,6 +1293,7 @@ where
                 reason.event_type(),
                 at,
             )?;
+            self.publish_queued_result(&work, TurnOutcome::Terminated(reason.clone()));
         }
         self.append_and_publish(reason.event_type(), "lifecycle", reason.event_type(), at)?;
         self.repository
@@ -1333,7 +1346,7 @@ fn validate_notification<Input>(
     notification: &SessionNotification<Input>,
 ) -> Result<(), SupervisorError> {
     if notification.turns.is_empty() {
-        return Ok(());
+        return Err(SupervisorError::MissingTurn);
     }
     if notification.turns.iter().any(|turn| {
         turn.session_id.as_deref() != Some(session_id) || turn.state != TurnState::Running
