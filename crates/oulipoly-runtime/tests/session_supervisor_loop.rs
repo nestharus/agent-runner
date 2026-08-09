@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use oulipoly_runtime::session_supervisor::{
     ProcessObservation, ProcessObserver, SessionNotification, SessionSupervisor, SupervisorConfig,
@@ -85,12 +86,14 @@ fn notification(
 }
 
 fn receive_turn(turns: &Receiver<FakeTurn>) -> FakeTurn {
-    turns.recv().expect("supervisor should launch a fake turn")
+    turns
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor should launch a fake turn")
 }
 
 fn receive_result(results: &Receiver<TurnResult<&'static str>>) -> TurnResult<&'static str> {
     results
-        .recv()
+        .recv_timeout(Duration::from_secs(5))
         .expect("supervisor should publish the exact turn result")
 }
 
