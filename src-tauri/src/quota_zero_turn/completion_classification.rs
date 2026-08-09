@@ -227,8 +227,13 @@ fn classify_after_completion(
     let accepted_provider_turn =
         classify_accepted_provider_turn(baseline, counts.clone(), false, current_completion)
             .is_some();
-    let incomplete_tool_boundary =
-        is_incomplete_tool_boundary(baseline, counts.clone(), false, current_completion);
+    let incomplete_tool_boundary = is_incomplete_tool_boundary(
+        baseline,
+        counts.clone(),
+        false,
+        current_completion,
+        report.assistant_tool_boundaries.get(session_id),
+    );
     completion_classification(
         classify_completion(baseline, counts, host_observed),
         accepted_provider_turn,

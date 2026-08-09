@@ -248,6 +248,53 @@ fn resumed_clean_exit_after_new_tool_calls_boundary_is_non_success() {
 }
 
 #[test]
+fn resumed_clean_exit_after_loaded_tool_boundary_is_typed_incomplete() {
+    let fixture = ExternalRecoveryFixture::new("loaded-incomplete");
+    fixture
+        .base
+        .seed_active_chain(EXTERNAL_PROVIDER, EXTERNAL_MODEL);
+
+    let output = fixture.run_resume();
+    let persisted = fixture.latest_persisted_invocation();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(persisted.status, "failed");
+    assert_eq!(persisted.success, 0);
+    assert_eq!(persisted.exit_code, 0);
+    assert_eq!(
+        persisted.error_category.as_deref(),
+        Some("incomplete_tool_boundary")
+    );
+    assert_eq!(
+        persisted.terminal_reason.as_deref(),
+        Some("incomplete_tool_boundary")
+    );
+    assert_eq!(
+        persisted.resume_acceptance_status.as_deref(),
+        Some("rejected")
+    );
+    assert_eq!(
+        persisted.resume_acceptance_evidence.as_deref(),
+        Some("incomplete_tool_boundary")
+    );
+    assert!(stderr.contains("incomplete_tool_boundary"), "{stderr}");
+    assert!(
+        !stderr.contains("resume_completion_unconfirmed"),
+        "{stderr}"
+    );
+    let envelope = single_result_envelope(&output);
+    assert_failure_envelope_matches(
+        &envelope,
+        &persisted,
+        EXTERNAL_PROVIDER,
+        SESSION_ID,
+        CHAIN_ID,
+    );
+    fixture.assert_local_external_provider_only();
+}
+
+#[test]
 fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
     let fixture = ExternalRecoveryFixture::new("unconfirmed");
     fixture
@@ -463,8 +510,10 @@ fn external_turn_script() -> &'static str {
 if [ ! -f "${AGE270_EXTERNAL_LAUNCH_CANARY:-}" ]; then
   exit 0
 fi
-printf '{"session_id":"%s","turn_id":"new-tool-calls","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"tool-calls"}\n' "$SESSION_ID"
-printf '{"session_id":"%s","turn_id":"new-outcome-less","timestamp":"2026-07-21T00:00:02Z","role":"assistant"}\n' "$SESSION_ID""#
+if [ "${AGE270_EXTERNAL_MODE:-}" = "loaded-incomplete" ]; then
+  printf '{"session_id":"%s","turn_id":"new-tool-calls","timestamp":"2026-07-21T00:00:01Z","role":"assistant","completion_outcome":"tool-calls"}\n' "$SESSION_ID"
+  printf '{"session_id":"%s","turn_id":"new-outcome-less","timestamp":"2026-07-21T00:00:02Z","role":"assistant"}\n' "$SESSION_ID"
+fi"#
 }
 
 fn external_provider_script() -> &'static str {

@@ -97,6 +97,7 @@ pub struct ScanReport {
     pub script_lines: u64,
     pub errors: Vec<String>,
     pub assistant_completions: HashMap<String, AssistantCompletionRecord>,
+    pub assistant_tool_boundaries: HashMap<String, AssistantCompletionRecord>,
 }
 
 pub(crate) fn is_canonical_body_shape(body: &Value) -> bool {
@@ -506,6 +507,7 @@ fn record_assistant_completion(
     let Some(completion) = completion else {
         return;
     };
+    record_assistant_tool_boundary(report, &completion);
     if !assistant_completion_should_replace(
         current_assistant_completion(report, &completion.session_id),
         &completion,
@@ -513,6 +515,20 @@ fn record_assistant_completion(
         return;
     }
     insert_assistant_completion(report, completion);
+}
+
+fn record_assistant_tool_boundary(report: &mut ScanReport, completion: &AssistantCompletionRecord) {
+    if completion.completion_outcome.as_deref() != Some("tool-calls")
+        || !assistant_completion_should_replace(
+            report.assistant_tool_boundaries.get(&completion.session_id),
+            completion,
+        )
+    {
+        return;
+    }
+    report
+        .assistant_tool_boundaries
+        .insert(completion.session_id.clone(), completion.clone());
 }
 
 fn current_assistant_completion<'a>(
@@ -1268,6 +1284,43 @@ EOF"#,
         let s2 = report.assistant_completions.get("S2").unwrap();
         assert_eq!(s2.turn_id, "s2-only");
         assert_eq!(s2.completion_outcome.as_deref(), Some("error"));
+        assert_eq!(
+            report
+                .assistant_tool_boundaries
+                .get("S1")
+                .map(|completion| completion.turn_id.as_str()),
+            Some("s1-new")
+        );
+        assert!(!report.assistant_tool_boundaries.contains_key("S2"));
+    }
+
+    #[test]
+    fn scan_report_retains_tool_boundary_before_newer_outcome_less_assistant() {
+        let db = db();
+        let script = fixture_script(
+            r#"cat <<'EOF'
+{"session_id":"S1","turn_id":"tool-boundary","timestamp":"2026-04-17T08:00:01Z","role":"assistant","completion_outcome":"tool-calls"}
+{"session_id":"S1","turn_id":"outcome-less","timestamp":"2026-04-17T08:00:02Z","role":"assistant"}
+EOF"#,
+        );
+        let cfg = cfg_with("p", &script.path);
+
+        let report = scan_provider("p", &cfg, &db);
+
+        assert_eq!(
+            report
+                .assistant_completions
+                .get("S1")
+                .map(|completion| completion.turn_id.as_str()),
+            Some("outcome-less")
+        );
+        assert_eq!(
+            report
+                .assistant_tool_boundaries
+                .get("S1")
+                .map(|completion| completion.turn_id.as_str()),
+            Some("tool-boundary")
+        );
     }
 
     #[test]
