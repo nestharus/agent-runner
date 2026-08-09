@@ -28,3 +28,23 @@ pub use adapters::{
 pub use dtos::*;
 pub use error::ServiceError;
 pub use ports::*;
+
+pub(crate) fn emit_live_session_marker(
+    state: &oulipoly_state::StateDb,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+    session_id: &str,
+    capture_method: &str,
+) -> Result<(), String> {
+    let mut stderr = std::io::stderr();
+    marker::emit_known_session_id_for_service(
+        state,
+        &mut stderr,
+        invocation_row_id,
+        invocation_uuid,
+        session_id,
+        capture_method,
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
+}

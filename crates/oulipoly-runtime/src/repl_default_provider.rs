@@ -12,12 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::executor::cli::InteractiveLiveSessionBinding;
+use crate::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use crate::services::{
     LauncherServiceOutput, LauncherServicePort, LauncherServiceRequest, ServiceError,
 };
+use crate::session_provider::SessionProviderIdentity;
 
 const UNKNOWN_DEFAULT_PROVIDER_MODEL: &str = "<unknown>";
 const DEFAULT_PROVIDER_REPL_CAPTURE_METHOD: &str = "turn_script";
+const LIVE_SESSION_IDENTITY_UNAVAILABLE: &str = "live_session_identity_unavailable";
 
 pub struct RuntimeServices<O: StateDbOpener = ProductionStateDbOpener> {
     pub config_root: PathBuf,
@@ -51,6 +55,7 @@ pub(crate) trait InteractiveLauncher {
         working_dir: Option<&Path>,
         parent_invocation_env: Option<&str>,
         state_db_path: Option<&Path>,
+        live_session_binding: Option<InteractiveLiveSessionBinding>,
     ) -> Result<crate::executor::cli::InteractiveExecutionResult, String>;
 }
 
@@ -80,6 +85,7 @@ impl InteractiveLauncher for RuntimeLauncherService {
         working_dir: Option<&Path>,
         parent_invocation_env: Option<&str>,
         state_db_path: Option<&Path>,
+        live_session_binding: Option<InteractiveLiveSessionBinding>,
     ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
         crate::executor::cli::execute_interactive_with_result_and_state_db_path(
             provider,
@@ -87,6 +93,7 @@ impl InteractiveLauncher for RuntimeLauncherService {
             parent_invocation_env,
             None,
             state_db_path,
+            live_session_binding,
         )
     }
 }
@@ -132,6 +139,22 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
         inputs: Vec::new(),
         provider: None,
     };
+    let state_db_path = default_provider_state_db_path(&services)?;
+    let registry_data_root = state_db_path
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or(services.config_root.as_path());
+    let provider_registry = Arc::new(
+        ProviderRegistry::from_model_configs_with_provider_config(
+            std::slice::from_ref(&carrier_model),
+            &providers,
+            ProviderRegistryOptions::default()
+                .with_path_entries_from_process_path()
+                .with_config_root(&services.config_root)
+                .with_data_root(registry_data_root),
+        )
+        .map_err(|err| err.to_string())?,
+    );
 
     let state = match services.state_db_path.as_ref() {
         Some(path) => services.state_db_opener.open_at(path),
@@ -160,7 +183,7 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
     let launch_provider = ProviderConfig {
         environment: Default::default(),
         unset_environment: Default::default(),
-        name: carrier_model.name,
+        name: carrier_model.name.clone(),
         ..provider
     };
 
@@ -170,6 +193,9 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
         providers: &providers,
         provider_name: &selected_provider_name,
         provider_index,
+        carrier_model: &carrier_model,
+        provider_registry,
+        state_db_path: state_db_path.as_deref(),
         launch_provider: &launch_provider,
         launcher,
     })
@@ -181,6 +207,9 @@ struct RegisteredDefaultProviderReplInput<'a, O: StateDbOpener> {
     providers: &'a ProvidersConfig,
     provider_name: &'a str,
     provider_index: usize,
+    carrier_model: &'a ModelConfig,
+    provider_registry: Arc<ProviderRegistry>,
+    state_db_path: Option<&'a Path>,
     launch_provider: &'a ProviderConfig,
     launcher: &'a dyn InteractiveLauncher,
 }
@@ -199,6 +228,7 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
         })
         .map_err(|err| err.to_string())?
         .invocation_row_id;
+    eprintln!("{}", invocation.stderr_line());
     let parent_invocation_env = serde_json::to_string(&invocation)
         .map_err(|err| format!("Failed to serialize invocation id: {err}"))?;
 
@@ -206,7 +236,8 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
         input.launch_provider,
         input.services.working_dir.as_deref(),
         Some(&parent_invocation_env),
-        input.services.state_db_path.as_deref(),
+        input.state_db_path,
+        default_provider_live_session_binding(&input, invocation_row_id, &invocation.id),
     ) {
         Ok(result) => result,
         Err(err) => {
@@ -215,8 +246,21 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
         }
     };
 
+    let bound_session_id = default_provider_invocation_session_id(input.state, &invocation.id)?;
+    if result.exit_code == 0
+        && result.live_session_capture_required
+        && (result.live_session_id.is_none()
+            || result.live_session_id.as_deref() != bound_session_id.as_deref())
+    {
+        finalize_default_provider_live_session_error(&lifecycle, input.state, invocation_row_id)?;
+        return Err(format!(
+            "{LIVE_SESSION_IDENTITY_UNAVAILABLE}: provider {} exited successfully without reporting and binding its exact live session; nested asynchronous completion is unavailable",
+            input.provider_name
+        ));
+    }
+
     finalize_default_provider_repl_result(&lifecycle, input.state, invocation_row_id, &result)?;
-    if result.exit_code == 0 {
+    if result.exit_code == 0 && bound_session_id.is_none() {
         ingest_default_provider_session(DefaultProviderSessionIngestInput {
             services: input.services,
             state: input.state,
@@ -227,6 +271,50 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
         });
     }
     Ok(result.exit_code)
+}
+
+fn default_provider_invocation_session_id(
+    state: &oulipoly_state::StateDb,
+    invocation_uuid: &str,
+) -> Result<Option<String>, String> {
+    state.get_invocation_by_uuid(invocation_uuid).map(|record| {
+        record.and_then(|record| {
+            record
+                .provider_session_id
+                .or(record.session_id)
+                .filter(|session_id| !session_id.trim().is_empty())
+        })
+    })
+}
+
+fn default_provider_state_db_path<O: StateDbOpener>(
+    services: &RuntimeServices<O>,
+) -> Result<Option<PathBuf>, String> {
+    match services.state_db_path.as_deref() {
+        Some(path) => Ok(Some(path.to_path_buf())),
+        None => services.state_db_opener.default_path(),
+    }
+}
+
+fn default_provider_live_session_binding<O: StateDbOpener>(
+    input: &RegisteredDefaultProviderReplInput<'_, O>,
+    invocation_row_id: i64,
+    invocation_uuid: &str,
+) -> Option<InteractiveLiveSessionBinding> {
+    let state_db_path = input.state_db_path?;
+    Some(InteractiveLiveSessionBinding {
+        registry: Arc::clone(&input.provider_registry),
+        identity: SessionProviderIdentity {
+            model_name: input.carrier_model.name.clone(),
+            provider_name: input.provider_name.to_string(),
+            provider_instance_id: None,
+            settings_id: input.provider_name.to_string(),
+        },
+        state_db_path: state_db_path.to_path_buf(),
+        invocation_row_id,
+        invocation_uuid: invocation_uuid.to_string(),
+        effective_cwd: default_provider_effective_cwd(input.services.working_dir.as_deref()),
+    })
 }
 
 fn default_provider_invocation(provider_name: &str) -> CompositeInvocationId {
@@ -282,6 +370,24 @@ fn finalize_default_provider_spawn_error(
             exit_code: 1,
             error_category: Some("spawn_error"),
             terminal_reason: Some("spawn_error"),
+        })
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn finalize_default_provider_live_session_error(
+    lifecycle: &ProductionInvocationLifecycleService,
+    state: &oulipoly_state::StateDb,
+    invocation_row_id: i64,
+) -> Result<(), String> {
+    lifecycle
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state,
+            invocation_row_id,
+            success: false,
+            exit_code: 1,
+            error_category: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
+            terminal_reason: Some(LIVE_SESSION_IDENTITY_UNAVAILABLE),
         })
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -383,9 +489,12 @@ fn is_benign_default_provider_session_ingest_token(token: &str) -> bool {
 }
 
 fn default_provider_effective_cwd(working_dir: Option<&Path>) -> Option<PathBuf> {
-    working_dir
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())
+    let cwd = match working_dir {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => std::env::current_dir().ok()?.join(path),
+        None => std::env::current_dir().ok()?,
+    };
+    cwd.canonicalize().ok().or(Some(cwd))
 }
 
 #[allow(dead_code)]
@@ -464,7 +573,7 @@ pub(crate) use resolve_family_keys as resolve_family_keys_for_test;
 mod tests {
     use super::*;
     use crate::services::{LauncherServicePort, LauncherServiceRequest};
-    use oulipoly_state::StateDb;
+    use oulipoly_state::{ProviderSessionBinding, StateDb};
     use rusqlite::Connection;
     use std::cell::RefCell;
     #[cfg(unix)]
@@ -536,6 +645,7 @@ interactive_args = ["ok"]
             working_dir: Option<&Path>,
             parent_invocation_env: Option<&str>,
             _state_db_path: Option<&Path>,
+            _live_session_binding: Option<InteractiveLiveSessionBinding>,
         ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
             self.calls.borrow_mut().push((
                 provider.name.clone(),
@@ -551,6 +661,8 @@ interactive_args = ["ok"]
             exit_code: 0,
             terminal_reason: None,
             terminal_signal: None,
+            live_session_id: None,
+            live_session_capture_required: false,
         }
     }
 
@@ -558,6 +670,41 @@ interactive_args = ["ok"]
     struct TurnWritingLauncher {
         turns_path: PathBuf,
         session_id: String,
+    }
+
+    struct CapturingTerminalLauncher {
+        session_id: String,
+        exit_code: i32,
+        terminal_reason: String,
+    }
+
+    impl InteractiveLauncher for CapturingTerminalLauncher {
+        fn launch(
+            &self,
+            _provider: &ProviderConfig,
+            _working_dir: Option<&Path>,
+            _parent_invocation_env: Option<&str>,
+            _state_db_path: Option<&Path>,
+            live_session_binding: Option<InteractiveLiveSessionBinding>,
+        ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
+            let binding = live_session_binding.expect("live-session binding context");
+            StateDb::open(&binding.state_db_path)?.bind_invocation_provider_session_start(
+                binding.invocation_row_id,
+                &ProviderSessionBinding {
+                    provider_session_id: self.session_id.clone(),
+                    capture_method: "provider_live_report",
+                    resume_input_id: None,
+                    provider_session_resolved_account: Some(binding.identity.settings_id.clone()),
+                },
+            )?;
+            Ok(crate::executor::cli::InteractiveExecutionResult {
+                exit_code: self.exit_code,
+                terminal_reason: Some(self.terminal_reason.clone()),
+                terminal_signal: None,
+                live_session_id: Some(self.session_id.clone()),
+                live_session_capture_required: true,
+            })
+        }
     }
 
     #[cfg(unix)]
@@ -568,6 +715,7 @@ interactive_args = ["ok"]
             _working_dir: Option<&Path>,
             _parent_invocation_env: Option<&str>,
             _state_db_path: Option<&Path>,
+            _live_session_binding: Option<InteractiveLiveSessionBinding>,
         ) -> Result<crate::executor::cli::InteractiveExecutionResult, String> {
             std::thread::sleep(std::time::Duration::from_millis(10));
             let timestamp = chrono::Utc::now().to_rfc3339();
@@ -675,7 +823,7 @@ exit 17"#,
             })
             .expect("service launch");
         let private_result = private_launcher
-            .launch(&provider, Some(working_dir.path()), None, None)
+            .launch(&provider, Some(working_dir.path()), None, None, None)
             .expect("private seam launch");
 
         assert_eq!(service_output.exit_code, private_result.exit_code);
@@ -1039,6 +1187,36 @@ turn_script = "{}"
     }
 
     #[test]
+    fn captured_live_session_survives_cancellation_and_terminal_failure() {
+        for (exit_code, terminal_reason) in [(130, "cancelled"), (17, "terminal_failure")] {
+            let temp = tempfile::tempdir().unwrap();
+            let state_path = temp.path().join("state.db");
+            StateDb::open(&state_path).unwrap();
+            write_config(temp.path(), r#"default_provider = "generic""#);
+            write_providers(temp.path(), &provider_fixture("generic"));
+            let session_id = format!("session-terminal-{exit_code}");
+            let launcher = CapturingTerminalLauncher {
+                session_id: session_id.clone(),
+                exit_code,
+                terminal_reason: terminal_reason.to_string(),
+            };
+
+            let code = run_repl_with_default_provider_with_launcher(
+                runtime_services_with_state(temp.path().to_path_buf(), state_path.clone()),
+                &launcher,
+            )
+            .expect("captured terminal result should finalize normally");
+
+            assert_eq!(code, exit_code);
+            let (_model, _provider, status, provider_session_id, capture_method) =
+                invocation_row(&state_path);
+            assert_eq!(status, "failed");
+            assert_eq!(provider_session_id.as_deref(), Some(session_id.as_str()));
+            assert_eq!(capture_method.as_deref(), Some("provider_live_report"));
+        }
+    }
+
+    #[test]
     fn does_not_increment_quota_tick() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("state.db");
@@ -1056,6 +1234,18 @@ turn_script = "{}"
         assert_eq!(code, 0);
         assert_eq!(table_count(&state_path, "provider_quotas"), 0);
         assert_eq!(table_count(&state_path, "provider_quota_windows"), 0);
+    }
+
+    #[test]
+    fn live_session_working_directory_resolves_relative_project_without_git() {
+        let relative = PathBuf::from("target/age284-relative-project");
+        let absolute = std::env::current_dir().unwrap().join(&relative);
+        std::fs::create_dir_all(&absolute).unwrap();
+
+        let resolved = default_provider_effective_cwd(Some(&relative)).unwrap();
+
+        assert_eq!(resolved, absolute.canonicalize().unwrap());
+        assert!(!absolute.join(".git").exists());
     }
 
     #[test]

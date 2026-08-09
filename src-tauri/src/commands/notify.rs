@@ -371,26 +371,46 @@ fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), 
     if !path.exists() {
         return Err("State DB is unavailable for completion listener validation".to_string());
     }
-    let state = StateDb::open_read_only(&path)
+    let record = completion_owner_invocation(&path, owner)?;
+    match resolved_invocation_session_id(&record) {
+        Some(session_id) if session_id == owner.session_id => return Ok(()),
+        Some(_) => return Err(owner_binding_error(owner)),
+        None => {}
+    }
+    if record.status == InvocationStatus::Running {
+        if oulipoly_runtime::executor::cli::report_live_session_binding_from_env(
+            &owner.invocation_uuid,
+            &owner.session_id,
+        )? {
+            let rebound = completion_owner_invocation(&path, owner)?;
+            if resolved_invocation_session_id(&rebound).as_deref()
+                == Some(owner.session_id.as_str())
+            {
+                return Ok(());
+            }
+            return Err(owner_binding_error(owner));
+        }
+        if running_owner_binding_is_live(owner, metadata)? {
+            return Ok(());
+        }
+    }
+    Err(owner_binding_error(owner))
+}
+
+fn completion_owner_invocation(
+    path: &Path,
+    owner: &OwnerBinding,
+) -> Result<InvocationRecord, String> {
+    let state = StateDb::open_read_only(path)
         .map_err(|err| format!("Failed to open state DB read-only: {err:?}"))?;
-    let record = state
+    state
         .get_invocation_by_uuid(&owner.invocation_uuid)?
         .ok_or_else(|| {
             format!(
                 "Completion listener invocation {} does not exist",
                 owner.invocation_uuid
             )
-        })?;
-    match resolved_invocation_session_id(&record) {
-        Some(session_id) if session_id == owner.session_id => return Ok(()),
-        Some(_) => return Err(owner_binding_error(owner)),
-        None => {}
-    }
-    if record.status == InvocationStatus::Running && running_owner_binding_is_live(owner, metadata)?
-    {
-        return Ok(());
-    }
-    Err(owner_binding_error(owner))
+        })
 }
 
 fn resolved_invocation_session_id(record: &InvocationRecord) -> Option<String> {

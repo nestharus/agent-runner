@@ -69,6 +69,7 @@ mod input_flags;
 mod interactive;
 mod ipc;
 mod launch;
+mod live_session_binding;
 mod policy;
 mod provider_execution;
 mod provider_identity;
@@ -94,6 +95,8 @@ pub use interactive::{
     execute_interactive_with_result_and_model_config,
     execute_interactive_with_result_and_model_identity,
 };
+pub(crate) use live_session_binding::InteractiveLiveSessionBinding;
+pub use live_session_binding::report_live_session_binding_from_env;
 pub use provider_identity::{provider_name, shell_split};
 pub use request::EffectiveExecuteRequest;
 pub use resume::{ResumePayload, compose_resume_args};

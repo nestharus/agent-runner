@@ -5667,9 +5667,12 @@ fn inject_control_payload(
     control: &ControlSocket,
 ) -> Result<Option<String>, String> {
     validate_control_peer(stream)?;
+    let session_id = control
+        .session_id()
+        .ok_or_else(|| "awaiting_session_identity".to_string())?;
     let payload = prepare_control_payload(
         read_tui_control_payload(stream)?,
-        Some((control.session_id(), control.invocation_uuid())),
+        Some((&session_id, control.invocation_uuid())),
     )?;
     if payload.bytes.is_empty() {
         acknowledge_control_payload(&payload)?;

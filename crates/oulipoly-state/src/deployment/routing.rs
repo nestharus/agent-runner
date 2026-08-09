@@ -5,7 +5,7 @@ use crate::deployment::metadata::store::rows::DeploymentSnapshot;
 use crate::deployment::paths::{ResolveError, ResolvedStateDb};
 use crate::repositories::StateDbOpener;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub type ReadOnlyStateDb = StateDb;
@@ -73,6 +73,10 @@ impl DeploymentAwareOpener {
         self.inner
             .open_at(&resolved.path)
             .map_err(OpenError::OpenFailed)
+    }
+
+    pub fn default_path(&self) -> Result<PathBuf, OpenError> {
+        Ok(self.routing.resolve_for_current_binary()?.path)
     }
 
     pub fn open_read_only_default(&self) -> Result<ReadOnlyStateDb, OpenError> {

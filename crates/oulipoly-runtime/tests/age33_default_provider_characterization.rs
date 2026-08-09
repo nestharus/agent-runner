@@ -410,16 +410,19 @@ prompt_mode = "arg"
     )
     .unwrap();
 
-    let status = run_repl_with_default_provider(RuntimeServices {
+    let error = run_repl_with_default_provider(RuntimeServices {
         config_root,
         state_db_path: Some(PathBuf::from(&explicit_state_db)),
         working_dir: None,
         state_db_opener: ProductionStateDbOpener,
         routing_service: Arc::new(ProductionRoutingService),
     })
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(status, 0);
+    assert!(
+        error.contains("live_session_identity_unavailable"),
+        "{error}"
+    );
     assert_eq!(fs::read_to_string(&marker).unwrap(), "interactive-launch");
     assert!(explicit_state_db.exists());
     assert!(

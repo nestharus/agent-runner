@@ -156,10 +156,35 @@
       ]
     },
     "SessionReadTurnsErrorResponse": { "$ref": "common.schema.json#/$defs/ErrorResponseEnvelope" },
+    "SessionLiveReport": {
+      "type": "object",
+      "properties": {
+        "provider_session_id": { "type": "string", "minLength": 1 },
+        "invocation_uuid": { "type": "string", "minLength": 1 }
+      },
+      "required": ["provider_session_id", "invocation_uuid"],
+      "additionalProperties": false
+    },
     "SessionCaptureRequest": {
       "allOf": [
         { "$ref": "common.schema.json#/$defs/RequestEnvelope" },
-        { "type": "object", "properties": { "params": { "$ref": "#/$defs/SessionBaseParams" } } }
+        {
+          "type": "object",
+          "properties": {
+            "params": {
+              "allOf": [
+                { "$ref": "#/$defs/SessionBaseParams" },
+                {
+                  "type": "object",
+                  "properties": {
+                    "invocation_uuid": { "type": "string", "minLength": 1 },
+                    "live_report": { "$ref": "#/$defs/SessionLiveReport" }
+                  }
+                }
+              ]
+            }
+          }
+        }
       ]
     },
     "SessionCaptureResult": {

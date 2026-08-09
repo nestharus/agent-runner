@@ -15,7 +15,9 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -528,6 +530,90 @@ fn completion_registration_accepts_running_owner_from_exact_live_pid_sidecar() {
     assert_eq!(registered["owner_session_id"], SESSION_A);
     assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_waits_for_live_session_binding() {
+    let fixture = Fixture::new();
+    let state = fixture.open_state();
+    let invocation_row_id = state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: INVOCATION_A.to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    let artifacts = fixture.write_notify_artifacts(
+        "h-live-binding-owner",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
+    let socket_path = fixture.dir.path().join("live-binding.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let state_path = fixture.state_path();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let report: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(report["invocation_uuid"], INVOCATION_A);
+        assert_eq!(report["provider_session_id"], SESSION_A);
+        assert_eq!(report["token"], "fixture-token");
+        StateDb::open(&state_path)
+            .unwrap()
+            .bind_invocation_provider_session_start(
+                invocation_row_id,
+                &ProviderSessionBinding {
+                    provider_session_id: SESSION_A.to_string(),
+                    capture_method: "provider_live_report",
+                    resume_input_id: None,
+                    provider_session_resolved_account: Some("fixture-provider".to_string()),
+                },
+            )
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"ok": true, "session_id": SESSION_A, "error": null})
+        )
+        .unwrap();
+    });
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    cmd.arg("notify")
+        .arg("agent-bash-register")
+        .arg("--handle")
+        .arg("h-live-binding-owner")
+        .arg("--delivery-mode")
+        .arg("async")
+        .arg("--state-dir")
+        .arg(&artifacts.state_dir)
+        .arg("--meta")
+        .arg(&artifacts.meta)
+        .arg("--log")
+        .arg(&artifacts.log)
+        .arg("--rc")
+        .arg(&artifacts.rc)
+        .arg("--json")
+        .env("OULIPOLY_LIVE_SESSION_BIND_SOCKET", &socket_path)
+        .env("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "fixture-token");
+    let registration = fixture.run(cmd);
+    server.join().unwrap();
+
+    assert!(registration.status.success(), "{registration:?}");
+    let registered = stdout_json(&registration);
+    assert_eq!(registered["owner_session_id"], SESSION_A);
+    assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+    let rebound = fixture
+        .open_state()
+        .get_invocation_by_uuid(INVOCATION_A)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rebound.provider_session_id.as_deref(), Some(SESSION_A));
 }
 
 #[test]

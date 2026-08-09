@@ -350,7 +350,11 @@ disallowed_tools = ["Task"]
 
     let output = fixture.command().arg("--new").output().unwrap();
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("live_session_identity_unavailable"),
+        "{output:?}"
+    );
     assert_eq!(
         read_lines(&argv_dump),
         vec![
@@ -396,7 +400,11 @@ disable_slash_commands = true
 
     let output = fixture.command().arg("--new").output().unwrap();
 
-    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("live_session_identity_unavailable"),
+        "{output:?}"
+    );
     assert_eq!(
         read_lines(&argv_dump),
         vec![

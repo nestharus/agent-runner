@@ -27,6 +27,9 @@
 
 use super::super::TerminalSignal;
 use super::launch::build_command;
+use super::live_session_binding::InteractiveLiveSessionBinding;
+#[cfg(unix)]
+use super::live_session_binding::LiveSessionBindingServer;
 use super::policy::apply_provider_policy;
 use super::provider_identity::ProviderRecognizer;
 #[cfg(unix)]
@@ -44,7 +47,7 @@ use oulipoly_config::{ModelConfig, ProviderConfig};
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub fn execute_interactive(
     provider: &ProviderConfig,
@@ -61,6 +64,8 @@ pub struct InteractiveExecutionResult {
     pub exit_code: i32,
     pub terminal_reason: Option<String>,
     pub terminal_signal: Option<TerminalSignal>,
+    pub live_session_id: Option<String>,
+    pub live_session_capture_required: bool,
 }
 
 pub fn execute_interactive_with_result(
@@ -84,15 +89,22 @@ pub(crate) fn execute_interactive_with_result_and_state_db_path(
     parent_invocation_env: Option<&str>,
     resume: Option<ResumePayload<'_>>,
     state_db_path: Option<&Path>,
+    live_session_binding: Option<InteractiveLiveSessionBinding>,
 ) -> Result<InteractiveExecutionResult, String> {
+    let provider_registry = live_session_binding
+        .as_ref()
+        .map(|binding| Arc::clone(&binding.registry));
     execute_interactive_with_result_and_monitor_context(
         provider,
         working_dir,
         parent_invocation_env,
         resume,
-        None,
-        None,
-        state_db_path,
+        InteractiveMonitorContext {
+            model_name: None,
+            provider_registry,
+            live_session_binding,
+            state_db_path,
+        },
     )
 }
 
@@ -108,9 +120,12 @@ pub fn execute_interactive_with_result_and_model_identity(
         working_dir,
         parent_invocation_env,
         resume,
-        model_name,
-        None,
-        None,
+        InteractiveMonitorContext {
+            model_name,
+            provider_registry: None,
+            live_session_binding: None,
+            state_db_path: None,
+        },
     )
 }
 
@@ -127,10 +142,20 @@ pub fn execute_interactive_with_result_and_model_config(
         working_dir,
         parent_invocation_env,
         resume,
-        Some(&model.name),
-        Some(provider_registry),
-        None,
+        InteractiveMonitorContext {
+            model_name: Some(&model.name),
+            provider_registry: Some(provider_registry),
+            live_session_binding: None,
+            state_db_path: None,
+        },
     )
+}
+
+struct InteractiveMonitorContext<'a> {
+    model_name: Option<&'a str>,
+    provider_registry: Option<Arc<ProviderRegistry>>,
+    live_session_binding: Option<InteractiveLiveSessionBinding>,
+    state_db_path: Option<&'a Path>,
 }
 
 fn execute_interactive_with_result_and_monitor_context(
@@ -138,41 +163,73 @@ fn execute_interactive_with_result_and_monitor_context(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     resume: Option<ResumePayload<'_>>,
-    model_name: Option<&str>,
-    provider_registry: Option<Arc<ProviderRegistry>>,
-    state_db_path: Option<&Path>,
+    monitor: InteractiveMonitorContext<'_>,
 ) -> Result<InteractiveExecutionResult, String> {
     let resume_session_id = resume.as_ref().map(|resume| resume.session_id);
     let provider_args = interactive_provider_args(provider, resume)?;
     let spawn_identity = interactive_spawn_identity_context(
         parent_invocation_env,
         provider,
-        model_name,
+        monitor.model_name,
         resume_session_id,
         working_dir,
-        state_db_path,
+        monitor.state_db_path,
     )?;
     #[cfg(unix)]
+    let mut live_session_server = monitor
+        .live_session_binding
+        .map(LiveSessionBindingServer::bind)
+        .transpose()?;
+    #[cfg(unix)]
+    let live_session_capture_required = live_session_server.is_some();
+    #[cfg(not(unix))]
+    let live_session_capture_required = false;
+    #[cfg(unix)]
+    let live_session_state = live_session_server
+        .as_ref()
+        .map(LiveSessionBindingServer::session_state);
+    #[cfg(not(unix))]
+    let live_session_state: Option<Arc<Mutex<Option<String>>>> = None;
+    #[cfg(unix)]
     if pty_broker::controlling_terminal_available() {
-        let cmd =
+        let mut cmd =
             interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
-        let provider_inspect =
-            provider_registry.map(pty_broker::ProviderInspectMonitorContext::new);
+        if let Some(server) = live_session_server.as_ref() {
+            server.configure_command(&mut cmd);
+        }
+        let provider_inspect = monitor
+            .provider_registry
+            .map(pty_broker::ProviderInspectMonitorContext::new);
         let status = if pty_broker::observed_tui_enabled() {
             pty_broker::execute_interactive_child_observed(
                 cmd,
                 provider,
                 spawn_identity.as_ref(),
                 provider_inspect.as_ref(),
+                live_session_server,
             )?
         } else {
-            pty_broker::execute_interactive_child(cmd, provider, spawn_identity.as_ref())?
+            pty_broker::execute_interactive_child(
+                cmd,
+                provider,
+                spawn_identity.as_ref(),
+                live_session_server,
+            )?
         };
-        return Ok(interactive_result_from_status(provider, &status));
+        return Ok(interactive_result_from_status(
+            provider,
+            &status,
+            live_session_capture_required,
+            live_session_state.as_ref(),
+        ));
     }
 
     let mut cmd =
         interactive_command(provider, &provider_args, working_dir, parent_invocation_env)?;
+    #[cfg(unix)]
+    if let Some(server) = live_session_server.as_ref() {
+        server.configure_command(&mut cmd);
+    }
     configure_interactive_stdio(&mut cmd);
     register_runtime_generation_starting(spawn_identity.as_ref())?;
     let mut child = match spawn_interactive_child(cmd, provider) {
@@ -185,7 +242,22 @@ fn execute_interactive_with_result_and_monitor_context(
 
     #[cfg(unix)]
     let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-    if let Err(err) = record_child_identity(child.id(), spawn_identity.as_ref()) {
+    let generation = match record_child_identity(child.id(), spawn_identity.as_ref()) {
+        Ok(generation) => generation,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = mark_runtime_generation_exited(spawn_identity.as_ref(), None);
+            return Err(err);
+        }
+    };
+    #[cfg(unix)]
+    if let (Some(server), Some(context), Some(generation)) = (
+        live_session_server.as_mut(),
+        spawn_identity.as_ref(),
+        generation,
+    ) && let Err(err) = server.start(context.clone(), generation)
+    {
         let _ = child.kill();
         let _ = child.wait();
         let _ = mark_runtime_generation_exited(spawn_identity.as_ref(), None);
@@ -201,7 +273,12 @@ fn execute_interactive_with_result_and_monitor_context(
     #[cfg(unix)]
     drop(signal_guard);
 
-    Ok(interactive_result_from_status(provider, &status))
+    Ok(interactive_result_from_status(
+        provider,
+        &status,
+        live_session_capture_required,
+        live_session_state.as_ref(),
+    ))
 }
 
 fn interactive_provider_args(
@@ -296,6 +373,8 @@ fn interactive_args_missing_error(provider: &ProviderConfig) -> String {
 fn interactive_result_from_status(
     provider: &ProviderConfig,
     status: &ExitStatus,
+    live_session_capture_required: bool,
+    live_session_state: Option<&Arc<Mutex<Option<String>>>>,
 ) -> InteractiveExecutionResult {
     let terminal_reason = terminal_signal::classify_terminal_reason(status);
     let terminal_signal = terminal_signal::recognize_terminal_signal(
@@ -309,5 +388,9 @@ fn interactive_result_from_status(
         exit_code: terminal_signal::exit_code_from_status(status),
         terminal_reason,
         terminal_signal: Some(terminal_signal),
+        live_session_id: live_session_state
+            .and_then(|state| state.lock().ok())
+            .and_then(|session_id| session_id.clone()),
+        live_session_capture_required,
     }
 }
