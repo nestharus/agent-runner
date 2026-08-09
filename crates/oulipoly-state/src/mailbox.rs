@@ -28,6 +28,19 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
+const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, enqueued_at,
+    delivered_at, delivered_by_invocation_uuid, delivery_attempts,
+    delivery_error, owner_invocation_uuid, matched_os_pid,
+    matched_os_boot_id, matched_os_pid_starttime_ticks,
+    matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
+    payload_file_path, payload_sha256, payload_byte_len,
+    payload_retention_policy, payload_compacted_at,
+    submission_token, target_kind, target_id";
+const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
+    (target_kind IS NULL AND session_id = ?1)
+    OR (target_kind = 'session' AND target_id = ?1)
+    OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
+)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -1912,26 +1925,16 @@ impl MailboxDb {
         session_id: &str,
         chain_id: Option<&str>,
     ) -> Result<Vec<MailboxRow>, String> {
+        let query = format!(
+            "SELECT {MAILBOX_ROW_COLUMNS}
+             FROM mailbox
+             WHERE delivered_at IS NULL
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}
+             ORDER BY seq ASC"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT seq, session_id, kind, handle, payload_json, enqueued_at,
-                        delivered_at, delivered_by_invocation_uuid, delivery_attempts,
-                        delivery_error, owner_invocation_uuid, matched_os_pid,
-                        matched_os_boot_id, matched_os_pid_starttime_ticks,
-                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
-                        payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, payload_compacted_at,
-                        submission_token, target_kind, target_id
-                 FROM mailbox
-                 WHERE delivered_at IS NULL
-                   AND (
-                       (target_kind IS NULL AND session_id = ?1)
-                       OR (target_kind = 'session' AND target_id = ?1)
-                       OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
-                   )
-                 ORDER BY seq ASC",
-            )
+            .prepare(&query)
             .map_err(|err| format!("Failed to prepare pending mailbox query: {err}"))?;
         let rows = stmt
             .query_map(params![session_id, chain_id], map_mailbox_row)
@@ -1956,34 +1959,24 @@ impl MailboxDb {
             .ok()
             .filter(|limit| *limit > 0)
             .ok_or_else(|| "Mailbox batch limit must be positive".to_string())?;
+        let query = format!(
+            "SELECT {MAILBOX_ROW_COLUMNS}
+             FROM mailbox
+             WHERE delivered_at IS NULL
+               AND seq > ?3
+               AND (delivery_error IS NULL OR delivery_error != ?5)
+               AND (
+                   delivery_error IS NULL
+                   OR delivery_error != ?6
+                   OR delivery_attempts < ?7
+               )
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}
+             ORDER BY seq ASC
+             LIMIT ?4"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT seq, session_id, kind, handle, payload_json, enqueued_at,
-                        delivered_at, delivered_by_invocation_uuid, delivery_attempts,
-                        delivery_error, owner_invocation_uuid, matched_os_pid,
-                        matched_os_boot_id, matched_os_pid_starttime_ticks,
-                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
-                        payload_file_path, payload_sha256, payload_byte_len,
-                        payload_retention_policy, payload_compacted_at,
-                        submission_token, target_kind, target_id
-                 FROM mailbox
-                 WHERE delivered_at IS NULL
-                   AND seq > ?3
-                   AND (delivery_error IS NULL OR delivery_error != ?5)
-                   AND (
-                       delivery_error IS NULL
-                       OR delivery_error != ?6
-                       OR delivery_attempts < ?7
-                   )
-                   AND (
-                       (target_kind IS NULL AND session_id = ?1)
-                       OR (target_kind = 'session' AND target_id = ?1)
-                       OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
-                   )
-                 ORDER BY seq ASC
-                 LIMIT ?4",
-            )
+            .prepare(&query)
             .map_err(|err| format!("Failed to prepare bounded pending mailbox query: {err}"))?;
         let rows = stmt
             .query_map(
