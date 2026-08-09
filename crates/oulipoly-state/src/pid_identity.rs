@@ -74,6 +74,7 @@ pub struct LiveProcessIdentityRecord<'a> {
 pub struct PidIdentityDb {
     conn: Connection,
     path: PathBuf,
+    _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
 }
 
 impl PidIdentityDb {
@@ -95,6 +96,7 @@ impl PidIdentityDb {
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            _read_only_snapshot: None,
         })
     }
 
@@ -104,11 +106,15 @@ impl PidIdentityDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create(path)
             .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        let conn =
+            Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
+            _read_only_snapshot: Some(snapshot),
         })
     }
 

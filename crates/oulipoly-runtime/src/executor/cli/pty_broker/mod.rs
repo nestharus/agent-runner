@@ -46,6 +46,7 @@ mod tui;
 const CONTROL_MAGIC: &[u8; 4] = b"OPTY";
 const CONTROL_VERSION: u8 = 1;
 const CONTROL_OP_INJECT: u8 = 1;
+const CONTROL_OP_HEADLESS_RESUME: u8 = 2;
 pub const CONTROL_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const RELAY_POLL_TIMEOUT_MS: i32 = 25;
@@ -94,6 +95,12 @@ pub struct PtyControlResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveSessionControlOperation<'a> {
+    PtyInject(&'a str),
+    HeadlessResume(&'a str),
+}
+
 pub(super) struct ProviderInspectMonitorContext {
     registry: Arc<ProviderRegistry>,
 }
@@ -116,7 +123,19 @@ pub fn inject_control_envelope(
     path: impl AsRef<Path>,
     payload: &str,
 ) -> Result<PtyControlResponse, PtyControlClientError> {
-    let bytes = payload.as_bytes();
+    send_control_operation(path, LiveSessionControlOperation::PtyInject(payload))
+}
+
+pub fn send_control_operation(
+    path: impl AsRef<Path>,
+    operation: LiveSessionControlOperation<'_>,
+) -> Result<PtyControlResponse, PtyControlClientError> {
+    let (operation_code, bytes) = match operation {
+        LiveSessionControlOperation::PtyInject(payload) => (CONTROL_OP_INJECT, payload.as_bytes()),
+        LiveSessionControlOperation::HeadlessResume(payload) => {
+            (CONTROL_OP_HEADLESS_RESUME, payload.as_bytes())
+        }
+    };
     validate_client_payload(bytes)?;
     let mut stream = UnixStream::connect(path.as_ref()).map_err(connect_error)?;
     stream
@@ -125,7 +144,7 @@ pub fn inject_control_envelope(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(protocol_error)?;
-    write_inject_frame(&mut stream, bytes).map_err(protocol_error)?;
+    write_control_frame(&mut stream, operation_code, bytes).map_err(protocol_error)?;
     read_control_response(&mut stream)
 }
 
@@ -608,16 +627,27 @@ fn control_response_from_parts(status: u8, message: String) -> PtyControlRespons
     }
 }
 
+fn write_control_frame(stream: &mut UnixStream, operation: u8, payload: &[u8]) -> io::Result<()> {
+    let header = control_frame_header(operation, payload);
+    write_frame_parts(stream, &header, payload)
+}
+
+#[cfg(test)]
 fn write_inject_frame(stream: &mut UnixStream, payload: &[u8]) -> io::Result<()> {
     let header = inject_frame_header(payload);
     write_frame_parts(stream, &header, payload)
 }
 
+#[cfg(test)]
 fn inject_frame_header(payload: &[u8]) -> [u8; 12] {
+    control_frame_header(CONTROL_OP_INJECT, payload)
+}
+
+fn control_frame_header(operation: u8, payload: &[u8]) -> [u8; 12] {
     let mut header = [0_u8; 12];
     header[..4].copy_from_slice(CONTROL_MAGIC);
     header[4] = CONTROL_VERSION;
-    header[5] = CONTROL_OP_INJECT;
+    header[5] = operation;
     header[8..12].copy_from_slice(&(payload.len() as u32).to_be_bytes());
     header
 }
@@ -2021,6 +2051,11 @@ struct PreparedControlPayload {
     delivery_attempt_id: Option<String>,
 }
 
+struct ControlRequest {
+    operation: u8,
+    payload: Vec<u8>,
+}
+
 fn handle_control_request(
     control: &ControlSocket,
     io: &mut ControlRequestIo<'_>,
@@ -2109,7 +2144,8 @@ fn process_control_request_with_pending(
     expected_target: Option<(&str, &str)>,
 ) -> Result<Option<String>, String> {
     validate_control_request_peer(stream)?;
-    let payload = prepare_control_payload(read_control_request_payload(stream)?, expected_target)?;
+    let request = read_control_request_payload(stream)?;
+    let payload = prepare_control_payload(require_inject_operation(request)?, expected_target)?;
     if payload.bytes.is_empty() {
         acknowledge_control_payload(&payload)?;
         return Ok(payload.delivery_attempt_id);
@@ -2219,17 +2255,28 @@ fn submit_control_request_payload(pending_child_input: &mut PendingChildInput, p
     queue_control_injection(pending_child_input, payload, false, true);
 }
 
-fn read_control_request_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
+fn read_control_request_payload(stream: &mut UnixStream) -> Result<ControlRequest, String> {
     let header = read_control_request_header(stream)?;
     validate_control_request_header(&header)?;
     let length = control_request_payload_len(&header)?;
     let payload = read_control_request_bytes(stream, length)?;
     validate_control_request_utf8(&payload)?;
-    Ok(payload)
+    Ok(ControlRequest {
+        operation: header[5],
+        payload,
+    })
 }
 
 fn read_control_request(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
-    read_control_request_payload(stream)
+    let request = read_control_request_payload(stream)?;
+    require_inject_operation(request)
+}
+
+fn require_inject_operation(request: ControlRequest) -> Result<Vec<u8>, String> {
+    if request.operation != CONTROL_OP_INJECT {
+        return Err("headless_resume_requires_resident_owner".to_string());
+    }
+    Ok(request.payload)
 }
 
 fn read_control_request_header(stream: &mut UnixStream) -> Result<[u8; 12], String> {
@@ -2251,7 +2298,7 @@ fn validate_control_request_header(header: &[u8; 12]) -> Result<(), String> {
     if header[4] != CONTROL_VERSION {
         return Err("bad_version".to_string());
     }
-    if header[5] != CONTROL_OP_INJECT {
+    if !matches!(header[5], CONTROL_OP_INJECT | CONTROL_OP_HEADLESS_RESUME) {
         return Err("bad_op".to_string());
     }
     if header[6] != 0 || header[7] != 0 {
@@ -3293,6 +3340,60 @@ print(json.dumps({
             read_control_request(&mut big_server).unwrap_err(),
             "oversize_frame"
         );
+    }
+
+    #[test]
+    fn live_control_operations_keep_pty_inject_and_headless_resume_distinct() {
+        let (mut inject_client, mut inject_server) = UnixStream::pair().unwrap();
+        write_control_frame(&mut inject_client, CONTROL_OP_INJECT, b"interactive").unwrap();
+        assert_eq!(
+            read_control_request(&mut inject_server).unwrap(),
+            b"interactive"
+        );
+
+        let (mut headless_client, mut headless_server) = UnixStream::pair().unwrap();
+        write_control_frame(
+            &mut headless_client,
+            CONTROL_OP_HEADLESS_RESUME,
+            br#"{"session_id":"session-a"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_control_request(&mut headless_server).unwrap_err(),
+            "headless_resume_requires_resident_owner"
+        );
+    }
+
+    #[test]
+    fn broker_rejects_headless_resume_without_queueing_child_input() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_control_frame(
+            &mut client,
+            CONTROL_OP_HEADLESS_RESUME,
+            br#"{"session_id":"session-a"}"#,
+        )
+        .unwrap();
+        let (master, _peer) = socketpair_files();
+        let mut state = InputLineState::default();
+        let mut output_state = ChildOutputState::default();
+        let mut pending = PendingChildInput::new();
+
+        let result = {
+            let mut request_io = ControlRequestIo {
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut state,
+                child_output_state: &mut output_state,
+                pending_child_input: &mut pending,
+            };
+            process_control_request_with_pending(&mut server, &mut request_io, None)
+        };
+
+        assert_eq!(
+            result,
+            Err("headless_resume_requires_resident_owner".to_string())
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]

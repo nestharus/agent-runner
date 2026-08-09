@@ -139,6 +139,7 @@ mod returned_artifacts_read;
 mod returned_artifacts_write;
 mod schema_types;
 mod session_capture;
+mod session_lifecycle;
 mod session_markers;
 mod session_turns_ingest;
 mod session_turns_query;
@@ -193,6 +194,14 @@ use self::schema_types::{
     ColumnRepair, DropColumnRepair, InvocationDualIdProjection, InvocationsSchemaShape,
     ProviderSessionProjection, ProvidersSchemaShape,
 };
+pub use self::session_lifecycle::{
+    AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
+    DeliveryEvidenceKind, DispositionWrite, EventDisposition, ExactProcessIdentity,
+    ExternalIngress, ExternalIngressWrite, LeaseAcquire, LeaseReplace, LifecycleEvent,
+    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError, SessionLifecycleRepository,
+    SessionLifecycleResult, SessionReconstruction, SupervisorFence, SupervisorLease, TurnFence,
+    TurnState,
+};
 pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]
 pub use self::session_turns_ingest::SessionTurnRecord;
@@ -219,6 +228,7 @@ pub struct StateDb {
     conn: sqlite::Connection,
     db_path: PathBuf,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
+    _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
 }
 
 #[derive(Debug, Clone)]

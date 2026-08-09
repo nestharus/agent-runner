@@ -238,8 +238,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
 
     assert_eq!(
         plan_target_versions(&plan),
-        vec![5, 6, 7, 8, 9, CURRENT_SCHEMA_VERSION],
-        "schema-4 DBs must take the AGE-54 schema-5, AGE-58 schema-6, AGE-123 schema-7, PP-002 schema-8, AGE-163 schema-9, and imported-session metadata schema-10 migrations"
+        vec![5, 6, 7, 8, 9, 10, 11, CURRENT_SCHEMA_VERSION],
+        "schema-4 DBs must take every ordered migration through session ingress evidence schema 12"
     );
     assert_eq!(
         plan_ids(&plan),
@@ -250,6 +250,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0008_owned_turn_events",
             "0009_age163_working_set_and_round_robin",
             "0010_imported_session_display_metadata",
+            "0011_durable_session_lifecycle",
+            "0012_session_ingress_evidence",
         ]
     );
 }

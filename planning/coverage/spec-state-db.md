@@ -5,6 +5,7 @@
 - `crates/oulipoly-core/src/lib.rs`
 - `crates/oulipoly-state/build.rs`
 - `crates/oulipoly-state/src/db.rs`
+- `crates/oulipoly-state/src/db/session_lifecycle.rs`
 - `crates/oulipoly-state/src/db/invocation_records.rs`
 - `crates/oulipoly-state/src/db/resume_lookup.rs`
 - `crates/oulipoly-state/src/db/resume_resolution.rs`
@@ -12,6 +13,8 @@
 - `crates/oulipoly-state/src/db/owned_turn_event.rs`
 - `crates/oulipoly-state/src/lib.rs`
 - `crates/oulipoly-state/src/lifecycle_log.rs`
+- `crates/oulipoly-state/src/mailbox.rs`
+- `crates/oulipoly-state/migrations/0012_session_ingress_evidence.sql`
 - `crates/oulipoly-state/src/migrations.rs`
 - `crates/oulipoly-state/src/repositories/mod.rs`
 - `crates/oulipoly-state/src/schema.rs`
@@ -69,6 +72,8 @@
 | Existing DB at a known-incompatible past version (no migration path). | Open fails with `MigrationUnsupported`; advise the operator to reset or restore. |
 | Concurrent reader during writer migration. | SQLite WAL + retry handles short waits; long contention surfaces as `DbBusy`. |
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
+| A resident owner accepts one immutable mailbox row. | One transaction verifies the exact supervisor lease, persists ingress, records `accepted_pending`, and advances only that session's cursor. |
+| PTY transport or manual acknowledgement evidence arrives. | Store its explicit evidence kind under the exact delivery/session/generation fence without advancing provider `submitted` or `confirmed`. |
 | A caller lists direct logical invocation children. | `list_invocation_children` returns only direct children in deterministic chronological `created_at, id` order; consumer-specific projections may reorder their already-loaded copy without changing this history contract. |
 
 ## Edge cases

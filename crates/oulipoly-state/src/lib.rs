@@ -36,6 +36,7 @@ pub mod mailbox;
 pub mod migrations;
 pub mod paths;
 pub mod pid_identity;
+mod read_only_snapshot;
 pub mod repositories;
 pub mod result_envelope;
 pub mod schema;
@@ -53,6 +54,14 @@ pub use db::SessionTurnCounts;
 pub use db::SessionTurnIngest;
 pub use db::StateDb;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
+pub use db::{
+    AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
+    DeliveryEvidenceKind, DispositionWrite, EventDisposition, ExactProcessIdentity,
+    ExternalIngress, ExternalIngressWrite, LeaseAcquire, LeaseReplace, LifecycleEvent,
+    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError, SessionLifecycleRepository,
+    SessionLifecycleResult, SessionReconstruction, SupervisorFence, SupervisorLease, TurnFence,
+    TurnState,
+};
 pub use db::{
     ActiveChainSegmentSnapshot, ChainSegmentRotationInput, QuotaRecord, QuotaWindow,
     QuotaWindowInput,

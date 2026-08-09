@@ -1,4 +1,5 @@
 pub mod balancer;
+pub mod delivery_evidence;
 pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
@@ -16,10 +17,12 @@ pub mod rotation_journal;
 pub mod services;
 pub mod session_export;
 pub mod session_external_provider;
+pub mod session_ingress;
 pub mod session_lock;
 pub mod session_metadata;
 pub mod session_provider;
 pub mod session_replace;
+pub mod session_supervisor;
 pub mod sessions;
 pub mod trace;
 
