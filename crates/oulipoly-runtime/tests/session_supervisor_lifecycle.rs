@@ -737,6 +737,36 @@ fn active_and_queued_cancellation_drain_close_and_expiry_have_exact_terminal_out
 }
 
 #[test]
+fn cancelling_the_last_active_turn_while_draining_stops_the_released_owner() {
+    let started = start(SupervisorConfig::default());
+    started
+        .supervisor
+        .notify(notification("session-a", 1, [1]), 10)
+        .unwrap();
+    let active = started.turns.recv().unwrap();
+
+    started.supervisor.drain(11).unwrap();
+    started.supervisor.cancel(1, 12).unwrap();
+
+    assert!(matches!(
+        started.results.recv().unwrap().outcome,
+        TurnOutcome::Cancelled
+    ));
+    assert!(matches!(
+        started.supervisor.status(),
+        Err(SupervisorError::Closed)
+    ));
+    assert!(active.completion.complete("stale", 13).is_err());
+    assert_eq!(
+        StateDb::open(&started.path)
+            .unwrap()
+            .supervisor_lease("session-a")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn retry_and_generation_exhaustion_are_distinct_and_stale_commands_cannot_finalize_a_turn() {
     let retry_exhausted = start(SupervisorConfig::default());
     retry_exhausted

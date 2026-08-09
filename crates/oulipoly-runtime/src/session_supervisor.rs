@@ -768,8 +768,9 @@ fn run_owner<Input, Output>(
             }
             SupervisorCommand::Resume { at, reply } => {
                 let result = state.resume(at, command_tx);
+                let keep_running = !state.terminal;
                 let _ = reply.send(result);
-                true
+                keep_running
             }
             SupervisorCommand::Cancel {
                 sequence,
@@ -777,8 +778,9 @@ fn run_owner<Input, Output>(
                 reply,
             } => {
                 let result = state.cancel(sequence, at, command_tx);
+                let keep_running = !state.terminal;
                 let _ = reply.send(result);
-                true
+                keep_running
             }
             SupervisorCommand::Drain { at, reply } => {
                 let result = state.drain(at, command_tx);
@@ -790,8 +792,9 @@ fn run_owner<Input, Output>(
                 state.turns = turns;
                 state.child_adapter_connected = true;
                 let result = state.start_next(at, command_tx);
+                let keep_running = !state.terminal;
                 let _ = reply.send(result);
-                true
+                keep_running
             }
             SupervisorCommand::ReconstructedExit {
                 fence,
@@ -800,8 +803,9 @@ fn run_owner<Input, Output>(
                 reply,
             } => {
                 let result = state.reconstructed_exit(&fence, at, &reason, command_tx);
+                let keep_running = !state.terminal;
                 let _ = reply.send(result);
-                true
+                keep_running
             }
             SupervisorCommand::Expire { at, reply } => {
                 let result = state.terminate(TerminalReason::Expired, at);
