@@ -285,6 +285,7 @@ pub fn is_incomplete_tool_boundary(
     end_count: SessionTurnCounts,
     post_scan_failed: bool,
     current: Option<&AssistantCompletionRecord>,
+    latest_tool_boundary: Option<&AssistantCompletionRecord>,
 ) -> bool {
     if post_scan_failed {
         return false;
@@ -292,16 +293,24 @@ pub fn is_incomplete_tool_boundary(
     let Ok(delta) = validate_turn_delta(baseline, end_count) else {
         return false;
     };
-    let (Some(baseline_completion), Some(current)) =
-        (baseline.baseline_assistant_completion.as_ref(), current)
-    else {
+    let (Some(baseline_completion), Some(current), Some(latest_tool_boundary)) = (
+        baseline.baseline_assistant_completion.as_ref(),
+        current,
+        latest_tool_boundary,
+    ) else {
         return false;
     };
     delta.new_assistant_turns > 0
         && baseline_completion.session_id == delta.provider_session_id
         && current.session_id == delta.provider_session_id
+        && latest_tool_boundary.session_id == delta.provider_session_id
         && assistant_completion_cursor_is_newer(current, baseline_completion)
-        && current.completion_outcome.as_deref() == Some("tool-calls")
+        && assistant_completion_cursor_is_newer(latest_tool_boundary, baseline_completion)
+        && current.timestamp >= latest_tool_boundary.timestamp
+        && matches!(
+            current.completion_outcome.as_deref(),
+            None | Some("tool-calls")
+        )
 }
 
 struct ValidatedAcceptedProviderTurn<'a> {
@@ -572,11 +581,13 @@ mod tests {
             counts(4),
             false,
             Some(&current),
+            Some(&current),
         ));
         assert!(!is_incomplete_tool_boundary(
             &completion_baseline(),
             counts(4),
             true,
+            Some(&current),
             Some(&current),
         ));
         assert!(!is_incomplete_tool_boundary(
@@ -584,6 +595,41 @@ mod tests {
             counts(3),
             false,
             Some(&current),
+            Some(&current),
+        ));
+    }
+
+    #[test]
+    fn outcome_less_assistant_preserves_new_tool_boundary_evidence() {
+        let tool_boundary = completion(
+            "session-1",
+            "turn-4",
+            "2026-04-17T08:00:01Z",
+            Some("tool-calls"),
+        );
+        let outcome_less = completion("session-1", "turn-5", "2026-04-17T08:00:02Z", None);
+        let stop = completion("session-1", "turn-5", "2026-04-17T08:00:02Z", Some("stop"));
+
+        assert!(is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(5),
+            false,
+            Some(&outcome_less),
+            Some(&tool_boundary),
+        ));
+        assert!(!is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(5),
+            false,
+            Some(&stop),
+            Some(&tool_boundary),
+        ));
+        assert!(!is_incomplete_tool_boundary(
+            &completion_baseline(),
+            counts(5),
+            false,
+            Some(&outcome_less),
+            None,
         ));
     }
 
