@@ -61,8 +61,8 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
         "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
     );
     assert!(
-        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 10;"),
-        "schema version must include the imported-session metadata migration baseline"
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 11;"),
+        "schema version must include the durable session lifecycle migration"
     );
     assert!(
         !lib_source().contains("pub mod lifecycle_log"),
@@ -103,6 +103,7 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
             "0008_owned_turn_events.sql",
             "0009_age163_working_set_and_round_robin.sql",
             "0010_imported_session_display_metadata.sql",
+            "0011_durable_session_lifecycle.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

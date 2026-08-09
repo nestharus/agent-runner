@@ -55,6 +55,13 @@ pub use db::SessionTurnIngest;
 pub use db::StateDb;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 pub use db::{
+    AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DispositionWrite,
+    EventDisposition, ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace,
+    LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError,
+    SessionLifecycleRepository, SessionLifecycleResult, SessionReconstruction, SupervisorFence,
+    SupervisorLease, TurnFence, TurnState,
+};
+pub use db::{
     ActiveChainSegmentSnapshot, ChainSegmentRotationInput, QuotaRecord, QuotaWindow,
     QuotaWindowInput,
 };
