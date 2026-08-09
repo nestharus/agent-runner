@@ -302,6 +302,7 @@ impl From<SessionLifecycleError> for SupervisorStartError {
 #[derive(Debug)]
 pub struct TurnCompletion<Input, Output> {
     fence: TurnFence,
+    issued_at: i64,
     commands: Option<Sender<SupervisorCommand<Input, Output>>>,
 }
 
@@ -353,7 +354,7 @@ impl<Input, Output> Drop for TurnCompletion<Input, Output> {
         let _ = commands.send(SupervisorCommand::ChildExited {
             fence: self.fence.clone(),
             exit: ChildExit::Failed(ChildFailure::CompletionDropped),
-            completed_at: 0,
+            completed_at: self.issued_at,
             reply,
         });
     }
@@ -932,6 +933,7 @@ where
                 },
                 completion: TurnCompletion {
                     fence: fence.clone(),
+                    issued_at: at,
                     commands: Some(command_tx.clone()),
                 },
             };
