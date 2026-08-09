@@ -37,6 +37,8 @@ const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, 
     payload_file_path, payload_sha256, payload_byte_len,
     payload_retention_policy, payload_compacted_at,
     submission_token, target_kind, target_id";
+// Reserves ?1 for the session ID and ?2 for the optional chain ID;
+// embedding queries must number additional parameters from ?3.
 const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     (target_kind IS NULL AND session_id = ?1)
     OR (target_kind = 'session' AND target_id = ?1)
