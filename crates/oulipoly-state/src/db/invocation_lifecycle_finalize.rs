@@ -195,10 +195,9 @@ impl StateDb {
         terminal_reason: Option<&str>,
         finished_at: &str,
     ) -> Result<FinalizeInvocationRow, String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(Self::format_begin_transaction_error)?;
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(Self::format_begin_transaction_error)?;
 
         let invocation = Self::load_invocation_for_finalize(&tx, id)?;
         Self::validate_invocation_is_running(id, &invocation.status)?;

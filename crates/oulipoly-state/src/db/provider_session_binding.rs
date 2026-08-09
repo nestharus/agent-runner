@@ -77,10 +77,9 @@ impl StateDb {
         invocation_row_id: i64,
         binding: &ProviderSessionBinding,
     ) -> Result<(), String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(Self::format_provider_session_binding_begin_error)?;
+        let tx =
+            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
+                .map_err(Self::format_provider_session_binding_begin_error)?;
 
         let existing = Self::load_existing_provider_session_binding(&tx, invocation_row_id)?;
         Self::validate_provider_session_rebind(invocation_row_id, binding, existing.as_deref())?;

@@ -24,7 +24,8 @@ pub(super) use rusqlite::OptionalExtension as RusqliteOptionalExtension;
 pub(super) use rusqlite::ffi;
 pub(super) use rusqlite::params;
 pub(super) use rusqlite::{
-    Connection, Error, OpenFlags, Result, Row, Statement, Transaction, types::Type,
+    Connection, Error, OpenFlags, Result, Row, Statement, Transaction, TransactionBehavior,
+    types::Type,
 };
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};

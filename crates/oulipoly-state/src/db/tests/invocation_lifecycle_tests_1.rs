@@ -262,3 +262,58 @@ fn start_invocation_rejects_duplicate_uuid() {
     let err = db.start_invocation(&start).unwrap_err();
     assert!(err.contains("invocation"));
 }
+
+fn assert_operation_waits_for_competing_writer(
+    operation: impl FnOnce(StateDb, i64) -> Result<(), String> + Send + 'static,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let db = StateDb::open(&path).unwrap();
+    let id = seed_running_invocation(&db);
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let operation_start = start.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        operation_start.wait();
+        result_tx.send(operation(db, id)).unwrap();
+    });
+    start.wait();
+
+    match result_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(err) => panic!("operation result channel failed: {err}"),
+        Ok(result) => panic!("operation completed before the writer released its lock: {result:?}"),
+    }
+
+    writer.execute_batch("COMMIT;").unwrap();
+    result_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn provider_session_binding_waits_for_competing_writer() {
+    assert_operation_waits_for_competing_writer(|db, id| {
+        db.bind_invocation_provider_session_start(
+            id,
+            &ProviderSessionBinding {
+                provider_session_id: Uuid::new_v4().to_string(),
+                capture_method: "provider_live_report",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+    });
+}
+
+#[test]
+fn invocation_finalization_waits_for_competing_writer() {
+    assert_operation_waits_for_competing_writer(|db, id| {
+        db.finalize_invocation(id, true, 0, None, Some("completed"))
+    });
+}
