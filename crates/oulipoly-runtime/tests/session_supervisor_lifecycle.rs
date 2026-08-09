@@ -15,6 +15,7 @@ use oulipoly_state::{
     NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleRepository, SessionLifecycleResult,
     SessionReconstruction, StateDb, SupervisorFence, SupervisorLease, TurnFence, TurnState,
 };
+use proc_macro2::{TokenStream, TokenTree};
 
 type FakeTurn = TurnRequest<&'static str, &'static str>;
 
@@ -1136,22 +1137,34 @@ fn replacement_generation_exhaustion_fails_before_starting_an_owner() {
 
 #[test]
 fn resident_owner_source_has_no_poll_scan_sweep_sleep_or_timer_coordination() {
-    let source = include_str!("../src/session_supervisor.rs");
-    for forbidden in [
-        "recv_timeout",
-        "try_recv",
-        "thread::sleep",
-        "std::thread::sleep",
-        "Instant::",
-        "Duration::",
-        "outbox",
-        "scan_sessions",
-        "sweep",
-        "maintenance_driver",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "resident coordination must not contain {forbidden}"
-        );
+    fn assert_allowed_identifiers(tokens: TokenStream) {
+        for token in tokens {
+            match token {
+                TokenTree::Group(group) => assert_allowed_identifiers(group.stream()),
+                TokenTree::Ident(ident) => {
+                    let ident = ident.to_string();
+                    let forbidden = ident == "recv_deadline"
+                        || ident.starts_with("recv_timeout")
+                        || matches!(
+                            ident.as_str(),
+                            "try_recv"
+                                | "sleep"
+                                | "sleep_until"
+                                | "park_timeout"
+                                | "Instant"
+                                | "Duration"
+                                | "scan_sessions"
+                                | "maintenance_driver"
+                        )
+                        || ident.contains("outbox")
+                        || ident.starts_with("sweep");
+                    assert!(!forbidden, "resident coordination must not contain {ident}");
+                }
+                _ => {}
+            }
+        }
     }
+
+    let source = include_str!("../src/session_supervisor.rs");
+    assert_allowed_identifiers(source.parse().expect("supervisor source must tokenize"));
 }
