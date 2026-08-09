@@ -479,11 +479,27 @@ fn simultaneous_stale_owner_replacements_converge_on_one_resident_owner() {
             )
         })
     };
-    let first = spawn(owner(2, "candidate-a"));
-    let second = spawn(owner(2, "candidate-b"));
+    let candidate_a = SupervisorFence {
+        process: process(301, "candidate-a"),
+        ..owner(2, "candidate-a")
+    };
+    let candidate_b = SupervisorFence {
+        process: process(302, "candidate-b"),
+        ..owner(2, "candidate-b")
+    };
+    let first = spawn(candidate_a.clone());
+    let second = spawn(candidate_b.clone());
     let results = [first.join().unwrap(), second.join().unwrap()];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+
+    let stored = StateDb::open(&path)
+        .unwrap()
+        .supervisor_lease("session-a")
+        .unwrap();
+    let winner = stored.expect("winning owner must hold the lease").fence;
+    assert!(winner == candidate_a || winner == candidate_b);
     for (supervisor, _results) in results.into_iter().flatten() {
+        assert_eq!(supervisor.status().unwrap().fence, winner);
         supervisor.close(3).unwrap();
     }
 }
