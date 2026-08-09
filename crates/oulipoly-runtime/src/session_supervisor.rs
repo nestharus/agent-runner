@@ -408,13 +408,15 @@ where
         let mut startup_events = reconstruction.undisposed_events.clone();
         let active = reconcile_reconstructed_turn(
             repository.as_mut(),
-            &session_id,
-            &fence,
             process_observer.as_ref(),
             reconstruction.active_turn.take(),
             acquired_at,
             &mut startup_events,
-        )?;
+        )
+        .map_err(|error| {
+            let _ = repository.release_supervisor_lease(&session_id, &fence);
+            error
+        })?;
 
         let (command_tx, command_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
@@ -1372,11 +1374,8 @@ fn acquire_or_replace(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn reconcile_reconstructed_turn<Input>(
     repository: &mut dyn SessionLifecycleRepository,
-    session_id: &str,
-    owner_fence: &SupervisorFence,
     observer: &dyn ProcessObserver,
     active_turn: Option<ProviderTurnGeneration>,
     at: i64,
@@ -1388,7 +1387,6 @@ fn reconcile_reconstructed_turn<Input>(
     match observer.observe(&turn.child) {
         ProcessObservation::ExactLive => Ok(Some(ActiveTurn { turn, work: None })),
         ProcessObservation::Unknown(error) => {
-            let _ = repository.release_supervisor_lease(session_id, owner_fence);
             Err(SupervisorStartError::ProcessObservationUnknown(error))
         }
         ProcessObservation::Dead | ProcessObservation::Reused(_) => {

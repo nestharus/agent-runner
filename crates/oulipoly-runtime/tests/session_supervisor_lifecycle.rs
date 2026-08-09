@@ -44,6 +44,7 @@ impl ProcessObserver for FakeProcesses {
 struct RepositoryProbe {
     reconstructed_sessions: Arc<Mutex<Vec<String>>>,
     fail_next_append: Arc<AtomicBool>,
+    fail_next_transition: Arc<AtomicBool>,
     replacement_barrier: Option<Arc<Barrier>>,
 }
 
@@ -142,6 +143,15 @@ impl SessionLifecycleRepository for FakeRepository {
         to: TurnState,
         event: &NewLifecycleEvent,
     ) -> SessionLifecycleResult<LifecycleEvent> {
+        if self
+            .probe
+            .fail_next_transition
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(oulipoly_state::SessionLifecycleError::Conflict(
+                "forced fake transition failure",
+            ));
+        }
         self.inner
             .transition_turn_and_append_event(fence, from, to, event)
     }
@@ -820,6 +830,40 @@ fn reconstructed_live_turn_is_not_relaunched_and_only_its_exact_exit_is_accepted
         .unwrap();
     assert_eq!(supervisor.status().unwrap().active_generation, None);
     supervisor.close(5).unwrap();
+}
+
+#[test]
+fn failed_reconstructed_turn_reconciliation_releases_the_supervisor_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let owner_fence = owner(1, "failed-reconciliation");
+    let active = turn("session-a", 1);
+    let mut seed = StateDb::open(&path).unwrap();
+    seed.acquire_supervisor_lease("session-a", &owner_fence, 1)
+        .unwrap();
+    seed.start_provider_turn(&active).unwrap();
+    drop(seed);
+
+    let probe = RepositoryProbe::default();
+    probe.fail_next_transition.store(true, Ordering::SeqCst);
+    let processes = FakeProcesses::default();
+    processes.set(active.child.pid, ProcessObservation::Dead);
+    let (turn_tx, _turn_rx) = mpsc::channel::<FakeTurn>();
+    let (event_tx, _events) = mpsc::channel();
+    let result = SessionSupervisor::start(
+        "session-a",
+        owner_fence,
+        2,
+        Box::new(FakeRepository::open(&path, probe)),
+        Arc::new(processes),
+        SupervisorConfig::default(),
+        turn_tx,
+        event_tx,
+    );
+
+    assert!(matches!(result, Err(SupervisorStartError::Repository(_))));
+    let db = StateDb::open(&path).unwrap();
+    assert_eq!(db.supervisor_lease("session-a").unwrap(), None);
 }
 
 #[test]
