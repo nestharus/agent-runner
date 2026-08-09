@@ -1026,17 +1026,17 @@ where
                 )?;
                 if work.attempts <= self.config.max_retries {
                     if work.notification.turns.is_empty() {
-                        self.publish_result(
-                            &active.turn,
-                            &work,
-                            TurnOutcome::GenerationExhausted(reason.clone()),
-                        );
                         self.append_and_publish(
                             "supervisor_generation_exhausted",
                             &active.turn.generation_id,
                             &reason,
                             at,
                         )?;
+                        self.publish_result(
+                            &active.turn,
+                            &work,
+                            TurnOutcome::GenerationExhausted(reason.clone()),
+                        );
                     } else {
                         self.publish_result(
                             &active.turn,
@@ -1046,17 +1046,17 @@ where
                         self.queued.push_front(work);
                     }
                 } else {
-                    self.publish_result(
-                        &active.turn,
-                        &work,
-                        TurnOutcome::RetryExhausted(reason.clone()),
-                    );
                     self.append_and_publish(
                         "supervisor_retry_exhausted",
                         &active.turn.generation_id,
                         &reason,
                         at,
                     )?;
+                    self.publish_result(
+                        &active.turn,
+                        &work,
+                        TurnOutcome::RetryExhausted(reason.clone()),
+                    );
                 }
             }
         }
