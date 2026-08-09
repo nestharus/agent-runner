@@ -92,11 +92,7 @@ fn attempt_pty_mailbox_delivery_inner(
     let control_path = authority.control_path;
     let delivery_invocation_uuid = authority.delivery_invocation_uuid;
     let turn_generation_id = authority.turn_generation_id;
-    if let Err(err) = acknowledge_injected_pty_delivery_attempts(
-        mailbox,
-        session_id,
-        turn_generation_id.as_deref(),
-    ) {
+    if let Err(err) = acknowledge_injected_pty_delivery_attempts(mailbox, session_id) {
         tracing::warn!(
             session_id,
             "Failed to acknowledge injected PTY delivery: {err}"
@@ -623,12 +619,32 @@ fn pty_status_implies_submit(status: &str) -> bool {
 fn acknowledge_injected_pty_delivery_attempts(
     mailbox: &mut MailboxDb,
     session_id: &str,
-    turn_generation_id: Option<&str>,
 ) -> Result<(), String> {
-    for window in mailbox.accepted_delivery_attempt_windows(session_id)? {
-        if let Some(turn_generation_id) = turn_generation_id {
-            record_pty_transport_evidence(&window.attempt_id, session_id, turn_generation_id)?;
+    let windows = mailbox.accepted_delivery_attempt_windows(session_id)?;
+    if windows.is_empty() {
+        return Ok(());
+    }
+    let generations = mailbox
+        .runtime_generation_history(session_id)
+        .map_err(|error| error.to_string())?;
+    for window in windows {
+        let mut matches = generations.iter().filter(|generation| {
+            generation.spawn_invocation_uuid == window.delivery_invocation_uuid
+        });
+        let generation = matches.next().ok_or_else(|| {
+            format!(
+                "Cannot resolve runtime generation for accepted PTY delivery attempt {}",
+                window.attempt_id
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "Multiple runtime generations match accepted PTY delivery attempt {}",
+                window.attempt_id
+            ));
         }
+        let generation_id = generation.generation_id.to_string();
+        record_pty_transport_evidence(&window.attempt_id, session_id, &generation_id)?;
         mailbox.confirm_delivery_attempt(&window.attempt_id)?;
     }
     Ok(())
