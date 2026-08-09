@@ -180,7 +180,8 @@ impl StateDb {
         invocation_row_id: i64,
         binding: &ProviderSessionBinding,
     ) -> Result<(), String> {
-        conn.execute(
+        let updated = conn
+            .execute(
             "UPDATE invocations
              SET provider_session_id = ?1,
                  provider_session_capture_method = ?2,
@@ -194,7 +195,8 @@ impl StateDb {
                      ELSE ?1
                  END,
                  session_capture_method = ?2
-             WHERE id = ?5",
+             WHERE id = ?5
+               AND status = 'running'",
             sqlite::params![
                 &binding.provider_session_id,
                 binding.capture_method,
@@ -202,9 +204,15 @@ impl StateDb {
                 binding.resume_input_id.as_deref(),
                 invocation_row_id
             ],
-        )
-        .map_err(|e| Self::format_provider_session_binding_write_error(invocation_row_id, e))?;
-        Ok(())
+            )
+            .map_err(|e| Self::format_provider_session_binding_write_error(invocation_row_id, e))?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Invocation {invocation_row_id} is no longer running; refusing provider session binding"
+            ))
+        }
     }
 
     fn format_provider_session_binding_write_error(
@@ -212,6 +220,44 @@ impl StateDb {
         e: sqlite::Error,
     ) -> String {
         format!("Failed to bind provider session for invocation {invocation_row_id}: {e}")
+    }
+
+    pub fn transition_invocation_provider_session_capture_method(
+        &self,
+        invocation_row_id: i64,
+        provider_session_id: &str,
+        expected_method: &str,
+        next_method: &str,
+    ) -> Result<(), String> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE invocations
+                 SET provider_session_capture_method = ?1,
+                     session_capture_method = ?1
+                 WHERE id = ?2
+                   AND status = 'running'
+                   AND provider_session_id = ?3
+                   AND provider_session_capture_method = ?4",
+                sqlite::params![
+                    next_method,
+                    invocation_row_id,
+                    provider_session_id,
+                    expected_method
+                ],
+            )
+            .map_err(|err| {
+                format!(
+                    "Failed to transition provider session capture method for invocation {invocation_row_id}: {err}"
+                )
+            })?;
+        if updated == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Invocation {invocation_row_id} is not a running {expected_method} binding for provider session {provider_session_id}"
+            ))
+        }
     }
 
     fn provider_session_binding_should_mint_chain(binding: &ProviderSessionBinding) -> bool {

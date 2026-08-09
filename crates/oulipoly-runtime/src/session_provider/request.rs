@@ -109,6 +109,18 @@ pub(super) fn capture_extra(invocation_uuid: &str) -> JsonObject {
     extra
 }
 
+pub(super) fn live_capture_extra(invocation_uuid: &str, provider_session_id: &str) -> JsonObject {
+    let mut extra = capture_extra(invocation_uuid);
+    extra.insert(
+        "live_report".to_string(),
+        serde_json::json!({
+            "provider_session_id": provider_session_id,
+            "invocation_uuid": invocation_uuid,
+        }),
+    );
+    extra
+}
+
 pub(super) fn user_observation_extra() -> JsonObject {
     let mut extra = JsonObject::new();
     extra.insert(

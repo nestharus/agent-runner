@@ -611,6 +611,25 @@ pub struct SessionBaseParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionLiveReport {
+    pub provider_session_id: String,
+    pub invocation_uuid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionCaptureParams {
+    pub settings_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_report: Option<SessionLiveReport>,
+    #[serde(flatten)]
+    pub extra: JsonObject,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionLocateTranscriptResult {
     pub located: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1087,7 +1106,7 @@ pub type SessionLocateTranscriptErrorResponse = ErrorResponseEnvelope;
 pub type SessionReadTurnsRequest = RequestEnvelope<SessionBaseParams>;
 pub type SessionReadTurnsResponse = SuccessResponseEnvelope<SessionReadTurnsResult>;
 pub type SessionReadTurnsErrorResponse = ErrorResponseEnvelope;
-pub type SessionCaptureRequest = RequestEnvelope<SessionBaseParams>;
+pub type SessionCaptureRequest = RequestEnvelope<SessionCaptureParams>;
 pub type SessionCaptureResponse = SuccessResponseEnvelope<SessionCaptureResult>;
 pub type SessionCaptureErrorResponse = ErrorResponseEnvelope;
 pub type SessionExportRequest = RequestEnvelope<SessionBaseParams>;

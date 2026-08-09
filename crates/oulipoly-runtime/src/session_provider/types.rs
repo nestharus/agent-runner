@@ -54,6 +54,15 @@ pub struct SessionProviderCaptureRequest<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub struct SessionProviderLiveCaptureRequest<'a> {
+    pub registry: &'a ProviderRegistry,
+    pub identity: SessionProviderIdentity,
+    pub invocation_uuid: &'a str,
+    pub provider_session_id: &'a str,
+    pub effective_cwd: Option<&'a Path>,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionProviderEnumerateRequest<'a> {
     pub registry: &'a ProviderRegistry,
     pub identity: SessionProviderIdentity,

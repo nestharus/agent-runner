@@ -18,7 +18,7 @@ mod turns;
 mod types;
 
 pub use dispatch::{
-    capture, capture_for_lifecycle, enumerate_sessions, locate_transcript,
+    capture, capture_for_lifecycle, capture_live_report, enumerate_sessions, locate_transcript,
     locate_transcript_with_raw_metadata, read_turns, read_turns_for_lifecycle,
     read_user_turn_observations,
 };
@@ -28,7 +28,7 @@ pub use types::{
     NoRefProofOutput, NoRefProofRequest, S7A_NEUTRAL_SETTINGS_ID, SessionProviderCaptureRequest,
     SessionProviderCaptureResult, SessionProviderEnumerateEntry, SessionProviderEnumerateRequest,
     SessionProviderEnumerateResult, SessionProviderEnumerateSource, SessionProviderError,
-    SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLocateRequest,
-    SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest,
-    SessionProviderReadTurnsResult, SessionProviderTurn,
+    SessionProviderIdentity, SessionProviderLifecycleContext, SessionProviderLiveCaptureRequest,
+    SessionProviderLocateRequest, SessionProviderLocatedTranscript,
+    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult, SessionProviderTurn,
 };

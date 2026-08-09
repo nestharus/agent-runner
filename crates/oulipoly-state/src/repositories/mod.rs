@@ -645,6 +645,9 @@ pub trait StateDbOpener {
     fn open_default(&self) -> Result<StateDb, String>;
     fn open_at(&self, path: &Path) -> Result<StateDb, String>;
     fn open_in_memory(&self) -> StateDb;
+    fn default_path(&self) -> Result<Option<PathBuf>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -742,5 +745,15 @@ impl StateDbOpener for ProductionStateDbOpenerState {
 
     fn open_in_memory(&self) -> StateDb {
         StateDb::open(Path::new(":memory:")).expect("in-memory StateDb must open")
+    }
+
+    fn default_path(&self) -> Result<Option<PathBuf>, String> {
+        if let Some(opener) = DEPLOYMENT_AWARE_OPENER
+            .with(|slot| slot.borrow().as_ref().map(|slot| slot.opener.clone()))
+        {
+            opener.default_path().map(Some).map_err(String::from)
+        } else {
+            StateDb::default_path().map(Some)
+        }
     }
 }

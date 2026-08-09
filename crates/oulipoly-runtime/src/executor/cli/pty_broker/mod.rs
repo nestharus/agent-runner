@@ -11,6 +11,7 @@
 //! helpers decode control frames, and mapper/filter helpers project low-level
 //! protocol values into runner records.
 
+use super::live_session_binding::LiveSessionBindingServer;
 use super::spawn_identity::{
     SpawnIdentityContext, mark_runtime_generation_exited,
     mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
@@ -34,7 +35,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod cancel;
@@ -220,11 +221,15 @@ pub(super) fn execute_interactive_child(
     mut cmd: Command,
     provider: &ProviderConfig,
     context: Option<&SpawnIdentityContext>,
+    mut live_session_server: Option<LiveSessionBindingServer>,
 ) -> Result<ExitStatus, String> {
     let real_tty = RealTerminal::open()?;
     let winsize = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
     let pty = PtyPair::open(&winsize, &real_tty.original)?;
-    let mut control = ControlSocket::bind_for(context)?;
+    let live_session_state = live_session_server
+        .as_ref()
+        .map(LiveSessionBindingServer::session_state);
+    let mut control = ControlSocket::bind_for(context, live_session_state.clone())?;
     configure_child_pty(&mut cmd, &pty)?;
     let recorded_context = control.as_ref().and_then(|control| {
         context.map(|context| context.with_pty_control_path(control.path_string()))
@@ -241,13 +246,25 @@ pub(super) fn execute_interactive_child(
     if let Some(control) = control.as_mut() {
         control.mark_child_spawned();
     }
-    if let Err(err) = record_child_identity(child.id(), generation_context) {
+    let generation = match record_child_identity(child.id(), generation_context) {
+        Ok(generation) => generation,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = mark_runtime_generation_exited(generation_context, None);
+            return Err(err);
+        }
+    };
+    if let (Some(server), Some(context), Some(generation)) =
+        (live_session_server.as_mut(), generation_context, generation)
+        && let Err(err) = server.start(context.clone(), generation)
+    {
         let _ = child.kill();
         let _ = child.wait();
         let _ = mark_runtime_generation_exited(generation_context, None);
         return Err(err);
     }
-    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context);
+    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context, live_session_state);
     drop(pty.slave);
 
     let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
@@ -269,12 +286,16 @@ pub(super) fn execute_interactive_child_observed(
     provider: &ProviderConfig,
     context: Option<&SpawnIdentityContext>,
     provider_inspect: Option<&ProviderInspectMonitorContext>,
+    mut live_session_server: Option<LiveSessionBindingServer>,
 ) -> Result<ExitStatus, String> {
     let real_tty = RealTerminal::open()?;
     let full = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
     let child_winsize = tui::top_pane_winsize(&full);
     let pty = PtyPair::open(&child_winsize, &real_tty.original)?;
-    let mut control = ControlSocket::bind_for(context)?;
+    let live_session_state = live_session_server
+        .as_ref()
+        .map(LiveSessionBindingServer::session_state);
+    let mut control = ControlSocket::bind_for(context, live_session_state.clone())?;
     configure_child_pty(&mut cmd, &pty)?;
     let provider_session =
         provider_session_observation_context(provider, context, provider_inspect);
@@ -299,13 +320,25 @@ pub(super) fn execute_interactive_child_observed(
     if let Some(control) = control.as_mut() {
         control.mark_child_spawned();
     }
-    if let Err(err) = record_child_identity(child.id(), generation_context) {
+    let generation = match record_child_identity(child.id(), generation_context) {
+        Ok(generation) => generation,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = mark_runtime_generation_exited(generation_context, None);
+            return Err(err);
+        }
+    };
+    if let (Some(server), Some(context), Some(generation)) =
+        (live_session_server.as_mut(), generation_context, generation)
+        && let Err(err) = server.start(context.clone(), generation)
+    {
         let _ = child.kill();
         let _ = child.wait();
         let _ = mark_runtime_generation_exited(generation_context, None);
         return Err(err);
     }
-    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context);
+    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context, live_session_state);
     drop(pty.slave);
 
     let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
@@ -889,17 +922,42 @@ struct ControlSocket {
     listener: UnixListener,
     path: PathBuf,
     owned_dir: PathBuf,
-    session_id: String,
+    session_id: Arc<Mutex<Option<String>>>,
     invocation_uuid: String,
     child_started_at: Instant,
 }
 
 impl ControlSocket {
-    fn bind_for(context: Option<&SpawnIdentityContext>) -> Result<Option<Self>, String> {
-        let Some((session_id, invocation_uuid)) = control_socket_context(context) else {
+    fn bind_for(
+        context: Option<&SpawnIdentityContext>,
+        live_session_id: Option<Arc<Mutex<Option<String>>>>,
+    ) -> Result<Option<Self>, String> {
+        let Some((session_id, invocation_uuid)) = control_socket_context(context, &live_session_id)
+        else {
             return Ok(None);
         };
-        let (dir, path) = control_socket_location(session_id, invocation_uuid)?;
+        let session_state = match live_session_id {
+            Some(state) => {
+                let mut live = state
+                    .lock()
+                    .map_err(|_| "Live-session state lock was poisoned".to_string())?;
+                if let Some(resolved) = session_id.as_deref() {
+                    if let Some(existing) = live.as_deref()
+                        && existing != resolved
+                    {
+                        return Err(format!(
+                            "Live-session state is already bound to {existing}; refusing {resolved}"
+                        ));
+                    }
+                    *live = Some(resolved.to_string());
+                }
+                drop(live);
+                state
+            }
+            None => Arc::new(Mutex::new(session_id.clone())),
+        };
+        let socket_session_id = session_id.as_deref().unwrap_or("pending");
+        let (dir, path) = control_socket_location(socket_session_id, invocation_uuid)?;
         create_private_dir(&dir)?;
         unlink_stale_or_refuse_active(&path, &dir)?;
         let listener = bind_control_listener(&path)?;
@@ -908,7 +966,7 @@ impl ControlSocket {
             listener,
             path,
             owned_dir: dir,
-            session_id: session_id.to_string(),
+            session_id: session_state,
             invocation_uuid: invocation_uuid.to_string(),
             child_started_at: Instant::now(),
         }))
@@ -922,8 +980,8 @@ impl ControlSocket {
         self.path.to_string_lossy().into_owned()
     }
 
-    fn session_id(&self) -> &str {
-        &self.session_id
+    fn session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|value| value.clone())
     }
 
     fn invocation_uuid(&self) -> &str {
@@ -939,9 +997,19 @@ impl ControlSocket {
     }
 }
 
-fn control_socket_context(context: Option<&SpawnIdentityContext>) -> Option<(&str, &str)> {
+fn control_socket_context<'a>(
+    context: Option<&'a SpawnIdentityContext>,
+    live_session_id: &Option<Arc<Mutex<Option<String>>>>,
+) -> Option<(Option<String>, &'a str)> {
     let context = context?;
-    Some((context.session_id()?, context.invocation_uuid()))
+    let session_id = context
+        .session_id()
+        .map(str::to_string)
+        .or_else(|| live_session_id.as_ref()?.lock().ok()?.clone());
+    if session_id.is_none() && live_session_id.is_none() {
+        return None;
+    }
+    Some((session_id, context.invocation_uuid()))
 }
 
 fn bind_control_listener(path: &Path) -> Result<UnixListener, String> {
@@ -1205,17 +1273,22 @@ struct SessionRuntimeIdleGuard {
     context: Option<SpawnIdentityContext>,
     session_id: Option<String>,
     invocation_uuid: Option<String>,
+    live_session_id: Option<Arc<Mutex<Option<String>>>>,
     exit_code: Option<i32>,
 }
 
 impl SessionRuntimeIdleGuard {
-    fn new(context: Option<&SpawnIdentityContext>) -> Self {
+    fn new(
+        context: Option<&SpawnIdentityContext>,
+        live_session_id: Option<Arc<Mutex<Option<String>>>>,
+    ) -> Self {
         Self {
             context: context.cloned(),
             session_id: context
                 .and_then(SpawnIdentityContext::session_id)
                 .map(str::to_string),
             invocation_uuid: context.map(|context| context.invocation_uuid().to_string()),
+            live_session_id,
             exit_code: None,
         }
     }
@@ -1229,15 +1302,19 @@ impl Drop for SessionRuntimeIdleGuard {
         } else {
             let _ = mark_runtime_generation_exited(self.context.as_ref(), self.exit_code);
         }
-        let (Some(session_id), Some(invocation_uuid)) = (&self.session_id, &self.invocation_uuid)
-        else {
+        let session_id = self.session_id.clone().or_else(|| {
+            self.live_session_id
+                .as_ref()
+                .and_then(|state| state.lock().ok()?.clone())
+        });
+        let (Some(session_id), Some(invocation_uuid)) = (session_id, &self.invocation_uuid) else {
             return;
         };
         if let Some(context) = self.context.as_ref()
             && let Ok(mut db) = context.open_mailbox()
         {
             if db
-                .accepted_delivery_attempt_windows(session_id)
+                .accepted_delivery_attempt_windows(&session_id)
                 .is_ok_and(|windows| {
                     windows.iter().any(|window| {
                         window.delivery_invocation_uuid.as_str() == invocation_uuid.as_str()
@@ -1247,7 +1324,7 @@ impl Drop for SessionRuntimeIdleGuard {
                 return;
             }
             let _ = db.mark_session_idle(SessionRuntimeIdleUpdate {
-                session_id,
+                session_id: &session_id,
                 invocation_uuid,
                 last_exit_code: self.exit_code,
             });
@@ -2070,11 +2147,14 @@ fn handle_control_request(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(format_control_write_timeout_error)?;
-    let response = process_control_request_with_pending(
-        &mut stream,
-        io,
-        Some((control.session_id(), control.invocation_uuid())),
-    );
+    let response = match control.session_id() {
+        Some(session_id) => process_control_request_with_pending(
+            &mut stream,
+            io,
+            Some((session_id.as_str(), control.invocation_uuid())),
+        ),
+        None => Err("awaiting_session_identity".to_string()),
+    };
     let (ack, message) = control_response_parts(response);
     trace_notify_gate_decision(
         control,
@@ -2520,7 +2600,9 @@ fn trace_notify_gate_decision(
          user_input_idle_threshold_ms={} boundary_probe={} mouse_skipped={} quiescent={} \
          last_child_output_ms={} foreground={} decision={} inject_status={} \
          reason={} consumed=unknown",
-        control.session_id(),
+        control
+            .session_id()
+            .unwrap_or_else(|| "<pending>".to_string()),
         control.invocation_uuid(),
         line.input_empty,
         line.at_boundary,

@@ -4,16 +4,16 @@ use super::provider_client::{
     invoke_session, provider_client, session_client, session_enumerate_client,
 };
 use super::request::{
-    base_request, capture_extra, enumerate_request, lifecycle_extra, locate_extra,
-    read_session_id_for_lifecycle, user_observation_extra,
+    base_request, capture_extra, enumerate_request, lifecycle_extra, live_capture_extra,
+    locate_extra, read_session_id_for_lifecycle, user_observation_extra,
 };
 use super::turns;
 use super::types::{
     SessionProviderCaptureRequest, SessionProviderCaptureResult, SessionProviderEnumerateRequest,
     SessionProviderEnumerateResult, SessionProviderError, SessionProviderIdentity,
-    SessionProviderLifecycleContext, SessionProviderLocateRequest,
-    SessionProviderLocatedTranscript, SessionProviderReadTurnsRequest,
-    SessionProviderReadTurnsResult,
+    SessionProviderLifecycleContext, SessionProviderLiveCaptureRequest,
+    SessionProviderLocateRequest, SessionProviderLocatedTranscript,
+    SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
 };
 use crate::session_metadata::LocatedTranscript;
 use oulipoly_provider::client::ProviderClient;
@@ -91,6 +91,18 @@ pub fn capture(
         &request.identity,
         request.effective_cwd,
         capture_extra(request.invocation_uuid),
+    )
+}
+
+pub fn capture_live_report(
+    request: SessionProviderLiveCaptureRequest<'_>,
+) -> Result<SessionProviderCaptureResult, SessionProviderError> {
+    let client = session_client(request.registry, &request.identity)?;
+    capture_with_client(
+        &client,
+        &request.identity,
+        request.effective_cwd,
+        live_capture_extra(request.invocation_uuid, request.provider_session_id),
     )
 }
 
