@@ -414,6 +414,12 @@ fn completion_owner_invocation(
 }
 
 fn resolved_invocation_session_id(record: &InvocationRecord) -> Option<String> {
+    #[cfg(unix)]
+    if record.provider_session_capture_method.as_deref()
+        == Some(oulipoly_runtime::executor::cli::PENDING_LIVE_SESSION_CAPTURE_METHOD)
+    {
+        return None;
+    }
     record
         .provider_session_id
         .clone()

@@ -175,6 +175,18 @@ fn execute_interactive_with_result_and_monitor_context(
         working_dir,
         monitor.state_db_path,
     )?;
+    #[cfg(not(unix))]
+    if monitor.live_session_binding.is_some() {
+        return Err(
+            "live_session_binding_unsupported: live interactive session binding requires Unix"
+                .to_string(),
+        );
+    }
+    if monitor.live_session_binding.is_some() && spawn_identity.is_none() {
+        return Err(
+            "Live-session binding requires a durable interactive spawn identity".to_string(),
+        );
+    }
     #[cfg(unix)]
     let mut live_session_server = monitor
         .live_session_binding

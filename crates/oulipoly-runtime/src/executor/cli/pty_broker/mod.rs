@@ -936,6 +936,26 @@ impl ControlSocket {
         else {
             return Ok(None);
         };
+        let session_state = match live_session_id {
+            Some(state) => {
+                let mut live = state
+                    .lock()
+                    .map_err(|_| "Live-session state lock was poisoned".to_string())?;
+                if let Some(resolved) = session_id.as_deref() {
+                    if let Some(existing) = live.as_deref()
+                        && existing != resolved
+                    {
+                        return Err(format!(
+                            "Live-session state is already bound to {existing}; refusing {resolved}"
+                        ));
+                    }
+                    *live = Some(resolved.to_string());
+                }
+                drop(live);
+                state
+            }
+            None => Arc::new(Mutex::new(session_id.clone())),
+        };
         let socket_session_id = session_id.as_deref().unwrap_or("pending");
         let (dir, path) = control_socket_location(socket_session_id, invocation_uuid)?;
         create_private_dir(&dir)?;
@@ -946,7 +966,7 @@ impl ControlSocket {
             listener,
             path,
             owned_dir: dir,
-            session_id: live_session_id.unwrap_or_else(|| Arc::new(Mutex::new(session_id))),
+            session_id: session_state,
             invocation_uuid: invocation_uuid.to_string(),
             child_started_at: Instant::now(),
         }))
@@ -2127,11 +2147,14 @@ fn handle_control_request(
     stream
         .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
         .map_err(format_control_write_timeout_error)?;
-    let session_id = control.session_id();
-    let expected_target = session_id
-        .as_deref()
-        .map(|session_id| (session_id, control.invocation_uuid()));
-    let response = process_control_request_with_pending(&mut stream, io, expected_target);
+    let response = match control.session_id() {
+        Some(session_id) => process_control_request_with_pending(
+            &mut stream,
+            io,
+            Some((session_id.as_str(), control.invocation_uuid())),
+        ),
+        None => Err("awaiting_session_identity".to_string()),
+    };
     let (ack, message) = control_response_parts(response);
     trace_notify_gate_decision(
         control,

@@ -96,6 +96,7 @@ pub use interactive::{
     execute_interactive_with_result_and_model_identity,
 };
 pub(crate) use live_session_binding::InteractiveLiveSessionBinding;
+pub use live_session_binding::PENDING_CAPTURE_METHOD as PENDING_LIVE_SESSION_CAPTURE_METHOD;
 pub use live_session_binding::report_live_session_binding_from_env;
 pub use provider_identity::{provider_name, shell_split};
 pub use request::EffectiveExecuteRequest;

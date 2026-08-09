@@ -20,6 +20,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 const INVOCATION_A: &str = "11111111-1111-4111-8111-111111111111";
 const INVOCATION_B: &str = "22222222-2222-4222-8222-222222222222";
@@ -552,17 +553,28 @@ fn completion_registration_waits_for_live_session_binding() {
     );
     let socket_path = fixture.dir.path().join("live-binding.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let state_path = fixture.state_path();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "runner never connected");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("live-binding fixture accept failed: {err}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut line = String::new();
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .unwrap();
         let report: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(report["invocation_uuid"], INVOCATION_A);
-        assert_eq!(report["provider_session_id"], SESSION_A);
-        assert_eq!(report["token"], "fixture-token");
         StateDb::open(&state_path)
             .unwrap()
             .bind_invocation_provider_session_start(
@@ -581,6 +593,9 @@ fn completion_registration_waits_for_live_session_binding() {
             json!({"ok": true, "session_id": SESSION_A, "error": null})
         )
         .unwrap();
+        assert_eq!(report["invocation_uuid"], INVOCATION_A);
+        assert_eq!(report["provider_session_id"], SESSION_A);
+        assert_eq!(report["token"], "fixture-token");
     });
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));

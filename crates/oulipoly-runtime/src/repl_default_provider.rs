@@ -279,6 +279,11 @@ fn default_provider_invocation_session_id(
 ) -> Result<Option<String>, String> {
     state.get_invocation_by_uuid(invocation_uuid).map(|record| {
         record.and_then(|record| {
+            if record.provider_session_capture_method.as_deref()
+                == Some(crate::executor::cli::PENDING_LIVE_SESSION_CAPTURE_METHOD)
+            {
+                return None;
+            }
             record
                 .provider_session_id
                 .or(record.session_id)
@@ -573,7 +578,7 @@ pub(crate) use resolve_family_keys as resolve_family_keys_for_test;
 mod tests {
     use super::*;
     use crate::services::{LauncherServicePort, LauncherServiceRequest};
-    use oulipoly_state::{ProviderSessionBinding, StateDb};
+    use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
     use rusqlite::Connection;
     use std::cell::RefCell;
     #[cfg(unix)]
@@ -1214,6 +1219,54 @@ turn_script = "{}"
             assert_eq!(provider_session_id.as_deref(), Some(session_id.as_str()));
             assert_eq!(capture_method.as_deref(), Some("provider_live_report"));
         }
+    }
+
+    #[test]
+    fn pending_live_session_binding_is_not_ready_until_marker_promotion() {
+        const INVOCATION_UUID: &str = "pending-live-session-invocation";
+        const SESSION_ID: &str = "pending-live-session";
+
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "fixture-model".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .bind_invocation_provider_session_start(
+                invocation_row_id,
+                &ProviderSessionBinding {
+                    provider_session_id: SESSION_ID.to_string(),
+                    capture_method: crate::executor::cli::PENDING_LIVE_SESSION_CAPTURE_METHOD,
+                    resume_input_id: None,
+                    provider_session_resolved_account: Some("fixture-provider".to_string()),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            default_provider_invocation_session_id(&state, INVOCATION_UUID).unwrap(),
+            None
+        );
+
+        state
+            .transition_invocation_provider_session_capture_method(
+                invocation_row_id,
+                SESSION_ID,
+                crate::executor::cli::PENDING_LIVE_SESSION_CAPTURE_METHOD,
+                "provider_live_report",
+            )
+            .unwrap();
+        assert_eq!(
+            default_provider_invocation_session_id(&state, INVOCATION_UUID).unwrap(),
+            Some(SESSION_ID.to_string())
+        );
     }
 
     #[test]

@@ -1,34 +1,61 @@
 //! Provider-neutral live interactive session binding.
 
+#[cfg(unix)]
 use super::spawn_identity::{
     RunningRuntimeGeneration, SpawnIdentityContext, backfill_captured_session_id,
 };
 use crate::provider_registry::ProviderRegistry;
+#[cfg(unix)]
 use crate::services::emit_live_session_marker;
-use crate::session_provider::{
-    SessionProviderIdentity, SessionProviderLiveCaptureRequest, capture_live_report,
-};
+use crate::session_provider::SessionProviderIdentity;
+#[cfg(unix)]
+use crate::session_provider::{SessionProviderLiveCaptureRequest, capture_live_report};
+#[cfg(unix)]
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
+#[cfg(unix)]
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 const SOCKET_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_SOCKET";
+#[cfg(unix)]
 const TOKEN_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_TOKEN";
+#[cfg(unix)]
 const PROTOCOL_VERSION: u8 = 1;
+#[cfg(unix)]
 const CAPTURE_METHOD: &str = "provider_live_report";
+pub const PENDING_CAPTURE_METHOD: &str = "provider_live_report_pending";
+#[cfg(unix)]
 const MAX_LIVE_SESSION_MESSAGE_BYTES: usize = 16 * 1024;
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+#[cfg(unix)]
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
+#[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(unix)]
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub(crate) struct InteractiveLiveSessionBinding {
@@ -40,6 +67,7 @@ pub(crate) struct InteractiveLiveSessionBinding {
     pub effective_cwd: Option<PathBuf>,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct LiveSessionReport {
     schema_version: u8,
@@ -48,6 +76,7 @@ struct LiveSessionReport {
     provider_session_id: String,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Serialize, Deserialize)]
 struct LiveSessionResponse {
     ok: bool,
@@ -75,7 +104,11 @@ impl LiveSessionBindingServer {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .map_err(|err| format!("Failed to secure live-session socket directory: {err}"))?;
         let token = uuid::Uuid::new_v4().to_string();
-        let socket_path = dir.join(format!("{}.sock", uuid::Uuid::new_v4()));
+        let socket_path = dir.join(format!(
+            "{:016x}.sock",
+            uuid::Uuid::new_v4().as_u128() as u64
+        ));
+        validate_socket_path_length(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .map_err(|err| format!("Failed to bind live-session socket: {err}"))?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
@@ -135,10 +168,21 @@ impl LiveSessionBindingServer {
 impl Drop for LiveSessionBindingServer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
         let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(worker) = self.worker.take() {
+            join_worker_bounded(worker);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn join_worker_bounded(worker: JoinHandle<()>) {
+    let deadline = Instant::now() + WORKER_JOIN_TIMEOUT;
+    while !worker.is_finished() && Instant::now() < deadline {
+        thread::sleep(ACCEPT_POLL);
+    }
+    if worker.is_finished() {
+        let _ = worker.join();
     }
 }
 
@@ -183,6 +227,14 @@ fn serve_live_session_reports(
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(ACCEPT_POLL);
             }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                thread::sleep(ACCEPT_POLL);
+            }
             Err(_) => return,
         }
     }
@@ -223,17 +275,62 @@ fn handle_live_session_report(
             report.provider_session_id, captured
         ));
     }
-    persist_live_binding(context, &captured)?;
+    let state = StateDb::open(&context.state_db_path)?;
+    persist_live_binding(context, &state, &captured)?;
     backfill_captured_session_id(Some(spawn_context), Some(generation), &captured)?;
     set_shared_session(session_state, &captured)?;
-    emit_live_session_marker(
-        &StateDb::open(&context.state_db_path)?,
+    state.transition_invocation_provider_session_capture_method(
+        context.invocation_row_id,
+        &captured,
+        PENDING_CAPTURE_METHOD,
+        CAPTURE_METHOD,
+    )?;
+    let marker = match emit_live_session_marker(
+        &state,
         context.invocation_row_id,
         &context.invocation_uuid,
         &captured,
         CAPTURE_METHOD,
-    )?;
+    ) {
+        Ok(marker) => marker,
+        Err(error) => {
+            return Err(restore_pending_capture_after_marker_failure(
+                &state,
+                context.invocation_row_id,
+                &captured,
+                error,
+            ));
+        }
+    };
+    if !marker.emitted {
+        return Err(restore_pending_capture_after_marker_failure(
+            &state,
+            context.invocation_row_id,
+            &captured,
+            "Live-session marker was not emitted".to_string(),
+        ));
+    }
     Ok(captured)
+}
+
+#[cfg(unix)]
+fn restore_pending_capture_after_marker_failure(
+    state: &StateDb,
+    invocation_row_id: i64,
+    provider_session_id: &str,
+    marker_error: String,
+) -> String {
+    match state.transition_invocation_provider_session_capture_method(
+        invocation_row_id,
+        provider_session_id,
+        CAPTURE_METHOD,
+        PENDING_CAPTURE_METHOD,
+    ) {
+        Ok(()) => marker_error,
+        Err(restore_error) => format!(
+            "{marker_error}; failed to restore pending live-session binding: {restore_error}"
+        ),
+    }
 }
 
 #[cfg(unix)]
@@ -249,6 +346,7 @@ fn read_report(stream: &mut UnixStream) -> Result<LiveSessionReport, String> {
     serde_json::from_str(&line).map_err(|err| format!("Invalid live-session report: {err}"))
 }
 
+#[cfg(unix)]
 fn validate_report(
     report: &LiveSessionReport,
     context: &InteractiveLiveSessionBinding,
@@ -269,11 +367,12 @@ fn validate_report(
     Ok(())
 }
 
+#[cfg(unix)]
 fn persist_live_binding(
     context: &InteractiveLiveSessionBinding,
+    state: &StateDb,
     provider_session_id: &str,
 ) -> Result<(), String> {
-    let state = StateDb::open(&context.state_db_path)?;
     let record = state
         .get_invocation_by_uuid(&context.invocation_uuid)?
         .ok_or_else(|| "Live-session invocation does not exist".to_string())?;
@@ -290,20 +389,21 @@ fn persist_live_binding(
         context.invocation_row_id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.to_string(),
-            capture_method: CAPTURE_METHOD,
+            capture_method: PENDING_CAPTURE_METHOD,
             resume_input_id: None,
             provider_session_resolved_account: Some(context.identity.settings_id.clone()),
         },
     )
 }
 
+#[cfg(unix)]
 fn set_shared_session(
     session_state: &Arc<Mutex<Option<String>>>,
     provider_session_id: &str,
 ) -> Result<(), String> {
     let mut state = session_state
         .lock()
-        .map_err(|_| "Live-session state lock was poisoned".to_string())?;
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = state.as_deref()
         && existing != provider_session_id
     {
@@ -324,11 +424,24 @@ fn write_response(stream: &mut UnixStream, response: &LiveSessionResponse) -> Re
         .map_err(|err| format!("Failed to write live-session response: {err}"))
 }
 
+#[cfg(unix)]
 fn live_binding_socket_dir(state_db_path: &Path) -> PathBuf {
     state_db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("runtime/live-session")
+}
+
+#[cfg(unix)]
+fn validate_socket_path_length(socket_path: &Path) -> Result<(), String> {
+    let byte_len = socket_path.as_os_str().as_bytes().len();
+    if byte_len > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(format!(
+            "Live-session socket path is {byte_len} bytes, exceeding the portable Unix limit of {MAX_UNIX_SOCKET_PATH_BYTES}: {}",
+            socket_path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -361,19 +474,36 @@ fn report_live_session_binding(
 ) -> Result<bool, String> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|err| format!("Failed to connect to live-session binding owner: {err}"))?;
+    configure_live_session_stream(&stream)?;
+    exchange_live_session_report(
+        &mut stream,
+        &LiveSessionReport {
+            schema_version: PROTOCOL_VERSION,
+            token: token.to_string(),
+            invocation_uuid: invocation_uuid.to_string(),
+            provider_session_id: provider_session_id.to_string(),
+        },
+        provider_session_id,
+    )
+}
+
+#[cfg(unix)]
+fn configure_live_session_stream(stream: &UnixStream) -> Result<(), String> {
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|err| format!("Failed to configure live-session response timeout: {err}"))?;
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|err| format!("Failed to configure live-session request timeout: {err}"))?;
-    let report = LiveSessionReport {
-        schema_version: PROTOCOL_VERSION,
-        token: token.to_string(),
-        invocation_uuid: invocation_uuid.to_string(),
-        provider_session_id: provider_session_id.to_string(),
-    };
-    serde_json::to_writer(&mut stream, &report)
+        .map_err(|err| format!("Failed to configure live-session request timeout: {err}"))
+}
+
+#[cfg(unix)]
+fn exchange_live_session_report(
+    stream: &mut UnixStream,
+    report: &LiveSessionReport,
+    expected_session_id: &str,
+) -> Result<bool, String> {
+    serde_json::to_writer(&mut *stream, &report)
         .map_err(|err| format!("Failed to encode live-session report: {err}"))?;
     stream
         .write_all(b"\n")
@@ -382,7 +512,7 @@ fn report_live_session_binding(
         BufReader::new(stream).take(MAX_LIVE_SESSION_MESSAGE_BYTES as u64 + 1),
     )
     .map_err(|err| format!("Invalid live-session binding response: {err}"))?;
-    if response.ok && response.session_id.as_deref() == Some(provider_session_id) {
+    if response.ok && response.session_id.as_deref() == Some(expected_session_id) {
         return Ok(true);
     }
     Err(response
@@ -493,34 +623,62 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_protocol_version_does_not_consume_the_binding_socket() {
+        let fixture = LiveBindingFixture::new();
+        let mut stream = UnixStream::connect(&fixture.server.socket_path).unwrap();
+        configure_live_session_stream(&stream).unwrap();
+
+        let error = exchange_live_session_report(
+            &mut stream,
+            &LiveSessionReport {
+                schema_version: PROTOCOL_VERSION + 1,
+                token: fixture.server.token.clone(),
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                provider_session_id: SESSION_ID.to_string(),
+            },
+            SESSION_ID,
+        )
+        .expect_err("unsupported protocol version must fail closed");
+
+        assert_eq!(error, "Unsupported live-session report protocol version");
+        assert!(
+            report_live_session_binding(
+                &fixture.server.socket_path,
+                &fixture.server.token,
+                INVOCATION_UUID,
+                SESSION_ID,
+            )
+            .expect("valid retry should bind")
+        );
+    }
+
+    #[test]
     fn concurrent_conflicting_reports_only_bind_the_provider_validated_session() {
         let fixture = LiveBindingFixture::new();
         let socket_path = fixture.server.socket_path.clone();
         let token = fixture.server.token.clone();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-
-        let valid_barrier = Arc::clone(&barrier);
-        let valid_path = socket_path.clone();
-        let valid_token = token.clone();
+        let mut conflicting_stream = UnixStream::connect(&socket_path).unwrap();
+        configure_live_session_stream(&conflicting_stream).unwrap();
         let valid = std::thread::spawn(move || {
-            valid_barrier.wait();
-            report_live_session_binding(&valid_path, &valid_token, INVOCATION_UUID, SESSION_ID)
+            report_live_session_binding(&socket_path, &token, INVOCATION_UUID, SESSION_ID)
         });
+        let conflicting = exchange_live_session_report(
+            &mut conflicting_stream,
+            &LiveSessionReport {
+                schema_version: PROTOCOL_VERSION,
+                token: fixture.server.token.clone(),
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                provider_session_id: "session-conflicting-fixture".to_string(),
+            },
+            "session-conflicting-fixture",
+        )
+        .expect_err("provider must reject conflicting identity");
 
-        let conflicting_barrier = Arc::clone(&barrier);
-        let conflicting = std::thread::spawn(move || {
-            conflicting_barrier.wait();
-            report_live_session_binding(
-                &socket_path,
-                &token,
-                INVOCATION_UUID,
-                "session-conflicting-fixture",
-            )
-        });
-
-        barrier.wait();
+        assert!(
+            conflicting.contains("Provider rejected live session report"),
+            "{conflicting}"
+        );
         assert!(valid.join().unwrap().expect("valid report should bind"));
-        assert!(conflicting.join().unwrap().is_err());
 
         let invocation = StateDb::open(&fixture.state_path)
             .unwrap()
@@ -554,6 +712,18 @@ mod tests {
             invocation.provider_session_id.as_deref(),
             Some(session_id.as_str())
         );
+    }
+
+    #[test]
+    fn socket_path_limit_failure_is_actionable() {
+        let path = PathBuf::from("/")
+            .join("x".repeat(MAX_UNIX_SOCKET_PATH_BYTES))
+            .join("live.sock");
+
+        let error = validate_socket_path_length(&path).unwrap_err();
+
+        assert!(error.contains("portable Unix limit"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
     }
 
     struct LiveBindingFixture {

@@ -79,7 +79,10 @@ impl StateDb {
     }
 
     fn open_state_connection(path: &Path) -> Result<sqlite::Connection, String> {
-        sqlite::Connection::open(path).map_err(Self::format_state_db_open_error)
+        let conn = sqlite::Connection::open(path).map_err(Self::format_state_db_open_error)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| format!("Failed to configure state DB busy timeout: {err}"))?;
+        Ok(conn)
     }
 
     fn format_state_db_open_error(err: sqlite::Error) -> String {

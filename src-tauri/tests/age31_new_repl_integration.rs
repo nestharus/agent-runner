@@ -87,6 +87,16 @@ fn combined_output(output: &Output) -> String {
     )
 }
 
+fn marker_value(output: &str, prefix: &str) -> Value {
+    serde_json::from_str(
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn new_flag_binds_exact_live_session_before_nested_registration_returns() {
     const SESSION_ID: &str = "ses_age284_live_fixture";
@@ -154,13 +164,9 @@ esac"#,
     assert!(invocation_index < session_index, "{stderr}");
     assert!(session_index < registration_index, "{stderr}");
     assert_eq!(stderr.matches("OULIPOLY_SESSION=").count(), 1, "{stderr}");
-    let marker: Value = serde_json::from_str(
-        stderr
-            .lines()
-            .find_map(|line| line.strip_prefix("OULIPOLY_SESSION="))
-            .unwrap(),
-    )
-    .unwrap();
+    let invocation_marker = marker_value(&stderr, "OULIPOLY_INVOCATION=");
+    let invocation_uuid = invocation_marker["id"].as_str().unwrap();
+    let marker = marker_value(&stderr, "OULIPOLY_SESSION=");
     assert_eq!(marker["provider_session_id"], SESSION_ID);
 
     let state_path = fixture
@@ -170,8 +176,10 @@ esac"#,
     let state = Connection::open(state_path).unwrap();
     let binding: (String, String) = state
         .query_row(
-            "SELECT provider_session_id, provider_session_capture_method FROM invocations",
-            [],
+            "SELECT provider_session_id, provider_session_capture_method
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [invocation_uuid],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
@@ -231,6 +239,8 @@ esac"#,
         "{combined}"
     );
     assert!(!combined.contains("OULIPOLY_SESSION="), "{combined}");
+    let invocation_marker = marker_value(&combined, "OULIPOLY_INVOCATION=");
+    let invocation_uuid = invocation_marker["id"].as_str().unwrap();
 
     let state = Connection::open(
         fixture
@@ -241,8 +251,10 @@ esac"#,
     .unwrap();
     let invocation: (String, Option<String>, Option<String>) = state
         .query_row(
-            "SELECT status, provider_session_id, error_category FROM invocations",
-            [],
+            "SELECT status, provider_session_id, error_category
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [invocation_uuid],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();

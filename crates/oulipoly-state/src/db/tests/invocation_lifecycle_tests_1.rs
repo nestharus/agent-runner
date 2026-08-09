@@ -138,6 +138,29 @@ fn bind_invocation_provider_session_start_same_id_is_idempotent() {
 }
 
 #[test]
+fn bind_invocation_provider_session_start_rejects_terminal_invocation() {
+    let db = test_db();
+    let id = seed_running_invocation(&db);
+    db.finalize_invocation(id, true, 0, None, None).unwrap();
+
+    let err = db
+        .bind_invocation_provider_session_start(
+            id,
+            &ProviderSessionBinding {
+                provider_session_id: Uuid::new_v4().to_string(),
+                capture_method: "provider_live_report",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap_err();
+
+    assert!(err.contains("no longer running"), "{err}");
+    assert_eq!(invocation_provider_session_id(&db, id), None);
+    assert_eq!(segment_count(&db), 0);
+}
+
+#[test]
 fn bind_invocation_provider_session_start_conflicting_rebind_rejects_without_mutation() {
     let db = test_db();
     let id = seed_running_invocation(&db);

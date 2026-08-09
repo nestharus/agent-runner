@@ -35,7 +35,7 @@ pub(crate) fn emit_live_session_marker(
     invocation_uuid: &str,
     session_id: &str,
     capture_method: &str,
-) -> Result<(), String> {
+) -> Result<SessionLifecycleOutput, String> {
     let mut stderr = std::io::stderr();
     marker::emit_known_session_id_for_service(
         state,
@@ -45,6 +45,5 @@ pub(crate) fn emit_live_session_marker(
         session_id,
         capture_method,
     )
-    .map(|_| ())
     .map_err(|err| err.to_string())
 }
