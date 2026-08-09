@@ -993,7 +993,11 @@ impl SessionLifecycleRepository for StateDb {
             &evidence.turn_generation_id,
         )?;
         if let Some(existing) = read_delivery_evidence(&tx, &evidence.evidence_id)? {
-            return if existing == *evidence {
+            return if existing.kind == evidence.kind
+                && existing.delivery_id == evidence.delivery_id
+                && existing.session_id == evidence.session_id
+                && existing.turn_generation_id == evidence.turn_generation_id
+            {
                 Ok(AcknowledgementWrite::AlreadyRecorded)
             } else {
                 Err(SessionLifecycleError::Conflict("delivery evidence"))
