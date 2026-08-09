@@ -14,8 +14,8 @@ use oulipoly_runtime::session_supervisor::{
     TurnRequest,
 };
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
-    SubmittedInputEnqueue,
+    AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind,
+    MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR, MailboxDb, MailboxRow, SubmittedInputEnqueue,
 };
 use oulipoly_state::{
     ExactProcessIdentity, ExternalIngress, ProviderTurnGeneration, SessionLifecycleRepository,
@@ -505,6 +505,68 @@ fn lifecycle_append_failure_rearms_accepted_pending_recovery() {
     let recovered = ingress.fallback_read(&owner, 11).unwrap();
     assert_eq!(recovered.recovered_sequences, vec![row.seq]);
     assert!(recovered.accepted_sequences.is_empty());
+    receive_turn(&turns)
+        .completion
+        .complete("done", 12)
+        .unwrap();
+    owner.close(13).unwrap();
+}
+
+#[test]
+fn payload_verification_failure_is_retired_without_starving_later_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let mailbox_path = dir.path().join("pid-identity.db");
+    let mut mailbox = MailboxDb::open(&mailbox_path).unwrap();
+    let invalid = enqueue(&mut mailbox, "session-a", "invalid");
+    let valid = enqueue(&mut mailbox, "session-a", "valid");
+    drop(mailbox);
+    let connection = rusqlite::Connection::open(&mailbox_path).unwrap();
+    connection
+        .execute(
+            "UPDATE mailbox SET payload_file_path = 'incomplete' WHERE seq = ?1",
+            [invalid.seq],
+        )
+        .unwrap();
+    drop(connection);
+    let fence = owner(1, "payload-verification");
+    let (owner, turns) = start_owner(&state_path, fence.clone(), 1);
+    let mut ingress = SessionMailboxIngress::new(
+        "session-a",
+        None,
+        fence,
+        1,
+        MailboxDb::open(&mailbox_path).unwrap(),
+        StateDb::open(&state_path).unwrap(),
+        map_notification,
+    )
+    .unwrap();
+
+    assert!(
+        ingress
+            .fallback_read(&owner, 10)
+            .unwrap()
+            .accepted_sequences
+            .is_empty()
+    );
+    assert_eq!(
+        ingress
+            .fallback_read(&owner, 11)
+            .unwrap()
+            .accepted_sequences,
+        vec![valid.seq]
+    );
+    let failed = MailboxDb::open(&mailbox_path)
+        .unwrap()
+        .list_mailbox("session-a", true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.seq == invalid.seq)
+        .unwrap();
+    assert_eq!(
+        failed.delivery_error.as_deref(),
+        Some(MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR)
+    );
     receive_turn(&turns)
         .completion
         .complete("done", 12)

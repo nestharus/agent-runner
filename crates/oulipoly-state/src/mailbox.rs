@@ -23,6 +23,7 @@ use crate::pid_identity::{self, ProcessIdentity};
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
+pub const MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR: &str = "mailbox_payload_verification_failed";
 pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
@@ -1965,6 +1966,7 @@ impl MailboxDb {
              WHERE delivered_at IS NULL
                AND seq > ?3
                AND (delivery_error IS NULL OR delivery_error != ?5)
+               AND (delivery_error IS NULL OR delivery_error != ?8)
                AND (
                    delivery_error IS NULL
                    OR delivery_error != ?6
@@ -1988,6 +1990,7 @@ impl MailboxDb {
                     WAKE_SWEEP_ABANDONED_ERROR,
                     MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
                     MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
+                    MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                 ],
                 map_mailbox_row,
             )

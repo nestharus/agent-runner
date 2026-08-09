@@ -5,7 +5,7 @@ use std::fmt;
 #[cfg(unix)]
 use std::path::Path;
 
-use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR, MailboxDb, MailboxRow};
 use oulipoly_state::{ExternalIngress, SessionLifecycleRepository, StateDb, SupervisorFence};
 use serde::{Deserialize, Serialize};
 
@@ -204,6 +204,13 @@ where
             .map_err(SessionIngressError::Mailbox)?;
         for row in rows {
             if self.mailbox.verify_mailbox_row_payload(&row).is_err() {
+                self.mailbox
+                    .mark_delivery_failed(
+                        &self.session_id,
+                        &[row.seq],
+                        MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
+                    )
+                    .map_err(SessionIngressError::Mailbox)?;
                 continue;
             }
             let notification = (self.map_notification)(&self.session_id, &row)
