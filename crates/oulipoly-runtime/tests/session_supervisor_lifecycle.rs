@@ -675,7 +675,7 @@ fn dropped_completion_child_panic_and_abnormal_exit_have_bounded_retry_outcomes(
 #[test]
 fn pause_queue_caps_and_expiry_are_command_driven_and_deterministic() {
     let config = SupervisorConfig {
-        queue_capacity: 1,
+        queue_capacity: 2,
         ..SupervisorConfig::default()
     };
     let started = start(config);
@@ -684,16 +684,21 @@ fn pause_queue_caps_and_expiry_are_command_driven_and_deterministic() {
         .supervisor
         .notify(notification("session-a", 1, [1]).expiring_at(20), 10)
         .unwrap();
+    started
+        .supervisor
+        .notify(notification("session-a", 2, [2]).expiring_at(21), 10)
+        .unwrap();
     assert!(matches!(
         started
             .supervisor
-            .notify(notification("session-a", 2, [2]), 11),
+            .notify(notification("session-a", 3, [3]), 11),
         Err(SupervisorError::QueueFull)
     ));
     assert!(matches!(started.turns.try_recv(), Err(TryRecvError::Empty)));
 
     started.supervisor.resume(20).unwrap();
-    assert!(matches!(started.turns.try_recv(), Err(TryRecvError::Empty)));
+    let surviving = started.turns.recv().unwrap();
+    assert_eq!(surviving.notification.sequence, 2);
     let expired = started.results.recv().unwrap();
     assert_eq!(expired.notification_sequence, 1);
     assert_eq!(expired.generation_id, "generation-session-a-1");
@@ -701,6 +706,14 @@ fn pause_queue_caps_and_expiry_are_command_driven_and_deterministic() {
         expired.outcome,
         TurnOutcome::Terminated(TerminalReason::Expired)
     ));
+    let expiry_event = started
+        .events
+        .try_iter()
+        .find(|event| event.event_type == "supervisor_work_expired")
+        .unwrap();
+    assert_eq!(expiry_event.payload, "sequence=1");
+    surviving.completion.complete("second", 21).unwrap();
+    assert_eq!(started.results.recv().unwrap().notification_sequence, 2);
     assert!(
         started
             .supervisor
@@ -712,12 +725,12 @@ fn pause_queue_caps_and_expiry_are_command_driven_and_deterministic() {
 
     started
         .supervisor
-        .notify(notification("session-a", 3, [3]), 21)
+        .notify(notification("session-a", 4, [4]), 22)
         .unwrap();
-    let third = started.turns.recv().unwrap();
-    third.completion.complete("third", 22).unwrap();
-    assert_eq!(started.results.recv().unwrap().notification_sequence, 3);
-    started.supervisor.close(23).unwrap();
+    let fourth = started.turns.recv().unwrap();
+    fourth.completion.complete("fourth", 23).unwrap();
+    assert_eq!(started.results.recv().unwrap().notification_sequence, 4);
+    started.supervisor.close(24).unwrap();
 }
 
 #[test]
