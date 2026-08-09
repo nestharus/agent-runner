@@ -3057,6 +3057,7 @@ dependencies = [
  "oulipoly-core",
  "oulipoly-provider",
  "oulipoly-state",
+ "proc-macro2",
  "ratatui",
  "rusqlite",
  "serde",

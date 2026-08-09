@@ -1,4 +1,4 @@
-# spec-session-lifecycle — Resume, chain segments, migration, session lock, metadata
+# spec-session-lifecycle — Resume, resident supervision, migration, session lock, metadata
 
 ## Source files
 
@@ -23,6 +23,7 @@
 - `crates/oulipoly-runtime/src/session_metadata/transcript.rs`
 - `crates/oulipoly-runtime/src/session_metadata/workspace.rs`
 - `crates/oulipoly-runtime/src/session_replace/mod.rs`
+- `crates/oulipoly-runtime/src/session_supervisor.rs`
 - `crates/oulipoly-state/src/db/imported_session_list.rs`
 - `crates/oulipoly-runtime/src/migration/mod.rs`
 - `src-tauri/src/commands/migrate/session_ownership/classifier.rs`
@@ -89,6 +90,7 @@ co-located unit tests in `src-tauri/src/commands/session_locate_export/{mapper,v
 | Resume a session whose provider has migrated (claude pre-flag-day → post-flag-day). | Resolve through `migration/mod.rs`: locate the new id from the dual-id mapping, return success. |
 | Resume a session that no longer exists on disk. | Return a structured "not found" error carrying the provider/account; do NOT auto-create a new session. |
 | Two callers race to resume the same session id. | `session_lock` serializes: first wins, second blocks or errors per the lock policy. |
+| Accepted work targets a resident provider session. | One exact durable owner serializes generation-fenced turns, queues busy-time work FIFO, and remains alive between turns. |
 | Session export request. | Emit a canonical transcript record covering the session's full chain; `session_export/metadata.rs` produces the metadata sidecar. |
 | Session list query. | Return active chain rows joined to imported display metadata and ingested turn counts, sorted by last-used/updated descending then provider/session id. |
 | Session replace request (overwrite ingest). | Resolve target session, validate the replacement payload, atomically swap on-disk artifacts. |
@@ -123,7 +125,9 @@ co-located unit tests in `src-tauri/src/commands/session_locate_export/{mapper,v
 - Session lifecycle does NOT decide which provider to use — that is the
   balancer. The lifecycle takes a locator as input.
 - Session lifecycle does NOT execute the provider process — that is the
-  executor. It hands the executor a resume id, then ingests outputs back.
+  executor. The resident owner emits a generation-fenced request through an
+  effect port and ingests its single-use completion without launching or
+  waiting synchronously.
 - Session lifecycle does NOT classify terminal signals — that is the
   recognizer.
 - Session metadata writes go through the row-version-tracked `oulipoly-state`
@@ -147,6 +151,8 @@ tests.
 - `crates/oulipoly-runtime/tests/session_metadata_resume_cwd_characterization.rs`
 - `crates/oulipoly-runtime/tests/session_ownership.rs` (public `session_metadata` ownership capability compile/use contract)
 - `crates/oulipoly-runtime/tests/session_lifecycle_service.rs`
+- `crates/oulipoly-runtime/tests/session_supervisor_loop.rs`
+- `crates/oulipoly-runtime/tests/session_supervisor_lifecycle.rs`
 - `crates/oulipoly-runtime/src/session_metadata/ownership.rs` (colocated `session_ownership_*` membership, cwd-independence, conclusive-negative, malformed-output, missing-storage, and script-failure cases)
 - `src-tauri/tests/age67_opencode_resume.rs`
 - `src-tauri/tests/age100_one_shot_quota_migration.rs`

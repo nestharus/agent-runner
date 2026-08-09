@@ -34,4 +34,5 @@ toml.workspace = true
 
 [dev-dependencies]
 oulipoly-state = { path = "../oulipoly-state", features = ["test-support"] }
+proc-macro2 = "1"
 tokio = { workspace = true, features = ["macros", "rt"] }
