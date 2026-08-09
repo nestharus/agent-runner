@@ -912,6 +912,8 @@ fn reconstructed_live_turn_is_not_relaunched_and_only_its_exact_exit_is_accepted
         .unwrap();
     seed.start_provider_turn(&active).unwrap();
     drop(seed);
+    let processes = FakeProcesses::default();
+    processes.set(active.child.pid, ProcessObservation::ExactLive);
     let (turn_tx, turn_rx) = mpsc::channel::<FakeTurn>();
     let (event_tx, _events) = mpsc::channel();
     let (supervisor, _results) = SessionSupervisor::start(
@@ -919,7 +921,7 @@ fn reconstructed_live_turn_is_not_relaunched_and_only_its_exact_exit_is_accepted
         owner_fence,
         2,
         Box::new(FakeRepository::open(&path, RepositoryProbe::default())),
-        Arc::new(FakeProcesses::default()),
+        Arc::new(processes),
         SupervisorConfig::default(),
         turn_tx,
         event_tx,
@@ -953,6 +955,98 @@ fn reconstructed_live_turn_is_not_relaunched_and_only_its_exact_exit_is_accepted
         .unwrap();
     assert_eq!(supervisor.status().unwrap().active_generation, None);
     supervisor.close(5).unwrap();
+}
+
+#[test]
+fn stale_reconstructed_turn_is_durably_exited_during_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let owner_fence = owner(1, "stale-reconstruction");
+    let active = turn("session-a", 1);
+    let mut seed = StateDb::open(&path).unwrap();
+    seed.acquire_supervisor_lease("session-a", &owner_fence, 1)
+        .unwrap();
+    seed.start_provider_turn(&active).unwrap();
+    drop(seed);
+
+    let processes = FakeProcesses::default();
+    processes.set(active.child.pid, ProcessObservation::Dead);
+    let (turn_tx, turn_rx) = mpsc::channel::<FakeTurn>();
+    let (event_tx, events) = mpsc::channel();
+    let (supervisor, _results) = SessionSupervisor::start(
+        "session-a",
+        owner_fence,
+        2,
+        Box::new(FakeRepository::open(&path, RepositoryProbe::default())),
+        Arc::new(processes),
+        SupervisorConfig::default(),
+        turn_tx,
+        event_tx,
+    )
+    .unwrap();
+
+    assert!(matches!(turn_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(supervisor.status().unwrap().active_generation, None);
+    assert_eq!(
+        events.recv().unwrap().event_type,
+        "supervisor_reconstructed_child_stale"
+    );
+    assert_eq!(
+        StateDb::open(&path)
+            .unwrap()
+            .provider_turn(&active.generation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Exited
+    );
+    supervisor.close(3).unwrap();
+}
+
+#[test]
+fn unknown_reconstructed_child_observation_releases_the_supervisor_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let owner_fence = owner(1, "unknown-reconstruction");
+    let active = turn("session-a", 1);
+    let mut seed = StateDb::open(&path).unwrap();
+    seed.acquire_supervisor_lease("session-a", &owner_fence, 1)
+        .unwrap();
+    seed.start_provider_turn(&active).unwrap();
+    drop(seed);
+
+    let processes = FakeProcesses::default();
+    processes.set(
+        active.child.pid,
+        ProcessObservation::Unknown("unreadable proc".to_owned()),
+    );
+    let (turn_tx, _turn_rx) = mpsc::channel::<FakeTurn>();
+    let (event_tx, _events) = mpsc::channel();
+    let result = SessionSupervisor::start(
+        "session-a",
+        owner_fence,
+        2,
+        Box::new(FakeRepository::open(&path, RepositoryProbe::default())),
+        Arc::new(processes),
+        SupervisorConfig::default(),
+        turn_tx,
+        event_tx,
+    );
+
+    assert!(matches!(
+        result,
+        Err(SupervisorStartError::ProcessObservationUnknown(error))
+            if error == "unreadable proc"
+    ));
+    let db = StateDb::open(&path).unwrap();
+    assert_eq!(db.supervisor_lease("session-a").unwrap(), None);
+    assert_eq!(
+        db.provider_turn(&active.generation_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Running
+    );
 }
 
 #[test]
