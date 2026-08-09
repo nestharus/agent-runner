@@ -180,6 +180,7 @@ where
             if !self.recovered {
                 return Ok(drain);
             }
+            self.hydrated_delivery_ids = HashSet::new();
         }
         if snapshot.phase == SupervisorPhase::Draining {
             return Ok(drain);
@@ -202,18 +203,13 @@ where
             let notification = (self.map_notification)(&self.session_id, &row)
                 .map_err(SessionIngressError::Decode)?;
             let ingress = mailbox_external_ingress(&self.session_id, &row)?;
-            match owner.notify_external(ingress.clone(), notification, accepted_at) {
-                Ok(_) => {
-                    self.hydrated_delivery_ids.insert(ingress.ingress_id);
-                    drain.accepted_sequences.push(row.seq);
-                }
+            match owner.notify_external(ingress, notification, accepted_at) {
+                Ok(_) => drain.accepted_sequences.push(row.seq),
                 Err(SupervisorError::QueueFull) => {
                     drain.queue_saturated = true;
                     break;
                 }
-                Err(SupervisorError::DuplicateOrStaleSequence) => {
-                    self.hydrated_delivery_ids.insert(ingress.ingress_id);
-                }
+                Err(SupervisorError::DuplicateOrStaleSequence) => {}
                 Err(error) => return Err(SessionIngressError::Supervisor(error)),
             }
         }
