@@ -24,6 +24,8 @@
 - `crates/oulipoly-runtime/src/session_metadata/workspace.rs`
 - `crates/oulipoly-runtime/src/session_replace/mod.rs`
 - `crates/oulipoly-runtime/src/session_supervisor.rs`
+- `crates/oulipoly-runtime/src/session_ingress.rs`
+- `crates/oulipoly-runtime/src/delivery_evidence.rs`
 - `crates/oulipoly-state/src/db/imported_session_list.rs`
 - `crates/oulipoly-runtime/src/migration/mod.rs`
 - `src-tauri/src/commands/migrate/session_ownership/classifier.rs`
@@ -91,6 +93,7 @@ co-located unit tests in `src-tauri/src/commands/session_locate_export/{mapper,v
 | Resume a session that no longer exists on disk. | Return a structured "not found" error carrying the provider/account; do NOT auto-create a new session. |
 | Two callers race to resume the same session id. | `session_lock` serializes: first wins, second blocks or errors per the lock policy. |
 | Accepted work targets a resident provider session. | One exact durable owner serializes generation-fenced turns, queues busy-time work FIFO, and remains alive between turns. |
+| A mailbox row targets a resident headless session. | A bounded session-local read above the durable cursor submits immutable work through the owner's external lane; fallback and targeted poke use the same drain. |
 | Session export request. | Emit a canonical transcript record covering the session's full chain; `session_export/metadata.rs` produces the metadata sidecar. |
 | Session list query. | Return active chain rows joined to imported display metadata and ingested turn counts, sorted by last-used/updated descending then provider/session id. |
 | Session replace request (overwrite ingest). | Resolve target session, validate the replacement payload, atomically swap on-disk artifacts. |
@@ -153,6 +156,9 @@ tests.
 - `crates/oulipoly-runtime/tests/session_lifecycle_service.rs`
 - `crates/oulipoly-runtime/tests/session_supervisor_loop.rs`
 - `crates/oulipoly-runtime/tests/session_supervisor_lifecycle.rs`
+- `crates/oulipoly-runtime/tests/session_mailbox_ingress.rs`
+- `crates/oulipoly-runtime/tests/delivery_evidence.rs`
+- `crates/oulipoly-state/tests/session_lifecycle_repository.rs`
 - `crates/oulipoly-runtime/src/session_metadata/ownership.rs` (colocated `session_ownership_*` membership, cwd-independence, conclusive-negative, malformed-output, missing-storage, and script-failure cases)
 - `src-tauri/tests/age67_opencode_resume.rs`
 - `src-tauri/tests/age100_one_shot_quota_migration.rs`

@@ -2,6 +2,8 @@
 
 ## Source files
 
+- `src-tauri/src/mailbox_delivery.rs`
+
 - `src-tauri/src/lib.rs`
 - `src-tauri/src/app_state.rs`
 - `src-tauri/src/app_paths.rs`

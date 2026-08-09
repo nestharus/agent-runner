@@ -195,11 +195,12 @@ use self::schema_types::{
     ProviderSessionProjection, ProvidersSchemaShape,
 };
 pub use self::session_lifecycle::{
-    AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DispositionWrite,
-    EventDisposition, ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace,
-    LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError,
-    SessionLifecycleRepository, SessionLifecycleResult, SessionReconstruction, SupervisorFence,
-    SupervisorLease, TurnFence, TurnState,
+    AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
+    DeliveryEvidenceKind, DispositionWrite, EventDisposition, ExactProcessIdentity,
+    ExternalIngress, ExternalIngressWrite, LeaseAcquire, LeaseReplace, LifecycleEvent,
+    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError, SessionLifecycleRepository,
+    SessionLifecycleResult, SessionReconstruction, SupervisorFence, SupervisorLease, TurnFence,
+    TurnState,
 };
 pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]

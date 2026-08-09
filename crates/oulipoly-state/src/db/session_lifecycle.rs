@@ -190,6 +190,39 @@ pub struct ExternalIngress {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryEvidenceKind {
+    PtyTransportAck,
+    ManualAcknowledgement,
+}
+
+impl DeliveryEvidenceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PtyTransportAck => "pty_transport_ack",
+            Self::ManualAcknowledgement => "manual_acknowledgement",
+        }
+    }
+
+    fn parse(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "pty_transport_ack" => Ok(Self::PtyTransportAck),
+            "manual_acknowledgement" => Ok(Self::ManualAcknowledgement),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryEvidence {
+    pub evidence_id: String,
+    pub kind: DeliveryEvidenceKind,
+    pub delivery_id: String,
+    pub session_id: String,
+    pub turn_generation_id: String,
+    pub observed_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcknowledgementStage {
     AcceptedPending,
     Submitted,
@@ -224,6 +257,12 @@ impl DeliveryAcknowledgement {
 pub enum AcknowledgementWrite {
     Advanced,
     AlreadyRecorded,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalIngressWrite {
+    Accepted,
+    AlreadyAccepted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +333,20 @@ pub trait SessionLifecycleRepository {
         session_id: &str,
         limit: usize,
     ) -> SessionLifecycleResult<Vec<ExternalIngress>>;
+    fn external_ingress_cursor(&self, session_id: &str) -> SessionLifecycleResult<i64>;
+    fn accept_external_ingress(
+        &mut self,
+        ingress: &ExternalIngress,
+        owner: &SupervisorFence,
+        turn_generation_id: &str,
+        accepted_at: i64,
+    ) -> SessionLifecycleResult<ExternalIngressWrite>;
+    fn accepted_pending_external_ingress(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> SessionLifecycleResult<Vec<ExternalIngress>>;
     fn accept_pending(
         &mut self,
         delivery_id: &str,
@@ -321,6 +374,14 @@ pub trait SessionLifecycleRepository {
         &self,
         delivery_id: &str,
     ) -> SessionLifecycleResult<Option<DeliveryAcknowledgement>>;
+    fn record_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite>;
+    fn delivery_evidence(
+        &self,
+        evidence_id: &str,
+    ) -> SessionLifecycleResult<Option<DeliveryEvidence>>;
     fn reconstruct_session(
         &self,
         session_id: &str,
@@ -666,33 +727,145 @@ impl SessionLifecycleRepository for StateDb {
     ) -> SessionLifecycleResult<Vec<ExternalIngress>> {
         validate_session_id(session_id)?;
         let limit = bounded_limit(limit)?;
+        let cursor = read_cursor(&self.conn, session_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, ingress_sequence, ingress_id, payload
+             FROM session_external_ingress
+             WHERE session_id = ? AND ingress_sequence > ?
+             ORDER BY ingress_sequence
+             LIMIT ?",
+        )?;
+        statement
+            .query_map(params![session_id, cursor, limit], map_ingress)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn external_ingress_cursor(&self, session_id: &str) -> SessionLifecycleResult<i64> {
+        validate_session_id(session_id)?;
+        read_cursor(&self.conn, session_id).map_err(Into::into)
+    }
+
+    fn accept_external_ingress(
+        &mut self,
+        ingress: &ExternalIngress,
+        owner: &SupervisorFence,
+        turn_generation_id: &str,
+        accepted_at: i64,
+    ) -> SessionLifecycleResult<ExternalIngressWrite> {
+        validate_ingress(ingress)?;
+        validate_supervisor_fence(owner)?;
+        validate_nonempty(turn_generation_id, "turn_generation_id")?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cursor = read_cursor(&tx, session_id)?;
-        let rows = {
-            let mut statement = tx.prepare(
-                "SELECT session_id, ingress_sequence, ingress_id, payload
-                 FROM session_external_ingress
-                 WHERE session_id = ? AND ingress_sequence > ?
-                 ORDER BY ingress_sequence
-                 LIMIT ?",
-            )?;
-            statement
-                .query_map(params![session_id, cursor, limit], map_ingress)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        if let Some(last) = rows.last() {
+        let lease = read_lease(&tx, &ingress.session_id)?
+            .ok_or(SessionLifecycleError::Missing("supervisor lease"))?;
+        if lease.fence != *owner {
+            return Err(SessionLifecycleError::FenceMismatch);
+        }
+        let turn = read_turn_by_generation(&tx, turn_generation_id)?
+            .ok_or(SessionLifecycleError::Missing("provider turn generation"))?;
+        if turn
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id != ingress.session_id)
+        {
+            return Err(SessionLifecycleError::FenceMismatch);
+        }
+        let cursor = read_cursor(&tx, &ingress.session_id)?;
+        let existing_ingress = read_ingress_by_identity(&tx, ingress)?;
+        let existing_acknowledgement = read_acknowledgement(&tx, &ingress.ingress_id)?;
+        if ingress.sequence <= cursor {
+            if existing_ingress.as_ref() == Some(ingress)
+                && existing_acknowledgement
+                    .as_ref()
+                    .is_some_and(|acknowledgement| {
+                        acknowledgement.session_id == ingress.session_id
+                            && acknowledgement.turn_generation_id == turn_generation_id
+                    })
+            {
+                tx.commit()?;
+                return Ok(ExternalIngressWrite::AlreadyAccepted);
+            }
+            return Err(SessionLifecycleError::Conflict("external ingress cursor"));
+        }
+        if let Some(existing) = existing_ingress {
+            if existing != *ingress {
+                return Err(SessionLifecycleError::Conflict("external ingress"));
+            }
+        } else {
             tx.execute(
-                "INSERT INTO session_external_ingress_cursors (session_id, last_sequence)
-                 VALUES (?, ?)
-                 ON CONFLICT(session_id) DO UPDATE SET last_sequence = excluded.last_sequence
-                 WHERE excluded.last_sequence > last_sequence",
-                params![session_id, last.sequence],
+                "INSERT INTO session_external_ingress (
+                    session_id, ingress_sequence, ingress_id, payload
+                 ) VALUES (?, ?, ?, ?)",
+                params![
+                    ingress.session_id,
+                    ingress.sequence,
+                    ingress.ingress_id,
+                    ingress.payload,
+                ],
             )?;
         }
+        if let Some(existing) = existing_acknowledgement {
+            if existing.session_id != ingress.session_id
+                || existing.turn_generation_id != turn_generation_id
+            {
+                return Err(SessionLifecycleError::FenceMismatch);
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO session_delivery_acknowledgements (
+                    delivery_id, session_id, turn_generation_id, accepted_at
+                 ) VALUES (?, ?, ?, ?)",
+                params![
+                    ingress.ingress_id,
+                    ingress.session_id,
+                    turn_generation_id,
+                    accepted_at,
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO session_external_ingress_cursors (session_id, last_sequence)
+             VALUES (?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET last_sequence = excluded.last_sequence
+             WHERE excluded.last_sequence > last_sequence",
+            params![ingress.session_id, ingress.sequence],
+        )?;
         tx.commit()?;
-        Ok(rows)
+        Ok(ExternalIngressWrite::Accepted)
+    }
+
+    fn accepted_pending_external_ingress(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> SessionLifecycleResult<Vec<ExternalIngress>> {
+        validate_session_id(session_id)?;
+        if after_sequence < 0 {
+            return Err(SessionLifecycleError::Invalid("ingress_sequence"));
+        }
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.conn.prepare(
+            "SELECT ingress.session_id, ingress.ingress_sequence,
+                    ingress.ingress_id, ingress.payload
+             FROM session_external_ingress AS ingress
+             JOIN session_delivery_acknowledgements AS acknowledgement
+               ON acknowledgement.delivery_id = ingress.ingress_id
+             WHERE ingress.session_id = ?
+               AND ingress.ingress_sequence > ?
+               AND acknowledgement.session_id = ingress.session_id
+               AND acknowledgement.submitted_at IS NULL
+               AND acknowledgement.confirmed_at IS NULL
+             ORDER BY ingress.ingress_sequence
+             LIMIT ?",
+        )?;
+        statement
+            .query_map(params![session_id, after_sequence, limit], map_ingress)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn accept_pending(
@@ -812,6 +985,57 @@ impl SessionLifecycleRepository for StateDb {
     ) -> SessionLifecycleResult<Option<DeliveryAcknowledgement>> {
         validate_nonempty(delivery_id, "delivery_id")?;
         read_acknowledgement(&self.conn, delivery_id).map_err(Into::into)
+    }
+
+    fn record_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite> {
+        validate_delivery_evidence(evidence)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        acknowledgement_with_fence(
+            &tx,
+            &evidence.delivery_id,
+            &evidence.session_id,
+            &evidence.turn_generation_id,
+        )?;
+        if let Some(existing) = read_delivery_evidence(&tx, &evidence.evidence_id)? {
+            return if existing.kind == evidence.kind
+                && existing.delivery_id == evidence.delivery_id
+                && existing.session_id == evidence.session_id
+                && existing.turn_generation_id == evidence.turn_generation_id
+            {
+                Ok(AcknowledgementWrite::AlreadyRecorded)
+            } else {
+                Err(SessionLifecycleError::Conflict("delivery evidence"))
+            };
+        }
+        tx.execute(
+            "INSERT INTO session_delivery_evidence (
+                evidence_id, evidence_kind, delivery_id, session_id,
+                turn_generation_id, observed_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                evidence.evidence_id,
+                evidence.kind.as_str(),
+                evidence.delivery_id,
+                evidence.session_id,
+                evidence.turn_generation_id,
+                evidence.observed_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(AcknowledgementWrite::Advanced)
+    }
+
+    fn delivery_evidence(
+        &self,
+        evidence_id: &str,
+    ) -> SessionLifecycleResult<Option<DeliveryEvidence>> {
+        validate_nonempty(evidence_id, "evidence_id")?;
+        read_delivery_evidence(&self.conn, evidence_id).map_err(Into::into)
     }
 
     fn reconstruct_session(
@@ -947,6 +1171,15 @@ fn validate_acknowledgement_fence(
     validate_nonempty(delivery_id, "delivery_id")?;
     validate_session_id(session_id)?;
     validate_nonempty(turn_generation_id, "turn_generation_id")
+}
+
+fn validate_delivery_evidence(evidence: &DeliveryEvidence) -> SessionLifecycleResult<()> {
+    validate_nonempty(&evidence.evidence_id, "evidence_id")?;
+    validate_acknowledgement_fence(
+        &evidence.delivery_id,
+        &evidence.session_id,
+        &evidence.turn_generation_id,
+    )
 }
 
 fn bounded_limit(limit: usize) -> SessionLifecycleResult<i64> {
@@ -1128,6 +1361,20 @@ fn map_ingress(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExternalIngress> {
     })
 }
 
+fn read_ingress_by_identity(
+    conn: &Connection,
+    ingress: &ExternalIngress,
+) -> rusqlite::Result<Option<ExternalIngress>> {
+    conn.query_row(
+        "SELECT session_id, ingress_sequence, ingress_id, payload
+         FROM session_external_ingress
+         WHERE ingress_id = ? OR (session_id = ? AND ingress_sequence = ?)",
+        params![ingress.ingress_id, ingress.session_id, ingress.sequence],
+        map_ingress,
+    )
+    .optional()
+}
+
 fn read_cursor(conn: &Connection, session_id: &str) -> rusqlite::Result<i64> {
     Ok(conn
         .query_row(
@@ -1178,4 +1425,27 @@ fn map_acknowledgement(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryAckn
         confirmed_at: row.get(6)?,
         confirmed_evidence: row.get(7)?,
     })
+}
+
+fn read_delivery_evidence(
+    conn: &Connection,
+    evidence_id: &str,
+) -> rusqlite::Result<Option<DeliveryEvidence>> {
+    conn.query_row(
+        "SELECT evidence_id, evidence_kind, delivery_id, session_id,
+                turn_generation_id, observed_at
+         FROM session_delivery_evidence WHERE evidence_id = ?",
+        params![evidence_id],
+        |row| {
+            Ok(DeliveryEvidence {
+                evidence_id: row.get(0)?,
+                kind: DeliveryEvidenceKind::parse(&row.get::<_, String>(1)?)?,
+                delivery_id: row.get(2)?,
+                session_id: row.get(3)?,
+                turn_generation_id: row.get(4)?,
+                observed_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
 }

@@ -10,10 +10,11 @@ use oulipoly_runtime::session_supervisor::{
     TurnRequest, TurnResult,
 };
 use oulipoly_state::{
-    AcknowledgementWrite, DeliveryAcknowledgement, DispositionWrite, EventDisposition,
-    ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace, LifecycleEvent,
-    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleRepository, SessionLifecycleResult,
-    SessionReconstruction, StateDb, SupervisorFence, SupervisorLease, TurnFence, TurnState,
+    AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence, DispositionWrite,
+    EventDisposition, ExactProcessIdentity, ExternalIngress, ExternalIngressWrite, LeaseAcquire,
+    LeaseReplace, LifecycleEvent, NewLifecycleEvent, ProviderTurnGeneration,
+    SessionLifecycleRepository, SessionLifecycleResult, SessionReconstruction, StateDb,
+    SupervisorFence, SupervisorLease, TurnFence, TurnState,
 };
 use proc_macro2::{TokenStream, TokenTree};
 
@@ -45,6 +46,7 @@ impl ProcessObserver for FakeProcesses {
 struct RepositoryProbe {
     reconstructed_sessions: Arc<Mutex<Vec<String>>>,
     fail_next_append: Arc<AtomicBool>,
+    fail_next_external_ingress: Arc<AtomicBool>,
     fail_next_start: Arc<AtomicBool>,
     fail_next_transition: Arc<AtomicBool>,
     replacement_barrier: Option<Arc<Barrier>>,
@@ -186,6 +188,40 @@ impl SessionLifecycleRepository for FakeRepository {
         self.inner.read_external_ingress(session_id, limit)
     }
 
+    fn external_ingress_cursor(&self, session_id: &str) -> SessionLifecycleResult<i64> {
+        self.inner.external_ingress_cursor(session_id)
+    }
+
+    fn accept_external_ingress(
+        &mut self,
+        ingress: &ExternalIngress,
+        owner: &SupervisorFence,
+        turn_generation_id: &str,
+        accepted_at: i64,
+    ) -> SessionLifecycleResult<ExternalIngressWrite> {
+        if self
+            .probe
+            .fail_next_external_ingress
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(oulipoly_state::SessionLifecycleError::Conflict(
+                "forced fake external ingress failure",
+            ));
+        }
+        self.inner
+            .accept_external_ingress(ingress, owner, turn_generation_id, accepted_at)
+    }
+
+    fn accepted_pending_external_ingress(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> SessionLifecycleResult<Vec<ExternalIngress>> {
+        self.inner
+            .accepted_pending_external_ingress(session_id, after_sequence, limit)
+    }
+
     fn accept_pending(
         &mut self,
         delivery_id: &str,
@@ -236,6 +272,20 @@ impl SessionLifecycleRepository for FakeRepository {
         delivery_id: &str,
     ) -> SessionLifecycleResult<Option<DeliveryAcknowledgement>> {
         self.inner.acknowledgement(delivery_id)
+    }
+
+    fn record_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite> {
+        self.inner.record_delivery_evidence(evidence)
+    }
+
+    fn delivery_evidence(
+        &self,
+        evidence_id: &str,
+    ) -> SessionLifecycleResult<Option<DeliveryEvidence>> {
+        self.inner.delivery_evidence(evidence_id)
     }
 
     fn reconstruct_session(
@@ -565,6 +615,47 @@ fn committed_events_publish_directly_and_failed_commits_never_publish() {
         Err(TryRecvError::Empty)
     ));
     started.supervisor.close(20).unwrap();
+}
+
+#[test]
+fn failed_external_ingress_acceptance_does_not_queue_or_consume_the_sequence() {
+    let started = start(SupervisorConfig::default());
+    started
+        .probe
+        .fail_next_external_ingress
+        .store(true, Ordering::SeqCst);
+    let ingress = ExternalIngress {
+        session_id: "session-a".to_owned(),
+        sequence: 1,
+        ingress_id: "mailbox:session-a:1".to_owned(),
+        payload: "payload".to_owned(),
+    };
+
+    assert!(matches!(
+        started
+            .supervisor
+            .notify_external(ingress, notification("session-a", 1, [1]), 10),
+        Err(SupervisorError::Repository(_))
+    ));
+    assert!(
+        started
+            .supervisor
+            .status()
+            .unwrap()
+            .queued_sequences
+            .is_empty()
+    );
+    assert!(matches!(started.turns.try_recv(), Err(TryRecvError::Empty)));
+
+    started
+        .supervisor
+        .notify(notification("session-a", 1, [1]), 11)
+        .unwrap();
+    let request = started.turns.recv().unwrap();
+    assert_eq!(request.notification.sequence, 1);
+    request.completion.complete("result", 12).unwrap();
+    assert_eq!(started.results.recv().unwrap().notification_sequence, 1);
+    started.supervisor.close(13).unwrap();
 }
 
 #[test]
