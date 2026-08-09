@@ -2145,10 +2145,7 @@ fn process_control_request_with_pending(
 ) -> Result<Option<String>, String> {
     validate_control_request_peer(stream)?;
     let request = read_control_request_payload(stream)?;
-    if request.operation != CONTROL_OP_INJECT {
-        return Err("headless_resume_requires_resident_owner".to_string());
-    }
-    let payload = prepare_control_payload(request.payload, expected_target)?;
+    let payload = prepare_control_payload(require_inject_operation(request)?, expected_target)?;
     if payload.bytes.is_empty() {
         acknowledge_control_payload(&payload)?;
         return Ok(payload.delivery_attempt_id);
@@ -2272,6 +2269,10 @@ fn read_control_request_payload(stream: &mut UnixStream) -> Result<ControlReques
 
 fn read_control_request(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
     let request = read_control_request_payload(stream)?;
+    require_inject_operation(request)
+}
+
+fn require_inject_operation(request: ControlRequest) -> Result<Vec<u8>, String> {
     if request.operation != CONTROL_OP_INJECT {
         return Err("headless_resume_requires_resident_owner".to_string());
     }
