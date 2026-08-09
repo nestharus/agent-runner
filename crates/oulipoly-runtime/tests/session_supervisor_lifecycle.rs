@@ -577,7 +577,7 @@ fn child_adapter_disconnect_preserves_fifo_work_until_a_new_exact_generation_is_
     let (event_tx, _events) = mpsc::channel();
     let (supervisor, results) = SessionSupervisor::start(
         "session-a",
-        owner(1, "current"),
+        owner(1, "adapter-reconnect"),
         1,
         Box::new(FakeRepository::open(&path, probe)),
         Arc::new(FakeProcesses::default()),
@@ -609,6 +609,39 @@ fn child_adapter_disconnect_preserves_fifo_work_until_a_new_exact_generation_is_
         TurnOutcome::Completed("result")
     ));
     supervisor.close(13).unwrap();
+}
+
+#[test]
+fn closing_after_a_single_turn_adapter_disconnect_reports_the_consumed_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let (closed_turn_tx, closed_turn_rx) = mpsc::channel::<FakeTurn>();
+    drop(closed_turn_rx);
+    let (event_tx, _events) = mpsc::channel();
+    let (supervisor, results) = SessionSupervisor::start(
+        "session-a",
+        owner(1, "single-disconnect"),
+        1,
+        Box::new(FakeRepository::open(&path, RepositoryProbe::default())),
+        Arc::new(FakeProcesses::default()),
+        SupervisorConfig::default(),
+        closed_turn_tx,
+        event_tx,
+    )
+    .unwrap();
+
+    supervisor
+        .notify(notification("session-a", 1, [1]), 10)
+        .unwrap();
+    supervisor.close(11).unwrap();
+
+    let result = results.recv().unwrap();
+    assert_eq!(result.notification_sequence, 1);
+    assert_eq!(result.generation_id, "generation-session-a-1");
+    assert!(matches!(
+        result.outcome,
+        TurnOutcome::Terminated(TerminalReason::ExplicitClose)
+    ));
 }
 
 #[test]
@@ -751,6 +784,10 @@ fn active_and_queued_cancellation_drain_close_and_expiry_have_exact_terminal_out
         .notify(notification("session-a", 3, [3]), 12)
         .unwrap();
     started.supervisor.cancel(2, 13).unwrap();
+    let queued_cancelled = started.results.recv().unwrap();
+    assert_eq!(queued_cancelled.notification_sequence, 2);
+    assert_eq!(queued_cancelled.generation_id, "generation-session-a-2");
+    assert!(matches!(queued_cancelled.outcome, TurnOutcome::Cancelled));
     assert_eq!(
         started.supervisor.status().unwrap().queued_sequences,
         vec![3]

@@ -655,6 +655,7 @@ enum SupervisorCommand<Input, Output> {
 
 struct PendingWork<Input> {
     notification: SessionNotification<Input>,
+    reportable_turn: ProviderTurnGeneration,
     attempts: usize,
 }
 
@@ -877,9 +878,15 @@ where
             accepted_at,
         )?;
         let sequence = notification.sequence;
+        let reportable_turn = notification
+            .turns
+            .front()
+            .expect("notification turns validated above")
+            .clone();
         self.last_sequence = Some(sequence);
         self.queued.push_back(PendingWork {
             notification,
+            reportable_turn,
             attempts: 0,
         });
         if let Err(error) = self.start_next(accepted_at, command_tx) {
@@ -936,6 +943,7 @@ where
                 )?;
                 continue;
             };
+            work.reportable_turn = turn.clone();
             if let Err(error) = self.repository.start_provider_turn(&turn) {
                 work.notification.turns.push_front(turn);
                 self.queued.push_front(work);
@@ -1121,13 +1129,17 @@ where
         else {
             return Err(SupervisorError::NotFound);
         };
-        self.queued.remove(index);
+        let work = self
+            .queued
+            .remove(index)
+            .expect("queued work index found above");
         self.append_and_publish(
             "supervisor_queued_work_cancelled",
             &format!("notification:{sequence}"),
             &format!("sequence={sequence}"),
             at,
         )?;
+        self.publish_queued_result(&work, TurnOutcome::Cancelled);
         Ok(())
     }
 
@@ -1261,12 +1273,7 @@ where
     }
 
     fn publish_queued_result(&self, work: &PendingWork<Input>, outcome: TurnOutcome<Output>) {
-        let turn = work
-            .notification
-            .turns
-            .front()
-            .expect("accepted queued work has at least one turn");
-        self.publish_result(turn, work, outcome);
+        self.publish_result(&work.reportable_turn, work, outcome);
     }
 
     fn terminate(&mut self, reason: TerminalReason, at: i64) -> Result<(), SupervisorError> {
