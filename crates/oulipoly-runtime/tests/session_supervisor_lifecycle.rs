@@ -684,7 +684,9 @@ fn dropped_completion_child_panic_and_abnormal_exit_have_bounded_retry_outcomes(
         started.results.recv().unwrap().outcome,
         TurnOutcome::RetryScheduled(reason) if reason == ChildFailure::CompletionDropped.to_string()
     ));
-    assert_eq!(started.events.recv().unwrap().created_at, 10);
+    let accepted_event = started.events.recv().unwrap();
+    assert_eq!(accepted_event.event_type, "supervisor_work_accepted");
+    assert_eq!(accepted_event.created_at, 10);
     let dropped_event = started.events.recv().unwrap();
     assert_eq!(dropped_event.event_type, "supervisor_turn_failed");
     assert_eq!(dropped_event.created_at, 10);
