@@ -212,6 +212,7 @@ fn apply_unconfirmed_resume_completion_failure(
     result.produced_assistant_response = false;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_resume_attempt_terminal_signal(
     input: &ResumeAttemptInput<'_>,
     attempt: &mut ResumeInvocationAttempt<'_>,

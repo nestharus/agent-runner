@@ -2,6 +2,8 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
 
+use oulipoly_runtime::delivery_evidence::PtyTransportAcknowledgementEvidence;
+use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     ExactProcessEvidence, ExitRuntimeGenerationNonOrderly, GenerationMutation, MailboxDb,
     MailboxRow, RuntimeGenerationFence, RuntimeLifecycleState, RuntimeTerminalReason,
@@ -54,6 +56,7 @@ pub(crate) struct PtyMailboxDeliveryDiagnostic {
 struct PtyRuntimeAuthority {
     control_path: String,
     delivery_invocation_uuid: String,
+    turn_generation_id: Option<String>,
 }
 
 #[cfg(unix)]
@@ -88,7 +91,12 @@ fn attempt_pty_mailbox_delivery_inner(
     };
     let control_path = authority.control_path;
     let delivery_invocation_uuid = authority.delivery_invocation_uuid;
-    if let Err(err) = acknowledge_injected_pty_delivery_attempts(mailbox, session_id) {
+    let turn_generation_id = authority.turn_generation_id;
+    if let Err(err) = acknowledge_injected_pty_delivery_attempts(
+        mailbox,
+        session_id,
+        turn_generation_id.as_deref(),
+    ) {
         tracing::warn!(
             session_id,
             "Failed to acknowledge injected PTY delivery: {err}"
@@ -133,7 +141,13 @@ fn attempt_pty_mailbox_delivery_inner(
             if response.ack
                 && response.message == pty_delivery_ack_message(&prepared.attempt_id) =>
         {
-            acknowledge_pty_batch_injected(mailbox, session_id, &prepared.attempt_id, control_path)
+            acknowledge_pty_batch_injected(
+                mailbox,
+                session_id,
+                &prepared.attempt_id,
+                turn_generation_id.as_deref(),
+                control_path,
+            )
         }
         Ok(response) if response.ack => mark_unconfirmed_pty_ack(
             mailbox,
@@ -225,6 +239,7 @@ fn pty_runtime_authority(
             Ok(PtyRuntimeAuthority {
                 control_path,
                 delivery_invocation_uuid: generation.spawn_invocation_uuid.clone(),
+                turn_generation_id: Some(generation.generation_id.to_string()),
             })
         }
         Ok(SessionGenerationProjection::Multiple(_)) => Err(pty_status(
@@ -308,6 +323,7 @@ fn legacy_pty_runtime_authority(
     Ok(PtyRuntimeAuthority {
         control_path,
         delivery_invocation_uuid,
+        turn_generation_id: None,
     })
 }
 
@@ -386,6 +402,7 @@ fn acknowledge_pty_batch_injected(
     mailbox: &mut MailboxDb,
     session_id: &str,
     attempt_id: &str,
+    turn_generation_id: Option<&str>,
     control_path: String,
 ) -> PtyMailboxDeliveryDiagnostic {
     let seqs = mailbox
@@ -400,6 +417,19 @@ fn acknowledge_pty_batch_injected(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if let Some(turn_generation_id) = turn_generation_id
+        && let Err(error) =
+            record_pty_transport_evidence(attempt_id, session_id, turn_generation_id)
+    {
+        return pty_status(
+            true,
+            "evidence_error",
+            Some(control_path),
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            Some(error),
+        );
+    }
     let confirmation = mailbox
         .record_delivery_attempt_transport_ack(attempt_id)
         .and_then(|recorded| {
@@ -593,11 +623,39 @@ fn pty_status_implies_submit(status: &str) -> bool {
 fn acknowledge_injected_pty_delivery_attempts(
     mailbox: &mut MailboxDb,
     session_id: &str,
+    turn_generation_id: Option<&str>,
 ) -> Result<(), String> {
     for window in mailbox.accepted_delivery_attempt_windows(session_id)? {
+        if let Some(turn_generation_id) = turn_generation_id {
+            record_pty_transport_evidence(&window.attempt_id, session_id, turn_generation_id)?;
+        }
         mailbox.confirm_delivery_attempt(&window.attempt_id)?;
     }
     Ok(())
+}
+
+fn record_pty_transport_evidence(
+    attempt_id: &str,
+    session_id: &str,
+    turn_generation_id: &str,
+) -> Result<(), String> {
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "PTY evidence timestamp exceeds i64".to_string())?;
+    let mut state = StateDb::open_default()?;
+    PtyTransportAcknowledgementEvidence {
+        evidence_id: format!("pty_transport_ack:{attempt_id}"),
+        delivery_attempt_id: attempt_id.to_owned(),
+        session_id: session_id.to_owned(),
+        turn_generation_id: turn_generation_id.to_owned(),
+        observed_at,
+    }
+    .record(&mut state)
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn finalize_pty_mailbox_delivery_handoff(
