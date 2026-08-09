@@ -143,7 +143,8 @@ fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
     }
     !matches!(
         &cli.command,
-        Some(Subcommands::Resume { .. })
+        Some(Subcommands::Notify { .. })
+            | Some(Subcommands::Resume { .. })
             | Some(Subcommands::Repl {
                 resume: Some(_),
                 ..
@@ -651,6 +652,30 @@ mod tests {
             .unwrap()
             .command
             .expect("resume argv should produce a subcommand")
+    }
+
+    #[test]
+    fn agent_bash_registration_skips_startup_wake_reclaim_sweep() {
+        let cli = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "notify",
+            "agent-bash-register",
+            "--handle",
+            "ab_test",
+            "--delivery-mode",
+            "sync",
+            "--state-dir",
+            "/tmp/ab_test",
+            "--meta",
+            "/tmp/ab_test/meta.json",
+            "--log",
+            "/tmp/ab_test/log",
+            "--rc",
+            "/tmp/ab_test/rc",
+        ])
+        .unwrap();
+
+        assert!(!startup_wake_reclaim_sweep_enabled(&cli));
     }
 
     fn assert_resume_debug_contains_option_field(
