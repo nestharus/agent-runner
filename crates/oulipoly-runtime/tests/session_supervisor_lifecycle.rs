@@ -600,6 +600,7 @@ fn child_adapter_disconnect_preserves_fifo_work_until_a_new_exact_generation_is_
         .unwrap();
     let request = replacement_rx.recv().unwrap();
     assert_eq!(request.notification.sequence, 1);
+    // The disconnected send consumed turn 1, so reconnection receives the next generation.
     assert_eq!(request.turn.generation_id, "generation-session-a-2");
     request.completion.complete("result", 12).unwrap();
     assert!(matches!(
