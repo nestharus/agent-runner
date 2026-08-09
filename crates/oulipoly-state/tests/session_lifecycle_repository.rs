@@ -615,7 +615,7 @@ fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
     assert_eq!(user_version(fresh.connection()), 11);
-    for table in [
+    let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
         "session_lifecycle_sequences",
@@ -624,7 +624,8 @@ fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
         "session_external_ingress",
         "session_external_ingress_cursors",
         "session_delivery_acknowledgements",
-    ] {
+    ];
+    for table in lifecycle_tables {
         assert!(table_exists(fresh.connection(), table), "missing {table}");
     }
 
@@ -645,7 +646,9 @@ fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
     );
     oulipoly_state::migrations::run_with_db_path(&mut conn, &plan, upgrade_path).unwrap();
     assert_eq!(user_version(&conn), 11);
-    assert!(table_exists(&conn, "session_supervisor_leases"));
+    for table in lifecycle_tables {
+        assert!(table_exists(&conn, table), "missing {table}");
+    }
     assert_eq!(
         conn.query_row("SELECT label FROM preserved_rows WHERE id = 1", [], |row| {
             row.get::<_, String>(0)
