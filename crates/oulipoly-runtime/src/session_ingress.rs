@@ -231,6 +231,7 @@ where
         let complete = rows.len() < self.batch_limit;
         for ingress in rows {
             if self.hydrated_delivery_ids.contains(&ingress.ingress_id) {
+                self.recovery_cursor = ingress.sequence;
                 continue;
             }
             let row: MailboxRow =
