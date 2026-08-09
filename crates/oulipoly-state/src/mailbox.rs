@@ -23,6 +23,7 @@ use crate::pid_identity::{self, ProcessIdentity};
 
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
+pub const MAILBOX_INGRESS_EXPIRED_ERROR: &str = "mailbox_ingress_expired";
 pub const MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR: &str = "mailbox_payload_verification_failed";
 pub const MAX_UNCONFIRMED_DELIVERY_ATTEMPTS: i64 = 2;
 pub const SUBMITTED_INPUT_KIND: &str = "input";
@@ -44,6 +45,26 @@ const PENDING_MAILBOX_TARGET_PREDICATE: &str = "(
     OR (target_kind = 'session' AND target_id = ?1)
     OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
 )";
+
+fn bounded_pending_mailbox_query() -> String {
+    format!(
+        "SELECT {MAILBOX_ROW_COLUMNS}
+         FROM mailbox
+         WHERE delivered_at IS NULL
+           AND seq > ?3
+           AND (delivery_error IS NULL OR delivery_error != ?5)
+           AND (delivery_error IS NULL OR delivery_error != ?8)
+           AND (delivery_error IS NULL OR delivery_error != ?9)
+           AND (
+               delivery_error IS NULL
+               OR delivery_error != ?6
+               OR delivery_attempts < ?7
+           )
+           AND {PENDING_MAILBOX_TARGET_PREDICATE}
+         ORDER BY seq ASC
+         LIMIT ?4"
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -1962,22 +1983,7 @@ impl MailboxDb {
             .ok()
             .filter(|limit| *limit > 0)
             .ok_or_else(|| "Mailbox batch limit must be positive".to_string())?;
-        let query = format!(
-            "SELECT {MAILBOX_ROW_COLUMNS}
-             FROM mailbox
-             WHERE delivered_at IS NULL
-               AND seq > ?3
-               AND (delivery_error IS NULL OR delivery_error != ?5)
-               AND (delivery_error IS NULL OR delivery_error != ?8)
-               AND (
-                   delivery_error IS NULL
-                   OR delivery_error != ?6
-                   OR delivery_attempts < ?7
-               )
-               AND {PENDING_MAILBOX_TARGET_PREDICATE}
-             ORDER BY seq ASC
-             LIMIT ?4"
-        );
+        let query = bounded_pending_mailbox_query();
         let mut stmt = self
             .conn
             .prepare(&query)
@@ -1993,6 +1999,7 @@ impl MailboxDb {
                     MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
                     MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
                     MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
+                    MAILBOX_INGRESS_EXPIRED_ERROR,
                 ],
                 map_mailbox_row,
             )
@@ -8124,6 +8131,48 @@ mod tests {
         assert_eq!(pending_rows.len(), 1);
         assert_eq!(pending_rows[0].seq, pending.seq);
         assert_eq!(pending_rows[0].handle, "handle-b");
+    }
+
+    #[test]
+    fn bounded_pending_session_and_chain_plans_use_supporting_mailbox_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+
+        for chain_id in [None, Some("chain-a")] {
+            let query = format!("EXPLAIN QUERY PLAN {}", bounded_pending_mailbox_query());
+            let mut statement = db.connection().prepare(&query).unwrap();
+            let details = statement
+                .query_map(
+                    params![
+                        "session-a",
+                        chain_id,
+                        0,
+                        1,
+                        WAKE_SWEEP_ABANDONED_ERROR,
+                        MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+                        MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
+                        MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
+                        MAILBOX_INGRESS_EXPIRED_ERROR,
+                    ],
+                    |row| row.get::<_, String>(3),
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_mailbox_pending (")),
+                "bounded pending plan did not use the session index: {details:?}"
+            );
+            assert!(
+                details
+                    .iter()
+                    .any(|detail| detail.contains("idx_mailbox_pending_target")),
+                "bounded pending plan did not use the target index: {details:?}"
+            );
+        }
     }
 
     #[test]

@@ -385,6 +385,14 @@ fn external_ingress_reads_do_not_advance_the_acceptance_cursor() {
 
     let owner = supervisor(1, "owner");
     db.acquire_supervisor_lease("session-a", &owner, 1).unwrap();
+    db.start_provider_turn(&turn(
+        "generation-a",
+        "invocation-a",
+        Some("session-a"),
+        TurnState::Running,
+        process(601, "ingress"),
+    ))
+    .unwrap();
     let first = db.read_external_ingress("session-a", 1).unwrap().remove(0);
     assert_eq!(
         db.accept_external_ingress(&first, &owner, "generation-a", 10)
@@ -402,6 +410,56 @@ fn external_ingress_reads_do_not_advance_the_acceptance_cursor() {
     assert_eq!(reopened.external_ingress_cursor("session-a").unwrap(), 1);
     drop(reopened);
     drop(dir);
+}
+
+#[test]
+fn external_ingress_rejects_a_missing_turn_generation_without_advancing() {
+    let (_dir, _path, mut db) = store();
+    let owner = supervisor(1, "owner");
+    db.acquire_supervisor_lease("session-a", &owner, 1).unwrap();
+    let ingress = ExternalIngress {
+        session_id: "session-a".to_owned(),
+        sequence: 1,
+        ingress_id: "mailbox:session-a:1".to_owned(),
+        payload: "payload".to_owned(),
+    };
+
+    assert!(matches!(
+        db.accept_external_ingress(&ingress, &owner, "generation-missing", 10),
+        Err(SessionLifecycleError::Missing("provider turn generation"))
+    ));
+    assert_eq!(db.external_ingress_cursor("session-a").unwrap(), 0);
+    assert!(db.acknowledgement(&ingress.ingress_id).unwrap().is_none());
+    assert!(db.read_external_ingress("session-a", 1).unwrap().is_empty());
+}
+
+#[test]
+fn external_ingress_rejects_a_generation_owned_by_another_session() {
+    let (_dir, _path, mut db) = store();
+    let owner = supervisor(1, "owner");
+    db.acquire_supervisor_lease("session-a", &owner, 1).unwrap();
+    db.start_provider_turn(&turn(
+        "generation-b",
+        "invocation-b",
+        Some("session-b"),
+        TurnState::Running,
+        process(602, "wrong-session"),
+    ))
+    .unwrap();
+    let ingress = ExternalIngress {
+        session_id: "session-a".to_owned(),
+        sequence: 1,
+        ingress_id: "mailbox:session-a:1".to_owned(),
+        payload: "payload".to_owned(),
+    };
+
+    assert!(matches!(
+        db.accept_external_ingress(&ingress, &owner, "generation-b", 10),
+        Err(SessionLifecycleError::FenceMismatch)
+    ));
+    assert_eq!(db.external_ingress_cursor("session-a").unwrap(), 0);
+    assert!(db.acknowledgement(&ingress.ingress_id).unwrap().is_none());
+    assert!(db.read_external_ingress("session-a", 1).unwrap().is_empty());
 }
 
 fn ingress_ids(rows: Vec<ExternalIngress>) -> Vec<String> {
@@ -538,6 +596,14 @@ fn owner_acceptance_atomically_persists_ingress_cursor_and_accepted_pending() {
     let (_dir, path, mut db) = store();
     let owner = supervisor(1, "owner");
     db.acquire_supervisor_lease("session-a", &owner, 1).unwrap();
+    db.start_provider_turn(&turn(
+        "generation-a",
+        "invocation-a",
+        None,
+        TurnState::Running,
+        process(603, "acceptance"),
+    ))
+    .unwrap();
     let ingress = ExternalIngress {
         session_id: "session-a".to_owned(),
         sequence: 7,

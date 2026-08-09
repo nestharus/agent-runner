@@ -764,6 +764,15 @@ impl SessionLifecycleRepository for StateDb {
         if lease.fence != *owner {
             return Err(SessionLifecycleError::FenceMismatch);
         }
+        let turn = read_turn_by_generation(&tx, turn_generation_id)?
+            .ok_or(SessionLifecycleError::Missing("provider turn generation"))?;
+        if turn
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id != ingress.session_id)
+        {
+            return Err(SessionLifecycleError::FenceMismatch);
+        }
         let cursor = read_cursor(&tx, &ingress.session_id)?;
         let existing_ingress = read_ingress_by_identity(&tx, ingress)?;
         let existing_acknowledgement = read_acknowledgement(&tx, &ingress.ingress_id)?;

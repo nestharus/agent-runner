@@ -448,6 +448,7 @@ where
                 phase: SupervisorPhase::Running,
                 queued: VecDeque::new(),
                 active,
+                prestarted_turns: HashSet::new(),
                 last_sequence: None,
                 child_adapter_connected: true,
                 published_events: 0,
@@ -698,6 +699,7 @@ struct OwnerState<Input, Output> {
     phase: SupervisorPhase,
     queued: VecDeque<PendingWork<Input>>,
     active: Option<ActiveTurn<Input>>,
+    prestarted_turns: HashSet<String>,
     last_sequence: Option<i64>,
     child_adapter_connected: bool,
     published_events: usize,
@@ -902,19 +904,38 @@ where
         if ingress.session_id != self.session_id || ingress.sequence != notification.sequence {
             return Err(SupervisorError::IngressMismatch);
         }
-        let generation_id = notification
+        let turn = notification
             .turns
             .front()
             .expect("notification turns validated above")
-            .generation_id
             .clone();
+        self.register_external_turn(&turn)?;
+        self.prestarted_turns.insert(turn.generation_id.clone());
         self.repository.accept_external_ingress(
             ingress,
             &self.fence,
-            &generation_id,
+            &turn.generation_id,
             accepted_at,
         )?;
         self.accept_validated(notification, accepted_at, command_tx)
+    }
+
+    fn register_external_turn(
+        &mut self,
+        turn: &ProviderTurnGeneration,
+    ) -> Result<(), SupervisorError> {
+        let unbound = ProviderTurnGeneration {
+            session_id: None,
+            ..turn.clone()
+        };
+        match self.repository.provider_turn(&turn.generation_id)? {
+            Some(existing) if existing == *turn || existing == unbound => Ok(()),
+            Some(_) => Err(SessionLifecycleError::Conflict("provider turn identity").into()),
+            None => self
+                .repository
+                .start_provider_turn(&unbound)
+                .map_err(Into::into),
+        }
     }
 
     fn validate_acceptance(
@@ -1024,10 +1045,10 @@ where
                 continue;
             };
             work.reportable_turn = turn.clone();
-            if let Err(error) = self.repository.start_provider_turn(&turn) {
+            if let Err(error) = self.start_queued_turn(&turn) {
                 work.notification.turns.push_front(turn);
                 self.queued.push_front(work);
-                return Err(error.into());
+                return Err(error);
             }
             work.attempts += 1;
             let fence = turn_fence(&turn);
@@ -1074,6 +1095,35 @@ where
             self.terminate(TerminalReason::Drained, at)?;
         }
         Ok(())
+    }
+
+    fn start_queued_turn(&mut self, turn: &ProviderTurnGeneration) -> Result<(), SupervisorError> {
+        if !self.prestarted_turns.contains(&turn.generation_id) {
+            return self
+                .repository
+                .start_provider_turn(turn)
+                .map_err(Into::into);
+        }
+        let unbound = ProviderTurnGeneration {
+            session_id: None,
+            ..turn.clone()
+        };
+        match self.repository.provider_turn(&turn.generation_id)? {
+            Some(existing) if existing == *turn => {
+                self.prestarted_turns.remove(&turn.generation_id);
+                Ok(())
+            }
+            Some(existing) if existing == unbound => {
+                self.repository.attach_provider_turn_session(
+                    &turn.generation_id,
+                    &turn.spawn_invocation_id,
+                    &self.session_id,
+                )?;
+                self.prestarted_turns.remove(&turn.generation_id);
+                Ok(())
+            }
+            _ => Err(SessionLifecycleError::Conflict("provider turn identity").into()),
+        }
     }
 
     fn child_exited(

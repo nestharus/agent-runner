@@ -15,7 +15,8 @@ use oulipoly_runtime::session_supervisor::{
 };
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind,
-    MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR, MailboxDb, MailboxRow, SubmittedInputEnqueue,
+    MAILBOX_INGRESS_EXPIRED_ERROR, MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR, MailboxDb,
+    MailboxRow, SubmittedInputEnqueue,
 };
 use oulipoly_state::{
     ExactProcessIdentity, ExternalIngress, ProviderTurnGeneration, SessionLifecycleRepository,
@@ -419,6 +420,12 @@ fn crash_windows_leave_unpersisted_persisted_and_accepted_work_recoverable() {
         payload: serde_json::to_string(&row).unwrap(),
     };
     state
+        .start_provider_turn(&ProviderTurnGeneration {
+            session_id: None,
+            ..turn("session-a", row.seq)
+        })
+        .unwrap();
+    state
         .accept_external_ingress(
             &durable,
             &stale_fence,
@@ -572,6 +579,57 @@ fn payload_verification_failure_is_retired_without_starving_later_rows() {
         .complete("done", 12)
         .unwrap();
     owner.close(13).unwrap();
+}
+
+#[test]
+fn expired_ingress_is_retired_without_starving_a_later_row_at_batch_size_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let mailbox_path = dir.path().join("pid-identity.db");
+    let mut mailbox = MailboxDb::open(&mailbox_path).unwrap();
+    let expired = enqueue(&mut mailbox, "session-a", "expired");
+    let valid = enqueue(&mut mailbox, "session-a", "valid");
+    let fence = owner(1, "expiry");
+    let (owner, turns) = start_owner(&state_path, fence.clone(), 1);
+    let mut ingress = SessionMailboxIngress::new(
+        "session-a",
+        None,
+        fence,
+        1,
+        mailbox,
+        StateDb::open(&state_path).unwrap(),
+        map_retry_notification,
+    )
+    .unwrap();
+
+    assert!(
+        ingress
+            .fallback_read(&owner, 10)
+            .unwrap()
+            .accepted_sequences
+            .is_empty()
+    );
+    assert_eq!(
+        ingress
+            .fallback_read(&owner, 11)
+            .unwrap()
+            .accepted_sequences,
+        vec![valid.seq]
+    );
+    let retired = MailboxDb::open(&mailbox_path)
+        .unwrap()
+        .list_mailbox("session-a", true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.seq == expired.seq)
+        .unwrap();
+    assert_eq!(
+        retired.delivery_error.as_deref(),
+        Some(MAILBOX_INGRESS_EXPIRED_ERROR)
+    );
+    assert!(retired.delivered_at.is_none());
+    assert_eq!(receive_turn(&turns).notification.sequence, valid.seq);
+    owner.close(12).unwrap();
 }
 
 #[test]

@@ -5,13 +5,23 @@ use std::fmt;
 #[cfg(unix)]
 use std::path::Path;
 
-use oulipoly_state::mailbox::{MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR, MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{
+    MAILBOX_INGRESS_EXPIRED_ERROR, MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR, MailboxDb, MailboxRow,
+};
 use oulipoly_state::{ExternalIngress, SessionLifecycleRepository, StateDb, SupervisorFence};
 use serde::{Deserialize, Serialize};
 
 use crate::session_supervisor::{
     SessionNotification, SessionSupervisor, SupervisorError, SupervisorPhase,
 };
+
+const PERSISTED_MAILBOX_INGRESS_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PersistedMailboxIngressV1 {
+    schema_version: u64,
+    mailbox_row: MailboxRow,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HeadlessResumePoke {
@@ -37,6 +47,7 @@ pub enum SessionIngressError {
     ControlTransport(crate::executor::cli::pty_broker::PtyControlClientError),
     State(oulipoly_state::SessionLifecycleError),
     Decode(String),
+    UnsupportedPersistedPayloadVersion(u64),
     Deserialize(serde_json::Error),
     Serialize(serde_json::Error),
     ControlPayload(serde_json::Error),
@@ -55,6 +66,10 @@ impl fmt::Display for SessionIngressError {
             }
             Self::State(error) => write!(formatter, "durable ingress: {error}"),
             Self::Decode(error) => write!(formatter, "mailbox ingress decode: {error}"),
+            Self::UnsupportedPersistedPayloadVersion(version) => write!(
+                formatter,
+                "mailbox ingress payload schema version {version} is unsupported"
+            ),
             Self::Deserialize(error) => {
                 write!(formatter, "mailbox ingress deserialization: {error}")
             }
@@ -223,7 +238,15 @@ where
                     break;
                 }
                 Err(SupervisorError::DuplicateOrStaleSequence) => {}
-                Err(SupervisorError::Expired) => {}
+                Err(SupervisorError::Expired) => {
+                    self.mailbox
+                        .mark_delivery_failed(
+                            &self.session_id,
+                            &[row.seq],
+                            MAILBOX_INGRESS_EXPIRED_ERROR,
+                        )
+                        .map_err(SessionIngressError::Mailbox)?;
+                }
                 Err(error) => {
                     self.recovered = false;
                     return Err(SessionIngressError::Supervisor(error));
@@ -250,8 +273,7 @@ where
                 self.recovery_cursor = ingress.sequence;
                 continue;
             }
-            let row: MailboxRow =
-                serde_json::from_str(&ingress.payload).map_err(SessionIngressError::Deserialize)?;
+            let row = deserialize_persisted_mailbox_ingress(&ingress.payload)?;
             let notification = (self.map_notification)(&self.session_id, &row)
                 .map_err(SessionIngressError::Decode)?;
             match owner.notify_external(ingress.clone(), notification, accepted_at) {
@@ -291,6 +313,107 @@ fn mailbox_external_ingress(
         session_id: session_id.to_owned(),
         sequence: row.seq,
         ingress_id: format!("mailbox:{session_id}:{}", row.seq),
-        payload: serde_json::to_string(row).map_err(SessionIngressError::Serialize)?,
+        payload: serde_json::to_string(&PersistedMailboxIngressV1 {
+            schema_version: PERSISTED_MAILBOX_INGRESS_SCHEMA_VERSION,
+            mailbox_row: row.clone(),
+        })
+        .map_err(SessionIngressError::Serialize)?,
     })
+}
+
+fn deserialize_persisted_mailbox_ingress(payload: &str) -> Result<MailboxRow, SessionIngressError> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(SessionIngressError::Deserialize)?;
+    let Some(schema_version) = value.get("schema_version") else {
+        return serde_json::from_value(value).map_err(SessionIngressError::Deserialize);
+    };
+    let schema_version = schema_version.as_u64().ok_or_else(|| {
+        SessionIngressError::Decode(
+            "persisted payload schema_version must be a non-negative integer".to_owned(),
+        )
+    })?;
+    if schema_version != PERSISTED_MAILBOX_INGRESS_SCHEMA_VERSION {
+        return Err(SessionIngressError::UnsupportedPersistedPayloadVersion(
+            schema_version,
+        ));
+    }
+    serde_json::from_value::<PersistedMailboxIngressV1>(value)
+        .map(|persisted| persisted.mailbox_row)
+        .map_err(SessionIngressError::Deserialize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mailbox_row() -> MailboxRow {
+        MailboxRow {
+            seq: 7,
+            session_id: "session-a".to_owned(),
+            kind: "agent_bash_complete".to_owned(),
+            handle: "ab-test".to_owned(),
+            payload_json: r#"{"handle":"ab-test"}"#.to_owned(),
+            enqueued_at: "2026-08-09T00:00:00Z".to_owned(),
+            delivered_at: None,
+            delivered_by_invocation_uuid: None,
+            delivery_attempts: 0,
+            delivery_error: None,
+            owner_invocation_uuid: Some("owner-a".to_owned()),
+            matched_os_pid: Some(42),
+            matched_os_boot_id: Some("boot-a".to_owned()),
+            matched_os_pid_starttime_ticks: Some(420),
+            matched_chain_index: Some(2),
+            state_dir: "/tmp/state".to_owned(),
+            meta_path: "/tmp/meta".to_owned(),
+            log_path: "/tmp/log".to_owned(),
+            rc_path: "/tmp/rc".to_owned(),
+            rc: 0,
+            payload_file_path: Some("/tmp/payload".to_owned()),
+            payload_sha256: Some("sha256".to_owned()),
+            payload_byte_len: Some(24),
+            payload_retention_policy: Some("until_terminal_disposition".to_owned()),
+            payload_compacted_at: None,
+            submission_token: None,
+            target_kind: Some("session".to_owned()),
+            target_id: Some("session-a".to_owned()),
+        }
+    }
+
+    #[test]
+    fn versioned_persisted_ingress_payload_round_trips() {
+        let row = mailbox_row();
+        let payload = mailbox_external_ingress("session-a", &row).unwrap().payload;
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            deserialize_persisted_mailbox_ingress(&payload).unwrap(),
+            row
+        );
+    }
+
+    #[test]
+    fn legacy_raw_mailbox_row_payload_recovers_at_the_persistence_seam() {
+        let row = mailbox_row();
+        let payload = serde_json::to_string(&row).unwrap();
+
+        assert_eq!(
+            deserialize_persisted_mailbox_ingress(&payload).unwrap(),
+            row
+        );
+    }
+
+    #[test]
+    fn unsupported_future_persisted_ingress_payload_version_is_rejected() {
+        let payload = serde_json::json!({
+            "schema_version": PERSISTED_MAILBOX_INGRESS_SCHEMA_VERSION + 1,
+            "mailbox_row": mailbox_row(),
+        })
+        .to_string();
+
+        assert!(matches!(
+            deserialize_persisted_mailbox_ingress(&payload),
+            Err(SessionIngressError::UnsupportedPersistedPayloadVersion(2))
+        ));
+    }
 }
