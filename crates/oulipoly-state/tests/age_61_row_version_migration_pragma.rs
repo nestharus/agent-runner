@@ -301,6 +301,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0009_age163_working_set_and_round_robin",
             "0010_imported_session_display_metadata",
             "0011_durable_session_lifecycle",
+            "0012_session_ingress_evidence",
         ]
     );
 }

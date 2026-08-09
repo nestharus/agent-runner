@@ -67,6 +67,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0011_durable_session_lifecycle.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 12,
+        id: "0012_session_ingress_evidence",
+        sql: include_str!("../migrations/0012_session_ingress_evidence.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

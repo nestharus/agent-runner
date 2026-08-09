@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -448,7 +448,7 @@ pub struct DeliveredPayloadCompactionReport {
     pub inline_bytes_reclaimed: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxRow {
     pub seq: i64,
     pub session_id: String,
@@ -1936,6 +1936,55 @@ impl MailboxDb {
         let rows = stmt
             .query_map(params![session_id, chain_id], map_mailbox_row)
             .map_err(|err| format!("Failed to query pending mailbox rows: {err}"))?;
+        collect_rows(rows)
+    }
+
+    pub fn list_pending_for_delivery_after(
+        &self,
+        session_id: &str,
+        chain_id: Option<&str>,
+        after_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<MailboxRow>, String> {
+        if session_id.is_empty() {
+            return Err("Mailbox session id cannot be empty".to_string());
+        }
+        if after_seq < 0 {
+            return Err("Mailbox cursor cannot be negative".to_string());
+        }
+        let limit = i64::try_from(limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| "Mailbox batch limit must be positive".to_string())?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, session_id, kind, handle, payload_json, enqueued_at,
+                        delivered_at, delivered_by_invocation_uuid, delivery_attempts,
+                        delivery_error, owner_invocation_uuid, matched_os_pid,
+                        matched_os_boot_id, matched_os_pid_starttime_ticks,
+                        matched_chain_index, state_dir, meta_path, log_path, rc_path, rc,
+                        payload_file_path, payload_sha256, payload_byte_len,
+                        payload_retention_policy, payload_compacted_at,
+                        submission_token, target_kind, target_id
+                 FROM mailbox
+                 WHERE delivered_at IS NULL
+                   AND seq > ?3
+                   AND (
+                       (target_kind IS NULL AND session_id = ?1)
+                       OR (target_kind = 'session' AND target_id = ?1)
+                       OR (?2 IS NOT NULL AND target_kind = 'chain' AND target_id = ?2)
+                   )
+                 ORDER BY seq ASC
+                 LIMIT ?4",
+            )
+            .map_err(|err| format!("Failed to prepare bounded pending mailbox query: {err}"))?;
+        let rows = stmt
+            .query_map(
+                params![session_id, chain_id, after_seq, limit],
+                map_mailbox_row,
+            )
+            .map_err(|err| format!("Failed to query bounded pending mailbox rows: {err}"))?;
         collect_rows(rows)
     }
 

@@ -1,8 +1,8 @@
 use oulipoly_state::{
     AcknowledgementStage, AcknowledgementWrite, DispositionWrite, EventDisposition,
-    ExactProcessIdentity, ExternalIngress, LeaseAcquire, LeaseReplace, NewLifecycleEvent,
-    ProviderTurnGeneration, SessionLifecycleError, SessionLifecycleRepository, StateDb,
-    SupervisorFence, TurnFence, TurnState,
+    ExactProcessIdentity, ExternalIngress, ExternalIngressWrite, LeaseAcquire, LeaseReplace,
+    NewLifecycleEvent, ProviderTurnGeneration, SessionLifecycleError, SessionLifecycleRepository,
+    StateDb, SupervisorFence, TurnFence, TurnState,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
@@ -550,6 +550,73 @@ fn acknowledgement_stages_are_distinct_idempotent_and_exact_fenced() {
 }
 
 #[test]
+fn owner_acceptance_atomically_persists_ingress_cursor_and_accepted_pending() {
+    let (_dir, path, mut db) = store();
+    let owner = supervisor(1, "owner");
+    db.acquire_supervisor_lease("session-a", &owner, 1).unwrap();
+    let ingress = ExternalIngress {
+        session_id: "session-a".to_owned(),
+        sequence: 7,
+        ingress_id: "mailbox:session-a:7".to_owned(),
+        payload: "immutable-payload".to_owned(),
+    };
+
+    assert_eq!(
+        db.accept_external_ingress(&ingress, &owner, "generation-a", 10)
+            .unwrap(),
+        ExternalIngressWrite::Accepted
+    );
+    assert_eq!(db.external_ingress_cursor("session-a").unwrap(), 7);
+    let acknowledgement = db.acknowledgement("mailbox:session-a:7").unwrap().unwrap();
+    assert_eq!(
+        acknowledgement.stage(),
+        AcknowledgementStage::AcceptedPending
+    );
+    assert_eq!(acknowledgement.submitted_at, None);
+    assert_eq!(acknowledgement.confirmed_at, None);
+    assert_eq!(
+        db.accepted_pending_external_ingress("session-a", 0, 1)
+            .unwrap(),
+        vec![ingress.clone()]
+    );
+    assert_eq!(
+        db.accept_external_ingress(&ingress, &owner, "generation-a", 99)
+            .unwrap(),
+        ExternalIngressWrite::AlreadyAccepted
+    );
+
+    drop(db);
+    let mut reopened = StateDb::open(&path).unwrap();
+    assert_eq!(reopened.external_ingress_cursor("session-a").unwrap(), 7);
+    assert!(matches!(
+        reopened.accept_external_ingress(
+            &ExternalIngress {
+                payload: "changed".to_owned(),
+                ..ingress
+            },
+            &owner,
+            "generation-a",
+            100,
+        ),
+        Err(SessionLifecycleError::Conflict("external ingress cursor"))
+    ));
+    assert!(matches!(
+        reopened.accept_external_ingress(
+            &ExternalIngress {
+                session_id: "session-b".to_owned(),
+                sequence: 8,
+                ingress_id: "mailbox:session-b:8".to_owned(),
+                payload: "other".to_owned(),
+            },
+            &owner,
+            "generation-a",
+            101,
+        ),
+        Err(SessionLifecycleError::Missing("supervisor lease"))
+    ));
+}
+
+#[test]
 fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
     let (_dir, _path, mut db) = store();
     let lease_a = supervisor(1, "a");
@@ -611,10 +678,10 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
 }
 
 #[test]
-fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
+fn schema_v12_is_created_fresh_and_upgrades_from_schema_v10() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
-    assert_eq!(user_version(fresh.connection()), 11);
+    assert_eq!(user_version(fresh.connection()), 12);
     let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
@@ -624,6 +691,7 @@ fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
         "session_external_ingress",
         "session_external_ingress_cursors",
         "session_delivery_acknowledgements",
+        "session_delivery_evidence",
     ];
     for table in lifecycle_tables {
         assert!(table_exists(fresh.connection(), table), "missing {table}");
@@ -637,15 +705,18 @@ fn schema_v11_is_created_fresh_and_upgrades_from_schema_v10() {
          PRAGMA user_version = 10;",
     )
     .unwrap();
-    let plan = oulipoly_state::migrations::plan(10, 11).unwrap();
+    let plan = oulipoly_state::migrations::plan(10, 12).unwrap();
     assert_eq!(
         plan.iter()
             .map(|migration| migration.id)
             .collect::<Vec<_>>(),
-        vec!["0011_durable_session_lifecycle"]
+        vec![
+            "0011_durable_session_lifecycle",
+            "0012_session_ingress_evidence"
+        ]
     );
     oulipoly_state::migrations::run_with_db_path(&mut conn, &plan, upgrade_path).unwrap();
-    assert_eq!(user_version(&conn), 11);
+    assert_eq!(user_version(&conn), 12);
     for table in lifecycle_tables {
         assert!(table_exists(&conn, table), "missing {table}");
     }
