@@ -44,6 +44,7 @@ impl ProcessObserver for FakeProcesses {
 struct RepositoryProbe {
     reconstructed_sessions: Arc<Mutex<Vec<String>>>,
     fail_next_append: Arc<AtomicBool>,
+    fail_next_start: Arc<AtomicBool>,
     fail_next_transition: Arc<AtomicBool>,
     replacement_barrier: Option<Arc<Barrier>>,
 }
@@ -103,6 +104,11 @@ impl SessionLifecycleRepository for FakeRepository {
     }
 
     fn start_provider_turn(&mut self, turn: &ProviderTurnGeneration) -> SessionLifecycleResult<()> {
+        if self.probe.fail_next_start.swap(false, Ordering::SeqCst) {
+            return Err(oulipoly_state::SessionLifecycleError::Conflict(
+                "forced fake start failure",
+            ));
+        }
         self.inner.start_provider_turn(turn)
     }
 
@@ -585,6 +591,28 @@ fn child_adapter_disconnect_preserves_fifo_work_until_a_new_exact_generation_is_
         TurnOutcome::Completed("result")
     ));
     supervisor.close(13).unwrap();
+}
+
+#[test]
+fn scheduling_failure_does_not_reject_or_discard_accepted_work() {
+    let started = start(SupervisorConfig::default());
+    started.probe.fail_next_start.store(true, Ordering::SeqCst);
+
+    let accepted = started
+        .supervisor
+        .notify(notification("session-a", 1, [1]), 10)
+        .unwrap();
+    assert_eq!(accepted.sequence, 1);
+    assert_eq!(accepted.active_generation, None);
+    assert_eq!(accepted.queued_notifications, 1);
+
+    started.supervisor.pause(11).unwrap();
+    started.supervisor.resume(12).unwrap();
+    let request = started.turns.recv().unwrap();
+    assert_eq!(request.notification.sequence, 1);
+    request.completion.complete("result", 13).unwrap();
+    assert_eq!(started.results.recv().unwrap().notification_sequence, 1);
+    started.supervisor.close(14).unwrap();
 }
 
 #[test]

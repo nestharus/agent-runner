@@ -880,7 +880,14 @@ where
             notification,
             attempts: 0,
         });
-        self.start_next(accepted_at, command_tx)?;
+        if let Err(error) = self.start_next(accepted_at, command_tx) {
+            tracing::warn!(
+                session_id = %self.session_id,
+                sequence,
+                error = %error,
+                "accepted supervisor work could not be scheduled"
+            );
+        }
         Ok(AcceptedNotification {
             sequence,
             active_generation: self
@@ -926,8 +933,12 @@ where
                 )?;
                 continue;
             };
+            if let Err(error) = self.repository.start_provider_turn(&turn) {
+                work.notification.turns.push_front(turn);
+                self.queued.push_front(work);
+                return Err(error.into());
+            }
             work.attempts += 1;
-            self.repository.start_provider_turn(&turn)?;
             let fence = turn_fence(&turn);
             let request = TurnRequest {
                 session_id: self.session_id.clone(),
