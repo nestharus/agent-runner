@@ -30,12 +30,36 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
     assert_eq!(accepted.submitted_at, None);
     assert_eq!(accepted.confirmed_at, None);
 
+    let stale_pty = PtyTransportAcknowledgementEvidence {
+        evidence_id: "pty:stale".to_owned(),
+        delivery_attempt_id: "attempt-a".to_owned(),
+        session_id: "session-a".to_owned(),
+        turn_generation_id: "generation-old".to_owned(),
+        observed_at: 11,
+    };
+    assert!(matches!(
+        stale_pty.record(&mut state),
+        Err(SessionLifecycleError::FenceMismatch)
+    ));
+
+    let wrong_session_pty = PtyTransportAcknowledgementEvidence {
+        evidence_id: "pty:wrong-session".to_owned(),
+        delivery_attempt_id: "attempt-a".to_owned(),
+        session_id: "session-b".to_owned(),
+        turn_generation_id: "generation-a".to_owned(),
+        observed_at: 12,
+    };
+    assert!(matches!(
+        wrong_session_pty.record(&mut state),
+        Err(SessionLifecycleError::FenceMismatch)
+    ));
+
     ManualAcknowledgementEvidence {
         evidence_id: "manual:attempt-a".to_owned(),
         delivery_attempt_id: "attempt-a".to_owned(),
         session_id: "session-a".to_owned(),
         turn_generation_id: "generation-a".to_owned(),
-        observed_at: 11,
+        observed_at: 13,
     }
     .record(&mut state)
     .unwrap();
@@ -49,7 +73,7 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
         delivery_attempt_id: "attempt-a".to_owned(),
         session_id: "session-a".to_owned(),
         turn_generation_id: "generation-old".to_owned(),
-        observed_at: 12,
+        observed_at: 14,
     };
     assert!(matches!(
         stale.record(&mut state),
@@ -61,7 +85,7 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
         delivery_attempt_id: "attempt-a".to_owned(),
         session_id: "session-b".to_owned(),
         turn_generation_id: "generation-a".to_owned(),
-        observed_at: 13,
+        observed_at: 15,
     };
     assert!(matches!(
         wrong_session.record(&mut state),
@@ -73,7 +97,7 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
         delivery_attempt_id: "attempt-missing".to_owned(),
         session_id: "session-a".to_owned(),
         turn_generation_id: "generation-a".to_owned(),
-        observed_at: 14,
+        observed_at: 16,
     };
     assert!(matches!(
         wrong_attempt.record(&mut state),
