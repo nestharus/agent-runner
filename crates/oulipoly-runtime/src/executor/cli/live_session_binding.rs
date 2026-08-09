@@ -26,7 +26,7 @@ const SOCKET_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_SOCKET";
 const TOKEN_ENV: &str = "OULIPOLY_LIVE_SESSION_BIND_TOKEN";
 const PROTOCOL_VERSION: u8 = 1;
 const CAPTURE_METHOD: &str = "provider_live_report";
-const MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_LIVE_SESSION_MESSAGE_BYTES: usize = 16 * 1024;
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -240,10 +240,10 @@ fn handle_live_session_report(
 fn read_report(stream: &mut UnixStream) -> Result<LiveSessionReport, String> {
     let mut line = String::new();
     BufReader::new(stream)
-        .take(MAX_MESSAGE_BYTES as u64 + 1)
+        .take(MAX_LIVE_SESSION_MESSAGE_BYTES as u64 + 1)
         .read_line(&mut line)
         .map_err(|err| format!("Failed to read live-session report: {err}"))?;
-    if line.len() > MAX_MESSAGE_BYTES {
+    if line.len() > MAX_LIVE_SESSION_MESSAGE_BYTES {
         return Err("Live-session report exceeded the size limit".to_string());
     }
     serde_json::from_str(&line).map_err(|err| format!("Invalid live-session report: {err}"))
@@ -378,9 +378,10 @@ fn report_live_session_binding(
     stream
         .write_all(b"\n")
         .map_err(|err| format!("Failed to write live-session report: {err}"))?;
-    let response: LiveSessionResponse =
-        serde_json::from_reader(BufReader::new(stream).take(MAX_MESSAGE_BYTES as u64 + 1))
-            .map_err(|err| format!("Invalid live-session binding response: {err}"))?;
+    let response: LiveSessionResponse = serde_json::from_reader(
+        BufReader::new(stream).take(MAX_LIVE_SESSION_MESSAGE_BYTES as u64 + 1),
+    )
+    .map_err(|err| format!("Invalid live-session binding response: {err}"))?;
     if response.ok && response.session_id.as_deref() == Some(provider_session_id) {
         return Ok(true);
     }
@@ -529,6 +530,32 @@ mod tests {
         assert_eq!(invocation.provider_session_id.as_deref(), Some(SESSION_ID));
     }
 
+    #[test]
+    fn multi_kilobyte_session_id_round_trips_without_truncation() {
+        let session_id = format!("ses_{}", "x".repeat(4 * 1024));
+        let fixture = LiveBindingFixture::new_with_session_id(&session_id);
+
+        assert!(
+            report_live_session_binding(
+                &fixture.server.socket_path,
+                &fixture.server.token,
+                INVOCATION_UUID,
+                &session_id,
+            )
+            .expect("multi-kilobyte session ID should bind")
+        );
+
+        let invocation = StateDb::open(&fixture.state_path)
+            .unwrap()
+            .get_invocation_by_uuid(INVOCATION_UUID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            invocation.provider_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+    }
+
     struct LiveBindingFixture {
         _temp: tempfile::TempDir,
         state_path: PathBuf,
@@ -539,6 +566,10 @@ mod tests {
 
     impl LiveBindingFixture {
         fn new() -> Self {
+            Self::new_with_session_id(SESSION_ID)
+        }
+
+        fn new_with_session_id(session_id: &str) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let state_path = temp.path().join("state.db");
             let state = StateDb::open(&state_path).unwrap();
@@ -551,7 +582,7 @@ mod tests {
                     parent_invocation_id: None,
                 })
                 .unwrap();
-            let provider = fake_provider(temp.path(), SESSION_ID);
+            let provider = fake_provider(temp.path(), session_id);
             let registry = Arc::new(
                 ProviderRegistry::from_model_configs(
                     &[fixture_model(&provider)],
