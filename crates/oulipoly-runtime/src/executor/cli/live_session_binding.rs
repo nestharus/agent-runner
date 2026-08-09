@@ -80,7 +80,8 @@ struct LiveSessionReport {
 #[derive(Debug, Serialize, Deserialize)]
 struct LiveSessionResponse {
     ok: bool,
-    session_id: Option<String>,
+    #[serde(flatten)]
+    session: Option<oulipoly_state::SessionMarkerPayload>,
     error: Option<String>,
 }
 
@@ -208,14 +209,14 @@ fn serve_live_session_reports(
                     &generation,
                 );
                 let response = match result {
-                    Ok(session_id) => LiveSessionResponse {
+                    Ok(session) => LiveSessionResponse {
                         ok: true,
-                        session_id: Some(session_id),
+                        session: Some(session),
                         error: None,
                     },
                     Err(error) => LiveSessionResponse {
                         ok: false,
-                        session_id: None,
+                        session: None,
                         error: Some(error),
                     },
                 };
@@ -248,7 +249,7 @@ fn handle_live_session_report(
     session_state: &Arc<Mutex<Option<String>>>,
     spawn_context: &SpawnIdentityContext,
     generation: &RunningRuntimeGeneration,
-) -> Result<String, String> {
+) -> Result<oulipoly_state::SessionMarkerPayload, String> {
     stream
         .set_read_timeout(Some(IO_TIMEOUT))
         .map_err(|err| format!("Failed to configure live-session report read timeout: {err}"))?;
@@ -302,15 +303,7 @@ fn handle_live_session_report(
             ));
         }
     };
-    if !marker.emitted {
-        return Err(restore_pending_capture_after_marker_failure(
-            &state,
-            context.invocation_row_id,
-            &captured,
-            "Live-session marker was not emitted".to_string(),
-        ));
-    }
-    Ok(captured)
+    Ok(marker)
 }
 
 #[cfg(unix)]
@@ -385,15 +378,31 @@ fn persist_live_binding(
     if record.status != InvocationStatus::Running {
         return Err("Live-session invocation is no longer running".to_string());
     }
+    let resolved_workspace = live_session_resolved_workspace(context.effective_cwd.as_deref())?;
     state.bind_invocation_provider_session_start(
         context.invocation_row_id,
         &ProviderSessionBinding {
             provider_session_id: provider_session_id.to_string(),
             capture_method: PENDING_CAPTURE_METHOD,
             resume_input_id: None,
-            provider_session_resolved_account: Some(context.identity.settings_id.clone()),
+            provider_session_resolved_account: resolved_workspace,
         },
     )
+}
+
+#[cfg(unix)]
+fn live_session_resolved_workspace(effective_cwd: Option<&Path>) -> Result<Option<String>, String> {
+    effective_cwd
+        .map(|path| {
+            if !path.is_absolute() {
+                return Err(format!(
+                    "Live-session effective cwd is not absolute: {}",
+                    path.display()
+                ));
+            }
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .transpose()
 }
 
 #[cfg(unix)]
@@ -512,7 +521,13 @@ fn exchange_live_session_report(
         BufReader::new(stream).take(MAX_LIVE_SESSION_MESSAGE_BYTES as u64 + 1),
     )
     .map_err(|err| format!("Invalid live-session binding response: {err}"))?;
-    if response.ok && response.session_id.as_deref() == Some(expected_session_id) {
+    if response.ok
+        && response.session.as_ref().is_some_and(|session| {
+            session.legacy_session_id.as_deref() == Some(expected_session_id)
+                && session.provider_session_id.as_deref() == Some(expected_session_id)
+                && session.agent_runner_invocation_id == report.invocation_uuid
+        })
+    {
         return Ok(true);
     }
     Err(response
@@ -577,6 +592,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(invocation.provider_session_id.as_deref(), Some(SESSION_ID));
+        let expected_workspace = fixture._temp.path().to_string_lossy().into_owned();
+        assert_eq!(
+            invocation.provider_session_resolved_account.as_deref(),
+            Some(expected_workspace.as_str())
+        );
         assert_eq!(
             invocation.provider_session_capture_method.as_deref(),
             Some(CAPTURE_METHOD)
@@ -724,6 +744,18 @@ mod tests {
 
         assert!(error.contains("portable Unix limit"), "{error}");
         assert!(error.contains(&path.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn live_session_workspace_must_be_absolute() {
+        let error = live_session_resolved_workspace(Some(Path::new("relative/project")))
+            .expect_err("relative workspace must fail closed");
+
+        assert_eq!(
+            error,
+            "Live-session effective cwd is not absolute: relative/project"
+        );
+        assert_eq!(live_session_resolved_workspace(None).unwrap(), None);
     }
 
     struct LiveBindingFixture {
