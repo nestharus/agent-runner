@@ -456,7 +456,7 @@ fn pause_caps_and_no_overlap_are_preserved_at_the_adapter_boundary() {
 }
 
 #[test]
-fn cancellation_retry_close_and_expiry_remain_owner_policy_through_ingress() {
+fn cancellation_retry_close_and_expiry_remain_owner_policy_without_blocking_ingress() {
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("state.db");
     let mailbox_path = dir.path().join("pid-identity.db");
@@ -464,6 +464,7 @@ fn cancellation_retry_close_and_expiry_remain_owner_policy_through_ingress() {
     let retry = enqueue(&mut mailbox, "session-a", "retry");
     let cancelled = enqueue(&mut mailbox, "session-a", "cancelled");
     let expired = enqueue(&mut mailbox, "session-a", "expired");
+    let later = enqueue(&mut mailbox, "session-a", "later");
     let fence = owner(1, "policy");
     let (owner, turns) = start_owner_with_retries(&state_path, fence.clone(), 4, 1);
     let mut ingress = SessionMailboxIngress::new(
@@ -490,19 +491,23 @@ fn cancellation_retry_close_and_expiry_remain_owner_policy_through_ingress() {
     assert!(matches!(turns.try_recv(), Err(TryRecvError::Empty)));
     retry_attempt.completion.complete("done", 8).unwrap();
 
-    assert!(matches!(
-        ingress.fallback_read(&owner, 10),
-        Err(SessionIngressError::Supervisor(
-            oulipoly_runtime::session_supervisor::SupervisorError::Expired
-        ))
-    ));
+    assert_eq!(
+        ingress
+            .fallback_read(&owner, 10)
+            .unwrap()
+            .accepted_sequences,
+        vec![later.seq]
+    );
+    let later_turn = receive_turn(&turns);
+    assert_eq!(later_turn.notification.sequence, later.seq);
+    later_turn.completion.complete("done", 11).unwrap();
     assert_eq!(
         StateDb::open(&state_path)
             .unwrap()
             .external_ingress_cursor("session-a")
             .unwrap(),
-        cancelled.seq,
-        "expired work remains durable in the mailbox and is not acknowledged"
+        later.seq,
+        "expired work does not block later durable ingress"
     );
     assert!(
         StateDb::open(&state_path)
@@ -511,5 +516,5 @@ fn cancellation_retry_close_and_expiry_remain_owner_policy_through_ingress() {
             .unwrap()
             .is_none()
     );
-    owner.close(11).unwrap();
+    owner.close(12).unwrap();
 }

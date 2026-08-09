@@ -5,7 +5,7 @@ use std::fmt;
 #[cfg(unix)]
 use std::path::Path;
 
-use oulipoly_state::mailbox::{MailboxDb, MailboxRow, mailbox_row_is_deliverable_pending};
+use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
 use oulipoly_state::{ExternalIngress, SessionLifecycleRepository, StateDb, SupervisorFence};
 use serde::{Deserialize, Serialize};
 
@@ -196,10 +196,10 @@ where
                 self.batch_limit,
             )
             .map_err(SessionIngressError::Mailbox)?;
-        for row in rows.into_iter().filter(mailbox_row_is_deliverable_pending) {
-            self.mailbox
-                .verify_mailbox_row_payload(&row)
-                .map_err(SessionIngressError::Mailbox)?;
+        for row in rows {
+            if self.mailbox.verify_mailbox_row_payload(&row).is_err() {
+                continue;
+            }
             let notification = (self.map_notification)(&self.session_id, &row)
                 .map_err(SessionIngressError::Decode)?;
             let ingress = mailbox_external_ingress(&self.session_id, &row)?;
@@ -210,6 +210,7 @@ where
                     break;
                 }
                 Err(SupervisorError::DuplicateOrStaleSequence) => {}
+                Err(SupervisorError::Expired) => {}
                 Err(error) => return Err(SessionIngressError::Supervisor(error)),
             }
         }

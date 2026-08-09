@@ -1970,6 +1970,12 @@ impl MailboxDb {
                  FROM mailbox
                  WHERE delivered_at IS NULL
                    AND seq > ?3
+                   AND (delivery_error IS NULL OR delivery_error != ?5)
+                   AND (
+                       delivery_error IS NULL
+                       OR delivery_error != ?6
+                       OR delivery_attempts < ?7
+                   )
                    AND (
                        (target_kind IS NULL AND session_id = ?1)
                        OR (target_kind = 'session' AND target_id = ?1)
@@ -1981,7 +1987,15 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to prepare bounded pending mailbox query: {err}"))?;
         let rows = stmt
             .query_map(
-                params![session_id, chain_id, after_seq, limit],
+                params![
+                    session_id,
+                    chain_id,
+                    after_seq,
+                    limit,
+                    WAKE_SWEEP_ABANDONED_ERROR,
+                    MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+                    MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
+                ],
                 map_mailbox_row,
             )
             .map_err(|err| format!("Failed to query bounded pending mailbox rows: {err}"))?;
@@ -7769,6 +7783,12 @@ mod tests {
             )
             .unwrap();
         }
+        assert_eq!(
+            db.list_pending_for_delivery_after("session-a", None, 0, 1)
+                .unwrap(),
+            vec![deliverable.clone()],
+            "the SQL limit counts only deliverable pending rows"
+        );
         db.register_delivery_attempt(
             "deliverable-attempt",
             "session-a",
