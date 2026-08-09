@@ -35,6 +35,7 @@ pub enum SessionIngressError {
     Mailbox(String),
     State(oulipoly_state::SessionLifecycleError),
     Decode(String),
+    Deserialize(serde_json::Error),
     Serialize(serde_json::Error),
     ControlPayload(serde_json::Error),
     Supervisor(SupervisorError),
@@ -48,6 +49,9 @@ impl fmt::Display for SessionIngressError {
             Self::Mailbox(error) => write!(formatter, "mailbox ingress: {error}"),
             Self::State(error) => write!(formatter, "durable ingress: {error}"),
             Self::Decode(error) => write!(formatter, "mailbox ingress decode: {error}"),
+            Self::Deserialize(error) => {
+                write!(formatter, "mailbox ingress deserialization: {error}")
+            }
             Self::Serialize(error) => write!(formatter, "mailbox ingress serialization: {error}"),
             Self::ControlPayload(error) => write!(formatter, "headless control payload: {error}"),
             Self::Supervisor(error) => write!(formatter, "resident owner: {error}"),
@@ -233,7 +237,7 @@ where
                 continue;
             }
             let row: MailboxRow =
-                serde_json::from_str(&ingress.payload).map_err(SessionIngressError::Serialize)?;
+                serde_json::from_str(&ingress.payload).map_err(SessionIngressError::Deserialize)?;
             let notification = (self.map_notification)(&self.session_id, &row)
                 .map_err(SessionIngressError::Decode)?;
             match owner.notify_external(ingress.clone(), notification, accepted_at) {
