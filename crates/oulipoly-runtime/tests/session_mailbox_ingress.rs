@@ -272,6 +272,28 @@ fn lost_duplicate_delayed_and_stale_pokes_converge_with_bounded_session_local_fa
         ingress.handle_poke(
             &HeadlessResumePoke {
                 supervisor_generation: fence.generation - 1,
+                ..poke.clone()
+            },
+            &owner,
+            17,
+        ),
+        Err(SessionIngressError::StalePoke)
+    ));
+    assert!(matches!(
+        ingress.handle_poke(
+            &HeadlessResumePoke {
+                lease_token: "wrong-owner".to_owned(),
+                ..poke.clone()
+            },
+            &owner,
+            17,
+        ),
+        Err(SessionIngressError::StalePoke)
+    ));
+    assert!(matches!(
+        ingress.handle_poke(
+            &HeadlessResumePoke {
+                session_id: "session-b".to_owned(),
                 ..poke
             },
             &owner,
