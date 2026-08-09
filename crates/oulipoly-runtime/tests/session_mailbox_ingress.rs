@@ -2,6 +2,10 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
+#[cfg(unix)]
+use oulipoly_runtime::executor::cli::pty_broker::PtyControlClientErrorKind;
+#[cfg(unix)]
+use oulipoly_runtime::session_ingress::send_headless_resume_poke;
 use oulipoly_runtime::session_ingress::{
     HeadlessResumePoke, SessionIngressError, SessionMailboxIngress,
 };
@@ -170,6 +174,28 @@ fn receive_turn(turns: &Receiver<FakeTurn>) -> FakeTurn {
     turns
         .recv_timeout(Duration::from_secs(5))
         .expect("resident owner should emit a bounded fake turn")
+}
+
+#[cfg(unix)]
+#[test]
+fn headless_resume_poke_preserves_control_transport_error_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let error = send_headless_resume_poke(
+        dir.path().join("missing.sock"),
+        &HeadlessResumePoke {
+            session_id: "session-a".to_owned(),
+            supervisor_generation: 1,
+            lease_token: "owner-current".to_owned(),
+        },
+    )
+    .unwrap_err();
+
+    match error {
+        SessionIngressError::ControlTransport(error) => {
+            assert_eq!(error.kind, PtyControlClientErrorKind::Connect);
+        }
+        other => panic!("expected control transport error, got {other}"),
+    }
 }
 
 #[test]

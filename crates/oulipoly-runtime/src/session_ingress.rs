@@ -33,6 +33,8 @@ pub enum SessionIngressError {
     InvalidBatchLimit,
     StalePoke,
     Mailbox(String),
+    #[cfg(unix)]
+    ControlTransport(crate::executor::cli::pty_broker::PtyControlClientError),
     State(oulipoly_state::SessionLifecycleError),
     Decode(String),
     Deserialize(serde_json::Error),
@@ -47,6 +49,10 @@ impl fmt::Display for SessionIngressError {
             Self::InvalidBatchLimit => formatter.write_str("mailbox ingress batch limit is zero"),
             Self::StalePoke => formatter.write_str("headless resume poke is stale or mis-targeted"),
             Self::Mailbox(error) => write!(formatter, "mailbox ingress: {error}"),
+            #[cfg(unix)]
+            Self::ControlTransport(error) => {
+                write!(formatter, "headless control transport: {}", error.message)
+            }
             Self::State(error) => write!(formatter, "durable ingress: {error}"),
             Self::Decode(error) => write!(formatter, "mailbox ingress decode: {error}"),
             Self::Deserialize(error) => {
@@ -264,7 +270,7 @@ pub fn send_headless_resume_poke(
         path,
         crate::executor::cli::pty_broker::LiveSessionControlOperation::HeadlessResume(&payload),
     )
-    .map_err(|error| SessionIngressError::Mailbox(error.message))
+    .map_err(SessionIngressError::ControlTransport)
 }
 
 fn mailbox_external_ingress(
