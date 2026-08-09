@@ -727,33 +727,18 @@ impl SessionLifecycleRepository for StateDb {
     ) -> SessionLifecycleResult<Vec<ExternalIngress>> {
         validate_session_id(session_id)?;
         let limit = bounded_limit(limit)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let cursor = read_cursor(&tx, session_id)?;
-        let rows = {
-            let mut statement = tx.prepare(
-                "SELECT session_id, ingress_sequence, ingress_id, payload
-                 FROM session_external_ingress
-                 WHERE session_id = ? AND ingress_sequence > ?
-                 ORDER BY ingress_sequence
-                 LIMIT ?",
-            )?;
-            statement
-                .query_map(params![session_id, cursor, limit], map_ingress)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        if let Some(last) = rows.last() {
-            tx.execute(
-                "INSERT INTO session_external_ingress_cursors (session_id, last_sequence)
-                 VALUES (?, ?)
-                 ON CONFLICT(session_id) DO UPDATE SET last_sequence = excluded.last_sequence
-                 WHERE excluded.last_sequence > last_sequence",
-                params![session_id, last.sequence],
-            )?;
-        }
-        tx.commit()?;
-        Ok(rows)
+        let cursor = read_cursor(&self.conn, session_id)?;
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, ingress_sequence, ingress_id, payload
+             FROM session_external_ingress
+             WHERE session_id = ? AND ingress_sequence > ?
+             ORDER BY ingress_sequence
+             LIMIT ?",
+        )?;
+        statement
+            .query_map(params![session_id, cursor, limit], map_ingress)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn external_ingress_cursor(&self, session_id: &str) -> SessionLifecycleResult<i64> {

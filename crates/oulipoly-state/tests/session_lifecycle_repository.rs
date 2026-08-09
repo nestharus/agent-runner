@@ -365,17 +365,11 @@ fn bounded_reads_reject_a_zero_limit() {
 }
 
 #[test]
-fn external_ingress_cursor_is_monotonic_persisted_and_session_local() {
+fn external_ingress_reads_do_not_advance_the_acceptance_cursor() {
     let (dir, path, mut db) = store();
-    for (session, sequence, id) in [
-        ("session-a", 1, "a1"),
-        ("session-b", 1, "b1"),
-        ("session-a", 2, "a2"),
-        ("session-b", 2, "b2"),
-        ("session-a", 3, "a3"),
-    ] {
+    for (sequence, id) in [(1, "a1"), (2, "a2")] {
         db.append_external_ingress(&ExternalIngress {
-            session_id: session.to_owned(),
+            session_id: "session-a".to_owned(),
             sequence,
             ingress_id: id.to_owned(),
             payload: format!("payload-{id}"),
@@ -387,13 +381,17 @@ fn external_ingress_cursor_is_monotonic_persisted_and_session_local() {
         ingress_ids(db.read_external_ingress("session-a", 1).unwrap()),
         vec!["a1"]
     );
+    assert_eq!(db.external_ingress_cursor("session-a").unwrap(), 0);
+
+    let owner = supervisor(1, "owner");
+    db.acquire_supervisor_lease("session-a", &owner, 1).unwrap();
+    let first = db.read_external_ingress("session-a", 1).unwrap().remove(0);
     assert_eq!(
-        db.reconstruct_session("session-a", "scheduler", 10)
-            .unwrap()
-            .ingress_cursor,
-        1,
-        "the cursor advances only through the last bounded row returned"
+        db.accept_external_ingress(&first, &owner, "generation-a", 10)
+            .unwrap(),
+        ExternalIngressWrite::Accepted
     );
+    assert_eq!(db.external_ingress_cursor("session-a").unwrap(), 1);
     drop(db);
 
     let mut reopened = StateDb::open(&path).unwrap();
@@ -401,21 +399,7 @@ fn external_ingress_cursor_is_monotonic_persisted_and_session_local() {
         ingress_ids(reopened.read_external_ingress("session-a", 1).unwrap()),
         vec!["a2"]
     );
-    assert_eq!(
-        reopened
-            .reconstruct_session("session-a", "scheduler", 10)
-            .unwrap()
-            .ingress_cursor,
-        2
-    );
-    assert_eq!(
-        ingress_ids(reopened.read_external_ingress("session-a", 10).unwrap()),
-        vec!["a3"]
-    );
-    assert_eq!(
-        ingress_ids(reopened.read_external_ingress("session-b", 10).unwrap()),
-        vec!["b1", "b2"]
-    );
+    assert_eq!(reopened.external_ingress_cursor("session-a").unwrap(), 1);
     drop(reopened);
     drop(dir);
 }
@@ -641,15 +625,22 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
         process(502, "child-b"),
     ))
     .unwrap();
-    for (session, sequence, id) in [("session-a", 1, "a1"), ("session-b", 1, "b1")] {
-        db.append_external_ingress(&ExternalIngress {
-            session_id: session.to_owned(),
-            sequence,
-            ingress_id: id.to_owned(),
-            payload: id.to_owned(),
-        })
+    for (session, id, owner, generation) in [
+        ("session-a", "delivery-a", &lease_a, "generation-a"),
+        ("session-b", "delivery-b", &lease_b, "generation-b"),
+    ] {
+        db.accept_external_ingress(
+            &ExternalIngress {
+                session_id: session.to_owned(),
+                sequence: 1,
+                ingress_id: id.to_owned(),
+                payload: id.to_owned(),
+            },
+            owner,
+            generation,
+            20,
+        )
         .unwrap();
-        db.read_external_ingress(session, 1).unwrap();
     }
     db.accept_pending("delivery-a", "session-a", "generation-a", 20)
         .unwrap();
