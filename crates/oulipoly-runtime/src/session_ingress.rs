@@ -217,7 +217,10 @@ where
                 }
                 Err(SupervisorError::DuplicateOrStaleSequence) => {}
                 Err(SupervisorError::Expired) => {}
-                Err(error) => return Err(SessionIngressError::Supervisor(error)),
+                Err(error) => {
+                    self.recovered = false;
+                    return Err(SessionIngressError::Supervisor(error));
+                }
             }
         }
         Ok(drain)

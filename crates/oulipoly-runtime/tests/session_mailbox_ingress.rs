@@ -436,6 +436,61 @@ fn crash_windows_leave_unpersisted_persisted_and_accepted_work_recoverable() {
 }
 
 #[test]
+fn lifecycle_append_failure_rearms_accepted_pending_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let mailbox_path = dir.path().join("pid-identity.db");
+    let mut mailbox = MailboxDb::open(&mailbox_path).unwrap();
+    let row = enqueue(&mut mailbox, "session-a", "recover-after-append-failure");
+    let fence = owner(1, "append-failure");
+    let (owner, turns) = start_owner(&state_path, fence.clone(), 8);
+    let mut ingress = SessionMailboxIngress::new(
+        "session-a",
+        None,
+        fence,
+        4,
+        mailbox,
+        StateDb::open(&state_path).unwrap(),
+        map_notification,
+    )
+    .unwrap();
+    let connection = rusqlite::Connection::open(&state_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_lifecycle_append
+             BEFORE INSERT ON session_lifecycle_events
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced lifecycle append failure');
+             END;",
+        )
+        .unwrap();
+
+    assert!(matches!(
+        ingress.fallback_read(&owner, 10),
+        Err(SessionIngressError::Supervisor(_))
+    ));
+    assert_eq!(
+        StateDb::open(&state_path)
+            .unwrap()
+            .external_ingress_cursor("session-a")
+            .unwrap(),
+        row.seq
+    );
+    connection
+        .execute_batch("DROP TRIGGER fail_lifecycle_append;")
+        .unwrap();
+
+    let recovered = ingress.fallback_read(&owner, 11).unwrap();
+    assert_eq!(recovered.recovered_sequences, vec![row.seq]);
+    assert!(recovered.accepted_sequences.is_empty());
+    receive_turn(&turns)
+        .completion
+        .complete("done", 12)
+        .unwrap();
+    owner.close(13).unwrap();
+}
+
+#[test]
 fn pause_caps_and_no_overlap_are_preserved_at_the_adapter_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("state.db");
