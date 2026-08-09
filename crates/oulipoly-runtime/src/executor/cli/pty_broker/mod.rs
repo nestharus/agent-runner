@@ -3365,6 +3365,38 @@ print(json.dumps({
     }
 
     #[test]
+    fn broker_rejects_headless_resume_without_queueing_child_input() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_control_frame(
+            &mut client,
+            CONTROL_OP_HEADLESS_RESUME,
+            br#"{"session_id":"session-a"}"#,
+        )
+        .unwrap();
+        let (master, _peer) = socketpair_files();
+        let mut state = InputLineState::default();
+        let mut output_state = ChildOutputState::default();
+        let mut pending = PendingChildInput::new();
+
+        let result = {
+            let mut request_io = ControlRequestIo {
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut state,
+                child_output_state: &mut output_state,
+                pending_child_input: &mut pending,
+            };
+            process_control_request_with_pending(&mut server, &mut request_io, None)
+        };
+
+        assert_eq!(
+            result,
+            Err("headless_resume_requires_resident_owner".to_string())
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn pending_child_input_flush_some_is_nonblocking_under_backpressure() {
         let (_read_end, write_end) = pipe_files();
         set_nonblocking(write_end.as_raw_fd());
