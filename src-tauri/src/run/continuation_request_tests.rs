@@ -33,7 +33,7 @@ fn versioned_request_maps_exact_internal_contract() {
 }
 
 #[test]
-fn unsupported_request_version_or_kind_is_invalid_evidence() {
+fn unsupported_request_version_and_kind_have_distinct_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let mut wrong_version = valid_request_json();
     wrong_version["schema_version"] = json!(2);
@@ -50,8 +50,16 @@ fn unsupported_request_version_or_kind_is_invalid_evidence() {
         oulipoly_runtime::fresh_continuation::ContinuationBlockKind::InvalidEvidence
     );
     assert_eq!(
+        version_error.message,
+        "Unsupported fresh continuation request schema version 2 (expected 1)"
+    );
+    assert_eq!(
         kind_error.kind,
         oulipoly_runtime::fresh_continuation::ContinuationBlockKind::InvalidEvidence
+    );
+    assert_eq!(
+        kind_error.message,
+        "Unsupported fresh continuation request kind \"other_request\" (expected \"fresh_continuation_request\")"
     );
 }
 

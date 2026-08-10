@@ -78,10 +78,17 @@ fn parse_request(bytes: &[u8]) -> Result<FreshContinuationRequestV1, serde_json:
 fn validate_request_schema(
     request: FreshContinuationRequestV1,
 ) -> Result<FreshContinuationRequestV1, ContinuationBlock> {
-    if request.schema_version != SCHEMA_VERSION || request.kind != REQUEST_KIND {
-        return Err(invalid_request(
-            "Unsupported fresh continuation request schema or kind".to_string(),
-        ));
+    if request.schema_version != SCHEMA_VERSION {
+        return Err(invalid_request(format!(
+            "Unsupported fresh continuation request schema version {} (expected {SCHEMA_VERSION})",
+            request.schema_version
+        )));
+    }
+    if request.kind != REQUEST_KIND {
+        return Err(invalid_request(format!(
+            "Unsupported fresh continuation request kind {:?} (expected {REQUEST_KIND:?})",
+            request.kind
+        )));
     }
     Ok(request)
 }
