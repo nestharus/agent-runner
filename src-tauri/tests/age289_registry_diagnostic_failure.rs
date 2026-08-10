@@ -97,7 +97,7 @@ impl Fixture {
 }
 
 #[test]
-fn provider_exit_plus_registry_diagnostic_failure_preserves_primary_and_secondary_evidence() {
+fn provider_exit_plus_diagnostic_failure_preserves_primary_and_secondary_evidence() {
     let fixture = Fixture::new();
     let output = fixture.run_failure();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -110,22 +110,22 @@ fn provider_exit_plus_registry_diagnostic_failure_preserves_primary_and_secondar
     );
     assert!(
         stderr.contains(
-            "[diagnostics] Failed to diagnose: external provider protocol failed: registry_lookup"
+            "[diagnostics] Failed to diagnose: Failed to spawn 'age289-diagnostic-provider'"
         ),
         "{stderr}"
     );
 
     let diagnostic_failure = marker_payload(&stderr, "OULIPOLY_DIAGNOSTIC_FAILURE");
     assert_eq!(diagnostic_failure["stage"], "diagnostics");
-    assert_eq!(diagnostic_failure["operation"], "registry_lookup");
-    assert_eq!(diagnostic_failure["error_category"], "provider_protocol");
+    assert_eq!(diagnostic_failure["operation"], "diagnose_error");
+    assert_eq!(diagnostic_failure["error_category"], "diagnostics_failure");
     assert_eq!(diagnostic_failure["provider_exit_code"], 7);
 
     let result = marker_payload(&stdout, "OULIPOLY_RESULT");
     assert_eq!(result["success"], false);
     assert_eq!(result["exit_code"], 7);
     assert_eq!(result["terminal_reason"], "exit_nonzero");
-    assert_eq!(result["error_category"], "provider_protocol");
+    assert!(result["error_category"].is_null(), "{result}");
     assert_eq!(result["provider_name"], PRIMARY_PROVIDER);
     assert!(result["provider_session_id"].is_string(), "{result}");
     assert_eq!(
@@ -146,14 +146,14 @@ fn provider_exit_plus_registry_diagnostic_failure_preserves_primary_and_secondar
         .expect("invocation row");
     assert_eq!(row.status, InvocationStatus::Failed);
     assert_eq!(row.exit_code, Some(7));
-    assert_eq!(row.error_category.as_deref(), Some("provider_protocol"));
+    assert_eq!(row.error_category, None);
     assert_eq!(row.terminal_reason.as_deref(), Some("exit_nonzero"));
 
     let trace = fixture.trace(&invocation.id);
     let trace_invocation = &trace["root"]["invocation"];
     let trace_session = &trace["root"]["session"];
     assert_eq!(trace_invocation["id"], invocation.id);
-    assert_eq!(trace_invocation["error_category"], "provider_protocol");
+    assert!(trace_invocation["error_category"].is_null(), "{trace}");
     assert_eq!(trace_invocation["terminal_reason"], "exit_nonzero");
     assert_eq!(
         trace_session["provider_session_id"],

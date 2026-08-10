@@ -15,7 +15,7 @@ pub(super) fn render_diagnostics_result(
             emit_diagnostics_failure(&e);
             let failure = super::mapper::diagnostics_failure(&e, provider_exit_code);
             emit_diagnostics_failure_marker(&failure);
-            Some(failure.error_category.to_string())
+            None
         }
     }
 }
