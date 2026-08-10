@@ -3,6 +3,7 @@ pub mod delivery_evidence;
 pub mod diagnostics;
 pub mod discovery;
 pub mod executor;
+pub mod fresh_continuation;
 pub mod migration;
 pub mod observability;
 pub mod ports;
