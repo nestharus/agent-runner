@@ -510,36 +510,19 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         ],
     );
     let unconfirmed_result = result_envelope(&unconfirmed);
+    let unconfirmed_invocation_uuid = unconfirmed_result["id"].as_str().unwrap().to_owned();
     assert_eq!(unconfirmed.status.code(), Some(1), "{unconfirmed:?}");
     assert_eq!(unconfirmed_result["status"], "failed");
     assert_eq!(
         unconfirmed_result["error_category"],
         "resume_completion_unconfirmed"
     );
-    let pending = no_assistant.mailbox_row(notification.seq);
-    assert!(pending.delivered_at.is_none(), "{pending:?}");
-    assert!(
-        pending.delivered_by_invocation_uuid.is_none(),
-        "{pending:?}"
-    );
-    assert_eq!(pending.delivery_attempts, 1);
-
-    let retry = no_assistant.run_resume_with_env(
-        "retry owning workflow",
-        &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
-            ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
-            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
-        ],
-    );
-    assert_success(&retry);
-    let retry_invocation_uuid = result_envelope(&retry)["id"].as_str().unwrap().to_owned();
     let delivered = no_assistant.mailbox_row(notification.seq);
     assert!(delivered.delivered_at.is_some(), "{delivered:?}");
-    assert_eq!(delivered.delivery_attempts, 2);
+    assert_eq!(delivered.delivery_attempts, 1);
     assert_eq!(
         delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(retry_invocation_uuid.as_str())
+        Some(unconfirmed_invocation_uuid.as_str())
     );
 
     let later_resume = no_assistant.run_resume_with_env(
@@ -551,10 +534,10 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     );
     assert_success(&later_resume);
     let still_delivered = no_assistant.mailbox_row(notification.seq);
-    assert_eq!(still_delivered.delivery_attempts, 2);
+    assert_eq!(still_delivered.delivery_attempts, 1);
     assert_eq!(
         still_delivered.delivered_by_invocation_uuid.as_deref(),
-        Some(retry_invocation_uuid.as_str())
+        Some(unconfirmed_invocation_uuid.as_str())
     );
     no_assistant.assert_xdg_isolated();
 

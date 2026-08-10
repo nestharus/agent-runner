@@ -88,13 +88,9 @@ pub(super) fn handle_resume_attempt_result(
         provenance.age270_failure_applied,
     ) {
         Age270MailboxEligibility::Ineligible => None,
-        Age270MailboxEligibility::PreMutationCleanExit => {
-            Some(if classification.terminal_completion_confirmed {
-                wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence)
-            } else {
-                wake::MailboxDeliveryOutcome::Unconfirmed
-            })
-        }
+        Age270MailboxEligibility::PreMutationCleanExit => Some(
+            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
+        ),
     };
     handle_resume_attempt_terminal_signal(
         input,
@@ -375,10 +371,21 @@ fn terminal_signal_disposition_for_result(
         }
         TerminalSignalDisposition::MaybeQuotaVerify
     } else {
-        crate::terminal_outcome_adapter::apply_terminal_signal_outcome(
+        let disposition = crate::terminal_outcome_adapter::apply_terminal_signal_outcome(
             &terminal_signal,
             &mut terminal_signal_ctx,
-        )
+        );
+        if matches!(disposition, TerminalSignalDisposition::InteractiveClean)
+            && let Some(signal) = terminal_signal.as_ref()
+        {
+            let _ = crate::terminal_outcome_adapter::emit_terminal_signal_marker(
+                signal,
+                terminal_signal_ctx.invocation_id,
+                terminal_signal_ctx.session_id,
+                &mut terminal_signal_ctx.stderr,
+            );
+        }
+        disposition
     }
 }
 

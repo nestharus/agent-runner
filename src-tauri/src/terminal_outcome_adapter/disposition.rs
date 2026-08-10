@@ -52,10 +52,7 @@ pub fn apply_terminal_signal_outcome(
         | TerminalSignalDisposition::InteractiveFail => {
             apply_typed_post_failure_forensics_terminal_failure_side_effects(signal, ctx);
         }
-        TerminalSignalDisposition::InteractiveClean => {
-            emit_terminal_signal_marker_or_warn(signal, ctx)
-        }
-        TerminalSignalDisposition::NotApplicable => {}
+        TerminalSignalDisposition::InteractiveClean | TerminalSignalDisposition::NotApplicable => {}
     }
     disposition
 }
