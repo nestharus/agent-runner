@@ -137,7 +137,7 @@ fn format_stdin_read_error(error: std::io::Error) -> String {
     format!("Failed to read stdin: {error}")
 }
 
-fn format_missing_prompt_error() -> String {
+pub(crate) fn format_missing_prompt_error() -> String {
     "No prompt provided. Pass as argument, --file, or pipe to stdin.".to_string()
 }
 
