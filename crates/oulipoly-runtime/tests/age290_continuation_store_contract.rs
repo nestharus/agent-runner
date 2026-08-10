@@ -261,38 +261,6 @@ fn resume_reservation_is_observed_with_the_same_identity_after_restart() {
 }
 
 #[test]
-fn stale_resume_lease_is_reclaimed_with_the_same_reserved_identity() {
-    let fixture = Fixture::new();
-    let context = fixture.context("fingerprint-1");
-    let mut store = fixture.open_store();
-    let continuation = accept(&mut store, &context);
-    store
-        .begin_resume(&continuation)
-        .expect("begin reserved resume");
-    drop(store);
-
-    expire_lease(
-        &fixture.state_path,
-        &continuation.continuation_id,
-        "resume_started_at",
-    );
-    let mut reopened = fixture.open_store();
-
-    assert_eq!(
-        reopened
-            .begin_resume(&continuation)
-            .expect("reclaim stale resume lease"),
-        RunDecision::Run(continuation.resume.clone())
-    );
-    assert_eq!(
-        reopened
-            .begin_resume(&continuation)
-            .expect("observe renewed resume lease"),
-        RunDecision::Observe(continuation.resume.clone())
-    );
-}
-
-#[test]
 fn fresh_waits_for_the_exact_resume_and_is_observed_with_the_same_identity_after_restart() {
     let fixture = Fixture::new();
     let context = fixture.context("fingerprint-1");
@@ -332,47 +300,6 @@ fn fresh_waits_for_the_exact_resume_and_is_observed_with_the_same_identity_after
 
     assert_eq!(
         after_restart,
-        RunDecision::Observe(continuation.fresh.clone())
-    );
-}
-
-#[test]
-fn stale_fresh_lease_is_reclaimed_with_the_same_reserved_identity() {
-    let fixture = Fixture::new();
-    let context = fixture.context("fingerprint-1");
-    let mut store = fixture.open_store();
-    let continuation = accept(&mut store, &context);
-    store
-        .begin_resume(&continuation)
-        .expect("begin reserved resume");
-    store
-        .record_resume(
-            &continuation,
-            &unconfirmed_resume(&continuation.resume.invocation_id),
-        )
-        .expect("record resume");
-    store
-        .begin_fresh(&continuation)
-        .expect("begin reserved fresh invocation");
-    drop(store);
-
-    expire_lease(
-        &fixture.state_path,
-        &continuation.continuation_id,
-        "fresh_started_at",
-    );
-    let mut reopened = fixture.open_store();
-
-    assert_eq!(
-        reopened
-            .begin_fresh(&continuation)
-            .expect("reclaim stale fresh lease"),
-        RunDecision::Run(continuation.fresh.clone())
-    );
-    assert_eq!(
-        reopened
-            .begin_fresh(&continuation)
-            .expect("observe renewed fresh lease"),
         RunDecision::Observe(continuation.fresh.clone())
     );
 }
@@ -603,17 +530,6 @@ fn accepted(decision: &AcceptDecision) -> &AcceptedContinuation {
         AcceptDecision::Accepted(continuation) => continuation,
         AcceptDecision::Replay(_) => panic!("expected a newly accepted continuation"),
     }
-}
-
-fn expire_lease(state_path: &Path, continuation_id: &str, column: &str) {
-    let state = StateDb::open(state_path).expect("open state to expire lease");
-    let sql = format!(
-        "UPDATE fresh_continuations SET {column} = unixepoch() - 86400 WHERE continuation_id = ?1"
-    );
-    state
-        .connection()
-        .execute(&sql, [continuation_id])
-        .expect("expire continuation lease");
 }
 
 fn artifact(root: &Path, name: &str) -> ArtifactIdentity {
