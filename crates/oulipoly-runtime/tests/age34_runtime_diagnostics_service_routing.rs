@@ -2,8 +2,12 @@
 
 // Declared roles: mapper, formatter, accessor, orchestration, validator.
 
-use oulipoly_config::{InvocationMode, ModelConfig, PromptMode, ProviderConfig};
+use oulipoly_config::{
+    InvocationMode, ModelConfig, PromptMode, ProviderConfig,
+    provider_implementation_ref::ProviderImplementationRef,
+};
 use oulipoly_runtime::diagnostics::{self, ErrorCategory};
+use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{
     DiagnosticsServiceOutput, DiagnosticsServicePort, DiagnosticsServiceRequest,
 };
@@ -132,6 +136,77 @@ fn runtime_diagnostics_service_model_backed_mode_matches_direct_diagnose_error()
 
     assert_service_diagnosis_matches_direct(output, direct);
     assert_diagnostic_prompt_dump(&fixture.prompt_dump, stderr);
+}
+
+#[test]
+fn runtime_diagnostics_service_uses_supplied_registry_for_external_model() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("external-diagnostic-provider.sh");
+    write_executable(&script, external_diagnostic_provider_script());
+    let mut model = migrated_diagnostic_model();
+    model.provider = Some(ProviderImplementationRef {
+        path: Some(script.display().to_string()),
+        crate_name: None,
+        version: None,
+        binary: None,
+        script: None,
+    });
+    let provider = effective_diagnostic_provider(PathBuf::from("unused-external-command"));
+    let registry = ProviderRegistry::from_model_configs(
+        std::slice::from_ref(&model),
+        ProviderRegistryOptions::default(),
+    )
+    .expect("provider registry");
+    let service = diagnostics::RuntimeDiagnosticsService::new(Arc::new(registry));
+
+    let output = service
+        .diagnose(DiagnosticsServiceRequest::DiagnoseError {
+            diagnostics_model: model,
+            effective_provider: provider,
+            provider_index: 0,
+            prompt_mode: PromptMode::Stdin,
+            exit_code: 7,
+            stderr: "opaque primary provider failure".to_string(),
+            working_dir: Some(dir.path().to_path_buf()),
+        })
+        .expect("external diagnostics should use the service registry");
+
+    match output {
+        DiagnosticsServiceOutput::Diagnosis { diagnosis } => {
+            assert_eq!(diagnosis.category, ErrorCategory::NetworkError);
+            assert_eq!(diagnosis.summary, "external registry diagnostics worked");
+        }
+        other => panic!("expected Diagnosis output, got {other:?}"),
+    }
+}
+
+fn external_diagnostic_provider_script() -> &'static str {
+    r#"#!/usr/bin/env bash
+set -euo pipefail
+subcommand="${1:-}"
+request="$(cat)"
+request_id="$(printf '%s' "$request" | sed -n 's/.*"request_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+
+success_envelope() {
+  printf '{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":%s}\n' "$request_id" "$1"
+}
+
+case "$subcommand" in
+  describe)
+    success_envelope '{"provider_id":"external-diagnostics","display_name":"External Diagnostics","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{"launch":true,"policy":true,"quota":false,"session":false,"terminal":false,"rotation":false,"discovery":false,"settings":false,"setup_brain":false,"setup":false,"migration":false},"concurrency":{"safe_for_parallel_invocation":true,"state_locking":"none"}}'
+    ;;
+  policy.evaluate)
+    success_envelope '{"accepted":true,"stdin":null,"prompt":null,"diagnostics":[],"markers":[]}'
+    ;;
+  launch)
+    printf '{"contract":"oulipoly.provider/v1","request_id":"%s","seq":1,"time_unix_ms":1001,"kind":"stdout","data_base64":"bmV0d29ya19lcnJvcgpleHRlcm5hbCByZWdpc3RyeSBkaWFnbm9zdGljcyB3b3JrZWQK"}\n' "$request_id"
+    printf '{"contract":"oulipoly.provider/v1","request_id":"%s","seq":2,"time_unix_ms":1002,"kind":"exit","status":{"kind":"exited","code":0},"terminal_signal":{"kind":"clean_exit","evidence":"diagnostics-complete","observed_at_unix_ms":1002}}\n' "$request_id"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#
 }
 
 struct DiagnosticProviderFixture {
@@ -277,8 +352,8 @@ fn diagnose_error_preserves_invocation_mode_into_executor_reentry() {
     let source = include_str!("../src/diagnostics/mod.rs");
     let body = source_from(source, "pub fn diagnose_error");
     let reentry_idx = body
-        .find("executor::execute_effective_with_inputs_and_env")
-        .expect("diagnose_error must re-enter the executor");
+        .find("executor.execute_effective(request)")
+        .expect("diagnose_error must re-enter the registry-bound executor");
     let before_reentry = &body[..reentry_idx];
 
     assert!(

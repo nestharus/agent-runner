@@ -13,11 +13,14 @@ pub(crate) fn run_diagnostics(
     working_dir: Option<&Path>,
 ) -> Option<String> {
     let context = super::mapper::diagnostics_context(models)?;
-    super::formatter::render_diagnostics_result(super::service::run_diagnostics_service(
-        agent_runtime_services,
-        context,
-        provider_output,
+    super::formatter::render_diagnostics_result(
+        super::service::run_diagnostics_service(
+            agent_runtime_services,
+            context,
+            provider_output,
+            exit_code,
+            working_dir,
+        ),
         exit_code,
-        working_dir,
-    ))
+    )
 }
