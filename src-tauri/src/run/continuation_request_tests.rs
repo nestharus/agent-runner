@@ -37,11 +37,10 @@ fn unsupported_request_version_or_kind_is_invalid_evidence() {
     let dir = tempfile::tempdir().unwrap();
     let mut wrong_version = valid_request_json();
     wrong_version["schema_version"] = json!(2);
-    let version_path = write_request(dir.path(), wrong_version);
+    let version_path = write_named_request(dir.path(), "version.json", wrong_version);
     let mut wrong_kind = valid_request_json();
     wrong_kind["kind"] = json!("other_request");
-    let kind_path = dir.path().join("kind.json");
-    fs::write(&kind_path, serde_json::to_vec(&wrong_kind).unwrap()).unwrap();
+    let kind_path = write_named_request(dir.path(), "kind.json", wrong_kind);
 
     let version_error = super::continuation_request::read(&version_path).unwrap_err();
     let kind_error = super::continuation_request::read(&kind_path).unwrap_err();
@@ -151,7 +150,11 @@ fn fresh_prompt_contains_references_not_artifact_bodies() {
 }
 
 fn write_request(root: &Path, value: serde_json::Value) -> PathBuf {
-    let path = root.join("request.json");
+    write_named_request(root, "request.json", value)
+}
+
+fn write_named_request(root: &Path, name: &str, value: serde_json::Value) -> PathBuf {
+    let path = root.join(name);
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     path
 }
