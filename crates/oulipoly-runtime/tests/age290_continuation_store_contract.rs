@@ -36,6 +36,31 @@ fn accept_reuses_exact_reserved_identities_for_the_same_validated_context() {
 }
 
 #[test]
+fn reserved_invocation_identities_are_valid_distinct_uuids() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let mut store = fixture.open_store();
+
+    let continuation = accept(&mut store, &context);
+
+    assert_eq!(
+        continuation.resume.parent_invocation_id,
+        context.request.origin_invocation_id
+    );
+    assert_eq!(
+        continuation.fresh.parent_invocation_id,
+        continuation.resume.invocation_id
+    );
+
+    let resume_invocation_id = uuid::Uuid::parse_str(&continuation.resume.invocation_id)
+        .expect("reserved resume invocation identity must be a valid UUID");
+    let fresh_invocation_id = uuid::Uuid::parse_str(&continuation.fresh.invocation_id)
+        .expect("reserved fresh invocation identity must be a valid UUID");
+
+    assert_ne!(resume_invocation_id, fresh_invocation_id);
+}
+
+#[test]
 fn accept_rejects_a_changed_fingerprint_for_the_same_logical_request() {
     let fixture = Fixture::new();
     let context = fixture.context("fingerprint-1");
