@@ -138,6 +138,7 @@ fn ti_06_probe_and_classifier_report_migratable_without_mutation() {
 
     let report = schema_probe::inspect_schema(&conn, db_path.clone()).unwrap();
     assert_eq!(report.user_version as i32, MINIMUM_SUPPORTED_SCHEMA_VERSION);
+    assert_eq!(report.tables.get("fresh_continuations"), Some(&false));
     assert!(
         report.migratable,
         "old supported DB must be distinguishable from incompatible old state"
@@ -158,6 +159,7 @@ fn ti_07_ti_22_schema_constants_are_single_source_for_probe_and_fixtures() {
     let db = StateDb::open(&db_path).unwrap();
     let report = schema_probe::inspect_schema(db.connection(), db_path).unwrap();
 
+    assert_eq!(report.tables.get("fresh_continuations"), Some(&true));
     assert_eq!(
         report.current_schema_version as i32, CURRENT_SCHEMA_VERSION,
         "schema probe must import oulipoly_state::schema::CURRENT_SCHEMA_VERSION"
