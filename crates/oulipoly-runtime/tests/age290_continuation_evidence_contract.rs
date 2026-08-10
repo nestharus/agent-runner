@@ -69,7 +69,7 @@ fn graph_and_trace_must_bind_the_origin_invocation_and_session() {
     let mut fixture = EvidenceFixture::valid();
     fixture.replace(
         "/planning/trace.json",
-        br#"{"root":{"invocation":{"invocation_uuid":"other","provider_session_id":"origin-session"}}}"#,
+        br#"{"root":{"invocation":{"id":"other"},"session":{"provider_session_id":"origin-session"}}}"#,
     );
     let mut validator = fixture.validator();
 
@@ -77,6 +77,33 @@ fn graph_and_trace_must_bind_the_origin_invocation_and_session() {
 
     assert_eq!(error.kind, ContinuationBlockKind::InvalidEvidence);
     assert!(error.message.contains("origin"), "{error:?}");
+}
+
+#[test]
+fn answer_must_be_authorized_by_the_root() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.replace(
+        "/planning/answer.json",
+        br#"{"schema_version":1,"kind":"agent_answer","question_id":"question-1","answered_by":"model","continuation_plan":{"session_graph_manifest":"/planning/graph.json"}}"#,
+    );
+    let mut validator = fixture.validator();
+
+    let error = validator.validate(&fixture.request).unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::InvalidEvidence);
+    assert!(error.message.contains("answer"), "{error:?}");
+}
+
+#[test]
+fn planning_root_must_contain_every_bound_artifact() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.request.planning_root = PathBuf::from("/other-planning-root");
+    let mut validator = fixture.validator();
+
+    let error = validator.validate(&fixture.request).unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::InvalidEvidence);
+    assert!(error.message.contains("planning"), "{error:?}");
 }
 
 #[test]
@@ -100,11 +127,11 @@ impl EvidenceFixture {
         let files = HashMap::from([
             (
                 PathBuf::from("/planning/question.json"),
-                br#"{"schema_version":1,"kind":"agent_question","question_id":"question-1","origin":{"invocation_uuid":"origin-invocation","session_id":"origin-session","worktree_path":"/worktree"},"state_refs":{"session_graph_manifest":"/planning/graph.json"}}"#.to_vec(),
+                br#"{"schema_version":1,"kind":"agent_question","question_id":"question-1","origin":{"invocation_uuid":"origin-invocation","session_id":"unknown","worktree_path":"/worktree"},"state_refs":{"session_graph_manifest":"unknown"}}"#.to_vec(),
             ),
             (
                 PathBuf::from("/planning/answer.json"),
-                br#"{"schema_version":1,"kind":"agent_answer","question_id":"question-1"}"#.to_vec(),
+                br#"{"schema_version":1,"kind":"agent_answer","question_id":"question-1","answered_by":"user-via-root-orchestrator","continuation_plan":{"session_graph_manifest":"/planning/graph.json"}}"#.to_vec(),
             ),
             (
                 PathBuf::from("/planning/graph.json"),
@@ -112,7 +139,7 @@ impl EvidenceFixture {
             ),
             (
                 PathBuf::from("/planning/trace.json"),
-                br#"{"root":{"invocation":{"invocation_uuid":"origin-invocation","provider_session_id":"origin-session"}}}"#.to_vec(),
+                br#"{"root":{"invocation":{"id":"origin-invocation"},"session":{"provider_session_id":"origin-session"}}}"#.to_vec(),
             ),
             (
                 PathBuf::from("/planning/ticket.md"),
