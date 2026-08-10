@@ -22,7 +22,7 @@ use crate::resume_cli::{
 use crate::spawn_cwd::effective_resume_spawn_cwd;
 use crate::wiring;
 
-pub(super) struct PreparedHeadlessResumeExecution {
+pub(in crate::run) struct PreparedHeadlessResumeExecution {
     pub(super) answer: Option<String>,
     pub(super) mailbox_session_id: String,
     pub(super) mailbox_delivery_seqs: Vec<i64>,
@@ -46,7 +46,7 @@ pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_headless_resume_execution(
+pub(in crate::run) fn prepare_headless_resume_execution(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
@@ -171,15 +171,17 @@ pub(super) fn prepare_resume_attempt_target(
             Ok(target) => target,
             Err(exit_code) => return Ok(Err(exit_code)),
         };
-    if let Err(exit_code) = migration::migrate_resume_target(
-        input.agent_runtime_services,
-        input.env,
-        input.resolved,
-        &mut target,
-        input.manual_migrate,
-        input.attempts,
-        input.effective_spawn_cwd,
-    ) {
+    if super::migration_allowed(input.reservation)
+        && let Err(exit_code) = migration::migrate_resume_target(
+            input.agent_runtime_services,
+            input.env,
+            input.resolved,
+            &mut target,
+            input.manual_migrate,
+            input.attempts,
+            input.effective_spawn_cwd,
+        )
+    {
         return Ok(Err(exit_code));
     }
     Ok(Ok(target))

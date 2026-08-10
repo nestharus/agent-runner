@@ -6,6 +6,7 @@ use std::path::Path;
 
 use super::{execution, lifecycle, terminal, wake};
 use crate::migration_providers::ResumeExecutionEnvironment;
+use crate::run::reservation::ReservedRun;
 use crate::wiring;
 use crate::zero_turn_orchestration::ZeroTurnConfirmationState;
 
@@ -47,9 +48,31 @@ pub(crate) fn run_resume(
             return Ok(exit_code);
         }
     };
+    run_prepared_resume(
+        agent_runtime_services,
+        &mut prepared,
+        None,
+        manual_migrate,
+        session_id,
+        working_dir,
+    )
+}
+
+pub(in crate::run) fn run_prepared_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    prepared: &mut execution::PreparedHeadlessResumeExecution,
+    reservation: Option<&ReservedRun>,
+    manual_migrate: Option<&str>,
+    session_id: &str,
+    working_dir: Option<&Path>,
+) -> Result<i32, String> {
+    if reservation.is_some() && manual_migrate.is_some() {
+        return Err("Reserved resume execution cannot migrate providers".to_string());
+    }
     let result = run_resume_loop(ResumeLoopInput {
         agent_runtime_services,
-        prepared: &mut prepared,
+        prepared,
+        reservation,
         manual_migrate,
         session_id,
         working_dir,
@@ -61,6 +84,7 @@ pub(crate) fn run_resume(
 struct ResumeLoopInput<'a> {
     agent_runtime_services: &'a wiring::AgentRuntimeServices,
     prepared: &'a mut execution::PreparedHeadlessResumeExecution,
+    reservation: Option<&'a ReservedRun>,
     manual_migrate: Option<&'a str>,
     session_id: &'a str,
     working_dir: Option<&'a Path>,
@@ -72,7 +96,8 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
     let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
 
     loop {
-        if terminal::resume_attempts_exhausted(attempts, input.prepared.max_attempts) {
+        let max_attempts = super::max_attempts(input.prepared.max_attempts, input.reservation);
+        if terminal::resume_attempts_exhausted(attempts, max_attempts) {
             return Ok(terminal::resume_attempts_exhausted_exit_code(
                 last_exit_code,
             ));
@@ -91,11 +116,15 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
                 .prepared
                 .mailbox_delivery_requires_turn_confirmation,
             manual_migrate: input.manual_migrate,
+            reservation: input.reservation,
             session_id: input.session_id,
             working_dir: input.working_dir,
             attempts,
-            max_attempts: input.prepared.max_attempts,
-            parent_invocation_id: input.prepared.parent_invocation_id,
+            max_attempts,
+            parent_invocation_id: super::parent_invocation_row_id(
+                input.prepared.parent_invocation_id,
+                input.reservation,
+            ),
             effective_spawn_cwd: &input.prepared.effective_spawn_cwd,
             zero_turn_confirmation: &mut zero_turn_confirmation,
         })? {
@@ -115,6 +144,7 @@ pub(super) struct ResumeAttemptInput<'a> {
     pub(super) mailbox_delivery_nonce: Option<&'a str>,
     pub(super) mailbox_delivery_requires_turn_confirmation: bool,
     pub(super) manual_migrate: Option<&'a str>,
+    pub(super) reservation: Option<&'a ReservedRun>,
     pub(super) session_id: &'a str,
     pub(super) working_dir: Option<&'a Path>,
     pub(super) attempts: usize,

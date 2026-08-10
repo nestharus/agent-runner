@@ -65,7 +65,7 @@ fn start_resume_invocation<'state>(
     provider: &oulipoly_config::ProviderConfig,
     provider_index: usize,
 ) -> Result<ResumeInvocationAttempt<'state>, String> {
-    let invocation = super::composite_invocation_id(&provider.name, None);
+    let invocation = super::composite_invocation_id(&provider.name, input.reservation);
     let invocation_start = mapper::resume_invocation_start(
         &invocation,
         input.resolved.model_name.as_deref(),
