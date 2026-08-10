@@ -258,7 +258,7 @@ fn verify_artifact_identity(
 ) -> Result<Vec<u8>, ContinuationBlock> {
     let actual = format!("{:x}", Sha256::digest(&bytes));
     require_identity(
-        actual == artifact.sha256,
+        actual.eq_ignore_ascii_case(&artifact.sha256),
         &format!("{name} artifact hash identity does not match its declared sha256"),
     )?;
     Ok(bytes)

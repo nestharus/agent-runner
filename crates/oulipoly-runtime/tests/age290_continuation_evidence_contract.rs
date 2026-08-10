@@ -57,6 +57,15 @@ fn matching_artifacts_produce_a_stable_validated_context() {
 }
 
 #[test]
+fn uppercase_artifact_hash_is_accepted() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.request.evidence.question.sha256 =
+        fixture.request.evidence.question.sha256.to_ascii_uppercase();
+
+    fixture.validated();
+}
+
+#[test]
 fn changed_question_id_changes_the_validated_fingerprint() {
     let mut fixture = EvidenceFixture::valid();
     let original = fixture.fingerprint();
