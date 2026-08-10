@@ -20,6 +20,9 @@
 - `crates/oulipoly-runtime/src/services/session_window.rs`
 - `crates/oulipoly-runtime/src/services/trace_failure.rs`
 - `crates/oulipoly-runtime/src/ports/mod.rs`
+- `src-tauri/src/commands/diagnostics/formatter.rs`
+- `src-tauri/src/commands/diagnostics/mapper.rs`
+- `src-tauri/src/commands/diagnostics/orchestration.rs`
 
 ## Preconditions
 
@@ -41,6 +44,8 @@
 | Trace failure occurs (e.g. trace sink is unreachable). | `services/trace_failure.rs` emits a typed `TraceFailure` carrying the cause without surfacing through the user-facing return path. |
 | Marker handling (OULIPOLY marker in stream). | `services/marker.rs` parses + buffers; downstream consumers (recognizer) read parsed markers, never raw bytes. |
 | Heuristic category fallback sees generic auth wording. | `diagnostics/mod.rs` classifies only specific auth-expired sentinels such as `unauthorized` and `token expired`; generic `auth` text is left for more-specific classifiers or falls through rather than becoming `AuthExpired`. |
+| An external diagnostics model executes through `RuntimeDiagnosticsService`. | The service reuses its populated provider registry for the external model while built-in diagnostics remain on the registry-free executor path. |
+| Primary provider execution fails and fallback diagnostics also fails. | The primary exit, terminal reason, stderr, invocation, and provider-session identity remain authoritative; the secondary failure emits one `OULIPOLY_DIAGNOSTIC_FAILURE` marker with its operation and settles a typed non-null error category. |
 | A live-only observability snapshot reads chronological logical children after terminal history fills the invocation cap. | The invocation projection stably prioritizes durable `Running` candidates before terminal candidates, then applies the existing finite traversal cap and exact PID/boot/start-time liveness validation. Terminal-inclusive snapshots retain the chronological child order. |
 
 ## Edge cases
@@ -57,6 +62,9 @@
   but lacks a specific expired/unauthorized sentinel must not be upgraded
   to `AuthExpired`; this preserves unknown observability and avoids hiding
   provider failures behind an overbroad auth bucket.
+- A secondary external-provider protocol failure such as `registry_lookup`
+  must not replace the primary provider exit or synthesize an agent result;
+  its structured diagnostics marker records the secondary operation.
 - Durable `Running` status only changes candidate order in a live-only
   projection. Missing, dead, or mismatched process identity still fails
   closed, and unrelated invocations remain outside the logical subtree.
@@ -98,6 +106,7 @@ tests on the ports surface, fixture tests on the trace envelope schema.
 - `crates/oulipoly-runtime/tests/service_traits_compile.rs`
 - `crates/oulipoly-runtime/tests/resume_service_parity.rs`
 - `src-tauri/tests/age27_diagnostics_effective_provider.rs`
+- `src-tauri/tests/age289_registry_diagnostic_failure.rs`
 - `src-tauri/tests/age_54_trace_row_preservation.rs`
 - `src-tauri/tests/pr_b_trace_integration.rs`
 - `src-tauri/tests/pipeline_status_propagation_rca/age158_characterization.rs`

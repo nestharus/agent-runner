@@ -160,6 +160,25 @@ impl RuntimeExecutorService {
     pub fn with_registry_handle(provider_registry: ProviderRegistryHandle) -> Self {
         Self { provider_registry }
     }
+
+    pub(crate) fn execute_effective(
+        &self,
+        request: cli::EffectiveExecuteRequest<'_>,
+    ) -> Result<ExecutionResult, String> {
+        self.execute(ExecutorServiceRequest::Effective {
+            model: request.model.clone(),
+            provider: request.provider.clone(),
+            provider_index: request.provider_index,
+            prompt_mode: request.prompt_mode,
+            prompt: request.prompt.to_string(),
+            working_dir: request.working_dir.map(Path::to_path_buf),
+            models_dir: request.models_dir.map(Path::to_path_buf),
+            extra_inputs: request.extra_inputs.clone(),
+            parent_invocation_env: request.parent_invocation_env.map(str::to_string),
+        })
+        .map(|output| output.result)
+        .map_err(|error| error.to_string())
+    }
 }
 
 impl Default for RuntimeExecutorService {
@@ -503,21 +522,7 @@ pub fn execute_with_inputs_and_env(
 pub fn execute_effective_with_inputs_and_env(
     request: cli::EffectiveExecuteRequest<'_>,
 ) -> Result<ExecutionResult, String> {
-    let service = RuntimeExecutorService::default();
-    service
-        .execute(ExecutorServiceRequest::Effective {
-            model: request.model.clone(),
-            provider: request.provider.clone(),
-            provider_index: request.provider_index,
-            prompt_mode: request.prompt_mode,
-            prompt: request.prompt.to_string(),
-            working_dir: request.working_dir.map(Path::to_path_buf),
-            models_dir: request.models_dir.map(Path::to_path_buf),
-            extra_inputs: request.extra_inputs.clone(),
-            parent_invocation_env: request.parent_invocation_env.map(str::to_string),
-        })
-        .map(|output| output.result)
-        .map_err(|error| error.to_string())
+    RuntimeExecutorService::default().execute_effective(request)
 }
 
 // Characterization test for AGE-8 — pins current behavior of executor/mod.rs facade wrappers in this inline test module.

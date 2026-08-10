@@ -48,6 +48,8 @@ pub enum ErrorCategory {
     NetworkError,
     HungSubprocess,
     ResumeSessionMismatch,
+    ProviderProtocol,
+    DiagnosticsFailure,
     Unknown,
 }
 
@@ -61,6 +63,8 @@ impl ErrorCategory {
             ErrorCategory::NetworkError => "network_error",
             ErrorCategory::HungSubprocess => "hung_subprocess",
             ErrorCategory::ResumeSessionMismatch => "resume_session_mismatch",
+            ErrorCategory::ProviderProtocol => "provider_protocol",
+            ErrorCategory::DiagnosticsFailure => "diagnostics_failure",
             ErrorCategory::Unknown => "unknown",
         }
     }
@@ -107,15 +111,15 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
                 exit_code,
                 stderr,
                 working_dir,
-            } => diagnose_error_request(
-                &diagnostics_model,
-                &effective_provider,
+            } => diagnose_error_request(DiagnoseErrorInput {
+                diagnostics_model: &diagnostics_model,
+                effective_provider: &effective_provider,
                 provider_index,
                 prompt_mode,
                 exit_code,
-                &stderr,
-                working_dir.as_deref(),
-            )
+                stderr: &stderr,
+                working_dir: working_dir.as_deref(),
+            })
             .map_err(|message| ServiceError::Dependency { message }),
         }
     }
@@ -131,25 +135,20 @@ fn diagnose_terminal_classify_request(
     ))
 }
 
-fn diagnose_error_request(
-    diagnostics_model: &ModelConfig,
-    effective_provider: &ProviderConfig,
+struct DiagnoseErrorInput<'a> {
+    diagnostics_model: &'a ModelConfig,
+    effective_provider: &'a ProviderConfig,
     provider_index: usize,
     prompt_mode: PromptMode,
     exit_code: i32,
-    stderr: &str,
-    working_dir: Option<&Path>,
+    stderr: &'a str,
+    working_dir: Option<&'a Path>,
+}
+
+fn diagnose_error_request(
+    input: DiagnoseErrorInput<'_>,
 ) -> Result<DiagnosticsServiceOutput, String> {
-    diagnose_error(
-        diagnostics_model,
-        effective_provider,
-        provider_index,
-        prompt_mode,
-        exit_code,
-        stderr,
-        working_dir,
-    )
-    .map(diagnostics_service_diagnosis_output)
+    diagnose_error_inner(input).map(diagnostics_service_diagnosis_output)
 }
 
 fn diagnostics_service_diagnosis_output(diagnosis: Diagnosis) -> DiagnosticsServiceOutput {
@@ -223,20 +222,32 @@ pub fn diagnose_error(
     stderr: &str,
     working_dir: Option<&Path>,
 ) -> Result<Diagnosis, String> {
-    let truncated = truncate_stderr_for_prompt(stderr);
-    let prompt = format_diagnosis_prompt(exit_code, &truncated);
-    let extra_inputs = HashMap::new();
-    let request = diagnostic_execute_request(
+    diagnose_error_inner(DiagnoseErrorInput {
         diagnostics_model,
         effective_provider,
         provider_index,
         prompt_mode,
-        &prompt,
+        exit_code,
+        stderr,
         working_dir,
+    })
+}
+
+fn diagnose_error_inner(input: DiagnoseErrorInput<'_>) -> Result<Diagnosis, String> {
+    let truncated = truncate_stderr_for_prompt(input.stderr);
+    let prompt = format_diagnosis_prompt(input.exit_code, &truncated);
+    let extra_inputs = HashMap::new();
+    let request = diagnostic_execute_request(
+        input.diagnostics_model,
+        input.effective_provider,
+        input.provider_index,
+        input.prompt_mode,
+        &prompt,
+        input.working_dir,
         &extra_inputs,
     );
     let result = execute_diagnostics_request(request)?;
-    diagnosis_from_execution_result(&result, stderr, exit_code)
+    diagnosis_from_execution_result(&result, input.stderr, input.exit_code)
 }
 
 fn diagnostic_execute_request<'a>(
@@ -264,7 +275,7 @@ fn diagnostic_execute_request<'a>(
 fn execute_diagnostics_request(
     request: executor::cli::EffectiveExecuteRequest<'_>,
 ) -> Result<executor::ExecutionResult, String> {
-    executor::execute_effective_with_inputs_and_env(request)
+    executor::cli::execute_effective(request)
 }
 
 fn diagnosis_from_execution_result(
@@ -293,6 +304,8 @@ fn map_error_category_token(token: &str) -> ErrorCategory {
         "network_error" => ErrorCategory::NetworkError,
         "hung_subprocess" => ErrorCategory::HungSubprocess,
         "resume_session_mismatch" => ErrorCategory::ResumeSessionMismatch,
+        "provider_protocol" => ErrorCategory::ProviderProtocol,
+        "diagnostics_failure" => ErrorCategory::DiagnosticsFailure,
         _ => ErrorCategory::Unknown,
     }
 }
