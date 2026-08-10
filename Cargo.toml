@@ -31,6 +31,8 @@ edition = "2024"
 rust-version = "1.88"
 
 [workspace.dependencies]
+cap-fs-ext = "4"
+cap-std = "4"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6"

@@ -169,9 +169,19 @@ pub(in crate::run) fn execute_with_callbacks(
         &InvocationOutcome,
     ) -> Result<(), ContinuationBlock>,
 ) -> FreshContinuationOutcome {
-    let validator = DefaultContinuationEvidenceValidator::new(
-        FilesystemContinuationArtifactSource::new(&request.planning_root),
-    );
+    let artifact_source = match FilesystemContinuationArtifactSource::new(&request.planning_root) {
+        Ok(source) => source,
+        Err(reason) => {
+            return FreshContinuationOutcome::Blocked {
+                continuation_id: None,
+                resume: None,
+                fresh: None,
+                handoff: None,
+                reason,
+            };
+        }
+    };
+    let validator = DefaultContinuationEvidenceValidator::new(artifact_source);
     let store = StateDbContinuationStore::new(store_state);
     let resume = ContinuationResumeRunner::new(observation_state, resume_execution);
     let fresh = ContinuationFreshRunner::new(observation_state, fresh_execution);

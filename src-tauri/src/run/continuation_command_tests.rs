@@ -43,7 +43,8 @@ fn filesystem_evidence_reader_rejects_a_symlink_outside_the_planning_root() {
     let linked = planning_root.join("linked.json");
     symlink(&outside, &linked).unwrap();
     let mut source =
-        super::continuation_artifact::FilesystemContinuationArtifactSource::new(&planning_root);
+        super::continuation_artifact::FilesystemContinuationArtifactSource::new(&planning_root)
+            .unwrap();
 
     let error = source
         .read(&ArtifactIdentity {
@@ -53,6 +54,59 @@ fn filesystem_evidence_reader_rejects_a_symlink_outside_the_planning_root() {
         .unwrap_err();
 
     assert_eq!(error.kind, ContinuationBlockKind::InvalidEvidence);
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_evidence_reader_rejects_symlinked_parent_traversal() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let planning_root = temp.path().join("planning");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&planning_root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("artifact.json"), b"outside").unwrap();
+    symlink(&outside, planning_root.join("linked")).unwrap();
+    let mut source =
+        super::continuation_artifact::FilesystemContinuationArtifactSource::new(&planning_root)
+            .unwrap();
+
+    let error = source
+        .read(&ArtifactIdentity {
+            path: planning_root.join("linked/artifact.json"),
+            sha256: format!("{:x}", Sha256::digest(b"outside")),
+        })
+        .unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::InvalidEvidence);
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_evidence_reader_uses_the_retained_planning_root_handle() {
+    let temp = tempfile::tempdir().unwrap();
+    let planning_root = temp.path().join("planning");
+    let moved_root = temp.path().join("moved-planning");
+    let artifact_path = planning_root.join("artifact.json");
+    fs::create_dir(&planning_root).unwrap();
+    fs::write(&artifact_path, b"original").unwrap();
+    let mut source =
+        super::continuation_artifact::FilesystemContinuationArtifactSource::new(&planning_root)
+            .unwrap();
+
+    fs::rename(&planning_root, &moved_root).unwrap();
+    fs::create_dir(&planning_root).unwrap();
+    fs::write(&artifact_path, b"replacement").unwrap();
+
+    let bytes = source
+        .read(&ArtifactIdentity {
+            path: artifact_path,
+            sha256: format!("{:x}", Sha256::digest(b"original")),
+        })
+        .unwrap();
+
+    assert_eq!(bytes, b"original");
 }
 
 #[test]
