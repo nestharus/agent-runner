@@ -32,15 +32,21 @@ pub struct ContinuationRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContinuationResumeAcceptance {
+    #[serde(rename = "Accepted")]
     Accepted,
+    #[serde(rename = "Rejected")]
     Rejected,
+    #[serde(rename = "Unconfirmed")]
     Unconfirmed,
+    #[serde(rename = "NotApplicable")]
     NotApplicable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContinuationInvocationDisposition {
+    #[serde(rename = "Succeeded")]
     Succeeded,
+    #[serde(rename = "Failed")]
     Failed {
         error_category: String,
         terminal_reason: String,
@@ -118,3 +124,42 @@ impl fmt::Display for ContinuationRepositoryError {
 }
 
 impl std::error::Error for ContinuationRepositoryError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_invocation_outcome_json_shape_is_stable() {
+        let succeeded = ContinuationInvocationOutcome {
+            invocation_id: "resume-invocation".to_string(),
+            session_id: Some("session-1".to_string()),
+            physical_exit_code: 0,
+            acceptance: ContinuationResumeAcceptance::Accepted,
+            disposition: ContinuationInvocationDisposition::Succeeded,
+        };
+        let succeeded_json = r#"{"invocation_id":"resume-invocation","session_id":"session-1","physical_exit_code":0,"acceptance":"Accepted","disposition":"Succeeded"}"#;
+        assert_eq!(serde_json::to_string(&succeeded).unwrap(), succeeded_json);
+        assert_eq!(
+            serde_json::from_str::<ContinuationInvocationOutcome>(succeeded_json).unwrap(),
+            succeeded
+        );
+
+        let failed = ContinuationInvocationOutcome {
+            invocation_id: "fresh-invocation".to_string(),
+            session_id: None,
+            physical_exit_code: 1,
+            acceptance: ContinuationResumeAcceptance::NotApplicable,
+            disposition: ContinuationInvocationDisposition::Failed {
+                error_category: "invocation".to_string(),
+                terminal_reason: "process exited".to_string(),
+            },
+        };
+        let failed_json = r#"{"invocation_id":"fresh-invocation","session_id":null,"physical_exit_code":1,"acceptance":"NotApplicable","disposition":{"Failed":{"error_category":"invocation","terminal_reason":"process exited"}}}"#;
+        assert_eq!(serde_json::to_string(&failed).unwrap(), failed_json);
+        assert_eq!(
+            serde_json::from_str::<ContinuationInvocationOutcome>(failed_json).unwrap(),
+            failed
+        );
+    }
+}
