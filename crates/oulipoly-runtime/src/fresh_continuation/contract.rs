@@ -141,6 +141,12 @@ pub enum RunDecision {
     Terminal(Box<FreshContinuationOutcome>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvocationAction {
+    Run,
+    Observe,
+}
+
 pub trait ContinuationEvidenceValidator {
     fn validate(
         &mut self,
@@ -190,6 +196,7 @@ pub trait ContinuationStore {
 pub trait ResumeRunner {
     fn run_or_observe(
         &mut self,
+        action: InvocationAction,
         reservation: &ReservedInvocation,
         context: &ValidatedContinuation,
     ) -> InvocationOutcome;
@@ -198,6 +205,7 @@ pub trait ResumeRunner {
 pub trait FreshRunner {
     fn run_or_observe(
         &mut self,
+        action: InvocationAction,
         reservation: &ReservedInvocation,
         context: &ValidatedContinuation,
         resume: &InvocationOutcome,

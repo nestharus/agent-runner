@@ -1,8 +1,8 @@
 use super::contract::{
     AcceptDecision, ContinuationBlock, ContinuationBlockKind, ContinuationEvidenceValidator,
     ContinuationHandoff, ContinuationStore, FreshContinuation, FreshContinuationOutcome,
-    FreshContinuationRequest, FreshRunner, HandoffPublisher, InvocationDisposition,
-    InvocationOutcome, ResumeAcceptance, ResumeRunner, RunDecision,
+    FreshContinuationRequest, FreshRunner, HandoffPublisher, InvocationAction,
+    InvocationDisposition, InvocationOutcome, ResumeAcceptance, ResumeRunner, RunDecision,
 };
 
 pub struct FreshContinuationCoordinator<Validator, Store, Resume, Fresh, Publisher> {
@@ -70,8 +70,9 @@ where
             }
         };
 
-        let resume_reservation = match self.store.begin_resume(&continuation) {
-            Ok(RunDecision::Run(reservation) | RunDecision::Observe(reservation)) => reservation,
+        let (resume_action, resume_reservation) = match self.store.begin_resume(&continuation) {
+            Ok(RunDecision::Run(reservation)) => (InvocationAction::Run, reservation),
+            Ok(RunDecision::Observe(reservation)) => (InvocationAction::Observe, reservation),
             Ok(RunDecision::Terminal(outcome)) => return *outcome,
             Err(reason) => {
                 return FreshContinuationOutcome::Blocked {
@@ -84,9 +85,9 @@ where
             }
         };
 
-        let resume = self
-            .resume
-            .run_or_observe(&resume_reservation, &continuation.context);
+        let resume =
+            self.resume
+                .run_or_observe(resume_action, &resume_reservation, &continuation.context);
         if let Err(reason) = self.store.record_resume(&continuation, &resume) {
             return FreshContinuationOutcome::Failed {
                 continuation_id: continuation.continuation_id.clone(),
@@ -111,8 +112,9 @@ where
             };
         }
 
-        let fresh_reservation = match self.store.begin_fresh(&continuation) {
-            Ok(RunDecision::Run(reservation) | RunDecision::Observe(reservation)) => reservation,
+        let (fresh_action, fresh_reservation) = match self.store.begin_fresh(&continuation) {
+            Ok(RunDecision::Run(reservation)) => (InvocationAction::Run, reservation),
+            Ok(RunDecision::Observe(reservation)) => (InvocationAction::Observe, reservation),
             Ok(RunDecision::Terminal(outcome)) => return *outcome,
             Err(reason) => {
                 return FreshContinuationOutcome::Failed {
@@ -125,9 +127,12 @@ where
             }
         };
 
-        let fresh = self
-            .fresh
-            .run_or_observe(&fresh_reservation, &continuation.context, &resume);
+        let fresh = self.fresh.run_or_observe(
+            fresh_action,
+            &fresh_reservation,
+            &continuation.context,
+            &resume,
+        );
         if let Err(reason) = self.store.record_fresh(&continuation, &fresh) {
             return FreshContinuationOutcome::Failed {
                 continuation_id: continuation.continuation_id.clone(),
