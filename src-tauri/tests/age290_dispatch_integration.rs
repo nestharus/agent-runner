@@ -931,6 +931,25 @@ fn request_flag_rejects_a_resume_session_that_differs_from_the_evidence_bound_or
 }
 
 #[test]
+fn request_flag_rejects_evidence_changed_after_the_request_was_written() {
+    let fixture = ContinuationFixture::new();
+    let baseline_invocation_count = invocation_count(&fixture.connection());
+    fs::write(&fixture.expected_artifacts[0].1, b"mutated question").unwrap();
+
+    let output = fixture.continuation_command().output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!fixture.resume_calls.exists());
+    assert!(!fixture.fresh_calls.exists());
+    assert_eq!(continuation_count(&fixture.connection()), 0);
+    assert_eq!(
+        invocation_count(&fixture.connection()),
+        baseline_invocation_count
+    );
+    assert!(!fixture.planning_root.join("continuations").exists());
+}
+
+#[test]
 fn no_request_headless_dispatch_preserves_file_project_parent_retry_and_migration() {
     let fixture = LegacyResumeFixture::new();
     let mut command = fixture.command();
