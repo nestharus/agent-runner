@@ -59,8 +59,12 @@ fn matching_artifacts_produce_a_stable_validated_context() {
 #[test]
 fn uppercase_artifact_hash_is_accepted() {
     let mut fixture = EvidenceFixture::valid();
-    fixture.request.evidence.question.sha256 =
-        fixture.request.evidence.question.sha256.to_ascii_uppercase();
+    fixture.request.evidence.question.sha256 = fixture
+        .request
+        .evidence
+        .question
+        .sha256
+        .to_ascii_uppercase();
 
     fixture.validated();
 }
@@ -265,6 +269,46 @@ fn noncanonical_origin_trace_path_identity_is_rejected() {
 #[test]
 fn noncanonical_ticket_snapshot_path_identity_is_rejected() {
     assert_noncanonical_artifact_path_rejected(TICKET_SNAPSHOT, "/outside/ticket.md");
+}
+
+#[test]
+fn unsupported_question_schema_version_is_rejected() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.rewrite_json(QUESTION, |question| {
+        question["schema_version"] = json!(2);
+    });
+
+    assert_identity_error(fixture.validation_error(), QUESTION, "schema identity");
+}
+
+#[test]
+fn wrong_question_kind_is_rejected() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.rewrite_json(QUESTION, |question| {
+        question["kind"] = json!("agent_answer");
+    });
+
+    assert_identity_error(fixture.validation_error(), QUESTION, "kind identity");
+}
+
+#[test]
+fn unsupported_answer_schema_version_is_rejected() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.rewrite_json(ANSWER, |answer| {
+        answer["schema_version"] = json!(2);
+    });
+
+    assert_identity_error(fixture.validation_error(), ANSWER, "schema identity");
+}
+
+#[test]
+fn wrong_answer_kind_is_rejected() {
+    let mut fixture = EvidenceFixture::valid();
+    fixture.rewrite_json(ANSWER, |answer| {
+        answer["kind"] = json!("agent_question");
+    });
+
+    assert_identity_error(fixture.validation_error(), ANSWER, "kind identity");
 }
 
 #[test]
