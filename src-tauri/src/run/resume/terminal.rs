@@ -371,21 +371,10 @@ fn terminal_signal_disposition_for_result(
         }
         TerminalSignalDisposition::MaybeQuotaVerify
     } else {
-        let disposition = crate::terminal_outcome_adapter::apply_terminal_signal_outcome(
+        crate::terminal_outcome_adapter::apply_terminal_signal_outcome(
             &terminal_signal,
             &mut terminal_signal_ctx,
-        );
-        if matches!(disposition, TerminalSignalDisposition::InteractiveClean)
-            && let Some(signal) = terminal_signal.as_ref()
-        {
-            let _ = crate::terminal_outcome_adapter::emit_terminal_signal_marker(
-                signal,
-                terminal_signal_ctx.invocation_id,
-                terminal_signal_ctx.session_id,
-                &mut terminal_signal_ctx.stderr,
-            );
-        }
-        disposition
+        )
     }
 }
 

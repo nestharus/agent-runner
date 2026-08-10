@@ -470,8 +470,6 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
         Some("validated submitted user turn: exact session and delivery nonce")
     );
     assert_eq!(resumed_result["exit_code"], 0);
-    let terminal_signal = terminal_signal_marker(&resumed_stderr);
-    assert_eq!(terminal_signal["kind"], "CleanExit");
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
     assert_eq!(provider_session_id, SESSION);
     assert_eq!(provider_name, provider);
