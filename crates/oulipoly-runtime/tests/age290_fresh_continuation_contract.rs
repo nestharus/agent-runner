@@ -231,7 +231,15 @@ fn non_triggering_resume_never_runs_the_fresh_component() {
 #[test]
 fn fresh_failure_preserves_the_original_resume_failure() {
     let mut fixture = Fixture::happy();
-    fixture.fresh_outcome = failed("fresh-1", Some("fresh-session"), 9, "provider_failed");
+    let fresh = failed("fresh-1", Some("fresh-session"), 9, "provider_failed");
+    fixture.fresh_outcome = fresh.clone();
+    fixture.terminal = FreshContinuationOutcome::Failed {
+        continuation_id: "continuation-1".to_string(),
+        resume: fixture.resume_outcome.clone(),
+        fresh: Some(fresh),
+        handoff: fixture.publication.clone().ok(),
+        reason: block(ContinuationBlockKind::InvocationFailed),
+    };
     let calls = fixture.calls.clone();
     let resume = fixture.resume_outcome.clone();
     let mut coordinator = fixture.coordinator();
@@ -250,6 +258,8 @@ fn fresh_failure_preserves_the_original_resume_failure() {
     assert_eq!(calls.resume, 1);
     assert_eq!(calls.fresh, 1);
     assert_eq!(calls.record_fresh, 1);
+    assert_eq!(calls.publish, 1);
+    assert_eq!(calls.finish, 1);
 }
 
 #[test]

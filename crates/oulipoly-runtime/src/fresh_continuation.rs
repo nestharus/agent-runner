@@ -80,6 +80,7 @@ pub enum ContinuationBlockKind {
     Conflict,
     TriggerNotMet,
     AmbiguousState,
+    InvocationFailed,
     Persistence,
     Publication,
 }
@@ -115,12 +116,14 @@ pub enum FreshContinuationOutcome {
         continuation_id: Option<String>,
         resume: Option<InvocationOutcome>,
         fresh: Option<InvocationOutcome>,
+        handoff: Option<PublishedHandoff>,
         reason: ContinuationBlock,
     },
     Failed {
         continuation_id: String,
         resume: InvocationOutcome,
         fresh: Option<InvocationOutcome>,
+        handoff: Option<PublishedHandoff>,
         reason: ContinuationBlock,
     },
 }
