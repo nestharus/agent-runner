@@ -154,6 +154,35 @@ fn malformed_recorded_outcome_blocks_during_accept() {
 }
 
 #[test]
+fn invalid_persisted_reservation_identity_blocks_during_accept() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let mut store = fixture.open_store();
+    let continuation = accept(&mut store, &context);
+    drop(store);
+
+    let state = StateDb::open(&fixture.state_path).expect("open state for corruption check");
+    state
+        .connection()
+        .execute(
+            "UPDATE fresh_continuations
+                SET resume_invocation_id = 'not-a-uuid',
+                    fresh_parent_invocation_id = 'not-a-uuid'
+              WHERE continuation_id = ?1",
+            [&continuation.continuation_id],
+        )
+        .expect("inject invalid parent-consistent reservation identity");
+    drop(state);
+
+    let mut reopened = fixture.open_store();
+    let error = reopened
+        .accept(&context)
+        .expect_err("invalid durable reservation must block during accept");
+
+    assert_eq!(error.kind, ContinuationBlockKind::AmbiguousState);
+}
+
+#[test]
 fn fresh_stage_before_resume_completion_blocks_during_accept() {
     let fixture = Fixture::new();
     let context = fixture.context("fingerprint-1");
