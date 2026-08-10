@@ -265,7 +265,7 @@ fn fresh_failure_preserves_the_original_resume_failure() {
 #[test]
 fn terminal_replay_returns_the_same_outcome_without_calling_runners() {
     let mut fixture = Fixture::happy();
-    fixture.accept = Ok(AcceptDecision::Replay(fixture.terminal.clone()));
+    fixture.accept = Ok(AcceptDecision::Replay(Box::new(fixture.terminal.clone())));
     let expected = fixture.terminal.clone();
     let calls = fixture.calls.clone();
     let mut coordinator = fixture.coordinator();
@@ -320,7 +320,7 @@ impl Fixture {
         Self {
             calls: Rc::new(RefCell::new(Calls::default())),
             validator: Ok(context),
-            accept: Ok(AcceptDecision::Accepted(accepted)),
+            accept: Ok(AcceptDecision::Accepted(Box::new(accepted))),
             resume_decision: Ok(RunDecision::Run(resume_reservation)),
             fresh_decision: Ok(RunDecision::Run(fresh_reservation)),
             resume_outcome: resume,
