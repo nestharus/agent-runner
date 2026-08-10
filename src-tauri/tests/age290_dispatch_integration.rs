@@ -159,16 +159,20 @@ impl ContinuationFixture {
     }
 
     fn continuation_command(&self) -> Command {
+        self.continuation_command_with(ORIGIN_SESSION_ID, &self.worktree)
+    }
+
+    fn continuation_command_with(&self, resume_session: &str, project: &Path) -> Command {
         let mut command = self.command();
         command
             .arg("--model")
             .arg("resume-model")
             .arg("--resume")
-            .arg(ORIGIN_SESSION_ID)
+            .arg(resume_session)
             .arg("--models-dir")
             .arg(&self.models_dir)
             .arg("--project")
-            .arg(&self.worktree)
+            .arg(project)
             .arg("--fresh-continuation-request")
             .arg(&self.request_path)
             .arg("resume input from dispatch");
@@ -874,8 +878,7 @@ fn request_flag_runs_reserved_production_adapters_and_terminal_replay_does_not_r
 #[test]
 fn request_flag_accepts_an_equivalent_project_path() {
     let fixture = ContinuationFixture::new();
-    let mut command = fixture.continuation_command();
-    replace_arg_value(&mut command, "--project", Path::new("."));
+    let mut command = fixture.continuation_command_with(ORIGIN_SESSION_ID, Path::new("."));
     command.current_dir(&fixture.worktree);
 
     let output = command.output().unwrap();
@@ -891,8 +894,7 @@ fn request_flag_rejects_a_project_that_differs_from_the_requested_worktree() {
     let fixture = ContinuationFixture::new();
     let other_project = fixture.worktree.join("other");
     fs::create_dir(&other_project).unwrap();
-    let mut command = fixture.continuation_command();
-    replace_arg_value(&mut command, "--project", &other_project);
+    let mut command = fixture.continuation_command_with(ORIGIN_SESSION_ID, &other_project);
 
     let output = command.output().unwrap();
 
@@ -910,8 +912,7 @@ fn request_flag_rejects_a_project_that_differs_from_the_requested_worktree() {
 fn request_flag_rejects_a_resume_session_that_differs_from_the_evidence_bound_origin() {
     let fixture = ContinuationFixture::new();
     let baseline_invocation_count = invocation_count(&fixture.connection());
-    let mut command = fixture.continuation_command();
-    replace_arg_value(&mut command, "--resume", Path::new(MISMATCHED_SESSION_ID));
+    let mut command = fixture.continuation_command_with(MISMATCHED_SESSION_ID, &fixture.worktree);
 
     let output = command.output().unwrap();
 
@@ -1470,42 +1471,6 @@ fn invocation_rows_after(connection: &Connection, row_id: i64) -> Vec<Invocation
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
-}
-
-fn replace_arg_value(command: &mut Command, flag: &str, replacement: &Path) {
-    let args = command
-        .get_args()
-        .map(|arg| arg.to_os_string())
-        .collect::<Vec<_>>();
-    let mut rebuilt = Vec::with_capacity(args.len());
-    let mut replace_next = false;
-    for arg in args {
-        if replace_next {
-            rebuilt.push(replacement.as_os_str().to_os_string());
-            replace_next = false;
-        } else {
-            replace_next = arg == flag;
-            rebuilt.push(arg);
-        }
-    }
-    let program = command.get_program().to_os_string();
-    let envs = command
-        .get_envs()
-        .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
-        .collect::<Vec<_>>();
-    let mut replacement_command = Command::new(program);
-    replacement_command.args(rebuilt);
-    for (key, value) in envs {
-        match value {
-            Some(value) => {
-                replacement_command.env(key, value);
-            }
-            None => {
-                replacement_command.env_remove(key);
-            }
-        }
-    }
-    *command = replacement_command;
 }
 
 fn timestamp(value: &str) -> DateTime<Utc> {
