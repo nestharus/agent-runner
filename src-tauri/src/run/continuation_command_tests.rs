@@ -215,10 +215,10 @@ fn request_fixture(root: &Path) -> FreshContinuationRequest {
             "question_id": "question-1",
             "origin": {
                 "invocation_uuid": ORIGIN_INVOCATION_ID,
-                "session_id": "unknown",
+                "session_id": ORIGIN_SESSION_ID,
                 "worktree_path": worktree,
             },
-            "state_refs": {"session_graph_manifest": "unknown"},
+            "state_refs": {"session_graph_manifest": graph_path},
         }))
         .unwrap(),
     );
