@@ -354,6 +354,18 @@ fn usage_rejected_with_top_level_resume() {
 }
 
 #[test]
+fn usage_rejected_with_fresh_continuation_request() {
+    clap_rejects(&[
+        "oulipoly-agent-runner",
+        "--usage",
+        "--resume",
+        SESSION_UUID,
+        "--fresh-continuation-request",
+        "/tmp/request.json",
+    ]);
+}
+
+#[test]
 fn fresh_continuation_request_is_opt_in_and_requires_top_level_resume() {
     Cli::try_parse_from([
         "oulipoly-agent-runner",
