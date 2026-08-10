@@ -85,9 +85,22 @@ where
             }
         };
 
-        let resume =
-            self.resume
-                .run_or_observe(resume_action, &resume_reservation, &continuation.context);
+        let resume = match self.resume.run_or_observe(
+            resume_action,
+            &resume_reservation,
+            &continuation.context,
+        ) {
+            Ok(resume) => resume,
+            Err(reason) => {
+                return FreshContinuationOutcome::Blocked {
+                    continuation_id: Some(continuation.continuation_id.clone()),
+                    resume: None,
+                    fresh: None,
+                    handoff: None,
+                    reason,
+                };
+            }
+        };
         if let Err(reason) = self.store.record_resume(&continuation, &resume) {
             return FreshContinuationOutcome::Failed {
                 continuation_id: continuation.continuation_id.clone(),
@@ -127,12 +140,23 @@ where
             }
         };
 
-        let fresh = self.fresh.run_or_observe(
+        let fresh = match self.fresh.run_or_observe(
             fresh_action,
             &fresh_reservation,
             &continuation.context,
             &resume,
-        );
+        ) {
+            Ok(fresh) => fresh,
+            Err(reason) => {
+                return FreshContinuationOutcome::Failed {
+                    continuation_id: continuation.continuation_id.clone(),
+                    resume,
+                    fresh: None,
+                    handoff: None,
+                    reason,
+                };
+            }
+        };
         if let Err(reason) = self.store.record_fresh(&continuation, &fresh) {
             return FreshContinuationOutcome::Failed {
                 continuation_id: continuation.continuation_id.clone(),

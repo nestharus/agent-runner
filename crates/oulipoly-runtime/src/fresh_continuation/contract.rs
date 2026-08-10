@@ -199,7 +199,7 @@ pub trait ResumeRunner {
         action: InvocationAction,
         reservation: &ReservedInvocation,
         context: &ValidatedContinuation,
-    ) -> InvocationOutcome;
+    ) -> Result<InvocationOutcome, ContinuationBlock>;
 }
 
 pub trait FreshRunner {
@@ -209,7 +209,7 @@ pub trait FreshRunner {
         reservation: &ReservedInvocation,
         context: &ValidatedContinuation,
         resume: &InvocationOutcome,
-    ) -> InvocationOutcome;
+    ) -> Result<InvocationOutcome, ContinuationBlock>;
 }
 
 pub trait HandoffPublisher {
