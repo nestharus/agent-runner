@@ -8,6 +8,8 @@ pub(crate) mod reservation;
 pub(crate) mod resume;
 
 #[cfg(test)]
+mod continuation_fresh_tests;
+#[cfg(test)]
 mod continuation_outcome_tests;
 #[cfg(test)]
 mod continuation_resume_tests;
