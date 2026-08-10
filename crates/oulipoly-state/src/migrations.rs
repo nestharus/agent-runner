@@ -73,6 +73,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0012_session_ingress_evidence.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 13,
+        id: "0013_fresh_continuations",
+        sql: include_str!("../migrations/0013_fresh_continuations.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

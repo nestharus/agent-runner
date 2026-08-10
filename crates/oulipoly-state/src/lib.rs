@@ -28,6 +28,7 @@
 //! ```
 
 mod chain_segments;
+pub mod continuation;
 mod db;
 pub mod deployment;
 pub mod invocation_marker;

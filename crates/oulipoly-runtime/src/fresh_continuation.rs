@@ -1,6 +1,7 @@
 mod contract;
 mod coordinator;
 mod evidence;
+mod state_db_store;
 
 pub use contract::{
     AcceptDecision, AcceptedContinuation, ArtifactIdentity, ContinuationArtifactSource,
@@ -12,3 +13,4 @@ pub use contract::{
 };
 pub use coordinator::FreshContinuationCoordinator;
 pub use evidence::DefaultContinuationEvidenceValidator;
+pub use state_db_store::StateDbContinuationStore;

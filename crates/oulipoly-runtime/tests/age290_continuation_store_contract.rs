@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
 
 use oulipoly_runtime::fresh_continuation::{
     AcceptDecision, AcceptedContinuation, ArtifactIdentity, ContinuationBlockKind,
@@ -48,6 +49,121 @@ fn accept_rejects_a_changed_fingerprint_for_the_same_logical_request() {
         .expect_err("changed fingerprint must conflict");
 
     assert_eq!(error.kind, ContinuationBlockKind::Conflict);
+}
+
+#[test]
+fn simultaneous_accepts_converge_on_one_exact_reservation() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let stores = (0..4).map(|_| fixture.open_store()).collect::<Vec<_>>();
+    let barrier = Arc::new(Barrier::new(stores.len()));
+
+    let continuations = std::thread::scope(|scope| {
+        let handles = stores
+            .into_iter()
+            .map(|mut store| {
+                let context = context.clone();
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    accept(&mut store, &context)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("accept thread"))
+            .collect::<Vec<_>>()
+    });
+
+    assert!(
+        continuations
+            .iter()
+            .all(|continuation| continuation == &continuations[0])
+    );
+}
+
+#[test]
+fn malformed_recorded_outcome_blocks_during_accept() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let mut store = fixture.open_store();
+    let continuation = accept(&mut store, &context);
+    store
+        .begin_resume(&continuation)
+        .expect("begin reserved resume");
+    store
+        .record_resume(
+            &continuation,
+            &unconfirmed_resume(&continuation.resume.invocation_id),
+        )
+        .expect("record resume");
+    drop(store);
+
+    let state = StateDb::open(&fixture.state_path).expect("open state for corruption check");
+    let constrained = state.connection().execute(
+        "UPDATE fresh_continuations SET resume_outcome_json = '{' WHERE continuation_id = ?1",
+        [&continuation.continuation_id],
+    );
+    assert!(constrained.is_err(), "schema must reject malformed JSON");
+    state
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("enable corruption injection");
+    state
+        .connection()
+        .execute(
+            "UPDATE fresh_continuations SET resume_outcome_json = '{' WHERE continuation_id = ?1",
+            [&continuation.continuation_id],
+        )
+        .expect("inject malformed durable outcome");
+    drop(state);
+
+    let mut reopened = fixture.open_store();
+    let error = reopened
+        .accept(&context)
+        .expect_err("corrupt outcome must block during accept");
+
+    assert_eq!(error.kind, ContinuationBlockKind::AmbiguousState);
+}
+
+#[test]
+fn fresh_stage_before_resume_completion_blocks_during_accept() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let mut store = fixture.open_store();
+    let continuation = accept(&mut store, &context);
+    drop(store);
+
+    let state = StateDb::open(&fixture.state_path).expect("open state for corruption check");
+    let constrained = state.connection().execute(
+        "UPDATE fresh_continuations SET fresh_stage = 'running' WHERE continuation_id = ?1",
+        [&continuation.continuation_id],
+    );
+    assert!(
+        constrained.is_err(),
+        "schema must reject fresh progress before durable resume completion"
+    );
+    state
+        .connection()
+        .execute_batch("PRAGMA ignore_check_constraints = ON")
+        .expect("enable corruption injection");
+    state
+        .connection()
+        .execute(
+            "UPDATE fresh_continuations SET fresh_stage = 'running' WHERE continuation_id = ?1",
+            [&continuation.continuation_id],
+        )
+        .expect("inject impossible stage ordering");
+    drop(state);
+
+    let mut reopened = fixture.open_store();
+    let error = reopened
+        .accept(&context)
+        .expect_err("impossible stage order must block during accept");
+
+    assert_eq!(error.kind, ContinuationBlockKind::AmbiguousState);
 }
 
 #[test]
@@ -117,6 +233,50 @@ fn fresh_waits_for_the_exact_resume_and_is_observed_with_the_same_identity_after
         after_restart,
         RunDecision::Observe(continuation.fresh.clone())
     );
+}
+
+#[test]
+fn outcome_replays_are_idempotent_only_for_the_same_exact_value() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let mut store = fixture.open_store();
+    let continuation = accept(&mut store, &context);
+    store
+        .begin_resume(&continuation)
+        .expect("begin reserved resume");
+    let resume = unconfirmed_resume(&continuation.resume.invocation_id);
+
+    store
+        .record_resume(&continuation, &resume)
+        .expect("record exact resume outcome");
+    store
+        .record_resume(&continuation, &resume)
+        .expect("repeat exact resume outcome");
+    let mut conflicting_resume = resume.clone();
+    conflicting_resume.session_id = Some("different-session".to_string());
+    let resume_conflict = store
+        .record_resume(&continuation, &conflicting_resume)
+        .expect_err("different resume replay must conflict");
+
+    assert_eq!(resume_conflict.kind, ContinuationBlockKind::Conflict);
+
+    store
+        .begin_fresh(&continuation)
+        .expect("begin reserved fresh invocation");
+    let fresh = successful_fresh(&continuation.fresh.invocation_id);
+    store
+        .record_fresh(&continuation, &fresh)
+        .expect("record exact fresh outcome");
+    store
+        .record_fresh(&continuation, &fresh)
+        .expect("repeat exact fresh outcome");
+    let mut conflicting_fresh = fresh.clone();
+    conflicting_fresh.physical_exit_code = 9;
+    let fresh_conflict = store
+        .record_fresh(&continuation, &conflicting_fresh)
+        .expect_err("different fresh replay must conflict");
+
+    assert_eq!(fresh_conflict.kind, ContinuationBlockKind::Conflict);
 }
 
 #[test]
@@ -196,9 +356,9 @@ fn failed_fresh_outcome_preserves_both_results_and_is_replayed_exactly() {
             fresh: Some(actual_fresh),
             reason,
             ..
-        } if continuation_id == continuation.continuation_id
-            && actual_resume == resume
-            && actual_fresh == fresh
+        } if continuation_id.as_str() == continuation.continuation_id.as_str()
+            && actual_resume == &resume
+            && actual_fresh == &fresh
             && reason.kind == ContinuationBlockKind::InvocationFailed
     ));
 

@@ -16,6 +16,11 @@
 //!       - deployment-aware opener for cross-deployment state.db routing
 //! ```
 
+use crate::continuation::{
+    ContinuationAcceptInput, ContinuationAcceptResult, ContinuationInvocationOutcome,
+    ContinuationPublishedHandoff, ContinuationRecord, ContinuationRepositoryError,
+    ContinuationRunDecision, ContinuationTerminalOutcome,
+};
 use crate::deployment::DeploymentAwareOpener;
 use crate::schema_probe::{self, SchemaProbeReport};
 use crate::{
@@ -34,6 +39,42 @@ use std::sync::{
 };
 
 static NEXT_DEPLOYMENT_AWARE_OPENER_TOKEN: AtomicUsize = AtomicUsize::new(1);
+
+/// Transactional persistence operations for one durable fresh continuation.
+pub trait ContinuationRepository {
+    fn accept_continuation(
+        &mut self,
+        input: &ContinuationAcceptInput,
+    ) -> Result<ContinuationAcceptResult, ContinuationRepositoryError>;
+
+    fn begin_continuation_resume(
+        &mut self,
+        continuation: &ContinuationRecord,
+    ) -> Result<ContinuationRunDecision, ContinuationRepositoryError>;
+
+    fn record_continuation_resume(
+        &mut self,
+        continuation: &ContinuationRecord,
+        outcome: &ContinuationInvocationOutcome,
+    ) -> Result<(), ContinuationRepositoryError>;
+
+    fn begin_continuation_fresh(
+        &mut self,
+        continuation: &ContinuationRecord,
+    ) -> Result<ContinuationRunDecision, ContinuationRepositoryError>;
+
+    fn record_continuation_fresh(
+        &mut self,
+        continuation: &ContinuationRecord,
+        outcome: &ContinuationInvocationOutcome,
+    ) -> Result<(), ContinuationRepositoryError>;
+
+    fn finish_continuation(
+        &mut self,
+        continuation: &ContinuationRecord,
+        handoff: &ContinuationPublishedHandoff,
+    ) -> Result<ContinuationTerminalOutcome, ContinuationRepositoryError>;
+}
 
 #[derive(Clone)]
 struct DeploymentAwareOpenerSlot {
