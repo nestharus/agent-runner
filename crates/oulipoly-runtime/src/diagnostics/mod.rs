@@ -87,16 +87,6 @@ impl RuntimeDiagnosticsService {
             provider_registry: Some(provider_registry),
         }
     }
-
-    fn diagnostic_executor_handle(
-        &self,
-        diagnostics_model: &ModelConfig,
-    ) -> Option<&ProviderRegistryHandle> {
-        diagnostics_model
-            .provider
-            .as_ref()
-            .and(self.provider_registry.as_ref())
-    }
 }
 
 impl DiagnosticsServicePort for RuntimeDiagnosticsService {
@@ -122,7 +112,6 @@ impl DiagnosticsServicePort for RuntimeDiagnosticsService {
                 stderr,
                 working_dir,
             } => diagnose_error_request(DiagnoseErrorInput {
-                executor_handle: self.diagnostic_executor_handle(&diagnostics_model),
                 diagnostics_model: &diagnostics_model,
                 effective_provider: &effective_provider,
                 provider_index,
@@ -147,7 +136,6 @@ fn diagnose_terminal_classify_request(
 }
 
 struct DiagnoseErrorInput<'a> {
-    executor_handle: Option<&'a ProviderRegistryHandle>,
     diagnostics_model: &'a ModelConfig,
     effective_provider: &'a ProviderConfig,
     provider_index: usize,
@@ -235,7 +223,6 @@ pub fn diagnose_error(
     working_dir: Option<&Path>,
 ) -> Result<Diagnosis, String> {
     diagnose_error_inner(DiagnoseErrorInput {
-        executor_handle: None,
         diagnostics_model,
         effective_provider,
         provider_index,
@@ -259,7 +246,7 @@ fn diagnose_error_inner(input: DiagnoseErrorInput<'_>) -> Result<Diagnosis, Stri
         input.working_dir,
         &extra_inputs,
     );
-    let result = execute_diagnostics_request(input.executor_handle, request)?;
+    let result = execute_diagnostics_request(request)?;
     diagnosis_from_execution_result(&result, input.stderr, input.exit_code)
 }
 
@@ -286,14 +273,9 @@ fn diagnostic_execute_request<'a>(
 }
 
 fn execute_diagnostics_request(
-    provider_registry: Option<&ProviderRegistryHandle>,
     request: executor::cli::EffectiveExecuteRequest<'_>,
 ) -> Result<executor::ExecutionResult, String> {
-    let executor = provider_registry
-        .cloned()
-        .map(executor::RuntimeExecutorService::with_registry_handle)
-        .unwrap_or_default();
-    executor.execute_effective(request)
+    executor::cli::execute_effective(request)
 }
 
 fn diagnosis_from_execution_result(

@@ -139,19 +139,20 @@ fn runtime_diagnostics_service_model_backed_mode_matches_direct_diagnose_error()
 }
 
 #[test]
-fn runtime_diagnostics_service_uses_supplied_registry_for_external_model() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let script = dir.path().join("external-diagnostic-provider.sh");
-    write_executable(&script, external_diagnostic_provider_script());
+fn runtime_diagnostics_service_does_not_dispatch_parse_only_provider_reference() {
+    let external_dir = tempfile::tempdir().expect("external tempdir");
+    let external_script = external_dir.path().join("external-diagnostic-provider.sh");
+    write_executable(&external_script, external_diagnostic_provider_script());
+    let fixture = diagnostic_provider_fixture();
     let mut model = migrated_diagnostic_model();
     model.provider = Some(ProviderImplementationRef {
-        path: Some(script.display().to_string()),
+        path: Some(external_script.display().to_string()),
         crate_name: None,
         version: None,
         binary: None,
         script: None,
     });
-    let provider = effective_diagnostic_provider(PathBuf::from("unused-external-command"));
+    let provider = effective_diagnostic_provider(fixture.script);
     let registry = ProviderRegistry::from_model_configs(
         std::slice::from_ref(&model),
         ProviderRegistryOptions::default(),
@@ -167,17 +168,18 @@ fn runtime_diagnostics_service_uses_supplied_registry_for_external_model() {
             prompt_mode: PromptMode::Stdin,
             exit_code: 7,
             stderr: "opaque primary provider failure".to_string(),
-            working_dir: Some(dir.path().to_path_buf()),
+            working_dir: Some(fixture.dir.path().to_path_buf()),
         })
-        .expect("external diagnostics should use the service registry");
+        .expect("diagnostics should use the effective CLI provider");
 
     match output {
         DiagnosticsServiceOutput::Diagnosis { diagnosis } => {
             assert_eq!(diagnosis.category, ErrorCategory::NetworkError);
-            assert_eq!(diagnosis.summary, "external registry diagnostics worked");
+            assert_eq!(diagnosis.summary, "Diagnostic model saw network trouble");
         }
         other => panic!("expected Diagnosis output, got {other:?}"),
     }
+    assert_diagnostic_prompt_dump(&fixture.prompt_dump, "opaque primary provider failure");
 }
 
 fn external_diagnostic_provider_script() -> &'static str {
@@ -352,8 +354,8 @@ fn diagnose_error_preserves_invocation_mode_into_executor_reentry() {
     let source = include_str!("../src/diagnostics/mod.rs");
     let body = source_from(source, "pub fn diagnose_error");
     let reentry_idx = body
-        .find("executor.execute_effective(request)")
-        .expect("diagnose_error must re-enter the registry-bound executor");
+        .find("executor::cli::execute_effective(request)")
+        .expect("diagnose_error must re-enter the effective-provider executor");
     let before_reentry = &body[..reentry_idx];
 
     assert!(
