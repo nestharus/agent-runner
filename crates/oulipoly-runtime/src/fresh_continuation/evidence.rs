@@ -327,7 +327,7 @@ fn continuation_fingerprint(request: &FreshContinuationRequest) -> String {
     fingerprint_part(&mut digest, request.target_model.as_bytes());
     for (_, artifact) in evidence_artifacts(request) {
         fingerprint_part(&mut digest, artifact.path.as_os_str().as_encoded_bytes());
-        fingerprint_part(&mut digest, artifact.sha256.as_bytes());
+        fingerprint_part(&mut digest, artifact.sha256.to_ascii_lowercase().as_bytes());
     }
     format!("{:x}", digest.finalize())
 }

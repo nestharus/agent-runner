@@ -59,6 +59,7 @@ fn matching_artifacts_produce_a_stable_validated_context() {
 #[test]
 fn uppercase_artifact_hash_is_accepted() {
     let mut fixture = EvidenceFixture::valid();
+    let lowercase_fingerprint = fixture.validated().fingerprint;
     fixture.request.evidence.question.sha256 = fixture
         .request
         .evidence
@@ -66,7 +67,9 @@ fn uppercase_artifact_hash_is_accepted() {
         .sha256
         .to_ascii_uppercase();
 
-    fixture.validated();
+    let uppercase_fingerprint = fixture.validated().fingerprint;
+
+    assert_eq!(uppercase_fingerprint, lowercase_fingerprint);
 }
 
 #[test]
