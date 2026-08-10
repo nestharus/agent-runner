@@ -77,6 +77,29 @@ fn reserved_run_supplies_the_exact_identity_to_both_concrete_adapters() {
 }
 
 #[test]
+fn reserved_resume_policy_pins_attempt_parent_and_migration() {
+    let fixture = reservation_fixture();
+    let plan = ReservedRun::resolve(&fixture.state, &fixture.reservation).unwrap();
+
+    assert_eq!(super::resume::max_attempts(7, Some(&plan)), 1);
+    assert_eq!(
+        super::resume::parent_invocation_row_id(Some(999), Some(&plan)),
+        Some(fixture.parent_row_id)
+    );
+    assert!(!super::resume::migration_allowed(Some(&plan)));
+}
+
+#[test]
+fn ordinary_resume_policy_preserves_retry_parent_and_migration() {
+    assert_eq!(super::resume::max_attempts(7, None), 7);
+    assert_eq!(
+        super::resume::parent_invocation_row_id(Some(999), None),
+        Some(999)
+    );
+    assert!(super::resume::migration_allowed(None));
+}
+
+#[test]
 fn reserved_run_rejects_a_missing_exact_parent_instead_of_using_another_row() {
     let state = StateDb::open(Path::new(":memory:")).unwrap();
     start_parent(&state, PARENT_UUID);
