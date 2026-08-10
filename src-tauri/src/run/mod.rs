@@ -1,6 +1,7 @@
 //! Run command wiring.
 
 pub(crate) mod balancing;
+pub(crate) mod continuation_outcome;
 pub(crate) mod repl;
 pub(crate) mod reservation;
 pub(crate) mod resume;
