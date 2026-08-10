@@ -48,6 +48,7 @@ use crate::quota_zero_turn::{
     zero_turn_classification_for_action, zero_turn_classify_after_completion_with_recovery,
     zero_turn_late_bind_baseline, zero_turn_record_baseline,
 };
+use crate::run::reservation::ReservedRun;
 use crate::terminal_outcome_adapter::{
     TerminalSignalContext, apply_age153_terminal_signal_fixture_override,
     balanced_terminal_signal_for_outcome, confirm_maybe_quota_exhausted,
@@ -68,6 +69,57 @@ pub(crate) fn run_with_balancing(
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
+    run_with_balancing_plan(
+        agent_runtime_services,
+        state_db_opener,
+        model,
+        prompt,
+        all_models,
+        models_dir,
+        working_dir,
+        extra_inputs,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub(in crate::run) fn run_reserved_with_balancing(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    state_db_opener: &dyn StateDbOpener,
+    model: &ModelConfig,
+    prompt: &str,
+    all_models: &HashMap<String, ModelConfig>,
+    models_dir: &Path,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    reservation: &ReservedRun,
+) -> Result<i32, String> {
+    run_with_balancing_plan(
+        agent_runtime_services,
+        state_db_opener,
+        model,
+        prompt,
+        all_models,
+        models_dir,
+        working_dir,
+        extra_inputs,
+        Some(reservation),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_balancing_plan(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    state_db_opener: &dyn StateDbOpener,
+    model: &ModelConfig,
+    prompt: &str,
+    all_models: &HashMap<String, ModelConfig>,
+    models_dir: &Path,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    reservation: Option<&ReservedRun>,
+) -> Result<i32, String> {
     let mut env = load_balanced_execution_environment(state_db_opener)?;
     env.models_dir = models_dir.to_path_buf();
     run_with_balancing_environment(
@@ -78,9 +130,11 @@ pub(crate) fn run_with_balancing(
         all_models,
         working_dir,
         extra_inputs,
+        reservation,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with_balancing_environment(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     env: BalancedExecutionEnvironment,
@@ -89,16 +143,20 @@ fn run_with_balancing_environment(
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
+    reservation: Option<&ReservedRun>,
 ) -> Result<i32, String> {
     let in_flight = oulipoly_runtime::quota::InFlight::new();
     let ctx = super::mapper::balance_context(&env.providers_cfg, &env.sessions_cfg, &in_flight);
     let state = &env.state;
-    let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(state);
+    let parent_invocation_id = super::parent_invocation_row_id(
+        crate::dispatch::resolve_parent_invocation_id(state),
+        reservation,
+    );
     // Source guard marker: resolve_parent_invocation_id(&state)
     // Source guard marker: routing_service.select_route(RoutingServiceRequest { ctx: Some(
     // Source guard marker: .finalize_invocation(
     // Source guard marker: record_returned_artifacts(
-    let max_attempts = super::mapper::quota_retry_budget(model);
+    let max_attempts = super::max_attempts(super::mapper::quota_retry_budget(model), reservation);
     let mut attempts = 0usize;
     let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
     let mut pending_same_provider_verification: Option<(usize, Option<String>)> = None;
@@ -133,6 +191,7 @@ fn run_with_balancing_environment(
             provider_index,
             parent_invocation_id,
             pending_verification,
+            reservation,
         )?;
 
         let mut result = execute_balanced_attempt(
@@ -300,6 +359,7 @@ struct StartKnownProviderSession {
     mode: Option<ProviderSessionStartMode>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_balanced_attempt<'state>(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     env: &'state BalancedExecutionEnvironment,
@@ -308,9 +368,10 @@ fn start_balanced_attempt<'state>(
     provider_index: usize,
     parent_invocation_id: Option<i64>,
     pending_verification: Option<(usize, Option<String>)>,
+    reservation: Option<&ReservedRun>,
 ) -> Result<BalancedInvocationAttempt<'state>, String> {
     let provider_name = provider.name.as_str();
-    let invocation = super::composite_invocation_id(provider_name, None);
+    let invocation = super::composite_invocation_id(provider_name, reservation);
     let invocation_row_id = start_balanced_invocation_row(
         agent_runtime_services,
         env,
