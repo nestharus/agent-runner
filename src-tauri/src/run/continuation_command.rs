@@ -262,15 +262,15 @@ fn load_target_model(
     ),
     ContinuationBlock,
 > {
-    let providers = load_provider_configuration();
+    let providers = load_provider_configuration()?;
     let models_dir = resolve_models_directory(models_dir_override);
     let models = load_model_configuration(&models_dir, &providers).map_err(invocation_failed)?;
     let model = require_target_model(target_model, &models)?;
     Ok(target_model_configuration(model, models, models_dir))
 }
 
-fn load_provider_configuration() -> ProvidersConfig {
-    ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default()
+fn load_provider_configuration() -> Result<ProvidersConfig, ContinuationBlock> {
+    ProvidersConfig::load(&default_config_root().join("providers.toml")).map_err(invocation_failed)
 }
 
 fn resolve_models_directory(models_dir_override: Option<&Path>) -> PathBuf {
