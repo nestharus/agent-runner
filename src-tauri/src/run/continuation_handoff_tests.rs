@@ -151,6 +151,33 @@ fn conflicting_handoff_body_is_rejected_without_changing_published_bytes() {
     assert_eq!(fs::read(&first.path).unwrap(), original);
 }
 
+#[cfg(unix)]
+#[test]
+fn publisher_rejects_an_existing_symlink_without_changing_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = PublisherFixture::new();
+    let output_dir = fixture.root().join("continuations");
+    fs::create_dir(&output_dir).unwrap();
+    let replacement = fixture.root().join("replacement.json");
+    let original = b"replacement bytes";
+    fs::write(&replacement, original).unwrap();
+    let target = output_dir.join("continuation-1.json");
+    symlink(&replacement, &target).unwrap();
+    let mut publisher = fixture.publisher();
+
+    let error = publisher.publish(handoff()).unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::Conflict);
+    assert!(
+        fs::symlink_metadata(&target)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(replacement).unwrap(), original);
+}
+
 #[test]
 fn invalid_continuation_id_cannot_escape_planning_root() {
     let fixture = PublisherFixture::new();
