@@ -273,6 +273,12 @@ pub trait HandoffPublisher {
         &mut self,
         handoff: ContinuationHandoff,
     ) -> Result<PublishedHandoff, ContinuationBlock>;
+
+    fn verify(
+        &mut self,
+        continuation_id: &str,
+        handoff: &PublishedHandoff,
+    ) -> Result<(), ContinuationBlock>;
 }
 
 pub trait FreshContinuation {

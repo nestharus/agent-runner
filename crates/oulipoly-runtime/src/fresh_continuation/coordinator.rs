@@ -65,7 +65,9 @@ where
 
         let continuation = match self.store.accept(&context) {
             Ok(AcceptDecision::Accepted(continuation)) => continuation,
-            Ok(AcceptDecision::Replay(outcome)) => return *outcome,
+            Ok(AcceptDecision::Replay(outcome)) => {
+                return verify_terminal_replay(&mut self.publisher, *outcome);
+            }
             Err(reason) => return blocked_without_continuation(reason),
         };
 
@@ -75,7 +77,7 @@ where
         };
         let (resume_action, resume_reservation) = match runnable_invocation(resume_decision) {
             Ok(run) => run,
-            Err(outcome) => return *outcome,
+            Err(outcome) => return verify_terminal_replay(&mut self.publisher, *outcome),
         };
 
         let resume = match self.resume.run_or_observe(
@@ -102,7 +104,7 @@ where
         };
         let (fresh_action, fresh_reservation) = match runnable_invocation(fresh_decision) {
             Ok(run) => run,
-            Err(outcome) => return *outcome,
+            Err(outcome) => return verify_terminal_replay(&mut self.publisher, *outcome),
         };
 
         let fresh = match self.fresh.run_or_observe(
@@ -149,6 +151,87 @@ fn runnable_invocation(
         RunDecision::Run(reservation) => Ok((InvocationAction::Run, reservation)),
         RunDecision::Observe(reservation) => Ok((InvocationAction::Observe, reservation)),
         RunDecision::Terminal(outcome) => Err(outcome),
+    }
+}
+
+fn verify_terminal_replay(
+    publisher: &mut impl HandoffPublisher,
+    outcome: FreshContinuationOutcome,
+) -> FreshContinuationOutcome {
+    let verification = match terminal_publication(&outcome) {
+        Ok((continuation_id, handoff)) => publisher.verify(continuation_id, handoff),
+        Err(reason) => Err(reason),
+    };
+    match verification {
+        Ok(()) => outcome,
+        Err(reason) => failed_terminal_replay(outcome, reason),
+    }
+}
+
+fn terminal_publication(
+    outcome: &FreshContinuationOutcome,
+) -> Result<(&str, &PublishedHandoff), ContinuationBlock> {
+    match outcome {
+        FreshContinuationOutcome::Continued {
+            continuation_id,
+            handoff,
+            ..
+        }
+        | FreshContinuationOutcome::Failed {
+            continuation_id,
+            handoff: Some(handoff),
+            ..
+        } => Ok((continuation_id, handoff)),
+        _ => Err(ContinuationBlock {
+            kind: ContinuationBlockKind::AmbiguousState,
+            message: "terminal continuation replay has no published handoff".to_string(),
+        }),
+    }
+}
+
+fn failed_terminal_replay(
+    outcome: FreshContinuationOutcome,
+    reason: ContinuationBlock,
+) -> FreshContinuationOutcome {
+    match outcome {
+        FreshContinuationOutcome::Continued {
+            continuation_id,
+            resume,
+            fresh,
+            handoff,
+        } => FreshContinuationOutcome::Failed {
+            continuation_id,
+            resume,
+            fresh: Some(fresh),
+            handoff: Some(handoff),
+            reason,
+        },
+        FreshContinuationOutcome::Failed {
+            continuation_id,
+            resume,
+            fresh,
+            handoff,
+            ..
+        } => FreshContinuationOutcome::Failed {
+            continuation_id,
+            resume,
+            fresh,
+            handoff,
+            reason,
+        },
+        FreshContinuationOutcome::Blocked {
+            continuation_id,
+            resume,
+            fresh,
+            handoff,
+            ..
+        } => FreshContinuationOutcome::Blocked {
+            continuation_id,
+            resume,
+            fresh,
+            handoff,
+            reason,
+        },
     }
 }
 

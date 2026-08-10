@@ -10,11 +10,11 @@
 //!     role: adapter
 //!     Translates:
 //!       - runtime-handoff-publisher-port-contract
-//!       - immutable-filesystem-handoff-schema-contract
+//!       - create-once-filesystem-handoff-schema-contract
 //! ```
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use oulipoly_runtime::fresh_continuation::{
@@ -60,10 +60,36 @@ impl HandoffPublisher for FilesystemHandoffPublisher {
 
         let temp_name = temporary_handoff_name(&handoff.continuation_id, Uuid::new_v4());
         let temp = publication_path(&output_dir, &temp_name);
-        write_durable_temp(&temp, &bytes)?;
+        if let Err(reason) = write_durable_temp(&temp, &bytes) {
+            let _ = fs::remove_file(&temp);
+            return Err(reason);
+        }
         let publish_result = link_publication(&temp, &target, &bytes, sha256);
         let _ = fs::remove_file(temp);
         publish_result
+    }
+
+    fn verify(
+        &mut self,
+        continuation_id: &str,
+        handoff: &PublishedHandoff,
+    ) -> Result<(), ContinuationBlock> {
+        validate_continuation_id(continuation_id)?;
+        let output_dir = self.planning_root.join("continuations");
+        validate_existing_output_dir(&self.planning_root, &output_dir)?;
+        let expected_path = publication_path(&output_dir, &handoff_name(continuation_id));
+        if handoff.path != expected_path {
+            return Err(conflict(
+                "Recorded continuation handoff path differs from its create-once target",
+            ));
+        }
+        let bytes = existing_handoff_bytes(&expected_path)?;
+        if sha256(&bytes) != handoff.sha256 {
+            return Err(conflict(
+                "Recorded continuation handoff hash does not match the published bytes",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -98,6 +124,18 @@ fn validate_output_dir(
     Ok(())
 }
 
+fn validate_existing_output_dir(root: &Path, output: &Path) -> Result<(), ContinuationBlock> {
+    let output_type = existing_file_type(output)?;
+    if output_type.is_symlink() || !output_type.is_dir() {
+        return Err(conflict(
+            "Recorded continuation handoff directory is not a regular directory",
+        ));
+    }
+    let canonical_root = canonical_path(root)?;
+    let canonical_output = canonical_path(output)?;
+    validate_output_dir(&canonical_root, &canonical_output)
+}
+
 fn write_durable_temp(path: &Path, bytes: &[u8]) -> Result<(), ContinuationBlock> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -115,9 +153,31 @@ fn link_publication(
     sha256: String,
 ) -> Result<PublishedHandoff, ContinuationBlock> {
     match fs::hard_link(temp, target) {
-        Ok(()) => Ok(published_handoff(target, sha256)),
+        Ok(()) => {
+            sync_parent_directory(target)?;
+            Ok(published_handoff(target, sha256))
+        }
         Err(error) => reconcile_link_error(error, target, expected, sha256),
     }
+}
+
+fn sync_parent_directory(target: &Path) -> Result<(), ContinuationBlock> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| conflict("Continuation handoff target has no parent directory"))?;
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), ContinuationBlock> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(persistence)
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), ContinuationBlock> {
+    Ok(())
 }
 
 fn reconcile_link_error(
@@ -151,12 +211,33 @@ fn existing_file_type(path: &Path) -> Result<fs::FileType, ContinuationBlock> {
 }
 
 fn existing_handoff_bytes(path: &Path) -> Result<Vec<u8>, ContinuationBlock> {
-    fs::read(path).map_err(persistence)
+    let mut file = open_existing_handoff(path)?;
+    let file_type = file.metadata().map_err(persistence)?.file_type();
+    validate_existing_file_type(file_type)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(persistence)?;
+    Ok(bytes)
+}
+
+fn open_existing_handoff(path: &Path) -> Result<File, ContinuationBlock> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path).map_err(persistence)
 }
 
 fn validate_existing_file_type(file_type: fs::FileType) -> Result<(), ContinuationBlock> {
     if file_type.is_symlink() {
         return Err(conflict("Existing continuation handoff is a symlink"));
+    }
+    if !file_type.is_file() {
+        return Err(conflict(
+            "Existing continuation handoff is not a regular file",
+        ));
     }
     Ok(())
 }

@@ -9,7 +9,7 @@
 //!   - component: src-tauri/src/run/continuation_handoff_tests.rs
 //!     role: adapter
 //!     Translates:
-//!       - immutable-handoff-publication-behavior-contract
+//!       - create-once-handoff-publication-behavior-contract
 //!       - filesystem-test-fixture-contract
 //! ```
 
@@ -83,6 +83,57 @@ fn exact_handoff_replay_returns_stable_create_once_identity() {
     assert_eq!(replay, first);
     assert_eq!(fs::read(&first.path).unwrap(), original);
     assert_eq!(replay.sha256, sha256(&original));
+}
+
+#[test]
+fn terminal_replay_verifies_the_recorded_create_once_handoff() {
+    let fixture = PublisherFixture::new();
+    let mut publisher = fixture.publisher();
+    let published = publisher.publish(handoff()).unwrap();
+
+    publisher.verify("continuation-1", &published).unwrap();
+}
+
+#[test]
+fn terminal_replay_rejects_a_missing_recorded_handoff() {
+    let fixture = PublisherFixture::new();
+    let mut publisher = fixture.publisher();
+    let published = publisher.publish(handoff()).unwrap();
+    fs::remove_file(&published.path).unwrap();
+
+    let error = publisher.verify("continuation-1", &published).unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::Persistence);
+}
+
+#[test]
+fn terminal_replay_rejects_replaced_recorded_handoff_bytes() {
+    let fixture = PublisherFixture::new();
+    let mut publisher = fixture.publisher();
+    let published = publisher.publish(handoff()).unwrap();
+    fs::write(&published.path, b"replacement").unwrap();
+
+    let error = publisher.verify("continuation-1", &published).unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::Conflict);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_replay_rejects_a_symlinked_recorded_handoff() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = PublisherFixture::new();
+    let mut publisher = fixture.publisher();
+    let published = publisher.publish(handoff()).unwrap();
+    let replacement = fixture.root().join("replacement.json");
+    fs::write(&replacement, fs::read(&published.path).unwrap()).unwrap();
+    fs::remove_file(&published.path).unwrap();
+    symlink(replacement, &published.path).unwrap();
+
+    let error = publisher.verify("continuation-1", &published).unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::Persistence);
 }
 
 #[test]

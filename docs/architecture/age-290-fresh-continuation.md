@@ -57,20 +57,25 @@ Unknown fields are rejected.
   "active_blocked_boundary": "<boundary description>",
   "target_model": "<configured model name>",
   "evidence": {
-    "question": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
-    "answer": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
-    "session_graph": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
-    "origin_trace": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
-    "ticket_snapshot": { "path": "<absolute path>", "sha256": "<lowercase hex>" }
+    "question": { "path": "<absolute path>", "sha256": "<64 hexadecimal characters>" },
+    "answer": { "path": "<absolute path>", "sha256": "<64 hexadecimal characters>" },
+    "session_graph": { "path": "<absolute path>", "sha256": "<64 hexadecimal characters>" },
+    "origin_trace": { "path": "<absolute path>", "sha256": "<64 hexadecimal characters>" },
+    "ticket_snapshot": { "path": "<absolute path>", "sha256": "<64 hexadecimal characters>" }
   }
 }
 ```
+
+Artifact hashes are case-insensitive hexadecimal on input and are normalized
+for comparison. The request's `origin_session_id` must match top-level
+`--resume`. When `--project` is supplied, its canonical path must identify the
+same directory as `worktree`.
 
 ## Composition Boundary
 
 The runner dispatch layer is the composition root. It constructs the
 coordinator from the filesystem evidence reader, SQLite continuation store,
-exact invocation observers, reserved execution callbacks, and immutable
+exact invocation observers, reserved execution callbacks, and create-once
 filesystem publisher only for `--fresh-continuation-request <PATH>`. The flag
 requires top-level `--resume` and rejects provider rotation. Without the flag,
 dispatch calls the existing resume entry point unchanged.
@@ -81,6 +86,29 @@ parent row, then calls the prepared-resume or one-attempt balancing entry point.
 The action adapters observe that exact row after execution. This replaces the
 prototype's post-run database search while keeping resume classification and
 model execution owned by their current components.
+
+## Execution and Recovery Semantics
+
+Resume and fresh reservations provide at-most-once execution, not exactly-once
+completion. Moving a reservation to `running` means physical execution may
+have started. A restart therefore observes the same reserved UUID and exact
+parent row; elapsed time never authorizes another execution attempt.
+
+If a process stops after recording `running` but before creating an observable
+invocation row or durable outcome, automatic execution remains suspended. An
+operator or a future reconciliation workflow must establish what happened
+before changing that state. This deliberately trades automatic liveness for
+protection against duplicate provider turns and side effects.
+
+Handoff publication is create-once and idempotent for identical bytes. The
+publisher synchronizes the temporary file before linking it and synchronizes
+the containing directory after creating the final entry on platforms that
+support directory synchronization. A terminal database outcome records the
+published path and hash, but that row is not sufficient proof that the file
+still exists. Terminal replay reopens the exact create-once target, rejects
+symlinks and non-files, and verifies the recorded hash before returning the
+stored outcome. Missing, replaced, or corrupted handoffs fail replay without
+relaunching either reserved invocation.
 
 ## Integration Sequence
 

@@ -48,6 +48,8 @@ struct Calls {
     recorded_fresh: Vec<(AcceptedContinuation, InvocationOutcome)>,
     publish: usize,
     published_handoffs: Vec<ContinuationHandoff>,
+    verify: usize,
+    verified_handoffs: Vec<(String, PublishedHandoff)>,
     finish: usize,
     finish_inputs: Vec<(AcceptedContinuation, PublishedHandoff)>,
 }
@@ -220,6 +222,7 @@ impl FreshRunner for FreshFake {
 struct PublisherFake {
     calls: SharedCalls,
     result: Result<PublishedHandoff, ContinuationBlock>,
+    verification: Result<(), ContinuationBlock>,
 }
 
 impl HandoffPublisher for PublisherFake {
@@ -231,6 +234,19 @@ impl HandoffPublisher for PublisherFake {
         calls.publish += 1;
         calls.published_handoffs.push(handoff);
         self.result.clone()
+    }
+
+    fn verify(
+        &mut self,
+        continuation_id: &str,
+        handoff: &PublishedHandoff,
+    ) -> Result<(), ContinuationBlock> {
+        let mut calls = self.calls.borrow_mut();
+        calls.verify += 1;
+        calls
+            .verified_handoffs
+            .push((continuation_id.to_string(), handoff.clone()));
+        self.verification.clone()
     }
 }
 
@@ -659,6 +675,7 @@ fn terminal_fresh_decision_replays_without_calling_the_fresh_runner() {
     assert_eq!(calls.fresh, 0);
     assert_eq!(calls.record_fresh, 0);
     assert_eq!(calls.publish, 0);
+    assert_eq!(calls.verify, 1);
     assert_eq!(calls.finish, 0);
 }
 
@@ -705,6 +722,41 @@ fn terminal_replay_returns_the_same_outcome_without_calling_runners() {
     assert_eq!(calls.validate, 1);
     assert_eq!(calls.accept, 1);
     assert_eq!(calls.begin_resume, 0);
+    assert_eq!(calls.resume, 0);
+    assert_eq!(calls.fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.verify, 1);
+    assert_eq!(
+        calls.verified_handoffs.as_slice(),
+        &[("continuation-1".to_string(), published_handoff())]
+    );
+}
+
+#[test]
+fn terminal_replay_fails_when_the_published_handoff_cannot_be_verified() {
+    let mut fixture = Fixture::happy();
+    let reason = ContinuationBlock {
+        kind: ContinuationBlockKind::Conflict,
+        message: "recorded handoff integrity check failed".to_string(),
+    };
+    fixture.accept = Ok(AcceptDecision::Replay(Box::new(fixture.terminal.clone())));
+    fixture.verification = Err(reason.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert!(matches!(
+        actual,
+        FreshContinuationOutcome::Failed {
+            continuation_id,
+            handoff: Some(_),
+            reason: actual_reason,
+            ..
+        } if continuation_id == "continuation-1" && actual_reason == reason
+    ));
+    let calls = calls.borrow();
+    assert_eq!(calls.verify, 1);
     assert_eq!(calls.resume, 0);
     assert_eq!(calls.fresh, 0);
     assert_eq!(calls.publish, 0);
@@ -817,6 +869,7 @@ struct Fixture {
     resume_outcome: Result<InvocationOutcome, ContinuationBlock>,
     fresh_outcome: Result<InvocationOutcome, ContinuationBlock>,
     publication: Result<PublishedHandoff, ContinuationBlock>,
+    verification: Result<(), ContinuationBlock>,
     record_resume: Result<(), ContinuationBlock>,
     record_fresh: Result<(), ContinuationBlock>,
     finish: Option<Result<FreshContinuationOutcome, ContinuationBlock>>,
@@ -847,6 +900,7 @@ impl Fixture {
             resume_outcome: Ok(resume),
             fresh_outcome: Ok(fresh),
             publication: Ok(handoff),
+            verification: Ok(()),
             record_resume: Ok(()),
             record_fresh: Ok(()),
             finish: None,
@@ -883,6 +937,7 @@ impl Fixture {
             PublisherFake {
                 calls: self.calls,
                 result: self.publication,
+                verification: self.verification,
             },
         )
     }

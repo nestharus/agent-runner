@@ -72,6 +72,35 @@ pub(in crate::run) fn prepare_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
+    let result = prepare_resume_inner(
+        agent_runtime_services,
+        model_name,
+        session_id,
+        target_kind,
+        prompt,
+        file,
+        submission_token,
+        working_dir,
+        models_dir_override,
+    );
+    if !matches!(&result, Ok(Ok(_))) {
+        wake::release_current_auto_wake_claim(session_id);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_resume_inner(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    session_id: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    submission_token: Option<&str>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
     if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
         return Ok(Err(exit_code));
     }
@@ -92,10 +121,7 @@ pub(in crate::run) fn prepare_resume(
         models_dir_override,
     )? {
         Ok(prepared) => Ok(Ok(prepared)),
-        Err(exit_code) => {
-            wake::release_current_auto_wake_claim(session_id);
-            Ok(Err(exit_code))
-        }
+        Err(exit_code) => Ok(Err(exit_code)),
     }
 }
 
