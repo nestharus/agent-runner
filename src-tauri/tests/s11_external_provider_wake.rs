@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const MODEL: &str = "s11-external-wake-model";
 const PROVIDER: &str = "opencode";
+const OPENCODE_PROVIDERS: [&str; 3] = ["opencode", "opencode2", "opencode5"];
 const SESSION: &str = "ses_s11externalwake";
 
 struct Fixture {
@@ -29,10 +30,15 @@ struct Fixture {
     app_config_dir: PathBuf,
     models_dir: PathBuf,
     work_dir: PathBuf,
+    provider: &'static str,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_provider(PROVIDER)
+    }
+
+    fn with_provider(provider: &'static str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let config_home = dir.path().join("xdg-config");
         let data_home = dir.path().join("xdg-data");
@@ -51,6 +57,7 @@ impl Fixture {
             app_config_dir,
             models_dir,
             work_dir,
+            provider,
         }
     }
 
@@ -118,6 +125,7 @@ impl Fixture {
     }
 
     fn write_external_provider(&self) {
+        let provider = self.provider;
         let provider_path = self.write_script("external-provider.py", external_provider_script());
         let turn_script_path = self.write_script("s11-turns.py", turn_script());
         fs::write(
@@ -127,7 +135,7 @@ impl Fixture {
 prompt_mode = "arg"
 
 [[providers]]
-name = "{PROVIDER}"
+name = "{provider}"
 args = []
 "#,
                 toml_string(&path_string(&provider_path))
@@ -137,7 +145,7 @@ args = []
         fs::write(
             self.app_config_dir.join("providers.toml"),
             format!(
-                r#"[{PROVIDER}]
+                r#"[{provider}]
 command = "fixture-opencode"
 args = []
 prompt_mode = "arg"
@@ -148,7 +156,7 @@ prompt_mode = "arg"
         fs::write(
             self.app_config_dir.join("sessions.toml"),
             format!(
-                r#"[{PROVIDER}]
+                r#"[{provider}]
 turn_script = {}
 "#,
                 toml_string(&path_string(&turn_script_path))
@@ -289,6 +297,15 @@ turn_script = {}
             .unwrap()
     }
 
+    fn mailbox_row(&self, seq: i64) -> MailboxRow {
+        self.mailbox()
+            .list_mailbox(SESSION, true)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.seq == seq)
+            .unwrap()
+    }
+
     fn assert_xdg_isolated(&self) {
         assert!(
             !self
@@ -413,7 +430,13 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
 
 #[test]
 fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evidence_loss() {
-    let positive = Fixture::new();
+    for provider in OPENCODE_PROVIDERS {
+        assert_owner_session_consumes_detached_child_completion(provider);
+    }
+}
+
+fn assert_owner_session_consumes_detached_child_completion(provider: &'static str) {
+    let positive = Fixture::with_provider(provider);
     positive.write_external_provider();
     positive.remove_turn_script_fallback();
     let owner = positive.run_agent_with_env(
@@ -449,18 +472,12 @@ fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evid
     assert_eq!(resumed_result["exit_code"], 0);
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
     assert_eq!(provider_session_id, SESSION);
-    assert_eq!(provider_name, PROVIDER);
+    assert_eq!(provider_name, provider);
     assert_eq!(
         fs::read_to_string(positive.work_dir.join("affirmative-result")).unwrap(),
         "owner consumed detached child result and continued\n"
     );
-    let delivered = positive
-        .mailbox()
-        .list_mailbox(SESSION, true)
-        .unwrap()
-        .into_iter()
-        .find(|row| row.seq == notification.seq)
-        .unwrap();
+    let delivered = positive.mailbox_row(notification.seq);
     assert!(delivered.delivered_at.is_some(), "{delivered:?}");
     assert_eq!(delivered.delivery_attempts, 1);
     assert_eq!(
@@ -475,13 +492,13 @@ fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evid
     assert_eq!(trace["root"]["session"]["assistant_turn_count"], 0);
     positive.assert_xdg_isolated();
 
-    let no_assistant = Fixture::new();
+    let no_assistant = Fixture::with_provider(provider);
     no_assistant.write_external_provider();
     no_assistant.remove_turn_script_fallback();
     let owner = no_assistant.run_agent_with_env("owner waits for detached child", &[]);
     assert_success(&owner);
     let owner_invocation_uuid = no_assistant.latest_invocation_uuid();
-    no_assistant.seed_detached_child_completion(&owner_invocation_uuid);
+    let notification = no_assistant.seed_detached_child_completion(&owner_invocation_uuid);
     let unconfirmed = no_assistant.run_resume_with_env(
         "continue owning workflow",
         &[
@@ -496,6 +513,46 @@ fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evid
     assert_eq!(
         unconfirmed_result["error_category"],
         "resume_completion_unconfirmed"
+    );
+    let pending = no_assistant.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+    assert!(
+        pending.delivered_by_invocation_uuid.is_none(),
+        "{pending:?}"
+    );
+    assert_eq!(pending.delivery_attempts, 1);
+
+    let retry = no_assistant.run_resume_with_env(
+        "retry owning workflow",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
+            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
+        ],
+    );
+    assert_success(&retry);
+    let retry_invocation_uuid = result_envelope(&retry)["id"].as_str().unwrap().to_owned();
+    let delivered = no_assistant.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(delivered.delivery_attempts, 2);
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(retry_invocation_uuid.as_str())
+    );
+
+    let later_resume = no_assistant.run_resume_with_env(
+        "continue after child completion",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
+        ],
+    );
+    assert_success(&later_resume);
+    let still_delivered = no_assistant.mailbox_row(notification.seq);
+    assert_eq!(still_delivered.delivery_attempts, 2);
+    assert_eq!(
+        still_delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(retry_invocation_uuid.as_str())
     );
     no_assistant.assert_xdg_isolated();
 

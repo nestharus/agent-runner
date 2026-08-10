@@ -88,9 +88,13 @@ pub(super) fn handle_resume_attempt_result(
         provenance.age270_failure_applied,
     ) {
         Age270MailboxEligibility::Ineligible => None,
-        Age270MailboxEligibility::PreMutationCleanExit => Some(
-            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
-        ),
+        Age270MailboxEligibility::PreMutationCleanExit => {
+            Some(if classification.terminal_completion_confirmed {
+                wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence)
+            } else {
+                wake::MailboxDeliveryOutcome::Unconfirmed
+            })
+        }
     };
     handle_resume_attempt_terminal_signal(
         input,
