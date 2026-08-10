@@ -77,8 +77,11 @@ The runner dispatch layer is the composition root. It constructs the
 coordinator from the filesystem evidence reader, SQLite continuation store,
 exact invocation observers, reserved execution callbacks, and create-once
 filesystem publisher only for `--fresh-continuation-request <PATH>`. The flag
-requires top-level `--resume` and rejects provider rotation. Without the flag,
-dispatch calls the existing resume entry point unchanged.
+requires top-level `--resume`, and `origin_session_id` must match that active
+resume session. When `--project` supplies a working directory, it must match
+`worktree`; when `--project` is absent, `worktree` becomes the effective working
+directory. The flag rejects provider rotation. Without the flag, dispatch calls
+the existing resume entry point unchanged.
 
 The resume and balancing modules do not call back into fresh continuation.
 The command callback resolves each `ReservedInvocation` to its exact UUID and
