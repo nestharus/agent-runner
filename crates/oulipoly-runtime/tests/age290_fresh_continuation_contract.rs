@@ -7,8 +7,8 @@ use oulipoly_runtime::fresh_continuation::{
     ContinuationBlockKind, ContinuationEvidence, ContinuationEvidenceValidator,
     ContinuationHandoff, ContinuationStore, FreshContinuation, FreshContinuationCoordinator,
     FreshContinuationOutcome, FreshContinuationRequest, FreshRunner, HandoffPublisher,
-    InvocationDisposition, InvocationOutcome, PublishedHandoff, ReservedInvocation,
-    ResumeAcceptance, ResumeRunner, RunDecision, ValidatedContinuation,
+    InvocationAction, InvocationDisposition, InvocationOutcome, PublishedHandoff,
+    ReservedInvocation, ResumeAcceptance, ResumeRunner, RunDecision, ValidatedContinuation,
 };
 
 #[derive(Default)]
@@ -17,9 +17,11 @@ struct Calls {
     accept: usize,
     begin_resume: usize,
     resume: usize,
+    resume_actions: Vec<InvocationAction>,
     record_resume: usize,
     begin_fresh: usize,
     fresh: usize,
+    fresh_actions: Vec<InvocationAction>,
     record_fresh: usize,
     publish: usize,
     finish: usize,
@@ -111,10 +113,13 @@ struct ResumeFake {
 impl ResumeRunner for ResumeFake {
     fn run_or_observe(
         &mut self,
+        action: InvocationAction,
         reservation: &ReservedInvocation,
         _context: &ValidatedContinuation,
     ) -> InvocationOutcome {
-        self.calls.borrow_mut().resume += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.resume += 1;
+        calls.resume_actions.push(action);
         assert_eq!(reservation.invocation_id, self.outcome.invocation_id);
         self.outcome.clone()
     }
@@ -128,11 +133,14 @@ struct FreshFake {
 impl FreshRunner for FreshFake {
     fn run_or_observe(
         &mut self,
+        action: InvocationAction,
         reservation: &ReservedInvocation,
         _context: &ValidatedContinuation,
         resume: &InvocationOutcome,
     ) -> InvocationOutcome {
-        self.calls.borrow_mut().fresh += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.fresh += 1;
+        calls.fresh_actions.push(action);
         assert_eq!(reservation.invocation_id, self.outcome.invocation_id);
         assert_eq!(reservation.parent_invocation_id, resume.invocation_id);
         self.outcome.clone()
@@ -169,7 +177,38 @@ fn exact_unconfirmed_resume_runs_one_fresh_invocation_and_returns_both_results()
     assert_eq!(calls.validate, 1);
     assert_eq!(calls.accept, 1);
     assert_eq!(calls.resume, 1);
+    assert_eq!(calls.resume_actions.as_slice(), &[InvocationAction::Run]);
     assert_eq!(calls.fresh, 1);
+    assert_eq!(calls.fresh_actions.as_slice(), &[InvocationAction::Run]);
+    assert_eq!(calls.publish, 1);
+    assert_eq!(calls.finish, 1);
+}
+
+#[test]
+fn observe_decisions_are_transported_without_changing_the_successful_continuation() {
+    let mut fixture = Fixture::happy();
+    fixture.resume_decision = Ok(RunDecision::Observe(reservation(
+        "resume-1",
+        "origin-invocation",
+    )));
+    fixture.fresh_decision = Ok(RunDecision::Observe(reservation("fresh-1", "resume-1")));
+    let calls = fixture.calls.clone();
+    let expected = fixture.terminal.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(actual, expected);
+    let calls = calls.borrow();
+    assert_eq!(calls.validate, 1);
+    assert_eq!(calls.accept, 1);
+    assert_eq!(calls.resume, 1);
+    assert_eq!(
+        calls.resume_actions.as_slice(),
+        &[InvocationAction::Observe]
+    );
+    assert_eq!(calls.fresh, 1);
+    assert_eq!(calls.fresh_actions.as_slice(), &[InvocationAction::Observe]);
     assert_eq!(calls.publish, 1);
     assert_eq!(calls.finish, 1);
 }
