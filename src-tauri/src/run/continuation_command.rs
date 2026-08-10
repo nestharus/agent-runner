@@ -238,10 +238,17 @@ fn validate_request_target(
     if request.origin_session_id != session_id {
         return Err("Fresh continuation origin session does not match --resume".to_string());
     }
-    if working_dir.is_some_and(|path| path != request.worktree) {
+    if working_dir.is_some_and(|path| !same_directory(path, &request.worktree)) {
         return Err("Fresh continuation worktree does not match --project".to_string());
     }
     Ok(())
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 fn load_target_model(

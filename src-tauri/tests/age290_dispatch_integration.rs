@@ -872,6 +872,21 @@ fn request_flag_runs_reserved_production_adapters_and_terminal_replay_does_not_r
 }
 
 #[test]
+fn request_flag_accepts_an_equivalent_project_path() {
+    let fixture = ContinuationFixture::new();
+    let mut command = fixture.continuation_command();
+    replace_arg_value(&mut command, "--project", Path::new("."));
+    command.current_dir(&fixture.worktree);
+
+    let output = command.output().unwrap();
+
+    assert_process_success(&output);
+    assert_eq!(line_count(&fixture.resume_calls), 1);
+    assert_eq!(line_count(&fixture.fresh_calls), 1);
+    assert_eq!(continuation_count(&fixture.connection()), 1);
+}
+
+#[test]
 fn request_flag_rejects_a_project_that_differs_from_the_requested_worktree() {
     let fixture = ContinuationFixture::new();
     let other_project = fixture.worktree.join("other");
