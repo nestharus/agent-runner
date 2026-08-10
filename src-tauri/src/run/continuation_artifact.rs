@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `accessor`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_artifact.rs
+//!     role: adapter
+//!     Translates:
+//!       - oulipoly-runtime-continuation-artifact-source-contract
+//!       - planning-root-filesystem-evidence-contract
+//! ```
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,23 +34,28 @@ impl FilesystemContinuationArtifactSource {
 
 impl ContinuationArtifactSource for FilesystemContinuationArtifactSource {
     fn read(&mut self, artifact: &ArtifactIdentity) -> Result<Vec<u8>, ContinuationBlock> {
-        let canonical_root = fs::canonicalize(&self.planning_root).map_err(invalid_evidence)?;
-        let canonical_artifact = fs::canonicalize(&artifact.path).map_err(invalid_evidence)?;
-        if !canonical_artifact.starts_with(&canonical_root) || canonical_artifact == canonical_root
-        {
-            return Err(ContinuationBlock {
-                kind: ContinuationBlockKind::InvalidEvidence,
-                message: "Continuation artifact resolves outside the planning root".to_string(),
-            });
-        }
-        fs::read(&canonical_artifact).map_err(|error| ContinuationBlock {
-            kind: ContinuationBlockKind::InvalidEvidence,
-            message: format!(
-                "Failed to read continuation artifact {}: {error}",
-                artifact.path.display()
-            ),
-        })
+        let canonical_artifact = canonical_artifact_path(&self.planning_root, &artifact.path)?;
+        read_artifact(&canonical_artifact).map_err(invalid_evidence)
     }
+}
+
+fn canonical_artifact_path(
+    planning_root: &Path,
+    artifact_path: &Path,
+) -> Result<PathBuf, ContinuationBlock> {
+    let canonical_root = fs::canonicalize(planning_root).map_err(invalid_evidence)?;
+    let canonical_artifact = fs::canonicalize(artifact_path).map_err(invalid_evidence)?;
+    if !canonical_artifact.starts_with(&canonical_root) || canonical_artifact == canonical_root {
+        return Err(ContinuationBlock {
+            kind: ContinuationBlockKind::InvalidEvidence,
+            message: "Continuation artifact resolves outside the planning root".to_string(),
+        });
+    }
+    Ok(canonical_artifact)
+}
+
+fn read_artifact(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    fs::read(path)
 }
 
 fn invalid_evidence(error: impl std::fmt::Display) -> ContinuationBlock {

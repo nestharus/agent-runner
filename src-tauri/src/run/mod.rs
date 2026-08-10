@@ -1,4 +1,8 @@
 //! Run command wiring.
+//!
+//! ## Declared roles
+//!
+//! `orchestration`
 
 pub(crate) mod balancing;
 pub(crate) mod continuation_artifact;

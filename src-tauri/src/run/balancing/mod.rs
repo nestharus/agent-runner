@@ -1,4 +1,8 @@
 //! Balancing module wiring.
+//!
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`
 
 use oulipoly_state::CompositeInvocationId;
 

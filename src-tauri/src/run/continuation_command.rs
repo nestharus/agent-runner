@@ -1,3 +1,21 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `accessor`, `formatter`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_command.rs
+//!     role: adapter
+//!     Translates:
+//!       - fresh-continuation-request-and-handoff-contract
+//!       - oulipoly-runtime-fresh-continuation-port-contract
+//!       - oulipoly-state-continuation-and-invocation-contract
+//!       - prepared-headless-resume-execution-contract
+//!       - reserved-balancing-execution-contract
+//! ```
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -22,6 +40,88 @@ use super::{
 };
 use crate::cli::paths::{default_config_root, default_models_dir};
 use crate::wiring;
+
+struct ResumeExecution<'a> {
+    agent_runtime_services: &'a wiring::AgentRuntimeServices,
+    model_name: Option<&'a str>,
+    session_id: &'a str,
+    target_kind: InboxTargetKind,
+    prompt: Option<&'a str>,
+    file: Option<&'a Path>,
+    submission_token: Option<&'a str>,
+    working_dir: &'a Path,
+    models_dir_override: Option<&'a Path>,
+}
+
+impl ResumeExecution<'_> {
+    fn execute(
+        &self,
+        reserved: &ReservedRun,
+        _context: &ValidatedContinuation,
+    ) -> Result<(), ContinuationBlock> {
+        let mut prepared = self.prepare()?;
+        run_prepared_resume(
+            self.agent_runtime_services,
+            &mut prepared,
+            Some(reserved),
+            None,
+            self.session_id,
+            Some(self.working_dir),
+        )
+        .map(|_| ())
+        .map_err(invocation_failed)
+    }
+
+    fn prepare(&self) -> Result<super::resume::PreparedHeadlessResumeExecution, ContinuationBlock> {
+        match prepare_resume(
+            self.agent_runtime_services,
+            self.model_name,
+            self.session_id,
+            self.target_kind,
+            self.prompt,
+            self.file,
+            self.submission_token,
+            Some(self.working_dir),
+            self.models_dir_override,
+        )
+        .map_err(invocation_failed)?
+        {
+            Ok(prepared) => Ok(prepared),
+            Err(exit_code) => Err(resume_preparation_failed(exit_code)),
+        }
+    }
+}
+
+struct FreshExecution<'a> {
+    agent_runtime_services: &'a wiring::AgentRuntimeServices,
+    models_dir_override: Option<&'a Path>,
+}
+
+impl FreshExecution<'_> {
+    fn execute(
+        &self,
+        reserved: &ReservedRun,
+        context: &ValidatedContinuation,
+        resume: &InvocationOutcome,
+    ) -> Result<(), ContinuationBlock> {
+        let (model, all_models, models_dir) =
+            load_target_model(&context.request.target_model, self.models_dir_override)?;
+        let fresh_prompt = continuation_request::fresh_prompt(context, resume);
+        run_reserved_with_balancing(
+            self.agent_runtime_services,
+            &ProductionStateDbOpener,
+            &model,
+            &fresh_prompt,
+            &all_models,
+            &models_dir,
+            Some(&context.request.worktree),
+            &HashMap::new(),
+            reserved,
+        )
+        .map(|_| ())
+        .map_err(invocation_failed)
+    }
+}
 
 pub(in crate::run) fn execute_with_callbacks(
     request: FreshContinuationRequest,
@@ -59,72 +159,47 @@ pub(crate) fn run(
     request_path: &Path,
 ) -> Result<i32, String> {
     let request = continuation_request::read(request_path).map_err(format_block)?;
+    validate_request_target(&request, session_id, working_dir)?;
+    let store_state = ProductionStateDbOpener.open_default()?;
+    let observation_state = ProductionStateDbOpener.open_default()?;
+    let effective_worktree = request.worktree.clone();
+    let resume_execution = ResumeExecution {
+        agent_runtime_services,
+        model_name,
+        session_id,
+        target_kind,
+        prompt,
+        file,
+        submission_token,
+        working_dir: &effective_worktree,
+        models_dir_override,
+    };
+    let fresh_execution = FreshExecution {
+        agent_runtime_services,
+        models_dir_override,
+    };
+    let outcome = execute_with_callbacks(
+        request,
+        store_state,
+        &observation_state,
+        |reserved, context| resume_execution.execute(reserved, context),
+        |reserved, context, resume| fresh_execution.execute(reserved, context, resume),
+    );
+    Ok(report_outcome(&outcome))
+}
+
+fn validate_request_target(
+    request: &FreshContinuationRequest,
+    session_id: &str,
+    working_dir: Option<&Path>,
+) -> Result<(), String> {
     if request.origin_session_id != session_id {
         return Err("Fresh continuation origin session does not match --resume".to_string());
     }
     if working_dir.is_some_and(|path| path != request.worktree) {
         return Err("Fresh continuation worktree does not match --project".to_string());
     }
-
-    let store_state = ProductionStateDbOpener.open_default()?;
-    let observation_state = ProductionStateDbOpener.open_default()?;
-    let effective_worktree = request.worktree.clone();
-    let outcome = execute_with_callbacks(
-        request,
-        store_state,
-        &observation_state,
-        |reserved, _| {
-            let mut prepared = match prepare_resume(
-                agent_runtime_services,
-                model_name,
-                session_id,
-                target_kind,
-                prompt,
-                file,
-                submission_token,
-                Some(&effective_worktree),
-                models_dir_override,
-            )
-            .map_err(invocation_failed)?
-            {
-                Ok(prepared) => prepared,
-                Err(exit_code) => {
-                    return Err(invocation_failed(format!(
-                        "Resume preparation exited with status {exit_code}"
-                    )));
-                }
-            };
-            run_prepared_resume(
-                agent_runtime_services,
-                &mut prepared,
-                Some(reserved),
-                None,
-                session_id,
-                Some(&effective_worktree),
-            )
-            .map(|_| ())
-            .map_err(invocation_failed)
-        },
-        |reserved, context, resume| {
-            let (model, all_models, models_dir) =
-                load_target_model(&context.request.target_model, models_dir_override)?;
-            let fresh_prompt = continuation_request::fresh_prompt(context, resume);
-            run_reserved_with_balancing(
-                agent_runtime_services,
-                &ProductionStateDbOpener,
-                &model,
-                &fresh_prompt,
-                &all_models,
-                &models_dir,
-                Some(&context.request.worktree),
-                &HashMap::new(),
-                reserved,
-            )
-            .map(|_| ())
-            .map_err(invocation_failed)
-        },
-    );
-    Ok(report_outcome(&outcome))
+    Ok(())
 }
 
 fn load_target_model(
@@ -188,4 +263,8 @@ fn invocation_failed(error: impl std::fmt::Display) -> ContinuationBlock {
         kind: ContinuationBlockKind::InvocationFailed,
         message: error.to_string(),
     }
+}
+
+fn resume_preparation_failed(exit_code: i32) -> ContinuationBlock {
+    invocation_failed(format!("Resume preparation exited with status {exit_code}"))
 }

@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `validator`, `accessor`
+
 use std::cell::Cell;
 use std::fs;
 use std::path::Path;

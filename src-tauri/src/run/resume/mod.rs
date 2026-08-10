@@ -1,4 +1,8 @@
 //! Headless resume module wiring.
+//!
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `predicate`
 
 use oulipoly_state::CompositeInvocationId;
 
@@ -20,6 +24,7 @@ mod terminal;
 mod validator;
 mod wake;
 
+pub(in crate::run) use execution::PreparedHeadlessResumeExecution;
 pub(crate) use orchestration::run_resume;
 pub(in crate::run) use orchestration::{prepare_resume, run_prepared_resume};
 pub(crate) use validator::validate_resume_input;
