@@ -84,6 +84,31 @@ fn observe_returns_exact_fresh_outcome_without_executing() {
 }
 
 #[test]
+fn observe_without_fresh_row_fails_closed_without_executing() {
+    let fixture = FreshFixture::new();
+    let execute_calls = Cell::new(0);
+    let mut runner = super::continuation_fresh::ContinuationFreshRunner::new(
+        &fixture.state,
+        |_: &super::reservation::ReservedRun, _: &ValidatedContinuation, _: &InvocationOutcome| {
+            execute_calls.set(execute_calls.get() + 1);
+            Ok(())
+        },
+    );
+
+    let error = runner
+        .run_or_observe(
+            InvocationAction::Observe,
+            &fixture.reservation,
+            &fixture.context,
+            &fixture.resume,
+        )
+        .unwrap_err();
+
+    assert_eq!(error.kind, ContinuationBlockKind::AmbiguousState);
+    assert_eq!(execute_calls.get(), 0);
+}
+
+#[test]
 fn run_executes_exact_fresh_plan_once_then_observes_it() {
     let fixture = FreshFixture::new();
     let execute_calls = Cell::new(0);
