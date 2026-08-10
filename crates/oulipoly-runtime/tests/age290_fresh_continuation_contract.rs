@@ -91,6 +91,8 @@ struct StoreFake {
     accept: Result<AcceptDecision, ContinuationBlock>,
     resume: Result<RunDecision, ContinuationBlock>,
     fresh: Result<RunDecision, ContinuationBlock>,
+    record_resume: Result<(), ContinuationBlock>,
+    record_fresh: Result<(), ContinuationBlock>,
     finish: Result<FreshContinuationOutcome, ContinuationBlock>,
 }
 
@@ -125,7 +127,7 @@ impl ContinuationStore for StoreFake {
         calls
             .recorded_resumes
             .push((continuation.clone(), outcome.clone()));
-        Ok(())
+        self.record_resume.clone()
     }
 
     fn begin_fresh(
@@ -148,7 +150,7 @@ impl ContinuationStore for StoreFake {
         calls
             .recorded_fresh
             .push((continuation.clone(), outcome.clone()));
-        Ok(())
+        self.record_fresh.clone()
     }
 
     fn finish(
@@ -583,6 +585,112 @@ fn fresh_adapter_error_fails_without_recording_or_publishing_fresh() {
 }
 
 #[test]
+fn resume_recording_error_preserves_the_resume_outcome() {
+    let mut fixture = Fixture::happy();
+    let reason = block(ContinuationBlockKind::Persistence);
+    fixture.record_resume = Err(reason.clone());
+    let resume = fixture.resume_outcome.clone().unwrap();
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(
+        actual,
+        FreshContinuationOutcome::Failed {
+            continuation_id: "continuation-1".to_string(),
+            resume,
+            fresh: None,
+            handoff: None,
+            reason,
+        }
+    );
+    let calls = calls.borrow();
+    assert_eq!(calls.record_resume, 1);
+    assert_eq!(calls.begin_fresh, 0);
+    assert_eq!(calls.fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
+}
+
+#[test]
+fn fresh_recording_error_preserves_both_invocation_outcomes() {
+    let mut fixture = Fixture::happy();
+    let reason = block(ContinuationBlockKind::Persistence);
+    fixture.record_fresh = Err(reason.clone());
+    let resume = fixture.resume_outcome.clone().unwrap();
+    let fresh = fixture.fresh_outcome.clone().unwrap();
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(
+        actual,
+        FreshContinuationOutcome::Failed {
+            continuation_id: "continuation-1".to_string(),
+            resume,
+            fresh: Some(fresh),
+            handoff: None,
+            reason,
+        }
+    );
+    let calls = calls.borrow();
+    assert_eq!(calls.record_fresh, 1);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
+}
+
+#[test]
+fn terminal_fresh_decision_replays_without_calling_the_fresh_runner() {
+    let mut fixture = Fixture::happy();
+    let expected = fixture.terminal.clone();
+    fixture.fresh_decision = Ok(RunDecision::Terminal(Box::new(expected.clone())));
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(actual, expected);
+    let calls = calls.borrow();
+    assert_eq!(calls.resume, 1);
+    assert_eq!(calls.record_resume, 1);
+    assert_eq!(calls.begin_fresh, 1);
+    assert_eq!(calls.fresh, 0);
+    assert_eq!(calls.record_fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
+}
+
+#[test]
+fn finish_error_preserves_the_published_handoff() {
+    let mut fixture = Fixture::happy();
+    let reason = block(ContinuationBlockKind::Persistence);
+    fixture.finish = Some(Err(reason.clone()));
+    let resume = fixture.resume_outcome.clone().unwrap();
+    let fresh = fixture.fresh_outcome.clone().unwrap();
+    let handoff = fixture.publication.clone().unwrap();
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(
+        actual,
+        FreshContinuationOutcome::Failed {
+            continuation_id: "continuation-1".to_string(),
+            resume,
+            fresh: Some(fresh),
+            handoff: Some(handoff),
+            reason,
+        }
+    );
+    let calls = calls.borrow();
+    assert_eq!(calls.publish, 1);
+    assert_eq!(calls.finish, 1);
+}
+
+#[test]
 fn terminal_replay_returns_the_same_outcome_without_calling_runners() {
     let mut fixture = Fixture::happy();
     fixture.accept = Ok(AcceptDecision::Replay(Box::new(fixture.terminal.clone())));
@@ -709,6 +817,9 @@ struct Fixture {
     resume_outcome: Result<InvocationOutcome, ContinuationBlock>,
     fresh_outcome: Result<InvocationOutcome, ContinuationBlock>,
     publication: Result<PublishedHandoff, ContinuationBlock>,
+    record_resume: Result<(), ContinuationBlock>,
+    record_fresh: Result<(), ContinuationBlock>,
+    finish: Option<Result<FreshContinuationOutcome, ContinuationBlock>>,
     terminal: FreshContinuationOutcome,
 }
 
@@ -736,6 +847,9 @@ impl Fixture {
             resume_outcome: Ok(resume),
             fresh_outcome: Ok(fresh),
             publication: Ok(handoff),
+            record_resume: Ok(()),
+            record_fresh: Ok(()),
+            finish: None,
             terminal,
         }
     }
@@ -754,7 +868,9 @@ impl Fixture {
                 accept: self.accept,
                 resume: self.resume_decision,
                 fresh: self.fresh_decision,
-                finish: Ok(self.terminal),
+                record_resume: self.record_resume,
+                record_fresh: self.record_fresh,
+                finish: self.finish.unwrap_or(Ok(self.terminal)),
             },
             ResumeFake {
                 calls: self.calls.clone(),
