@@ -7,9 +7,10 @@
 //! TEST: external-provider runtime fixtures for session ingestion, submitted
 //! turn acceptance, and policy diagnostics.
 
-use oulipoly_state::mailbox::MailboxDb;
+use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,12 @@ impl Fixture {
         self.run(cmd)
     }
 
+    fn run_trace(&self, invocation_uuid: &str) -> Output {
+        let mut cmd = Command::new(runner_bin());
+        cmd.arg("trace").arg(invocation_uuid).arg("--json");
+        self.run(cmd)
+    }
+
     fn write_external_provider(&self) {
         let provider_path = self.write_script("external-provider.py", external_provider_script());
         let turn_script_path = self.write_script("s11-turns.py", turn_script());
@@ -150,6 +157,10 @@ turn_script = {}
         .unwrap();
     }
 
+    fn remove_turn_script_fallback(&self) {
+        fs::remove_file(self.app_config_dir.join("sessions.toml")).unwrap();
+    }
+
     fn write_script(&self, name: &str, body: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         fs::write(&path, body).unwrap();
@@ -161,6 +172,67 @@ turn_script = {}
 
     fn mailbox(&self) -> MailboxDb {
         MailboxDb::open(&self.sidecar_path()).unwrap()
+    }
+
+    fn seed_detached_child_completion(&self, owner_invocation_uuid: &str) -> MailboxRow {
+        let state_dir = self.dir.path().join("detached-child");
+        fs::create_dir_all(&state_dir).unwrap();
+        let artifact = state_dir.join("result.json");
+        let artifact_bytes = b"{\"status\":\"PASS\"}\n";
+        fs::write(&artifact, artifact_bytes).unwrap();
+        let artifact_sha256 = format!("{:x}", Sha256::digest(artifact_bytes));
+        let meta = state_dir.join("meta.json");
+        let log = state_dir.join("log");
+        let rc = state_dir.join("rc");
+        fs::write(
+            &meta,
+            serde_json::json!({
+                "owner_session_id": SESSION,
+                "owner_invocation_uuid": owner_invocation_uuid,
+                "caller_chain": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(&log, "detached child completed with PASS\n").unwrap();
+        fs::write(&rc, "0\n").unwrap();
+        let payload_json = serde_json::json!({
+            "schema_version": 1,
+            "kind": "agent_bash_complete",
+            "handle": "age291-detached-child",
+            "state_dir": path_string(&state_dir),
+            "meta_path": path_string(&meta),
+            "log_path": path_string(&log),
+            "rc_path": path_string(&rc),
+            "rc": 0,
+            "terminal_artifact": {
+                "path": path_string(&artifact),
+                "sha256": artifact_sha256,
+            },
+        })
+        .to_string();
+        let mut mailbox = self.mailbox();
+        match mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: SESSION,
+                handle: "age291-detached-child",
+                payload_json: &payload_json,
+                owner_invocation_uuid: Some(owner_invocation_uuid),
+                matched_os_pid: Some(9000),
+                matched_os_boot_id: Some("age291-fixture-boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: &path_string(&state_dir),
+                meta_path: &path_string(&meta),
+                log_path: &path_string(&log),
+                rc_path: &path_string(&rc),
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("expected inserted detached-child notification, got {other:?}"),
+        }
     }
 
     fn finalized_invocation_count(&self) -> i64 {
@@ -189,6 +261,32 @@ turn_script = {}
             .optional()
             .unwrap()
             .expect("expected a resumed invocation row")
+    }
+
+    fn latest_resumed_provider_identity(&self) -> (String, String) {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT provider_name, provider_session_id
+                 FROM invocations
+                 WHERE session_capture_method = 'resumed'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn latest_invocation_uuid(&self) -> String {
+        Connection::open(self.state_path())
+            .unwrap()
+            .query_row(
+                "SELECT invocation_uuid FROM invocations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn assert_xdg_isolated(&self) {
@@ -314,6 +412,106 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
 }
 
 #[test]
+fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evidence_loss() {
+    let positive = Fixture::new();
+    positive.write_external_provider();
+    positive.remove_turn_script_fallback();
+    let owner = positive.run_agent_with_env(
+        "owner waits for detached child",
+        &[("S11_READ_TURNS_STDOUT_LIMIT", "1")],
+    );
+    assert_success(&owner);
+    let owner_stderr = String::from_utf8_lossy(&owner.stderr);
+    assert!(
+        owner_stderr.contains("session.read_turns: stdout_limit_exceeded"),
+        "incident ingest condition missing from owning log:\n{owner_stderr}"
+    );
+    let owner_invocation_uuid = positive.latest_invocation_uuid();
+    let notification = positive.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = positive.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
+            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
+        ],
+    );
+    let resumed_result = result_envelope(&resumed);
+    let resumed_invocation_uuid = resumed_result["id"].as_str().unwrap();
+    let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
+    let (acceptance, evidence) = positive.latest_resume_acceptance();
+    assert_eq!(acceptance.as_deref(), Some("accepted"));
+    assert_eq!(
+        evidence.as_deref(),
+        Some("validated submitted user turn: exact session and delivery nonce")
+    );
+    assert_eq!(resumed_result["exit_code"], 0);
+    let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
+    assert_eq!(provider_session_id, SESSION);
+    assert_eq!(provider_name, PROVIDER);
+    assert_eq!(
+        fs::read_to_string(positive.work_dir.join("affirmative-result")).unwrap(),
+        "owner consumed detached child result and continued\n"
+    );
+    let delivered = positive
+        .mailbox()
+        .list_mailbox(SESSION, true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.seq == notification.seq)
+        .unwrap();
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(delivered.delivery_attempts, 1);
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(resumed_invocation_uuid)
+    );
+    let trace = positive.run_trace(resumed_invocation_uuid);
+    assert_success(&trace);
+    let trace: Value = serde_json::from_slice(&trace.stdout).unwrap();
+    assert_eq!(trace["root"]["session"]["transcript_state"], "no_locator");
+    assert_eq!(trace["root"]["session"]["turn_count"], 0);
+    assert_eq!(trace["root"]["session"]["assistant_turn_count"], 0);
+    positive.assert_xdg_isolated();
+
+    let no_assistant = Fixture::new();
+    no_assistant.write_external_provider();
+    no_assistant.remove_turn_script_fallback();
+    let owner = no_assistant.run_agent_with_env("owner waits for detached child", &[]);
+    assert_success(&owner);
+    let owner_invocation_uuid = no_assistant.latest_invocation_uuid();
+    no_assistant.seed_detached_child_completion(&owner_invocation_uuid);
+    let unconfirmed = no_assistant.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
+        ],
+    );
+    let unconfirmed_result = result_envelope(&unconfirmed);
+    assert_eq!(unconfirmed.status.code(), Some(1), "{unconfirmed:?}");
+    assert_eq!(unconfirmed_result["status"], "failed");
+    assert_eq!(
+        unconfirmed_result["error_category"],
+        "resume_completion_unconfirmed"
+    );
+    no_assistant.assert_xdg_isolated();
+
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "AGE-291: the exact owner session accepted the detached-child delivery nonce and the provider emitted an affirmative assistant result, but the owning continuation did not consume it\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&resumed.stdout),
+        resumed_stderr,
+    );
+    assert_eq!(resumed_result["status"], "succeeded");
+    assert_eq!(resumed_result["success"], true);
+    assert!(resumed_result["error_category"].is_null());
+}
+
+#[test]
 fn external_provider_policy_rejection_terminal_signal_excerpt_includes_diagnostics() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
@@ -344,6 +542,8 @@ import base64
 import hashlib
 import json
 import os
+import pathlib
+import re
 import sys
 
 CONTRACT = "oulipoly.provider/v1"
@@ -433,6 +633,15 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     if os.environ.get("S11_MARKER_PROMPT_SHA_MISMATCH") == "1":
         prompt_sha = hashlib.sha256(b"different payload").hexdigest()
+    value = {
+        "provider_session_id": session_id,
+        "prompt_sha256": prompt_sha,
+        "source": "s11.fixture",
+        "message_id": "msg-s11-submitted",
+    }
+    match = re.search(r"^\[OULIPOLY-DELIVERY ([^\]]+)\]$", prompt, re.MULTILINE)
+    if match:
+        value["delivery_nonce"] = match.group(1)
     return {
         "contract": CONTRACT,
         "request_id": request_id(request),
@@ -440,12 +649,18 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
         "time_unix_ms": 1000 + seq,
         "kind": "marker",
         "name": "oulipoly.submitted_user_turn",
-        "value": {
-            "provider_session_id": session_id,
-            "prompt_sha256": prompt_sha,
-            "source": "s11.fixture",
-            "message_id": "msg-s11-submitted",
-        },
+        "value": value,
+    }
+
+def produced_assistant_response_marker_event(request, seq):
+    return {
+        "contract": CONTRACT,
+        "request_id": request_id(request),
+        "seq": seq,
+        "time_unix_ms": 1000 + seq,
+        "kind": "marker",
+        "name": "oulipoly.produced_assistant_response",
+        "value": True,
     }
 
 def exit_event(request, seq, session_id):
@@ -474,10 +689,21 @@ def launch(request):
     known = params.get("session", {}).get("known_provider_session_id")
     prompt = params.get("model", {}).get("inputs", {}).get("prompt", "")
     if known:
-        emit(stdout_event(request, 1, "resumed\n"))
-        seq = 2
+        seq = 1
+        produced_assistant_response = False
+        if os.environ.get("S11_NO_ASSISTANT_RESULT") != "1":
+            text = "resumed\n"
+            if os.environ.get("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT") == "1":
+                text = "owner consumed detached child result and continued\n"
+                pathlib.Path(os.environ["S11_WORK_DIR"]).joinpath("affirmative-result").write_text(text)
+                produced_assistant_response = True
+            emit(stdout_event(request, seq, text))
+            seq += 1
         if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
             emit(submitted_turn_marker_event(request, seq, known, prompt))
+            seq += 1
+        if produced_assistant_response:
+            emit(produced_assistant_response_marker_event(request, seq))
             seq += 1
         emit(exit_event(request, seq, known))
         return
@@ -495,6 +721,9 @@ def session_id_from_request(request):
     return params.get("session_id") or extra.get("start_bound_provider_session_id") or SESSION
 
 def read_turns(request):
+    if os.environ.get("S11_READ_TURNS_STDOUT_LIMIT") == "1":
+        sys.stdout.write("x" * (2 * 1024 * 1024))
+        return None
     session_id = session_id_from_request(request)
     return envelope(request, {
         "turns": [{
@@ -528,7 +757,9 @@ def main():
         launch(request)
         return 0
     if subcommand == "session.read_turns":
-        print(json.dumps(read_turns(request)))
+        result = read_turns(request)
+        if result is not None:
+            print(json.dumps(result))
         return 0
     if subcommand == "session.capture":
         print(json.dumps(capture(request)))
@@ -574,6 +805,23 @@ fn assert_success(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn result_envelope(output: &Output) -> Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("OULIPOLY_RESULT="))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected one result envelope: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(lines[0]).unwrap()
 }
 
 fn terminal_signal_marker(stderr: &str) -> Value {
