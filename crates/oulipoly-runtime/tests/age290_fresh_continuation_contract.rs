@@ -107,7 +107,7 @@ impl ContinuationStore for StoreFake {
 
 struct ResumeFake {
     calls: SharedCalls,
-    outcome: InvocationOutcome,
+    result: Result<InvocationOutcome, ContinuationBlock>,
 }
 
 impl ResumeRunner for ResumeFake {
@@ -116,18 +116,20 @@ impl ResumeRunner for ResumeFake {
         action: InvocationAction,
         reservation: &ReservedInvocation,
         _context: &ValidatedContinuation,
-    ) -> InvocationOutcome {
+    ) -> Result<InvocationOutcome, ContinuationBlock> {
         let mut calls = self.calls.borrow_mut();
         calls.resume += 1;
         calls.resume_actions.push(action);
-        assert_eq!(reservation.invocation_id, self.outcome.invocation_id);
-        self.outcome.clone()
+        if let Ok(outcome) = &self.result {
+            assert_eq!(reservation.invocation_id, outcome.invocation_id);
+        }
+        self.result.clone()
     }
 }
 
 struct FreshFake {
     calls: SharedCalls,
-    outcome: InvocationOutcome,
+    result: Result<InvocationOutcome, ContinuationBlock>,
 }
 
 impl FreshRunner for FreshFake {
@@ -137,13 +139,15 @@ impl FreshRunner for FreshFake {
         reservation: &ReservedInvocation,
         _context: &ValidatedContinuation,
         resume: &InvocationOutcome,
-    ) -> InvocationOutcome {
+    ) -> Result<InvocationOutcome, ContinuationBlock> {
         let mut calls = self.calls.borrow_mut();
         calls.fresh += 1;
         calls.fresh_actions.push(action);
-        assert_eq!(reservation.invocation_id, self.outcome.invocation_id);
-        assert_eq!(reservation.parent_invocation_id, resume.invocation_id);
-        self.outcome.clone()
+        if let Ok(outcome) = &self.result {
+            assert_eq!(reservation.invocation_id, outcome.invocation_id);
+            assert_eq!(reservation.parent_invocation_id, resume.invocation_id);
+        }
+        self.result.clone()
     }
 }
 
@@ -242,9 +246,39 @@ fn invalid_evidence_blocks_before_any_invocation() {
 }
 
 #[test]
+fn resume_adapter_error_blocks_before_recording_or_starting_fresh() {
+    let mut fixture = Fixture::happy();
+    let reason = block(ContinuationBlockKind::AmbiguousState);
+    fixture.resume_outcome = Err(reason.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(
+        actual,
+        FreshContinuationOutcome::Blocked {
+            continuation_id: Some("continuation-1".to_string()),
+            resume: None,
+            fresh: None,
+            handoff: None,
+            reason,
+        }
+    );
+    let calls = calls.borrow();
+    assert_eq!(calls.resume, 1);
+    assert_eq!(calls.record_resume, 0);
+    assert_eq!(calls.begin_fresh, 0);
+    assert_eq!(calls.fresh, 0);
+    assert_eq!(calls.record_fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
+}
+
+#[test]
 fn non_triggering_resume_never_runs_the_fresh_component() {
     let mut fixture = Fixture::happy();
-    fixture.resume_outcome = succeeded("resume-1", Some("origin-session"));
+    fixture.resume_outcome = Ok(succeeded("resume-1", Some("origin-session")));
     let calls = fixture.calls.clone();
     let mut coordinator = fixture.coordinator();
 
@@ -271,16 +305,16 @@ fn non_triggering_resume_never_runs_the_fresh_component() {
 fn fresh_failure_preserves_the_original_resume_failure() {
     let mut fixture = Fixture::happy();
     let fresh = failed("fresh-1", Some("fresh-session"), 9, "provider_failed");
-    fixture.fresh_outcome = fresh.clone();
+    fixture.fresh_outcome = Ok(fresh.clone());
     fixture.terminal = FreshContinuationOutcome::Failed {
         continuation_id: "continuation-1".to_string(),
-        resume: fixture.resume_outcome.clone(),
+        resume: fixture.resume_outcome.clone().unwrap(),
         fresh: Some(fresh),
         handoff: fixture.publication.clone().ok(),
         reason: block(ContinuationBlockKind::InvocationFailed),
     };
     let calls = fixture.calls.clone();
-    let resume = fixture.resume_outcome.clone();
+    let resume = fixture.resume_outcome.clone().unwrap();
     let mut coordinator = fixture.coordinator();
 
     let actual = coordinator.execute(request());
@@ -299,6 +333,36 @@ fn fresh_failure_preserves_the_original_resume_failure() {
     assert_eq!(calls.record_fresh, 1);
     assert_eq!(calls.publish, 1);
     assert_eq!(calls.finish, 1);
+}
+
+#[test]
+fn fresh_adapter_error_fails_without_recording_or_publishing_fresh() {
+    let mut fixture = Fixture::happy();
+    let reason = block(ContinuationBlockKind::Persistence);
+    fixture.fresh_outcome = Err(reason.clone());
+    let resume = fixture.resume_outcome.clone().unwrap();
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    assert_eq!(
+        actual,
+        FreshContinuationOutcome::Failed {
+            continuation_id: "continuation-1".to_string(),
+            resume,
+            fresh: None,
+            handoff: None,
+            reason,
+        }
+    );
+    let calls = calls.borrow();
+    assert_eq!(calls.record_resume, 1);
+    assert_eq!(calls.begin_fresh, 1);
+    assert_eq!(calls.fresh, 1);
+    assert_eq!(calls.record_fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
 }
 
 #[test]
@@ -327,8 +391,8 @@ struct Fixture {
     accept: Result<AcceptDecision, ContinuationBlock>,
     resume_decision: Result<RunDecision, ContinuationBlock>,
     fresh_decision: Result<RunDecision, ContinuationBlock>,
-    resume_outcome: InvocationOutcome,
-    fresh_outcome: InvocationOutcome,
+    resume_outcome: Result<InvocationOutcome, ContinuationBlock>,
+    fresh_outcome: Result<InvocationOutcome, ContinuationBlock>,
     publication: Result<PublishedHandoff, ContinuationBlock>,
     terminal: FreshContinuationOutcome,
 }
@@ -362,8 +426,8 @@ impl Fixture {
             accept: Ok(AcceptDecision::Accepted(Box::new(accepted))),
             resume_decision: Ok(RunDecision::Run(resume_reservation)),
             fresh_decision: Ok(RunDecision::Run(fresh_reservation)),
-            resume_outcome: resume,
-            fresh_outcome: fresh,
+            resume_outcome: Ok(resume),
+            fresh_outcome: Ok(fresh),
             publication: Ok(handoff),
             terminal,
         }
@@ -387,11 +451,11 @@ impl Fixture {
             },
             ResumeFake {
                 calls: self.calls.clone(),
-                outcome: self.resume_outcome,
+                result: self.resume_outcome,
             },
             FreshFake {
                 calls: self.calls.clone(),
-                outcome: self.fresh_outcome,
+                result: self.fresh_outcome,
             },
             PublisherFake {
                 calls: self.calls,
