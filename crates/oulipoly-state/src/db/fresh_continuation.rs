@@ -196,8 +196,8 @@ fn with_transaction<R>(
 
 fn new_continuation_record(input: &ContinuationAcceptInput) -> ContinuationRecord {
     let continuation_id = format!("continuation-{}", Uuid::new_v4());
-    let resume_invocation_id = format!("continuation-resume-{}", Uuid::new_v4());
-    let fresh_invocation_id = format!("continuation-fresh-{}", Uuid::new_v4());
+    let resume_invocation_id = Uuid::new_v4().to_string();
+    let fresh_invocation_id = Uuid::new_v4().to_string();
     ContinuationRecord {
         logical_request_key: input.logical_request_key.clone(),
         continuation_id,
@@ -241,13 +241,21 @@ fn record_from_row(
     if row.logical_request_key.is_empty()
         || row.continuation_id.is_empty()
         || row.fingerprint.is_empty()
-        || row.resume_invocation_id.is_empty()
         || row.resume_parent_invocation_id.is_empty()
-        || row.fresh_invocation_id.is_empty()
         || row.fresh_parent_invocation_id.is_empty()
     {
         return Err(ambiguous("continuation record contains an empty identity"));
     }
+    Uuid::parse_str(&row.resume_invocation_id).map_err(|error| {
+        ambiguous(format!(
+            "reserved resume invocation identity is invalid: {error}"
+        ))
+    })?;
+    Uuid::parse_str(&row.fresh_invocation_id).map_err(|error| {
+        ambiguous(format!(
+            "reserved fresh invocation identity is invalid: {error}"
+        ))
+    })?;
     if row.fresh_parent_invocation_id != row.resume_invocation_id {
         return Err(ambiguous(
             "fresh continuation parent does not match the reserved resume invocation",
