@@ -3,12 +3,18 @@ use oulipoly_runtime::services::InvocationLifecycleStartRequest;
 use oulipoly_state::{CompositeInvocationId, InvocationStart, StateDb};
 use uuid::Uuid;
 
+use crate::run::reservation::ReservedRun;
+
 pub(in crate::run::balancing) fn composite_invocation_id(
     provider_name: &str,
+    reservation: Option<&ReservedRun>,
 ) -> CompositeInvocationId {
     CompositeInvocationId {
         source: provider_name.to_string(),
-        id: Uuid::new_v4().to_string(),
+        id: reservation
+            .map(ReservedRun::invocation_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
     }
 }
 

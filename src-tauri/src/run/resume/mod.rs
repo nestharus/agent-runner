@@ -1,5 +1,9 @@
 //! Headless resume module wiring.
 
+use oulipoly_state::CompositeInvocationId;
+
+use super::reservation::ReservedRun;
+
 mod disposition;
 mod execution;
 mod filter;
@@ -18,3 +22,10 @@ mod wake;
 
 pub(crate) use orchestration::run_resume;
 pub(crate) use validator::validate_resume_input;
+
+pub(in crate::run) fn composite_invocation_id(
+    provider_name: &str,
+    reservation: Option<&ReservedRun>,
+) -> CompositeInvocationId {
+    mapper::composite_invocation_id(provider_name, reservation)
+}

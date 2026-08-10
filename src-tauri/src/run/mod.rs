@@ -2,6 +2,7 @@
 
 pub(crate) mod balancing;
 pub(crate) mod repl;
+pub(crate) mod reservation;
 pub(crate) mod resume;
 
 #[cfg(test)]

@@ -34,10 +34,7 @@ use super::disposition::{
 };
 use super::finalization::finalize_completed_attempt;
 use super::formatter;
-use super::mapper::{
-    TerminalSignalBranch, balanced_invocation_start, composite_invocation_id,
-    terminal_signal_branch,
-};
+use super::mapper::{TerminalSignalBranch, balanced_invocation_start, terminal_signal_branch};
 use super::predicate::{
     attempts_exhausted, confirmed_zero_turn_exhaustion, provider_selection_pool_exhausted,
     should_defer_generic_exit, should_late_bind_zero_turn_baseline,
@@ -313,7 +310,7 @@ fn start_balanced_attempt<'state>(
     pending_verification: Option<(usize, Option<String>)>,
 ) -> Result<BalancedInvocationAttempt<'state>, String> {
     let provider_name = provider.name.as_str();
-    let invocation = composite_invocation_id(provider_name);
+    let invocation = super::composite_invocation_id(provider_name, None);
     let invocation_row_id = start_balanced_invocation_row(
         agent_runtime_services,
         env,

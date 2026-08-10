@@ -8,6 +8,7 @@ use oulipoly_state::{CompositeInvocationId, InvocationStart, ProviderSessionBind
 use uuid::Uuid;
 
 use crate::migration_providers::ResumeExecutionEnvironment;
+use crate::run::reservation::ReservedRun;
 use crate::terminal_outcome_adapter::TerminalSignalContext;
 
 pub(super) fn prepared_headless_resume_execution(
@@ -154,10 +155,16 @@ pub(super) fn migration_service_request<'a>(
     }
 }
 
-pub(super) fn composite_invocation_id(provider_name: &str) -> CompositeInvocationId {
+pub(super) fn composite_invocation_id(
+    provider_name: &str,
+    reservation: Option<&ReservedRun>,
+) -> CompositeInvocationId {
     CompositeInvocationId {
         source: provider_name.to_string(),
-        id: Uuid::new_v4().to_string(),
+        id: reservation
+            .map(ReservedRun::invocation_id)
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
     }
 }
 
