@@ -531,6 +531,27 @@ fn dispatch_top_level_resume(
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     validate_top_level_resume_cli(cli)?;
+    if let Some(request_path) = cli.fresh_continuation_request.as_deref() {
+        let prompt_source = resolve_top_level_resume_prompt_source(cli)?;
+        let prompt = match &prompt_source {
+            TopLevelResumePromptSource::Headless {
+                positional_or_stdin_prompt,
+            } => positional_or_stdin_prompt.as_deref(),
+            TopLevelResumePromptSource::Interactive => None,
+        };
+        return run::continuation_command::run(
+            agent_runtime_services,
+            cli.model.as_deref(),
+            session_id,
+            oulipoly_state::InboxTargetKind::Session,
+            prompt,
+            cli.file.as_deref(),
+            cli.submission_token.as_deref(),
+            cli.project.as_deref(),
+            cli.models_dir.as_deref(),
+            request_path,
+        );
+    }
     match resolve_top_level_resume_prompt_source(cli)? {
         TopLevelResumePromptSource::Headless {
             positional_or_stdin_prompt,

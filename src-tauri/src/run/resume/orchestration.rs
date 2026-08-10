@@ -23,15 +23,7 @@ pub(crate) fn run_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
-    if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
-        return Ok(exit_code);
-    }
-    if let Some(exit_code) = prepare_resume_wake(session_id)? {
-        return Ok(exit_code);
-    }
-    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
-
-    let mut prepared = match execution::prepare_headless_resume_execution(
+    let mut prepared = match prepare_resume(
         agent_runtime_services,
         model_name,
         session_id,
@@ -43,10 +35,7 @@ pub(crate) fn run_resume(
         models_dir_override,
     )? {
         Ok(prepared) => prepared,
-        Err(exit_code) => {
-            wake::release_current_auto_wake_claim(session_id);
-            return Ok(exit_code);
-        }
+        Err(exit_code) => return Ok(exit_code),
     };
     run_prepared_resume(
         agent_runtime_services,
@@ -56,6 +45,45 @@ pub(crate) fn run_resume(
         session_id,
         working_dir,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::run) fn prepare_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    session_id: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    submission_token: Option<&str>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
+    if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
+        return Ok(Err(exit_code));
+    }
+    if let Some(exit_code) = prepare_resume_wake(session_id)? {
+        return Ok(Err(exit_code));
+    }
+    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
+
+    match execution::prepare_headless_resume_execution(
+        agent_runtime_services,
+        model_name,
+        session_id,
+        target_kind,
+        prompt,
+        file,
+        submission_token,
+        working_dir,
+        models_dir_override,
+    )? {
+        Ok(prepared) => Ok(Ok(prepared)),
+        Err(exit_code) => {
+            wake::release_current_auto_wake_claim(session_id);
+            Ok(Err(exit_code))
+        }
+    }
 }
 
 pub(in crate::run) fn run_prepared_resume(

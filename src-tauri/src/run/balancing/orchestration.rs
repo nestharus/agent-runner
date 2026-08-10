@@ -83,7 +83,6 @@ pub(crate) fn run_with_balancing(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(in crate::run) fn run_reserved_with_balancing(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     state_db_opener: &dyn StateDbOpener,

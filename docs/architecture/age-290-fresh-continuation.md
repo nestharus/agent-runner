@@ -6,8 +6,9 @@ their internal responsibilities into the coordinator.
 
 ```text
 CLI / dispatch
-  no continuation request -> existing resume path
-  continuation request    -> FreshContinuationCoordinator
+  no --fresh-continuation-request -> existing resume path
+  --fresh-continuation-request    -> strict schema-v1 request reader
+                                  -> FreshContinuationCoordinator
                                 |-- ContinuationEvidenceValidator
                                 |-- ContinuationStore
                                 |-- ResumeRunner
@@ -28,15 +29,18 @@ CLI / dispatch
 ## Composition Boundary
 
 The runner dispatch layer is the composition root. It constructs the
-coordinator from production adapters only for an explicit fresh-continuation
-request. Without that request it calls the existing resume entry point
-unchanged.
+coordinator from the filesystem evidence reader, SQLite continuation store,
+exact invocation observers, reserved execution callbacks, and immutable
+filesystem publisher only for `--fresh-continuation-request <PATH>`. The flag
+requires top-level `--resume` and rejects provider rotation. Without the flag,
+dispatch calls the existing resume entry point unchanged.
 
 The resume and balancing modules do not call back into fresh continuation.
-They expose adapter-level operations that accept a `ReservedInvocation` and
-return the exact typed `InvocationOutcome`. This replaces the prototype's
-post-run database search while keeping resume classification and model
-execution owned by their current components.
+The command callback resolves each `ReservedInvocation` to its exact UUID and
+parent row, then calls the prepared-resume or one-attempt balancing entry point.
+The action adapters observe that exact row after execution. This replaces the
+prototype's post-run database search while keeping resume classification and
+model execution owned by their current components.
 
 ## Integration Sequence
 

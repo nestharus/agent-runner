@@ -21,6 +21,7 @@ mod validator;
 mod wake;
 
 pub(crate) use orchestration::run_resume;
+pub(in crate::run) use orchestration::{prepare_resume, run_prepared_resume};
 pub(crate) use validator::validate_resume_input;
 
 pub(in crate::run) fn composite_invocation_id(
