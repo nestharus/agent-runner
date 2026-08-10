@@ -148,6 +148,20 @@ pub trait ContinuationEvidenceValidator {
     ) -> Result<ValidatedContinuation, ContinuationBlock>;
 }
 
+pub trait ContinuationArtifactSource {
+    fn read(&mut self, artifact: &ArtifactIdentity) -> Result<Vec<u8>, ContinuationBlock>;
+}
+
+pub struct DefaultContinuationEvidenceValidator<Source> {
+    source: Source,
+}
+
+impl<Source> DefaultContinuationEvidenceValidator<Source> {
+    pub fn new(source: Source) -> Self {
+        Self { source }
+    }
+}
+
 pub trait ContinuationStore {
     fn accept(
         &mut self,
