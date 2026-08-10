@@ -26,12 +26,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FilesystemHandoffPublisher {
     planning_root: PathBuf,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl FilesystemHandoffPublisher {
     pub(crate) fn new(planning_root: PathBuf) -> Self {
         Self { planning_root }

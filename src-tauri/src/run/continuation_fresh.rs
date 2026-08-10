@@ -22,13 +22,11 @@ use oulipoly_state::StateDb;
 
 use super::{continuation_outcome, reservation::ReservedRun};
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ContinuationFreshRunner<'state, Execute> {
     state: &'state StateDb,
     execute: Execute,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'state, Execute> ContinuationFreshRunner<'state, Execute> {
     pub(crate) fn new(state: &'state StateDb, execute: Execute) -> Self {
         Self { state, execute }

@@ -58,7 +58,6 @@ struct ArtifactIdentityV1 {
     sha256: String,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read(path: &Path) -> Result<FreshContinuationRequest, ContinuationBlock> {
     let bytes = read_request_bytes(path)
         .map_err(|error| invalid_request(format_request_read_error(path, &error)))?;
@@ -98,7 +97,6 @@ fn format_request_parse_error(error: &serde_json::Error) -> String {
     format!("Invalid fresh continuation request: {error}")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fresh_prompt(context: &ValidatedContinuation, resume: &InvocationOutcome) -> String {
     oulipoly_runtime::fresh_continuation::fresh_prompt(context, resume)
 }
