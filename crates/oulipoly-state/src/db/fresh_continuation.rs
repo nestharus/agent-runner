@@ -23,6 +23,7 @@ use crate::continuation::{
 use crate::repositories::ContinuationRepository;
 
 const FRESH_INVOCATION_FAILED_REASON: &str = "fresh continuation invocation failed";
+const INVOCATION_LEASE_SECONDS: i64 = 6 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -51,10 +52,12 @@ struct ContinuationRow {
     resume_invocation_id: String,
     resume_parent_invocation_id: String,
     resume_stage: String,
+    resume_started_at: Option<i64>,
     resume_outcome_json: Option<String>,
     fresh_invocation_id: String,
     fresh_parent_invocation_id: String,
     fresh_stage: String,
+    fresh_started_at: Option<i64>,
     fresh_outcome_json: Option<String>,
     handoff_json: Option<String>,
     terminal_outcome_json: Option<String>,
@@ -201,19 +204,8 @@ fn begin_continuation_resume_transaction(
     }
 
     let stage = Stage::parse(&row.resume_stage, "resume")?;
-    transition_resume_if_reserved(tx, continuation, stage)?;
-    Ok(stage_run_decision(stage, &continuation.resume))
-}
-
-fn transition_resume_if_reserved(
-    tx: &Transaction<'_>,
-    continuation: &ContinuationRecord,
-    stage: Stage,
-) -> Result<(), ContinuationRepositoryError> {
-    if stage == Stage::Reserved {
-        return transition_stage(tx, continuation, "resume_stage", "reserved", "running");
-    }
-    Ok(())
+    let claimed = claim_stage(tx, continuation, stage, OutcomeKind::Resume)?;
+    Ok(stage_run_decision(stage, claimed, &continuation.resume))
 }
 
 fn begin_continuation_fresh_transaction(
@@ -228,8 +220,8 @@ fn begin_continuation_fresh_transaction(
     let resume = require_recorded_outcome(&row, OutcomeKind::Resume)?;
     require_fresh_trigger(&resume)?;
     let stage = Stage::parse(&row.fresh_stage, "fresh")?;
-    transition_fresh_if_reserved(tx, continuation, stage)?;
-    Ok(stage_run_decision(stage, &continuation.fresh))
+    let claimed = claim_stage(tx, continuation, stage, OutcomeKind::Fresh)?;
+    Ok(stage_run_decision(stage, claimed, &continuation.fresh))
 }
 
 fn require_fresh_trigger(
@@ -254,28 +246,24 @@ fn require_fresh_trigger(
     ))
 }
 
-fn transition_fresh_if_reserved(
-    tx: &Transaction<'_>,
-    continuation: &ContinuationRecord,
-    stage: Stage,
-) -> Result<(), ContinuationRepositoryError> {
-    if stage == Stage::Reserved {
-        return transition_stage(tx, continuation, "fresh_stage", "reserved", "running");
-    }
-    Ok(())
-}
-
 fn terminal_run_decision(terminal: ContinuationTerminalOutcome) -> ContinuationRunDecision {
     ContinuationRunDecision::Terminal(Box::new(terminal))
 }
 
 fn stage_run_decision(
     stage: Stage,
+    claimed: bool,
     reservation: &ContinuationReservation,
 ) -> ContinuationRunDecision {
-    match stage {
-        Stage::Reserved => ContinuationRunDecision::Run(reservation.clone()),
-        Stage::Running | Stage::Recorded => ContinuationRunDecision::Observe(reservation.clone()),
+    if claimed {
+        ContinuationRunDecision::Run(reservation.clone())
+    } else {
+        match stage {
+            Stage::Running | Stage::Recorded => {
+                ContinuationRunDecision::Observe(reservation.clone())
+            }
+            Stage::Reserved => unreachable!("a reserved continuation must be claimed"),
+        }
     }
 }
 
@@ -429,6 +417,8 @@ fn validate_continuation_row(
         "resume",
     )?;
     validate_stage_outcome_pair(parsed.fresh_stage, row.fresh_outcome_json.as_ref(), "fresh")?;
+    validate_stage_lease_pair(parsed.resume_stage, row.resume_started_at, "resume")?;
+    validate_stage_lease_pair(parsed.fresh_stage, row.fresh_started_at, "fresh")?;
     validate_recorded_outcome(row, OutcomeKind::Resume, parsed.resume_stage)?;
     validate_recorded_outcome(row, OutcomeKind::Fresh, parsed.fresh_stage)?;
     if parsed.fresh_stage != Stage::Reserved && parsed.resume_stage != Stage::Recorded {
@@ -475,6 +465,19 @@ fn validate_stage_outcome_pair(
     if (stage == Stage::Recorded) != outcome_json.is_some() {
         return Err(ambiguous(format!(
             "continuation {label} stage and durable outcome disagree"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stage_lease_pair(
+    stage: Stage,
+    started_at: Option<i64>,
+    label: &str,
+) -> Result<(), ContinuationRepositoryError> {
+    if (stage == Stage::Reserved) != started_at.is_none() {
+        return Err(ambiguous(format!(
+            "continuation {label} stage and durable lease disagree"
         )));
     }
     Ok(())
@@ -562,10 +565,12 @@ fn format_row_query(predicate: &str) -> String {
             resume_invocation_id,
             resume_parent_invocation_id,
             resume_stage,
+            resume_started_at,
             resume_outcome_json,
             fresh_invocation_id,
             fresh_parent_invocation_id,
             fresh_stage,
+            fresh_started_at,
             fresh_outcome_json,
             handoff_json,
             terminal_outcome_json
@@ -582,45 +587,49 @@ fn map_continuation_row_from_sql(row: &sqlite::Row<'_>) -> Result<ContinuationRo
         resume_invocation_id: row.get(3)?,
         resume_parent_invocation_id: row.get(4)?,
         resume_stage: row.get(5)?,
-        resume_outcome_json: row.get(6)?,
-        fresh_invocation_id: row.get(7)?,
-        fresh_parent_invocation_id: row.get(8)?,
-        fresh_stage: row.get(9)?,
-        fresh_outcome_json: row.get(10)?,
-        handoff_json: row.get(11)?,
-        terminal_outcome_json: row.get(12)?,
+        resume_started_at: row.get(6)?,
+        resume_outcome_json: row.get(7)?,
+        fresh_invocation_id: row.get(8)?,
+        fresh_parent_invocation_id: row.get(9)?,
+        fresh_stage: row.get(10)?,
+        fresh_started_at: row.get(11)?,
+        fresh_outcome_json: row.get(12)?,
+        handoff_json: row.get(13)?,
+        terminal_outcome_json: row.get(14)?,
     })
 }
 
-fn transition_stage(
+fn claim_stage(
     tx: &Transaction<'_>,
     continuation: &ContinuationRecord,
-    column: &str,
-    expected: &str,
-    next: &str,
-) -> Result<(), ContinuationRepositoryError> {
-    let sql = format_transition_sql(column);
-    execute_stage_transition(tx, continuation, expected, next, &sql)
-}
-
-fn execute_stage_transition(
-    tx: &Transaction<'_>,
-    continuation: &ContinuationRecord,
-    expected: &str,
-    next: &str,
-    sql: &str,
-) -> Result<(), ContinuationRepositoryError> {
+    stage: Stage,
+    kind: OutcomeKind,
+) -> Result<bool, ContinuationRepositoryError> {
+    let columns = outcome_columns(kind);
+    let stage_column = columns.stage;
+    let started_at_column = columns.started_at;
+    let predicate = match stage {
+        Stage::Reserved => format!("{stage_column} = 'reserved' AND ?2 > 0"),
+        Stage::Running => {
+            format!("{stage_column} = 'running' AND {started_at_column} <= unixepoch() - ?2")
+        }
+        Stage::Recorded => return Ok(false),
+    };
+    let sql = format!(
+        "UPDATE fresh_continuations
+            SET {stage_column} = 'running', {started_at_column} = unixepoch()
+          WHERE continuation_id = ?1 AND {predicate}"
+    );
     let updated = tx
-        .execute(sql, params![next, continuation.continuation_id, expected])
-        .map_err(|error| persistence("transition continuation stage", error))?;
-    require_one_updated(updated, "transition continuation stage")
-}
-
-fn format_transition_sql(column: &str) -> String {
-    format!(
-        "UPDATE fresh_continuations SET {column} = ?1
-          WHERE continuation_id = ?2 AND {column} = ?3"
-    )
+        .execute(
+            &sql,
+            params![continuation.continuation_id, INVOCATION_LEASE_SECONDS],
+        )
+        .map_err(|error| persistence("claim continuation invocation lease", error))?;
+    if stage == Stage::Reserved {
+        require_one_updated(updated, "claim reserved continuation invocation lease")?;
+    }
+    Ok(updated == 1)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -748,6 +757,7 @@ fn serialize_outcome(
 #[derive(Debug, Clone, Copy)]
 struct OutcomeColumns {
     stage: &'static str,
+    started_at: &'static str,
     outcome: &'static str,
 }
 
@@ -755,10 +765,12 @@ fn outcome_columns(kind: OutcomeKind) -> OutcomeColumns {
     match kind {
         OutcomeKind::Resume => OutcomeColumns {
             stage: "resume_stage",
+            started_at: "resume_started_at",
             outcome: "resume_outcome_json",
         },
         OutcomeKind::Fresh => OutcomeColumns {
             stage: "fresh_stage",
+            started_at: "fresh_started_at",
             outcome: "fresh_outcome_json",
         },
     }

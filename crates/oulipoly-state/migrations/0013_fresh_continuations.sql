@@ -11,17 +11,21 @@ CREATE TABLE fresh_continuations (
     resume_stage TEXT NOT NULL DEFAULT 'reserved' CHECK (
         resume_stage IN ('reserved', 'running', 'recorded')
     ),
+    resume_started_at INTEGER,
     resume_outcome_json TEXT,
     fresh_invocation_id TEXT NOT NULL UNIQUE CHECK (fresh_invocation_id <> ''),
     fresh_parent_invocation_id TEXT NOT NULL CHECK (fresh_parent_invocation_id <> ''),
     fresh_stage TEXT NOT NULL DEFAULT 'reserved' CHECK (
         fresh_stage IN ('reserved', 'running', 'recorded')
     ),
+    fresh_started_at INTEGER,
     fresh_outcome_json TEXT,
     handoff_json TEXT,
     terminal_outcome_json TEXT,
     CHECK ((resume_stage = 'recorded') = (resume_outcome_json IS NOT NULL)),
     CHECK ((fresh_stage = 'recorded') = (fresh_outcome_json IS NOT NULL)),
+    CHECK ((resume_stage = 'reserved') = (resume_started_at IS NULL)),
+    CHECK ((fresh_stage = 'reserved') = (fresh_started_at IS NULL)),
     CHECK (resume_outcome_json IS NULL OR json_valid(resume_outcome_json)),
     CHECK (fresh_outcome_json IS NULL OR json_valid(fresh_outcome_json)),
     CHECK (handoff_json IS NULL OR json_valid(handoff_json)),
