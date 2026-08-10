@@ -1,6 +1,17 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `validator`, `accessor`
+//! `orchestration`, `mapper`, `validator`, `accessor`, `formatter`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_command_tests.rs
+//!     role: adapter
+//!     Translates:
+//!       - fresh-continuation-command-composition-contract
+//!       - filesystem-and-SQLite-test-fixture-contract
+//! ```
 
 use std::cell::Cell;
 use std::fs;

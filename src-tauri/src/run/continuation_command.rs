@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use oulipoly_config::{ModelConfig, ProvidersConfig, load_models};
 use oulipoly_runtime::fresh_continuation::{
@@ -51,6 +51,31 @@ struct ResumeExecution<'a> {
     submission_token: Option<&'a str>,
     working_dir: &'a Path,
     models_dir_override: Option<&'a Path>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_execution<'a>(
+    agent_runtime_services: &'a wiring::AgentRuntimeServices,
+    model_name: Option<&'a str>,
+    session_id: &'a str,
+    target_kind: InboxTargetKind,
+    prompt: Option<&'a str>,
+    file: Option<&'a Path>,
+    submission_token: Option<&'a str>,
+    working_dir: &'a Path,
+    models_dir_override: Option<&'a Path>,
+) -> ResumeExecution<'a> {
+    ResumeExecution {
+        agent_runtime_services,
+        model_name,
+        session_id,
+        target_kind,
+        prompt,
+        file,
+        submission_token,
+        working_dir,
+        models_dir_override,
+    }
 }
 
 impl ResumeExecution<'_> {
@@ -95,6 +120,16 @@ impl ResumeExecution<'_> {
 struct FreshExecution<'a> {
     agent_runtime_services: &'a wiring::AgentRuntimeServices,
     models_dir_override: Option<&'a Path>,
+}
+
+fn fresh_execution<'a>(
+    agent_runtime_services: &'a wiring::AgentRuntimeServices,
+    models_dir_override: Option<&'a Path>,
+) -> FreshExecution<'a> {
+    FreshExecution {
+        agent_runtime_services,
+        models_dir_override,
+    }
 }
 
 impl FreshExecution<'_> {
@@ -163,7 +198,7 @@ pub(crate) fn run(
     let store_state = ProductionStateDbOpener.open_default()?;
     let observation_state = ProductionStateDbOpener.open_default()?;
     let effective_worktree = request.worktree.clone();
-    let resume_execution = ResumeExecution {
+    let resume_execution = resume_execution(
         agent_runtime_services,
         model_name,
         session_id,
@@ -171,13 +206,10 @@ pub(crate) fn run(
         prompt,
         file,
         submission_token,
-        working_dir: &effective_worktree,
+        &effective_worktree,
         models_dir_override,
-    };
-    let fresh_execution = FreshExecution {
-        agent_runtime_services,
-        models_dir_override,
-    };
+    );
+    let fresh_execution = fresh_execution(agent_runtime_services, models_dir_override);
     let outcome = execute_with_callbacks(
         request,
         store_state,
@@ -213,20 +245,57 @@ fn load_target_model(
     ),
     ContinuationBlock,
 > {
-    let providers =
-        ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default();
-    let models_dir = models_dir_override
+    let providers = load_provider_configuration();
+    let models_dir = resolve_models_directory(models_dir_override);
+    let models = load_model_configuration(&models_dir, &providers).map_err(invocation_failed)?;
+    let model = require_target_model(target_model, &models)?;
+    Ok(target_model_configuration(model, models, models_dir))
+}
+
+fn load_provider_configuration() -> ProvidersConfig {
+    ProvidersConfig::load(&default_config_root().join("providers.toml")).unwrap_or_default()
+}
+
+fn resolve_models_directory(models_dir_override: Option<&Path>) -> PathBuf {
+    models_dir_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(default_models_dir);
-    let models = load_models(&models_dir, Some(&providers)).map_err(invocation_failed)?;
-    let model = models
-        .get(target_model)
-        .cloned()
-        .ok_or_else(|| ContinuationBlock {
-            kind: ContinuationBlockKind::InvalidEvidence,
-            message: format!("Fresh continuation target model not found: {target_model}"),
-        })?;
-    Ok((model, models, models_dir))
+        .unwrap_or_else(default_models_dir)
+}
+
+fn load_model_configuration(
+    models_dir: &Path,
+    providers: &ProvidersConfig,
+) -> Result<HashMap<String, ModelConfig>, oulipoly_config::ModelError> {
+    load_models(models_dir, Some(providers))
+}
+
+fn require_target_model(
+    target_model: &str,
+    models: &HashMap<String, ModelConfig>,
+) -> Result<ModelConfig, ContinuationBlock> {
+    let Some(model) = models.get(target_model).cloned() else {
+        return Err(target_model_not_found(target_model));
+    };
+    Ok(model)
+}
+
+fn target_model_not_found(target_model: &str) -> ContinuationBlock {
+    ContinuationBlock {
+        kind: ContinuationBlockKind::InvalidEvidence,
+        message: format_target_model_not_found(target_model),
+    }
+}
+
+fn format_target_model_not_found(target_model: &str) -> String {
+    format!("Fresh continuation target model not found: {target_model}")
+}
+
+fn target_model_configuration(
+    model: ModelConfig,
+    models: HashMap<String, ModelConfig>,
+    models_dir: PathBuf,
+) -> (ModelConfig, HashMap<String, ModelConfig>, PathBuf) {
+    (model, models, models_dir)
 }
 
 fn report_outcome(outcome: &FreshContinuationOutcome) -> i32 {

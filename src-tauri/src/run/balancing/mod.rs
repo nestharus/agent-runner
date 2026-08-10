@@ -2,7 +2,20 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`
+//! `orchestration`, `mapper`, `accessor`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/run/balancing/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: balancing_module_facade
+//!     Owns:
+//!       - balancing child module declarations
+//!       - balancing orchestration and diagnostic re-exports
+//!       - balancing reservation policy mappers
+//! ```
 
 use oulipoly_state::CompositeInvocationId;
 

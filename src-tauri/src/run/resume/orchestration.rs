@@ -1,6 +1,19 @@
 //! ## Declared roles
 //!
 //! `orchestration`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/resume/orchestration.rs
+//!     role: adapter
+//!     Translates:
+//!       - resume-execution-preparation-contract
+//!       - resume-attempt-lifecycle-contract
+//!       - resume-terminal-disposition-contract
+//!       - resume-wake-contract
+//! ```
 
 use std::path::Path;
 
@@ -94,9 +107,7 @@ pub(in crate::run) fn run_prepared_resume(
     session_id: &str,
     working_dir: Option<&Path>,
 ) -> Result<i32, String> {
-    if reservation.is_some() && manual_migrate.is_some() {
-        return Err("Reserved resume execution cannot migrate providers".to_string());
-    }
+    execution::validate_reserved_resume_options(reservation, manual_migrate)?;
     let result = run_resume_loop(ResumeLoopInput {
         agent_runtime_services,
         prepared,

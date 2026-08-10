@@ -1,10 +1,26 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `formatter`, `mapper`, `predicate`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_handoff.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-handoff-publisher-port-contract
+//!       - immutable-filesystem-handoff-schema-contract
+//! ```
+
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use oulipoly_runtime::fresh_continuation::{
-    ContinuationBlock, ContinuationBlockKind, ContinuationHandoff, HandoffPublisher,
-    InvocationDisposition, InvocationOutcome, PublishedHandoff, ResumeAcceptance,
+    ArtifactIdentity, ContinuationBlock, ContinuationBlockKind, ContinuationEvidence,
+    ContinuationHandoff, FreshContinuationRequest, HandoffPublisher, InvocationDisposition,
+    InvocationOutcome, PublishedHandoff, ResumeAcceptance,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -30,8 +46,11 @@ impl HandoffPublisher for FilesystemHandoffPublisher {
         validate_continuation_id(&handoff.continuation_id)?;
         let output_dir = self.planning_root.join("continuations");
         fs::create_dir_all(&output_dir).map_err(persistence)?;
-        validate_output_dir(&self.planning_root, &output_dir)?;
-        let target = output_dir.join(format!("{}.json", handoff.continuation_id));
+        let canonical_root = canonical_path(&self.planning_root)?;
+        let canonical_output = canonical_path(&output_dir)?;
+        validate_output_dir(&canonical_root, &canonical_output)?;
+        let target_name = handoff_name(&handoff.continuation_id);
+        let target = publication_path(&output_dir, &target_name);
         let bytes = handoff_bytes(&handoff)?;
         let sha256 = sha256(&bytes);
 
@@ -39,22 +58,10 @@ impl HandoffPublisher for FilesystemHandoffPublisher {
             return reconcile_existing(&target, &bytes, sha256);
         }
 
-        let temp = output_dir.join(format!(
-            ".{}.{}.tmp",
-            handoff.continuation_id,
-            Uuid::new_v4()
-        ));
+        let temp_name = temporary_handoff_name(&handoff.continuation_id, Uuid::new_v4());
+        let temp = publication_path(&output_dir, &temp_name);
         write_durable_temp(&temp, &bytes)?;
-        let publish_result = match fs::hard_link(&temp, &target) {
-            Ok(()) => Ok(PublishedHandoff {
-                path: target,
-                sha256,
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                reconcile_existing(&target, &bytes, sha256)
-            }
-            Err(error) => Err(persistence(error)),
-        };
+        let publish_result = link_publication(&temp, &target, &bytes, sha256);
         let _ = fs::remove_file(temp);
         publish_result
     }
@@ -74,9 +81,14 @@ fn validate_continuation_id(continuation_id: &str) -> Result<(), ContinuationBlo
     Ok(())
 }
 
-fn validate_output_dir(planning_root: &Path, output_dir: &Path) -> Result<(), ContinuationBlock> {
-    let canonical_root = fs::canonicalize(planning_root).map_err(persistence)?;
-    let canonical_output = fs::canonicalize(output_dir).map_err(persistence)?;
+fn canonical_path(path: &Path) -> Result<PathBuf, ContinuationBlock> {
+    fs::canonicalize(path).map_err(persistence)
+}
+
+fn validate_output_dir(
+    canonical_root: &Path,
+    canonical_output: &Path,
+) -> Result<(), ContinuationBlock> {
     if !canonical_output.starts_with(canonical_root) {
         return Err(ContinuationBlock {
             kind: ContinuationBlockKind::InvalidEvidence,
@@ -96,28 +108,85 @@ fn write_durable_temp(path: &Path, bytes: &[u8]) -> Result<(), ContinuationBlock
     file.sync_all().map_err(persistence)
 }
 
+fn link_publication(
+    temp: &Path,
+    target: &Path,
+    expected: &[u8],
+    sha256: String,
+) -> Result<PublishedHandoff, ContinuationBlock> {
+    match fs::hard_link(temp, target) {
+        Ok(()) => Ok(published_handoff(target, sha256)),
+        Err(error) => reconcile_link_error(error, target, expected, sha256),
+    }
+}
+
+fn reconcile_link_error(
+    error: std::io::Error,
+    target: &Path,
+    expected: &[u8],
+    sha256: String,
+) -> Result<PublishedHandoff, ContinuationBlock> {
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return reconcile_existing(target, expected, sha256);
+    }
+    Err(persistence(error))
+}
+
 fn reconcile_existing(
     path: &Path,
     expected: &[u8],
     sha256: String,
 ) -> Result<PublishedHandoff, ContinuationBlock> {
-    if fs::symlink_metadata(path)
-        .map_err(persistence)?
-        .file_type()
-        .is_symlink()
-    {
+    let file_type = existing_file_type(path)?;
+    validate_existing_file_type(file_type)?;
+    let existing = existing_handoff_bytes(path)?;
+    validate_existing_bytes(&existing, expected)?;
+    Ok(published_handoff(path, sha256))
+}
+
+fn existing_file_type(path: &Path) -> Result<fs::FileType, ContinuationBlock> {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type())
+        .map_err(persistence)
+}
+
+fn existing_handoff_bytes(path: &Path) -> Result<Vec<u8>, ContinuationBlock> {
+    fs::read(path).map_err(persistence)
+}
+
+fn validate_existing_file_type(file_type: fs::FileType) -> Result<(), ContinuationBlock> {
+    if file_type.is_symlink() {
         return Err(conflict("Existing continuation handoff is a symlink"));
     }
-    let existing = fs::read(path).map_err(persistence)?;
+    Ok(())
+}
+
+fn validate_existing_bytes(existing: &[u8], expected: &[u8]) -> Result<(), ContinuationBlock> {
     if existing != expected {
         return Err(conflict(
             "Existing continuation handoff differs from the requested publication",
         ));
     }
-    Ok(PublishedHandoff {
+    Ok(())
+}
+
+fn handoff_name(continuation_id: &str) -> String {
+    format!("{continuation_id}.json")
+}
+
+fn temporary_handoff_name(continuation_id: &str, nonce: Uuid) -> String {
+    format!(".{continuation_id}.{nonce}.tmp")
+}
+
+fn publication_path(output_dir: &Path, name: &str) -> PathBuf {
+    output_dir.join(name)
+}
+
+fn published_handoff(path: &Path, sha256: String) -> PublishedHandoff {
+    PublishedHandoff {
         path: path.to_path_buf(),
         sha256,
-    })
+    }
 }
 
 fn handoff_bytes(handoff: &ContinuationHandoff) -> Result<Vec<u8>, ContinuationBlock> {
@@ -125,12 +194,47 @@ fn handoff_bytes(handoff: &ContinuationHandoff) -> Result<Vec<u8>, ContinuationB
         "schema_version": 1,
         "kind": "fresh_continuation_handoff",
         "continuation_id": handoff.continuation_id,
+        "fresh_prompt": handoff.fresh_prompt,
+        "request": request_json(&handoff.request),
         "resume": outcome_json(&handoff.resume),
         "fresh": handoff.fresh.as_ref().map(outcome_json),
     }))
     .map_err(persistence)?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+
+fn request_json(request: &FreshContinuationRequest) -> Value {
+    json!({
+        "schema_version": 1,
+        "kind": "fresh_continuation_request",
+        "question_id": request.question_id,
+        "origin_invocation_id": request.origin_invocation_id,
+        "origin_session_id": request.origin_session_id,
+        "planning_root": request.planning_root,
+        "worktree": request.worktree,
+        "last_successful_boundary": request.last_successful_boundary,
+        "active_blocked_boundary": request.active_blocked_boundary,
+        "target_model": request.target_model,
+        "evidence": evidence_json(&request.evidence),
+    })
+}
+
+fn evidence_json(evidence: &ContinuationEvidence) -> Value {
+    json!({
+        "question": artifact_json(&evidence.question),
+        "answer": artifact_json(&evidence.answer),
+        "session_graph": artifact_json(&evidence.session_graph),
+        "origin_trace": artifact_json(&evidence.origin_trace),
+        "ticket_snapshot": artifact_json(&evidence.ticket_snapshot),
+    })
+}
+
+fn artifact_json(artifact: &ArtifactIdentity) -> Value {
+    json!({
+        "path": artifact.path,
+        "sha256": artifact.sha256,
+    })
 }
 
 fn outcome_json(outcome: &InvocationOutcome) -> Value {

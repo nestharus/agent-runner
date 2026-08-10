@@ -25,6 +25,7 @@
 //!         remaining db concern surface) is the
 //!         documented stable consumer API this root carrier owns and re-exports
 //!         unchanged from the decomposed `db` module tree
+//!       - the root-public typed continuation DTO and repository error module
 //! ```
 
 mod chain_segments;

@@ -1,9 +1,31 @@
+//! ## Declared roles
+//!
+//! `validator`, `mapper`, `accessor`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_outcome.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-continuation-invocation-outcome-contract
+//!       - StateDb-invocation-record-contract
+//! ```
+
 use oulipoly_runtime::fresh_continuation::{
     InvocationDisposition, InvocationOutcome, ReservedInvocation, ResumeAcceptance,
 };
 use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
 
 use super::reservation::ReservedRun;
+
+struct ValidatedOutcome {
+    session_id: Option<String>,
+    physical_exit_code: i32,
+    acceptance: ResumeAcceptance,
+    disposition: InvocationDisposition,
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn observe_resume_outcome(
@@ -38,12 +60,7 @@ pub(crate) fn observe_fresh_outcome(
     reservation: &ReservedInvocation,
 ) -> Result<InvocationOutcome, String> {
     observe_exact_outcome(state, reservation, |row, disposition| {
-        if matches!(disposition, InvocationDisposition::Succeeded)
-            && row
-                .provider_session_id
-                .as_deref()
-                .is_none_or(|session_id| session_id.trim().is_empty())
-        {
+        if is_successful(disposition) && !has_provider_session(row) {
             return Err(format!(
                 "Successful reserved fresh invocation {} has no captured provider session",
                 reservation.invocation_id
@@ -52,6 +69,19 @@ pub(crate) fn observe_fresh_outcome(
 
         Ok(ResumeAcceptance::NotApplicable)
     })
+}
+
+fn is_successful(disposition: &InvocationDisposition) -> bool {
+    match disposition {
+        InvocationDisposition::Succeeded => true,
+        InvocationDisposition::Failed { .. } => false,
+    }
+}
+
+fn has_provider_session(row: &InvocationRecord) -> bool {
+    row.provider_session_id
+        .as_deref()
+        .is_some_and(|session_id| !session_id.trim().is_empty())
 }
 
 fn observe_exact_outcome(
@@ -63,76 +93,123 @@ fn observe_exact_outcome(
     ) -> Result<ResumeAcceptance, String>,
 ) -> Result<InvocationOutcome, String> {
     let reserved = ReservedRun::resolve(state, reservation)?;
-    let row = state
-        .get_invocation_by_uuid(&reservation.invocation_id)?
-        .ok_or_else(|| {
-            format!(
-                "Reserved invocation not found: {}",
-                reservation.invocation_id
-            )
-        })?;
+    let row = exact_invocation_row(state, &reservation.invocation_id)?;
+    let validated = validate_terminal_row(
+        row,
+        reserved.parent_invocation_row_id(),
+        &reservation.invocation_id,
+        acceptance,
+    )?;
+    Ok(invocation_outcome(reserved.invocation_id(), validated))
+}
 
-    if row.parent_invocation_id != Some(reserved.parent_invocation_row_id()) {
-        return Err(format!(
-            "Reserved invocation {} is attached to the wrong parent",
-            reservation.invocation_id
-        ));
+fn exact_invocation_row(state: &StateDb, invocation_id: &str) -> Result<InvocationRecord, String> {
+    let row = state.get_invocation_by_uuid(invocation_id)?;
+    match row {
+        Some(row) => Ok(row),
+        None => Err(format!("Reserved invocation not found: {invocation_id}")),
     }
+}
 
-    let physical_exit_code = row.exit_code.ok_or_else(|| {
-        format!(
-            "Reserved invocation {} has no physical exit code",
-            reservation.invocation_id
-        )
-    })?;
-    let disposition = match row.status {
-        InvocationStatus::Succeeded => {
-            if row.finished_at.is_none() || row.success != Some(true) {
-                return Err(format!(
-                    "Reserved invocation {} has an incoherent successful terminal row",
-                    reservation.invocation_id
-                ));
-            }
-            InvocationDisposition::Succeeded
-        }
-        InvocationStatus::Failed => {
-            if row.finished_at.is_none() || row.success != Some(false) {
-                return Err(format!(
-                    "Reserved invocation {} has an incoherent failed terminal row",
-                    reservation.invocation_id
-                ));
-            }
-            InvocationDisposition::Failed {
-                error_category: required_terminal_field(
-                    row.error_category.as_deref(),
-                    "error category",
-                    &reservation.invocation_id,
-                )?
-                .to_string(),
-                terminal_reason: required_terminal_field(
-                    row.terminal_reason.as_deref(),
-                    "terminal reason",
-                    &reservation.invocation_id,
-                )?
-                .to_string(),
-            }
-        }
-        InvocationStatus::Running | InvocationStatus::Legacy => {
-            return Err(format!(
-                "Reserved invocation {} is not coherently terminal",
-                reservation.invocation_id
-            ));
-        }
-    };
+fn validate_terminal_row(
+    row: InvocationRecord,
+    expected_parent_row_id: i64,
+    invocation_id: &str,
+    acceptance: impl FnOnce(
+        &InvocationRecord,
+        &InvocationDisposition,
+    ) -> Result<ResumeAcceptance, String>,
+) -> Result<ValidatedOutcome, String> {
+    validate_parent(&row, expected_parent_row_id, invocation_id)?;
+    let physical_exit_code = required_exit_code(&row, invocation_id)?;
+    let disposition = validate_disposition(&row, invocation_id)?;
     let acceptance = acceptance(&row, &disposition)?;
 
-    Ok(InvocationOutcome {
-        invocation_id: reserved.invocation_id().to_string(),
+    Ok(ValidatedOutcome {
         session_id: row.provider_session_id,
         physical_exit_code,
         acceptance,
         disposition,
     })
+}
+
+fn validate_parent(
+    row: &InvocationRecord,
+    expected_parent_row_id: i64,
+    invocation_id: &str,
+) -> Result<(), String> {
+    if row.parent_invocation_id != Some(expected_parent_row_id) {
+        return Err(format!(
+            "Reserved invocation {invocation_id} is attached to the wrong parent"
+        ));
+    }
+    Ok(())
+}
+
+fn required_exit_code(row: &InvocationRecord, invocation_id: &str) -> Result<i32, String> {
+    row.exit_code
+        .ok_or_else(|| format!("Reserved invocation {invocation_id} has no physical exit code"))
+}
+
+fn validate_disposition(
+    row: &InvocationRecord,
+    invocation_id: &str,
+) -> Result<InvocationDisposition, String> {
+    match row.status {
+        InvocationStatus::Succeeded => {
+            validate_successful_terminal(row, invocation_id)?;
+            Ok(InvocationDisposition::Succeeded)
+        }
+        InvocationStatus::Failed => validate_failed_terminal(row, invocation_id),
+        InvocationStatus::Running | InvocationStatus::Legacy => Err(format!(
+            "Reserved invocation {invocation_id} is not coherently terminal"
+        )),
+    }
+}
+
+fn validate_successful_terminal(row: &InvocationRecord, invocation_id: &str) -> Result<(), String> {
+    if row.finished_at.is_none() || row.success != Some(true) {
+        return Err(format!(
+            "Reserved invocation {invocation_id} has an incoherent successful terminal row"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_failed_terminal(
+    row: &InvocationRecord,
+    invocation_id: &str,
+) -> Result<InvocationDisposition, String> {
+    if row.finished_at.is_none() || row.success != Some(false) {
+        return Err(format!(
+            "Reserved invocation {invocation_id} has an incoherent failed terminal row"
+        ));
+    }
+
+    let error_category = required_terminal_field(
+        row.error_category.as_deref(),
+        "error category",
+        invocation_id,
+    )?;
+    let terminal_reason = required_terminal_field(
+        row.terminal_reason.as_deref(),
+        "terminal reason",
+        invocation_id,
+    )?;
+    Ok(InvocationDisposition::Failed {
+        error_category: error_category.to_string(),
+        terminal_reason: terminal_reason.to_string(),
+    })
+}
+
+fn invocation_outcome(invocation_id: &str, validated: ValidatedOutcome) -> InvocationOutcome {
+    InvocationOutcome {
+        invocation_id: invocation_id.to_string(),
+        session_id: validated.session_id,
+        physical_exit_code: validated.physical_exit_code,
+        acceptance: validated.acceptance,
+        disposition: validated.disposition,
+    }
 }
 
 fn required_terminal_field<'a>(

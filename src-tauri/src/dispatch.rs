@@ -533,12 +533,7 @@ fn dispatch_top_level_resume(
     validate_top_level_resume_cli(cli)?;
     if let Some(request_path) = cli.fresh_continuation_request.as_deref() {
         let prompt_source = resolve_top_level_resume_prompt_source(cli)?;
-        let prompt = match &prompt_source {
-            TopLevelResumePromptSource::Headless {
-                positional_or_stdin_prompt,
-            } => positional_or_stdin_prompt.as_deref(),
-            TopLevelResumePromptSource::Interactive => None,
-        };
+        let prompt = continuation_command_prompt(&prompt_source);
         return run::continuation_command::run(
             agent_runtime_services,
             cli.model.as_deref(),
@@ -564,6 +559,15 @@ fn dispatch_top_level_resume(
         TopLevelResumePromptSource::Interactive => {
             dispatch_interactive_top_level_resume(cli, session_id, agent_runtime_services)
         }
+    }
+}
+
+fn continuation_command_prompt(prompt_source: &TopLevelResumePromptSource) -> Option<&str> {
+    match prompt_source {
+        TopLevelResumePromptSource::Headless {
+            positional_or_stdin_prompt,
+        } => positional_or_stdin_prompt.as_deref(),
+        TopLevelResumePromptSource::Interactive => None,
     }
 }
 

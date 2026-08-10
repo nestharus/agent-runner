@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/tests/age290_fresh_continuation_contract.rs
+//!     role: adapter
+//!     Translates:
+//!       - fresh-continuation-coordinator-behavior-contract
+//!       - Rust-port-fake-contract
+//! ```
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -14,20 +29,45 @@ use oulipoly_runtime::fresh_continuation::{
 #[derive(Default)]
 struct Calls {
     validate: usize,
+    validation_requests: Vec<FreshContinuationRequest>,
     accept: usize,
+    accepted_contexts: Vec<ValidatedContinuation>,
     begin_resume: usize,
+    begin_resume_continuations: Vec<AcceptedContinuation>,
     resume: usize,
     resume_actions: Vec<InvocationAction>,
+    resume_inputs: Vec<ResumeInput>,
     record_resume: usize,
+    recorded_resumes: Vec<(AcceptedContinuation, InvocationOutcome)>,
     begin_fresh: usize,
+    begin_fresh_continuations: Vec<AcceptedContinuation>,
     fresh: usize,
     fresh_actions: Vec<InvocationAction>,
+    fresh_inputs: Vec<FreshInput>,
     record_fresh: usize,
+    recorded_fresh: Vec<(AcceptedContinuation, InvocationOutcome)>,
     publish: usize,
+    published_handoffs: Vec<ContinuationHandoff>,
     finish: usize,
+    finish_inputs: Vec<(AcceptedContinuation, PublishedHandoff)>,
 }
 
 type SharedCalls = Rc<RefCell<Calls>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeInput {
+    action: InvocationAction,
+    reservation: ReservedInvocation,
+    context: ValidatedContinuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FreshInput {
+    action: InvocationAction,
+    reservation: ReservedInvocation,
+    context: ValidatedContinuation,
+    resume: InvocationOutcome,
+}
 
 struct ValidatorFake {
     calls: SharedCalls,
@@ -37,9 +77,11 @@ struct ValidatorFake {
 impl ContinuationEvidenceValidator for ValidatorFake {
     fn validate(
         &mut self,
-        _request: &FreshContinuationRequest,
+        request: &FreshContinuationRequest,
     ) -> Result<ValidatedContinuation, ContinuationBlock> {
-        self.calls.borrow_mut().validate += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.validate += 1;
+        calls.validation_requests.push(request.clone());
         self.result.clone()
     }
 }
@@ -55,52 +97,70 @@ struct StoreFake {
 impl ContinuationStore for StoreFake {
     fn accept(
         &mut self,
-        _context: &ValidatedContinuation,
+        context: &ValidatedContinuation,
     ) -> Result<AcceptDecision, ContinuationBlock> {
-        self.calls.borrow_mut().accept += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.accept += 1;
+        calls.accepted_contexts.push(context.clone());
         self.accept.clone()
     }
 
     fn begin_resume(
         &mut self,
-        _continuation: &AcceptedContinuation,
+        continuation: &AcceptedContinuation,
     ) -> Result<RunDecision, ContinuationBlock> {
-        self.calls.borrow_mut().begin_resume += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.begin_resume += 1;
+        calls.begin_resume_continuations.push(continuation.clone());
         self.resume.clone()
     }
 
     fn record_resume(
         &mut self,
-        _continuation: &AcceptedContinuation,
-        _outcome: &InvocationOutcome,
+        continuation: &AcceptedContinuation,
+        outcome: &InvocationOutcome,
     ) -> Result<(), ContinuationBlock> {
-        self.calls.borrow_mut().record_resume += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.record_resume += 1;
+        calls
+            .recorded_resumes
+            .push((continuation.clone(), outcome.clone()));
         Ok(())
     }
 
     fn begin_fresh(
         &mut self,
-        _continuation: &AcceptedContinuation,
+        continuation: &AcceptedContinuation,
     ) -> Result<RunDecision, ContinuationBlock> {
-        self.calls.borrow_mut().begin_fresh += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.begin_fresh += 1;
+        calls.begin_fresh_continuations.push(continuation.clone());
         self.fresh.clone()
     }
 
     fn record_fresh(
         &mut self,
-        _continuation: &AcceptedContinuation,
-        _outcome: &InvocationOutcome,
+        continuation: &AcceptedContinuation,
+        outcome: &InvocationOutcome,
     ) -> Result<(), ContinuationBlock> {
-        self.calls.borrow_mut().record_fresh += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.record_fresh += 1;
+        calls
+            .recorded_fresh
+            .push((continuation.clone(), outcome.clone()));
         Ok(())
     }
 
     fn finish(
         &mut self,
-        _continuation: &AcceptedContinuation,
-        _handoff: &PublishedHandoff,
+        continuation: &AcceptedContinuation,
+        handoff: &PublishedHandoff,
     ) -> Result<FreshContinuationOutcome, ContinuationBlock> {
-        self.calls.borrow_mut().finish += 1;
+        let mut calls = self.calls.borrow_mut();
+        calls.finish += 1;
+        calls
+            .finish_inputs
+            .push((continuation.clone(), handoff.clone()));
         self.finish.clone()
     }
 }
@@ -115,14 +175,16 @@ impl ResumeRunner for ResumeFake {
         &mut self,
         action: InvocationAction,
         reservation: &ReservedInvocation,
-        _context: &ValidatedContinuation,
+        context: &ValidatedContinuation,
     ) -> Result<InvocationOutcome, ContinuationBlock> {
         let mut calls = self.calls.borrow_mut();
         calls.resume += 1;
         calls.resume_actions.push(action);
-        if let Ok(outcome) = &self.result {
-            assert_eq!(reservation.invocation_id, outcome.invocation_id);
-        }
+        calls.resume_inputs.push(ResumeInput {
+            action,
+            reservation: reservation.clone(),
+            context: context.clone(),
+        });
         self.result.clone()
     }
 }
@@ -137,16 +199,18 @@ impl FreshRunner for FreshFake {
         &mut self,
         action: InvocationAction,
         reservation: &ReservedInvocation,
-        _context: &ValidatedContinuation,
+        context: &ValidatedContinuation,
         resume: &InvocationOutcome,
     ) -> Result<InvocationOutcome, ContinuationBlock> {
         let mut calls = self.calls.borrow_mut();
         calls.fresh += 1;
         calls.fresh_actions.push(action);
-        if let Ok(outcome) = &self.result {
-            assert_eq!(reservation.invocation_id, outcome.invocation_id);
-            assert_eq!(reservation.parent_invocation_id, resume.invocation_id);
-        }
+        calls.fresh_inputs.push(FreshInput {
+            action,
+            reservation: reservation.clone(),
+            context: context.clone(),
+            resume: resume.clone(),
+        });
         self.result.clone()
     }
 }
@@ -161,8 +225,9 @@ impl HandoffPublisher for PublisherFake {
         &mut self,
         handoff: ContinuationHandoff,
     ) -> Result<PublishedHandoff, ContinuationBlock> {
-        self.calls.borrow_mut().publish += 1;
-        assert_eq!(handoff.continuation_id, "continuation-1");
+        let mut calls = self.calls.borrow_mut();
+        calls.publish += 1;
+        calls.published_handoffs.push(handoff);
         self.result.clone()
     }
 }
@@ -172,9 +237,17 @@ fn exact_unconfirmed_resume_runs_one_fresh_invocation_and_returns_both_results()
     let fixture = Fixture::happy();
     let calls = fixture.calls.clone();
     let expected = fixture.terminal.clone();
+    let context = validated();
+    let continuation = accepted_continuation(context.clone());
+    let resume = unconfirmed_resume();
+    let fresh = succeeded("fresh-1", Some("fresh-session"));
+    let publication = published_handoff();
+    let mut submitted_request = request();
+    submitted_request.origin_invocation_id = "nearby-origin-invocation".to_string();
+    submitted_request.target_model = "nearby-target-model".to_string();
     let mut coordinator = fixture.coordinator();
 
-    let actual = coordinator.execute(request());
+    let actual = coordinator.execute(submitted_request.clone());
 
     assert_eq!(actual, expected);
     let calls = calls.borrow();
@@ -186,6 +259,58 @@ fn exact_unconfirmed_resume_runs_one_fresh_invocation_and_returns_both_results()
     assert_eq!(calls.fresh_actions.as_slice(), &[InvocationAction::Run]);
     assert_eq!(calls.publish, 1);
     assert_eq!(calls.finish, 1);
+    assert_eq!(calls.validation_requests.as_slice(), &[submitted_request]);
+    assert_eq!(
+        calls.accepted_contexts.as_slice(),
+        std::slice::from_ref(&context)
+    );
+    assert_eq!(
+        calls.begin_resume_continuations.as_slice(),
+        std::slice::from_ref(&continuation)
+    );
+    assert_eq!(
+        calls.resume_inputs.as_slice(),
+        &[ResumeInput {
+            action: InvocationAction::Run,
+            reservation: continuation.resume.clone(),
+            context: context.clone(),
+        }]
+    );
+    assert_eq!(
+        calls.recorded_resumes.as_slice(),
+        &[(continuation.clone(), resume.clone())]
+    );
+    assert_eq!(
+        calls.begin_fresh_continuations.as_slice(),
+        std::slice::from_ref(&continuation)
+    );
+    assert_eq!(
+        calls.fresh_inputs.as_slice(),
+        &[FreshInput {
+            action: InvocationAction::Run,
+            reservation: continuation.fresh.clone(),
+            context: context.clone(),
+            resume: resume.clone(),
+        }]
+    );
+    assert_eq!(
+        calls.recorded_fresh.as_slice(),
+        &[(continuation.clone(), fresh.clone())]
+    );
+    assert_eq!(
+        calls.published_handoffs.as_slice(),
+        &[ContinuationHandoff {
+            continuation_id: continuation.continuation_id.clone(),
+            fresh_prompt: expected_fresh_prompt(),
+            request: context.request,
+            resume,
+            fresh: Some(fresh),
+        }]
+    );
+    assert_eq!(
+        calls.finish_inputs.as_slice(),
+        &[(continuation, publication)]
+    );
 }
 
 #[test]
@@ -246,59 +371,151 @@ fn invalid_evidence_blocks_before_any_invocation() {
 }
 
 #[test]
-fn resume_adapter_error_blocks_before_recording_or_starting_fresh() {
+fn unavailable_resume_outcome_returns_its_exact_typed_block() {
     let mut fixture = Fixture::happy();
-    let reason = block(ContinuationBlockKind::AmbiguousState);
+    let reason = ContinuationBlock {
+        kind: ContinuationBlockKind::AmbiguousState,
+        message: "reserved resume outcome is unavailable".to_string(),
+    };
     fixture.resume_outcome = Err(reason.clone());
     let calls = fixture.calls.clone();
     let mut coordinator = fixture.coordinator();
 
     let actual = coordinator.execute(request());
 
-    assert_eq!(
-        actual,
-        FreshContinuationOutcome::Blocked {
-            continuation_id: Some("continuation-1".to_string()),
-            resume: None,
-            fresh: None,
-            handoff: None,
-            reason,
-        }
-    );
     let calls = calls.borrow();
-    assert_eq!(calls.resume, 1);
-    assert_eq!(calls.record_resume, 0);
-    assert_eq!(calls.begin_fresh, 0);
-    assert_eq!(calls.fresh, 0);
-    assert_eq!(calls.record_fresh, 0);
-    assert_eq!(calls.publish, 0);
-    assert_eq!(calls.finish, 0);
+    assert_resume_port_blocked(&actual, &calls, reason);
 }
 
 #[test]
-fn non_triggering_resume_never_runs_the_fresh_component() {
+fn mismatched_resume_outcome_returns_its_exact_typed_block() {
     let mut fixture = Fixture::happy();
-    fixture.resume_outcome = Ok(succeeded("resume-1", Some("origin-session")));
+    let reason = ContinuationBlock {
+        kind: ContinuationBlockKind::Conflict,
+        message: "reserved resume outcome identity mismatched".to_string(),
+    };
+    fixture.resume_outcome = Err(reason.clone());
     let calls = fixture.calls.clone();
     let mut coordinator = fixture.coordinator();
 
     let actual = coordinator.execute(request());
 
-    assert!(matches!(
-        actual,
-        FreshContinuationOutcome::Blocked {
-            reason: ContinuationBlock {
-                kind: ContinuationBlockKind::TriggerNotMet,
-                ..
-            },
-            ..
-        }
-    ));
     let calls = calls.borrow();
-    assert_eq!(calls.resume, 1);
-    assert_eq!(calls.record_resume, 1);
-    assert_eq!(calls.fresh, 0);
-    assert_eq!(calls.publish, 0);
+    assert_resume_port_blocked(&actual, &calls, reason);
+}
+
+#[test]
+fn nonzero_resume_exit_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    resume.physical_exit_code = 9;
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
+}
+
+#[test]
+fn rejected_resume_acceptance_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    resume.acceptance = ResumeAcceptance::Rejected;
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
+}
+
+#[test]
+fn unconfirmed_resume_acceptance_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    resume.acceptance = ResumeAcceptance::Unconfirmed;
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
+}
+
+#[test]
+fn not_applicable_resume_acceptance_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    resume.acceptance = ResumeAcceptance::NotApplicable;
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
+}
+
+#[test]
+fn successful_resume_disposition_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    resume.disposition = InvocationDisposition::Succeeded;
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
+}
+
+#[test]
+fn wrong_resume_error_category_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    let InvocationDisposition::Failed { error_category, .. } = &mut resume.disposition else {
+        unreachable!("unconfirmed resume fixture must be failed");
+    };
+    *error_category = "quota_exhausted".to_string();
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
+}
+
+#[test]
+fn wrong_resume_terminal_reason_does_not_trigger_fresh_continuation() {
+    let mut fixture = Fixture::happy();
+    let mut resume = unconfirmed_resume();
+    let InvocationDisposition::Failed {
+        terminal_reason, ..
+    } = &mut resume.disposition
+    else {
+        unreachable!("unconfirmed resume fixture must be failed");
+    };
+    *terminal_reason = "provider_failed".to_string();
+    fixture.resume_outcome = Ok(resume.clone());
+    let calls = fixture.calls.clone();
+    let mut coordinator = fixture.coordinator();
+
+    let actual = coordinator.execute(request());
+
+    let calls = calls.borrow();
+    assert_trigger_not_met(&actual, &calls, resume);
 }
 
 #[test]
@@ -385,6 +602,104 @@ fn terminal_replay_returns_the_same_outcome_without_calling_runners() {
     assert_eq!(calls.publish, 0);
 }
 
+fn assert_resume_port_blocked(
+    actual: &FreshContinuationOutcome,
+    calls: &Calls,
+    reason: ContinuationBlock,
+) {
+    assert_eq!(
+        actual,
+        &FreshContinuationOutcome::Blocked {
+            continuation_id: Some("continuation-1".to_string()),
+            resume: None,
+            fresh: None,
+            handoff: None,
+            reason,
+        }
+    );
+    assert_eq!(calls.validate, 1);
+    assert_eq!(calls.accept, 1);
+    assert_eq!(calls.begin_resume, 1);
+    assert_eq!(calls.resume, 1);
+    assert_eq!(calls.record_resume, 0);
+    assert_eq!(calls.begin_fresh, 0);
+    assert_eq!(calls.fresh, 0);
+    assert_eq!(calls.record_fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
+    assert_eq!(calls.validation_requests.as_slice(), &[request()]);
+    assert_eq!(calls.accepted_contexts.as_slice(), &[validated()]);
+    assert_eq!(
+        calls.begin_resume_continuations.as_slice(),
+        &[accepted_continuation(validated())]
+    );
+    assert_eq!(
+        calls.resume_inputs.as_slice(),
+        &[ResumeInput {
+            action: InvocationAction::Run,
+            reservation: reservation("resume-1", "origin-invocation"),
+            context: validated(),
+        }]
+    );
+    assert!(calls.recorded_resumes.is_empty());
+    assert!(calls.begin_fresh_continuations.is_empty());
+    assert!(calls.fresh_inputs.is_empty());
+    assert!(calls.recorded_fresh.is_empty());
+    assert!(calls.published_handoffs.is_empty());
+    assert!(calls.finish_inputs.is_empty());
+}
+
+fn assert_trigger_not_met(
+    actual: &FreshContinuationOutcome,
+    calls: &Calls,
+    resume: InvocationOutcome,
+) {
+    let continuation = accepted_continuation(validated());
+    assert_eq!(
+        actual,
+        &FreshContinuationOutcome::Blocked {
+            continuation_id: Some("continuation-1".to_string()),
+            resume: Some(resume.clone()),
+            fresh: None,
+            handoff: None,
+            reason: ContinuationBlock {
+                kind: ContinuationBlockKind::TriggerNotMet,
+                message: "resume outcome does not meet the fresh-continuation trigger".to_string(),
+            },
+        }
+    );
+    assert_eq!(calls.validate, 1);
+    assert_eq!(calls.accept, 1);
+    assert_eq!(calls.begin_resume, 1);
+    assert_eq!(calls.resume, 1);
+    assert_eq!(calls.record_resume, 1);
+    assert_eq!(calls.begin_fresh, 0);
+    assert_eq!(calls.fresh, 0);
+    assert_eq!(calls.record_fresh, 0);
+    assert_eq!(calls.publish, 0);
+    assert_eq!(calls.finish, 0);
+    assert_eq!(calls.validation_requests.as_slice(), &[request()]);
+    assert_eq!(calls.accepted_contexts.as_slice(), &[validated()]);
+    assert_eq!(
+        calls.begin_resume_continuations.as_slice(),
+        std::slice::from_ref(&continuation)
+    );
+    assert_eq!(
+        calls.resume_inputs.as_slice(),
+        &[ResumeInput {
+            action: InvocationAction::Run,
+            reservation: continuation.resume.clone(),
+            context: validated(),
+        }]
+    );
+    assert_eq!(calls.recorded_resumes.as_slice(), &[(continuation, resume)]);
+    assert!(calls.begin_fresh_continuations.is_empty());
+    assert!(calls.fresh_inputs.is_empty());
+    assert!(calls.recorded_fresh.is_empty());
+    assert!(calls.published_handoffs.is_empty());
+    assert!(calls.finish_inputs.is_empty());
+}
+
 struct Fixture {
     calls: SharedCalls,
     validator: Result<ValidatedContinuation, ContinuationBlock>,
@@ -402,18 +717,10 @@ impl Fixture {
         let context = validated();
         let resume_reservation = reservation("resume-1", "origin-invocation");
         let fresh_reservation = reservation("fresh-1", "resume-1");
-        let accepted = AcceptedContinuation {
-            continuation_id: "continuation-1".to_string(),
-            context: context.clone(),
-            resume: resume_reservation.clone(),
-            fresh: fresh_reservation.clone(),
-        };
+        let accepted = accepted_continuation(context.clone());
         let resume = unconfirmed_resume();
         let fresh = succeeded("fresh-1", Some("fresh-session"));
-        let handoff = PublishedHandoff {
-            path: PathBuf::from("/planning/continuation.json"),
-            sha256: "handoff-sha".to_string(),
-        };
+        let handoff = published_handoff();
         let terminal = FreshContinuationOutcome::Continued {
             continuation_id: accepted.continuation_id.clone(),
             resume: resume.clone(),
@@ -490,6 +797,42 @@ fn validated() -> ValidatedContinuation {
         request: request(),
         fingerprint: "request-fingerprint".to_string(),
     }
+}
+
+fn accepted_continuation(context: ValidatedContinuation) -> AcceptedContinuation {
+    AcceptedContinuation {
+        continuation_id: "continuation-1".to_string(),
+        context,
+        resume: reservation("resume-1", "origin-invocation"),
+        fresh: reservation("fresh-1", "resume-1"),
+    }
+}
+
+fn published_handoff() -> PublishedHandoff {
+    PublishedHandoff {
+        path: PathBuf::from("/planning/continuation.json"),
+        sha256: "handoff-sha".to_string(),
+    }
+}
+
+fn expected_fresh_prompt() -> String {
+    concat!(
+        "Continue the blocked workflow in this fresh provider session.\n",
+        "Do not retry or mutate the origin session.\n",
+        "Origin invocation: origin-invocation\n",
+        "Origin session: origin-session\n",
+        "Failed resume invocation: resume-1\n",
+        "Worktree: /worktree\n",
+        "Last successful boundary: verified\n",
+        "Active blocked boundary: apply\n",
+        "Read these exact artifacts before continuing:\n",
+        "- question: /planning/question.json (sha256 question-sha)\n",
+        "- answer: /planning/answer.json (sha256 answer-sha)\n",
+        "- session graph: /planning/graph.json (sha256 graph-sha)\n",
+        "- origin trace: /planning/trace.json (sha256 trace-sha)\n",
+        "- ticket snapshot: /planning/ticket.json (sha256 ticket-sha)\n",
+    )
+    .to_string()
 }
 
 fn artifact(name: &str) -> ArtifactIdentity {

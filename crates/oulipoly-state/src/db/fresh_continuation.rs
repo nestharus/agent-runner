@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `parser`, `orchestration`, `mapper`, `validator`, `accessor`, `formatter`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-state/src/db/fresh_continuation.rs
+//!     role: adapter
+//!     Translates:
+//!       - typed-continuation-repository-contract
+//!       - fresh-continuations-SQLite-schema-contract
+//! ```
+
 use super::*;
 use crate::continuation::{
     ContinuationAcceptInput, ContinuationAcceptResult, ContinuationInvocationDisposition,
@@ -50,36 +65,7 @@ impl ContinuationRepository for StateDb {
         &mut self,
         input: &ContinuationAcceptInput,
     ) -> Result<ContinuationAcceptResult, ContinuationRepositoryError> {
-        with_transaction(self, |tx| {
-            if let Some(row) = row_by_logical_request(tx, &input.logical_request_key)? {
-                return replay_or_accept_existing(row, input);
-            }
-
-            let continuation = new_continuation_record(input);
-            tx.execute(
-                "INSERT INTO fresh_continuations (
-                    logical_request_key,
-                    continuation_id,
-                    validated_fingerprint,
-                    resume_invocation_id,
-                    resume_parent_invocation_id,
-                    fresh_invocation_id,
-                    fresh_parent_invocation_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    continuation.logical_request_key,
-                    continuation.continuation_id,
-                    continuation.fingerprint,
-                    continuation.resume.invocation_id,
-                    continuation.resume.parent_invocation_id,
-                    continuation.fresh.invocation_id,
-                    continuation.fresh.parent_invocation_id,
-                ],
-            )
-            .map_err(|error| persistence("insert fresh continuation", error))?;
-
-            Ok(ContinuationAcceptResult::Accepted(continuation))
-        })
+        with_transaction(self, |tx| accept_continuation_transaction(tx, input))
     }
 
     fn begin_continuation_resume(
@@ -87,20 +73,7 @@ impl ContinuationRepository for StateDb {
         continuation: &ContinuationRecord,
     ) -> Result<ContinuationRunDecision, ContinuationRepositoryError> {
         with_transaction(self, |tx| {
-            let row = validated_row(tx, continuation)?;
-            if let Some(terminal) = terminal_from_row(&row)? {
-                return Ok(ContinuationRunDecision::Terminal(Box::new(terminal)));
-            }
-
-            match Stage::parse(&row.resume_stage, "resume")? {
-                Stage::Reserved => {
-                    transition_stage(tx, continuation, "resume_stage", "reserved", "running")?;
-                    Ok(ContinuationRunDecision::Run(continuation.resume.clone()))
-                }
-                Stage::Running | Stage::Recorded => Ok(ContinuationRunDecision::Observe(
-                    continuation.resume.clone(),
-                )),
-            }
+            begin_continuation_resume_transaction(tx, continuation)
         })
     }
 
@@ -117,21 +90,7 @@ impl ContinuationRepository for StateDb {
         continuation: &ContinuationRecord,
     ) -> Result<ContinuationRunDecision, ContinuationRepositoryError> {
         with_transaction(self, |tx| {
-            let row = validated_row(tx, continuation)?;
-            if let Some(terminal) = terminal_from_row(&row)? {
-                return Ok(ContinuationRunDecision::Terminal(Box::new(terminal)));
-            }
-            require_recorded_outcome(&row, OutcomeKind::Resume)?;
-
-            match Stage::parse(&row.fresh_stage, "fresh")? {
-                Stage::Reserved => {
-                    transition_stage(tx, continuation, "fresh_stage", "reserved", "running")?;
-                    Ok(ContinuationRunDecision::Run(continuation.fresh.clone()))
-                }
-                Stage::Running | Stage::Recorded => {
-                    Ok(ContinuationRunDecision::Observe(continuation.fresh.clone()))
-                }
-            }
+            begin_continuation_fresh_transaction(tx, continuation)
         })
     }
 
@@ -149,33 +108,7 @@ impl ContinuationRepository for StateDb {
         handoff: &ContinuationPublishedHandoff,
     ) -> Result<ContinuationTerminalOutcome, ContinuationRepositoryError> {
         with_transaction(self, |tx| {
-            let row = validated_row(tx, continuation)?;
-            if let Some(terminal) = terminal_from_row(&row)? {
-                if terminal.handoff() != handoff {
-                    return Err(conflict(
-                        "continuation was already finished with a different handoff",
-                    ));
-                }
-                return Ok(terminal);
-            }
-
-            let resume = require_recorded_outcome(&row, OutcomeKind::Resume)?;
-            let fresh = require_recorded_outcome(&row, OutcomeKind::Fresh)?;
-            let terminal = terminal_outcome(continuation, resume, fresh, handoff.clone());
-            let handoff_json = serialize(handoff, "continuation handoff")?;
-            let terminal_json = serialize(&terminal, "continuation terminal outcome")?;
-            let updated = tx
-                .execute(
-                    "UPDATE fresh_continuations
-                        SET handoff_json = ?1, terminal_outcome_json = ?2
-                      WHERE continuation_id = ?3
-                        AND handoff_json IS NULL
-                        AND terminal_outcome_json IS NULL",
-                    params![handoff_json, terminal_json, continuation.continuation_id],
-                )
-                .map_err(|error| persistence("finish fresh continuation", error))?;
-            require_one_updated(updated, "finish fresh continuation")?;
-            Ok(terminal)
+            finish_continuation_transaction(tx, continuation, handoff)
         })
     }
 }
@@ -213,10 +146,185 @@ fn new_continuation_record(input: &ContinuationAcceptInput) -> ContinuationRecor
     }
 }
 
+fn accept_continuation_transaction(
+    tx: &Transaction<'_>,
+    input: &ContinuationAcceptInput,
+) -> Result<ContinuationAcceptResult, ContinuationRepositoryError> {
+    if let Some(row) = row_by_logical_request(tx, &input.logical_request_key)? {
+        return replay_or_accept_existing(row, input);
+    }
+
+    let continuation = new_continuation_record(input);
+    insert_continuation(tx, &continuation)?;
+    Ok(accepted_continuation(continuation))
+}
+
+fn insert_continuation(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+) -> Result<(), ContinuationRepositoryError> {
+    tx.execute(
+        "INSERT INTO fresh_continuations (
+            logical_request_key,
+            continuation_id,
+            validated_fingerprint,
+            resume_invocation_id,
+            resume_parent_invocation_id,
+            fresh_invocation_id,
+            fresh_parent_invocation_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            continuation.logical_request_key,
+            continuation.continuation_id,
+            continuation.fingerprint,
+            continuation.resume.invocation_id,
+            continuation.resume.parent_invocation_id,
+            continuation.fresh.invocation_id,
+            continuation.fresh.parent_invocation_id,
+        ],
+    )
+    .map_err(|error| persistence("insert fresh continuation", error))?;
+    Ok(())
+}
+
+fn accepted_continuation(continuation: ContinuationRecord) -> ContinuationAcceptResult {
+    ContinuationAcceptResult::Accepted(continuation)
+}
+
+fn begin_continuation_resume_transaction(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+) -> Result<ContinuationRunDecision, ContinuationRepositoryError> {
+    let row = validated_row(tx, continuation)?;
+    if let Some(terminal) = terminal_from_row(&row)? {
+        return Ok(terminal_run_decision(terminal));
+    }
+
+    let stage = Stage::parse(&row.resume_stage, "resume")?;
+    transition_resume_if_reserved(tx, continuation, stage)?;
+    Ok(stage_run_decision(stage, &continuation.resume))
+}
+
+fn transition_resume_if_reserved(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+    stage: Stage,
+) -> Result<(), ContinuationRepositoryError> {
+    if stage == Stage::Reserved {
+        return transition_stage(tx, continuation, "resume_stage", "reserved", "running");
+    }
+    Ok(())
+}
+
+fn begin_continuation_fresh_transaction(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+) -> Result<ContinuationRunDecision, ContinuationRepositoryError> {
+    let row = validated_row(tx, continuation)?;
+    if let Some(terminal) = terminal_from_row(&row)? {
+        return Ok(terminal_run_decision(terminal));
+    }
+
+    require_recorded_outcome(&row, OutcomeKind::Resume)?;
+    let stage = Stage::parse(&row.fresh_stage, "fresh")?;
+    transition_fresh_if_reserved(tx, continuation, stage)?;
+    Ok(stage_run_decision(stage, &continuation.fresh))
+}
+
+fn transition_fresh_if_reserved(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+    stage: Stage,
+) -> Result<(), ContinuationRepositoryError> {
+    if stage == Stage::Reserved {
+        return transition_stage(tx, continuation, "fresh_stage", "reserved", "running");
+    }
+    Ok(())
+}
+
+fn terminal_run_decision(terminal: ContinuationTerminalOutcome) -> ContinuationRunDecision {
+    ContinuationRunDecision::Terminal(Box::new(terminal))
+}
+
+fn stage_run_decision(
+    stage: Stage,
+    reservation: &ContinuationReservation,
+) -> ContinuationRunDecision {
+    match stage {
+        Stage::Reserved => ContinuationRunDecision::Run(reservation.clone()),
+        Stage::Running | Stage::Recorded => ContinuationRunDecision::Observe(reservation.clone()),
+    }
+}
+
+fn finish_continuation_transaction(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+    handoff: &ContinuationPublishedHandoff,
+) -> Result<ContinuationTerminalOutcome, ContinuationRepositoryError> {
+    let row = validated_row(tx, continuation)?;
+    if let Some(terminal) = terminal_from_row(&row)? {
+        return validate_existing_terminal(terminal, handoff);
+    }
+
+    let resume = require_recorded_outcome(&row, OutcomeKind::Resume)?;
+    let fresh = require_recorded_outcome(&row, OutcomeKind::Fresh)?;
+    let terminal = terminal_outcome(continuation, resume, fresh, handoff.clone());
+    let handoff_json = serialize(handoff, "continuation handoff")?;
+    let terminal_json = serialize(&terminal, "continuation terminal outcome")?;
+    persist_terminal_outcome(
+        tx,
+        &continuation.continuation_id,
+        &handoff_json,
+        &terminal_json,
+    )?;
+    Ok(terminal)
+}
+
+fn validate_existing_terminal(
+    terminal: ContinuationTerminalOutcome,
+    handoff: &ContinuationPublishedHandoff,
+) -> Result<ContinuationTerminalOutcome, ContinuationRepositoryError> {
+    if terminal.handoff() != handoff {
+        return Err(conflict(
+            "continuation was already finished with a different handoff",
+        ));
+    }
+    Ok(terminal)
+}
+
+fn persist_terminal_outcome(
+    tx: &Transaction<'_>,
+    continuation_id: &str,
+    handoff_json: &str,
+    terminal_json: &str,
+) -> Result<(), ContinuationRepositoryError> {
+    let updated = tx
+        .execute(
+            "UPDATE fresh_continuations
+                SET handoff_json = ?1, terminal_outcome_json = ?2
+              WHERE continuation_id = ?3
+                AND handoff_json IS NULL
+                AND terminal_outcome_json IS NULL",
+            params![handoff_json, terminal_json, continuation_id],
+        )
+        .map_err(|error| persistence("finish fresh continuation", error))?;
+    require_one_updated(updated, "finish fresh continuation")
+}
+
 fn replay_or_accept_existing(
     row: ContinuationRow,
     input: &ContinuationAcceptInput,
 ) -> Result<ContinuationAcceptResult, ContinuationRepositoryError> {
+    validate_logical_request_identity(&row, input)?;
+    let continuation = record_from_row(&row)?;
+    let terminal = terminal_from_row(&row)?;
+    Ok(existing_acceptance(continuation, terminal))
+}
+
+fn validate_logical_request_identity(
+    row: &ContinuationRow,
+    input: &ContinuationAcceptInput,
+) -> Result<(), ContinuationRepositoryError> {
     if row.fingerprint != input.fingerprint {
         return Err(conflict(
             "logical continuation request already exists with a different validated fingerprint",
@@ -227,17 +335,58 @@ fn replay_or_accept_existing(
             "logical continuation request has a different origin invocation",
         ));
     }
+    Ok(())
+}
 
-    let continuation = record_from_row(&row)?;
-    match terminal_from_row(&row)? {
-        Some(terminal) => Ok(ContinuationAcceptResult::Replay(terminal)),
-        None => Ok(ContinuationAcceptResult::Accepted(continuation)),
+fn existing_acceptance(
+    continuation: ContinuationRecord,
+    terminal: Option<ContinuationTerminalOutcome>,
+) -> ContinuationAcceptResult {
+    match terminal {
+        Some(terminal) => ContinuationAcceptResult::Replay(terminal),
+        None => ContinuationAcceptResult::Accepted(continuation),
     }
+}
+
+struct ParsedContinuationRow {
+    resume_stage: Stage,
+    fresh_stage: Stage,
 }
 
 fn record_from_row(
     row: &ContinuationRow,
 ) -> Result<ContinuationRecord, ContinuationRepositoryError> {
+    let parsed = parse_continuation_row(row)?;
+    validate_continuation_row(row, &parsed)?;
+    Ok(map_continuation_record(row))
+}
+
+fn parse_continuation_row(
+    row: &ContinuationRow,
+) -> Result<ParsedContinuationRow, ContinuationRepositoryError> {
+    parse_invocation_identity(&row.resume_invocation_id, "resume")?;
+    parse_invocation_identity(&row.fresh_invocation_id, "fresh")?;
+    Ok(ParsedContinuationRow {
+        resume_stage: Stage::parse(&row.resume_stage, "resume")?,
+        fresh_stage: Stage::parse(&row.fresh_stage, "fresh")?,
+    })
+}
+
+fn parse_invocation_identity(
+    value: &str,
+    label: &str,
+) -> Result<Uuid, ContinuationRepositoryError> {
+    Uuid::parse_str(value).map_err(|error| {
+        ambiguous(format!(
+            "reserved {label} invocation identity is invalid: {error}"
+        ))
+    })
+}
+
+fn validate_continuation_row(
+    row: &ContinuationRow,
+    parsed: &ParsedContinuationRow,
+) -> Result<(), ContinuationRepositoryError> {
     if row.logical_request_key.is_empty()
         || row.continuation_id.is_empty()
         || row.fingerprint.is_empty()
@@ -246,28 +395,20 @@ fn record_from_row(
     {
         return Err(ambiguous("continuation record contains an empty identity"));
     }
-    Uuid::parse_str(&row.resume_invocation_id).map_err(|error| {
-        ambiguous(format!(
-            "reserved resume invocation identity is invalid: {error}"
-        ))
-    })?;
-    Uuid::parse_str(&row.fresh_invocation_id).map_err(|error| {
-        ambiguous(format!(
-            "reserved fresh invocation identity is invalid: {error}"
-        ))
-    })?;
     if row.fresh_parent_invocation_id != row.resume_invocation_id {
         return Err(ambiguous(
             "fresh continuation parent does not match the reserved resume invocation",
         ));
     }
-    let resume_stage = Stage::parse(&row.resume_stage, "resume")?;
-    let fresh_stage = Stage::parse(&row.fresh_stage, "fresh")?;
-    validate_stage_outcome_pair(resume_stage, row.resume_outcome_json.as_ref(), "resume")?;
-    validate_stage_outcome_pair(fresh_stage, row.fresh_outcome_json.as_ref(), "fresh")?;
-    validate_recorded_outcome(row, OutcomeKind::Resume, resume_stage)?;
-    validate_recorded_outcome(row, OutcomeKind::Fresh, fresh_stage)?;
-    if fresh_stage != Stage::Reserved && resume_stage != Stage::Recorded {
+    validate_stage_outcome_pair(
+        parsed.resume_stage,
+        row.resume_outcome_json.as_ref(),
+        "resume",
+    )?;
+    validate_stage_outcome_pair(parsed.fresh_stage, row.fresh_outcome_json.as_ref(), "fresh")?;
+    validate_recorded_outcome(row, OutcomeKind::Resume, parsed.resume_stage)?;
+    validate_recorded_outcome(row, OutcomeKind::Fresh, parsed.fresh_stage)?;
+    if parsed.fresh_stage != Stage::Reserved && parsed.resume_stage != Stage::Recorded {
         return Err(ambiguous(
             "fresh continuation advanced before the resume outcome became durable",
         ));
@@ -278,14 +419,17 @@ fn record_from_row(
         ));
     }
     if row.terminal_outcome_json.is_some()
-        && (resume_stage != Stage::Recorded || fresh_stage != Stage::Recorded)
+        && (parsed.resume_stage != Stage::Recorded || parsed.fresh_stage != Stage::Recorded)
     {
         return Err(ambiguous(
             "continuation became terminal before both outcomes were durable",
         ));
     }
+    Ok(())
+}
 
-    Ok(ContinuationRecord {
+fn map_continuation_record(row: &ContinuationRow) -> ContinuationRecord {
+    ContinuationRecord {
         logical_request_key: row.logical_request_key.clone(),
         continuation_id: row.continuation_id.clone(),
         fingerprint: row.fingerprint.clone(),
@@ -297,7 +441,7 @@ fn record_from_row(
             invocation_id: row.fresh_invocation_id.clone(),
             parent_invocation_id: row.fresh_parent_invocation_id.clone(),
         },
-    })
+    }
 }
 
 fn validate_stage_outcome_pair(
@@ -335,12 +479,22 @@ fn validated_row(
     tx: &Transaction<'_>,
     expected: &ContinuationRecord,
 ) -> Result<ContinuationRow, ContinuationRepositoryError> {
-    let row = row_by_continuation_id(tx, &expected.continuation_id)?.ok_or_else(|| {
-        conflict(format!(
-            "unknown continuation identity {:?}",
-            expected.continuation_id
-        ))
-    })?;
+    let row = row_by_continuation_id(tx, &expected.continuation_id)?;
+    let row = require_continuation_row(row, &expected.continuation_id)?;
+    validate_row_identity(row, expected)
+}
+
+fn require_continuation_row(
+    row: Option<ContinuationRow>,
+    continuation_id: &str,
+) -> Result<ContinuationRow, ContinuationRepositoryError> {
+    row.ok_or_else(|| conflict(format!("unknown continuation identity {continuation_id:?}")))
+}
+
+fn validate_row_identity(
+    row: ContinuationRow,
+    expected: &ContinuationRecord,
+) -> Result<ContinuationRow, ContinuationRepositoryError> {
     let actual = record_from_row(&row)?;
     if actual != *expected {
         return Err(conflict(
@@ -354,22 +508,30 @@ fn row_by_logical_request(
     tx: &Transaction<'_>,
     logical_request_key: &str,
 ) -> Result<Option<ContinuationRow>, ContinuationRepositoryError> {
-    query_row(tx, "logical_request_key = ?1", logical_request_key)
+    let sql = format_row_query("logical_request_key = ?1");
+    query_row(tx, &sql, logical_request_key)
 }
 
 fn row_by_continuation_id(
     tx: &Transaction<'_>,
     continuation_id: &str,
 ) -> Result<Option<ContinuationRow>, ContinuationRepositoryError> {
-    query_row(tx, "continuation_id = ?1", continuation_id)
+    let sql = format_row_query("continuation_id = ?1");
+    query_row(tx, &sql, continuation_id)
 }
 
 fn query_row(
     tx: &Transaction<'_>,
-    predicate: &str,
+    sql: &str,
     value: &str,
 ) -> Result<Option<ContinuationRow>, ContinuationRepositoryError> {
-    let sql = format!(
+    tx.query_row(sql, [value], map_continuation_row_from_sql)
+        .optional()
+        .map_err(|error| persistence("read fresh continuation", error))
+}
+
+fn format_row_query(predicate: &str) -> String {
+    format!(
         "SELECT
             logical_request_key,
             continuation_id,
@@ -386,26 +548,25 @@ fn query_row(
             terminal_outcome_json
          FROM fresh_continuations
          WHERE {predicate}"
-    );
-    tx.query_row(&sql, [value], |row| {
-        Ok(ContinuationRow {
-            logical_request_key: row.get(0)?,
-            continuation_id: row.get(1)?,
-            fingerprint: row.get(2)?,
-            resume_invocation_id: row.get(3)?,
-            resume_parent_invocation_id: row.get(4)?,
-            resume_stage: row.get(5)?,
-            resume_outcome_json: row.get(6)?,
-            fresh_invocation_id: row.get(7)?,
-            fresh_parent_invocation_id: row.get(8)?,
-            fresh_stage: row.get(9)?,
-            fresh_outcome_json: row.get(10)?,
-            handoff_json: row.get(11)?,
-            terminal_outcome_json: row.get(12)?,
-        })
+    )
+}
+
+fn map_continuation_row_from_sql(row: &sqlite::Row<'_>) -> Result<ContinuationRow, sqlite::Error> {
+    Ok(ContinuationRow {
+        logical_request_key: row.get(0)?,
+        continuation_id: row.get(1)?,
+        fingerprint: row.get(2)?,
+        resume_invocation_id: row.get(3)?,
+        resume_parent_invocation_id: row.get(4)?,
+        resume_stage: row.get(5)?,
+        resume_outcome_json: row.get(6)?,
+        fresh_invocation_id: row.get(7)?,
+        fresh_parent_invocation_id: row.get(8)?,
+        fresh_stage: row.get(9)?,
+        fresh_outcome_json: row.get(10)?,
+        handoff_json: row.get(11)?,
+        terminal_outcome_json: row.get(12)?,
     })
-    .optional()
-    .map_err(|error| persistence("read fresh continuation", error))
 }
 
 fn transition_stage(
@@ -415,14 +576,28 @@ fn transition_stage(
     expected: &str,
     next: &str,
 ) -> Result<(), ContinuationRepositoryError> {
-    let sql = format!(
-        "UPDATE fresh_continuations SET {column} = ?1
-          WHERE continuation_id = ?2 AND {column} = ?3"
-    );
+    let sql = format_transition_sql(column);
+    execute_stage_transition(tx, continuation, expected, next, &sql)
+}
+
+fn execute_stage_transition(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+    expected: &str,
+    next: &str,
+    sql: &str,
+) -> Result<(), ContinuationRepositoryError> {
     let updated = tx
-        .execute(&sql, params![next, continuation.continuation_id, expected])
+        .execute(sql, params![next, continuation.continuation_id, expected])
         .map_err(|error| persistence("transition continuation stage", error))?;
     require_one_updated(updated, "transition continuation stage")
+}
+
+fn format_transition_sql(column: &str) -> String {
+    format!(
+        "UPDATE fresh_continuations SET {column} = ?1
+          WHERE continuation_id = ?2 AND {column} = ?3"
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -468,55 +643,126 @@ fn record_outcome(
     kind: OutcomeKind,
 ) -> Result<(), ContinuationRepositoryError> {
     with_transaction(db, |tx| {
-        let row = validated_row(tx, continuation)?;
-        let reservation = kind.reservation(continuation);
-        if outcome.invocation_id != reservation.invocation_id {
-            return Err(conflict(format!(
-                "{} outcome invocation does not match its exact reservation",
-                kind.label()
-            )));
-        }
-        if matches!(kind, OutcomeKind::Fresh) {
-            require_recorded_outcome(&row, OutcomeKind::Resume)?;
-        }
-
-        if let Some(existing_json) = kind.outcome_json(&row) {
-            let existing = deserialize_outcome(existing_json, kind.label())?;
-            validate_outcome_identity(&row, kind, &existing)?;
-            return if existing == *outcome {
-                Ok(())
-            } else {
-                Err(conflict(format!(
-                    "{} outcome was already recorded with a different value",
-                    kind.label()
-                )))
-            };
-        }
-
-        if Stage::parse(kind.stage(&row), kind.label())? != Stage::Running {
-            return Err(ambiguous(format!(
-                "{} outcome cannot be recorded before its reservation begins",
-                kind.label()
-            )));
-        }
-
-        let outcome_json = serialize(outcome, &format!("{} outcome", kind.label()))?;
-        let (stage_column, outcome_column) = match kind {
-            OutcomeKind::Resume => ("resume_stage", "resume_outcome_json"),
-            OutcomeKind::Fresh => ("fresh_stage", "fresh_outcome_json"),
-        };
-        let sql = format!(
-            "UPDATE fresh_continuations
-                SET {stage_column} = 'recorded', {outcome_column} = ?1
-              WHERE continuation_id = ?2
-                AND {stage_column} = 'running'
-                AND {outcome_column} IS NULL"
-        );
-        let updated = tx
-            .execute(&sql, params![outcome_json, continuation.continuation_id])
-            .map_err(|error| persistence("record continuation outcome", error))?;
-        require_one_updated(updated, "record continuation outcome")
+        record_outcome_transaction(tx, continuation, outcome, kind)
     })
+}
+
+fn record_outcome_transaction(
+    tx: &Transaction<'_>,
+    continuation: &ContinuationRecord,
+    outcome: &ContinuationInvocationOutcome,
+    kind: OutcomeKind,
+) -> Result<(), ContinuationRepositoryError> {
+    let row = validated_row(tx, continuation)?;
+    validate_outcome_prerequisites(&row, continuation, outcome, kind)?;
+    if let Some(existing_json) = kind.outcome_json(&row) {
+        return validate_existing_outcome(&row, existing_json, outcome, kind);
+    }
+
+    validate_outcome_stage(&row, kind)?;
+    let outcome_json = serialize_outcome(outcome, kind)?;
+    let columns = outcome_columns(kind);
+    let sql = format_record_outcome_sql(columns);
+    persist_recorded_outcome(tx, &continuation.continuation_id, &outcome_json, &sql)
+}
+
+fn validate_outcome_prerequisites(
+    row: &ContinuationRow,
+    continuation: &ContinuationRecord,
+    outcome: &ContinuationInvocationOutcome,
+    kind: OutcomeKind,
+) -> Result<(), ContinuationRepositoryError> {
+    let reservation = kind.reservation(continuation);
+    if outcome.invocation_id != reservation.invocation_id {
+        return Err(conflict(format!(
+            "{} outcome invocation does not match its exact reservation",
+            kind.label()
+        )));
+    }
+    if matches!(kind, OutcomeKind::Fresh) {
+        require_recorded_outcome(row, OutcomeKind::Resume)?;
+    }
+    Ok(())
+}
+
+fn validate_existing_outcome(
+    row: &ContinuationRow,
+    existing_json: &str,
+    outcome: &ContinuationInvocationOutcome,
+    kind: OutcomeKind,
+) -> Result<(), ContinuationRepositoryError> {
+    let existing = deserialize_outcome(existing_json, kind.label())?;
+    validate_outcome_identity(row, kind, &existing)?;
+    if existing != *outcome {
+        return Err(conflict(format!(
+            "{} outcome was already recorded with a different value",
+            kind.label()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_outcome_stage(
+    row: &ContinuationRow,
+    kind: OutcomeKind,
+) -> Result<(), ContinuationRepositoryError> {
+    if Stage::parse(kind.stage(row), kind.label())? != Stage::Running {
+        return Err(ambiguous(format!(
+            "{} outcome cannot be recorded before its reservation begins",
+            kind.label()
+        )));
+    }
+    Ok(())
+}
+
+fn serialize_outcome(
+    outcome: &ContinuationInvocationOutcome,
+    kind: OutcomeKind,
+) -> Result<String, ContinuationRepositoryError> {
+    serialize(outcome, &format!("{} outcome", kind.label()))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutcomeColumns {
+    stage: &'static str,
+    outcome: &'static str,
+}
+
+fn outcome_columns(kind: OutcomeKind) -> OutcomeColumns {
+    match kind {
+        OutcomeKind::Resume => OutcomeColumns {
+            stage: "resume_stage",
+            outcome: "resume_outcome_json",
+        },
+        OutcomeKind::Fresh => OutcomeColumns {
+            stage: "fresh_stage",
+            outcome: "fresh_outcome_json",
+        },
+    }
+}
+
+fn format_record_outcome_sql(columns: OutcomeColumns) -> String {
+    let stage_column = columns.stage;
+    let outcome_column = columns.outcome;
+    format!(
+        "UPDATE fresh_continuations
+            SET {stage_column} = 'recorded', {outcome_column} = ?1
+          WHERE continuation_id = ?2
+            AND {stage_column} = 'running'
+            AND {outcome_column} IS NULL"
+    )
+}
+
+fn persist_recorded_outcome(
+    tx: &Transaction<'_>,
+    continuation_id: &str,
+    outcome_json: &str,
+    sql: &str,
+) -> Result<(), ContinuationRepositoryError> {
+    let updated = tx
+        .execute(sql, params![outcome_json, continuation_id])
+        .map_err(|error| persistence("record continuation outcome", error))?;
+    require_one_updated(updated, "record continuation outcome")
 }
 
 fn require_recorded_outcome(
@@ -575,27 +821,60 @@ fn terminal_from_row(
     let Some(terminal_json) = row.terminal_outcome_json.as_deref() else {
         return Ok(None);
     };
-    let handoff_json = row.handoff_json.as_deref().ok_or_else(|| {
+    let handoff_json = require_terminal_handoff_json(row.handoff_json.as_deref())?;
+    let parsed = parse_terminal_artifacts(handoff_json, terminal_json)?;
+    let expected = expected_terminal_from_row(row, parsed.handoff)?;
+    let terminal = validate_terminal_artifact(parsed.terminal, &expected)?;
+    Ok(Some(terminal))
+}
+
+fn require_terminal_handoff_json(
+    handoff_json: Option<&str>,
+) -> Result<&str, ContinuationRepositoryError> {
+    handoff_json.ok_or_else(|| {
         ambiguous("continuation terminal outcome exists without its published handoff")
-    })?;
-    let handoff: ContinuationPublishedHandoff = serde_json::from_str(handoff_json)
+    })
+}
+
+struct ParsedTerminalArtifacts {
+    handoff: ContinuationPublishedHandoff,
+    terminal: ContinuationTerminalOutcome,
+}
+
+fn parse_terminal_artifacts(
+    handoff_json: &str,
+    terminal_json: &str,
+) -> Result<ParsedTerminalArtifacts, ContinuationRepositoryError> {
+    let handoff = serde_json::from_str(handoff_json)
         .map_err(|error| ambiguous(format!("durable continuation handoff is invalid: {error}")))?;
+    let terminal = serde_json::from_str(terminal_json).map_err(|error| {
+        ambiguous(format!(
+            "durable continuation terminal outcome is invalid: {error}"
+        ))
+    })?;
+    Ok(ParsedTerminalArtifacts { handoff, terminal })
+}
+
+fn expected_terminal_from_row(
+    row: &ContinuationRow,
+    handoff: ContinuationPublishedHandoff,
+) -> Result<ContinuationTerminalOutcome, ContinuationRepositoryError> {
     let resume = require_recorded_outcome(row, OutcomeKind::Resume)?;
     let fresh = require_recorded_outcome(row, OutcomeKind::Fresh)?;
     let continuation = record_from_row(row)?;
-    let expected = terminal_outcome(&continuation, resume, fresh, handoff);
-    let actual: ContinuationTerminalOutcome =
-        serde_json::from_str(terminal_json).map_err(|error| {
-            ambiguous(format!(
-                "durable continuation terminal outcome is invalid: {error}"
-            ))
-        })?;
-    if actual != expected {
+    Ok(terminal_outcome(&continuation, resume, fresh, handoff))
+}
+
+fn validate_terminal_artifact(
+    terminal: ContinuationTerminalOutcome,
+    expected: &ContinuationTerminalOutcome,
+) -> Result<ContinuationTerminalOutcome, ContinuationRepositoryError> {
+    if terminal != *expected {
         return Err(ambiguous(
             "durable continuation terminal output disagrees with its exact outcomes or handoff",
         ));
     }
-    Ok(Some(actual))
+    Ok(terminal)
 }
 
 fn terminal_outcome(

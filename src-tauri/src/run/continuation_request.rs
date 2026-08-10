@@ -1,4 +1,18 @@
-use std::fmt::Write;
+//! ## Declared roles
+//!
+//! `orchestration`, `parser`, `validator`, `accessor`, `formatter`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_request.rs
+//!     role: adapter
+//!     Translates:
+//!       - versioned-fresh-continuation-request-file-schema
+//!       - runtime-fresh-continuation-request-and-prompt-contract
+//! ```
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -46,70 +60,47 @@ struct ArtifactIdentityV1 {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read(path: &Path) -> Result<FreshContinuationRequest, ContinuationBlock> {
-    let bytes = fs::read(path).map_err(|error| {
-        invalid_request(format!(
-            "Failed to read fresh continuation request {}: {error}",
-            path.display()
-        ))
-    })?;
-    let request: FreshContinuationRequestV1 = serde_json::from_slice(&bytes)
-        .map_err(|error| invalid_request(format!("Invalid fresh continuation request: {error}")))?;
+    let bytes = read_request_bytes(path)
+        .map_err(|error| invalid_request(format_request_read_error(path, &error)))?;
+    let request = parse_request(&bytes)
+        .map_err(|error| invalid_request(format_request_parse_error(&error)))?;
+    let request = validate_request_schema(request)?;
+    Ok(FreshContinuationRequest::from(request))
+}
+
+fn read_request_bytes(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    fs::read(path)
+}
+
+fn parse_request(bytes: &[u8]) -> Result<FreshContinuationRequestV1, serde_json::Error> {
+    serde_json::from_slice(bytes)
+}
+
+fn validate_request_schema(
+    request: FreshContinuationRequestV1,
+) -> Result<FreshContinuationRequestV1, ContinuationBlock> {
     if request.schema_version != SCHEMA_VERSION || request.kind != REQUEST_KIND {
         return Err(invalid_request(
             "Unsupported fresh continuation request schema or kind".to_string(),
         ));
     }
-    Ok(request.into())
+    Ok(request)
+}
+
+fn format_request_read_error(path: &Path, error: &std::io::Error) -> String {
+    format!(
+        "Failed to read fresh continuation request {}: {error}",
+        path.display()
+    )
+}
+
+fn format_request_parse_error(error: &serde_json::Error) -> String {
+    format!("Invalid fresh continuation request: {error}")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn fresh_prompt(context: &ValidatedContinuation, resume: &InvocationOutcome) -> String {
-    let request = &context.request;
-    let mut prompt = String::new();
-    writeln!(
-        prompt,
-        "Continue the blocked workflow in this fresh provider session."
-    )
-    .unwrap();
-    writeln!(prompt, "Do not retry or mutate the origin session.").unwrap();
-    writeln!(
-        prompt,
-        "Origin invocation: {}",
-        request.origin_invocation_id
-    )
-    .unwrap();
-    writeln!(prompt, "Origin session: {}", request.origin_session_id).unwrap();
-    writeln!(prompt, "Failed resume invocation: {}", resume.invocation_id).unwrap();
-    writeln!(prompt, "Worktree: {}", request.worktree.display()).unwrap();
-    writeln!(
-        prompt,
-        "Last successful boundary: {}",
-        request.last_successful_boundary
-    )
-    .unwrap();
-    writeln!(
-        prompt,
-        "Active blocked boundary: {}",
-        request.active_blocked_boundary
-    )
-    .unwrap();
-    writeln!(prompt, "Read these exact artifacts before continuing:").unwrap();
-    for (name, artifact) in [
-        ("question", &request.evidence.question),
-        ("answer", &request.evidence.answer),
-        ("session graph", &request.evidence.session_graph),
-        ("origin trace", &request.evidence.origin_trace),
-        ("ticket snapshot", &request.evidence.ticket_snapshot),
-    ] {
-        writeln!(
-            prompt,
-            "- {name}: {} (sha256 {})",
-            artifact.path.display(),
-            artifact.sha256
-        )
-        .unwrap();
-    }
-    prompt
+    oulipoly_runtime::fresh_continuation::fresh_prompt(context, resume)
 }
 
 impl From<FreshContinuationRequestV1> for FreshContinuationRequest {

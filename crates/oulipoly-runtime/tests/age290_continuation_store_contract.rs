@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `accessor`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/tests/age290_continuation_store_contract.rs
+//!     role: adapter
+//!     Translates:
+//!       - fresh-continuation-store-behavior-contract
+//!       - file-backed-SQLite-test-fixture-contract
+//! ```
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 

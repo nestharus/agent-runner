@@ -1,3 +1,8 @@
+//! ## Declared roles
+//!
+//! `accessor`, `validator`, `orchestration`
+
+use std::fmt::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,8 +99,59 @@ pub struct ContinuationBlock {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuationHandoff {
     pub continuation_id: String,
+    pub fresh_prompt: String,
+    pub request: FreshContinuationRequest,
     pub resume: InvocationOutcome,
     pub fresh: Option<InvocationOutcome>,
+}
+
+pub fn fresh_prompt(context: &ValidatedContinuation, resume: &InvocationOutcome) -> String {
+    let request = &context.request;
+    let mut prompt = String::new();
+    writeln!(
+        prompt,
+        "Continue the blocked workflow in this fresh provider session."
+    )
+    .unwrap();
+    writeln!(prompt, "Do not retry or mutate the origin session.").unwrap();
+    writeln!(
+        prompt,
+        "Origin invocation: {}",
+        request.origin_invocation_id
+    )
+    .unwrap();
+    writeln!(prompt, "Origin session: {}", request.origin_session_id).unwrap();
+    writeln!(prompt, "Failed resume invocation: {}", resume.invocation_id).unwrap();
+    writeln!(prompt, "Worktree: {}", request.worktree.display()).unwrap();
+    writeln!(
+        prompt,
+        "Last successful boundary: {}",
+        request.last_successful_boundary
+    )
+    .unwrap();
+    writeln!(
+        prompt,
+        "Active blocked boundary: {}",
+        request.active_blocked_boundary
+    )
+    .unwrap();
+    writeln!(prompt, "Read these exact artifacts before continuing:").unwrap();
+    for (name, artifact) in [
+        ("question", &request.evidence.question),
+        ("answer", &request.evidence.answer),
+        ("session graph", &request.evidence.session_graph),
+        ("origin trace", &request.evidence.origin_trace),
+        ("ticket snapshot", &request.evidence.ticket_snapshot),
+    ] {
+        writeln!(
+            prompt,
+            "- {name}: {} (sha256 {})",
+            artifact.path.display(),
+            artifact.sha256
+        )
+        .unwrap();
+    }
+    prompt
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

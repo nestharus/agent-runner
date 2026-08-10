@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `mapper`, `accessor`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_request_tests.rs
+//!     role: adapter
+//!     Translates:
+//!       - versioned-request-and-prompt-behavior-contract
+//!       - filesystem-request-test-fixture-contract
+//! ```
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

@@ -1,4 +1,19 @@
-//! mapper
+//! ## Declared roles
+//!
+//! `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/resume/mapper.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-resume-service-DTO-contract
+//!       - StateDb-resume-and-invocation-DTO-contract
+//!       - reserved-run-identity-contract
+//!       - resume-terminal-signal-context-contract
+//! ```
 
 use oulipoly_runtime::services::{
     InvocationLifecycleFinalizeRequest, InvocationLifecycleStartRequest, MigrationServiceRequest,

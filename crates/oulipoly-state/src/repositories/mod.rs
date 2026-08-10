@@ -14,6 +14,7 @@
 //!       - routing reads facade (provider eligibility queries, session-turn count reads)
 //!       - session-turn reads (assistant counts per provider/session)
 //!       - deployment-aware opener for cross-deployment state.db routing
+//!       - continuation lifecycle repository operations and typed outcomes
 //! ```
 
 use crate::continuation::{

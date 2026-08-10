@@ -1,8 +1,23 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `predicate`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/fresh_continuation/coordinator.rs
+//!     role: adapter
+//!     Translates:
+//!       - fresh-continuation-port-and-outcome-contract
+//! ```
+
 use super::contract::{
     AcceptDecision, ContinuationBlock, ContinuationBlockKind, ContinuationEvidenceValidator,
     ContinuationHandoff, ContinuationStore, FreshContinuation, FreshContinuationOutcome,
     FreshContinuationRequest, FreshRunner, HandoffPublisher, InvocationAction,
-    InvocationDisposition, InvocationOutcome, ResumeAcceptance, ResumeRunner, RunDecision,
+    InvocationDisposition, InvocationOutcome, PublishedHandoff, ReservedInvocation,
+    ResumeAcceptance, ResumeRunner, RunDecision, ValidatedContinuation, fresh_prompt,
 };
 
 pub struct FreshContinuationCoordinator<Validator, Store, Resume, Fresh, Publisher> {
@@ -45,44 +60,22 @@ where
     fn execute(&mut self, request: FreshContinuationRequest) -> FreshContinuationOutcome {
         let context = match self.validator.validate(&request) {
             Ok(context) => context,
-            Err(reason) => {
-                return FreshContinuationOutcome::Blocked {
-                    continuation_id: None,
-                    resume: None,
-                    fresh: None,
-                    handoff: None,
-                    reason,
-                };
-            }
+            Err(reason) => return blocked_without_continuation(reason),
         };
 
         let continuation = match self.store.accept(&context) {
             Ok(AcceptDecision::Accepted(continuation)) => continuation,
             Ok(AcceptDecision::Replay(outcome)) => return *outcome,
-            Err(reason) => {
-                return FreshContinuationOutcome::Blocked {
-                    continuation_id: None,
-                    resume: None,
-                    fresh: None,
-                    handoff: None,
-                    reason,
-                };
-            }
+            Err(reason) => return blocked_without_continuation(reason),
         };
 
-        let (resume_action, resume_reservation) = match self.store.begin_resume(&continuation) {
-            Ok(RunDecision::Run(reservation)) => (InvocationAction::Run, reservation),
-            Ok(RunDecision::Observe(reservation)) => (InvocationAction::Observe, reservation),
-            Ok(RunDecision::Terminal(outcome)) => return *outcome,
-            Err(reason) => {
-                return FreshContinuationOutcome::Blocked {
-                    continuation_id: Some(continuation.continuation_id.clone()),
-                    resume: None,
-                    fresh: None,
-                    handoff: None,
-                    reason,
-                };
-            }
+        let resume_decision = match self.store.begin_resume(&continuation) {
+            Ok(decision) => decision,
+            Err(reason) => return blocked_continuation(&continuation.continuation_id, reason),
+        };
+        let (resume_action, resume_reservation) = match runnable_invocation(resume_decision) {
+            Ok(run) => run,
+            Err(outcome) => return *outcome,
         };
 
         let resume = match self.resume.run_or_observe(
@@ -91,53 +84,25 @@ where
             &continuation.context,
         ) {
             Ok(resume) => resume,
-            Err(reason) => {
-                return FreshContinuationOutcome::Blocked {
-                    continuation_id: Some(continuation.continuation_id.clone()),
-                    resume: None,
-                    fresh: None,
-                    handoff: None,
-                    reason,
-                };
-            }
+            Err(reason) => return blocked_continuation(&continuation.continuation_id, reason),
         };
         if let Err(reason) = self.store.record_resume(&continuation, &resume) {
-            return FreshContinuationOutcome::Failed {
-                continuation_id: continuation.continuation_id.clone(),
-                resume,
-                fresh: None,
-                handoff: None,
-                reason,
-            };
+            return failed_after_resume(&continuation.continuation_id, resume, reason);
         }
 
         if !is_fresh_continuation_trigger(&resume) {
-            return FreshContinuationOutcome::Blocked {
-                continuation_id: Some(continuation.continuation_id.clone()),
-                resume: Some(resume),
-                fresh: None,
-                handoff: None,
-                reason: ContinuationBlock {
-                    kind: ContinuationBlockKind::TriggerNotMet,
-                    message: "resume outcome does not meet the fresh-continuation trigger"
-                        .to_string(),
-                },
-            };
+            return trigger_not_met(&continuation.continuation_id, resume);
         }
 
-        let (fresh_action, fresh_reservation) = match self.store.begin_fresh(&continuation) {
-            Ok(RunDecision::Run(reservation)) => (InvocationAction::Run, reservation),
-            Ok(RunDecision::Observe(reservation)) => (InvocationAction::Observe, reservation),
-            Ok(RunDecision::Terminal(outcome)) => return *outcome,
+        let fresh_decision = match self.store.begin_fresh(&continuation) {
+            Ok(decision) => decision,
             Err(reason) => {
-                return FreshContinuationOutcome::Failed {
-                    continuation_id: continuation.continuation_id.clone(),
-                    resume,
-                    fresh: None,
-                    handoff: None,
-                    reason,
-                };
+                return failed_after_resume(&continuation.continuation_id, resume, reason);
             }
+        };
+        let (fresh_action, fresh_reservation) = match runnable_invocation(fresh_decision) {
+            Ok(run) => run,
+            Err(outcome) => return *outcome,
         };
 
         let fresh = match self.fresh.run_or_observe(
@@ -148,52 +113,138 @@ where
         ) {
             Ok(fresh) => fresh,
             Err(reason) => {
-                return FreshContinuationOutcome::Failed {
-                    continuation_id: continuation.continuation_id.clone(),
-                    resume,
-                    fresh: None,
-                    handoff: None,
-                    reason,
-                };
+                return failed_after_resume(&continuation.continuation_id, resume, reason);
             }
         };
         if let Err(reason) = self.store.record_fresh(&continuation, &fresh) {
-            return FreshContinuationOutcome::Failed {
-                continuation_id: continuation.continuation_id.clone(),
-                resume,
-                fresh: Some(fresh),
-                handoff: None,
-                reason,
-            };
+            return failed_after_fresh(&continuation.continuation_id, resume, fresh, reason);
         }
 
-        let handoff = match self.publisher.publish(ContinuationHandoff {
-            continuation_id: continuation.continuation_id.clone(),
-            resume: resume.clone(),
-            fresh: Some(fresh.clone()),
-        }) {
+        let handoff_request = continuation_handoff(
+            &continuation.continuation_id,
+            &continuation.context,
+            &resume,
+            &fresh,
+        );
+        let handoff = match self.publisher.publish(handoff_request) {
             Ok(handoff) => handoff,
             Err(reason) => {
-                return FreshContinuationOutcome::Failed {
-                    continuation_id: continuation.continuation_id.clone(),
-                    resume,
-                    fresh: Some(fresh),
-                    handoff: None,
-                    reason,
-                };
+                return failed_after_fresh(&continuation.continuation_id, resume, fresh, reason);
             }
         };
 
         match self.store.finish(&continuation, &handoff) {
             Ok(outcome) => outcome,
-            Err(reason) => FreshContinuationOutcome::Failed {
-                continuation_id: continuation.continuation_id,
-                resume,
-                fresh: Some(fresh),
-                handoff: Some(handoff),
-                reason,
-            },
+            Err(reason) => {
+                failed_after_handoff(continuation.continuation_id, resume, fresh, handoff, reason)
+            }
         }
+    }
+}
+
+fn runnable_invocation(
+    decision: RunDecision,
+) -> Result<(InvocationAction, ReservedInvocation), Box<FreshContinuationOutcome>> {
+    match decision {
+        RunDecision::Run(reservation) => Ok((InvocationAction::Run, reservation)),
+        RunDecision::Observe(reservation) => Ok((InvocationAction::Observe, reservation)),
+        RunDecision::Terminal(outcome) => Err(outcome),
+    }
+}
+
+fn blocked_without_continuation(reason: ContinuationBlock) -> FreshContinuationOutcome {
+    FreshContinuationOutcome::Blocked {
+        continuation_id: None,
+        resume: None,
+        fresh: None,
+        handoff: None,
+        reason,
+    }
+}
+
+fn blocked_continuation(
+    continuation_id: &str,
+    reason: ContinuationBlock,
+) -> FreshContinuationOutcome {
+    FreshContinuationOutcome::Blocked {
+        continuation_id: Some(continuation_id.to_string()),
+        resume: None,
+        fresh: None,
+        handoff: None,
+        reason,
+    }
+}
+
+fn trigger_not_met(continuation_id: &str, resume: InvocationOutcome) -> FreshContinuationOutcome {
+    FreshContinuationOutcome::Blocked {
+        continuation_id: Some(continuation_id.to_string()),
+        resume: Some(resume),
+        fresh: None,
+        handoff: None,
+        reason: ContinuationBlock {
+            kind: ContinuationBlockKind::TriggerNotMet,
+            message: "resume outcome does not meet the fresh-continuation trigger".to_string(),
+        },
+    }
+}
+
+fn failed_after_resume(
+    continuation_id: &str,
+    resume: InvocationOutcome,
+    reason: ContinuationBlock,
+) -> FreshContinuationOutcome {
+    FreshContinuationOutcome::Failed {
+        continuation_id: continuation_id.to_string(),
+        resume,
+        fresh: None,
+        handoff: None,
+        reason,
+    }
+}
+
+fn failed_after_fresh(
+    continuation_id: &str,
+    resume: InvocationOutcome,
+    fresh: InvocationOutcome,
+    reason: ContinuationBlock,
+) -> FreshContinuationOutcome {
+    FreshContinuationOutcome::Failed {
+        continuation_id: continuation_id.to_string(),
+        resume,
+        fresh: Some(fresh),
+        handoff: None,
+        reason,
+    }
+}
+
+fn continuation_handoff(
+    continuation_id: &str,
+    context: &ValidatedContinuation,
+    resume: &InvocationOutcome,
+    fresh: &InvocationOutcome,
+) -> ContinuationHandoff {
+    ContinuationHandoff {
+        continuation_id: continuation_id.to_string(),
+        fresh_prompt: fresh_prompt(context, resume),
+        request: context.request.clone(),
+        resume: resume.clone(),
+        fresh: Some(fresh.clone()),
+    }
+}
+
+fn failed_after_handoff(
+    continuation_id: String,
+    resume: InvocationOutcome,
+    fresh: InvocationOutcome,
+    handoff: PublishedHandoff,
+    reason: ContinuationBlock,
+) -> FreshContinuationOutcome {
+    FreshContinuationOutcome::Failed {
+        continuation_id,
+        resume,
+        fresh: Some(fresh),
+        handoff: Some(handoff),
+        reason,
     }
 }
 

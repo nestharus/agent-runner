@@ -1,3 +1,19 @@
+//! ## Declared roles
+//!
+//! `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/balancing/mapper/context/invocation.rs
+//!     role: adapter
+//!     Translates:
+//!       - balancing-invocation-context-contract
+//!       - StateDb-invocation-lifecycle-contract
+//!       - reserved-run-identity-contract
+//! ```
+
 use oulipoly_config::ModelConfig;
 use oulipoly_runtime::services::InvocationLifecycleStartRequest;
 use oulipoly_state::{CompositeInvocationId, InvocationStart, StateDb};

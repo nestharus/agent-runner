@@ -2,7 +2,21 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`, `mapper`, `predicate`
+//! `orchestration`, `mapper`, `predicate`, `accessor`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/run/resume/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: headless_resume_module_facade
+//!     Owns:
+//!       - headless resume child module declarations
+//!       - prepared resume execution and orchestration re-exports
+//!       - resume validation re-export
+//!       - resume reservation policy mappers and predicate
+//! ```
 
 use oulipoly_state::CompositeInvocationId;
 

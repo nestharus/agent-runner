@@ -26,6 +26,7 @@
 //!       - oulipoly_state row-version REGISTRY symbol and registry::lookup API
 //!       - TableRegistration table, primary_key_columns, payload_columns, and kind fields
 //!       - RowKind::Mutable registry row-kind contract
+//!       - ordered migration asset identities and schema-version plan membership
 
 mod fixtures;
 

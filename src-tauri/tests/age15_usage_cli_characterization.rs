@@ -1,5 +1,21 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! `orchestration`, `accessor`, `mapper`, `formatter`, `validator`, `predicate`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/tests/age15_usage_cli_characterization.rs
+//!     role: adapter
+//!     Translates:
+//!       - public-AgentsCli-syntax-contract
+//!       - process-and-filesystem-CLI-fixture-contract
+//!       - StateDb-CLI-observation-contract
+//! ```
+
 use agent_runner_lib::usage::cli::Cli;
 use chrono::{TimeZone, Utc};
 use clap::{Parser, error::ErrorKind};

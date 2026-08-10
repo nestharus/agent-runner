@@ -1,4 +1,8 @@
 //! Typed persistence contract for durable fresh continuations.
+//!
+//! ## Declared roles
+//!
+//! `accessor`, `formatter`
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_fresh_tests.rs
+//!     role: adapter
+//!     Translates:
+//!       - continuation-fresh-runner-behavior-contract
+//!       - StateDb-invocation-test-fixture-contract
+//! ```
+
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 

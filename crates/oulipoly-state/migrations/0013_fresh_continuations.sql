@@ -1,4 +1,6 @@
 -- Durable exact-identity state machine for fresh continuation handoffs.
+-- ## Declared roles
+-- `mapper`, `validator`
 
 CREATE TABLE fresh_continuations (
     logical_request_key TEXT PRIMARY KEY CHECK (logical_request_key <> ''),

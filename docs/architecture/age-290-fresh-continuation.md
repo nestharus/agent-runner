@@ -26,6 +26,46 @@ CLI / dispatch
 | `FreshRunner` | `src-tauri` model routing/execution flow | Run or observe one reserved fresh invocation and return `InvocationOutcome` without turning retry or rotation into a second continuation invocation. |
 | `HandoffPublisher` | Session-graph continuation output | Publish the typed handoff idempotently; publication never authorizes execution. |
 
+## Adapter declarations
+
+```yaml
+adapter_declarations:
+  - component: docs/architecture/age-290-fresh-continuation.md
+    role: adapter
+    Translates:
+      - oulipoly-runtime-fresh-continuation-port-contract
+      - src-tauri-fresh-continuation-application-contract
+```
+
+## Fresh Continuation Request Schema
+
+This document is the runner-owned interface for request producers. A producer
+pushes one strict JSON object into the path passed by
+`--fresh-continuation-request`; the runner does not discover or infer fields.
+Unknown fields are rejected.
+
+```json
+{
+  "schema_version": 1,
+  "kind": "fresh_continuation_request",
+  "question_id": "<question identity>",
+  "origin_invocation_id": "<invocation UUID>",
+  "origin_session_id": "<provider session identity>",
+  "planning_root": "<absolute planning directory>",
+  "worktree": "<absolute worktree directory>",
+  "last_successful_boundary": "<boundary description>",
+  "active_blocked_boundary": "<boundary description>",
+  "target_model": "<configured model name>",
+  "evidence": {
+    "question": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
+    "answer": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
+    "session_graph": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
+    "origin_trace": { "path": "<absolute path>", "sha256": "<lowercase hex>" },
+    "ticket_snapshot": { "path": "<absolute path>", "sha256": "<lowercase hex>" }
+  }
+}
+```
+
 ## Composition Boundary
 
 The runner dispatch layer is the composition root. It constructs the

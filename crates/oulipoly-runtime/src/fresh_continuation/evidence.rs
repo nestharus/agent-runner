@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `validator`, `parser`, `predicate`, `mapper`, `accessor`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/fresh_continuation/evidence.rs
+//!     role: adapter
+//!     Translates:
+//!       - fresh-continuation-evidence-port-contract
+//!       - versioned-question-answer-graph-and-trace-artifact-contracts
+//! ```
+
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
@@ -36,7 +51,7 @@ struct QuestionOrigin {
 
 #[derive(Deserialize)]
 struct QuestionStateRefs {
-    session_graph_manifest: PathBuf,
+    session_graph_manifest: String,
 }
 
 #[derive(Deserialize)]
@@ -50,7 +65,7 @@ struct AnswerArtifact {
 
 #[derive(Deserialize)]
 struct AnswerContinuationPlan {
-    session_graph_manifest: PathBuf,
+    session_graph_manifest: String,
 }
 
 #[derive(Deserialize)]
@@ -90,10 +105,10 @@ where
         &mut self,
         request: &FreshContinuationRequest,
     ) -> Result<ValidatedContinuation, ContinuationBlock> {
-        for artifact in evidence_artifacts(request) {
+        for (name, artifact) in evidence_artifacts(request) {
             require_identity(
                 path_is_within(&artifact.path, &request.planning_root),
-                "evidence artifact path is outside the declared planning root",
+                &format!("{name} artifact path identity is outside the declared planning root"),
             )?;
         }
 
@@ -142,7 +157,10 @@ where
         )?;
         require_identity(
             answer.continuation_plan.as_ref().is_some_and(|plan| {
-                plan.session_graph_manifest == request.evidence.session_graph.path
+                graph_reference_matches(
+                    &plan.session_graph_manifest,
+                    &request.evidence.session_graph.path,
+                )
             }),
             "answer artifact continuation plan does not identify the requested session graph",
         )?;
@@ -160,9 +178,11 @@ where
             "question artifact origin worktree identity does not match the request",
         )?;
         require_identity(
-            question.state_refs.session_graph_manifest == Path::new("unknown")
-                || question.state_refs.session_graph_manifest
-                    == request.evidence.session_graph.path,
+            question.state_refs.session_graph_manifest == "unknown"
+                || graph_reference_matches(
+                    &question.state_refs.session_graph_manifest,
+                    &request.evidence.session_graph.path,
+                ),
             "question artifact session graph manifest reference does not match the request",
         )?;
         require_identity(
@@ -212,20 +232,36 @@ where
         name: &str,
         artifact: &ArtifactIdentity,
     ) -> Result<Vec<u8>, ContinuationBlock> {
+        let bytes = self.read_artifact(name, artifact)?;
+        verify_artifact_identity(name, artifact, bytes)
+    }
+
+    fn read_artifact(
+        &mut self,
+        name: &str,
+        artifact: &ArtifactIdentity,
+    ) -> Result<Vec<u8>, ContinuationBlock> {
         let bytes = self.source.read(artifact).map_err(|error| {
             invalid_evidence(format!(
                 "{name} artifact could not be read for identity validation: {}",
                 error.message
             ))
         })?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        if actual != artifact.sha256 {
-            return Err(invalid_evidence(format!(
-                "{name} artifact hash identity does not match its declared sha256"
-            )));
-        }
         Ok(bytes)
     }
+}
+
+fn verify_artifact_identity(
+    name: &str,
+    artifact: &ArtifactIdentity,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, ContinuationBlock> {
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    require_identity(
+        actual == artifact.sha256,
+        &format!("{name} artifact hash identity does not match its declared sha256"),
+    )?;
+    Ok(bytes)
 }
 
 fn parse_artifact<'a, Artifact>(name: &str, bytes: &'a [u8]) -> Result<Artifact, ContinuationBlock>
@@ -252,14 +288,18 @@ fn invalid_evidence(message: String) -> ContinuationBlock {
     }
 }
 
-fn evidence_artifacts(request: &FreshContinuationRequest) -> [&ArtifactIdentity; 5] {
+fn evidence_artifacts(request: &FreshContinuationRequest) -> [(&str, &ArtifactIdentity); 5] {
     [
-        &request.evidence.question,
-        &request.evidence.answer,
-        &request.evidence.session_graph,
-        &request.evidence.origin_trace,
-        &request.evidence.ticket_snapshot,
+        ("question", &request.evidence.question),
+        ("answer", &request.evidence.answer),
+        ("session graph", &request.evidence.session_graph),
+        ("origin trace", &request.evidence.origin_trace),
+        ("ticket snapshot", &request.evidence.ticket_snapshot),
     ]
+}
+
+fn graph_reference_matches(reference: &str, expected: &Path) -> bool {
+    expected.to_str() == Some(reference)
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -285,7 +325,7 @@ fn continuation_fingerprint(request: &FreshContinuationRequest) -> String {
     fingerprint_part(&mut digest, request.last_successful_boundary.as_bytes());
     fingerprint_part(&mut digest, request.active_blocked_boundary.as_bytes());
     fingerprint_part(&mut digest, request.target_model.as_bytes());
-    for artifact in evidence_artifacts(request) {
+    for (_, artifact) in evidence_artifacts(request) {
         fingerprint_part(&mut digest, artifact.path.as_os_str().as_encoded_bytes());
         fingerprint_part(&mut digest, artifact.sha256.as_bytes());
     }

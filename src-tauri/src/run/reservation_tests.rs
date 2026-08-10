@@ -1,3 +1,7 @@
+//! ## Declared roles
+//!
+//! `mapper`, `orchestration`, `validator`
+
 use std::path::Path;
 
 use oulipoly_runtime::fresh_continuation::ReservedInvocation;

@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `validator`, `accessor`, `mapper`
+//! `orchestration`, `validator`, `accessor`, `mapper`, `formatter`
 //!
 //! ## Adapter declarations
 //!
@@ -43,9 +43,20 @@ fn canonical_artifact_path(
     planning_root: &Path,
     artifact_path: &Path,
 ) -> Result<PathBuf, ContinuationBlock> {
-    let canonical_root = fs::canonicalize(planning_root).map_err(invalid_evidence)?;
-    let canonical_artifact = fs::canonicalize(artifact_path).map_err(invalid_evidence)?;
-    if !canonical_artifact.starts_with(&canonical_root) || canonical_artifact == canonical_root {
+    let canonical_root = canonical_path(planning_root).map_err(invalid_evidence)?;
+    let canonical_artifact = canonical_path(artifact_path).map_err(invalid_evidence)?;
+    validate_artifact_containment(&canonical_root, canonical_artifact)
+}
+
+fn canonical_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    fs::canonicalize(path)
+}
+
+fn validate_artifact_containment(
+    canonical_root: &Path,
+    canonical_artifact: PathBuf,
+) -> Result<PathBuf, ContinuationBlock> {
+    if !canonical_artifact.starts_with(canonical_root) || canonical_artifact == canonical_root {
         return Err(ContinuationBlock {
             kind: ContinuationBlockKind::InvalidEvidence,
             message: "Continuation artifact resolves outside the planning root".to_string(),

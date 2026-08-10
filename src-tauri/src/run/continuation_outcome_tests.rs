@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `mapper`, `orchestration`, `validator`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_outcome_tests.rs
+//!     role: adapter
+//!     Translates:
+//!       - exact-continuation-outcome-observation-contract
+//!       - StateDb-invocation-test-fixture-contract
+//! ```
+
 use std::path::Path;
 
 use oulipoly_runtime::fresh_continuation::{

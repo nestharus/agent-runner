@@ -1,3 +1,18 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/fresh_continuation/state_db_store.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-fresh-continuation-store-contract
+//!       - state-continuation-repository-contract
+//! ```
+
 use super::contract::{
     AcceptDecision, AcceptedContinuation, ContinuationBlock, ContinuationBlockKind,
     ContinuationStore, FreshContinuationOutcome, InvocationDisposition, InvocationOutcome,
@@ -28,23 +43,12 @@ impl ContinuationStore for StateDbContinuationStore {
         &mut self,
         context: &ValidatedContinuation,
     ) -> Result<AcceptDecision, ContinuationBlock> {
-        let input = ContinuationAcceptInput {
-            logical_request_key: logical_request_key(context),
-            fingerprint: context.fingerprint.clone(),
-            origin_invocation_id: context.request.origin_invocation_id.clone(),
-        };
-        match self
+        let input = continuation_accept_input(context);
+        let result = self
             .state
             .accept_continuation(&input)
-            .map_err(map_repository_error)?
-        {
-            ContinuationAcceptResult::Accepted(record) => Ok(AcceptDecision::Accepted(Box::new(
-                accepted_continuation(record, context.clone()),
-            ))),
-            ContinuationAcceptResult::Replay(terminal) => {
-                Ok(AcceptDecision::Replay(Box::new(runtime_terminal(terminal))))
-            }
-        }
+            .map_err(map_repository_error)?;
+        Ok(runtime_accept_decision(result, context))
     }
 
     fn begin_resume(
@@ -96,6 +100,28 @@ impl ContinuationStore for StateDbContinuationStore {
             .finish_continuation(&state_record(continuation), &state_handoff(handoff))
             .map(runtime_terminal)
             .map_err(map_repository_error)
+    }
+}
+
+fn continuation_accept_input(context: &ValidatedContinuation) -> ContinuationAcceptInput {
+    ContinuationAcceptInput {
+        logical_request_key: logical_request_key(context),
+        fingerprint: context.fingerprint.clone(),
+        origin_invocation_id: context.request.origin_invocation_id.clone(),
+    }
+}
+
+fn runtime_accept_decision(
+    result: ContinuationAcceptResult,
+    context: &ValidatedContinuation,
+) -> AcceptDecision {
+    match result {
+        ContinuationAcceptResult::Accepted(record) => {
+            AcceptDecision::Accepted(Box::new(accepted_continuation(record, context.clone())))
+        }
+        ContinuationAcceptResult::Replay(terminal) => {
+            AcceptDecision::Replay(Box::new(runtime_terminal(terminal)))
+        }
     }
 }
 

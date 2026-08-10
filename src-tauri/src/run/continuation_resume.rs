@@ -1,3 +1,19 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `validator`, `accessor`, `mapper`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/continuation_resume.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-resume-runner-port-contract
+//!       - exact-StateDb-invocation-observation-contract
+//!       - reserved-resume-execution-callback-contract
+//! ```
+
 use oulipoly_runtime::fresh_continuation::{
     ContinuationBlock, ContinuationBlockKind, InvocationAction, InvocationOutcome,
     ReservedInvocation, ResumeRunner, ValidatedContinuation,
@@ -29,14 +45,21 @@ where
         reservation: &ReservedInvocation,
         context: &ValidatedContinuation,
     ) -> Result<InvocationOutcome, ContinuationBlock> {
-        if reservation.parent_invocation_id != context.request.origin_invocation_id {
-            return Err(ContinuationBlock {
-                kind: ContinuationBlockKind::Conflict,
-                message: "Reserved resume parent does not match the continuation origin"
-                    .to_string(),
-            });
-        }
+        validate_resume_parent(reservation, context)?;
+        self.execute_or_observe(action, reservation, context)
+    }
+}
 
+impl<Execute> ContinuationResumeRunner<'_, Execute>
+where
+    Execute: FnMut(&ReservedRun, &ValidatedContinuation) -> Result<(), ContinuationBlock>,
+{
+    fn execute_or_observe(
+        &mut self,
+        action: InvocationAction,
+        reservation: &ReservedInvocation,
+        context: &ValidatedContinuation,
+    ) -> Result<InvocationOutcome, ContinuationBlock> {
         if action == InvocationAction::Observe {
             return self.observe(reservation, context);
         }
@@ -50,9 +73,7 @@ where
             (Ok(()), Err(error)) => Err(error),
         }
     }
-}
 
-impl<Execute> ContinuationResumeRunner<'_, Execute> {
     fn observe(
         &self,
         reservation: &ReservedInvocation,
@@ -65,6 +86,19 @@ impl<Execute> ContinuationResumeRunner<'_, Execute> {
         )
         .map_err(ambiguous_state)
     }
+}
+
+fn validate_resume_parent(
+    reservation: &ReservedInvocation,
+    context: &ValidatedContinuation,
+) -> Result<(), ContinuationBlock> {
+    if reservation.parent_invocation_id != context.request.origin_invocation_id {
+        return Err(ContinuationBlock {
+            kind: ContinuationBlockKind::Conflict,
+            message: "Reserved resume parent does not match the continuation origin".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn ambiguous_state(message: String) -> ContinuationBlock {

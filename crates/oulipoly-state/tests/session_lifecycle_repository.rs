@@ -1,3 +1,19 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `accessor`, `predicate`, `validator`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-state/tests/session_lifecycle_repository.rs
+//!     role: adapter
+//!     Translates:
+//!       - session-lifecycle-repository-behavior-contract
+//!       - StateDb-SQLite-test-fixture-contract
+//!       - ordered-state-schema-migration-contract
+//! ```
+
 use oulipoly_state::{
     AcknowledgementStage, AcknowledgementWrite, DispositionWrite, EventDisposition,
     ExactProcessIdentity, ExternalIngress, ExternalIngressWrite, LeaseAcquire, LeaseReplace,

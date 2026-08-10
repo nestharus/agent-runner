@@ -2,7 +2,19 @@
 //!
 //! ## Declared roles
 //!
-//! `orchestration`
+//! `orchestration`, `accessor`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/run/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: run_module_facade
+//!     Owns:
+//!       - run child module declarations
+//!       - run_repl and run_resume public re-exports
+//! ```
 
 pub(crate) mod balancing;
 pub(crate) mod continuation_artifact;

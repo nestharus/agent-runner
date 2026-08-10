@@ -1,6 +1,19 @@
 //! ## Declared roles
 //!
 //! `formatter`, `mapper`, `orchestration`, `predicate`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/resume/lifecycle.rs
+//!     role: adapter
+//!     Translates:
+//!       - resume-attempt-lifecycle-contract
+//!       - invocation-finalization-guard-contract
+//!       - zero-turn-baseline-contract
+//!       - resume-wake-contract
+//! ```
 
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 
