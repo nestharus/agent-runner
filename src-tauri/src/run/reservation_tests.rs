@@ -100,6 +100,27 @@ fn ordinary_resume_policy_preserves_retry_parent_and_migration() {
 }
 
 #[test]
+fn reserved_balancing_policy_pins_attempt_and_parent() {
+    let fixture = reservation_fixture();
+    let plan = ReservedRun::resolve(&fixture.state, &fixture.reservation).unwrap();
+
+    assert_eq!(super::balancing::max_attempts(7, Some(&plan)), 1);
+    assert_eq!(
+        super::balancing::parent_invocation_row_id(Some(999), Some(&plan)),
+        Some(fixture.parent_row_id)
+    );
+}
+
+#[test]
+fn ordinary_balancing_policy_preserves_retry_and_parent() {
+    assert_eq!(super::balancing::max_attempts(7, None), 7);
+    assert_eq!(
+        super::balancing::parent_invocation_row_id(Some(999), None),
+        Some(999)
+    );
+}
+
+#[test]
 fn reserved_run_rejects_a_missing_exact_parent_instead_of_using_another_row() {
     let state = StateDb::open(Path::new(":memory:")).unwrap();
     start_parent(&state, PARENT_UUID);
