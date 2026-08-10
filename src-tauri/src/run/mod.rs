@@ -13,6 +13,8 @@ mod continuation_fresh_tests;
 #[cfg(test)]
 mod continuation_outcome_tests;
 #[cfg(test)]
+mod continuation_request_tests;
+#[cfg(test)]
 mod continuation_resume_tests;
 #[cfg(test)]
 mod reservation_tests;
