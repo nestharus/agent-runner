@@ -17,8 +17,8 @@ use super::*;
 use crate::continuation::{
     ContinuationAcceptInput, ContinuationAcceptResult, ContinuationInvocationDisposition,
     ContinuationInvocationOutcome, ContinuationPublishedHandoff, ContinuationRecord,
-    ContinuationRepositoryError, ContinuationReservation, ContinuationRunDecision,
-    ContinuationTerminalOutcome,
+    ContinuationRepositoryError, ContinuationReservation, ContinuationResumeAcceptance,
+    ContinuationRunDecision, ContinuationTerminalOutcome,
 };
 use crate::repositories::ContinuationRepository;
 
@@ -225,10 +225,33 @@ fn begin_continuation_fresh_transaction(
         return Ok(terminal_run_decision(terminal));
     }
 
-    require_recorded_outcome(&row, OutcomeKind::Resume)?;
+    let resume = require_recorded_outcome(&row, OutcomeKind::Resume)?;
+    require_fresh_trigger(&resume)?;
     let stage = Stage::parse(&row.fresh_stage, "fresh")?;
     transition_fresh_if_reserved(tx, continuation, stage)?;
     Ok(stage_run_decision(stage, &continuation.fresh))
+}
+
+fn require_fresh_trigger(
+    resume: &ContinuationInvocationOutcome,
+) -> Result<(), ContinuationRepositoryError> {
+    let unconfirmed_completion = matches!(
+        &resume.disposition,
+        ContinuationInvocationDisposition::Failed {
+            error_category,
+            terminal_reason,
+        } if error_category == "resume_completion_unconfirmed"
+            && terminal_reason == "resume_completion_unconfirmed"
+    );
+    if resume.physical_exit_code == 0
+        && resume.acceptance == ContinuationResumeAcceptance::Accepted
+        && unconfirmed_completion
+    {
+        return Ok(());
+    }
+    Err(conflict(
+        "fresh continuation requires a zero-exit accepted resume with unconfirmed completion",
+    ))
 }
 
 fn transition_fresh_if_reserved(

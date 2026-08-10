@@ -305,6 +305,27 @@ fn fresh_waits_for_the_exact_resume_and_is_observed_with_the_same_identity_after
 }
 
 #[test]
+fn fresh_rejects_a_recorded_resume_that_does_not_meet_the_trigger() {
+    let fixture = Fixture::new();
+    let context = fixture.context("fingerprint-1");
+    let mut store = fixture.open_store();
+    let continuation = accept(&mut store, &context);
+    store
+        .begin_resume(&continuation)
+        .expect("begin reserved resume");
+    let resume = successful_resume(&continuation.resume.invocation_id);
+    store
+        .record_resume(&continuation, &resume)
+        .expect("record successful resume outcome");
+
+    let error = store
+        .begin_fresh(&continuation)
+        .expect_err("successful resume must not trigger a fresh continuation");
+
+    assert_eq!(error.kind, ContinuationBlockKind::Conflict);
+}
+
+#[test]
 fn outcome_replays_are_idempotent_only_for_the_same_exact_value() {
     let fixture = Fixture::new();
     let context = fixture.context("fingerprint-1");
@@ -528,6 +549,16 @@ fn unconfirmed_resume(invocation_id: &str) -> InvocationOutcome {
             error_category: "resume_completion_unconfirmed".to_string(),
             terminal_reason: "resume_completion_unconfirmed".to_string(),
         },
+    }
+}
+
+fn successful_resume(invocation_id: &str) -> InvocationOutcome {
+    InvocationOutcome {
+        invocation_id: invocation_id.to_string(),
+        session_id: Some("origin-session".to_string()),
+        physical_exit_code: 0,
+        acceptance: ResumeAcceptance::Accepted,
+        disposition: InvocationDisposition::Succeeded,
     }
 }
 
