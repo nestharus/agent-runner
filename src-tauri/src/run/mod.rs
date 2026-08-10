@@ -2,6 +2,7 @@
 
 pub(crate) mod balancing;
 pub(crate) mod continuation_fresh;
+pub(crate) mod continuation_handoff;
 pub(crate) mod continuation_outcome;
 pub(crate) mod continuation_request;
 pub(crate) mod continuation_resume;
