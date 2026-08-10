@@ -374,6 +374,22 @@ fn fresh_continuation_request_is_opt_in_and_requires_top_level_resume() {
 }
 
 #[test]
+fn fresh_continuation_request_rejects_provider_rotation() {
+    let error = Cli::try_parse_from([
+        "oulipoly-agent-runner",
+        "--resume",
+        SESSION_UUID,
+        "--fresh-continuation-request",
+        "/tmp/request.json",
+        "--rotate-provider",
+        "claude2",
+    ])
+    .expect_err("a fresh continuation request must reject provider rotation");
+
+    assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
+}
+
+#[test]
 fn usage_rejected_with_top_level_rotate_provider_flag() {
     clap_rejects(&[
         "oulipoly-agent-runner",

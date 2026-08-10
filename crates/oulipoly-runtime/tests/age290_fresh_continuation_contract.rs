@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `orchestration`, `validator`, `mapper`
+//! `orchestration`, `validator`, `mapper`, `formatter`
 //!
 //! ## Adapter declarations
 //!

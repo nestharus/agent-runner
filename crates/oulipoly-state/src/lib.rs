@@ -26,6 +26,8 @@
 //!         documented stable consumer API this root carrier owns and re-exports
 //!         unchanged from the decomposed `db` module tree
 //!       - the root-public typed continuation DTO and repository error module
+//!       - root-public deployment, invocation_marker, mailbox, migrations, paths,
+//!         pid_identity, repositories, result_envelope, schema, and schema_probe modules
 //! ```
 
 mod chain_segments;

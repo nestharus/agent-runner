@@ -14,6 +14,8 @@
 //!       - public-fresh-continuation-dispatch-contract
 //!       - legacy-resume-dispatch-contract
 //!       - isolated-provider-filesystem-and-SQLite-fixture-contract
+//!       - fixture-authored-provider-output-source-owner-contract
+//!       - direct-SQLite-observation-schema-producer-contract
 //! ```
 
 use chrono::{DateTime, Utc};
@@ -31,6 +33,7 @@ use std::process::{Command, Output, Stdio};
 
 const ORIGIN_INVOCATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const ORIGIN_SESSION_ID: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+const MISMATCHED_SESSION_ID: &str = "6169694d-de0f-40d1-890c-6e28e55bab27";
 const FRESH_SESSION_ID: &str = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
 const PARENT_INVOCATION_ID: &str = "22222222-2222-4222-8222-222222222222";
 const FORCE_TERMINAL_SIGNAL_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
@@ -73,103 +76,33 @@ impl ContinuationFixture {
         let resume_provider = write_python_provider(
             dir.path(),
             "resume-provider.py",
-            &format!(
-                r#"import json
-import os
-import pathlib
-import sys
-pathlib.Path({record:?}).write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
-with pathlib.Path({calls:?}).open("a") as stream:
-    stream.write("resume\n")
-print("resume accepted", file=sys.stderr)
-"#,
-                record = resume_record.display().to_string(),
-                calls = resume_calls.display().to_string(),
-            ),
+            &format_resume_provider_source(&resume_record, &resume_calls),
         );
         let fresh_provider = write_python_provider(
             dir.path(),
             "fresh-provider.py",
-            &format!(
-                r#"import datetime
-import json
-import os
-import pathlib
-import sys
-pathlib.Path({record:?}).write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
-with pathlib.Path({calls:?}).open("a") as stream:
-    stream.write("fresh\n")
-turn = {{
-    "session_id": {fresh_session:?},
-    "turn_id": "fresh-turn-1",
-    "timestamp": "2026-08-10T12:00:00Z",
-    "role": "assistant",
-}}
-with pathlib.Path({transcript:?}).open("a") as stream:
-    stream.write(json.dumps(turn) + "\n")
-print(json.dumps({{"type": "step_start", "sessionID": {fresh_session:?}}}))
-print("fresh continuation completed")
-"#,
-                record = fresh_record.display().to_string(),
-                calls = fresh_calls.display().to_string(),
-                fresh_session = FRESH_SESSION_ID,
-                transcript = transcript.display().to_string(),
-            ),
+            &format_fresh_provider_source(&fresh_record, &fresh_calls, &transcript),
         );
 
         fs::write(
             models_dir.join("resume-model.toml"),
-            "[[providers]]\nname = \"resume-provider\"\nargs = [\"resume-base\"]\n",
+            format_resume_model_config(),
         )
         .unwrap();
         fs::write(
             models_dir.join("fresh-model.toml"),
-            "[[providers]]\nname = \"fresh-provider\"\nargs = [\"fresh-base\"]\n",
+            format_fresh_model_config(),
         )
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
-                r#"[resume-provider]
-command = {resume_command:?}
-args = []
-interactive_args = ["resume-interactive"]
-prompt_mode = "arg"
-
-[resume-provider.resume]
-kind = "flag"
-flag = "--resume"
-
-[resume-provider.resume_acceptance]
-accepted_output_patterns = ["resume accepted"]
-
-[fresh-provider]
-command = {fresh_command:?}
-args = []
-interactive_args = ["fresh-interactive"]
-prompt_mode = "arg"
-
-[fresh-provider.session_capture]
-kind = "stdout_json_event"
-json_args = ["--format", "json"]
-event_type = "step_start"
-event_id_path = "sessionID"
-"#,
-                resume_command = resume_provider.display().to_string(),
-                fresh_command = fresh_provider.display().to_string(),
-            ),
+            format_continuation_providers_config(&resume_provider, &fresh_provider),
         )
         .unwrap();
+        let fresh_session_state = dir.path().join("fresh-session-state");
         fs::write(
             app_config_dir.join("sessions.toml"),
-            format!(
-                r#"[fresh-provider]
-turn_script = {turn_script:?}
-state_dir = {state_dir:?}
-"#,
-                turn_script = format!("cat {}", transcript.display()),
-                state_dir = dir.path().join("fresh-session-state").display().to_string(),
-            ),
+            format_continuation_sessions_config(&transcript, &fresh_session_state),
         )
         .unwrap();
 
@@ -205,8 +138,8 @@ state_dir = {state_dir:?}
             &expected_artifacts,
         );
 
-        Self {
-            _dir: dir,
+        map_continuation_fixture(
+            dir,
             config_home,
             data_home,
             models_dir,
@@ -218,7 +151,7 @@ state_dir = {state_dir:?}
             resume_calls,
             fresh_calls,
             expected_artifacts,
-        }
+        )
     }
 
     fn command(&self) -> Command {
@@ -251,7 +184,8 @@ state_dir = {state_dir:?}
     }
 
     fn continuation_row(&self) -> ContinuationRow {
-        self.connection()
+        let encoded = self
+            .connection()
             .query_row(
                 "SELECT continuation_id, resume_invocation_id, resume_parent_invocation_id,
                         fresh_invocation_id, fresh_parent_invocation_id,
@@ -259,21 +193,20 @@ state_dir = {state_dir:?}
                         terminal_outcome_json
                    FROM fresh_continuations",
                 [],
-                |row| {
-                    Ok(ContinuationRow {
-                        continuation_id: row.get(0)?,
-                        resume_invocation_id: row.get(1)?,
-                        resume_parent_invocation_id: row.get(2)?,
-                        fresh_invocation_id: row.get(3)?,
-                        fresh_parent_invocation_id: row.get(4)?,
-                        resume_outcome: serde_json::from_str(&row.get::<_, String>(5)?).unwrap(),
-                        fresh_outcome: serde_json::from_str(&row.get::<_, String>(6)?).unwrap(),
-                        handoff: serde_json::from_str(&row.get::<_, String>(7)?).unwrap(),
-                        terminal_outcome: serde_json::from_str(&row.get::<_, String>(8)?).unwrap(),
-                    })
-                },
+                map_encoded_continuation_row,
             )
-            .unwrap()
+            .unwrap();
+        let resume_outcome = parse_encoded_json(&encoded.resume_outcome);
+        let fresh_outcome = parse_encoded_json(&encoded.fresh_outcome);
+        let handoff = parse_encoded_json(&encoded.handoff);
+        let terminal_outcome = parse_encoded_json(&encoded.terminal_outcome);
+        map_continuation_row(
+            encoded,
+            resume_outcome,
+            fresh_outcome,
+            handoff,
+            terminal_outcome,
+        )
     }
 }
 
@@ -310,13 +243,10 @@ impl LegacyResumeFixture {
         fs::create_dir_all(source_projects.join("source-project")).unwrap();
         fs::create_dir_all(&target_projects).unwrap();
         fs::write(&answer_path, "legacy answer from file\n").unwrap();
+        let origin_session_file_name = format_origin_session_file_name();
         fs::write(
-            source_projects
-                .join("source-project")
-                .join(format!("{ORIGIN_SESSION_ID}.jsonl")),
-            format!(
-                "{{\"sessionId\":\"{ORIGIN_SESSION_ID}\",\"turnId\":\"origin-turn\",\"timestamp\":\"2026-08-10T10:00:00Z\",\"type\":\"assistant\"}}\n"
-            ),
+            map_origin_session_path(&source_projects, &origin_session_file_name),
+            format_origin_session_turn(),
         )
         .unwrap();
 
@@ -341,60 +271,22 @@ impl LegacyResumeFixture {
 
         fs::write(
             models_dir.join("legacy-headless.toml"),
-            "[[providers]]\nname = \"claude-legacy-a\"\nargs = [\"headless-a\"]\n\n[[providers]]\nname = \"claude-legacy-b\"\nargs = [\"headless-b\"]\n",
+            format_legacy_headless_model_config(),
         )
         .unwrap();
         fs::write(
             models_dir.join("legacy-interactive.toml"),
-            "[[providers]]\nname = \"interactive-owner\"\nargs = [\"headless-unused\"]\n",
+            format_legacy_interactive_model_config(),
         )
         .unwrap();
         fs::write(
             app_config_dir.join("providers.toml"),
-            format!(
-                r#"[claude-legacy-a]
-command = {first_command:?}
-args = []
-interactive_args = ["interactive-a"]
-prompt_mode = "arg"
-
-[claude-legacy-a.resume]
-kind = "flag"
-flag = "--resume"
-
-[claude-legacy-a.session_storage]
-kind = "claude_code"
-projects_dir = {source_projects:?}
-
-[claude-legacy-b]
-command = {second_command:?}
-args = []
-interactive_args = ["interactive-b"]
-prompt_mode = "arg"
-
-[claude-legacy-b.resume]
-kind = "flag"
-flag = "--resume"
-
-[claude-legacy-b.session_storage]
-kind = "claude_code"
-projects_dir = {target_projects:?}
-
-[interactive-owner]
-command = {interactive_command:?}
-args = []
-interactive_args = ["interactive-launch"]
-prompt_mode = "arg"
-
-[interactive-owner.resume]
-kind = "flag"
-flag = "--resume"
-"#,
-                first_command = first_provider.display().to_string(),
-                second_command = second_provider.display().to_string(),
-                interactive_command = interactive_provider.display().to_string(),
-                source_projects = source_projects.display().to_string(),
-                target_projects = target_projects.display().to_string(),
+            format_legacy_providers_config(
+                &first_provider,
+                &second_provider,
+                &interactive_provider,
+                &source_projects,
+                &target_projects,
             ),
         )
         .unwrap();
@@ -446,8 +338,8 @@ flag = "--resume"
             .query_row("SELECT MAX(id) FROM invocations", [], |row| row.get(0))
             .unwrap();
 
-        Self {
-            _dir: dir,
+        map_legacy_resume_fixture(
+            dir,
             config_home,
             data_home,
             models_dir,
@@ -458,19 +350,14 @@ flag = "--resume"
             interactive_record,
             parent_row_id,
             baseline_max_invocation_id,
-        }
+        )
     }
 
     fn command(&self) -> Command {
         let mut command = isolated_command(&self.config_home, &self.data_home);
-        command.env(
-            "OULIPOLY_PARENT_INVOCATION",
-            serde_json::to_string(&CompositeInvocationId {
-                source: "parent-provider".to_string(),
-                id: PARENT_INVOCATION_ID.to_string(),
-            })
-            .unwrap(),
-        );
+        let parent_invocation = map_parent_invocation();
+        let parent_invocation = format_parent_invocation(&parent_invocation);
+        command.env("OULIPOLY_PARENT_INVOCATION", parent_invocation);
         command
     }
 
@@ -500,7 +387,301 @@ struct ContinuationRow {
     terminal_outcome: Value,
 }
 
+struct EncodedContinuationRow {
+    continuation_id: String,
+    resume_invocation_id: String,
+    resume_parent_invocation_id: String,
+    fresh_invocation_id: String,
+    fresh_parent_invocation_id: String,
+    resume_outcome: String,
+    fresh_outcome: String,
+    handoff: String,
+    terminal_outcome: String,
+}
+
 type InvocationRow = (i64, Option<i64>, String, String, Option<String>);
+type EvidenceArtifact = (&'static str, PathBuf, Vec<u8>);
+type EvidenceIdentity = (&'static str, PathBuf, String);
+
+fn format_resume_provider_source(record: &Path, calls: &Path) -> String {
+    format!(
+        r#"import json
+import os
+import pathlib
+import sys
+pathlib.Path({record:?}).write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
+with pathlib.Path({calls:?}).open("a") as stream:
+    stream.write("resume\n")
+print("resume accepted", file=sys.stderr)
+"#,
+        record = record.display().to_string(),
+        calls = calls.display().to_string(),
+    )
+}
+
+fn format_fresh_provider_source(record: &Path, calls: &Path, transcript: &Path) -> String {
+    format!(
+        r#"import datetime
+import json
+import os
+import pathlib
+import sys
+pathlib.Path({record:?}).write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
+with pathlib.Path({calls:?}).open("a") as stream:
+    stream.write("fresh\n")
+turn = {{
+    "session_id": {fresh_session:?},
+    "turn_id": "fresh-turn-1",
+    "timestamp": "2026-08-10T12:00:00Z",
+    "role": "assistant",
+}}
+with pathlib.Path({transcript:?}).open("a") as stream:
+    stream.write(json.dumps(turn) + "\n")
+print(json.dumps({{"type": "step_start", "sessionID": {fresh_session:?}}}))
+print("fresh continuation completed")
+"#,
+        record = record.display().to_string(),
+        calls = calls.display().to_string(),
+        fresh_session = FRESH_SESSION_ID,
+        transcript = transcript.display().to_string(),
+    )
+}
+
+fn format_resume_model_config() -> String {
+    "[[providers]]\nname = \"resume-provider\"\nargs = [\"resume-base\"]\n".to_string()
+}
+
+fn format_fresh_model_config() -> String {
+    "[[providers]]\nname = \"fresh-provider\"\nargs = [\"fresh-base\"]\n".to_string()
+}
+
+fn format_continuation_providers_config(resume_provider: &Path, fresh_provider: &Path) -> String {
+    format!(
+        r#"[resume-provider]
+command = {resume_command:?}
+args = []
+interactive_args = ["resume-interactive"]
+prompt_mode = "arg"
+
+[resume-provider.resume]
+kind = "flag"
+flag = "--resume"
+
+[resume-provider.resume_acceptance]
+accepted_output_patterns = ["resume accepted"]
+
+[fresh-provider]
+command = {fresh_command:?}
+args = []
+interactive_args = ["fresh-interactive"]
+prompt_mode = "arg"
+
+[fresh-provider.session_capture]
+kind = "stdout_json_event"
+json_args = ["--format", "json"]
+event_type = "step_start"
+event_id_path = "sessionID"
+"#,
+        resume_command = resume_provider.display().to_string(),
+        fresh_command = fresh_provider.display().to_string(),
+    )
+}
+
+fn format_continuation_sessions_config(transcript: &Path, state_dir: &Path) -> String {
+    format!(
+        r#"[fresh-provider]
+turn_script = {turn_script:?}
+state_dir = {state_dir:?}
+"#,
+        turn_script = format!("cat {}", transcript.display()),
+        state_dir = state_dir.display().to_string(),
+    )
+}
+
+fn map_continuation_fixture(
+    dir: tempfile::TempDir,
+    config_home: PathBuf,
+    data_home: PathBuf,
+    models_dir: PathBuf,
+    planning_root: PathBuf,
+    worktree: PathBuf,
+    request_path: PathBuf,
+    resume_record: PathBuf,
+    fresh_record: PathBuf,
+    resume_calls: PathBuf,
+    fresh_calls: PathBuf,
+    expected_artifacts: Vec<(&'static str, PathBuf, String)>,
+) -> ContinuationFixture {
+    ContinuationFixture {
+        _dir: dir,
+        config_home,
+        data_home,
+        models_dir,
+        planning_root,
+        worktree,
+        request_path,
+        resume_record,
+        fresh_record,
+        resume_calls,
+        fresh_calls,
+        expected_artifacts,
+    }
+}
+
+fn map_encoded_continuation_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<EncodedContinuationRow> {
+    Ok(EncodedContinuationRow {
+        continuation_id: row.get(0)?,
+        resume_invocation_id: row.get(1)?,
+        resume_parent_invocation_id: row.get(2)?,
+        fresh_invocation_id: row.get(3)?,
+        fresh_parent_invocation_id: row.get(4)?,
+        resume_outcome: row.get(5)?,
+        fresh_outcome: row.get(6)?,
+        handoff: row.get(7)?,
+        terminal_outcome: row.get(8)?,
+    })
+}
+
+fn parse_encoded_json(encoded: &str) -> Value {
+    serde_json::from_str(encoded).unwrap()
+}
+
+fn map_continuation_row(
+    encoded: EncodedContinuationRow,
+    resume_outcome: Value,
+    fresh_outcome: Value,
+    handoff: Value,
+    terminal_outcome: Value,
+) -> ContinuationRow {
+    ContinuationRow {
+        continuation_id: encoded.continuation_id,
+        resume_invocation_id: encoded.resume_invocation_id,
+        resume_parent_invocation_id: encoded.resume_parent_invocation_id,
+        fresh_invocation_id: encoded.fresh_invocation_id,
+        fresh_parent_invocation_id: encoded.fresh_parent_invocation_id,
+        resume_outcome,
+        fresh_outcome,
+        handoff,
+        terminal_outcome,
+    }
+}
+
+fn map_origin_session_path(source_projects: &Path, file_name: &str) -> PathBuf {
+    source_projects.join("source-project").join(file_name)
+}
+
+fn format_origin_session_file_name() -> String {
+    format!("{ORIGIN_SESSION_ID}.jsonl")
+}
+
+fn format_origin_session_turn() -> String {
+    format!(
+        "{{\"sessionId\":\"{ORIGIN_SESSION_ID}\",\"turnId\":\"origin-turn\",\"timestamp\":\"2026-08-10T10:00:00Z\",\"type\":\"assistant\"}}\n"
+    )
+}
+
+fn format_legacy_headless_model_config() -> String {
+    "[[providers]]\nname = \"claude-legacy-a\"\nargs = [\"headless-a\"]\n\n[[providers]]\nname = \"claude-legacy-b\"\nargs = [\"headless-b\"]\n".to_string()
+}
+
+fn format_legacy_interactive_model_config() -> String {
+    "[[providers]]\nname = \"interactive-owner\"\nargs = [\"headless-unused\"]\n".to_string()
+}
+
+fn format_legacy_providers_config(
+    first_provider: &Path,
+    second_provider: &Path,
+    interactive_provider: &Path,
+    source_projects: &Path,
+    target_projects: &Path,
+) -> String {
+    format!(
+        r#"[claude-legacy-a]
+command = {first_command:?}
+args = []
+interactive_args = ["interactive-a"]
+prompt_mode = "arg"
+
+[claude-legacy-a.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude-legacy-a.session_storage]
+kind = "claude_code"
+projects_dir = {source_projects:?}
+
+[claude-legacy-b]
+command = {second_command:?}
+args = []
+interactive_args = ["interactive-b"]
+prompt_mode = "arg"
+
+[claude-legacy-b.resume]
+kind = "flag"
+flag = "--resume"
+
+[claude-legacy-b.session_storage]
+kind = "claude_code"
+projects_dir = {target_projects:?}
+
+[interactive-owner]
+command = {interactive_command:?}
+args = []
+interactive_args = ["interactive-launch"]
+prompt_mode = "arg"
+
+[interactive-owner.resume]
+kind = "flag"
+flag = "--resume"
+"#,
+        first_command = first_provider.display().to_string(),
+        second_command = second_provider.display().to_string(),
+        interactive_command = interactive_provider.display().to_string(),
+        source_projects = source_projects.display().to_string(),
+        target_projects = target_projects.display().to_string(),
+    )
+}
+
+fn map_legacy_resume_fixture(
+    dir: tempfile::TempDir,
+    config_home: PathBuf,
+    data_home: PathBuf,
+    models_dir: PathBuf,
+    project: PathBuf,
+    answer_path: PathBuf,
+    first_record: PathBuf,
+    second_record: PathBuf,
+    interactive_record: PathBuf,
+    parent_row_id: i64,
+    baseline_max_invocation_id: i64,
+) -> LegacyResumeFixture {
+    LegacyResumeFixture {
+        _dir: dir,
+        config_home,
+        data_home,
+        models_dir,
+        project,
+        answer_path,
+        first_record,
+        second_record,
+        interactive_record,
+        parent_row_id,
+        baseline_max_invocation_id,
+    }
+}
+
+fn map_parent_invocation() -> CompositeInvocationId {
+    CompositeInvocationId {
+        source: "parent-provider".to_string(),
+        id: PARENT_INVOCATION_ID.to_string(),
+    }
+}
+
+fn format_parent_invocation(parent_invocation: &CompositeInvocationId) -> String {
+    serde_json::to_string(parent_invocation).unwrap()
+}
 
 #[test]
 fn request_flag_runs_reserved_production_adapters_and_terminal_replay_does_not_relaunch() {
@@ -711,6 +892,30 @@ fn request_flag_rejects_a_project_that_differs_from_the_requested_worktree() {
 }
 
 #[test]
+fn request_flag_rejects_a_resume_session_that_differs_from_the_evidence_bound_origin() {
+    let fixture = ContinuationFixture::new();
+    let baseline_invocation_count = invocation_count(&fixture.connection());
+    let mut command = fixture.continuation_command();
+    replace_arg_value(&mut command, "--resume", Path::new(MISMATCHED_SESSION_ID));
+
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Error: Fresh continuation origin session does not match --resume\n"
+    );
+    assert!(!fixture.resume_calls.exists());
+    assert!(!fixture.fresh_calls.exists());
+    assert_eq!(continuation_count(&fixture.connection()), 0);
+    assert_eq!(
+        invocation_count(&fixture.connection()),
+        baseline_invocation_count
+    );
+    assert!(!fixture.planning_root.join("continuations").exists());
+}
+
+#[test]
 fn no_request_headless_dispatch_preserves_file_project_parent_retry_and_migration() {
     let fixture = LegacyResumeFixture::new();
     let mut command = fixture.command();
@@ -816,17 +1021,27 @@ fn state_db_path(data_home: &Path) -> PathBuf {
 
 fn write_python_provider(root: &Path, name: &str, body: &str) -> PathBuf {
     let path = root.join(name);
-    fs::write(&path, format!("#!/usr/bin/env python3\n{body}\n")).unwrap();
+    let source = format_python_provider_source(body);
+    fs::write(&path, source).unwrap();
     make_executable(&path);
     path
 }
 
+fn format_python_provider_source(body: &str) -> String {
+    format!("#!/usr/bin/env python3\n{body}\n")
+}
+
 fn write_recording_shell_provider(root: &Path, name: &str, record: &Path, body: &str) -> PathBuf {
     let path = root.join(name);
-    fs::write(
-        &path,
-        format!(
-            r#"#!/usr/bin/env python3
+    let source = format_recording_shell_provider_source(record, body);
+    fs::write(&path, source).unwrap();
+    make_executable(&path);
+    path
+}
+
+fn format_recording_shell_provider_source(record: &Path, body: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env python3
 import json
 import os
 import pathlib
@@ -835,18 +1050,27 @@ import sys
 pathlib.Path({record:?}).write_text(json.dumps({{"argv": sys.argv[1:], "cwd": os.getcwd()}}))
 raise SystemExit(subprocess.call(["bash", "-c", {body:?}]))
 "#,
-            record = record.display().to_string(),
-            body = body,
-        ),
+        record = record.display().to_string(),
+        body = body,
     )
-    .unwrap();
-    make_executable(&path);
-    path
 }
 
 fn make_executable(path: &Path) {
-    let mut permissions = fs::metadata(path).unwrap().permissions();
+    let permissions = read_permissions(path);
+    let permissions = map_executable_permissions(permissions);
+    write_permissions(path, permissions);
+}
+
+fn read_permissions(path: &Path) -> fs::Permissions {
+    fs::metadata(path).unwrap().permissions()
+}
+
+fn map_executable_permissions(mut permissions: fs::Permissions) -> fs::Permissions {
     permissions.set_mode(0o755);
+    permissions
+}
+
+fn write_permissions(path: &Path, permissions: fs::Permissions) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
@@ -931,71 +1155,117 @@ fn seed_active_chain(
         .unwrap();
 }
 
-fn write_evidence(planning_root: &Path, worktree: &Path) -> Vec<(&'static str, PathBuf, String)> {
-    let graph_path = planning_root.join("graph.json");
+fn write_evidence(planning_root: &Path, worktree: &Path) -> Vec<EvidenceIdentity> {
+    let graph_path = map_session_graph_path(planning_root);
+    let artifacts = map_evidence_artifacts(
+        planning_root,
+        graph_path.clone(),
+        format_question_artifact(worktree, &graph_path),
+        format_answer_artifact(&graph_path),
+        format_session_graph_artifact(),
+        format_origin_trace_artifact(),
+        format_ticket_snapshot_artifact(),
+    );
+    artifacts.into_iter().map(write_evidence_artifact).collect()
+}
+
+fn map_session_graph_path(planning_root: &Path) -> PathBuf {
+    planning_root.join("graph.json")
+}
+
+fn format_question_artifact(worktree: &Path, graph_path: &Path) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "kind": "agent_question",
+        "question_id": "question-1",
+        "origin": {
+            "invocation_uuid": ORIGIN_INVOCATION_ID,
+            "session_id": ORIGIN_SESSION_ID,
+            "worktree_path": worktree,
+        },
+        "state_refs": {"session_graph_manifest": graph_path},
+    }))
+    .unwrap()
+}
+
+fn format_answer_artifact(graph_path: &Path) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "kind": "agent_answer",
+        "question_id": "question-1",
+        "answered_by": "user-via-root-orchestrator",
+        "continuation_plan": {"session_graph_manifest": graph_path},
+    }))
+    .unwrap()
+}
+
+fn format_session_graph_artifact() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "root_invocation_uuid": ORIGIN_INVOCATION_ID,
+        "invocation_ids": [ORIGIN_INVOCATION_ID],
+        "session_ids": [ORIGIN_SESSION_ID],
+        "question_ids": ["question-1"],
+    }))
+    .unwrap()
+}
+
+fn format_origin_trace_artifact() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "root": {
+            "invocation": {"id": ORIGIN_INVOCATION_ID},
+            "session": {"provider_session_id": ORIGIN_SESSION_ID},
+        },
+    }))
+    .unwrap()
+}
+
+fn format_ticket_snapshot_artifact() -> Vec<u8> {
+    b"AGE-290 ticket snapshot".to_vec()
+}
+
+fn map_evidence_artifacts(
+    planning_root: &Path,
+    graph_path: PathBuf,
+    question: Vec<u8>,
+    answer: Vec<u8>,
+    session_graph: Vec<u8>,
+    origin_trace: Vec<u8>,
+    ticket_snapshot: Vec<u8>,
+) -> [EvidenceArtifact; 5] {
     [
-        (
-            "question",
-            planning_root.join("question.json"),
-            serde_json::to_vec(&json!({
-                "schema_version": 1,
-                "kind": "agent_question",
-                "question_id": "question-1",
-                "origin": {
-                    "invocation_uuid": ORIGIN_INVOCATION_ID,
-                    "session_id": ORIGIN_SESSION_ID,
-                    "worktree_path": worktree,
-                },
-                "state_refs": {"session_graph_manifest": graph_path},
-            }))
-            .unwrap(),
-        ),
-        (
-            "answer",
-            planning_root.join("answer.json"),
-            serde_json::to_vec(&json!({
-                "schema_version": 1,
-                "kind": "agent_answer",
-                "question_id": "question-1",
-                "answered_by": "user-via-root-orchestrator",
-                "continuation_plan": {"session_graph_manifest": graph_path},
-            }))
-            .unwrap(),
-        ),
-        (
-            "session graph",
-            graph_path,
-            serde_json::to_vec(&json!({
-                "root_invocation_uuid": ORIGIN_INVOCATION_ID,
-                "invocation_ids": [ORIGIN_INVOCATION_ID],
-                "session_ids": [ORIGIN_SESSION_ID],
-                "question_ids": ["question-1"],
-            }))
-            .unwrap(),
-        ),
+        ("question", planning_root.join("question.json"), question),
+        ("answer", planning_root.join("answer.json"), answer),
+        ("session graph", graph_path, session_graph),
         (
             "origin trace",
             planning_root.join("trace.json"),
-            serde_json::to_vec(&json!({
-                "root": {
-                    "invocation": {"id": ORIGIN_INVOCATION_ID},
-                    "session": {"provider_session_id": ORIGIN_SESSION_ID},
-                },
-            }))
-            .unwrap(),
+            origin_trace,
         ),
         (
             "ticket snapshot",
             planning_root.join("ticket.md"),
-            b"AGE-290 ticket snapshot".to_vec(),
+            ticket_snapshot,
         ),
     ]
-    .into_iter()
-    .map(|(name, path, bytes)| {
-        fs::write(&path, &bytes).unwrap();
-        (name, path, format!("{:x}", Sha256::digest(bytes)))
-    })
-    .collect()
+}
+
+fn write_evidence_artifact(artifact: EvidenceArtifact) -> EvidenceIdentity {
+    let (name, path, bytes) = artifact;
+    write_file_bytes(&path, &bytes);
+    let sha256 = format_sha256(&bytes);
+    map_evidence_identity(name, path, sha256)
+}
+
+fn write_file_bytes(path: &Path, bytes: &[u8]) {
+    fs::write(path, bytes).unwrap();
+}
+
+fn format_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn map_evidence_identity(name: &'static str, path: PathBuf, sha256: String) -> EvidenceIdentity {
+    (name, path, sha256)
 }
 
 fn write_request(
@@ -1003,36 +1273,71 @@ fn write_request(
     planning_root: &Path,
     worktree: &Path,
     origin_session_id: &str,
-    artifacts: &[(&str, PathBuf, String)],
+    artifacts: &[EvidenceIdentity],
 ) {
-    let artifact = |name: &str| {
-        let (_, path, sha256) = artifacts.iter().find(|item| item.0 == name).unwrap();
-        json!({"path": path, "sha256": sha256})
-    };
-    fs::write(
-        request_path,
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": 1,
-            "kind": "fresh_continuation_request",
-            "question_id": "question-1",
-            "origin_invocation_id": ORIGIN_INVOCATION_ID,
-            "origin_session_id": origin_session_id,
-            "planning_root": planning_root,
-            "worktree": worktree,
-            "last_successful_boundary": "phase-4-verified",
-            "active_blocked_boundary": "phase-5-apply-answer",
-            "target_model": "fresh-model",
-            "evidence": {
-                "question": artifact("question"),
-                "answer": artifact("answer"),
-                "session_graph": artifact("session graph"),
-                "origin_trace": artifact("origin trace"),
-                "ticket_snapshot": artifact("ticket snapshot"),
-            },
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let question = map_artifact_identity(find_evidence_artifact(artifacts, "question"));
+    let answer = map_artifact_identity(find_evidence_artifact(artifacts, "answer"));
+    let session_graph = map_artifact_identity(find_evidence_artifact(artifacts, "session graph"));
+    let origin_trace = map_artifact_identity(find_evidence_artifact(artifacts, "origin trace"));
+    let ticket_snapshot =
+        map_artifact_identity(find_evidence_artifact(artifacts, "ticket snapshot"));
+    let bytes = format_continuation_request(
+        planning_root,
+        worktree,
+        origin_session_id,
+        question,
+        answer,
+        session_graph,
+        origin_trace,
+        ticket_snapshot,
+    );
+    write_file_bytes(request_path, &bytes);
+}
+
+fn find_evidence_artifact<'a>(
+    artifacts: &'a [EvidenceIdentity],
+    name: &str,
+) -> &'a EvidenceIdentity {
+    artifacts
+        .iter()
+        .find(|artifact| artifact.0 == name)
+        .unwrap()
+}
+
+fn map_artifact_identity(artifact: &EvidenceIdentity) -> Value {
+    json!({"path": artifact.1, "sha256": artifact.2})
+}
+
+fn format_continuation_request(
+    planning_root: &Path,
+    worktree: &Path,
+    origin_session_id: &str,
+    question: Value,
+    answer: Value,
+    session_graph: Value,
+    origin_trace: Value,
+    ticket_snapshot: Value,
+) -> Vec<u8> {
+    serde_json::to_vec_pretty(&json!({
+        "schema_version": 1,
+        "kind": "fresh_continuation_request",
+        "question_id": "question-1",
+        "origin_invocation_id": ORIGIN_INVOCATION_ID,
+        "origin_session_id": origin_session_id,
+        "planning_root": planning_root,
+        "worktree": worktree,
+        "last_successful_boundary": "phase-4-verified",
+        "active_blocked_boundary": "phase-5-apply-answer",
+        "target_model": "fresh-model",
+        "evidence": {
+            "question": question,
+            "answer": answer,
+            "session_graph": session_graph,
+            "origin_trace": origin_trace,
+            "ticket_snapshot": ticket_snapshot,
+        },
+    }))
+    .unwrap()
 }
 
 fn expected_fresh_prompt(
@@ -1060,7 +1365,16 @@ fn expected_fresh_prompt(
 }
 
 fn read_provider_record(path: &Path) -> Value {
-    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    let bytes = read_file_bytes(path);
+    parse_provider_record(&bytes)
+}
+
+fn read_file_bytes(path: &Path) -> Vec<u8> {
+    fs::read(path).unwrap()
+}
+
+fn parse_provider_record(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).unwrap()
 }
 
 fn assert_process_success(output: &Output) {
@@ -1074,9 +1388,16 @@ fn assert_process_success(output: &Output) {
 }
 
 fn line_count(path: &Path) -> usize {
-    fs::read_to_string(path)
-        .map(|content| content.lines().count())
-        .unwrap_or(0)
+    let content = read_optional_file_text(path);
+    map_line_count(content)
+}
+
+fn read_optional_file_text(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
+}
+
+fn map_line_count(content: Option<String>) -> usize {
+    content.map(|content| content.lines().count()).unwrap_or(0)
 }
 
 fn invocation_count(connection: &Connection) -> i64 {

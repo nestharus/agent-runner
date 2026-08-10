@@ -1,3 +1,25 @@
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: crates/oulipoly-runtime/src/lib.rs
+//!     role: intrinsic-surface
+//!     Domain: oulipoly_runtime_module_facade
+//!     Owns:
+//!       - runtime child module declarations and root-public module exposure
+//! ```
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-runtime/src/lib.rs::test_support
+//!     role: adapter
+//!     Translates:
+//!       - process-environment test serialization contract
+//!       - std::sync mutex initialization and guard contract
+//! ```
+
 pub mod balancer;
 pub mod delivery_evidence;
 pub mod diagnostics;

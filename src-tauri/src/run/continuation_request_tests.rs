@@ -72,6 +72,36 @@ fn unknown_request_field_is_rejected() {
 }
 
 #[test]
+fn unknown_evidence_field_is_rejected_during_request_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut value = valid_request_json();
+    value["evidence"]["unexpected"] = json!(true);
+    let path = write_request(dir.path(), value);
+
+    let error = super::continuation_request::read(&path).unwrap_err();
+
+    assert_eq!(
+        error.kind,
+        oulipoly_runtime::fresh_continuation::ContinuationBlockKind::InvalidEvidence
+    );
+}
+
+#[test]
+fn unknown_artifact_identity_field_is_rejected_during_request_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut value = valid_request_json();
+    value["evidence"]["question"]["unexpected"] = json!(true);
+    let path = write_request(dir.path(), value);
+
+    let error = super::continuation_request::read(&path).unwrap_err();
+
+    assert_eq!(
+        error.kind,
+        oulipoly_runtime::fresh_continuation::ContinuationBlockKind::InvalidEvidence
+    );
+}
+
+#[test]
 fn fresh_prompt_names_exact_pull_references_and_boundaries() {
     let context = ValidatedContinuation {
         request: request_contract(),

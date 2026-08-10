@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `validator`, `orchestration`
+//! `accessor`, `validator`, `orchestration`, `formatter`
 
 use std::fmt::Write;
 use std::path::PathBuf;

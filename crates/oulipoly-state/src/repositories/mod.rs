@@ -15,6 +15,11 @@
 //!       - session-turn reads (assistant counts per provider/session)
 //!       - deployment-aware opener for cross-deployment state.db routing
 //!       - continuation lifecycle repository operations and typed outcomes
+//!       - invocation lifecycle repository operations
+//!       - session-chain repository operations
+//!       - resume resolution and persistence operations
+//!       - setup, provider, account, model, and parameter repository operations
+//!       - schema-probe and state-introspection repository operations
 //! ```
 
 use crate::continuation::{

@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `validator`, `mapper`, `accessor`
+//! `validator`, `mapper`, `accessor`, `predicate`
 //!
 //! ## Adapter declarations
 //!

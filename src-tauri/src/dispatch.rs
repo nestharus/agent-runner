@@ -20,6 +20,12 @@
 //!     role: adapter
 //!     Translates:
 //!       - oulipoly_runtime modules outside services consumed by CLI dispatch
+//!   - component: src-tauri/src/dispatch.rs::dispatch_to_cli_application
+//!     role: adapter
+//!     Translates:
+//!       - src-tauri CLI input resolution and resume-error formatting contract
+//!       - src-tauri public usage command DTO contract
+//!       - src-tauri commands, run, usage, and wiring composition contract
 //! ```
 //!
 //! ## Intrinsic-surface declarations

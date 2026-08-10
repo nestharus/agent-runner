@@ -556,10 +556,19 @@ impl EvidenceFixture {
     }
 
     fn rewrite_json(&mut self, name: &str, edit: impl FnOnce(&mut Value)) {
-        let path = self.artifact(name).path.clone();
-        let mut document: Value = serde_json::from_slice(self.files.get(&path).unwrap()).unwrap();
+        let path = self.artifact_path(name);
+        let mut document = parse_json(self.file_bytes(&path));
         edit(&mut document);
-        self.replace_bytes(name, serde_json::to_vec(&document).unwrap());
+        let bytes = format_json(&document);
+        self.replace_bytes(name, bytes);
+    }
+
+    fn artifact_path(&self, name: &str) -> PathBuf {
+        self.artifact(name).path.clone()
+    }
+
+    fn file_bytes(&self, path: &Path) -> &[u8] {
+        self.files.get(path).unwrap()
     }
 
     fn replace_bytes(&mut self, name: &str, bytes: Vec<u8>) {
@@ -663,6 +672,14 @@ impl EvidenceFixture {
             question["origin"]["worktree_path"] = json!(worktree);
         });
     }
+}
+
+fn parse_json(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).unwrap()
+}
+
+fn format_json(document: &Value) -> Vec<u8> {
+    serde_json::to_vec(document).unwrap()
 }
 
 fn assert_fingerprint_changed(fixture: &EvidenceFixture, original: &str, identity: &str) {
