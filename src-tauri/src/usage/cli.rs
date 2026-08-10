@@ -36,6 +36,7 @@ pub struct Cli {
             "agent_file",
             "new",
             "resume",
+            "fresh_continuation_request",
             "rotate_provider",
             "pin_provider",
             "input"
@@ -62,6 +63,15 @@ pub struct Cli {
     /// unified at the top level.
     #[arg(long = "resume")]
     pub(crate) resume: Option<String>,
+
+    /// Execute an evidence-bound fresh continuation after the named resume.
+    #[arg(
+        long = "fresh-continuation-request",
+        value_name = "PATH",
+        requires = "resume",
+        conflicts_with = "rotate_provider"
+    )]
+    pub(crate) fresh_continuation_request: Option<PathBuf>,
 
     /// Caller-stable token for idempotent durable submission of a resume payload.
     #[arg(long = "submission-token", requires = "resume")]

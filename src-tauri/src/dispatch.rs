@@ -20,6 +20,12 @@
 //!     role: adapter
 //!     Translates:
 //!       - oulipoly_runtime modules outside services consumed by CLI dispatch
+//!   - component: src-tauri/src/dispatch.rs::dispatch_to_cli_application
+//!     role: adapter
+//!     Translates:
+//!       - src-tauri CLI input resolution and resume-error formatting contract
+//!       - src-tauri public usage command DTO contract
+//!       - src-tauri commands, run, usage, and wiring composition contract
 //! ```
 //!
 //! ## Intrinsic-surface declarations
@@ -55,7 +61,9 @@
 
 use oulipoly_runtime::{session_external_provider, session_replace};
 
-use crate::cli::inputs::{TopLevelResumePromptSource, resolve_top_level_resume_prompt_source};
+use crate::cli::inputs::{
+    TopLevelResumePromptSource, format_missing_prompt_error, resolve_top_level_resume_prompt_source,
+};
 use crate::resume_cli::format_resume_error;
 use crate::usage::cli::{
     Cli, MailboxSubcommands, NotifySubcommands, SessionSubcommands, Subcommands,
@@ -531,6 +539,22 @@ fn dispatch_top_level_resume(
     agent_runtime_services: &wiring::AgentRuntimeServices,
 ) -> Result<i32, String> {
     validate_top_level_resume_cli(cli)?;
+    if let Some(request_path) = cli.fresh_continuation_request.as_deref() {
+        let prompt_source = resolve_top_level_resume_prompt_source(cli)?;
+        let prompt = continuation_command_prompt(&prompt_source)?;
+        return run::continuation_command::run(
+            agent_runtime_services,
+            cli.model.as_deref(),
+            session_id,
+            oulipoly_state::InboxTargetKind::Session,
+            prompt,
+            cli.file.as_deref(),
+            cli.submission_token.as_deref(),
+            cli.project.as_deref(),
+            cli.models_dir.as_deref(),
+            request_path,
+        );
+    }
     match resolve_top_level_resume_prompt_source(cli)? {
         TopLevelResumePromptSource::Headless {
             positional_or_stdin_prompt,
@@ -543,6 +567,17 @@ fn dispatch_top_level_resume(
         TopLevelResumePromptSource::Interactive => {
             dispatch_interactive_top_level_resume(cli, session_id, agent_runtime_services)
         }
+    }
+}
+
+fn continuation_command_prompt(
+    prompt_source: &TopLevelResumePromptSource,
+) -> Result<Option<&str>, String> {
+    match prompt_source {
+        TopLevelResumePromptSource::Headless {
+            positional_or_stdin_prompt,
+        } => Ok(positional_or_stdin_prompt.as_deref()),
+        TopLevelResumePromptSource::Interactive => Err(format_missing_prompt_error()),
     }
 }
 
@@ -1332,5 +1367,25 @@ mod tests {
             Some("5169694d-de0f-40d1-890c-6e28e55bab27")
         );
         assert_eq!(cli.rotate_provider.as_deref(), Some("provider2"));
+    }
+
+    #[test]
+    fn fresh_continuation_rejects_interactive_prompt_source() {
+        let error = continuation_command_prompt(&TopLevelResumePromptSource::Interactive)
+            .expect_err("fresh continuation should require input");
+
+        assert_eq!(
+            error,
+            "No prompt provided. Pass as argument, --file, or pipe to stdin."
+        );
+    }
+
+    #[test]
+    fn fresh_continuation_preserves_file_only_prompt_source() {
+        let prompt_source = TopLevelResumePromptSource::Headless {
+            positional_or_stdin_prompt: None,
+        };
+
+        assert_eq!(continuation_command_prompt(&prompt_source).unwrap(), None);
     }
 }

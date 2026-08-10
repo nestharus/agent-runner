@@ -34,10 +34,7 @@ use super::disposition::{
 };
 use super::finalization::finalize_completed_attempt;
 use super::formatter;
-use super::mapper::{
-    TerminalSignalBranch, balanced_invocation_start, composite_invocation_id,
-    terminal_signal_branch,
-};
+use super::mapper::{TerminalSignalBranch, balanced_invocation_start, terminal_signal_branch};
 use super::predicate::{
     attempts_exhausted, confirmed_zero_turn_exhaustion, provider_selection_pool_exhausted,
     should_defer_generic_exit, should_late_bind_zero_turn_baseline,
@@ -51,6 +48,7 @@ use crate::quota_zero_turn::{
     zero_turn_classification_for_action, zero_turn_classify_after_completion_with_recovery,
     zero_turn_late_bind_baseline, zero_turn_record_baseline,
 };
+use crate::run::reservation::ReservedRun;
 use crate::terminal_outcome_adapter::{
     TerminalSignalContext, apply_age153_terminal_signal_fixture_override,
     balanced_terminal_signal_for_outcome, confirm_maybe_quota_exhausted,
@@ -71,6 +69,56 @@ pub(crate) fn run_with_balancing(
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
 ) -> Result<i32, String> {
+    run_with_balancing_plan(
+        agent_runtime_services,
+        state_db_opener,
+        model,
+        prompt,
+        all_models,
+        models_dir,
+        working_dir,
+        extra_inputs,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::run) fn run_reserved_with_balancing(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    state_db_opener: &dyn StateDbOpener,
+    model: &ModelConfig,
+    prompt: &str,
+    all_models: &HashMap<String, ModelConfig>,
+    models_dir: &Path,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    reservation: &ReservedRun,
+) -> Result<i32, String> {
+    run_with_balancing_plan(
+        agent_runtime_services,
+        state_db_opener,
+        model,
+        prompt,
+        all_models,
+        models_dir,
+        working_dir,
+        extra_inputs,
+        Some(reservation),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_balancing_plan(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    state_db_opener: &dyn StateDbOpener,
+    model: &ModelConfig,
+    prompt: &str,
+    all_models: &HashMap<String, ModelConfig>,
+    models_dir: &Path,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    reservation: Option<&ReservedRun>,
+) -> Result<i32, String> {
     let mut env = load_balanced_execution_environment(state_db_opener)?;
     env.models_dir = models_dir.to_path_buf();
     run_with_balancing_environment(
@@ -81,9 +129,11 @@ pub(crate) fn run_with_balancing(
         all_models,
         working_dir,
         extra_inputs,
+        reservation,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_with_balancing_environment(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     env: BalancedExecutionEnvironment,
@@ -92,16 +142,20 @@ fn run_with_balancing_environment(
     all_models: &HashMap<String, ModelConfig>,
     working_dir: Option<&Path>,
     extra_inputs: &HashMap<String, Vec<String>>,
+    reservation: Option<&ReservedRun>,
 ) -> Result<i32, String> {
     let in_flight = oulipoly_runtime::quota::InFlight::new();
     let ctx = super::mapper::balance_context(&env.providers_cfg, &env.sessions_cfg, &in_flight);
     let state = &env.state;
-    let parent_invocation_id = crate::dispatch::resolve_parent_invocation_id(state);
+    let parent_invocation_id = super::parent_invocation_row_id(
+        crate::dispatch::resolve_parent_invocation_id(state),
+        reservation,
+    );
     // Source guard marker: resolve_parent_invocation_id(&state)
     // Source guard marker: routing_service.select_route(RoutingServiceRequest { ctx: Some(
     // Source guard marker: .finalize_invocation(
     // Source guard marker: record_returned_artifacts(
-    let max_attempts = super::mapper::quota_retry_budget(model);
+    let max_attempts = super::max_attempts(super::mapper::quota_retry_budget(model), reservation);
     let mut attempts = 0usize;
     let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
     let mut pending_same_provider_verification: Option<(usize, Option<String>)> = None;
@@ -136,6 +190,7 @@ fn run_with_balancing_environment(
             provider_index,
             parent_invocation_id,
             pending_verification,
+            reservation,
         )?;
 
         let mut result = execute_balanced_attempt(
@@ -230,12 +285,23 @@ fn resolve_balanced_attempt_provider(
         attempts,
         pending_verification,
     )?;
-    let (provider, prompt_mode) = attempt_effective_provider(model, env, provider_index)?;
-    Ok(BalancedAttemptProvider {
+    let effective_provider = attempt_effective_provider(model, env, provider_index)?;
+    Ok(balanced_attempt_provider(
+        provider_index,
+        effective_provider,
+    ))
+}
+
+fn balanced_attempt_provider(
+    provider_index: usize,
+    effective_provider: (ProviderConfig, PromptMode),
+) -> BalancedAttemptProvider {
+    let (provider, prompt_mode) = effective_provider;
+    BalancedAttemptProvider {
         provider_index,
         provider,
         prompt_mode,
-    })
+    }
 }
 
 fn attempt_provider_index(
@@ -303,6 +369,7 @@ struct StartKnownProviderSession {
     mode: Option<ProviderSessionStartMode>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_balanced_attempt<'state>(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     env: &'state BalancedExecutionEnvironment,
@@ -311,9 +378,10 @@ fn start_balanced_attempt<'state>(
     provider_index: usize,
     parent_invocation_id: Option<i64>,
     pending_verification: Option<(usize, Option<String>)>,
+    reservation: Option<&ReservedRun>,
 ) -> Result<BalancedInvocationAttempt<'state>, String> {
     let provider_name = provider.name.as_str();
-    let invocation = composite_invocation_id(provider_name);
+    let invocation = super::composite_invocation_id(provider_name, reservation);
     let invocation_row_id = start_balanced_invocation_row(
         agent_runtime_services,
         env,
@@ -340,7 +408,25 @@ fn start_balanced_attempt<'state>(
     let invocation_env = formatter::invocation_env(&invocation)
         .map_err(formatter::invocation_env_serialization_error)?;
     formatter::emit_invocation_stderr_line(&invocation);
-    Ok(BalancedInvocationAttempt {
+    Ok(balanced_invocation_attempt(
+        invocation,
+        invocation_row_id,
+        guard,
+        start_known_provider_session,
+        zero_turn_baseline,
+        invocation_env,
+    ))
+}
+
+fn balanced_invocation_attempt<'state>(
+    invocation: CompositeInvocationId,
+    invocation_row_id: i64,
+    guard: FinalizerGuard<'state>,
+    start_known_provider_session: StartKnownProviderSession,
+    zero_turn_baseline: ZeroTurnBaseline,
+    invocation_env: String,
+) -> BalancedInvocationAttempt<'state> {
+    BalancedInvocationAttempt {
         invocation,
         invocation_row_id,
         guard,
@@ -348,7 +434,7 @@ fn start_balanced_attempt<'state>(
         start_known_provider_session_mode: start_known_provider_session.mode,
         zero_turn_baseline,
         invocation_env,
-    })
+    }
 }
 
 fn start_balanced_invocation_row(
@@ -428,24 +514,44 @@ fn execute_balanced_attempt(
     {
         Ok(output) => Ok(output.result),
         Err(err) => {
-            let err = err.to_string();
-            finalize_spawn_error(super::mapper::spawn_error_input_for_attempt(
-                (
-                    agent_runtime_services,
-                    env,
-                    &attempt.invocation,
-                    attempt.invocation_row_id,
-                    &mut attempt.guard,
-                ),
-                (
-                    provider.name.as_str(),
-                    attempt.start_known_provider_session_id.as_deref(),
-                ),
-                err.clone(),
-            ));
-            Err(err)
+            let error = executor_error_message(err);
+            dispatch_balanced_spawn_error(
+                agent_runtime_services,
+                env,
+                provider.name.as_str(),
+                attempt,
+                error.clone(),
+            );
+            Err(error)
         }
     }
+}
+
+fn executor_error_message(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
+fn dispatch_balanced_spawn_error(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    env: &BalancedExecutionEnvironment,
+    provider_name: &str,
+    attempt: &mut BalancedInvocationAttempt<'_>,
+    error: String,
+) {
+    finalize_spawn_error(super::mapper::spawn_error_input_for_attempt(
+        (
+            agent_runtime_services,
+            env,
+            &attempt.invocation,
+            attempt.invocation_row_id,
+            &mut attempt.guard,
+        ),
+        (
+            provider_name,
+            attempt.start_known_provider_session_id.as_deref(),
+        ),
+        error,
+    ));
 }
 
 fn start_live_pty_retry_driver_if_applicable(
@@ -506,10 +612,22 @@ fn classify_balanced_zero_turn_result(input: BalancedZeroTurnInput<'_>) -> Balan
             provider_session_id.as_deref(),
         ),
     );
+    balanced_zero_turn_outcome(
+        provider_session_id,
+        action,
+        completion.recovered_generic_nonzero,
+    )
+}
+
+fn balanced_zero_turn_outcome(
+    provider_session_id: Option<String>,
+    action: ZeroTurnAction,
+    recovered_generic_nonzero: bool,
+) -> BalancedZeroTurnOutcome {
     BalancedZeroTurnOutcome {
         provider_session_id,
         action,
-        recovered_generic_nonzero: completion.recovered_generic_nonzero,
+        recovered_generic_nonzero,
     }
 }
 
@@ -685,15 +803,13 @@ fn exhausted_attempt_reason(
     env: &BalancedExecutionEnvironment,
     ctx: &oulipoly_runtime::balancer::BalanceContext<'_>,
 ) -> String {
-    let route_error = match agent_runtime_services
+    let route_result = agent_runtime_services
         .routing_service
         // routing_service.select_route(RoutingServiceRequest { ctx: Some(
         .select_route(super::mapper::routing_service_request(
             model, &env.state, ctx,
-        )) {
-        Err(err) => Some(err.to_string()),
-        Ok(_) => None,
-    };
+        ));
+    let route_error = route_probe_error(route_result).map(route_probe_error_message);
     formatter::exhausted_attempt_reason(
         route_error,
         &model.name,
@@ -701,43 +817,109 @@ fn exhausted_attempt_reason(
     )
 }
 
+fn route_probe_error<T, E>(result: Result<T, E>) -> Option<E> {
+    result.err()
+}
+
+fn route_probe_error_message(error: impl std::fmt::Display) -> String {
+    error.to_string()
+}
+
 fn finalize_spawn_error(input: super::mapper::SpawnErrorInput<'_, '_>) {
     let signal = spawn_error_signal(&input);
     apply_spawn_error_terminal_outcome(&input, &signal);
     let finalized = finalize_spawn_error_invocation(&input, &signal);
     emit_spawn_error_envelope(&input, &signal);
+    mark_spawn_error_guard_finalized(input.guard, finalized);
+    let handed_off = finalize_spawn_error_mailbox_handoff(&input);
+    mark_spawn_error_session_idle_if_needed(&input, handed_off);
+}
+
+fn mark_spawn_error_guard_finalized(guard: &mut FinalizerGuard<'_>, finalized: bool) {
     if finalized {
-        input.guard.mark_finalized();
+        guard.mark_finalized();
     }
-    let handed_off = match crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
+}
+
+struct SpawnErrorHandoffStatus<E> {
+    handed_off: bool,
+    error: Option<E>,
+}
+
+fn spawn_error_handoff_status<E>(result: Result<bool, E>) -> SpawnErrorHandoffStatus<E> {
+    match result {
+        Ok(handed_off) => SpawnErrorHandoffStatus {
+            handed_off,
+            error: None,
+        },
+        Err(error) => SpawnErrorHandoffStatus {
+            handed_off: false,
+            error: Some(error),
+        },
+    }
+}
+
+fn finalize_spawn_error_mailbox_handoff(input: &super::mapper::SpawnErrorInput<'_, '_>) -> bool {
+    let result = crate::mailbox_delivery::finalize_pty_mailbox_delivery_handoff(
         input.provider_session_id,
         input.invocation_id,
         1,
-    ) {
-        Ok(handled) => handled,
-        Err(err) => {
-            tracing::warn!(
-                session_id = input.provider_session_id,
-                invocation_uuid = input.invocation_id,
-                "Failed to hand off balanced spawn-error PTY mailbox delivery: {err}"
-            );
-            false
-        }
-    };
-    if !handed_off
-        && let Some(session_id) = input.provider_session_id
-        && let Err(err) = crate::wake_coordinator::mark_session_idle_after_turn(
-            session_id,
-            input.invocation_id,
-            Some(1),
-        )
-    {
-        tracing::warn!(
-            session_id,
-            invocation_uuid = input.invocation_id,
-            "Failed to mark balanced spawn-error session idle: {err}"
-        );
+    );
+    let status = spawn_error_handoff_status(result);
+    if let Some(error) = status.error {
+        emit_spawn_error_handoff_warning(input, error);
     }
+    status.handed_off
+}
+
+fn emit_spawn_error_handoff_warning(
+    input: &super::mapper::SpawnErrorInput<'_, '_>,
+    error: impl std::fmt::Display,
+) {
+    tracing::warn!(
+        session_id = input.provider_session_id,
+        invocation_uuid = input.invocation_id,
+        "Failed to hand off balanced spawn-error PTY mailbox delivery: {error}"
+    );
+}
+
+fn should_mark_spawn_error_session_idle(
+    handed_off: bool,
+    provider_session_id: Option<&str>,
+) -> bool {
+    !handed_off && provider_session_id.is_some()
+}
+
+fn mark_spawn_error_session_idle_if_needed(
+    input: &super::mapper::SpawnErrorInput<'_, '_>,
+    handed_off: bool,
+) {
+    if !should_mark_spawn_error_session_idle(handed_off, input.provider_session_id) {
+        return;
+    }
+    let session_id = input
+        .provider_session_id
+        .expect("idle eligibility requires a provider session id");
+    let result = crate::wake_coordinator::mark_session_idle_after_turn(
+        session_id,
+        input.invocation_id,
+        Some(1),
+    );
+    if let Err(error) = result {
+        emit_spawn_error_idle_warning(session_id, input.invocation_id, error);
+    }
+}
+
+fn emit_spawn_error_idle_warning(
+    session_id: &str,
+    invocation_id: &str,
+    error: impl std::fmt::Display,
+) {
+    tracing::warn!(
+        session_id,
+        invocation_uuid = invocation_id,
+        "Failed to mark balanced spawn-error session idle: {error}"
+    );
 }
 
 fn spawn_error_signal(
@@ -775,19 +957,36 @@ fn finalize_spawn_error_invocation(
     signal: &oulipoly_runtime::executor::TerminalSignal,
 ) -> bool {
     let terminal_reason = formatter::spawn_error_terminal_reason(signal);
-    match input
+    let result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(super::mapper::spawn_error_finalize_request(
             &input.env.state,
             input.invocation_row_id,
             terminal_reason,
-        )) {
-        Ok(_) => true,
-        Err(err) => {
-            formatter::emit_finalize_invocation_warning(err);
-            false
-        }
+        ));
+    let status = spawn_error_finalization_status(result);
+    if let Some(error) = status.error {
+        formatter::emit_finalize_invocation_warning(error);
+    }
+    status.finalized
+}
+
+struct SpawnErrorFinalizationStatus<E> {
+    finalized: bool,
+    error: Option<E>,
+}
+
+fn spawn_error_finalization_status<T, E>(result: Result<T, E>) -> SpawnErrorFinalizationStatus<E> {
+    match result {
+        Ok(_) => SpawnErrorFinalizationStatus {
+            finalized: true,
+            error: None,
+        },
+        Err(error) => SpawnErrorFinalizationStatus {
+            finalized: false,
+            error: Some(error),
+        },
     }
 }
 

@@ -1,3 +1,19 @@
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `accessor`, `predicate`, `validator`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-state/tests/session_lifecycle_repository.rs
+//!     role: adapter
+//!     Translates:
+//!       - session-lifecycle-repository-behavior-contract
+//!       - StateDb-SQLite-test-fixture-contract
+//!       - ordered-state-schema-migration-contract
+//! ```
+
 use oulipoly_state::{
     AcknowledgementStage, AcknowledgementWrite, DispositionWrite, EventDisposition,
     ExactProcessIdentity, ExternalIngress, ExternalIngressWrite, LeaseAcquire, LeaseReplace,
@@ -735,10 +751,10 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
 }
 
 #[test]
-fn schema_v12_is_created_fresh_and_upgrades_from_schema_v10() {
+fn schema_v13_is_created_fresh_and_upgrades_from_schema_v10() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
-    assert_eq!(user_version(fresh.connection()), 12);
+    assert_eq!(user_version(fresh.connection()), 13);
     let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
@@ -753,6 +769,10 @@ fn schema_v12_is_created_fresh_and_upgrades_from_schema_v10() {
     for table in lifecycle_tables {
         assert!(table_exists(fresh.connection(), table), "missing {table}");
     }
+    assert!(
+        table_exists(fresh.connection(), "fresh_continuations"),
+        "missing fresh_continuations"
+    );
 
     let upgrade_path = dir.path().join("upgrade.db");
     let mut conn = rusqlite::Connection::open(&upgrade_path).unwrap();
@@ -762,21 +782,26 @@ fn schema_v12_is_created_fresh_and_upgrades_from_schema_v10() {
          PRAGMA user_version = 10;",
     )
     .unwrap();
-    let plan = oulipoly_state::migrations::plan(10, 12).unwrap();
+    let plan = oulipoly_state::migrations::plan(10, 13).unwrap();
     assert_eq!(
         plan.iter()
             .map(|migration| migration.id)
             .collect::<Vec<_>>(),
         vec![
             "0011_durable_session_lifecycle",
-            "0012_session_ingress_evidence"
+            "0012_session_ingress_evidence",
+            "0013_fresh_continuations"
         ]
     );
     oulipoly_state::migrations::run_with_db_path(&mut conn, &plan, upgrade_path).unwrap();
-    assert_eq!(user_version(&conn), 12);
+    assert_eq!(user_version(&conn), 13);
     for table in lifecycle_tables {
         assert!(table_exists(&conn, table), "missing {table}");
     }
+    assert!(
+        table_exists(&conn, "fresh_continuations"),
+        "missing fresh_continuations"
+    );
     assert_eq!(
         conn.query_row("SELECT label FROM preserved_rows WHERE id = 1", [], |row| {
             row.get::<_, String>(0)

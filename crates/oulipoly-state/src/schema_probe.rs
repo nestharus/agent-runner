@@ -144,7 +144,7 @@ pub fn inspect_schema(conn: &Connection, path: PathBuf) -> Result<StateDbReport,
 
     let tables = required_tables()
         .into_iter()
-        .map(|table| (table.to_string(), tables_seen.contains(table)))
+        .map(|(table, _)| (table.to_string(), tables_seen.contains(table)))
         .collect();
     let required_columns = required_column_map(Some(conn))?;
     let required_indexes = required_index_map(Some(conn))?;
@@ -152,12 +152,16 @@ pub fn inspect_schema(conn: &Connection, path: PathBuf) -> Result<StateDbReport,
     let has_required_shape = all_values(&tables)
         && all_nested_values(&required_columns)
         && all_nested_values(&required_indexes);
+    let has_migratable_shape = required_tables()
+        .into_iter()
+        .filter(|(_, introduced_in)| *introduced_in <= user_version)
+        .all(|(table, _)| tables.get(table).copied().unwrap_or(false))
+        && all_nested_values(&required_columns)
+        && all_nested_values(&required_indexes);
     let compatible = user_version == CURRENT_SCHEMA_VERSION && has_required_shape;
     let migratable = (MINIMUM_SUPPORTED_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION)
         .contains(&user_version)
-        && all_values(&tables)
-        && all_nested_values(&required_columns)
-        && all_nested_values(&required_indexes);
+        && has_migratable_shape;
 
     Ok(StateDbReport {
         path,
@@ -228,12 +232,13 @@ fn safe_for_import_replace(
         && supported_storage_types == self::supported_storage_types()
 }
 
-fn required_tables() -> [&'static str; 4] {
+fn required_tables() -> [(&'static str, i32); 5] {
     [
-        "invocations",
-        "session_turns",
-        "session_chains",
-        "session_chain_segments",
+        ("invocations", MINIMUM_SUPPORTED_SCHEMA_VERSION),
+        ("session_turns", MINIMUM_SUPPORTED_SCHEMA_VERSION),
+        ("session_chains", MINIMUM_SUPPORTED_SCHEMA_VERSION),
+        ("session_chain_segments", MINIMUM_SUPPORTED_SCHEMA_VERSION),
+        ("fresh_continuations", CURRENT_SCHEMA_VERSION),
     ]
 }
 
@@ -306,7 +311,7 @@ fn required_indexes() -> BTreeMap<&'static str, Vec<RequiredIndex>> {
 fn required_table_map(value: bool) -> BTreeMap<String, bool> {
     required_tables()
         .into_iter()
-        .map(|table| (table.to_string(), value))
+        .map(|(table, _)| (table.to_string(), value))
         .collect()
 }
 

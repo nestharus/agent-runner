@@ -1,4 +1,26 @@
 //! Headless resume module wiring.
+//!
+//! ## Declared roles
+//!
+//! `orchestration`, `mapper`, `predicate`, `accessor`
+//!
+//! ## Intrinsic-surface declarations
+//!
+//! ```yaml
+//! intrinsic_surface_declarations:
+//!   - component: src-tauri/src/run/resume/mod.rs
+//!     role: intrinsic-surface
+//!     Domain: headless_resume_module_facade
+//!     Owns:
+//!       - headless resume child module declarations
+//!       - prepared resume execution and orchestration re-exports
+//!       - resume validation re-export
+//!       - resume reservation policy mappers and predicate
+//! ```
+
+use oulipoly_state::CompositeInvocationId;
+
+use super::reservation::ReservedRun;
 
 mod disposition;
 mod execution;
@@ -16,5 +38,34 @@ mod terminal;
 mod validator;
 mod wake;
 
+pub(in crate::run) use execution::PreparedHeadlessResumeExecution;
 pub(crate) use orchestration::run_resume;
+pub(in crate::run) use orchestration::{prepare_resume, run_prepared_resume};
 pub(crate) use validator::validate_resume_input;
+
+pub(in crate::run) fn composite_invocation_id(
+    provider_name: &str,
+    reservation: Option<&ReservedRun>,
+) -> CompositeInvocationId {
+    mapper::composite_invocation_id(provider_name, reservation)
+}
+
+pub(in crate::run) fn max_attempts(
+    ordinary_max_attempts: usize,
+    reservation: Option<&ReservedRun>,
+) -> usize {
+    reservation.map_or(ordinary_max_attempts, ReservedRun::max_attempts)
+}
+
+pub(in crate::run) fn parent_invocation_row_id(
+    ordinary_parent: Option<i64>,
+    reservation: Option<&ReservedRun>,
+) -> Option<i64> {
+    reservation
+        .map(ReservedRun::parent_invocation_row_id)
+        .or(ordinary_parent)
+}
+
+pub(in crate::run) fn migration_allowed(reservation: Option<&ReservedRun>) -> bool {
+    reservation.is_none()
+}

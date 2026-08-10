@@ -1,11 +1,25 @@
 //! ## Declared roles
 //!
 //! `orchestration`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/resume/orchestration.rs
+//!     role: adapter
+//!     Translates:
+//!       - resume-execution-preparation-contract
+//!       - resume-attempt-lifecycle-contract
+//!       - resume-terminal-disposition-contract
+//!       - resume-wake-contract
+//! ```
 
 use std::path::Path;
 
 use super::{execution, lifecycle, terminal, wake};
 use crate::migration_providers::ResumeExecutionEnvironment;
+use crate::run::reservation::ReservedRun;
 use crate::wiring;
 use crate::zero_turn_orchestration::ZeroTurnConfirmationState;
 
@@ -22,15 +36,7 @@ pub(crate) fn run_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<i32, String> {
-    if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
-        return Ok(exit_code);
-    }
-    if let Some(exit_code) = prepare_resume_wake(session_id)? {
-        return Ok(exit_code);
-    }
-    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
-
-    let mut prepared = match execution::prepare_headless_resume_execution(
+    let mut prepared = match prepare_resume(
         agent_runtime_services,
         model_name,
         session_id,
@@ -42,14 +48,96 @@ pub(crate) fn run_resume(
         models_dir_override,
     )? {
         Ok(prepared) => prepared,
-        Err(exit_code) => {
-            wake::release_current_auto_wake_claim(session_id);
-            return Ok(exit_code);
-        }
+        Err(exit_code) => return Ok(exit_code),
     };
+    run_prepared_resume(
+        agent_runtime_services,
+        &mut prepared,
+        None,
+        manual_migrate,
+        session_id,
+        working_dir,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::run) fn prepare_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    session_id: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    submission_token: Option<&str>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
+    let result = prepare_resume_inner(
+        agent_runtime_services,
+        model_name,
+        session_id,
+        target_kind,
+        prompt,
+        file,
+        submission_token,
+        working_dir,
+        models_dir_override,
+    );
+    if !matches!(&result, Ok(Ok(_))) {
+        wake::release_current_auto_wake_claim(session_id);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_resume_inner(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    model_name: Option<&str>,
+    session_id: &str,
+    target_kind: oulipoly_state::InboxTargetKind,
+    prompt: Option<&str>,
+    file: Option<&Path>,
+    submission_token: Option<&str>,
+    working_dir: Option<&Path>,
+    models_dir_override: Option<&Path>,
+) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
+    if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
+        return Ok(Err(exit_code));
+    }
+    if let Some(exit_code) = prepare_resume_wake(session_id)? {
+        return Ok(Err(exit_code));
+    }
+    // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
+
+    match execution::prepare_headless_resume_execution(
+        agent_runtime_services,
+        model_name,
+        session_id,
+        target_kind,
+        prompt,
+        file,
+        submission_token,
+        working_dir,
+        models_dir_override,
+    )? {
+        Ok(prepared) => Ok(Ok(prepared)),
+        Err(exit_code) => Ok(Err(exit_code)),
+    }
+}
+
+pub(in crate::run) fn run_prepared_resume(
+    agent_runtime_services: &wiring::AgentRuntimeServices,
+    prepared: &mut execution::PreparedHeadlessResumeExecution,
+    reservation: Option<&ReservedRun>,
+    manual_migrate: Option<&str>,
+    session_id: &str,
+    working_dir: Option<&Path>,
+) -> Result<i32, String> {
+    execution::validate_reserved_resume_options(reservation, manual_migrate)?;
     let result = run_resume_loop(ResumeLoopInput {
         agent_runtime_services,
-        prepared: &mut prepared,
+        prepared,
+        reservation,
         manual_migrate,
         session_id,
         working_dir,
@@ -61,6 +149,7 @@ pub(crate) fn run_resume(
 struct ResumeLoopInput<'a> {
     agent_runtime_services: &'a wiring::AgentRuntimeServices,
     prepared: &'a mut execution::PreparedHeadlessResumeExecution,
+    reservation: Option<&'a ReservedRun>,
     manual_migrate: Option<&'a str>,
     session_id: &'a str,
     working_dir: Option<&'a Path>,
@@ -72,7 +161,8 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
     let mut zero_turn_confirmation = ZeroTurnConfirmationState::new();
 
     loop {
-        if terminal::resume_attempts_exhausted(attempts, input.prepared.max_attempts) {
+        let max_attempts = super::max_attempts(input.prepared.max_attempts, input.reservation);
+        if terminal::resume_attempts_exhausted(attempts, max_attempts) {
             return Ok(terminal::resume_attempts_exhausted_exit_code(
                 last_exit_code,
             ));
@@ -91,11 +181,15 @@ fn run_resume_loop(input: ResumeLoopInput<'_>) -> Result<i32, String> {
                 .prepared
                 .mailbox_delivery_requires_turn_confirmation,
             manual_migrate: input.manual_migrate,
+            reservation: input.reservation,
             session_id: input.session_id,
             working_dir: input.working_dir,
             attempts,
-            max_attempts: input.prepared.max_attempts,
-            parent_invocation_id: input.prepared.parent_invocation_id,
+            max_attempts,
+            parent_invocation_id: super::parent_invocation_row_id(
+                input.prepared.parent_invocation_id,
+                input.reservation,
+            ),
             effective_spawn_cwd: &input.prepared.effective_spawn_cwd,
             zero_turn_confirmation: &mut zero_turn_confirmation,
         })? {
@@ -115,6 +209,7 @@ pub(super) struct ResumeAttemptInput<'a> {
     pub(super) mailbox_delivery_nonce: Option<&'a str>,
     pub(super) mailbox_delivery_requires_turn_confirmation: bool,
     pub(super) manual_migrate: Option<&'a str>,
+    pub(super) reservation: Option<&'a ReservedRun>,
     pub(super) session_id: &'a str,
     pub(super) working_dir: Option<&'a Path>,
     pub(super) attempts: usize,

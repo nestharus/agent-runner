@@ -57,6 +57,7 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             "0010_imported_session_display_metadata",
             "0011_durable_session_lifecycle",
             "0012_session_ingress_evidence",
+            "0013_fresh_continuations",
         ]
     );
 

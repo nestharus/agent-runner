@@ -96,6 +96,7 @@ mod chain_segments_open;
 mod cli_providers;
 mod discovered_models;
 mod discovery_types;
+mod fresh_continuation;
 mod imported_session_display_metadata;
 mod imported_session_list;
 mod invocation_artifacts;

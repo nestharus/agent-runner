@@ -73,6 +73,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0012_session_ingress_evidence.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 13,
+        id: "0013_fresh_continuations",
+        sql: include_str!("../migrations/0013_fresh_continuations.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -286,25 +292,43 @@ fn add_column_if_missing(
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
+    let exists = read_table_exists_scalar(conn, table)?;
+    Ok(schema_match_exists(exists))
+}
+
+fn read_table_exists_scalar(conn: &Connection, table: &str) -> Result<i64, rusqlite::Error> {
     conn.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM sqlite_schema
               WHERE type = 'table' AND name = ?1
          )",
         [table],
-        |row| row.get::<_, bool>(0),
+        |row| row.get(0),
     )
 }
 
+fn schema_match_exists(value: i64) -> bool {
+    value != 0
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for name in columns {
-        if name? == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let sql = format_table_info_query(table);
+    let columns = read_column_names(conn, &sql)?;
+    Ok(contains_column(&columns, column))
+}
+
+fn format_table_info_query(table: &str) -> String {
+    format!("PRAGMA table_info({table})")
+}
+
+fn read_column_names(conn: &Connection, sql: &str) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(sql)?;
+    let columns = stmt.query_map([], |row| row.get(1))?;
+    columns.collect()
+}
+
+fn contains_column(columns: &[String], column: &str) -> bool {
+    columns.iter().any(|name| name == column)
 }
 
 pub(crate) fn classify_versionless(

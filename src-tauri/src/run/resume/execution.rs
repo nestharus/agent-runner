@@ -1,6 +1,19 @@
 //! ## Declared roles
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/src/run/resume/execution.rs
+//!     role: adapter
+//!     Translates:
+//!       - runtime-resume-and-executor-service-contract
+//!       - StateDb-mailbox-and-resume-resolution-contract
+//!       - runner-model-and-provider-configuration-contract
+//!       - resume-prompt-and-spawn-working-directory-contract
+//! ```
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -22,7 +35,7 @@ use crate::resume_cli::{
 use crate::spawn_cwd::effective_resume_spawn_cwd;
 use crate::wiring;
 
-pub(super) struct PreparedHeadlessResumeExecution {
+pub(in crate::run) struct PreparedHeadlessResumeExecution {
     pub(super) answer: Option<String>,
     pub(super) mailbox_session_id: String,
     pub(super) mailbox_delivery_seqs: Vec<i64>,
@@ -46,7 +59,7 @@ pub(super) fn reject_invalid_resume_input(session_id: &str) -> Option<i32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_headless_resume_execution(
+pub(in crate::run) fn prepare_headless_resume_execution(
     agent_runtime_services: &wiring::AgentRuntimeServices,
     model_name: Option<&str>,
     session_id: &str,
@@ -122,11 +135,14 @@ fn persist_tokenized_resume_input(
     })? {
         oulipoly_state::mailbox::EnqueueResult::Inserted(_)
         | oulipoly_state::mailbox::EnqueueResult::AlreadyEnqueued(_) => Ok(None),
-        oulipoly_state::mailbox::EnqueueResult::Conflict { existing } => Err(format!(
-            "submission token conflicts with existing inbox item {}",
-            existing.seq
-        )),
+        oulipoly_state::mailbox::EnqueueResult::Conflict { existing } => {
+            Err(format_submission_token_conflict(existing.seq))
+        }
     }
+}
+
+fn format_submission_token_conflict(existing_seq: i64) -> String {
+    format!("submission token conflicts with existing inbox item {existing_seq}")
 }
 
 fn refresh_resume_provider_registry(
@@ -171,15 +187,17 @@ pub(super) fn prepare_resume_attempt_target(
             Ok(target) => target,
             Err(exit_code) => return Ok(Err(exit_code)),
         };
-    if let Err(exit_code) = migration::migrate_resume_target(
-        input.agent_runtime_services,
-        input.env,
-        input.resolved,
-        &mut target,
-        input.manual_migrate,
-        input.attempts,
-        input.effective_spawn_cwd,
-    ) {
+    if super::migration_allowed(input.reservation)
+        && let Err(exit_code) = migration::migrate_resume_target(
+            input.agent_runtime_services,
+            input.env,
+            input.resolved,
+            &mut target,
+            input.manual_migrate,
+            input.attempts,
+            input.effective_spawn_cwd,
+        )
+    {
         return Ok(Err(exit_code));
     }
     Ok(Ok(target))
@@ -206,13 +224,15 @@ pub(super) fn execute_resume_attempt_command(
     invocation_env: &str,
     strategy: Option<&oulipoly_config::ResumeStrategy>,
 ) -> Result<executor::ExecutionResult, String> {
-    if let Some(request) = provider_ref_resume_executor_request(
-        input,
-        provider,
-        provider_index,
-        prompt_mode,
-        invocation_env,
-    ) {
+    if let Some(model) = eligible_provider_ref_resume_model(input.resolved) {
+        let request = provider_ref_resume_executor_request(
+            input,
+            model,
+            provider,
+            provider_index,
+            prompt_mode,
+            invocation_env,
+        );
         return input
             .agent_runtime_services
             .executor_service
@@ -237,29 +257,45 @@ pub(super) fn execute_resume_attempt_command(
     )
 }
 
+fn eligible_provider_ref_resume_model(
+    resolved: &oulipoly_state::ResolvedResume,
+) -> Option<&oulipoly_config::ModelConfig> {
+    resolved
+        .model
+        .as_ref()
+        .filter(|model| model.provider.is_some())
+}
+
 fn provider_ref_resume_executor_request(
     input: &ResumeAttemptInput<'_>,
+    model: &oulipoly_config::ModelConfig,
     provider: &oulipoly_config::ProviderConfig,
     provider_index: usize,
     prompt_mode: oulipoly_config::PromptMode,
     invocation_env: &str,
-) -> Option<ExecutorServiceRequest> {
-    let model = input.resolved.model.as_ref()?;
-    model.provider.as_ref()?;
-    Some(
-        ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
-            model: model.clone(),
-            provider: provider.clone(),
-            provider_index,
-            prompt_mode,
-            prompt: input.answer.unwrap_or_default().to_string(),
-            working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
-            models_dir: Some(input.env.models_dir.clone()),
-            extra_inputs: HashMap::new(),
-            parent_invocation_env: Some(invocation_env.to_string()),
-            start_known_provider_session_id: input.resolved.active_session_id.clone(),
-        },
-    )
+) -> ExecutorServiceRequest {
+    ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
+        model: model.clone(),
+        provider: provider.clone(),
+        provider_index,
+        prompt_mode,
+        prompt: input.answer.unwrap_or_default().to_string(),
+        working_dir: Some(input.effective_spawn_cwd.to_path_buf()),
+        models_dir: Some(input.env.models_dir.clone()),
+        extra_inputs: HashMap::new(),
+        parent_invocation_env: Some(invocation_env.to_string()),
+        start_known_provider_session_id: input.resolved.active_session_id.clone(),
+    }
+}
+
+pub(super) fn validate_reserved_resume_options(
+    reservation: Option<&crate::run::reservation::ReservedRun>,
+    manual_migrate: Option<&str>,
+) -> Result<(), String> {
+    if reservation.is_some() && manual_migrate.is_some() {
+        return Err("Reserved resume execution cannot migrate providers".to_string());
+    }
+    Ok(())
 }
 
 fn resolve_resume_for_headless_execution(

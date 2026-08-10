@@ -138,6 +138,7 @@ fn ti_06_probe_and_classifier_report_migratable_without_mutation() {
 
     let report = schema_probe::inspect_schema(&conn, db_path.clone()).unwrap();
     assert_eq!(report.user_version as i32, MINIMUM_SUPPORTED_SCHEMA_VERSION);
+    assert_eq!(report.tables.get("fresh_continuations"), Some(&false));
     assert!(
         report.migratable,
         "old supported DB must be distinguishable from incompatible old state"
@@ -158,6 +159,7 @@ fn ti_07_ti_22_schema_constants_are_single_source_for_probe_and_fixtures() {
     let db = StateDb::open(&db_path).unwrap();
     let report = schema_probe::inspect_schema(db.connection(), db_path).unwrap();
 
+    assert_eq!(report.tables.get("fresh_continuations"), Some(&true));
     assert_eq!(
         report.current_schema_version as i32, CURRENT_SCHEMA_VERSION,
         "schema probe must import oulipoly_state::schema::CURRENT_SCHEMA_VERSION"
@@ -238,8 +240,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
 
     assert_eq!(
         plan_target_versions(&plan),
-        vec![5, 6, 7, 8, 9, 10, 11, CURRENT_SCHEMA_VERSION],
-        "schema-4 DBs must take every ordered migration through session ingress evidence schema 12"
+        vec![5, 6, 7, 8, 9, 10, 11, 12, CURRENT_SCHEMA_VERSION],
+        "schema-4 DBs must take every ordered migration through fresh continuation schema 13"
     );
     assert_eq!(
         plan_ids(&plan),
@@ -252,6 +254,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0010_imported_session_display_metadata",
             "0011_durable_session_lifecycle",
             "0012_session_ingress_evidence",
+            "0013_fresh_continuations",
         ]
     );
 }

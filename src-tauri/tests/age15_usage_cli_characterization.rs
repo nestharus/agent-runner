@@ -1,5 +1,21 @@
 #![cfg(unix)]
 
+//! ## Declared roles
+//!
+//! `orchestration`, `accessor`, `mapper`, `formatter`, `validator`, `predicate`
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: src-tauri/tests/age15_usage_cli_characterization.rs
+//!     role: adapter
+//!     Translates:
+//!       - public-AgentsCli-syntax-contract
+//!       - process-and-filesystem-CLI-fixture-contract
+//!       - StateDb-CLI-observation-contract
+//! ```
+
 use agent_runner_lib::usage::cli::Cli;
 use chrono::{TimeZone, Utc};
 use clap::{Parser, error::ErrorKind};
@@ -335,6 +351,54 @@ fn usage_rejected_with_new_flag() {
 #[test]
 fn usage_rejected_with_top_level_resume() {
     clap_rejects(&["oulipoly-agent-runner", "--usage", "--resume", SESSION_UUID]);
+}
+
+#[test]
+fn usage_rejected_with_fresh_continuation_request() {
+    clap_rejects(&[
+        "oulipoly-agent-runner",
+        "--usage",
+        "--resume",
+        SESSION_UUID,
+        "--fresh-continuation-request",
+        "/tmp/request.json",
+    ]);
+}
+
+#[test]
+fn fresh_continuation_request_is_opt_in_and_requires_top_level_resume() {
+    Cli::try_parse_from([
+        "oulipoly-agent-runner",
+        "--resume",
+        SESSION_UUID,
+        "--fresh-continuation-request",
+        "/tmp/request.json",
+    ])
+    .unwrap();
+
+    let error = Cli::try_parse_from([
+        "oulipoly-agent-runner",
+        "--fresh-continuation-request",
+        "/tmp/request.json",
+    ])
+    .expect_err("a fresh continuation request must name the resume session");
+    assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument, "{error}");
+}
+
+#[test]
+fn fresh_continuation_request_rejects_provider_rotation() {
+    let error = Cli::try_parse_from([
+        "oulipoly-agent-runner",
+        "--resume",
+        SESSION_UUID,
+        "--fresh-continuation-request",
+        "/tmp/request.json",
+        "--rotate-provider",
+        "claude2",
+    ])
+    .expect_err("a fresh continuation request must reject provider rotation");
+
+    assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}");
 }
 
 #[test]

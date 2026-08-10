@@ -1,11 +1,23 @@
 //! ## Declared roles
 //! accessor, formatter, mapper, orchestration, predicate, validator
+//!
+//! ## Adapter declarations
+//!
+//! ```yaml
+//! adapter_declarations:
+//!   - component: crates/oulipoly-state/src/schema.rs
+//!     role: adapter
+//!     Translates:
+//!       - rusqlite SQLite schema-introspection contract
+//!       - oulipoly-state typed schema-compatibility and error contract
+//!       - std ordered table-name comparison support contract
+//! ```
 
 use crate::StateDbError;
 use rusqlite::{Connection, Statement};
 use std::collections::BTreeSet;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 12;
+pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 pub const MINIMUM_SUPPORTED_SCHEMA_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
