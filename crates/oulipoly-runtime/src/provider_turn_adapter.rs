@@ -839,7 +839,15 @@ fn evidence_rank(evidence: &ProviderEvidence) -> u8 {
         ProviderEvidence::IngestedAssistantTurn { .. } => 0,
         ProviderEvidence::AssistantOutput { .. } => 1,
         ProviderEvidence::AffirmativeProviderCompletion { .. } => 2,
-        _ => u8::MAX,
+        ProviderEvidence::ProcessLaunched
+        | ProviderEvidence::TransportAccepted
+        | ProviderEvidence::AssistantOutputAbsent
+        | ProviderEvidence::TerminalSignal { .. }
+        | ProviderEvidence::ProviderRejected { .. }
+        | ProviderEvidence::QuotaExhausted { .. }
+        | ProviderEvidence::Malformed { .. }
+        | ProviderEvidence::Manual { .. }
+        | ProviderEvidence::ResumeCompletionUnconfirmed => u8::MAX,
     }
 }
 
