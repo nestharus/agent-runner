@@ -23,8 +23,8 @@ use oulipoly_runtime::provider_turn_adapter::{
     EffectWrite, EvidenceStrength, FencedProviderEvidence, InvocationOwnership,
     LegacyCliResumeRequest, MailboxBatchIdentity, ProductionProviderTurnExecutor, ProviderEvidence,
     ProviderExecutionError, ProviderExecutionOutcome, ProviderExecutionStatus, ProviderTurnAdapter,
-    ProviderTurnAdapterError, ProviderTurnCallerResult, ProviderTurnEffects,
-    ProviderTurnExecutionRequest, ProviderTurnExecutor, ProviderTurnLaunch,
+    ProviderTurnAdapterError, ProviderTurnCallerResult, ProviderTurnEffectReport,
+    ProviderTurnEffects, ProviderTurnExecutionRequest, ProviderTurnExecutor, ProviderTurnLaunch,
     classify_provider_evidence, prompt_sha256,
 };
 use oulipoly_runtime::services::{
@@ -845,12 +845,10 @@ fn create_known_external_turn_is_supported_and_wrong_fences_do_not_execute() {
                 launch_id: "external-create".to_string(),
                 invocation,
                 execution: effect.outcome,
-                effects: ProviderTurnEffects::Ready(
-                    oulipoly_runtime::provider_turn_adapter::ProviderTurnEffectReport {
-                        acknowledgement: EffectWrite::NotApplicable,
-                        invocation_finalization: EffectWrite::NotApplicable,
-                    },
-                ),
+                effects: ProviderTurnEffects::Ready(ProviderTurnEffectReport {
+                    acknowledgement: EffectWrite::NotApplicable,
+                    invocation_finalization: EffectWrite::NotApplicable,
+                }),
             },
             11,
         )
