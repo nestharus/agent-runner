@@ -606,9 +606,13 @@ fn submitted_payload_matches(
     expected_prompt_sha256: Option<&str>,
     expected_delivery_nonce: Option<&str>,
 ) -> bool {
-    match expected_delivery_nonce {
-        Some(expected) => delivery_nonce == Some(expected),
-        None => expected_prompt_sha256 == Some(prompt_sha256),
+    match (expected_prompt_sha256, expected_delivery_nonce) {
+        (Some(expected_prompt), Some(expected_nonce)) => {
+            prompt_sha256 == expected_prompt && delivery_nonce == Some(expected_nonce)
+        }
+        (Some(expected_prompt), None) => prompt_sha256 == expected_prompt,
+        (None, Some(expected_nonce)) => delivery_nonce == Some(expected_nonce),
+        (None, None) => false,
     }
 }
 

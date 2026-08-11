@@ -1012,6 +1012,36 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
         );
     }
 
+    for (submitted_prompt_hash, expected) in [
+        (prompt_hash.clone(), EvidenceStrength::Submitted),
+        (
+            prompt_sha256("different prompt"),
+            EvidenceStrength::Informational,
+        ),
+    ] {
+        let evidence = FencedProviderEvidence {
+            fence: fence.clone(),
+            evidence: ProviderEvidence::SubmittedUserTurn {
+                provider_session_id: SESSION.to_string(),
+                prompt_sha256: submitted_prompt_hash,
+                delivery_nonce: Some("delivery-nonce".to_string()),
+                source: None,
+                message_id: None,
+            },
+        };
+        assert_eq!(
+            classify_provider_evidence(
+                &fence,
+                SESSION,
+                Some(&prompt_hash),
+                Some("delivery-nonce"),
+                &evidence,
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
     let wrong_session = FencedProviderEvidence {
         fence: fence.clone(),
         evidence: ProviderEvidence::AssistantOutput {
