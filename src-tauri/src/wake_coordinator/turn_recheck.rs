@@ -4,12 +4,13 @@
 
 use super::auto_wake_env::{
     AutoWakeEnv, auto_wake_cap_reached, auto_wake_max_for_session, current_auto_wake,
-    current_auto_wake_count, emit_auto_wake_cap_reached, pending_count,
-    release_current_auto_wake_claim, sleep_before_failed_auto_wake_retry,
+    current_auto_wake_count, emit_auto_wake_cap_reached, release_current_auto_wake_claim,
+    sleep_before_failed_auto_wake_retry,
 };
 use super::diagnostics::{WakeDiagnostic, auto_wake_cap_diagnostic, storage_error_diagnostic};
 use super::idle::mark_session_idle_after_turn;
 use super::wake_start::{StartWakeInput, start_wake_chain};
+use oulipoly_state::mailbox::MailboxDb;
 
 pub(crate) fn mark_successful_turn_idle_and_recheck(
     session_id: &str,
@@ -42,10 +43,18 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
         Ok(value) => value,
         Err(err) => return storage_error_diagnostic(err),
     };
+    let current_count = current_auto_wake_count(auto_wake.as_ref());
     apply_turn_end_recheck_decision(
         session_id,
         auto_wake.as_ref(),
-        turn_end_recheck_decision(session_id, pending_count, auto_wake.as_ref(), auto_wake_max),
+        turn_end_recheck_decision(
+            session_id,
+            no_pending(pending_count),
+            auto_wake_cap_reached(current_count, auto_wake_max),
+            current_count,
+            auto_wake_max,
+            auto_wake.as_ref(),
+        ),
     )
 }
 
@@ -61,7 +70,13 @@ fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDi
     apply_failed_auto_wake_recheck_decision(
         session_id,
         auto_wake,
-        failed_auto_wake_recheck_decision(session_id, pending_count, auto_wake, auto_wake_max),
+        failed_auto_wake_recheck_decision(
+            session_id,
+            no_pending(pending_count),
+            auto_wake_cap_reached(auto_wake.count, auto_wake_max),
+            auto_wake,
+            auto_wake_max,
+        ),
     )
 }
 
@@ -73,16 +88,17 @@ enum TurnEndRecheckDecision<'a> {
 
 fn turn_end_recheck_decision<'a>(
     session_id: &'a str,
-    pending_count: usize,
-    auto_wake: Option<&'a AutoWakeEnv>,
+    no_pending: bool,
+    cap_reached: bool,
+    current_count: i64,
     auto_wake_max: i64,
+    auto_wake: Option<&'a AutoWakeEnv>,
 ) -> TurnEndRecheckDecision<'a> {
-    if no_pending(pending_count) {
+    if no_pending {
         return TurnEndRecheckDecision::NoPending;
     }
-    let current_count = current_auto_wake_count(auto_wake);
     let max_count = auto_wake_max;
-    if auto_wake_cap_reached(current_count, max_count) {
+    if cap_reached {
         return TurnEndRecheckDecision::CapReached {
             current_count,
             max_count,
@@ -137,15 +153,16 @@ enum FailedAutoWakeRecheckDecision<'a> {
 
 fn failed_auto_wake_recheck_decision<'a>(
     session_id: &'a str,
-    pending_count: usize,
+    no_pending: bool,
+    cap_reached: bool,
     auto_wake: &'a AutoWakeEnv,
     auto_wake_max: i64,
 ) -> FailedAutoWakeRecheckDecision<'a> {
-    if no_pending(pending_count) {
+    if no_pending {
         return FailedAutoWakeRecheckDecision::NoPending;
     }
     let max_count = auto_wake_max;
-    if auto_wake_cap_reached(auto_wake.count, max_count) {
+    if cap_reached {
         return FailedAutoWakeRecheckDecision::CapReached {
             current_count: auto_wake.count,
             max_count,
@@ -185,7 +202,13 @@ fn apply_failed_auto_wake_recheck_decision(
 }
 
 fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
-    pending_count(session_id)
+    let mut db = MailboxDb::open_default()?;
+    turn_end_pending_count_on(&mut db, session_id)
+}
+
+fn turn_end_pending_count_on(db: &mut MailboxDb, session_id: &str) -> Result<usize, String> {
+    super::consumed_completion::reconcile_late_consumed_completions_on(db, session_id)?;
+    crate::mailbox_delivery::deliverable_pending_count_on(db, session_id)
 }
 
 fn no_pending_diagnostic() -> WakeDiagnostic {
@@ -199,4 +222,36 @@ fn cap_reached_diagnostic(session_id: &str, current_count: i64, max_count: i64) 
 
 fn no_pending(pending_count: usize) -> bool {
     pending_count == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
+
+    #[test]
+    fn turn_end_pending_count_reconciles_late_consumption() {
+        let fixture = ConsumedCompletionFixture::new();
+        fixture.mark_consumed();
+        let mut db = fixture.mailbox();
+
+        assert_eq!(
+            turn_end_pending_count_on(&mut db, ConsumedCompletionFixture::SESSION_ID).unwrap(),
+            0
+        );
+        assert!(
+            db.list_pending(ConsumedCompletionFixture::SESSION_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let listener = db
+            .completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            listener.acknowledgement_reason.as_deref(),
+            Some("consumed_in_call")
+        );
+    }
 }

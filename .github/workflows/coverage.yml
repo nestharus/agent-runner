@@ -50,6 +50,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
+      - name: Install pinned agent-bash
+        uses: ./.github/actions/install-agent-bash
+
       - name: Generate coverage (lcov, cobertura, JSON summary)
         run: |
           mkdir -p coverage

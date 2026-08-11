@@ -5,6 +5,7 @@
 
 mod auto_wake_env;
 mod constants;
+mod consumed_completion;
 mod diagnostics;
 mod idle;
 mod spawn;

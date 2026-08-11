@@ -52,6 +52,16 @@ fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once() {
 }
 
 #[test]
+fn polled_completion_after_enqueue_does_not_wake_parent() {
+    cases_basic::polled_completion_after_enqueue_does_not_wake_parent();
+}
+
+#[test]
+fn consumed_completion_preserves_unpolled_completion_wake() {
+    cases_basic::consumed_completion_preserves_unpolled_completion_wake();
+}
+
+#[test]
 fn no_undelivered_no_wake_and_loop_terminates() {
     cases_basic::no_undelivered_no_wake_and_loop_terminates();
 }

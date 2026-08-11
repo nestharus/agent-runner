@@ -1,0 +1,9 @@
+name: Install pinned agent-bash
+description: Install the agent-bash version required by wake integration tests
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        cargo install --git https://github.com/nestharus/agent-bash-tool --rev 2a435c4909d184bbac28873fcfb8afb72861ec2c --locked --root "$RUNNER_TEMP/agent-bash" agent-bash-tool
+        echo "AGENT_BASH_BIN=$RUNNER_TEMP/agent-bash/bin/agent-bash" >> "$GITHUB_ENV"

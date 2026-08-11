@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`
+//! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use oulipoly_runtime::delivery_evidence::PtyTransportAcknowledgementEvidence;
 use oulipoly_state::StateDb;
@@ -724,19 +724,67 @@ fn trace_notify_pty_attempt(
     session_id: &str,
     diagnostic: &PtyMailboxDeliveryDiagnostic,
 ) {
-    let base_decision = if diagnostic.submitted {
+    let base_decision = notify_trace_base_decision(diagnostic);
+    let trace_status = notify_trace_status(diagnostic);
+    let inject_status = notify_trace_inject_status(base_decision, trace_status);
+    let record = format_notify_trace_record(
+        trigger,
+        session_id,
+        diagnostic,
+        base_decision,
+        &inject_status,
+    );
+    append_notify_trace_record(&record);
+    if trace_notify_enabled() {
+        emit_notify_trace_record(&record);
+    }
+}
+
+fn notify_trace_base_decision(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &'static str {
+    if diagnostic.submitted {
         "inject"
     } else {
         "skip"
-    };
-    let trace_status = if diagnostic.status == "stale_generation" {
+    }
+}
+
+fn notify_trace_status(diagnostic: &PtyMailboxDeliveryDiagnostic) -> &str {
+    if diagnostic.status == "stale_generation" {
         "connect_error"
     } else {
         &diagnostic.status
-    };
-    let inject_status = notify_trace_inject_status(base_decision, trace_status);
-    let reason = notify_trace_summary_reason(&diagnostic.status);
-    let record = format!(
+    }
+}
+
+fn notify_trace_control_path_present(diagnostic: &PtyMailboxDeliveryDiagnostic) -> bool {
+    diagnostic
+        .control_path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty())
+}
+
+fn notify_trace_remaining_pending(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
+    diagnostic
+        .remaining_pending
+        .map_or_else(|| "unknown".to_string(), |value| value.to_string())
+}
+
+fn notify_trace_message(diagnostic: &PtyMailboxDeliveryDiagnostic) -> String {
+    diagnostic
+        .message
+        .as_deref()
+        .map(trace_token)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_notify_trace_record(
+    trigger: &str,
+    session_id: &str,
+    diagnostic: &PtyMailboxDeliveryDiagnostic,
+    base_decision: &str,
+    inject_status: &str,
+) -> String {
+    format!(
         "trigger={} session_id={} attempted={} input_empty=unknown at_boundary=unknown \
          mid_escape=unknown last_user_input_ms=unknown user_input_idle_ms=unknown \
          user_input_idle=unknown user_input_idle_threshold_ms={} boundary_probe=unknown \
@@ -747,28 +795,23 @@ fn trace_notify_pty_attempt(
         trace_token(session_id),
         diagnostic.attempted,
         USER_INPUT_IDLE_INJECT_MS,
-        diagnostic
-            .control_path
-            .as_deref()
-            .is_some_and(|path| !path.is_empty()),
-        notify_trace_decision(base_decision, &inject_status),
+        notify_trace_control_path_present(diagnostic),
+        notify_trace_decision(base_decision, inject_status),
         inject_status,
         diagnostic.submitted,
         diagnostic.delivered_seqs.len(),
-        diagnostic
-            .remaining_pending
-            .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-        diagnostic
-            .message
-            .as_deref()
-            .map(trace_token)
-            .unwrap_or_else(|| "none".to_string()),
-        reason,
-    );
-    append_notify_trace_record(&record);
-    if trace_notify_enabled() {
-        eprintln!("oulipoly_notify_trace {record}");
-    }
+        notify_trace_remaining_pending(diagnostic),
+        notify_trace_message(diagnostic),
+        notify_trace_summary_reason(&diagnostic.status),
+    )
+}
+
+fn emit_notify_trace_record(record: &str) {
+    eprintln!("{}", format_notify_trace_output(record));
+}
+
+fn format_notify_trace_output(record: &str) -> String {
+    format!("oulipoly_notify_trace {record}")
 }
 
 fn notify_trace_summary_reason(status: &str) -> &'static str {
@@ -802,10 +845,25 @@ pub(crate) fn deliverable_pending_count(session_id: &str) -> Result<usize, Strin
     let Some(db) = open_mailbox_sidecar()? else {
         return Ok(0);
     };
-    if db.notifications_paused(session_id)? {
+    deliverable_pending_count_on(&db, session_id)
+}
+
+pub(crate) fn deliverable_pending_count_on(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<usize, String> {
+    if notifications_paused_on(db, session_id)? {
         return Ok(0);
     }
-    pending_mailbox_rows(&db, session_id, None).map(|rows| rows.len())
+    pending_mailbox_row_count(db, session_id)
+}
+
+fn notifications_paused_on(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
+    db.notifications_paused(session_id)
+}
+
+fn pending_mailbox_row_count(db: &MailboxDb, session_id: &str) -> Result<usize, String> {
+    pending_mailbox_rows(db, session_id, None).map(|rows| rows.len())
 }
 
 fn delivery_session_id(resolved: &oulipoly_state::ResolvedResume) -> String {
@@ -817,12 +875,29 @@ fn pending_mailbox_rows(
     session_id: &str,
     chain_id: Option<&str>,
 ) -> Result<Vec<MailboxRow>, String> {
-    let rows = db.list_pending_for_delivery(session_id, chain_id)?;
-    for row in &rows {
-        db.verify_mailbox_row_payload(row)
-            .map_err(|err| format!("Mailbox row {} payload unavailable: {err}", row.seq))?;
-    }
+    let rows = load_pending_mailbox_rows(db, session_id, chain_id)?;
+    verify_pending_mailbox_payloads(db, &rows)?;
     Ok(deliverable_pending_rows(rows))
+}
+
+fn load_pending_mailbox_rows(
+    db: &MailboxDb,
+    session_id: &str,
+    chain_id: Option<&str>,
+) -> Result<Vec<MailboxRow>, String> {
+    db.list_pending_for_delivery(session_id, chain_id)
+}
+
+fn verify_pending_mailbox_payloads(db: &MailboxDb, rows: &[MailboxRow]) -> Result<(), String> {
+    for row in rows {
+        db.verify_mailbox_row_payload(row)
+            .map_err(|err| format_mailbox_payload_unavailable(row.seq, err))?;
+    }
+    Ok(())
+}
+
+fn format_mailbox_payload_unavailable(mailbox_seq: i64, err: String) -> String {
+    format!("Mailbox row {mailbox_seq} payload unavailable: {err}")
 }
 
 fn deliverable_pending_rows(rows: Vec<MailboxRow>) -> Vec<MailboxRow> {
@@ -1088,17 +1163,32 @@ fn render_submitted_input(
     index: usize,
     row: &MailboxRow,
 ) -> Result<(), String> {
-    let path = row
-        .payload_file_path
+    let path = submitted_input_payload_path(row)?;
+    let payload = read_submitted_input_payload(path, row.seq)?;
+    rendered.push_str(&format_submitted_input(index, row, &payload));
+    Ok(())
+}
+
+fn submitted_input_payload_path(row: &MailboxRow) -> Result<&str, String> {
+    row.payload_file_path
         .as_deref()
-        .ok_or_else(|| format!("Input mailbox row {} has no payload file", row.seq))?;
-    let payload = std::fs::read_to_string(path).map_err(|err| {
-        format!(
-            "Failed to read input mailbox row {} payload: {err}",
-            row.seq
-        )
-    })?;
-    rendered.push_str(&format!(
+        .ok_or_else(|| format_missing_input_payload_file(row.seq))
+}
+
+fn format_missing_input_payload_file(mailbox_seq: i64) -> String {
+    format!("Input mailbox row {mailbox_seq} has no payload file")
+}
+
+fn read_submitted_input_payload(path: &str, mailbox_seq: i64) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|err| format_input_payload_read_error(mailbox_seq, err))
+}
+
+fn format_input_payload_read_error(mailbox_seq: i64, err: std::io::Error) -> String {
+    format!("Failed to read input mailbox row {mailbox_seq} payload: {err}")
+}
+
+fn format_submitted_input(index: usize, row: &MailboxRow, payload: &str) -> String {
+    format!(
         "{}. kind: {}\n   item_id: {}\n   target: {}:{}\n   payload:\n{}\n\n",
         index + 1,
         sanitize(&row.kind),
@@ -1106,8 +1196,7 @@ fn render_submitted_input(
         sanitize(row.target_kind.as_deref().unwrap_or("unknown")),
         sanitize(row.target_id.as_deref().unwrap_or("unknown")),
         payload,
-    ));
-    Ok(())
+    )
 }
 
 fn new_delivery_nonce() -> String {

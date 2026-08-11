@@ -1,6 +1,6 @@
 //! ## Declared roles
 //!
-//! Roles: accessor.
+//! Roles: accessor, filter, formatter, mapper, orchestration, validator.
 //!
 //! TEST: state-db, sidecar, mailbox, runtime, and process identity accessors
 //! for proactive wake integration fixtures.
@@ -11,7 +11,7 @@ use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, MailboxDb,
+    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, MailboxDb, MailboxRow,
     SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord};
@@ -46,10 +46,7 @@ impl Fixture {
 
     pub(crate) fn assert_delivery_invocation_is_child_of_owner(&self, session_id: &str) {
         let rows = self.mailbox().list_mailbox(session_id, true).unwrap();
-        let row = rows
-            .iter()
-            .find(|row| row.delivered_by_invocation_uuid.is_some())
-            .expect("delivered mailbox row");
+        let row = delivered_non_owner_row(&rows);
         let owner_uuid = row
             .owner_invocation_uuid
             .as_deref()
@@ -58,8 +55,12 @@ impl Fixture {
             .delivered_by_invocation_uuid
             .as_deref()
             .expect("mailbox delivery invocation");
-        let parent_uuid: Option<String> = self
-            .state()
+        let parent_uuid = self.delivery_parent_uuid(delivery_uuid);
+        assert_delivery_parent(&parent_uuid, owner_uuid);
+    }
+
+    fn delivery_parent_uuid(&self, delivery_uuid: &str) -> Option<String> {
+        self.state()
             .connection()
             .query_row(
                 "SELECT parent.invocation_uuid
@@ -69,8 +70,7 @@ impl Fixture {
                 rusqlite::params![delivery_uuid],
                 |row| row.get(0),
             )
-            .unwrap();
-        assert_eq!(parent_uuid.as_deref(), Some(owner_uuid));
+            .unwrap()
     }
 
     pub(crate) fn seed_outer_caller(
@@ -393,6 +393,19 @@ impl Fixture {
         }
         crate::wake_claim_setup::seed_dead_wake_claim_for(self, session_id, claim_token, 601);
     }
+}
+
+fn delivered_non_owner_row(rows: &[MailboxRow]) -> &MailboxRow {
+    rows.iter()
+        .find(|row| {
+            row.delivered_by_invocation_uuid.is_some()
+                && row.delivered_by_invocation_uuid != row.owner_invocation_uuid
+        })
+        .expect("delivered mailbox row")
+}
+
+fn assert_delivery_parent(parent_uuid: &Option<String>, owner_uuid: &str) {
+    assert_eq!(parent_uuid.as_deref(), Some(owner_uuid));
 }
 
 fn seed_mailbox_dir_name(handle: &str) -> String {

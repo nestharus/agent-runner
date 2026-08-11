@@ -1,3 +1,5 @@
+//! Declared roles: accessor, filter, formatter, mapper, orchestration, parser, predicate, validator.
+
 use regex::Regex;
 use serde_yaml_ng::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -12,28 +14,59 @@ fn path_from_test_file(relative_path: &str) -> PathBuf {
 
 fn read_text(relative_path: &str) -> String {
     let path = path_from_test_file(relative_path);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
+    require_read_text(&path, read_text_result(&path))
+}
+
+fn read_text_result(path: &Path) -> std::io::Result<String> {
+    fs::read_to_string(path)
+}
+
+fn require_read_text(path: &Path, result: std::io::Result<String>) -> String {
+    result.unwrap_or_else(|err| panic!("{}", format_read_text_error(path, &err)))
+}
+
+fn format_read_text_error(path: &Path, err: &std::io::Error) -> String {
+    format!("failed to read {}: {err}", path.display())
 }
 
 fn parse_workflow(relative_path: &str) -> Value {
     let body = read_text(relative_path);
-    serde_yaml_ng::from_str(&body).unwrap_or_else(|err| {
-        panic!(
-            "failed to parse {} as workflow YAML: {err}",
-            path_from_test_file(relative_path).display()
-        )
-    })
+    require_workflow(relative_path, parse_workflow_body(&body))
+}
+
+fn parse_workflow_body(body: &str) -> Result<Value, serde_yaml_ng::Error> {
+    serde_yaml_ng::from_str(body)
+}
+
+fn require_workflow(relative_path: &str, result: Result<Value, serde_yaml_ng::Error>) -> Value {
+    result.unwrap_or_else(|err| panic!("{}", format_workflow_parse_error(relative_path, &err)))
+}
+
+fn format_workflow_parse_error(relative_path: &str, err: &serde_yaml_ng::Error) -> String {
+    format!(
+        "failed to parse {} as workflow YAML: {err}",
+        path_from_test_file(relative_path).display()
+    )
 }
 
 fn parse_toml(relative_path: &str) -> toml::Value {
     let body = read_text(relative_path);
-    toml::from_str(&body).unwrap_or_else(|err| {
-        panic!(
-            "failed to parse {} as TOML: {err}",
-            path_from_test_file(relative_path).display()
-        )
-    })
+    require_toml(relative_path, parse_toml_body(&body))
+}
+
+fn parse_toml_body(body: &str) -> Result<toml::Value, toml::de::Error> {
+    toml::from_str(body)
+}
+
+fn require_toml(relative_path: &str, result: Result<toml::Value, toml::de::Error>) -> toml::Value {
+    result.unwrap_or_else(|err| panic!("{}", format_toml_parse_error(relative_path, &err)))
+}
+
+fn format_toml_parse_error(relative_path: &str, err: &toml::de::Error) -> String {
+    format!(
+        "failed to parse {} as TOML: {err}",
+        path_from_test_file(relative_path).display()
+    )
 }
 
 fn ci_workflow() -> Value {
@@ -156,6 +189,67 @@ fn step_by_name<'a>(
         matching.len()
     );
     matching[0]
+}
+
+fn assert_agent_bash_install_precedes_test(
+    workflow: &Value,
+    workflow_name: &str,
+    job_name: &str,
+    test_command: &str,
+) {
+    const INSTALL_ACTION: &str = "./.github/actions/install-agent-bash";
+    let steps = job_steps(workflow, job_name, workflow_name);
+    let install_index = require_step_index(
+        step_index_by_uses(steps, INSTALL_ACTION),
+        format_missing_agent_bash_install(workflow_name, job_name),
+    );
+    let test_index = require_step_index(
+        step_index_by_run_text(steps, test_command),
+        format_missing_test_command(workflow_name, job_name, test_command),
+    );
+    assert_step_order(
+        install_index,
+        test_index,
+        format_agent_bash_install_order_error(workflow_name, job_name, test_command),
+    );
+}
+
+fn step_index_by_uses(steps: &[Value], uses: &str) -> Option<usize> {
+    steps
+        .iter()
+        .position(|step| mapping_get(step, "uses").and_then(Value::as_str) == Some(uses))
+}
+
+fn step_index_by_run_text(steps: &[Value], text: &str) -> Option<usize> {
+    steps.iter().position(|step| {
+        mapping_get(step, "run")
+            .and_then(Value::as_str)
+            .is_some_and(|run| run.contains(text))
+    })
+}
+
+fn require_step_index(index: Option<usize>, failure: String) -> usize {
+    index.unwrap_or_else(|| panic!("{failure}"))
+}
+
+fn assert_step_order(before: usize, after: usize, failure: String) {
+    assert!(before < after, "{failure}");
+}
+
+fn format_missing_agent_bash_install(workflow_name: &str, job_name: &str) -> String {
+    format!("{workflow_name} {job_name} must install pinned agent-bash")
+}
+
+fn format_missing_test_command(workflow_name: &str, job_name: &str, test_command: &str) -> String {
+    format!("{workflow_name} {job_name} must run {test_command}")
+}
+
+fn format_agent_bash_install_order_error(
+    workflow_name: &str,
+    job_name: &str,
+    test_command: &str,
+) -> String {
+    format!("{workflow_name} {job_name} must install agent-bash before {test_command}")
 }
 
 fn string_at<'a>(root: &'a Value, label: &str, path: &[&str]) -> &'a str {
@@ -960,6 +1054,50 @@ fn assertion_a04_integration_workspace_commands() {
             "cargo clippy --workspace -- -D warnings",
         );
     }
+}
+
+#[test]
+fn agent_bash_integration_dependency_is_pinned_in_test_workflows() {
+    assert_agent_bash_action_is_pinned();
+    assert_agent_bash_test_workflow_ordering();
+}
+
+fn assert_agent_bash_action_is_pinned() {
+    const AGENT_BASH_REV: &str = "2a435c4909d184bbac28873fcfb8afb72861ec2c";
+    let action = read_text("../../.github/actions/install-agent-bash/action.yml");
+    assert_eq!(text_match_count(&action, AGENT_BASH_REV), 1);
+    assert_eq!(text_match_count(&action, "AGENT_BASH_BIN="), 1);
+}
+
+fn text_match_count(text: &str, pattern: &str) -> usize {
+    text.matches(pattern).count()
+}
+
+fn assert_agent_bash_test_workflow_ordering() {
+    for (workflow_name, workflow) in [
+        ("ci.yml", ci_workflow()),
+        ("release.yml", release_workflow()),
+    ] {
+        assert_agent_bash_install_precedes_test(
+            &workflow,
+            workflow_name,
+            "rust-client-check",
+            "cargo test -p ${{ matrix.client.name }}",
+        );
+        assert_agent_bash_install_precedes_test(
+            &workflow,
+            workflow_name,
+            "rust-integration",
+            "cargo test --workspace",
+        );
+    }
+    let coverage = parse_workflow("../../.github/workflows/coverage.yml");
+    assert_agent_bash_install_precedes_test(
+        &coverage,
+        "coverage.yml",
+        "rust-coverage",
+        "cargo llvm-cov --workspace --no-report",
+    );
 }
 
 #[test]
