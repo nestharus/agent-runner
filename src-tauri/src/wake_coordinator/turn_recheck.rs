@@ -49,8 +49,10 @@ fn trigger_turn_end_recheck(session_id: &str) -> WakeDiagnostic {
         auto_wake.as_ref(),
         turn_end_recheck_decision(
             session_id,
-            no_pending(pending_count),
-            auto_wake_cap_reached(current_count, auto_wake_max),
+            RecheckConditions {
+                no_pending: no_pending(pending_count),
+                cap_reached: auto_wake_cap_reached(current_count, auto_wake_max),
+            },
             current_count,
             auto_wake_max,
             auto_wake.as_ref(),
@@ -72,8 +74,10 @@ fn failed_auto_wake_recheck(session_id: &str, auto_wake: &AutoWakeEnv) -> WakeDi
         auto_wake,
         failed_auto_wake_recheck_decision(
             session_id,
-            no_pending(pending_count),
-            auto_wake_cap_reached(auto_wake.count, auto_wake_max),
+            RecheckConditions {
+                no_pending: no_pending(pending_count),
+                cap_reached: auto_wake_cap_reached(auto_wake.count, auto_wake_max),
+            },
             auto_wake,
             auto_wake_max,
         ),
@@ -86,19 +90,23 @@ enum TurnEndRecheckDecision<'a> {
     Start(StartWakeInput<'a>),
 }
 
-fn turn_end_recheck_decision<'a>(
-    session_id: &'a str,
+struct RecheckConditions {
     no_pending: bool,
     cap_reached: bool,
+}
+
+fn turn_end_recheck_decision<'a>(
+    session_id: &'a str,
+    conditions: RecheckConditions,
     current_count: i64,
     auto_wake_max: i64,
     auto_wake: Option<&'a AutoWakeEnv>,
 ) -> TurnEndRecheckDecision<'a> {
-    if no_pending {
+    if conditions.no_pending {
         return TurnEndRecheckDecision::NoPending;
     }
     let max_count = auto_wake_max;
-    if cap_reached {
+    if conditions.cap_reached {
         return TurnEndRecheckDecision::CapReached {
             current_count,
             max_count,
@@ -153,16 +161,15 @@ enum FailedAutoWakeRecheckDecision<'a> {
 
 fn failed_auto_wake_recheck_decision<'a>(
     session_id: &'a str,
-    no_pending: bool,
-    cap_reached: bool,
+    conditions: RecheckConditions,
     auto_wake: &'a AutoWakeEnv,
     auto_wake_max: i64,
 ) -> FailedAutoWakeRecheckDecision<'a> {
-    if no_pending {
+    if conditions.no_pending {
         return FailedAutoWakeRecheckDecision::NoPending;
     }
     let max_count = auto_wake_max;
-    if cap_reached {
+    if conditions.cap_reached {
         return FailedAutoWakeRecheckDecision::CapReached {
             current_count: auto_wake.count,
             max_count,
