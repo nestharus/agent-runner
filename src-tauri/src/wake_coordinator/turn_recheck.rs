@@ -263,4 +263,21 @@ mod tests {
             Some("consumed_in_call")
         );
     }
+
+    #[test]
+    fn turn_end_pending_count_keeps_unconsumed_completion_pending() {
+        let fixture = ConsumedCompletionFixture::new();
+        let mut db = fixture.mailbox();
+
+        assert_eq!(
+            turn_end_pending_count_on(&mut db, ConsumedCompletionFixture::SESSION_ID).unwrap(),
+            1
+        );
+        let listener = db
+            .completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(listener.acknowledgement_reason, None);
+    }
 }
