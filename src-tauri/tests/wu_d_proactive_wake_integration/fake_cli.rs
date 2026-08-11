@@ -121,7 +121,7 @@ pub(crate) fn mixed_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -
             r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 run_job() {{
-  dispatch="$1"
+  local dispatch="$1"
   AGENT_BASH_OWNER_SESSION_ID="$session" \
   AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
   AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
