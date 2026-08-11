@@ -634,6 +634,77 @@ fn launch_and_state_effect_replay_are_exact_and_idempotent() {
 }
 
 #[test]
+fn completed_turn_evicts_its_cached_execution() {
+    let executor = QueueExecutor::new([
+        complete_outcome(execution_result(
+            SESSION,
+            "first prompt",
+            None,
+            true,
+            Vec::new(),
+        )),
+        complete_outcome(execution_result(
+            SESSION,
+            "second prompt",
+            None,
+            true,
+            Vec::new(),
+        )),
+    ]);
+    let calls = executor.calls.clone();
+    let mut adapter = ProviderTurnAdapter::new(executor);
+
+    {
+        let harness = start_harness();
+        let mut state = StateDb::open(&harness.path).unwrap();
+        let invocation = seed_invocation(&state, FIRST_UUID, None);
+        harness
+            .supervisor()
+            .notify(
+                SessionNotification::new(
+                    1,
+                    launch(
+                        "first-launch",
+                        legacy_request("first prompt"),
+                        invocation,
+                        MailboxBatchIdentity::empty(SESSION),
+                    ),
+                    turn(1, FIRST_UUID),
+                ),
+                10,
+            )
+            .unwrap();
+        adapter
+            .consume(receive_turn(&harness.turns), &mut state, 11)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    let harness = start_harness();
+    let state = StateDb::open(&harness.path).unwrap();
+    let invocation = seed_invocation(&state, FIRST_UUID, None);
+    harness
+        .supervisor()
+        .notify(
+            SessionNotification::new(
+                1,
+                launch(
+                    "second-launch",
+                    legacy_request("second prompt"),
+                    invocation,
+                    MailboxBatchIdentity::empty(SESSION),
+                ),
+                turn(1, FIRST_UUID),
+            ),
+            12,
+        )
+        .unwrap();
+    let execution = adapter.execute_once(&receive_turn(&harness.turns)).unwrap();
+    assert_eq!(execution.write, EffectWrite::Applied);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
 fn create_known_external_turn_is_supported_and_wrong_fences_do_not_execute() {
     let harness = start_harness();
     let state = StateDb::open(&harness.path).unwrap();

@@ -451,6 +451,7 @@ where
         state: &mut StateDb,
         completed_at: i64,
     ) -> Result<(), ProviderTurnAdapterError> {
+        let fence = turn_fence(&request);
         let execution = self.execute_once(&request)?.outcome;
         let effects = match self.apply_effects(&request, state, &execution, &[], completed_at) {
             Ok(report) => ProviderTurnEffects::Ready(report),
@@ -463,6 +464,7 @@ where
             effects,
         };
         request.completion.complete(result, completed_at)?;
+        self.executions.remove(&fence);
         Ok(())
     }
 }
