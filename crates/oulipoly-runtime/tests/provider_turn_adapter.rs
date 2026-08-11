@@ -20,9 +20,9 @@ use oulipoly_runtime::executor::{
     SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn, TerminalSignal,
 };
 use oulipoly_runtime::provider_turn_adapter::{
-    EffectWrite, EvidenceStrength, FencedProviderEvidence, InvocationOwnership,
-    LegacyCliResumeRequest, MailboxBatchIdentity, ProductionProviderTurnExecutor, ProviderEvidence,
-    ProviderExecutionError, ProviderExecutionOutcome, ProviderExecutionStatus, ProviderTurnAdapter,
+    CliResumeRequest, EffectWrite, EvidenceStrength, FencedProviderEvidence, InvocationOwnership,
+    MailboxBatchIdentity, ProductionProviderTurnExecutor, ProviderEvidence, ProviderExecutionError,
+    ProviderExecutionOutcome, ProviderExecutionStatus, ProviderTurnAdapter,
     ProviderTurnAdapterError, ProviderTurnCallerResult, ProviderTurnEffectReport,
     ProviderTurnEffects, ProviderTurnExecutionRequest, ProviderTurnExecutor, ProviderTurnLaunch,
     classify_provider_evidence, prompt_sha256,
@@ -221,8 +221,8 @@ fn resume_strategy() -> ResumeStrategy {
     }
 }
 
-fn legacy_request(prompt: &str) -> ProviderTurnExecutionRequest {
-    ProviderTurnExecutionRequest::LegacyCliResume(LegacyCliResumeRequest {
+fn cli_request(prompt: &str) -> ProviderTurnExecutionRequest {
+    ProviderTurnExecutionRequest::CliResume(CliResumeRequest {
         provider: ProviderConfig::new("fixture-provider", vec!["--fixed".to_string()]),
         provider_index: 4,
         prompt_mode: PromptMode::Arg,
@@ -431,7 +431,7 @@ fn resident_owner_publishes_exact_results_and_accepts_a_later_turn() {
 
     let first_launch = launch(
         "launch-1",
-        legacy_request("first prompt"),
+        cli_request("first prompt"),
         first_invocation.clone(),
         mailbox("delivery-1", 1, "nonce-1"),
     );
@@ -509,7 +509,7 @@ fn resident_owner_publishes_exact_results_and_accepts_a_later_turn() {
                 2,
                 launch(
                     "launch-2",
-                    legacy_request("second prompt"),
+                    cli_request("second prompt"),
                     second_invocation.clone(),
                     MailboxBatchIdentity::empty(SESSION),
                 ),
@@ -557,7 +557,7 @@ fn launch_and_state_effect_replay_are_exact_and_idempotent() {
                 1,
                 launch(
                     "replay-launch",
-                    legacy_request("replay prompt"),
+                    cli_request("replay prompt"),
                     invocation.clone(),
                     mailbox("replay-delivery", 1, "replay-nonce"),
                 ),
@@ -646,7 +646,7 @@ fn provider_turn_effects_roll_back_when_finalization_fails() {
                 1,
                 launch(
                     "atomic-launch",
-                    legacy_request("atomic prompt"),
+                    cli_request("atomic prompt"),
                     invocation.clone(),
                     mailbox("atomic-delivery", 1, "atomic-nonce"),
                 ),
@@ -729,7 +729,7 @@ fn completed_turn_evicts_its_cached_execution() {
                     1,
                     launch(
                         "first-launch",
-                        legacy_request("first prompt"),
+                        cli_request("first prompt"),
                         invocation,
                         MailboxBatchIdentity::empty(SESSION),
                     ),
@@ -754,7 +754,7 @@ fn completed_turn_evicts_its_cached_execution() {
                 1,
                 launch(
                     "second-launch",
-                    legacy_request("second prompt"),
+                    cli_request("second prompt"),
                     invocation,
                     MailboxBatchIdentity::empty(SESSION),
                 ),
@@ -870,7 +870,7 @@ fn malformed_mailbox_batches_report_exact_fences_without_executing() {
                 1,
                 launch(
                     "mailbox-fences",
-                    legacy_request("prompt"),
+                    cli_request("prompt"),
                     invocation,
                     MailboxBatchIdentity::empty(SESSION),
                 ),
@@ -1158,7 +1158,7 @@ fn confirmation_only_evidence_advances_both_required_acknowledgement_stages() {
                 1,
                 launch(
                     "confirmation-only",
-                    legacy_request("prompt"),
+                    cli_request("prompt"),
                     invocation,
                     mailbox("confirmation-delivery", 1, "nonce"),
                 ),
@@ -1239,7 +1239,7 @@ fn execution_status_does_not_overstate_unconfirmed_or_failure_evidence() {
 }
 
 #[test]
-fn production_executors_preserve_legacy_grammar_and_external_request_contracts() {
+fn production_executors_preserve_cli_grammar_and_external_request_contracts() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("fake-provider.sh");
     let args_path = dir.path().join("args.txt");
@@ -1271,27 +1271,27 @@ fn production_executors_preserve_legacy_grammar_and_external_request_contracts()
         result: Ok(service_result.clone()),
     }));
 
-    let legacy = ProviderTurnExecutionRequest::LegacyCliResume(LegacyCliResumeRequest {
+    let cli = ProviderTurnExecutionRequest::CliResume(CliResumeRequest {
         provider,
         provider_index: 7,
         prompt_mode: PromptMode::Arg,
-        prompt: Some("legacy prompt".to_string()),
+        prompt: Some("cli prompt".to_string()),
         working_dir: Some(dir.path().to_path_buf()),
         parent_invocation_env: None,
         session_id: SESSION.to_string(),
         strategy: resume_strategy(),
-        model_name: "legacy-model".to_string(),
+        model_name: "cli-model".to_string(),
         models_dir: None,
     });
-    let legacy_outcome = production.execute(&legacy);
-    assert_eq!(legacy_outcome.status, ProviderExecutionStatus::Completed);
-    let legacy_result = legacy_outcome.result.unwrap();
-    assert_eq!(legacy_result.provider_index, 7);
-    assert_eq!(legacy_result.stdout, b"assistant\0\xff");
-    assert_eq!(legacy_result.stderr, "stderr-exact");
+    let cli_outcome = production.execute(&cli);
+    assert_eq!(cli_outcome.status, ProviderExecutionStatus::Completed);
+    let cli_result = cli_outcome.result.unwrap();
+    assert_eq!(cli_result.provider_index, 7);
+    assert_eq!(cli_result.stdout, b"assistant\0\xff");
+    assert_eq!(cli_result.stderr, "stderr-exact");
     assert_eq!(
         fs::read_to_string(args_path).unwrap(),
-        format!("--fixed\n--resume\n{SESSION}\nlegacy prompt\n")
+        format!("--fixed\n--resume\n{SESSION}\ncli prompt\n")
     );
     assert_eq!(
         fs::read_to_string(cwd_path).unwrap().trim(),
@@ -1347,7 +1347,7 @@ fn provider_failures_publish_one_bounded_result_without_scheduling_another_turn(
     let invocation = seed_invocation(&state, FIRST_UUID, Some(parent.invocation_row_id));
     let executor = QueueExecutor::new([ProviderExecutionOutcome::failed(
         ProviderExecutionStatus::LaunchFailed,
-        ProviderExecutionError::LegacyCli("spawn denied".to_string()),
+        ProviderExecutionError::Cli("spawn denied".to_string()),
     )]);
     let mut adapter = ProviderTurnAdapter::new(executor);
     harness
@@ -1357,7 +1357,7 @@ fn provider_failures_publish_one_bounded_result_without_scheduling_another_turn(
                 1,
                 launch(
                     "failed-launch",
-                    legacy_request("prompt"),
+                    cli_request("prompt"),
                     invocation,
                     MailboxBatchIdentity::empty(SESSION),
                 ),

@@ -23,7 +23,7 @@ use crate::session_supervisor::{SupervisorError, TurnRequest};
 const MAX_MAILBOX_BATCH_ROWS: usize = 20;
 
 #[derive(Clone, Debug)]
-pub struct LegacyCliResumeRequest {
+pub struct CliResumeRequest {
     pub provider: ProviderConfig,
     pub provider_index: usize,
     pub prompt_mode: PromptMode,
@@ -38,14 +38,14 @@ pub struct LegacyCliResumeRequest {
 
 #[derive(Clone, Debug)]
 pub enum ProviderTurnExecutionRequest {
-    LegacyCliResume(LegacyCliResumeRequest),
+    CliResume(CliResumeRequest),
     ExternalProvider(ExecutorServiceRequest),
 }
 
 impl ProviderTurnExecutionRequest {
     fn target_session_id(&self) -> Option<&str> {
         match self {
-            Self::LegacyCliResume(request) => Some(&request.session_id),
+            Self::CliResume(request) => Some(&request.session_id),
             Self::ExternalProvider(
                 ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
                     start_known_provider_session_id,
@@ -62,7 +62,7 @@ impl ProviderTurnExecutionRequest {
 
     fn prompt(&self) -> Option<&str> {
         match self {
-            Self::LegacyCliResume(request) => request.prompt.as_deref(),
+            Self::CliResume(request) => request.prompt.as_deref(),
             Self::ExternalProvider(
                 ExecutorServiceRequest::Facade { prompt, .. }
                 | ExecutorServiceRequest::Effective { prompt, .. }
@@ -140,14 +140,14 @@ impl ProviderExecutionStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderExecutionError {
-    LegacyCli(String),
+    Cli(String),
     Service(ServiceError),
 }
 
 impl fmt::Display for ProviderExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LegacyCli(message) => formatter.write_str(message),
+            Self::Cli(message) => formatter.write_str(message),
             Self::Service(error) => write!(formatter, "{error}"),
         }
     }
@@ -211,7 +211,7 @@ impl ProductionProviderTurnExecutor {
 impl ProviderTurnExecutor for ProductionProviderTurnExecutor {
     fn execute(&self, request: &ProviderTurnExecutionRequest) -> ProviderExecutionOutcome {
         match request {
-            ProviderTurnExecutionRequest::LegacyCliResume(request) => {
+            ProviderTurnExecutionRequest::CliResume(request) => {
                 let result = cli::execute_resume_optional_prompt_with_model_identity(
                     &request.provider,
                     request.provider_index,
@@ -230,7 +230,7 @@ impl ProviderTurnExecutor for ProductionProviderTurnExecutor {
                     Ok(result) => ProviderExecutionOutcome::from_result(result),
                     Err(error) => ProviderExecutionOutcome::failed(
                         ProviderExecutionStatus::LaunchFailed,
-                        ProviderExecutionError::LegacyCli(error),
+                        ProviderExecutionError::Cli(error),
                     ),
                 }
             }
