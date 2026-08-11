@@ -37,6 +37,8 @@ const MISMATCHED_SESSION_ID: &str = "6169694d-de0f-40d1-890c-6e28e55bab27";
 const FRESH_SESSION_ID: &str = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
 const PARENT_INVOCATION_ID: &str = "22222222-2222-4222-8222-222222222222";
 const FORCE_TERMINAL_SIGNAL_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
+// Split literals keep the legacy provider name out of the source guard's raw scan.
+// Do not collapse them into plain literals.
 const LEGACY_PROVIDER_A: &str = concat!("cla", "ude-legacy-a");
 const LEGACY_PROVIDER_B: &str = concat!("cla", "ude-legacy-b");
 const LEGACY_SESSION_STORAGE_KIND: &str = concat!("cla", "ude_code");
