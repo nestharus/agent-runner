@@ -858,6 +858,95 @@ fn create_known_external_turn_is_supported_and_wrong_fences_do_not_execute() {
 }
 
 #[test]
+fn malformed_mailbox_batches_report_exact_fences_without_executing() {
+    let harness = start_harness();
+    let state = StateDb::open(&harness.path).unwrap();
+    let invocation = seed_invocation(&state, FIRST_UUID, None);
+    let executor = QueueExecutor::new([]);
+    let calls = executor.calls.clone();
+    let mut adapter = ProviderTurnAdapter::new(executor);
+    harness
+        .supervisor()
+        .notify(
+            SessionNotification::new(
+                1,
+                launch(
+                    "mailbox-fences",
+                    legacy_request("prompt"),
+                    invocation,
+                    MailboxBatchIdentity::empty(SESSION),
+                ),
+                turn(1, FIRST_UUID),
+            ),
+            10,
+        )
+        .unwrap();
+    let mut request = receive_turn(&harness.turns);
+
+    let cases = [
+        (
+            MailboxBatchIdentity::empty("wrong-session"),
+            "mailbox session",
+        ),
+        (
+            MailboxBatchIdentity {
+                session_id: SESSION.to_string(),
+                delivery_ids: vec!["delivery-1".to_string()],
+                sequences: Vec::new(),
+                delivery_nonce: Some("nonce".to_string()),
+            },
+            "mailbox batch bounds",
+        ),
+        (
+            MailboxBatchIdentity {
+                session_id: SESSION.to_string(),
+                delivery_ids: (1..=21).map(|index| format!("delivery-{index}")).collect(),
+                sequences: (1..=21).collect(),
+                delivery_nonce: Some("nonce".to_string()),
+            },
+            "mailbox batch bounds",
+        ),
+        (
+            MailboxBatchIdentity {
+                delivery_nonce: Some("nonce".to_string()),
+                ..MailboxBatchIdentity::empty(SESSION)
+            },
+            "mailbox nonce",
+        ),
+        (mailbox(" ", 1, "nonce"), "mailbox identity"),
+        (mailbox("delivery-1", 1, ""), "mailbox identity"),
+        (
+            MailboxBatchIdentity {
+                session_id: SESSION.to_string(),
+                delivery_ids: vec!["delivery-1".to_string(), "delivery-1".to_string()],
+                sequences: vec![1, 2],
+                delivery_nonce: Some("nonce".to_string()),
+            },
+            "mailbox ordering",
+        ),
+        (mailbox("delivery-1", 0, "nonce"), "mailbox ordering"),
+        (
+            MailboxBatchIdentity {
+                session_id: SESSION.to_string(),
+                delivery_ids: vec!["delivery-1".to_string(), "delivery-2".to_string()],
+                sequences: vec![2, 1],
+                delivery_nonce: Some("nonce".to_string()),
+            },
+            "mailbox ordering",
+        ),
+    ];
+
+    for (batch, expected_fence) in cases {
+        request.notification.input.mailbox_batch = batch;
+        assert_eq!(
+            adapter.execute_once(&request).unwrap_err(),
+            ProviderTurnAdapterError::InvalidFence(expected_fence)
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn external_turn_without_session_identity_reports_distinct_fence() {
     for (sequence, facade) in [(1, true), (2, false)] {
         let harness = start_harness();
