@@ -86,6 +86,8 @@ fn prepare_wake_start_context_with_db<'a>(
     let runtime =
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
+    super::consumed_completion::reconcile_late_consumed_completions_on(&mut db, input.session_id)
+        .map_err(storage_error_diagnostic)?;
     validate_wake_has_deliverable_pending(&db, input.session_id)?;
     let auto_wake_max = auto_wake_max_for_runtime(runtime.as_ref());
     validate_start_wake_cap(input, auto_wake_max)?;
@@ -94,8 +96,6 @@ fn prepare_wake_start_context_with_db<'a>(
     if wake_liveness_busy(liveness) {
         return Err(busy_diagnostic());
     }
-    super::consumed_completion::reconcile_late_consumed_completions_on(&mut db, input.session_id)
-        .map_err(storage_error_diagnostic)?;
     let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
     Ok(wake_start_context(input, db, runtime, claim, auto_wake_max))
 }
