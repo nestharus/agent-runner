@@ -129,17 +129,19 @@ fn auto_wake_retry_base_ms() -> u64 {
 }
 
 fn parsed_auto_wake_retry_base_ms() -> Option<u64> {
-    std::env::var(AUTO_WAKE_RETRY_BASE_MS_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    parse_auto_wake_retry_base_ms(auto_wake_retry_base_ms_text())
+}
+
+fn auto_wake_retry_base_ms_text() -> Option<String> {
+    std::env::var(AUTO_WAKE_RETRY_BASE_MS_ENV).ok()
+}
+
+fn parse_auto_wake_retry_base_ms(value: Option<String>) -> Option<u64> {
+    value.and_then(|value| value.parse().ok())
 }
 
 pub(super) fn current_auto_wake_count(auto_wake: Option<&AutoWakeEnv>) -> i64 {
     auto_wake.map(|wake| wake.count).unwrap_or(0)
-}
-
-pub(super) fn pending_count(session_id: &str) -> Result<usize, String> {
-    crate::mailbox_delivery::deliverable_pending_count(session_id)
 }
 
 pub(super) fn auto_wake_cap_reached(current_count: i64, max_count: i64) -> bool {

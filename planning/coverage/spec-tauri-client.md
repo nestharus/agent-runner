@@ -3,6 +3,10 @@
 ## Source files
 
 - `src-tauri/src/mailbox_delivery.rs`
+- `src-tauri/src/wake_coordinator/mod.rs`
+- `src-tauri/src/wake_coordinator/consumed_completion.rs`
+- `src-tauri/src/wake_coordinator/turn_recheck.rs`
+- `src-tauri/src/wake_coordinator/wake_start/mod.rs`
 
 - `src-tauri/src/lib.rs`
 - `src-tauri/src/app_state.rs`
@@ -127,6 +131,7 @@
 | Tauri discovery IPC commands invoked (`commands/discovery/`). | Run runtime discovery in a blocking task, open the GUI-derived `state.db`, map join failures to `Discovery task failed: {e}`, preserve empty-result stale-delete guard, delete stale rows before model upserts before parameter upserts, and preserve provider/model read filters through `SetupRepository`. |
 | Tauri owned-turn event arrives. | `main/owned_turn_event_ingest.rs` parses and persists per `oulipoly-state` schema. |
 | `commands/quota_refresh/` invoked. | Refresh stale quota data only for providers in multi-provider models, preserve sorted provider-name output, map runtime quota outcomes to the stable frontend DTO strings. |
+| A terminal `agent-bash` result is polled after its completion row was already enqueued. | Reconcile the durable `consumed` marker against its registered owner before wake startup, acknowledge the exact completion row once as `consumed_in_call`, do not resume for that row, and preserve normal wake delivery for sibling or unrelated unpolled rows. |
 
 AGE-237 owns the adjacent usage-CLI/quota-refresh outcome drift. This spec
 records the current quota-refresh command behavior only; it does not normalize
@@ -147,6 +152,9 @@ or consolidate usage CLI row-state strings with the quota-refresh DTO strings.
   sending to a closed setup response channel returns `Failed to send response: {e}`.
 - Discovery persistence with no discovered models preserves existing rows; a
   non-empty result deletes stale rows before upserting models and parameters.
+- A completion consumed before event trigger remains suppressed by the normal
+  completion path; a completion consumed after enqueue is reconciled at turn
+  end and again immediately before wake startup.
 - Resume acceptance adapter sees a session in `mutability: read-only` —
   refuses gracefully (delegates to `oulipoly-runtime/session_metadata/
   mutability.rs`).
@@ -214,6 +222,14 @@ wiring smoke tests, adapter contract tests, workspace-layout invariants.
 - `src-tauri/tests/workflow_yml_contract.rs`
 - `src-tauri/tests/wiring_smoke.rs`
 - `src-tauri/tests/workspace_layout.rs`
+- `src-tauri/tests/wu_d_proactive_wake_integration/`
+  (`polled_completion_after_enqueue_does_not_wake_parent`,
+  `consumed_completion_preserves_unpolled_completion_wake`,
+  `delayed_agent_bash_completion_wakes_inactive_headless_parent_once`)
+- `src-tauri/src/wake_coordinator/turn_recheck.rs`
+  (`turn_end_pending_count_reconciles_late_consumption`)
+- `src-tauri/src/wake_coordinator/wake_start/mod.rs`
+  (`wake_start_reconciles_late_consumption_before_claim`)
 - `src-tauri/tests/claude_path_hash_rca/age158_characterization.rs`
 - `src-tauri/tests/claude_path_hash_rca/rc1_non_alnum_encoding.rs`
 - `src-tauri/tests/claude_path_hash_rca/rc2_windows_backslash_encoding.rs`

@@ -74,6 +74,7 @@
 | Repository operation on a row whose `row_version` has advanced. | `repositories/mod.rs` returns a typed conflict error; caller decides retry/replace. |
 | A resident owner accepts one immutable mailbox row. | One transaction verifies the exact supervisor lease, persists ingress, records `accepted_pending`, and advances only that session's cursor. |
 | PTY transport or manual acknowledgement evidence arrives. | Store its explicit evidence kind under the exact delivery/session/generation fence without advancing provider `submitted` or `confirmed`. |
+| A caller reports that one materialized completion mailbox row was consumed in-band. | When the durable completion owner matches the exact listener owner, acknowledge only that mailbox row and listener once as `consumed_in_call`, resolve its delivery attempt, and leave sibling event listeners and unrelated pending rows active. |
 | A caller lists direct logical invocation children. | `list_invocation_children` returns only direct children in deterministic chronological `created_at, id` order; consumer-specific projections may reorder their already-loaded copy without changing this history contract. |
 
 ## Edge cases
@@ -89,6 +90,13 @@
   modules surface a typed mismatch; caller decides repair path.
 - Path resolution finds a multi-deployment ambiguity — `paths/triggers`
   emits a structured ambiguity error rather than guessing.
+- Repeating an exact-row consumed acknowledgement is idempotent; it does not
+  increase `delivery_attempts` or acknowledge another listener for the event.
+- Only the exact listener matching an event's durable completion owner may
+  claim its late-consumption marker; repeat and sibling-listener claims leave
+  their mailbox rows unchanged.
+- A sibling row presented with another listener's durable owner identity remains
+  pending even when both rows reference the same completion marker.
 
 ## Error conditions
 
@@ -140,6 +148,8 @@ table tests, repositories contract.
 - `crates/oulipoly-state/src/db/tests/resume_resolution_tests_1.rs`
   (exact-chain precedence, provider-scoped native candidate preservation,
   one-lineage deduplication, and multi-lineage ambiguity)
+- `crates/oulipoly-state/src/mailbox.rs`
+  (`late_consumed_completion_acknowledges_materialized_mailbox_row_once`)
 - `src-tauri/tests/age_32_state_db_migrations.rs`
 - `src-tauri/tests/age149_owned_turn_event_schema.rs`
 - `src-tauri/tests/empty_bodies_ref_rca/rc1_schema_contract.rs`

@@ -81,6 +81,80 @@ AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
     )
 }
 
+pub(crate) fn late_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+    let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
+    provider_script(
+        &format!(
+            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
+dispatch="$work/late-consumed-dispatch.json"
+AGENT_BASH_OWNER_SESSION_ID="$session" \
+AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
+AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
+AGENT_BASH_CONSUMER_GRACE_MS=0 \
+{agent_bash_bin} run --completion-scope root --delivery async -- \
+  bash -lc 'printf nested-root-complete' > "$dispatch"
+handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$dispatch")"
+state_dir="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["state_dir"])' "$dispatch")"
+found=""
+for _ in $(seq 1 200); do
+  mailbox="$($runner mailbox list --session-id "$session" --json)"
+  if printf '%s' "$mailbox" | grep -Fq "$handle"; then
+    found=1
+    break
+  fi
+  sleep 0.05
+done
+[ -n "$found" ]
+{agent_bash_bin} status "$handle" > "$work/late-consumed-poll.txt"
+: > "$state_dir/consumed""#,
+        ),
+        "",
+        "late-consumed-resumed-input.txt",
+    )
+}
+
+pub(crate) fn mixed_consumed_agent_bash_provider_script(agent_bash_bin: &Path) -> String {
+    let agent_bash_bin = shell_single_quote(&agent_bash_bin.to_string_lossy());
+    provider_script(
+        &format!(
+            r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
+owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
+run_job() {{
+  local dispatch="$1"
+  AGENT_BASH_OWNER_SESSION_ID="$session" \
+  AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
+  AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
+  AGENT_BASH_CONSUMER_GRACE_MS=0 \
+  {agent_bash_bin} run --completion-scope root --delivery async -- \
+    bash -lc 'printf nested-root-complete' > "$dispatch"
+}}
+consumed_dispatch="$work/mixed-consumed-dispatch.json"
+unpolled_dispatch="$work/mixed-unpolled-dispatch.json"
+run_job "$consumed_dispatch"
+run_job "$unpolled_dispatch"
+consumed_handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$consumed_dispatch")"
+unpolled_handle="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["handle"])' "$unpolled_dispatch")"
+consumed_state_dir="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["state_dir"])' "$consumed_dispatch")"
+found=""
+for _ in $(seq 1 200); do
+  mailbox="$($runner mailbox list --session-id "$session" --json)"
+  if printf '%s' "$mailbox" | grep -Fq "$consumed_handle" && \
+     printf '%s' "$mailbox" | grep -Fq "$unpolled_handle"; then
+    found=1
+    break
+  fi
+  sleep 0.05
+done
+[ -n "$found" ]
+{agent_bash_bin} status "$consumed_handle" > "$work/mixed-consumed-poll.txt"
+: > "$consumed_state_dir/consumed""#,
+        ),
+        "",
+        "mixed-resumed-input.txt",
+    )
+}
+
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

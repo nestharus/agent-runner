@@ -6,8 +6,8 @@ mod claim;
 mod liveness;
 
 use oulipoly_state::mailbox::{
-    MailboxDb, SessionGenerationProjection, SessionLiveness, SessionRuntimeRow,
-    WakeClaimAcquireResult, WakeClaimRow,
+    GenerationStorageError, MailboxDb, SessionGenerationProjection, SessionLiveness,
+    SessionRuntimeRow, WakeClaimAcquireResult, WakeClaimRow,
 };
 use uuid::Uuid;
 
@@ -71,14 +71,24 @@ fn prepare_wake_start_context<'a>(
     input: StartWakeInput<'a>,
     claim_token: &str,
 ) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
-    let mut db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
+    let db = open_wake_mailbox().map_err(storage_error_diagnostic)?;
+    prepare_wake_start_context_with_db(input, claim_token, db)
+}
+
+fn prepare_wake_start_context_with_db<'a>(
+    input: StartWakeInput<'a>,
+    claim_token: &str,
+    mut db: MailboxDb,
+) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
     if generation_authority_blocks_wake(&db, input.session_id)? {
         return Err(busy_diagnostic());
     }
     let runtime =
         session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
-    validate_wake_has_deliverable_pending(input.session_id)?;
+    super::consumed_completion::reconcile_late_consumed_completions_on(&mut db, input.session_id)
+        .map_err(storage_error_diagnostic)?;
+    validate_wake_has_deliverable_pending(&db, input.session_id)?;
     let auto_wake_max = auto_wake_max_for_runtime(runtime.as_ref());
     validate_start_wake_cap(input, auto_wake_max)?;
     let liveness = wake_runtime_liveness(&mut db, input.session_id, runtime.as_ref())?;
@@ -90,8 +100,11 @@ fn prepare_wake_start_context<'a>(
     Ok(wake_start_context(input, db, runtime, claim, auto_wake_max))
 }
 
-fn validate_wake_has_deliverable_pending(session_id: &str) -> Result<(), WakeDiagnostic> {
-    match crate::mailbox_delivery::deliverable_pending_count(session_id) {
+fn validate_wake_has_deliverable_pending(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<(), WakeDiagnostic> {
+    match crate::mailbox_delivery::deliverable_pending_count_on(db, session_id) {
         Ok(0) => Err(WakeDiagnostic::status("no_pending")),
         Ok(_) => Ok(()),
         Err(err) => Err(storage_error_diagnostic(err)),
@@ -102,9 +115,24 @@ fn generation_authority_blocks_wake(
     db: &MailboxDb,
     session_id: &str,
 ) -> Result<bool, WakeDiagnostic> {
+    let projection =
+        session_generation_projection(db, session_id).map_err(generation_storage_diagnostic)?;
+    Ok(generation_projection_blocks_wake(projection))
+}
+
+fn session_generation_projection(
+    db: &MailboxDb,
+    session_id: &str,
+) -> Result<SessionGenerationProjection, GenerationStorageError> {
     db.session_generation_projection(session_id)
-        .map(|projection| !matches!(projection, SessionGenerationProjection::None))
-        .map_err(|err| storage_error_diagnostic(err.to_string()))
+}
+
+fn generation_storage_diagnostic(err: GenerationStorageError) -> WakeDiagnostic {
+    storage_error_diagnostic(err.to_string())
+}
+
+fn generation_projection_blocks_wake(projection: SessionGenerationProjection) -> bool {
+    !matches!(projection, SessionGenerationProjection::None)
 }
 
 fn wake_start_context<'a>(
@@ -276,4 +304,53 @@ fn wake_pid_identity_names(runtime: Option<&SessionRuntimeRow>) -> (Option<&str>
 
 fn warn_wake_pid_record_failed(session_id: &str, claim_token: &str, err: String) {
     tracing::warn!(session_id, claim_token, "Failed to record wake PID: {err}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
+
+    #[test]
+    fn wake_start_reconciles_late_consumption_before_claim() {
+        let fixture = ConsumedCompletionFixture::new();
+        fixture.mark_consumed();
+
+        let diagnostic = match prepare_wake_start_context_with_db(
+            StartWakeInput {
+                session_id: ConsumedCompletionFixture::SESSION_ID,
+                reason: "test",
+                auto_wake_count: 1,
+                renew_token: None,
+            },
+            "claim-token",
+            fixture.mailbox(),
+        ) {
+            Err(diagnostic) => diagnostic,
+            Ok(_) => panic!("consumed completion must stop wake preparation"),
+        };
+
+        assert_eq!(diagnostic.status, "no_pending");
+        assert!(!diagnostic.attempted);
+        let db = fixture.mailbox();
+        assert!(
+            db.list_pending(ConsumedCompletionFixture::SESSION_ID)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.wake_claim(ConsumedCompletionFixture::SESSION_ID)
+                .unwrap()
+                .is_none()
+        );
+        let listener = db
+            .completion_event_listeners(ConsumedCompletionFixture::EVENT_ID)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            listener.acknowledgement_reason.as_deref(),
+            Some("consumed_in_call")
+        );
+    }
 }

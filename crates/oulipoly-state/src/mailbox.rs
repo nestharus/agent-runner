@@ -1752,6 +1752,36 @@ impl MailboxDb {
         completion_event_listeners_on(&self.conn, event_id)
     }
 
+    pub fn acknowledge_consumed_completion_event_for_mailbox_seq(
+        &mut self,
+        mailbox_seq: i64,
+        consumer_session_id: &str,
+        consumer_invocation_uuid: &str,
+    ) -> Result<Option<String>, String> {
+        let now = now_rfc3339();
+        let tx = begin_consumed_completion_acknowledgement(&mut self.conn)?;
+        let Some(binding) = consumed_completion_binding(&tx, mailbox_seq)? else {
+            commit_consumed_completion_acknowledgement(tx)?;
+            return Ok(None);
+        };
+        if !binding.owner_matches(consumer_session_id, consumer_invocation_uuid) {
+            commit_consumed_completion_acknowledgement(tx)?;
+            return Ok(None);
+        }
+        if binding.is_settled() || completion_consumption_claimed(&tx, &binding.event_id)? {
+            commit_consumed_completion_acknowledgement(tx)?;
+            return Ok(None);
+        }
+        let mailbox_changed =
+            consume_completion_mailbox_row(&tx, mailbox_seq, &now, &binding.owner_invocation_uuid)?;
+        validate_consumed_completion_change(mailbox_changed, "mailbox row", mailbox_seq)?;
+        let listener_changed = acknowledge_consumed_completion_listener(&tx, mailbox_seq, &now)?;
+        validate_consumed_completion_change(listener_changed, "listener", mailbox_seq)?;
+        resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
+        commit_consumed_completion_acknowledgement(tx)?;
+        Ok(Some(binding.event_id))
+    }
+
     fn completion_event_registration(
         &self,
         event_id: &str,
@@ -3318,6 +3348,187 @@ fn resolve_completed_delivery_attempts(
     )
     .map(|_| ())
     .map_err(|err| format!("Failed to resolve completed mailbox delivery attempts: {err}"))
+}
+
+struct ConsumedCompletionBinding {
+    event_id: String,
+    owner_session_id: String,
+    owner_invocation_uuid: String,
+    acknowledged_at: Option<String>,
+    delivered_at: Option<String>,
+}
+
+impl ConsumedCompletionBinding {
+    fn owner_matches(&self, session_id: &str, invocation_uuid: &str) -> bool {
+        self.owner_session_id == session_id && self.owner_invocation_uuid == invocation_uuid
+    }
+
+    fn is_settled(&self) -> bool {
+        self.acknowledged_at.is_some() || self.delivered_at.is_some()
+    }
+}
+
+fn begin_consumed_completion_acknowledgement(
+    conn: &mut Connection,
+) -> Result<Transaction<'_>, String> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(format_consumed_completion_transaction_start_error)
+}
+
+fn format_consumed_completion_transaction_start_error(err: rusqlite::Error) -> String {
+    format!("Failed to start consumed completion acknowledgement transaction: {err}")
+}
+
+fn consumed_completion_binding(
+    tx: &Transaction<'_>,
+    mailbox_seq: i64,
+) -> Result<Option<ConsumedCompletionBinding>, String> {
+    tx.query_row(
+        "SELECT listener.event_id, listener.session_id,
+                listener.owner_invocation_uuid, listener.acknowledged_at,
+                mailbox.delivered_at
+         FROM completion_event_listener AS listener
+         JOIN mailbox ON mailbox.seq = listener.mailbox_seq
+         WHERE listener.mailbox_seq = ?1",
+        params![mailbox_seq],
+        map_consumed_completion_binding,
+    )
+    .optional()
+    .map_err(format_consumed_completion_binding_error)
+}
+
+fn map_consumed_completion_binding(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ConsumedCompletionBinding> {
+    Ok(ConsumedCompletionBinding {
+        event_id: row.get(0)?,
+        owner_session_id: row.get(1)?,
+        owner_invocation_uuid: row.get(2)?,
+        acknowledged_at: row.get(3)?,
+        delivered_at: row.get(4)?,
+    })
+}
+
+fn format_consumed_completion_binding_error(err: rusqlite::Error) -> String {
+    format!("Failed to resolve mailbox completion event: {err}")
+}
+
+fn completion_consumption_claimed(tx: &Transaction<'_>, event_id: &str) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM completion_event_listener
+            WHERE event_id = ?1
+              AND acknowledgement_reason = 'consumed_in_call'
+         )",
+        params![event_id],
+        |row| row.get(0),
+    )
+    .map_err(format_completion_consumption_claim_error)
+}
+
+fn format_completion_consumption_claim_error(err: rusqlite::Error) -> String {
+    format!("Failed to inspect completion consumption claim: {err}")
+}
+
+fn consume_completion_mailbox_row(
+    tx: &Transaction<'_>,
+    mailbox_seq: i64,
+    acknowledged_at: &str,
+    owner_invocation_uuid: &str,
+) -> Result<usize, String> {
+    tx.execute(
+        "UPDATE mailbox
+         SET delivered_at = ?2,
+             delivered_by_invocation_uuid = ?3,
+             delivery_attempts = delivery_attempts + 1,
+             delivery_error = NULL
+         WHERE seq = ?1 AND delivered_at IS NULL",
+        params![mailbox_seq, acknowledged_at, owner_invocation_uuid],
+    )
+    .map_err(format_consumed_completion_mailbox_error)
+}
+
+fn format_consumed_completion_mailbox_error(err: rusqlite::Error) -> String {
+    format!("Failed to consume completion event mailbox row: {err}")
+}
+
+fn acknowledge_consumed_completion_listener(
+    tx: &Transaction<'_>,
+    mailbox_seq: i64,
+    acknowledged_at: &str,
+) -> Result<usize, String> {
+    tx.execute(
+        "UPDATE completion_event_listener
+         SET active = 0,
+             acknowledged_at = ?2,
+             acknowledgement_reason = 'consumed_in_call'
+         WHERE mailbox_seq = ?1 AND acknowledged_at IS NULL",
+        params![mailbox_seq, acknowledged_at],
+    )
+    .map_err(format_consumed_completion_listener_error)
+}
+
+fn format_consumed_completion_listener_error(err: rusqlite::Error) -> String {
+    format!("Failed to acknowledge consumed completion listener: {err}")
+}
+
+fn validate_consumed_completion_change(
+    changed: usize,
+    target: &str,
+    mailbox_seq: i64,
+) -> Result<(), String> {
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(format_consumed_completion_change_error(target, mailbox_seq))
+}
+
+fn format_consumed_completion_change_error(target: &str, mailbox_seq: i64) -> String {
+    format!(
+        "Completion event {target} for mailbox row {mailbox_seq} changed while it was being consumed"
+    )
+}
+
+fn commit_consumed_completion_acknowledgement(tx: Transaction<'_>) -> Result<(), String> {
+    tx.commit()
+        .map_err(format_consumed_completion_transaction_commit_error)
+}
+
+fn format_consumed_completion_transaction_commit_error(err: rusqlite::Error) -> String {
+    format!("Failed to commit consumed completion acknowledgement: {err}")
+}
+
+fn resolve_completed_delivery_attempts_for_mailbox_seq(
+    tx: &Transaction<'_>,
+    mailbox_seq: i64,
+    resolved_at: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "UPDATE mailbox_delivery_attempts AS attempt
+         SET resolved_at = COALESCE(resolved_at, ?2)
+         WHERE resolved_at IS NULL
+           AND EXISTS (
+                 SELECT 1
+                 FROM mailbox_delivery_attempt_items AS consumed
+                 WHERE consumed.attempt_id = attempt.attempt_id
+                   AND consumed.mailbox_seq = ?1
+             )
+           AND NOT EXISTS (
+                 SELECT 1
+                 FROM mailbox_delivery_attempt_items AS unresolved
+                 JOIN mailbox ON mailbox.seq = unresolved.mailbox_seq
+                 WHERE unresolved.attempt_id = attempt.attempt_id
+                   AND mailbox.delivered_at IS NULL
+             )",
+        params![mailbox_seq, resolved_at],
+    )
+    .map(|_| ())
+    .map_err(format_exact_row_delivery_attempt_resolution_error)
+}
+
+fn format_exact_row_delivery_attempt_resolution_error(err: rusqlite::Error) -> String {
+    format!("Failed to resolve exact-row mailbox delivery attempts: {err}")
 }
 
 fn payload_address(sha256: &str) -> String {
@@ -7043,6 +7254,289 @@ mod tests {
             consumed.listeners[0].acknowledgement_reason.as_deref(),
             Some("consumed_in_call")
         );
+    }
+
+    struct LateConsumedCompletionFixture {
+        _dir: tempfile::TempDir,
+        db: MailboxDb,
+        event_id: &'static str,
+        unrelated_event_id: &'static str,
+        invocation_uuid: &'static str,
+        sibling_invocation_uuid: &'static str,
+        seq: i64,
+        sibling_seq: i64,
+    }
+
+    const LATE_CONSUMED_EVENT_ID: &str = "ab_late_consumed";
+    const UNRELATED_PENDING_EVENT_ID: &str = "ab_unrelated_pending";
+    const UNRELATED_COMPLETED_EVENT_ID: &str = "ab_unrelated_completed";
+    const LATE_CONSUMED_INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
+    const LATE_CONSUMED_SIBLING_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn late_consumed_completion_fixture() -> LateConsumedCompletionFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let (seq, sibling_seq) = seed_late_consumed_listeners(&mut db);
+        seed_unrelated_pending_completion(&mut db, seq);
+        seed_unrelated_completed_attempt(&mut db);
+        map_late_consumed_completion_fixture(dir, db, seq, sibling_seq)
+    }
+
+    fn seed_late_consumed_listeners(db: &mut MailboxDb) -> (i64, i64) {
+        db.register_completion_event(completion_registration(
+            LATE_CONSUMED_EVENT_ID,
+            "async",
+            "session-a",
+            LATE_CONSUMED_INVOCATION_UUID,
+        ))
+        .unwrap();
+        db.register_completion_event(completion_registration(
+            LATE_CONSUMED_EVENT_ID,
+            "async",
+            "session-b",
+            LATE_CONSUMED_SIBLING_INVOCATION_UUID,
+        ))
+        .unwrap();
+        let triggered = db
+            .trigger_completion_event(completion_trigger(
+                LATE_CONSUMED_EVENT_ID,
+                r#"{"schema_version":2,"handle":"ab_late_consumed"}"#,
+                false,
+            ))
+            .unwrap();
+        (
+            triggered_mailbox_seq(&triggered, "session-a"),
+            triggered_mailbox_seq(&triggered, "session-b"),
+        )
+    }
+
+    fn triggered_mailbox_seq(triggered: &CompletionEventTriggerResult, session_id: &str) -> i64 {
+        triggered
+            .mailbox_rows
+            .iter()
+            .find(|row| row.session_id == session_id)
+            .unwrap()
+            .seq
+    }
+
+    fn seed_unrelated_pending_completion(db: &mut MailboxDb, consumed_seq: i64) {
+        db.register_completion_event(completion_registration(
+            UNRELATED_PENDING_EVENT_ID,
+            "async",
+            "session-a",
+            LATE_CONSUMED_INVOCATION_UUID,
+        ))
+        .unwrap();
+        let unrelated = db
+            .trigger_completion_event(completion_trigger(
+                UNRELATED_PENDING_EVENT_ID,
+                r#"{"schema_version":2,"handle":"ab_unrelated_pending"}"#,
+                false,
+            ))
+            .unwrap();
+        let unrelated_seq = unrelated.mailbox_rows[0].seq;
+        db.register_delivery_attempt(
+            "attempt-late-consumed",
+            "session-a",
+            LATE_CONSUMED_INVOCATION_UUID,
+            &[consumed_seq],
+            0,
+        )
+        .unwrap();
+        db.register_delivery_attempt(
+            "attempt-unrelated",
+            "session-a",
+            LATE_CONSUMED_INVOCATION_UUID,
+            &[unrelated_seq],
+            0,
+        )
+        .unwrap();
+    }
+
+    fn seed_unrelated_completed_attempt(db: &mut MailboxDb) {
+        db.register_completion_event(completion_registration(
+            UNRELATED_COMPLETED_EVENT_ID,
+            "async",
+            "session-a",
+            LATE_CONSUMED_INVOCATION_UUID,
+        ))
+        .unwrap();
+        let unrelated_completed = db
+            .trigger_completion_event(completion_trigger(
+                UNRELATED_COMPLETED_EVENT_ID,
+                r#"{"schema_version":2,"handle":"ab_unrelated_completed"}"#,
+                false,
+            ))
+            .unwrap();
+        let unrelated_completed_seq = unrelated_completed.mailbox_rows[0].seq;
+        db.register_delivery_attempt(
+            "attempt-unrelated-completed",
+            "session-a",
+            LATE_CONSUMED_INVOCATION_UUID,
+            &[unrelated_completed_seq],
+            0,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE mailbox SET delivered_at = '2026-08-10T00:00:00Z' WHERE seq = ?1",
+                params![unrelated_completed_seq],
+            )
+            .unwrap();
+    }
+
+    fn map_late_consumed_completion_fixture(
+        dir: tempfile::TempDir,
+        db: MailboxDb,
+        seq: i64,
+        sibling_seq: i64,
+    ) -> LateConsumedCompletionFixture {
+        LateConsumedCompletionFixture {
+            _dir: dir,
+            db,
+            event_id: LATE_CONSUMED_EVENT_ID,
+            unrelated_event_id: UNRELATED_PENDING_EVENT_ID,
+            invocation_uuid: LATE_CONSUMED_INVOCATION_UUID,
+            sibling_invocation_uuid: LATE_CONSUMED_SIBLING_INVOCATION_UUID,
+            seq,
+            sibling_seq,
+        }
+    }
+
+    #[test]
+    fn late_consumed_completion_acknowledges_materialized_mailbox_row_once() {
+        let fixture = late_consumed_completion_fixture();
+        let event_id = fixture.event_id;
+        let unrelated_event_id = fixture.unrelated_event_id;
+        let invocation_uuid = fixture.invocation_uuid;
+        let sibling_invocation_uuid = fixture.sibling_invocation_uuid;
+        let seq = fixture.seq;
+        let sibling_seq = fixture.sibling_seq;
+        let mut db = fixture.db;
+
+        assert_eq!(
+            db.acknowledge_consumed_completion_event_for_mailbox_seq(
+                sibling_seq,
+                "session-a",
+                invocation_uuid,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.acknowledge_consumed_completion_event_for_mailbox_seq(
+                seq,
+                "session-a",
+                invocation_uuid,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(event_id)
+        );
+        let first_acknowledged_at = db
+            .completion_event_listeners(event_id)
+            .unwrap()
+            .into_iter()
+            .find(completion_listener_for_session_a)
+            .unwrap()
+            .acknowledged_at
+            .unwrap();
+        assert_eq!(
+            db.acknowledge_consumed_completion_event_for_mailbox_seq(
+                seq,
+                "session-a",
+                invocation_uuid,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.acknowledge_consumed_completion_event_for_mailbox_seq(
+                sibling_seq,
+                "session-a",
+                invocation_uuid,
+            )
+            .unwrap(),
+            None
+        );
+
+        let rows = db.list_mailbox("session-a", true).unwrap();
+        assert_eq!(rows.len(), 3);
+        let consumed_row = mailbox_row_for_seq(&rows, seq);
+        assert!(consumed_row.delivered_at.is_some());
+        assert_eq!(consumed_row.delivery_attempts, 1);
+        assert_eq!(
+            consumed_row.delivered_by_invocation_uuid.as_deref(),
+            Some(invocation_uuid)
+        );
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-late-consumed")
+                .unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Resolved)
+        );
+        assert!(
+            db.delivery_attempt_window("attempt-late-consumed")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_some()
+        );
+        assert_eq!(
+            db.delivery_attempt_disposition("attempt-unrelated")
+                .unwrap(),
+            Some(MailboxDeliveryAttemptDisposition::Pending)
+        );
+        assert!(
+            db.delivery_attempt_window("attempt-unrelated-completed")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_none()
+        );
+        let pending = db.list_pending("session-a").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].handle, unrelated_event_id);
+        let listeners = db.completion_event_listeners(event_id).unwrap();
+        let consumed_listener = completion_listener_for_session(&listeners, "session-a");
+        assert_eq!(
+            consumed_listener.acknowledgement_reason.as_deref(),
+            Some("consumed_in_call")
+        );
+        assert!(!consumed_listener.active);
+        assert_eq!(
+            consumed_listener.acknowledged_at.as_deref(),
+            Some(first_acknowledged_at.as_str())
+        );
+        let sibling_listener = completion_listener_for_session(&listeners, "session-b");
+        assert!(sibling_listener.active);
+        assert!(sibling_listener.acknowledged_at.is_none());
+        let sibling_pending = db.list_pending("session-b").unwrap();
+        assert_eq!(sibling_pending.len(), 1);
+        assert_eq!(
+            sibling_pending[0].owner_invocation_uuid.as_deref(),
+            Some(sibling_invocation_uuid)
+        );
+        let unrelated = db.completion_event_listeners(unrelated_event_id).unwrap();
+        assert!(unrelated[0].active);
+        assert!(unrelated[0].acknowledged_at.is_none());
+    }
+
+    fn completion_listener_for_session_a(listener: &CompletionEventListenerRow) -> bool {
+        listener.session_id == "session-a"
+    }
+
+    fn completion_listener_for_session<'a>(
+        listeners: &'a [CompletionEventListenerRow],
+        session_id: &str,
+    ) -> &'a CompletionEventListenerRow {
+        listeners
+            .iter()
+            .find(|listener| listener.session_id == session_id)
+            .unwrap()
+    }
+
+    fn mailbox_row_for_seq(rows: &[MailboxRow], seq: i64) -> &MailboxRow {
+        rows.iter().find(|row| row.seq == seq).unwrap()
     }
 
     #[test]
