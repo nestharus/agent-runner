@@ -49,17 +49,43 @@ impl StateDb {
             terminal_reason,
             &finished_at,
         );
-        self.warn_result_artifact_for_finalize_result(
+        self.report_finalize_invocation(
+            id,
             success,
             exit_code,
             error_category,
             terminal_reason,
             &finished_at,
+            lifecycle_row.as_ref(),
+            timer,
+            transaction_result,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn report_finalize_invocation(
+        &self,
+        id: i64,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<&str>,
+        terminal_reason: Option<&str>,
+        finished_at: &str,
+        lifecycle_row: Option<&LifecycleInvocationRow>,
+        timer: std::time::Instant,
+        transaction_result: Result<FinalizeInvocationRow, String>,
+    ) -> Result<(), String> {
+        self.warn_result_artifact_for_finalize_result(
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+            finished_at,
             &transaction_result,
         );
         let result = Self::translate_finalize_invocation_result(transaction_result);
         let finalize_success = Self::is_finalize_result_success(&result);
-        let sqlite_error = Self::is_finalize_sqlite_error(id, lifecycle_row.as_ref(), &result);
+        let sqlite_error = Self::is_finalize_sqlite_error(id, lifecycle_row, &result);
         let operation_result =
             Self::classify_finalize_operation_result(finalize_success, sqlite_error);
         let terminal_status = Self::format_terminal_status(success, exit_code, terminal_reason);
@@ -70,7 +96,7 @@ impl StateDb {
             terminal_reason,
             operation_result,
         );
-        let context = self.finalize_context(id, lifecycle_row.as_ref(), input);
+        let context = self.finalize_context(id, lifecycle_row, input);
         lc_log_adapter::emit_finalize(
             &self.lifecycle_sink,
             timer,

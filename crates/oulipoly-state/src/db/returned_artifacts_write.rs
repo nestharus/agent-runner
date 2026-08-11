@@ -153,7 +153,7 @@ impl StateDb {
         format!("Failed to begin returned-artifacts tx: {err}")
     }
 
-    fn format_reset_returned_artifacts_error(err: sqlite::Error) -> DbError {
+    pub(super) fn format_reset_returned_artifacts_error(err: sqlite::Error) -> DbError {
         format!("Failed to reset returned artifacts: {err}")
     }
 

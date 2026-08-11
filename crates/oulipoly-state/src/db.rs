@@ -129,6 +129,7 @@ mod provider_quotas;
 mod provider_schema_migration;
 mod provider_schema_validation;
 mod provider_session_binding;
+mod provider_turn_effects;
 mod providers;
 mod resume_active_segment;
 mod resume_lookup;
@@ -175,6 +176,7 @@ use self::provider_quotas::{
 pub use self::provider_quotas::{QuotaRecord, QuotaWindow, QuotaWindowInput};
 use self::provider_schema_migration::ProviderColumn;
 pub use self::provider_session_binding::ProviderSessionBinding;
+pub use self::provider_turn_effects::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
 pub use self::providers::ProviderRecord;
 pub use self::resume_types::{
     ChainPreview, ModelStore, RESUME_INPUT_MAX_LEN, ResolvedResume, ResumeError, ResumeInputMatch,

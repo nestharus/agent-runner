@@ -41,6 +41,14 @@ pub(super) fn release_current_auto_wake_claim(session_id: &str) {
     crate::wake_coordinator::release_current_auto_wake_claim_for_session(session_id);
 }
 
+pub(super) fn release_claim_after_wake_preparation_error(session_id: &str) {
+    if crate::wake_coordinator::is_auto_wake_invocation() {
+        release_current_auto_wake_claim(session_id);
+    } else if let Err(err) = crate::wake_coordinator::reset_manual_resume_wake_claim(session_id) {
+        tracing::warn!(session_id, "Failed to release manual wake claim: {err}");
+    }
+}
+
 pub(super) fn recheck_after_failed_auto_wake(session_id: &str, result: &Result<i32, String>) {
     if failed_auto_wake_needs_recheck(result) {
         let _ = crate::wake_coordinator::recheck_after_failed_auto_wake(session_id);

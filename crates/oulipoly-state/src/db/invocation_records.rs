@@ -180,7 +180,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn format_resume_acceptance_update_error(id: i64, err: sqlite::Error) -> String {
+    pub(super) fn format_resume_acceptance_update_error(id: i64, err: sqlite::Error) -> String {
         format!("Failed to update resume acceptance for invocation {id}: {err}")
     }
 

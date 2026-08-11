@@ -122,7 +122,7 @@ impl TurnState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TurnFence {
     pub session_id: String,
     pub generation_id: String,
@@ -1100,7 +1100,7 @@ impl SessionLifecycleRepository for StateDb {
     }
 }
 
-fn validate_nonempty(value: &str, field: &'static str) -> SessionLifecycleResult<()> {
+pub(super) fn validate_nonempty(value: &str, field: &'static str) -> SessionLifecycleResult<()> {
     if value.is_empty() {
         Err(SessionLifecycleError::Invalid(field))
     } else {
@@ -1163,7 +1163,7 @@ fn validate_ingress(ingress: &ExternalIngress) -> SessionLifecycleResult<()> {
     validate_nonempty(&ingress.ingress_id, "ingress_id")
 }
 
-fn validate_acknowledgement_fence(
+pub(super) fn validate_acknowledgement_fence(
     delivery_id: &str,
     session_id: &str,
     turn_generation_id: &str,
@@ -1386,7 +1386,7 @@ fn read_cursor(conn: &Connection, session_id: &str) -> rusqlite::Result<i64> {
         .unwrap_or(0))
 }
 
-fn acknowledgement_with_fence(
+pub(super) fn acknowledgement_with_fence(
     conn: &Connection,
     delivery_id: &str,
     session_id: &str,
