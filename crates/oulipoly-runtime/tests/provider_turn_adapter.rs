@@ -83,7 +83,6 @@ impl Drop for Harness {
 
 struct QueueExecutor {
     calls: Arc<AtomicUsize>,
-    kinds: Arc<Mutex<Vec<&'static str>>>,
     outcomes: Mutex<VecDeque<ProviderExecutionOutcome>>,
 }
 
@@ -91,19 +90,14 @@ impl QueueExecutor {
     fn new(outcomes: impl IntoIterator<Item = ProviderExecutionOutcome>) -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
-            kinds: Arc::new(Mutex::new(Vec::new())),
             outcomes: Mutex::new(outcomes.into_iter().collect()),
         }
     }
 }
 
 impl ProviderTurnExecutor for QueueExecutor {
-    fn execute(&self, request: &ProviderTurnExecutionRequest) -> ProviderExecutionOutcome {
+    fn execute(&self, _request: &ProviderTurnExecutionRequest) -> ProviderExecutionOutcome {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.kinds.lock().unwrap().push(match request {
-            ProviderTurnExecutionRequest::LegacyCliResume(_) => "legacy",
-            ProviderTurnExecutionRequest::ExternalProvider(_) => "external",
-        });
         self.outcomes
             .lock()
             .unwrap()
