@@ -81,6 +81,7 @@ pub use db::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,
 };
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
+pub use db::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 pub use mailbox::{

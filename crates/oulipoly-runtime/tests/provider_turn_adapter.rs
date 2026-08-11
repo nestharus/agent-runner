@@ -634,6 +634,84 @@ fn launch_and_state_effect_replay_are_exact_and_idempotent() {
 }
 
 #[test]
+fn provider_turn_effects_roll_back_when_finalization_fails() {
+    let harness = start_harness();
+    let mut state = StateDb::open(&harness.path).unwrap();
+    let parent = seed_invocation(&state, PARENT_UUID, None);
+    let invocation = seed_invocation(&state, FIRST_UUID, Some(parent.invocation_row_id));
+    let mut adapter =
+        ProviderTurnAdapter::new(QueueExecutor::new([complete_outcome(execution_result(
+            SESSION,
+            "atomic prompt",
+            Some("atomic-nonce"),
+            true,
+            vec![artifact(FIRST_UUID)],
+        ))]));
+    harness
+        .supervisor()
+        .notify_external(
+            ExternalIngress {
+                session_id: SESSION.to_string(),
+                sequence: 1,
+                ingress_id: "atomic-delivery".to_string(),
+                payload: "atomic prompt".to_string(),
+            },
+            SessionNotification::new(
+                1,
+                launch(
+                    "atomic-launch",
+                    legacy_request("atomic prompt"),
+                    invocation.clone(),
+                    mailbox("atomic-delivery", 1, "atomic-nonce"),
+                ),
+                turn(1, FIRST_UUID),
+            ),
+            10,
+        )
+        .unwrap();
+    let request = receive_turn(&harness.turns);
+    let execution = adapter.execute_once(&request).unwrap().outcome;
+    rusqlite::Connection::open(&harness.path)
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_provider_turn_finalize
+             BEFORE UPDATE OF status ON invocations
+             WHEN NEW.id = {}
+             BEGIN SELECT RAISE(ABORT, 'forced finalization failure'); END;",
+            invocation.invocation_row_id
+        ))
+        .unwrap();
+
+    assert!(
+        adapter
+            .apply_effects(&request, &mut state, &execution, &[], 11)
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .acknowledgement("atomic-delivery")
+            .unwrap()
+            .unwrap()
+            .stage(),
+        AcknowledgementStage::AcceptedPending
+    );
+    assert!(
+        state
+            .list_returned_artifacts(invocation.invocation_row_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state
+            .get_invocation_by_uuid(FIRST_UUID)
+            .unwrap()
+            .unwrap()
+            .status,
+        InvocationStatus::Running
+    );
+}
+
+#[test]
 fn completed_turn_evicts_its_cached_execution() {
     let executor = QueueExecutor::new([
         complete_outcome(execution_result(

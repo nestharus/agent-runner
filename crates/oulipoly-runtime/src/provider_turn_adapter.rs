@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use oulipoly_config::{PromptMode, ProviderConfig, ResumeStrategy};
 use oulipoly_state::{
-    AcknowledgementWrite, CompositeInvocationId, InvocationStatus, SessionLifecycleRepository,
-    StateDb, TurnFence,
+    AcknowledgementWrite, CompositeInvocationId, InvocationStatus, ProviderTurnEffectInput,
+    SessionLifecycleRepository, StateDb, TurnFence,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -436,9 +436,17 @@ where
         for item in &evidence {
             validate_evidence_fence(&fence, item)?;
         }
-        let acknowledgement =
-            apply_acknowledgement_evidence(state, launch, &fence, &evidence, observed_at)?;
-        let invocation_finalization = finalize_invocation_exact(state, launch, execution)?;
+        let (submitted_evidence, confirmed_evidence) =
+            acknowledgement_evidence(launch, &fence, &evidence)?;
+        let (acknowledgement, invocation_finalization) = finalize_invocation_exact(
+            state,
+            launch,
+            &fence,
+            execution,
+            submitted_evidence.as_deref(),
+            confirmed_evidence.as_deref(),
+            observed_at,
+        )?;
         Ok(ProviderTurnEffectReport {
             acknowledgement,
             invocation_finalization,
@@ -759,15 +767,13 @@ fn failure_evidence(execution: &ProviderExecutionOutcome) -> ProviderEvidence {
     }
 }
 
-fn apply_acknowledgement_evidence(
-    state: &mut StateDb,
+fn acknowledgement_evidence(
     launch: &ProviderTurnLaunch,
     fence: &TurnFence,
     evidence: &[FencedProviderEvidence],
-    observed_at: i64,
-) -> Result<EffectWrite, ProviderTurnAdapterError> {
+) -> Result<(Option<String>, Option<String>), ProviderTurnAdapterError> {
     if launch.mailbox_batch.delivery_ids.is_empty() {
-        return Ok(EffectWrite::NotApplicable);
+        return Ok((None, None));
     }
     let prompt_hash = launch.request.prompt().map(prompt_sha256);
     let submitted = select_evidence(
@@ -787,42 +793,7 @@ fn apply_acknowledgement_evidence(
     // Confirmation is stronger than submission. Persist the stronger fact at
     // both monotonic stages when the provider exposes no separate submit fact.
     let submission = submitted.as_deref().or(confirmed.as_deref());
-    let mut write = EffectWrite::AlreadyApplied;
-    for delivery_id in &launch.mailbox_batch.delivery_ids {
-        if let Some(submitted) = submission {
-            write = merge_acknowledgement_write(
-                write,
-                state
-                    .mark_submitted(
-                        delivery_id,
-                        &launch.mailbox_batch.session_id,
-                        &fence.generation_id,
-                        submitted,
-                        observed_at,
-                    )
-                    .map_err(|error| ProviderTurnAdapterError::State(error.to_string()))?,
-            );
-        }
-        if let Some(confirmed) = confirmed.as_deref() {
-            write = merge_acknowledgement_write(
-                write,
-                state
-                    .mark_confirmed(
-                        delivery_id,
-                        &launch.mailbox_batch.session_id,
-                        &fence.generation_id,
-                        confirmed,
-                        observed_at,
-                    )
-                    .map_err(|error| ProviderTurnAdapterError::State(error.to_string()))?,
-            );
-        }
-    }
-    if submission.is_none() && confirmed.is_none() {
-        Ok(EffectWrite::NotApplicable)
-    } else {
-        Ok(write)
-    }
+    Ok((submission.map(ToOwned::to_owned), confirmed))
 }
 
 fn select_evidence(
@@ -936,19 +907,15 @@ fn turn_evidence(kind: &str, provider_session_id: &str, turn_id: &str) -> Value 
     })
 }
 
-fn merge_acknowledgement_write(current: EffectWrite, write: AcknowledgementWrite) -> EffectWrite {
-    if current == EffectWrite::Applied || write == AcknowledgementWrite::Advanced {
-        EffectWrite::Applied
-    } else {
-        EffectWrite::AlreadyApplied
-    }
-}
-
 fn finalize_invocation_exact(
-    state: &StateDb,
+    state: &mut StateDb,
     launch: &ProviderTurnLaunch,
+    fence: &TurnFence,
     execution: &ProviderExecutionOutcome,
-) -> Result<EffectWrite, ProviderTurnAdapterError> {
+    submitted_evidence: Option<&str>,
+    confirmed_evidence: Option<&str>,
+    observed_at: i64,
+) -> Result<(EffectWrite, EffectWrite), ProviderTurnAdapterError> {
     let invocation = state
         .get_invocation_by_uuid(&launch.invocation.invocation.id)
         .map_err(ProviderTurnAdapterError::State)?
@@ -962,6 +929,13 @@ fn finalize_invocation_exact(
     }
     let (success, exit_code, error_category, terminal_reason) = finalization_fields(execution);
     if invocation.status != InvocationStatus::Running {
+        validate_acknowledgement_replay(
+            state,
+            launch,
+            fence,
+            submitted_evidence,
+            confirmed_evidence,
+        )?;
         validate_finalized_replay(
             state,
             &invocation,
@@ -972,39 +946,82 @@ fn finalize_invocation_exact(
             error_category,
             terminal_reason,
         )?;
-        return Ok(EffectWrite::AlreadyApplied);
+        let acknowledgement = if submitted_evidence.is_some() || confirmed_evidence.is_some() {
+            EffectWrite::AlreadyApplied
+        } else {
+            EffectWrite::NotApplicable
+        };
+        return Ok((acknowledgement, EffectWrite::AlreadyApplied));
     }
     let artifacts = execution
         .result
         .as_ref()
         .map(|result| result.returned_artifacts.as_slice())
         .unwrap_or_default();
-    state
-        .record_returned_artifacts(invocation.id, artifacts)
-        .map_err(ProviderTurnAdapterError::State)?;
-    if let Some(acceptance) = execution
+    let acceptance = execution
         .result
         .as_ref()
-        .and_then(|result| result.resume_acceptance.as_ref())
-    {
-        state
-            .update_resume_acceptance(
-                invocation.id,
-                acceptance.status.db_value(),
-                acceptance.evidence.as_deref(),
-            )
-            .map_err(ProviderTurnAdapterError::State)?;
-    }
-    state
-        .finalize_invocation(
-            invocation.id,
+        .and_then(|result| result.resume_acceptance.as_ref());
+    let write = state
+        .apply_provider_turn_effects(ProviderTurnEffectInput {
+            invocation_row_id: invocation.id,
+            delivery_ids: &launch.mailbox_batch.delivery_ids,
+            session_id: &launch.mailbox_batch.session_id,
+            turn_generation_id: &fence.generation_id,
+            submitted_evidence,
+            confirmed_evidence,
+            observed_at,
+            returned_artifacts: artifacts,
+            resume_acceptance_status: acceptance.map(|value| value.status.db_value()),
+            resume_acceptance_evidence: acceptance.and_then(|value| value.evidence.as_deref()),
             success,
             exit_code,
             error_category,
             terminal_reason,
-        )
+        })
         .map_err(ProviderTurnAdapterError::State)?;
-    Ok(EffectWrite::Applied)
+    let acknowledgement = if submitted_evidence.is_none() && confirmed_evidence.is_none() {
+        EffectWrite::NotApplicable
+    } else if write.acknowledgement == AcknowledgementWrite::Advanced {
+        EffectWrite::Applied
+    } else {
+        EffectWrite::AlreadyApplied
+    };
+    Ok((acknowledgement, EffectWrite::Applied))
+}
+
+fn validate_acknowledgement_replay(
+    state: &StateDb,
+    launch: &ProviderTurnLaunch,
+    fence: &TurnFence,
+    submitted_evidence: Option<&str>,
+    confirmed_evidence: Option<&str>,
+) -> Result<(), ProviderTurnAdapterError> {
+    if submitted_evidence.is_none() && confirmed_evidence.is_none() {
+        return Ok(());
+    }
+    for delivery_id in &launch.mailbox_batch.delivery_ids {
+        let recorded = state
+            .acknowledgement(delivery_id)
+            .map_err(|error| ProviderTurnAdapterError::State(error.to_string()))?
+            .ok_or_else(|| {
+                ProviderTurnAdapterError::State(format!(
+                    "delivery acknowledgement {delivery_id} not found"
+                ))
+            })?;
+        if recorded.session_id != launch.mailbox_batch.session_id
+            || recorded.turn_generation_id != fence.generation_id
+            || submitted_evidence
+                .is_some_and(|evidence| recorded.submitted_evidence.as_deref() != Some(evidence))
+            || confirmed_evidence
+                .is_some_and(|evidence| recorded.confirmed_evidence.as_deref() != Some(evidence))
+        {
+            return Err(ProviderTurnAdapterError::State(format!(
+                "delivery acknowledgement {delivery_id} conflicts with provider-turn replay"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
