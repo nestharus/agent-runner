@@ -248,42 +248,34 @@ fn model() -> ModelConfig {
 
 fn external_request(start_mode: &str) -> ProviderTurnExecutionRequest {
     let provider = ProviderConfig::new("fixture-provider", vec!["--fixed".to_string()]);
-    let fields = (
-        model(),
-        provider,
-        4,
-        PromptMode::Arg,
-        "external prompt".to_string(),
-        None,
-        None,
-        HashMap::new(),
-        None,
-        SESSION.to_string(),
-    );
+    let model = model();
+    let prompt = "external prompt".to_string();
+    let extra_inputs = HashMap::new();
+    let session = SESSION.to_string();
     let request = match start_mode {
         "resume" => ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
-            model: fields.0,
-            provider: fields.1,
-            provider_index: fields.2,
-            prompt_mode: fields.3,
-            prompt: fields.4,
-            working_dir: fields.5,
-            models_dir: fields.6,
-            extra_inputs: fields.7,
-            parent_invocation_env: fields.8,
-            start_known_provider_session_id: fields.9,
+            model,
+            provider,
+            provider_index: 4,
+            prompt_mode: PromptMode::Arg,
+            prompt,
+            working_dir: None,
+            models_dir: None,
+            extra_inputs,
+            parent_invocation_env: None,
+            start_known_provider_session_id: session,
         },
         "create" => ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
-            model: fields.0,
-            provider: fields.1,
-            provider_index: fields.2,
-            prompt_mode: fields.3,
-            prompt: fields.4,
-            working_dir: fields.5,
-            models_dir: fields.6,
-            extra_inputs: fields.7,
-            parent_invocation_env: fields.8,
-            start_known_provider_session_id: fields.9,
+            model,
+            provider,
+            provider_index: 4,
+            prompt_mode: PromptMode::Arg,
+            prompt,
+            working_dir: None,
+            models_dir: None,
+            extra_inputs,
+            parent_invocation_env: None,
+            start_known_provider_session_id: session,
         },
         _ => panic!("unsupported fixture start mode"),
     };
