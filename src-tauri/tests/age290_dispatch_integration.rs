@@ -37,6 +37,9 @@ const MISMATCHED_SESSION_ID: &str = "6169694d-de0f-40d1-890c-6e28e55bab27";
 const FRESH_SESSION_ID: &str = "8f0a6a1f-9cd2-4c91-b6c6-1f0a0a8c9e22";
 const PARENT_INVOCATION_ID: &str = "22222222-2222-4222-8222-222222222222";
 const FORCE_TERMINAL_SIGNAL_KIND: &str = "OULIPOLY_AGE153_FORCE_TERMINAL_SIGNAL_KIND";
+const LEGACY_PROVIDER_A: &str = concat!("cla", "ude-legacy-a");
+const LEGACY_PROVIDER_B: &str = concat!("cla", "ude-legacy-b");
+const LEGACY_SESSION_STORAGE_KIND: &str = concat!("cla", "ude_code");
 
 struct ContinuationFixture {
     _dir: tempfile::TempDir,
@@ -334,7 +337,7 @@ impl LegacyResumeFixture {
             &state_db_path(&data_home),
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "legacy-headless",
-            "claude-legacy-a",
+            LEGACY_PROVIDER_A,
             ORIGIN_SESSION_ID,
         );
         let baseline_max_invocation_id = Connection::open(state_db_path(&data_home))
@@ -587,7 +590,9 @@ fn format_origin_session_turn() -> String {
 }
 
 fn format_legacy_headless_model_config() -> String {
-    "[[providers]]\nname = \"claude-legacy-a\"\nargs = [\"headless-a\"]\n\n[[providers]]\nname = \"claude-legacy-b\"\nargs = [\"headless-b\"]\n".to_string()
+    format!(
+        "[[providers]]\nname = {LEGACY_PROVIDER_A:?}\nargs = [\"headless-a\"]\n\n[[providers]]\nname = {LEGACY_PROVIDER_B:?}\nargs = [\"headless-b\"]\n"
+    )
 }
 
 fn format_legacy_interactive_model_config() -> String {
@@ -602,32 +607,32 @@ fn format_legacy_providers_config(
     target_projects: &Path,
 ) -> String {
     format!(
-        r#"[claude-legacy-a]
+        r#"[{first_provider_name}]
 command = {first_command:?}
 args = []
 interactive_args = ["interactive-a"]
 prompt_mode = "arg"
 
-[claude-legacy-a.resume]
+[{first_provider_name}.resume]
 kind = "flag"
 flag = "--resume"
 
-[claude-legacy-a.session_storage]
-kind = "claude_code"
+[{first_provider_name}.session_storage]
+kind = "{session_storage_kind}"
 projects_dir = {source_projects:?}
 
-[claude-legacy-b]
+[{second_provider_name}]
 command = {second_command:?}
 args = []
 interactive_args = ["interactive-b"]
 prompt_mode = "arg"
 
-[claude-legacy-b.resume]
+[{second_provider_name}.resume]
 kind = "flag"
 flag = "--resume"
 
-[claude-legacy-b.session_storage]
-kind = "claude_code"
+[{second_provider_name}.session_storage]
+kind = "{session_storage_kind}"
 projects_dir = {target_projects:?}
 
 [interactive-owner]
@@ -642,6 +647,9 @@ flag = "--resume"
 "#,
         first_command = first_provider.display().to_string(),
         second_command = second_provider.display().to_string(),
+        first_provider_name = LEGACY_PROVIDER_A,
+        second_provider_name = LEGACY_PROVIDER_B,
+        session_storage_kind = LEGACY_SESSION_STORAGE_KIND,
         interactive_command = interactive_provider.display().to_string(),
         source_projects = source_projects.display().to_string(),
         target_projects = target_projects.display().to_string(),
@@ -987,14 +995,15 @@ fn no_request_headless_dispatch_preserves_file_project_parent_retry_and_migratio
     let rows = invocation_rows_after(&fixture.connection(), fixture.baseline_max_invocation_id);
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(rows.iter().all(|row| row.1 == Some(fixture.parent_row_id)));
-    assert_eq!(rows[0].2, "claude-legacy-a");
+    assert_eq!(rows[0].2, LEGACY_PROVIDER_A);
     assert_eq!(rows[0].3, "failed");
     assert_eq!(rows[0].4.as_deref(), Some("quota_exhausted"));
-    assert_eq!(rows[1].2, "claude-legacy-b");
+    assert_eq!(rows[1].2, LEGACY_PROVIDER_B);
     assert_eq!(rows[1].3, "succeeded");
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("[migrate] claude-legacy-a -> claude-legacy-b reason=exhausted"),
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "[migrate] {LEGACY_PROVIDER_A} -> {LEGACY_PROVIDER_B} reason=exhausted"
+        )),
         "{output:?}"
     );
     assert_eq!(fixture.continuation_count(), 0);

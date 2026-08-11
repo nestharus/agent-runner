@@ -394,7 +394,7 @@ fn fresh_continuation_request_rejects_provider_rotation() {
         "--fresh-continuation-request",
         "/tmp/request.json",
         "--rotate-provider",
-        "claude2",
+        "rotation-target",
     ])
     .expect_err("a fresh continuation request must reject provider rotation");
 
