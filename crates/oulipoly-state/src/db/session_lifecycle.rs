@@ -122,7 +122,7 @@ impl TurnState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct TurnFence {
     pub session_id: String,
     pub generation_id: String,

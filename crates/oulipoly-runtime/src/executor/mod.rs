@@ -57,7 +57,7 @@ pub use self::providers::opencode::Recognizer as OpenCodeRecognizer;
 pub use self::terminal_signal::TerminalSignal;
 pub use self::terminal_signal::TerminalSignalRecognizer;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct ExecutionResult {
     pub stdout: Vec<u8>,
@@ -116,13 +116,13 @@ impl ResumeAcceptanceStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCaptureResult {
     pub session_id: Option<String>,
     pub method: SessionCaptureMethod,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCaptureMethod {
     None,
     ForcedFlagVerified,

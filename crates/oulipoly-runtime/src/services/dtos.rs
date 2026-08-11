@@ -315,7 +315,7 @@ pub enum SessionLockFailure {
     Lock(LockError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(
     clippy::large_enum_variant,
     reason = "AGE-34 DTO contract pins unboxed ModelConfig and ProviderConfig fields"
