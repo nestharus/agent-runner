@@ -72,6 +72,12 @@ pub(in crate::run) fn prepare_resume(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
+    if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
+        return Ok(Err(exit_code));
+    }
+    if let Some(exit_code) = prepare_resume_wake(session_id)? {
+        return Ok(Err(exit_code));
+    }
     let result = prepare_resume_inner(
         agent_runtime_services,
         model_name,
@@ -101,12 +107,6 @@ fn prepare_resume_inner(
     working_dir: Option<&Path>,
     models_dir_override: Option<&Path>,
 ) -> Result<Result<execution::PreparedHeadlessResumeExecution, i32>, String> {
-    if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
-        return Ok(Err(exit_code));
-    }
-    if let Some(exit_code) = prepare_resume_wake(session_id)? {
-        return Ok(Err(exit_code));
-    }
     // Source guard marker: agent_runtime_services.resume_service.resolve_resume(ResumeServiceRequest)
 
     match execution::prepare_headless_resume_execution(
