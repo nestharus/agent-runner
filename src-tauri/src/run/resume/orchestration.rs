@@ -75,8 +75,13 @@ pub(in crate::run) fn prepare_resume(
     if let Some(exit_code) = execution::reject_invalid_resume_input(session_id) {
         return Ok(Err(exit_code));
     }
-    if let Some(exit_code) = prepare_resume_wake(session_id)? {
-        return Ok(Err(exit_code));
+    match prepare_resume_wake(session_id) {
+        Ok(Some(exit_code)) => return Ok(Err(exit_code)),
+        Ok(None) => {}
+        Err(err) => {
+            wake::release_claim_after_wake_preparation_error(session_id);
+            return Err(err);
+        }
     }
     let result = prepare_resume_inner(
         agent_runtime_services,
