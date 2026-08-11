@@ -732,6 +732,7 @@ fn trace_notify_pty_attempt(
         session_id,
         diagnostic,
         base_decision,
+        trace_status,
         &inject_status,
     );
     append_notify_trace_record(&record);
@@ -782,6 +783,7 @@ fn format_notify_trace_record(
     session_id: &str,
     diagnostic: &PtyMailboxDeliveryDiagnostic,
     base_decision: &str,
+    trace_status: &str,
     inject_status: &str,
 ) -> String {
     format!(
@@ -802,7 +804,7 @@ fn format_notify_trace_record(
         diagnostic.delivered_seqs.len(),
         notify_trace_remaining_pending(diagnostic),
         notify_trace_message(diagnostic),
-        notify_trace_summary_reason(&diagnostic.status),
+        notify_trace_summary_reason(trace_status),
     )
 }
 
@@ -1254,5 +1256,30 @@ mod tests {
             "unsafe_provider_starting"
         );
         assert_eq!(pty_nack_status("broker_rejected"), "protocol_error");
+    }
+
+    #[test]
+    fn stale_generation_trace_uses_normalized_connect_error_reason() {
+        let diagnostic = PtyMailboxDeliveryDiagnostic {
+            attempted: true,
+            status: "stale_generation".to_string(),
+            control_path: None,
+            submitted: false,
+            delivered_seqs: Vec::new(),
+            remaining_pending: None,
+            message: None,
+        };
+        let trace_status = notify_trace_status(&diagnostic);
+        let record = format_notify_trace_record(
+            "early_wake",
+            "session-id",
+            &diagnostic,
+            notify_trace_base_decision(&diagnostic),
+            trace_status,
+            trace_status,
+        );
+
+        assert!(record.contains("inject_status=connect_error"), "{record}");
+        assert!(record.contains("reason=connect_error"), "{record}");
     }
 }
