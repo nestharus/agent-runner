@@ -538,7 +538,12 @@ fn validate_turn_request(
     if request.turn.session_id.as_deref() != Some(request.session_id.as_str()) {
         return Err(ProviderTurnAdapterError::InvalidFence("turn.session_id"));
     }
-    if launch.request.target_session_id() != Some(request.session_id.as_str()) {
+    let Some(target_session_id) = launch.request.target_session_id() else {
+        return Err(ProviderTurnAdapterError::InvalidFence(
+            "execution session unavailable",
+        ));
+    };
+    if target_session_id != request.session_id {
         return Err(ProviderTurnAdapterError::InvalidFence("execution session"));
     }
     if launch.invocation.invocation.id != request.turn.spawn_invocation_id {

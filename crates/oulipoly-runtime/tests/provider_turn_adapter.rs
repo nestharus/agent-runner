@@ -296,6 +296,33 @@ fn external_request(start_mode: &str) -> ProviderTurnExecutionRequest {
     ProviderTurnExecutionRequest::ExternalProvider(request)
 }
 
+fn external_request_without_session_id(facade: bool) -> ProviderTurnExecutionRequest {
+    let request = if facade {
+        ExecutorServiceRequest::Facade {
+            model: model(),
+            provider_index: 4,
+            prompt: "external prompt".to_string(),
+            working_dir: None,
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        }
+    } else {
+        ExecutorServiceRequest::Effective {
+            model: model(),
+            provider: ProviderConfig::new("fixture-provider", vec!["--fixed".to_string()]),
+            provider_index: 4,
+            prompt_mode: PromptMode::Arg,
+            prompt: "external prompt".to_string(),
+            working_dir: None,
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: None,
+        }
+    };
+    ProviderTurnExecutionRequest::ExternalProvider(request)
+}
+
 fn mailbox(delivery_id: &str, sequence: i64, nonce: &str) -> MailboxBatchIdentity {
     MailboxBatchIdentity {
         session_id: SESSION.to_string(),
@@ -693,6 +720,48 @@ fn create_known_external_turn_is_supported_and_wrong_fences_do_not_execute() {
             11,
         )
         .unwrap();
+}
+
+#[test]
+fn external_turn_without_session_identity_reports_distinct_fence() {
+    for (sequence, facade) in [(1, true), (2, false)] {
+        let harness = start_harness();
+        let state = StateDb::open(&harness.path).unwrap();
+        let parent = seed_invocation(&state, PARENT_UUID, None);
+        let invocation = seed_invocation(&state, FIRST_UUID, Some(parent.invocation_row_id));
+        let executor = QueueExecutor::new([complete_outcome(execution_result(
+            SESSION,
+            "external prompt",
+            None,
+            true,
+            Vec::new(),
+        ))]);
+        let calls = executor.calls.clone();
+        let mut adapter = ProviderTurnAdapter::new(executor);
+        harness
+            .supervisor()
+            .notify(
+                SessionNotification::new(
+                    sequence,
+                    launch(
+                        "external-without-session",
+                        external_request_without_session_id(facade),
+                        invocation,
+                        MailboxBatchIdentity::empty(SESSION),
+                    ),
+                    turn(sequence, FIRST_UUID),
+                ),
+                10,
+            )
+            .unwrap();
+        let request = receive_turn(&harness.turns);
+
+        assert_eq!(
+            adapter.execute_once(&request).unwrap_err(),
+            ProviderTurnAdapterError::InvalidFence("execution session unavailable")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[test]
