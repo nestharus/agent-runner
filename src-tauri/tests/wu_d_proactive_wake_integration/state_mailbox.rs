@@ -401,7 +401,9 @@ fn delivered_non_owner_row(rows: &[MailboxRow]) -> &MailboxRow {
             row.delivered_by_invocation_uuid.is_some()
                 && row.delivered_by_invocation_uuid != row.owner_invocation_uuid
         })
-        .expect("delivered mailbox row")
+        .unwrap_or_else(|| {
+            panic!("no mailbox row was delivered by a non-owner invocation: {rows:?}")
+        })
 }
 
 fn assert_delivery_parent(parent_uuid: &Option<String>, owner_uuid: &str) {
