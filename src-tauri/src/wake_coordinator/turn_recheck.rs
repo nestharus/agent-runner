@@ -209,7 +209,9 @@ fn apply_failed_auto_wake_recheck_decision(
 }
 
 fn turn_end_pending_count(session_id: &str) -> Result<usize, String> {
-    let mut db = MailboxDb::open_default()?;
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return Ok(0);
+    };
     turn_end_pending_count_on(&mut db, session_id)
 }
 
