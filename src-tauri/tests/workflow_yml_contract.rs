@@ -196,6 +196,7 @@ fn assert_agent_bash_install_precedes_test(
     workflow_name: &str,
     job_name: &str,
     test_command: &str,
+    expected_condition: Option<&str>,
 ) {
     const INSTALL_ACTION: &str = "./.github/actions/install-agent-bash";
     let steps = job_steps(workflow, job_name, workflow_name);
@@ -206,6 +207,12 @@ fn assert_agent_bash_install_precedes_test(
     let test_index = require_step_index(
         step_index_by_run_text(steps, test_command),
         format_missing_test_command(workflow_name, job_name, test_command),
+    );
+    let install_step = &steps[install_index];
+    assert_eq!(
+        mapping_get(install_step, "if").and_then(Value::as_str),
+        expected_condition,
+        "{workflow_name} {job_name} agent-bash install condition must be {expected_condition:?}"
     );
     assert_step_order(
         install_index,
@@ -1065,12 +1072,23 @@ fn agent_bash_integration_dependency_is_pinned_in_test_workflows() {
 fn assert_agent_bash_action_is_pinned() {
     const AGENT_BASH_REV: &str = "2a435c4909d184bbac28873fcfb8afb72861ec2c";
     let action = read_text("../../.github/actions/install-agent-bash/action.yml");
-    assert_eq!(text_match_count(&action, AGENT_BASH_REV), 1);
-    assert_eq!(text_match_count(&action, "AGENT_BASH_BIN="), 1);
-}
-
-fn text_match_count(text: &str, pattern: &str) -> usize {
-    text.matches(pattern).count()
+    let revision_argument = Regex::new(&format!(
+        r"(?m)^\s*cargo\s+install\b[^\n]*\s--rev\s+{}(?:\s|$)",
+        regex::escape(AGENT_BASH_REV)
+    ))
+    .expect("agent-bash revision regex must compile");
+    assert!(
+        revision_argument.is_match(&action),
+        "install-agent-bash must pass the pinned revision to cargo install --rev"
+    );
+    let github_env_export = Regex::new(
+        r#"(?m)^\s*echo\s+["']AGENT_BASH_BIN=[^\n"']+["']\s*>>\s*["']\$GITHUB_ENV["']\s*$"#,
+    )
+    .expect("agent-bash GITHUB_ENV regex must compile");
+    assert!(
+        github_env_export.is_match(&action),
+        "install-agent-bash must export AGENT_BASH_BIN through GITHUB_ENV"
+    );
 }
 
 fn assert_agent_bash_test_workflow_ordering() {
@@ -1083,12 +1101,14 @@ fn assert_agent_bash_test_workflow_ordering() {
             workflow_name,
             "rust-client-check",
             "cargo test -p ${{ matrix.client.name }}",
+            Some("matrix.client.name == 'oulipoly-agent-runner'"),
         );
         assert_agent_bash_install_precedes_test(
             &workflow,
             workflow_name,
             "rust-integration",
             "cargo test --workspace",
+            None,
         );
     }
     let coverage = parse_workflow("../../.github/workflows/coverage.yml");
@@ -1097,6 +1117,7 @@ fn assert_agent_bash_test_workflow_ordering() {
         "coverage.yml",
         "rust-coverage",
         "cargo llvm-cov --workspace --no-report",
+        None,
     );
 }
 
