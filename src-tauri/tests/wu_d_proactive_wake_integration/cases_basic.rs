@@ -22,6 +22,7 @@ use crate::validators::{
 };
 use crate::wake_claim_setup::acquire_seed_wake_claim;
 use std::path::PathBuf;
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 const OUTER_SESSION: &str = "6169694d-de0f-40d1-890c-6e28e55bab28";
@@ -58,7 +59,7 @@ pub(crate) fn polled_completion_after_enqueue_does_not_wake_parent() {
     assert_terminal_poll(&poll);
     let session_id = wait_for_sidecar_session(&fixture, "mailbox");
     wait_for_late_consumed_reconciliation(&fixture, &session_id);
-    assert_late_consumed_completion_outcome(&fixture, &session_id);
+    assert_late_consumed_completion_outcome(&fixture, &session_id, &initial);
 }
 
 pub(crate) fn consumed_completion_preserves_unpolled_completion_wake() {
@@ -157,7 +158,7 @@ fn pending_mailbox_rows_are_empty(rows: Vec<oulipoly_state::mailbox::MailboxRow>
     rows.is_empty()
 }
 
-fn assert_late_consumed_completion_outcome(fixture: &Fixture, session_id: &str) {
+fn assert_late_consumed_completion_outcome(fixture: &Fixture, session_id: &str, initial: &Output) {
     let rows = fixture.mailbox().list_mailbox(session_id, true).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].delivery_attempts, 1);
@@ -175,7 +176,13 @@ fn assert_late_consumed_completion_outcome(fixture: &Fixture, session_id: &str) 
         listeners[0].acknowledgement_reason.as_deref(),
         Some("consumed_in_call")
     );
-    std::thread::sleep(Duration::from_millis(300));
+    let stderr = String::from_utf8_lossy(&initial.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "late_consumed_completion_acknowledged session_id={session_id}"
+        )),
+        "missing late-consumption acknowledgement in stderr: {stderr}"
+    );
     assert_eq!(invocation_count(fixture), 2);
     assert_prompt_file_missing(fixture, "late-consumed-resumed-input.txt");
     assert_no_wake_claim(fixture, session_id);
