@@ -10,8 +10,10 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SIDECAR_DB_NAME: &str = "pid-identity.db";
+const WRITABLE_CONNECTION_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessIdentity {
@@ -91,6 +93,7 @@ impl PidIdentityDb {
         ensure_parent_dir(path)?;
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
+        configure_writable_connection(&conn)?;
         set_wal_mode(&conn)?;
         ensure_identity_schema(&conn)?;
         Ok(Self {
@@ -259,6 +262,11 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
 fn set_wal_mode(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")
         .map_err(|err| format!("Failed to set PID identity sidecar WAL mode: {err}"))
+}
+
+pub(crate) fn configure_writable_connection(conn: &Connection) -> Result<(), String> {
+    conn.busy_timeout(WRITABLE_CONNECTION_BUSY_TIMEOUT)
+        .map_err(|err| format!("Failed to configure PID sidecar busy timeout: {err}"))
 }
 
 pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
@@ -584,6 +592,25 @@ mod tests {
             model_name: Some("fixture~high"),
             recorded_at: "2026-06-04T12:00:00Z",
         }
+    }
+
+    #[test]
+    fn writable_sidecar_policy_sets_bounded_busy_timeout() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        configure_writable_connection(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5_000
+        );
     }
 
     #[test]

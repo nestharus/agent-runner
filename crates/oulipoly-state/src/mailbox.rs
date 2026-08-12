@@ -797,6 +797,7 @@ impl MailboxDb {
         ensure_parent_dir(path)?;
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
+        pid_identity::configure_writable_connection(&conn)?;
         set_wal_mode(&conn)?;
         pid_identity::ensure_identity_schema(&conn)?;
         ensure_mailbox_schema(&conn)?;

@@ -4,6 +4,7 @@ mod fixtures;
 
 use fixtures::initiative_06_schema_probe::*;
 use oulipoly_state::{ReadOnlyOpenError, StateDb};
+use std::process::Command;
 
 /// Risk: T1 — Schema-probe success on current-schema DB returns full JSON with `compatible: true`, `safe_for_import_replace` per features.
 /// Level: particular-integration.
@@ -26,7 +27,15 @@ fn schema_probe_current_schema_db_emits_compatible_report() {
     let json = parse_stdout_json(&output);
     assert_eq!(json["binary"]["name"], "oulipoly-agent-runner");
     assert!(!json["binary"]["version"].as_str().unwrap().is_empty());
-    assert!(json["binary"]["commit"].as_str().is_some());
+    let source_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(source_head.status.success(), "{source_head:?}");
+    assert_eq!(
+        json["binary"]["commit"],
+        String::from_utf8(source_head.stdout).unwrap().trim()
+    );
     assert_eq!(
         json["state_db"]["path"],
         fixture.db_path().to_string_lossy().as_ref()
