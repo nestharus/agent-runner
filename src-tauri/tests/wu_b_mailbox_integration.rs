@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use chrono::{DateTime, Utc};
+use fs4::FileExt;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
     RuntimeLifecycleState, RuntimeTerminalReason, SessionRuntimeUpsert, SubmittedInputEnqueue,
@@ -661,6 +662,77 @@ fn completion_registration_rejects_mismatched_running_owner_sidecar() {
             .unwrap()
             .contains("is not bound")
     );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn command_registration_over_bound_fails_closed_and_replay_is_idempotent() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-command-over-bound",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
+    let sidecar_path = fixture.sidecar_path();
+    let lock_path = sidecar_path.with_extension("registration.lock");
+    fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    FileExt::lock(&lock).unwrap();
+
+    let output = fixture.run_register_artifacts("h-command-over-bound", "async", &artifacts);
+
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    let json = stdout_json(&output);
+    assert_eq!(json["status"], "notification_event_error");
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap()
+            .contains("timed out after 5000ms")
+    );
+    assert!(!sidecar_path.exists());
+    assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+    assert!(mailbox.session_runtime(SESSION_A).unwrap().is_none());
+    assert!(
+        mailbox
+            .completion_event("h-command-over-bound")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        mailbox
+            .completion_event_listeners("h-command-over-bound")
+            .unwrap()
+            .is_empty()
+    );
+    drop(mailbox);
+
+    FileExt::unlock(&lock).unwrap();
+    drop(lock);
+    let inserted = fixture.run_register_artifacts("h-command-over-bound", "async", &artifacts);
+    let replay = fixture.run_register_artifacts("h-command-over-bound", "async", &artifacts);
+
+    assert!(inserted.status.success(), "{inserted:?}");
+    assert!(replay.status.success(), "{replay:?}");
+    assert_eq!(stdout_json(&inserted)["status"], "registered");
+    assert_eq!(stdout_json(&replay)["status"], "already_registered");
+    let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+    assert_eq!(
+        mailbox
+            .completion_event_listeners("h-command-over-bound")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(mailbox.session_runtime(SESSION_A).unwrap().is_none());
     fixture.assert_default_user_paths_untouched();
 }
 

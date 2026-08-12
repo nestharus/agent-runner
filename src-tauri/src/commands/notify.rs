@@ -220,17 +220,20 @@ fn register_completion_event(
     let owner = parse_owner_binding(&metadata)?;
     validate_owner_binding(&owner, &metadata)?;
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
-    let mut mailbox = MailboxDb::open_default()?;
-    mailbox.register_completion_event(CompletionEventRegistrationInput {
-        event_id: args.handle,
-        delivery_mode: args.delivery_mode,
-        owner_session_id: Some(owner.session_id.as_str()),
-        owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
-        state_dir: &paths.state_dir,
-        meta_path: &paths.meta_path,
-        log_path: &paths.log_path,
-        rc_path: &paths.rc_path,
-    })
+    let mailbox_path = MailboxDb::default_path()?;
+    MailboxDb::register_completion_event(
+        &mailbox_path,
+        CompletionEventRegistrationInput {
+            event_id: args.handle,
+            delivery_mode: args.delivery_mode,
+            owner_session_id: Some(owner.session_id.as_str()),
+            owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
+            state_dir: &paths.state_dir,
+            meta_path: &paths.meta_path,
+            log_path: &paths.log_path,
+            rc_path: &paths.rc_path,
+        },
+    )
 }
 
 fn activate_completion_event(

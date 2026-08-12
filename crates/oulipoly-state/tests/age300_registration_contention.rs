@@ -38,11 +38,9 @@ fn locked_registration_file(db_path: &Path) -> File {
 }
 
 #[test]
-fn registration_burst_waits_behind_the_current_registration_writer() {
+fn concurrent_registration_entrypoints_open_and_insert_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pid-identity.db");
-    drop(MailboxDb::open(&path).unwrap());
-    let lock = locked_registration_file(&path);
     let start = Arc::new(Barrier::new(REGISTRATIONS + 1));
     let (result_tx, result_rx) = mpsc::channel();
     let mut workers = Vec::new();
@@ -52,25 +50,14 @@ fn registration_burst_waits_behind_the_current_registration_writer() {
         let result_tx = result_tx.clone();
         workers.push(std::thread::spawn(move || {
             let event_id = format!("ab_age_300_burst_{index}");
-            let mut mailbox = MailboxDb::open(&path).unwrap();
             start.wait();
-            let result = mailbox.register_completion_event(registration(&event_id));
+            let result = MailboxDb::register_completion_event(&path, registration(&event_id));
             result_tx.send((event_id, result)).unwrap();
         }));
     }
     drop(result_tx);
 
     start.wait();
-    match result_rx.recv_timeout(Duration::from_millis(250)) {
-        Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Err(err) => panic!("registration result channel failed: {err}"),
-        Ok((event_id, result)) => {
-            panic!("{event_id} bypassed the active registration writer: {result:?}")
-        }
-    }
-    FileExt::unlock(&lock).unwrap();
-    drop(lock);
-
     for _ in 0..REGISTRATIONS {
         let (event_id, result) = result_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let result = result.unwrap_or_else(|err| panic!("{event_id} failed: {err}"));
@@ -80,20 +67,34 @@ fn registration_burst_waits_behind_the_current_registration_writer() {
     for worker in workers {
         worker.join().unwrap();
     }
+
+    let mailbox = MailboxDb::open(&path).unwrap();
+    for index in 0..REGISTRATIONS {
+        let event_id = format!("ab_age_300_burst_{index}");
+        assert!(mailbox.completion_event(&event_id).unwrap().is_some());
+        assert_eq!(
+            mailbox.completion_event_listeners(&event_id).unwrap().len(),
+            1
+        );
+    }
 }
 
 #[test]
 fn registration_uses_only_the_remaining_shared_wait_budget_for_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pid-identity.db");
-    let mut mailbox = MailboxDb::open(&path).unwrap();
+    drop(MailboxDb::open(&path).unwrap());
     let lock = locked_registration_file(&path);
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
     let (result_tx, result_rx) = mpsc::channel();
+    let registration_path = path.clone();
     let registration = std::thread::spawn(move || {
         let started = Instant::now();
-        let result = mailbox.register_completion_event(registration("ab_age_300_shared_budget"));
+        let result = MailboxDb::register_completion_event(
+            &registration_path,
+            registration("ab_age_300_shared_budget"),
+        );
         result_tx.send((started.elapsed(), result)).unwrap();
     });
 
@@ -110,19 +111,91 @@ fn registration_uses_only_the_remaining_shared_wait_budget_for_sqlite() {
     );
     assert!(elapsed >= Duration::from_millis(4_500), "{elapsed:?}");
     assert!(elapsed < Duration::from_secs(7), "{elapsed:?}");
+    let mailbox = MailboxDb::open(&path).unwrap();
+    assert!(
+        mailbox
+            .completion_event("ab_age_300_shared_budget")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn sustained_later_arrivals_keep_independent_bounds_and_fail_closed() {
+    const LATER_ARRIVALS: usize = 4;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pid-identity.db");
+    drop(MailboxDb::open(&path).unwrap());
+    let lock = locked_registration_file(&path);
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+
+    for index in 0..=LATER_ARRIVALS {
+        let path = path.clone();
+        let result_tx = result_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1_000 * index as u64));
+            let event_id = format!("ab_age_300_arrival_{index}");
+            let started = Instant::now();
+            let result = MailboxDb::register_completion_event(&path, registration(&event_id));
+            result_tx
+                .send((index, event_id, started.elapsed(), result))
+                .unwrap();
+        }));
+    }
+    drop(result_tx);
+
+    let (index, event_id, elapsed, result) =
+        result_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(index, 0);
+    assert!(result.unwrap_err().contains("timed out after 5000ms"));
+    assert!(
+        elapsed >= Duration::from_millis(4_500),
+        "{event_id}: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(7), "{event_id}: {elapsed:?}");
+
+    FileExt::unlock(&lock).unwrap();
+    drop(lock);
+    for _ in 0..LATER_ARRIVALS {
+        let (index, event_id, elapsed, result) =
+            result_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = result.unwrap_or_else(|err| panic!("{event_id} failed: {err}"));
+        assert!(index > 0);
+        assert!(elapsed < Duration::from_secs(7), "{event_id}: {elapsed:?}");
+        assert!(result.inserted);
+        assert_eq!(result.listeners.len(), 1);
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let mailbox = MailboxDb::open(&path).unwrap();
+    assert!(
+        mailbox
+            .completion_event("ab_age_300_arrival_0")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        mailbox
+            .completion_event_listeners("ab_age_300_arrival_0")
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn registration_lock_timeout_fails_closed_and_replay_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pid-identity.db");
-    let mut mailbox = MailboxDb::open(&path).unwrap();
+    drop(MailboxDb::open(&path).unwrap());
     let lock_path = registration_lock_path(&path);
     let lock = locked_registration_file(&path);
 
     let started = Instant::now();
-    let err = mailbox
-        .register_completion_event(registration("ab_age_300_over_bound"))
+    let err = MailboxDb::register_completion_event(&path, registration("ab_age_300_over_bound"))
         .unwrap_err();
     let elapsed = started.elapsed();
 
@@ -134,7 +207,8 @@ fn registration_lock_timeout_fails_closed_and_replay_is_idempotent() {
         )
     );
     assert!(elapsed >= Duration::from_millis(4_500), "{elapsed:?}");
-    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(7), "{elapsed:?}");
+    let mailbox = MailboxDb::open(&path).unwrap();
     assert!(
         mailbox
             .completion_event("ab_age_300_over_bound")
@@ -150,14 +224,12 @@ fn registration_lock_timeout_fails_closed_and_replay_is_idempotent() {
 
     FileExt::unlock(&lock).unwrap();
     drop(lock);
-    let inserted = mailbox
-        .register_completion_event(registration("ab_age_300_over_bound"))
-        .unwrap();
+    let inserted =
+        MailboxDb::register_completion_event(&path, registration("ab_age_300_over_bound")).unwrap();
     assert!(inserted.inserted);
     assert_eq!(inserted.listeners.len(), 1);
-    let replay = mailbox
-        .register_completion_event(registration("ab_age_300_over_bound"))
-        .unwrap();
+    let replay =
+        MailboxDb::register_completion_event(&path, registration("ab_age_300_over_bound")).unwrap();
     assert!(!replay.inserted);
     assert_eq!(replay.listeners.len(), 1);
 }

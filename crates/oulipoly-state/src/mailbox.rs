@@ -783,6 +783,8 @@ struct CompletionRegistrationLock {
 
 impl CompletionRegistrationLock {
     fn acquire(db_path: &Path) -> Result<Self, String> {
+        let deadline = Instant::now() + COMPLETION_REGISTRATION_LOCK_WAIT;
+        ensure_parent_dir(db_path)?;
         let path = db_path.with_extension("registration.lock");
         let file = OpenOptions::new()
             .read(true)
@@ -796,10 +798,16 @@ impl CompletionRegistrationLock {
                     path.display()
                 )
             })?;
-        let deadline = Instant::now() + COMPLETION_REGISTRATION_LOCK_WAIT;
         loop {
             match FileExt::try_lock(&file) {
-                Ok(()) => return Ok(Self { file, deadline }),
+                Ok(()) if Instant::now() < deadline => return Ok(Self { file, deadline }),
+                Ok(()) => {
+                    return Err(format!(
+                        "Failed to acquire completion event registration lock {}: timed out after {}ms",
+                        path.display(),
+                        COMPLETION_REGISTRATION_LOCK_WAIT.as_millis()
+                    ));
+                }
                 Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                     thread::sleep(COMPLETION_REGISTRATION_LOCK_POLL);
                 }
@@ -822,6 +830,18 @@ impl CompletionRegistrationLock {
 
     fn remaining(&self) -> StdDuration {
         self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    fn bound_sqlite_phase(&self, conn: &Connection, phase: &str) -> Result<(), String> {
+        let remaining = self.remaining();
+        if remaining.is_zero() {
+            return Err(format!(
+                "Failed to {phase}: completion event registration timed out after {}ms",
+                COMPLETION_REGISTRATION_LOCK_WAIT.as_millis()
+            ));
+        }
+        conn.busy_timeout(remaining)
+            .map_err(|err| format!("Failed to bound {phase}: {err}"))
     }
 }
 
@@ -1708,36 +1728,39 @@ impl MailboxDb {
     }
 
     pub fn register_completion_event(
-        &mut self,
+        path: &Path,
         input: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        validate_completion_event_registration(&input)?;
-        let registration_lock = CompletionRegistrationLock::acquire(&self.path)?;
-        let original_busy_timeout = connection_busy_timeout(&self.conn)?;
-        self.conn
-            .busy_timeout(registration_lock.remaining())
-            .map_err(|err| format!("Failed to bound completion event registration wait: {err}"))?;
-        let result = self.register_completion_event_transaction(input);
-        if let Err(err) = self.conn.busy_timeout(original_busy_timeout) {
-            tracing::warn!(
-                error = %err,
-                "failed to restore PID mailbox busy timeout after completion event registration"
-            );
-        }
-        result
+        Self::register_completion_event_with_hooks(path, input, || {}, || {})
     }
 
-    fn register_completion_event_transaction(
-        &mut self,
+    fn register_completion_event_with_hooks(
+        path: &Path,
         input: CompletionEventRegistrationInput<'_>,
+        admitted: impl FnOnce(),
+        before_commit: impl FnOnce(),
     ) -> Result<CompletionEventRegistrationResult, String> {
-        let now = now_rfc3339();
-        let tx = self
-            .conn
+        validate_completion_event_registration(&input)?;
+        let registration_lock = CompletionRegistrationLock::acquire(path)?;
+        admitted();
+        let mut conn = Connection::open(path).map_err(|err| {
+            format!("Failed to open PID mailbox sidecar for completion event registration: {err}")
+        })?;
+        registration_lock.bound_sqlite_phase(&conn, "set durable PID mailbox sidecar mode")?;
+        set_wal_mode(&conn)?;
+        registration_lock
+            .bound_sqlite_phase(&conn, "start completion event registration transaction")?;
+        let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| {
                 format!("Failed to start completion event registration transaction: {err}")
             })?;
+        registration_lock.bound_sqlite_phase(&tx, "ensure PID identity sidecar schema")?;
+        pid_identity::ensure_identity_schema(&tx)?;
+        registration_lock.bound_sqlite_phase(&tx, "ensure PID mailbox sidecar schema")?;
+        ensure_mailbox_schema(&tx)?;
+        registration_lock.bound_sqlite_phase(&tx, "write completion event registration")?;
+        let now = now_rfc3339();
         let existing = completion_event_by_id_on(&tx, input.event_id)?;
         let inserted = if let Some(existing) = existing.as_ref() {
             validate_completion_event_registration_replay(existing, &input)?;
@@ -1752,9 +1775,18 @@ impl MailboxDb {
             existing.is_some_and(|event| event.state == "triggered"),
             &now,
         )?;
+        let event = completion_event_by_id_on(&tx, input.event_id)?
+            .ok_or_else(|| format!("Completion event {} disappeared", input.event_id))?;
+        let listeners = completion_event_listeners_on(&tx, input.event_id)?;
+        before_commit();
+        registration_lock.bound_sqlite_phase(&tx, "commit completion event registration")?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
-        self.completion_event_registration(input.event_id, inserted)
+        Ok(CompletionEventRegistrationResult {
+            inserted,
+            event,
+            listeners,
+        })
     }
 
     pub fn activate_completion_event_listeners(
@@ -1859,22 +1891,6 @@ impl MailboxDb {
         resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
         commit_consumed_completion_acknowledgement(tx)?;
         Ok(Some(binding.event_id))
-    }
-
-    fn completion_event_registration(
-        &self,
-        event_id: &str,
-        inserted: bool,
-    ) -> Result<CompletionEventRegistrationResult, String> {
-        let event = self
-            .completion_event(event_id)?
-            .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
-        let listeners = self.completion_event_listeners(event_id)?;
-        Ok(CompletionEventRegistrationResult {
-            inserted,
-            event,
-            listeners,
-        })
     }
 
     fn completion_event_trigger_result(
@@ -6357,12 +6373,6 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
         .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
 }
 
-fn connection_busy_timeout(conn: &Connection) -> Result<StdDuration, String> {
-    conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u32>(0))
-        .map(|millis| StdDuration::from_millis(millis.into()))
-        .map_err(|err| format!("Failed to read PID mailbox busy timeout: {err}"))
-}
-
 fn mailbox_schema_definition() -> &'static str {
     "CREATE TABLE IF NOT EXISTS mailbox (
             seq                          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6993,18 +7003,19 @@ mod tests {
     fn completion_registration_lock_open_failure_names_the_operation_and_path() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
-        let mut db = MailboxDb::open(&path).unwrap();
         let lock_path = path.with_extension("registration.lock");
         fs::create_dir(&lock_path).unwrap();
 
-        let error = db
-            .register_completion_event(completion_registration(
+        let error = MailboxDb::register_completion_event(
+            &path,
+            completion_registration(
                 "ab_lock_open_failure",
                 "async",
                 "session-a",
                 "11111111-1111-4111-8111-111111111111",
-            ))
-            .unwrap_err();
+            ),
+        )
+        .unwrap_err();
 
         assert_eq!(
             error,
@@ -7013,10 +7024,111 @@ mod tests {
                 lock_path.display()
             )
         );
-        assert!(
-            db.completion_event("ab_lock_open_failure")
-                .unwrap()
-                .is_none()
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn completion_registration_holds_admission_before_writable_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let lock_path = path.with_extension("registration.lock");
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let registration_path = path.clone();
+        let registration = std::thread::spawn(move || {
+            MailboxDb::register_completion_event_with_hooks(
+                &registration_path,
+                completion_registration(
+                    "ab_admission_before_open",
+                    "async",
+                    "session-a",
+                    "11111111-1111-4111-8111-111111111111",
+                ),
+                || {
+                    admitted_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                },
+                || {},
+            )
+        });
+
+        admitted_rx.recv().unwrap();
+        assert!(!path.exists());
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
+        continue_tx.send(()).unwrap();
+
+        let result = registration.join().unwrap().unwrap();
+        assert!(result.inserted);
+        assert_eq!(result.listeners.len(), 1);
+    }
+
+    #[test]
+    fn completion_registration_holds_admission_through_atomic_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        drop(MailboxDb::open(&path).unwrap());
+        let lock_path = path.with_extension("registration.lock");
+        let (before_commit_tx, before_commit_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let registration_path = path.clone();
+        let registration = std::thread::spawn(move || {
+            MailboxDb::register_completion_event_with_hooks(
+                &registration_path,
+                completion_registration(
+                    "ab_admission_through_commit",
+                    "async",
+                    "session-a",
+                    "11111111-1111-4111-8111-111111111111",
+                ),
+                || {},
+                || {
+                    before_commit_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                },
+            )
+        });
+
+        before_commit_rx.recv().unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
+        let reader = Connection::open(&path).unwrap();
+        let visible: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM completion_event WHERE event_id = ?1",
+                ["ab_admission_through_commit"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(visible, 0);
+        continue_tx.send(()).unwrap();
+
+        let result = registration.join().unwrap().unwrap();
+        assert!(result.inserted);
+        assert_eq!(result.listeners.len(), 1);
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_event WHERE event_id = ?1",
+                    ["ab_admission_through_commit"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 
@@ -7101,23 +7213,17 @@ mod tests {
         let first_invocation = "11111111-1111-4111-8111-111111111111";
         let second_invocation = "22222222-2222-4222-8222-222222222222";
 
-        let first = db
-            .register_completion_event(completion_registration(
-                event_id,
-                "async",
-                "session-a",
-                first_invocation,
-            ))
-            .unwrap();
+        let first = MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(event_id, "async", "session-a", first_invocation),
+        )
+        .unwrap();
         assert!(first.inserted);
-        let replay = db
-            .register_completion_event(completion_registration(
-                event_id,
-                "async",
-                "session-b",
-                second_invocation,
-            ))
-            .unwrap();
+        let replay = MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(event_id, "async", "session-b", second_invocation),
+        )
+        .unwrap();
         assert!(!replay.inserted);
         assert_eq!(replay.listeners.len(), 2);
 
@@ -7185,14 +7291,16 @@ mod tests {
         assert!(first.acknowledged_at.is_some());
         assert_eq!(first.acknowledgement_reason.as_deref(), Some("injected"));
         assert!(second.acknowledged_at.is_none());
-        let late_listener = db
-            .register_completion_event(completion_registration(
+        let late_listener = MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
                 event_id,
                 "async",
                 "session-c",
                 "33333333-3333-4333-8333-333333333333",
-            ))
-            .unwrap_err();
+            ),
+        )
+        .unwrap_err();
         assert!(late_listener.contains("after it was triggered"));
     }
 
@@ -7201,16 +7309,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let event_id = "ab_identity";
-        db.register_completion_event(completion_registration(
-            event_id,
-            "async",
-            "session-a",
-            "11111111-1111-4111-8111-111111111111",
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                event_id,
+                "async",
+                "session-a",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+        )
         .unwrap();
 
-        let registration_error = db
-            .register_completion_event(CompletionEventRegistrationInput {
+        let registration_error = MailboxDb::register_completion_event(
+            db.path(),
+            CompletionEventRegistrationInput {
                 delivery_mode: "sync",
                 ..completion_registration(
                     event_id,
@@ -7218,8 +7330,9 @@ mod tests {
                     "session-a",
                     "11111111-1111-4111-8111-111111111111",
                 )
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
         assert!(registration_error.contains("conflicts with its durable identity"));
 
         let trigger_error = db
@@ -7243,11 +7356,12 @@ mod tests {
     #[test]
     fn completion_event_registration_requires_an_owner() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let event_id = "ab_ownerless";
 
-        let error = db
-            .register_completion_event(CompletionEventRegistrationInput {
+        let error = MailboxDb::register_completion_event(
+            db.path(),
+            CompletionEventRegistrationInput {
                 owner_session_id: None,
                 owner_invocation_uuid: None,
                 ..completion_registration(
@@ -7256,8 +7370,9 @@ mod tests {
                     "session-a",
                     "11111111-1111-4111-8111-111111111111",
                 )
-            })
-            .unwrap_err();
+            },
+        )
+        .unwrap_err();
 
         assert!(error.contains("both required"));
         assert!(db.completion_event(event_id).unwrap().is_none());
@@ -7268,12 +7383,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let event_id = "ab_sync";
-        db.register_completion_event(completion_registration(
-            event_id,
-            "sync",
-            "session-a",
-            "11111111-1111-4111-8111-111111111111",
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                event_id,
+                "sync",
+                "session-a",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+        )
         .unwrap();
 
         let triggered = db
@@ -7297,12 +7415,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let event_id = "ab_consumed";
-        db.register_completion_event(completion_registration(
-            event_id,
-            "async",
-            "session-a",
-            "11111111-1111-4111-8111-111111111111",
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                event_id,
+                "async",
+                "session-a",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+        )
         .unwrap();
 
         let triggered = db
@@ -7329,12 +7450,10 @@ mod tests {
         let event_id = "ab_consumed_replay";
         let invocation_uuid = "11111111-1111-4111-8111-111111111111";
         let payload = r#"{"schema_version":2,"handle":"ab_consumed_replay"}"#;
-        db.register_completion_event(completion_registration(
-            event_id,
-            "async",
-            "session-a",
-            invocation_uuid,
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(event_id, "async", "session-a", invocation_uuid),
+        )
         .unwrap();
         let triggered = db
             .trigger_completion_event(completion_trigger(event_id, payload, false))
@@ -7399,19 +7518,25 @@ mod tests {
     }
 
     fn seed_late_consumed_listeners(db: &mut MailboxDb) -> (i64, i64) {
-        db.register_completion_event(completion_registration(
-            LATE_CONSUMED_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                LATE_CONSUMED_EVENT_ID,
+                "async",
+                "session-a",
+                LATE_CONSUMED_INVOCATION_UUID,
+            ),
+        )
         .unwrap();
-        db.register_completion_event(completion_registration(
-            LATE_CONSUMED_EVENT_ID,
-            "async",
-            "session-b",
-            LATE_CONSUMED_SIBLING_INVOCATION_UUID,
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                LATE_CONSUMED_EVENT_ID,
+                "async",
+                "session-b",
+                LATE_CONSUMED_SIBLING_INVOCATION_UUID,
+            ),
+        )
         .unwrap();
         let triggered = db
             .trigger_completion_event(completion_trigger(
@@ -7436,12 +7561,15 @@ mod tests {
     }
 
     fn seed_unrelated_pending_completion(db: &mut MailboxDb, consumed_seq: i64) {
-        db.register_completion_event(completion_registration(
-            UNRELATED_PENDING_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                UNRELATED_PENDING_EVENT_ID,
+                "async",
+                "session-a",
+                LATE_CONSUMED_INVOCATION_UUID,
+            ),
+        )
         .unwrap();
         let unrelated = db
             .trigger_completion_event(completion_trigger(
@@ -7470,12 +7598,15 @@ mod tests {
     }
 
     fn seed_unrelated_completed_attempt(db: &mut MailboxDb) {
-        db.register_completion_event(completion_registration(
-            UNRELATED_COMPLETED_EVENT_ID,
-            "async",
-            "session-a",
-            LATE_CONSUMED_INVOCATION_UUID,
-        ))
+        MailboxDb::register_completion_event(
+            db.path(),
+            completion_registration(
+                UNRELATED_COMPLETED_EVENT_ID,
+                "async",
+                "session-a",
+                LATE_CONSUMED_INVOCATION_UUID,
+            ),
+        )
         .unwrap();
         let unrelated_completed = db
             .trigger_completion_event(completion_trigger(

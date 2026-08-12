@@ -229,18 +229,21 @@ fn format_consumed_completion_fixture_owner() -> String {
 fn seed_consumed_completion_fixture_mailbox(paths: &ConsumedCompletionFixturePaths) {
     use oulipoly_state::mailbox::{CompletionEventRegistrationInput, CompletionEventTriggerInput};
 
-    let mut db = MailboxDb::open(&paths.db_path).unwrap();
-    db.register_completion_event(CompletionEventRegistrationInput {
-        event_id: ConsumedCompletionFixture::EVENT_ID,
-        delivery_mode: "async",
-        owner_session_id: Some(ConsumedCompletionFixture::SESSION_ID),
-        owner_invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
-        state_dir: &paths.state_dir_text,
-        meta_path: &paths.meta_path,
-        log_path: &paths.log_path,
-        rc_path: &paths.rc_path,
-    })
+    MailboxDb::register_completion_event(
+        &paths.db_path,
+        CompletionEventRegistrationInput {
+            event_id: ConsumedCompletionFixture::EVENT_ID,
+            delivery_mode: "async",
+            owner_session_id: Some(ConsumedCompletionFixture::SESSION_ID),
+            owner_invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
+            state_dir: &paths.state_dir_text,
+            meta_path: &paths.meta_path,
+            log_path: &paths.log_path,
+            rc_path: &paths.rc_path,
+        },
+    )
     .unwrap();
+    let mut db = MailboxDb::open(&paths.db_path).unwrap();
     db.trigger_completion_event(CompletionEventTriggerInput {
         event_id: ConsumedCompletionFixture::EVENT_ID,
         payload_json: r#"{"schema_version":2,"handle":"ab_late_consumed_fixture"}"#,

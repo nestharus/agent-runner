@@ -147,8 +147,9 @@ impl Fixture {
 
         let artifacts = self.seed_mailbox_artifacts(event_id);
         write_seed_mailbox_artifacts(&artifacts, event_id);
-        mailbox
-            .register_completion_event(CompletionEventRegistrationInput {
+        MailboxDb::register_completion_event(
+            mailbox.path(),
+            CompletionEventRegistrationInput {
                 event_id,
                 delivery_mode: "async",
                 owner_session_id: Some(session_id),
@@ -157,8 +158,9 @@ impl Fixture {
                 meta_path: &artifacts.meta_s,
                 log_path: &artifacts.log_s,
                 rc_path: &artifacts.rc_s,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
     }
 
     pub(crate) fn seed_session_turn(&self) {
