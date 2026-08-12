@@ -8,6 +8,7 @@
 //! the versioned `state.db` schema.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use fs4::{FileExt, TryLockError};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -17,6 +18,8 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
@@ -30,6 +33,8 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
+const COMPLETION_REGISTRATION_LOCK_WAIT: StdDuration = StdDuration::from_secs(5);
+const COMPLETION_REGISTRATION_LOCK_POLL: StdDuration = StdDuration::from_millis(10);
 const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, enqueued_at,
     delivered_at, delivered_by_invocation_uuid, delivery_attempts,
     delivery_error, owner_invocation_uuid, matched_os_pid,
@@ -771,6 +776,61 @@ enum BoundedMailboxRowsError {
     Row(rusqlite::Error),
 }
 
+struct CompletionRegistrationLock {
+    file: File,
+    deadline: Instant,
+}
+
+impl CompletionRegistrationLock {
+    fn acquire(db_path: &Path) -> Result<Self, String> {
+        let path = db_path.with_extension("registration.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| {
+                format!(
+                    "Failed to open completion event registration lock {}: {err}",
+                    path.display()
+                )
+            })?;
+        let deadline = Instant::now() + COMPLETION_REGISTRATION_LOCK_WAIT;
+        loop {
+            match FileExt::try_lock(&file) {
+                Ok(()) => return Ok(Self { file, deadline }),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(COMPLETION_REGISTRATION_LOCK_POLL);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "Failed to acquire completion event registration lock {}: timed out after {}ms",
+                        path.display(),
+                        COMPLETION_REGISTRATION_LOCK_WAIT.as_millis()
+                    ));
+                }
+                Err(TryLockError::Error(err)) => {
+                    return Err(format!(
+                        "Failed to acquire completion event registration lock {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    fn remaining(&self) -> StdDuration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+impl Drop for CompletionRegistrationLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
 impl MailboxDb {
     pub fn path_for_state_db(state_db_path: &Path) -> PathBuf {
         state_db_path.with_file_name("pid-identity.db")
@@ -797,7 +857,6 @@ impl MailboxDb {
         ensure_parent_dir(path)?;
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
-        pid_identity::configure_writable_connection(&conn)?;
         set_wal_mode(&conn)?;
         pid_identity::ensure_identity_schema(&conn)?;
         ensure_mailbox_schema(&conn)?;
@@ -1653,6 +1712,25 @@ impl MailboxDb {
         input: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
         validate_completion_event_registration(&input)?;
+        let registration_lock = CompletionRegistrationLock::acquire(&self.path)?;
+        let original_busy_timeout = connection_busy_timeout(&self.conn)?;
+        self.conn
+            .busy_timeout(registration_lock.remaining())
+            .map_err(|err| format!("Failed to bound completion event registration wait: {err}"))?;
+        let result = self.register_completion_event_transaction(input);
+        if let Err(err) = self.conn.busy_timeout(original_busy_timeout) {
+            tracing::warn!(
+                error = %err,
+                "failed to restore PID mailbox busy timeout after completion event registration"
+            );
+        }
+        result
+    }
+
+    fn register_completion_event_transaction(
+        &mut self,
+        input: CompletionEventRegistrationInput<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
         let now = now_rfc3339();
         let tx = self
             .conn
@@ -6279,6 +6357,12 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
         .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
 }
 
+fn connection_busy_timeout(conn: &Connection) -> Result<StdDuration, String> {
+    conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u32>(0))
+        .map(|millis| StdDuration::from_millis(millis.into()))
+        .map_err(|err| format!("Failed to read PID mailbox busy timeout: {err}"))
+}
+
 fn mailbox_schema_definition() -> &'static str {
     "CREATE TABLE IF NOT EXISTS mailbox (
             seq                          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6903,6 +6987,37 @@ mod tests {
             log_path: "/tmp/state/log",
             rc_path: "/tmp/state/rc",
         }
+    }
+
+    #[test]
+    fn completion_registration_lock_open_failure_names_the_operation_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let lock_path = path.with_extension("registration.lock");
+        fs::create_dir(&lock_path).unwrap();
+
+        let error = db
+            .register_completion_event(completion_registration(
+                "ab_lock_open_failure",
+                "async",
+                "session-a",
+                "11111111-1111-4111-8111-111111111111",
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            format!(
+                "Failed to open completion event registration lock {}: Is a directory (os error 21)",
+                lock_path.display()
+            )
+        );
+        assert!(
+            db.completion_event("ab_lock_open_failure")
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn completion_trigger<'a>(
