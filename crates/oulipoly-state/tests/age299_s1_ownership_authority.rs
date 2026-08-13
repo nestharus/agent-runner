@@ -1614,10 +1614,7 @@ fn invalid_utf8_statement(statement: &str, field: &str) -> String {
     let parameter = format!("?{}", field_index(field) + 1);
     statement.replacen(
         &parameter,
-        &format!(
-            "CASE WHEN {parameter} IS NULL \
-             THEN CAST(X'80' AS TEXT) ELSE CAST(X'80' AS TEXT) END"
-        ),
+        &format!("COALESCE(CAST(X'80' AS TEXT), {parameter})"),
         1,
     )
 }
