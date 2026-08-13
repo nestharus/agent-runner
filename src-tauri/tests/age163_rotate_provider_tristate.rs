@@ -11,11 +11,13 @@ fn cmd() -> (Command, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
     command
+        .current_dir(dir.path())
         .env("OULIPOLY_DATA_DIR", dir.path().join("app-data"))
         .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
         .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
         .env("XDG_STATE_HOME", dir.path().join("xdg-state"))
-        .env("HOME", dir.path().join("home"));
+        .env("HOME", dir.path().join("home"))
+        .env_remove("OULIPOLY_PARENT_INVOCATION");
     (command, dir)
 }
 
