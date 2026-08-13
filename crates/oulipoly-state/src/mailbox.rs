@@ -765,6 +765,10 @@ pub struct MailboxDb {
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
 }
 
+pub(crate) struct CompletionAuthorityFence<'a> {
+    _tx: Transaction<'a>,
+}
+
 enum BoundedMailboxRowsError {
     Prepare(rusqlite::Error),
     Query(rusqlite::Error),
@@ -817,6 +821,27 @@ impl MailboxDb {
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
         })
+    }
+
+    pub(crate) fn open_existing_for_completion_authority(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            _read_only_snapshot: None,
+        })
+    }
+
+    pub(crate) fn begin_completion_authority_fence(
+        &mut self,
+    ) -> Result<CompletionAuthorityFence<'_>, String> {
+        self.conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(|tx| CompletionAuthorityFence { _tx: tx })
+            .map_err(|err| format!("Failed to fence PID mailbox sidecar authority: {err}"))
     }
 
     pub fn path(&self) -> &Path {

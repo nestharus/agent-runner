@@ -114,7 +114,7 @@ fn finalize_regular_completed_attempt(
     success: bool,
     error_category: Option<&str>,
 ) -> Result<(), String> {
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::finalize_request(
@@ -124,8 +124,13 @@ fn finalize_regular_completed_attempt(
             input.result.exit_code,
             error_category,
             input.result.terminal_reason.as_deref(),
-        ))
-        .map_err(|err| err.to_string())?;
+        ));
+    if let Err(error) = &finalize_result
+        && success
+    {
+        input.guard.preserve_running_after_process_integrity(error);
+    }
+    finalize_result.map_err(|err| err.to_string())?;
     input.guard.mark_finalized();
     Ok(())
 }

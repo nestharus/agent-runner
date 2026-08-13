@@ -18,6 +18,12 @@ impl<'a> FinalizerGuard<'a> {
     pub(crate) fn mark_finalized(&mut self) {
         self.finalized = true;
     }
+
+    pub(crate) fn preserve_running_after_process_integrity(&mut self, error: &impl ToString) {
+        if error.to_string().starts_with("process_integrity:") {
+            self.finalized = true;
+        }
+    }
 }
 
 fn finalizer_guard<'a>(db: &'a StateDb, invocation_id: i64, finalized: bool) -> FinalizerGuard<'a> {
@@ -181,5 +187,33 @@ mod tests {
         assert_eq!(row.success, Some(false));
         assert_eq!(row.exit_code, Some(1));
         assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
+    }
+
+    #[test]
+    fn finalizer_guard_preserves_running_row_after_process_integrity_failure() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            guard.preserve_running_after_process_integrity(
+                &"process_integrity: completion sidecar authority is unavailable",
+            );
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
     }
 }

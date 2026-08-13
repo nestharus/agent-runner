@@ -32,7 +32,7 @@ pub(super) struct CompletedReplAttemptInput<'a, 'state> {
 pub(super) fn finalize_completed_repl_attempt(
     input: CompletedReplAttemptInput<'_, '_>,
 ) -> Result<i32, String> {
-    input
+    let finalize_result = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .finalize_invocation(mapper::finalize_request(
@@ -42,8 +42,13 @@ pub(super) fn finalize_completed_repl_attempt(
             input.result.exit_code,
             None,
             input.result.terminal_reason.as_deref(),
-        ))
-        .map_err(|err| err.to_string())?;
+        ));
+    if let Err(error) = &finalize_result
+        && input.result.exit_code == 0
+    {
+        input.guard.preserve_running_after_process_integrity(error);
+    }
+    finalize_result.map_err(|err| err.to_string())?;
     input.guard.mark_finalized();
     if input.result.exit_code == 0 {
         ingest_successful_repl_session(&input);

@@ -186,6 +186,9 @@ fn finalize_completed_attempt_lifecycle(
             input.result.terminal_reason.as_deref(),
         ));
     if let Err(err) = finalize_result {
+        if classification.success {
+            input.guard.preserve_running_after_process_integrity(&err);
+        }
         emit_completed_attempt_finalize_failure(input, err);
         return Some(BalancedLoopControl::Return(Ok(1)));
     }

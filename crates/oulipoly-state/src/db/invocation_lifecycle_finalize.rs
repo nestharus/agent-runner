@@ -29,6 +29,13 @@
 use super::*;
 use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput};
 
+struct FinalizeInvocationWrite<'a> {
+    exit_code: i32,
+    error_category: Option<&'a str>,
+    terminal_reason: Option<&'a str>,
+    finished_at: &'a str,
+}
+
 impl StateDb {
     pub fn finalize_invocation(
         &self,
@@ -221,63 +228,138 @@ impl StateDb {
         terminal_reason: Option<&str>,
         finished_at: &str,
     ) -> Result<FinalizeInvocationRow, String> {
+        self.finalize_invocation_transaction_on(
+            id,
+            success,
+            FinalizeInvocationWrite {
+                exit_code,
+                error_category,
+                terminal_reason,
+                finished_at,
+            },
+            || {},
+        )
+    }
+
+    fn finalize_invocation_transaction_on<BeforeCommit>(
+        &self,
+        id: i64,
+        success: bool,
+        write: FinalizeInvocationWrite<'_>,
+        before_commit: BeforeCommit,
+    ) -> Result<FinalizeInvocationRow, String>
+    where
+        BeforeCommit: FnOnce(),
+    {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(Self::format_begin_transaction_error)?;
 
         let invocation = Self::load_invocation_for_finalize(&tx, id)?;
         Self::validate_invocation_is_running(id, &invocation.status)?;
-        if success {
-            self.validate_completion_sidecar_authority(&tx, &invocation.invocation_uuid)?;
-        }
+        let obligations = success
+            .then(|| {
+                Self::completion_obligations_for_invocation_on(&tx, &invocation.invocation_uuid)
+            })
+            .transpose()
+            .map_err(|error| {
+                Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
+            })?
+            .unwrap_or_default();
+        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let mut sidecar = self.open_completion_authority_sidecar(
+            &sidecar_path,
+            &invocation.invocation_uuid,
+            &obligations,
+        )?;
+        let _sidecar_fence = sidecar
+            .as_mut()
+            .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
+            .transpose()
+            .map_err(|error| {
+                Self::format_unreadable_completion_sidecar(
+                    &invocation.invocation_uuid,
+                    &obligations,
+                    error,
+                )
+            })?;
+        self.validate_completion_sidecar_authority(
+            &sidecar_path,
+            &invocation.invocation_uuid,
+            &obligations,
+        )?;
         Self::write_invocation_final_row(
             &tx,
             id,
             success,
-            exit_code,
-            error_category,
-            terminal_reason,
-            finished_at,
+            write.exit_code,
+            write.error_category,
+            write.terminal_reason,
+            write.finished_at,
         )?;
         Self::upsert_provider_finalize_aggregate(
             &tx,
             &invocation.model_name,
             invocation.provider_name.as_deref(),
             success,
-            terminal_reason,
-            finished_at,
+            write.terminal_reason,
+            write.finished_at,
+        )?;
+
+        before_commit();
+        self.validate_completion_sidecar_authority(
+            &sidecar_path,
+            &invocation.invocation_uuid,
+            &obligations,
         )?;
 
         tx.commit().map_err(Self::format_commit_transaction_error)?;
         Ok(invocation)
     }
 
+    fn open_completion_authority_sidecar(
+        &self,
+        sidecar_path: &std::path::Path,
+        invocation_uuid: &str,
+        obligations: &[CompletionObligationExpectation],
+    ) -> Result<Option<crate::mailbox::MailboxDb>, String> {
+        if obligations.is_empty() {
+            return Ok(None);
+        }
+        if !sidecar_path.exists() {
+            return Err(Self::format_missing_completion_sidecar(
+                invocation_uuid,
+                obligations,
+            ));
+        }
+        crate::mailbox::MailboxDb::open_existing_for_completion_authority(sidecar_path)
+            .map(Some)
+            .map_err(|error| {
+                Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)
+            })
+    }
+
     fn validate_completion_sidecar_authority(
         &self,
-        conn: &sqlite::Connection,
+        sidecar_path: &std::path::Path,
         invocation_uuid: &str,
+        obligations: &[CompletionObligationExpectation],
     ) -> Result<(), String> {
-        let obligations = Self::completion_obligations_for_invocation_on(conn, invocation_uuid)
-            .map_err(|error| {
-                Self::format_completion_authority_storage_error(invocation_uuid, error)
-            })?;
         if obligations.is_empty() {
             return Ok(());
         }
 
-        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
         if !sidecar_path.exists() {
             return Err(Self::format_missing_completion_sidecar(
                 invocation_uuid,
-                &obligations,
+                obligations,
             ));
         }
-        let sidecar =
-            crate::mailbox::MailboxDb::open_read_only(&sidecar_path).map_err(|error| {
-                Self::format_unreadable_completion_sidecar(invocation_uuid, &obligations, error)
-            })?;
+        let sidecar = crate::mailbox::MailboxDb::open_read_only(sidecar_path).map_err(|error| {
+            Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)
+        })?;
         let observed_generation = sidecar.sidecar_generation().map_err(|error| {
-            Self::format_unreadable_completion_sidecar(invocation_uuid, &obligations, error)
+            Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)
         })?;
         if let Some(mismatch) = obligations
             .iter()
@@ -291,7 +373,7 @@ impl StateDb {
                 observed_generation,
             ));
         }
-        for obligation in &obligations {
+        for obligation in obligations {
             let present = sidecar
                 .contains_completion_obligation(
                     &obligation.event_id,
@@ -299,7 +381,7 @@ impl StateDb {
                     &obligation.owner_session_id,
                 )
                 .map_err(|error| {
-                    Self::format_unreadable_completion_sidecar(invocation_uuid, &obligations, error)
+                    Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)
                 })?;
             if !present {
                 return Err(format!(
@@ -375,5 +457,90 @@ impl StateDb {
 
     pub(super) fn format_invocation_not_found_error(id: i64) -> String {
         format!("Invocation {id} not found")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mailbox::{CompletionEventRegistrationInput, MailboxDb};
+    use crate::{CompletionObligationAdmission, InvocationStart};
+
+    const INVOCATION_UUID: &str = "77777777-7777-4777-8777-777777777777";
+    const EVENT_ID: &str = "age299-s2-finalize-fence-event";
+    const SESSION_ID: &str = "age299-s2-finalize-fence-session";
+
+    #[test]
+    fn sidecar_rename_before_state_commit_rolls_back_successful_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let renamed_sidecar_path = directory.path().join("pid-identity.renamed");
+        let state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let mut sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        let generation = sidecar.sidecar_generation().unwrap();
+        sidecar
+            .register_completion_event(CompletionEventRegistrationInput {
+                event_id: EVENT_ID,
+                delivery_mode: "async",
+                owner_session_id: Some(SESSION_ID),
+                owner_invocation_uuid: Some(INVOCATION_UUID),
+                state_dir: "/tmp/age299-s2-finalize-fence-state",
+                meta_path: "/tmp/age299-s2-finalize-fence-meta",
+                log_path: "/tmp/age299-s2-finalize-fence-log",
+                rc_path: "/tmp/age299-s2-finalize-fence-rc",
+            })
+            .unwrap();
+        drop(sidecar);
+        state
+            .record_completion_obligation(CompletionObligationAdmission {
+                admission_id: "age299-s2-finalize-fence-admission",
+                invocation_uuid: INVOCATION_UUID,
+                event_id: EVENT_ID,
+                owner_invocation_uuid: INVOCATION_UUID,
+                owner_session_id: SESSION_ID,
+                expected_sidecar_generation: &generation,
+            })
+            .unwrap();
+
+        let error = match state.finalize_invocation_transaction_on(
+            invocation_row_id,
+            true,
+            FinalizeInvocationWrite {
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: None,
+                finished_at: &StateDb::current_rfc3339_timestamp(),
+            },
+            || std::fs::rename(&sidecar_path, &renamed_sidecar_path).unwrap(),
+        ) {
+            Ok(_) => panic!("sidecar rename must block successful finalization"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("process_integrity"), "{error}");
+        assert!(error.contains("sidecar is missing"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+
+        std::fs::rename(renamed_sidecar_path, sidecar_path).unwrap();
+        state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap();
     }
 }
