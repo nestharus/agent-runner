@@ -1482,13 +1482,8 @@ fn assert_non_text_insert_forms_are_rejected(
 ) {
     for field in STRING_DECODED_FIELDS {
         for malformed in malformed_storage_values() {
-            let admission_id = match &malformed {
-                Value::Blob(_) if field == "admission_id" => NON_TEXT_ADMISSION_ID,
-                Value::Integer(_) if field == "admission_id" => NUMERIC_ADMISSION_ID,
-                _ => NON_TEXT_ADMISSION_ID,
-            };
             let mut values = completion_obligation_values(
-                admission_id,
+                NON_TEXT_ADMISSION_ID,
                 event_id,
                 owner_invocation_uuid,
                 owner_session_id,
