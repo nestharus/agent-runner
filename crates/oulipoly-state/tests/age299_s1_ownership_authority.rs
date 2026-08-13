@@ -217,7 +217,8 @@ fn fresh_and_migrated_v14_have_the_same_completion_obligation_schema() {
     for field in STRING_DECODED_FIELDS {
         assert!(
             table_sql.contains(&format!("CONSTRAINT completion_obligation_{field}_text"))
-                && table_sql.contains(&format!("typeof({field}) = 'text'")),
+                && table_sql.contains(&format!("typeof({field}) = 'text'"))
+                && table_sql.contains(&format!("{field} = trim({field})")),
             "missing storage-class contract for {field}: {table_sql}"
         );
     }
@@ -303,6 +304,91 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
         state.completion_obligation_authority(ADMISSION_ID).unwrap(),
         CompletionObligationAuthority::Admitted(expectation)
     );
+}
+
+#[test]
+fn padded_completion_obligation_identities_are_rejected() {
+    let state = state_with_root();
+    let padded = [
+        (
+            obligation(
+                " padded-admission",
+                ROOT_UUID,
+                EVENT_ID,
+                ROOT_UUID,
+                OWNER_SESSION_ID,
+                GENERATION_ID,
+            ),
+            "admission_id",
+        ),
+        (
+            obligation(
+                ADMISSION_ID,
+                " padded-invocation",
+                EVENT_ID,
+                ROOT_UUID,
+                OWNER_SESSION_ID,
+                GENERATION_ID,
+            ),
+            "invocation_uuid",
+        ),
+        (
+            obligation(
+                ADMISSION_ID,
+                ROOT_UUID,
+                "padded-event ",
+                ROOT_UUID,
+                OWNER_SESSION_ID,
+                GENERATION_ID,
+            ),
+            "event_id",
+        ),
+        (
+            obligation(
+                ADMISSION_ID,
+                ROOT_UUID,
+                EVENT_ID,
+                " padded-owner",
+                OWNER_SESSION_ID,
+                GENERATION_ID,
+            ),
+            "owner_invocation_uuid",
+        ),
+        (
+            obligation(
+                ADMISSION_ID,
+                ROOT_UUID,
+                EVENT_ID,
+                ROOT_UUID,
+                "padded-session ",
+                GENERATION_ID,
+            ),
+            "owner_session_id",
+        ),
+        (
+            obligation(
+                ADMISSION_ID,
+                ROOT_UUID,
+                EVENT_ID,
+                ROOT_UUID,
+                OWNER_SESSION_ID,
+                " padded-generation",
+            ),
+            "expected_sidecar_generation",
+        ),
+    ];
+
+    for (input, field) in padded {
+        assert_eq!(
+            state
+                .record_completion_obligation(input)
+                .unwrap_err()
+                .to_string(),
+            format!("invalid ownership identity: {field}")
+        );
+    }
+    assert!(SettlementVerifierIdentity::new(" padded-verifier").is_err());
+    assert!(SettlementVerifierIdentity::new("padded-verifier ").is_err());
 }
 
 #[test]

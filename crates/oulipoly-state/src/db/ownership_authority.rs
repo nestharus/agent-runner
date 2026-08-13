@@ -335,7 +335,7 @@ fn validate_completion_obligation(
 }
 
 fn validate_nonempty(value: &str, field: &'static str) -> Result<(), OwnershipAuthorityError> {
-    if value.trim().is_empty() {
+    if value.is_empty() || value.trim() != value {
         Err(OwnershipAuthorityError::InvalidIdentity(field))
     } else {
         Ok(())

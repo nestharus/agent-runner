@@ -8,28 +8,29 @@
 CREATE TABLE invocation_completion_obligations (
     admission_id ANY NOT NULL PRIMARY KEY
         CONSTRAINT completion_obligation_admission_id_text
-        CHECK (typeof(admission_id) = 'text' AND length(trim(admission_id)) > 0),
+        CHECK (typeof(admission_id) = 'text' AND admission_id = trim(admission_id) AND length(admission_id) > 0),
     invocation_uuid ANY NOT NULL REFERENCES invocations(invocation_uuid)
         CONSTRAINT completion_obligation_invocation_uuid_text
-        CHECK (typeof(invocation_uuid) = 'text' AND length(trim(invocation_uuid)) > 0),
+        CHECK (typeof(invocation_uuid) = 'text' AND invocation_uuid = trim(invocation_uuid) AND length(invocation_uuid) > 0),
     event_id ANY NOT NULL
         CONSTRAINT completion_obligation_event_id_text
-        CHECK (typeof(event_id) = 'text' AND length(trim(event_id)) > 0),
+        CHECK (typeof(event_id) = 'text' AND event_id = trim(event_id) AND length(event_id) > 0),
     owner_invocation_uuid ANY NOT NULL REFERENCES invocations(invocation_uuid)
         CONSTRAINT completion_obligation_owner_invocation_uuid_text
-        CHECK (typeof(owner_invocation_uuid) = 'text' AND length(trim(owner_invocation_uuid)) > 0),
+        CHECK (typeof(owner_invocation_uuid) = 'text' AND owner_invocation_uuid = trim(owner_invocation_uuid) AND length(owner_invocation_uuid) > 0),
     owner_session_id ANY NOT NULL
         CONSTRAINT completion_obligation_owner_session_id_text
-        CHECK (typeof(owner_session_id) = 'text' AND length(trim(owner_session_id)) > 0),
+        CHECK (typeof(owner_session_id) = 'text' AND owner_session_id = trim(owner_session_id) AND length(owner_session_id) > 0),
     expected_sidecar_generation ANY NOT NULL
         CONSTRAINT completion_obligation_expected_sidecar_generation_text
         CHECK (
             typeof(expected_sidecar_generation) = 'text'
-            AND length(trim(expected_sidecar_generation)) > 0
+            AND expected_sidecar_generation = trim(expected_sidecar_generation)
+            AND length(expected_sidecar_generation) > 0
         ),
     admitted_at ANY NOT NULL
         CONSTRAINT completion_obligation_admitted_at_text
-        CHECK (typeof(admitted_at) = 'text' AND length(trim(admitted_at)) > 0),
+        CHECK (typeof(admitted_at) = 'text' AND admitted_at = trim(admitted_at) AND length(admitted_at) > 0),
     UNIQUE (event_id, owner_invocation_uuid)
 ) STRICT;
 
