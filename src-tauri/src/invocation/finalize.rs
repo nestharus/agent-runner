@@ -2,6 +2,7 @@
 //!
 //! `orchestration`, `accessor`, `predicate`, `formatter`, `validator`
 
+use oulipoly_runtime::services::ServiceError;
 use oulipoly_state::StateDb;
 
 pub(crate) struct FinalizerGuard<'a> {
@@ -19,8 +20,11 @@ impl<'a> FinalizerGuard<'a> {
         self.finalized = true;
     }
 
-    pub(crate) fn preserve_running_after_process_integrity(&mut self, error: &impl ToString) {
-        if error.to_string().starts_with("process_integrity:") {
+    pub(crate) fn preserve_running_after_process_integrity(&mut self, error: &ServiceError) {
+        if matches!(
+            error,
+            ServiceError::Dependency { message } if message.starts_with("process_integrity:")
+        ) {
             self.finalized = true;
         }
     }
@@ -203,9 +207,10 @@ mod tests {
 
         {
             let mut guard = FinalizerGuard::new(&db, invocation_id);
-            guard.preserve_running_after_process_integrity(
-                &"process_integrity: completion sidecar authority is unavailable",
-            );
+            guard.preserve_running_after_process_integrity(&ServiceError::Dependency {
+                message: "process_integrity: completion sidecar authority is unavailable"
+                    .to_string(),
+            });
         }
 
         let row = db
