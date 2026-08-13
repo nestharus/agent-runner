@@ -7,6 +7,11 @@
 use super::{RusqliteOptionalExtension, StateDb, sqlite};
 use std::fmt;
 
+const COMPLETION_OBLIGATION_COLUMNS: &str = concat!(
+    "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
+    "owner_session_id, expected_sidecar_generation, admitted_at"
+);
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionObligationAdmission<'a> {
     pub admission_id: &'a str,
@@ -279,13 +284,12 @@ impl StateDb {
         validate_nonempty(invocation_uuid, "invocation_uuid")?;
         let mut statement = self
             .conn
-            .prepare(
-                "SELECT admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                        owner_session_id, expected_sidecar_generation, admitted_at
+            .prepare(&format!(
+                "SELECT {COMPLETION_OBLIGATION_COLUMNS}
                  FROM invocation_completion_obligations
                  WHERE invocation_uuid = ?1
-                 ORDER BY admitted_at, admission_id",
-            )
+                 ORDER BY admitted_at, admission_id"
+            ))
             .map_err(persistence("prepare completion obligation query"))?;
         let rows = statement
             .query_map(
@@ -348,9 +352,8 @@ fn completion_obligation_by_admission_id(
 ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
     completion_obligation_by_identity(
         conn,
-        "WHERE admission_id = ?1",
+        CompletionObligationIdentity::AdmissionId,
         admission_id,
-        "admission ID",
     )
 }
 
@@ -358,12 +361,7 @@ fn completion_obligation_by_event_id(
     conn: &sqlite::Connection,
     event_id: &str,
 ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
-    completion_obligation_by_identity(
-        conn,
-        "WHERE event_id = ?1 ORDER BY admitted_at, admission_id LIMIT 1",
-        event_id,
-        "event ID",
-    )
+    completion_obligation_by_identity(conn, CompletionObligationIdentity::EventId, event_id)
 }
 
 fn completion_obligation_by_listener(
@@ -371,11 +369,13 @@ fn completion_obligation_by_listener(
     event_id: &str,
     owner_invocation_uuid: &str,
 ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
-    conn.query_row(
-        "SELECT admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                owner_session_id, expected_sidecar_generation, admitted_at
+    let sql = format!(
+        "SELECT {COMPLETION_OBLIGATION_COLUMNS}
          FROM invocation_completion_obligations
-         WHERE event_id = ?1 AND owner_invocation_uuid = ?2",
+         WHERE event_id = ?1 AND owner_invocation_uuid = ?2"
+    );
+    conn.query_row(
+        &sql,
         sqlite::params![event_id, owner_invocation_uuid],
         map_completion_obligation_row,
     )
@@ -385,15 +385,25 @@ fn completion_obligation_by_listener(
     ))
 }
 
+enum CompletionObligationIdentity {
+    AdmissionId,
+    EventId,
+}
+
 fn completion_obligation_by_identity(
     conn: &sqlite::Connection,
-    predicate: &str,
+    identity_kind: CompletionObligationIdentity,
     identity: &str,
-    context: &str,
 ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
+    let (predicate, context) = match identity_kind {
+        CompletionObligationIdentity::AdmissionId => ("WHERE admission_id = ?1", "admission ID"),
+        CompletionObligationIdentity::EventId => (
+            "WHERE event_id = ?1 ORDER BY admitted_at, admission_id LIMIT 1",
+            "event ID",
+        ),
+    };
     let sql = format!(
-        "SELECT admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                owner_session_id, expected_sidecar_generation, admitted_at
+        "SELECT {COMPLETION_OBLIGATION_COLUMNS}
          FROM invocation_completion_obligations {predicate}"
     );
     conn.query_row(
