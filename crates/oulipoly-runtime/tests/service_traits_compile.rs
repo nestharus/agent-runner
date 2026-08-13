@@ -262,20 +262,29 @@ fn age299_s1_runtime_boundary_can_carry_ownership_authority_without_service_beha
         listener_settlement: oulipoly_state::ListenerSettlementClass::PendingOrUnsettled,
         recovery_disposition: oulipoly_state::RecoveryDisposition::NotRecorded,
     });
-    assert_eq!(snapshot.event_id, "ab_age299_compile");
+    let oulipoly_state::OwnershipAuthoritySnapshot {
+        invocation_uuid: _,
+        event_id: _,
+        sidecar_generation: _,
+        event_state: _,
+        owner_invocation_uuid: _,
+        owner_session_id: _,
+        owner_relationship: _,
+        listener_settlement: _,
+        recovery_disposition: _,
+    } = snapshot;
     let disposition = oulipoly_state::EffectiveTerminalDisposition {
         success: false,
         exit_code: 1,
         error_category: Some("process_integrity".to_string()),
         terminal_reason: Some("compile-only typed representation".to_string()),
     };
-    assert!(!disposition.success);
-
-    let start_request_type = std::any::type_name::<InvocationLifecycleStartRequest<'static>>();
-    let finalize_request_type =
-        std::any::type_name::<InvocationLifecycleFinalizeRequest<'static>>();
-    assert!(start_request_type.contains("InvocationLifecycleStartRequest"));
-    assert!(finalize_request_type.contains("InvocationLifecycleFinalizeRequest"));
+    let oulipoly_state::EffectiveTerminalDisposition {
+        success: _,
+        exit_code: _,
+        error_category: _,
+        terminal_reason: _,
+    } = disposition;
 }
 
 #[test]
