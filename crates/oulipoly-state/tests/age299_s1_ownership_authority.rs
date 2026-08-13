@@ -60,6 +60,29 @@ type RawCompletionObligationRow = (
 );
 
 #[test]
+fn state_db_rejects_completion_obligations_for_unknown_invocations() {
+    let state = StateDb::open(Path::new(":memory:")).unwrap();
+
+    let error = state
+        .connection()
+        .execute(
+            COMPLETION_OBLIGATION_INSERT,
+            rusqlite::params![
+                ADMISSION_ID,
+                CHILD_UUID,
+                EVENT_ID,
+                ROOT_UUID,
+                OWNER_SESSION_ID,
+                GENERATION_ID,
+                "2026-08-13T00:00:00Z",
+            ],
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+}
+
+#[test]
 fn schema_13_migrates_through_ordered_v14_and_preserves_invocation_data() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
