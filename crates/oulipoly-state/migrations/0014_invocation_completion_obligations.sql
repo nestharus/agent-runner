@@ -3,18 +3,32 @@
 -- `mapper`, `validator`
 
 CREATE TABLE invocation_completion_obligations (
-    admission_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(admission_id)) > 0),
-    invocation_uuid TEXT NOT NULL REFERENCES invocations(invocation_uuid)
-        CHECK (length(trim(invocation_uuid)) > 0),
-    event_id TEXT NOT NULL CHECK (length(trim(event_id)) > 0),
-    owner_invocation_uuid TEXT NOT NULL REFERENCES invocations(invocation_uuid)
-        CHECK (length(trim(owner_invocation_uuid)) > 0),
-    owner_session_id TEXT NOT NULL CHECK (length(trim(owner_session_id)) > 0),
-    expected_sidecar_generation TEXT NOT NULL
-        CHECK (length(trim(expected_sidecar_generation)) > 0),
-    admitted_at TEXT NOT NULL CHECK (length(trim(admitted_at)) > 0),
+    admission_id ANY NOT NULL PRIMARY KEY
+        CONSTRAINT completion_obligation_admission_id_text
+        CHECK (typeof(admission_id) = 'text' AND length(trim(admission_id)) > 0),
+    invocation_uuid ANY NOT NULL REFERENCES invocations(invocation_uuid)
+        CONSTRAINT completion_obligation_invocation_uuid_text
+        CHECK (typeof(invocation_uuid) = 'text' AND length(trim(invocation_uuid)) > 0),
+    event_id ANY NOT NULL
+        CONSTRAINT completion_obligation_event_id_text
+        CHECK (typeof(event_id) = 'text' AND length(trim(event_id)) > 0),
+    owner_invocation_uuid ANY NOT NULL REFERENCES invocations(invocation_uuid)
+        CONSTRAINT completion_obligation_owner_invocation_uuid_text
+        CHECK (typeof(owner_invocation_uuid) = 'text' AND length(trim(owner_invocation_uuid)) > 0),
+    owner_session_id ANY NOT NULL
+        CONSTRAINT completion_obligation_owner_session_id_text
+        CHECK (typeof(owner_session_id) = 'text' AND length(trim(owner_session_id)) > 0),
+    expected_sidecar_generation ANY NOT NULL
+        CONSTRAINT completion_obligation_expected_sidecar_generation_text
+        CHECK (
+            typeof(expected_sidecar_generation) = 'text'
+            AND length(trim(expected_sidecar_generation)) > 0
+        ),
+    admitted_at ANY NOT NULL
+        CONSTRAINT completion_obligation_admitted_at_text
+        CHECK (typeof(admitted_at) = 'text' AND length(trim(admitted_at)) > 0),
     UNIQUE (event_id, owner_invocation_uuid)
-);
+) STRICT;
 
 CREATE INDEX idx_invocation_completion_obligations_invocation
     ON invocation_completion_obligations (

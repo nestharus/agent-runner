@@ -7,7 +7,8 @@ use oulipoly_state::{
     OwnerLineageRelationship, RecoveryDisposition, SettlementVerifierIdentity,
     SidecarGenerationState, StateDb,
 };
-use rusqlite::Connection;
+use rusqlite::types::Value;
+use rusqlite::{Connection, params_from_iter};
 use std::path::Path;
 
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -23,6 +24,29 @@ const NULL_ADMISSION_ERROR: &str =
     "NOT NULL constraint failed: invocation_completion_obligations.admission_id";
 const APPEND_ONLY_UPDATE_ERROR: &str = "completion obligation is append-only: update forbidden";
 const APPEND_ONLY_DELETE_ERROR: &str = "completion obligation is append-only: delete forbidden";
+const NON_TEXT_ADMISSION_ID: &str = "malformed-storage-admission";
+const NUMERIC_ADMISSION_ID: &str = "299";
+const STRING_DECODED_FIELDS: [&str; 7] = [
+    "admission_id",
+    "invocation_uuid",
+    "event_id",
+    "owner_invocation_uuid",
+    "owner_session_id",
+    "expected_sidecar_generation",
+    "admitted_at",
+];
+const COMPLETION_OBLIGATION_INSERT: &str = concat!(
+    "INSERT INTO invocation_completion_obligations (",
+    "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
+    "owner_session_id, expected_sidecar_generation, admitted_at",
+    ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+);
+const COMPLETION_OBLIGATION_REPLACE: &str = concat!(
+    "INSERT OR REPLACE INTO invocation_completion_obligations (",
+    "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
+    "owner_session_id, expected_sidecar_generation, admitted_at",
+    ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+);
 
 type RawCompletionObligationRow = (
     Vec<u8>,
@@ -74,12 +98,22 @@ fn fresh_and_migrated_v14_have_the_same_completion_obligation_schema() {
         "fresh and migrated databases must expose identical table, index, and constraint SQL"
     );
     assert!(ownership_schema(&fresh).iter().any(|sql| {
-        sql.contains("admission_id TEXT NOT NULL PRIMARY KEY")
+        sql.contains("admission_id ANY NOT NULL PRIMARY KEY")
             && sql.contains("UNIQUE (event_id, owner_invocation_uuid)")
             && sql.contains("REFERENCES invocations(invocation_uuid)")
-            && sql.contains("owner_session_id TEXT NOT NULL")
-            && sql.contains("expected_sidecar_generation TEXT NOT NULL")
+            && sql.ends_with(") STRICT")
     }));
+    let table_sql = ownership_schema(&fresh)
+        .into_iter()
+        .find(|sql| sql.starts_with("CREATE TABLE invocation_completion_obligations"))
+        .unwrap();
+    for field in STRING_DECODED_FIELDS {
+        assert!(
+            table_sql.contains(&format!("CONSTRAINT completion_obligation_{field}_text"))
+                && table_sql.contains(&format!("typeof({field}) = 'text'")),
+            "missing storage-class contract for {field}: {table_sql}"
+        );
+    }
     let schema = ownership_schema(&fresh);
     assert_eq!(
         schema
@@ -228,6 +262,87 @@ fn multi_listener_event_rejects_null_admission_identity_without_mutation() {
         EVENT_ID,
         GRANDCHILD_UUID,
         "null-admission-multi-replacement",
+    );
+}
+
+#[test]
+fn empty_table_rejects_non_text_storage_for_every_string_projection() {
+    let state = state_with_lineage();
+
+    assert_non_text_insert_forms_are_rejected(
+        &state,
+        "malformed-empty-event",
+        CHILD_UUID,
+        "malformed-empty-session",
+    );
+}
+
+#[test]
+fn singleton_listener_rejects_non_text_storage_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_non_text_insert_forms_are_rejected(
+        &state,
+        "malformed-singleton-event",
+        GRANDCHILD_UUID,
+        "malformed-singleton-session",
+    );
+    assert_non_text_conflict_actions_are_rejected(
+        &state,
+        ADMISSION_ID,
+        EVENT_ID,
+        CHILD_UUID,
+        OWNER_SESSION_ID,
+    );
+    assert_equivalent_blob_admission_is_rejected(&state, ADMISSION_ID);
+}
+
+#[test]
+fn multi_listener_event_rejects_non_text_storage_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+    state
+        .record_completion_obligation(obligation(
+            SECOND_ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            GRANDCHILD_UUID,
+            SECOND_OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_non_text_insert_forms_are_rejected(
+        &state,
+        "malformed-multi-event",
+        ROOT_UUID,
+        "malformed-multi-session",
+    );
+    assert_non_text_conflict_actions_are_rejected(
+        &state,
+        SECOND_ADMISSION_ID,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        SECOND_OWNER_SESSION_ID,
     );
 }
 
@@ -938,6 +1053,256 @@ fn assert_null_admission_conflict_actions_are_rejected(
             "rejected {operation} with NULL admission identity changed prior rows"
         );
     }
+}
+
+fn assert_non_text_insert_forms_are_rejected(
+    state: &StateDb,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    for field in STRING_DECODED_FIELDS {
+        for malformed in malformed_storage_values() {
+            let admission_id = match &malformed {
+                Value::Blob(_) if field == "admission_id" => NON_TEXT_ADMISSION_ID,
+                Value::Integer(_) if field == "admission_id" => NUMERIC_ADMISSION_ID,
+                _ => NON_TEXT_ADMISSION_ID,
+            };
+            let mut values = completion_obligation_values(
+                admission_id,
+                event_id,
+                owner_invocation_uuid,
+                owner_session_id,
+                "2026-08-13T00:08:00Z",
+            );
+            values[field_index(field)] = malformed.clone();
+
+            for (operation, statement) in non_conflicting_insert_statements() {
+                assert_malformed_statement_is_rejected(
+                    state,
+                    field,
+                    operation,
+                    statement,
+                    &values,
+                    &format!("completion_obligation_{field}_text"),
+                );
+            }
+        }
+    }
+}
+
+fn assert_non_text_conflict_actions_are_rejected(
+    state: &StateDb,
+    admission_id: &str,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    for field in STRING_DECODED_FIELDS {
+        for malformed in malformed_storage_values() {
+            let mut values = completion_obligation_values(
+                admission_id,
+                event_id,
+                owner_invocation_uuid,
+                owner_session_id,
+                "2026-08-13T00:09:00Z",
+            );
+            values[field_index(field)] = malformed;
+
+            for (operation, statement) in conflicting_insert_statements() {
+                assert_malformed_statement_is_rejected(
+                    state,
+                    field,
+                    operation,
+                    statement,
+                    &values,
+                    "completion obligation immutable identity conflict",
+                );
+            }
+        }
+    }
+}
+
+fn assert_equivalent_blob_admission_is_rejected(state: &StateDb, text_admission_id: &str) {
+    let before = raw_completion_obligation_rows(state);
+    let authority_before = state
+        .completion_obligation_authority(text_admission_id)
+        .unwrap();
+    let values = [
+        Value::Blob(text_admission_id.as_bytes().to_vec()),
+        Value::Text(ROOT_UUID.to_string()),
+        Value::Text("equivalent-blob-event".to_string()),
+        Value::Text(GRANDCHILD_UUID.to_string()),
+        Value::Text("equivalent-blob-session".to_string()),
+        Value::Text(GENERATION_ID.to_string()),
+        Value::Text("2026-08-13T00:10:00Z".to_string()),
+    ];
+
+    let error = state
+        .connection()
+        .execute(
+            COMPLETION_OBLIGATION_INSERT,
+            params_from_iter(values.iter()),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completion_obligation_admission_id_text"),
+        "equivalent BLOB admission identity: {error}"
+    );
+    assert_eq!(raw_completion_obligation_rows(state), before);
+    assert_eq!(
+        state
+            .completion_obligation_authority(text_admission_id)
+            .unwrap(),
+        authority_before,
+        "BLOB and equivalent TEXT admission identities must not coexist"
+    );
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap()
+            .len(),
+        before.len(),
+        "equivalent BLOB rejection must preserve typed invocation lookup"
+    );
+}
+
+fn assert_malformed_statement_is_rejected(
+    state: &StateDb,
+    field: &str,
+    operation: &str,
+    statement: &str,
+    values: &[Value],
+    expected_error: &str,
+) {
+    let before = raw_completion_obligation_rows(state);
+    let typed_before = state
+        .completion_obligations_for_invocation(ROOT_UUID)
+        .unwrap();
+    let blob_text_before = state
+        .completion_obligation_authority(NON_TEXT_ADMISSION_ID)
+        .unwrap();
+    let numeric_text_before = state
+        .completion_obligation_authority(NUMERIC_ADMISSION_ID)
+        .unwrap();
+
+    let error = state
+        .connection()
+        .execute(statement, params_from_iter(values.iter()))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(expected_error),
+        "{operation} with non-text {field}: {error}"
+    );
+    assert_eq!(
+        raw_completion_obligation_rows(state),
+        before,
+        "rejected {operation} with non-text {field} changed the complete prior table"
+    );
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap(),
+        typed_before,
+        "rejected {operation} with non-text {field} changed typed invocation projection"
+    );
+    for expectation in typed_before {
+        assert_eq!(
+            state
+                .completion_obligation_authority(&expectation.admission_id)
+                .unwrap(),
+            CompletionObligationAuthority::Admitted(expectation),
+            "rejected {operation} with non-text {field} changed typed admission lookup"
+        );
+    }
+    assert_eq!(
+        state
+            .completion_obligation_authority(NON_TEXT_ADMISSION_ID)
+            .unwrap(),
+        blob_text_before,
+        "BLOB and equivalent TEXT admission identities must not coexist"
+    );
+    assert_eq!(
+        state
+            .completion_obligation_authority(NUMERIC_ADMISSION_ID)
+            .unwrap(),
+        numeric_text_before,
+        "numeric and equivalent TEXT admission identities must not coexist"
+    );
+}
+
+fn malformed_storage_values() -> [Value; 2] {
+    [
+        Value::Blob(NON_TEXT_ADMISSION_ID.as_bytes().to_vec()),
+        Value::Integer(299),
+    ]
+}
+
+fn completion_obligation_values(
+    admission_id: &str,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+    admitted_at: &str,
+) -> Vec<Value> {
+    [
+        admission_id,
+        ROOT_UUID,
+        event_id,
+        owner_invocation_uuid,
+        owner_session_id,
+        GENERATION_ID,
+        admitted_at,
+    ]
+    .into_iter()
+    .map(|value| Value::Text(value.to_string()))
+    .collect()
+}
+
+fn field_index(field: &str) -> usize {
+    STRING_DECODED_FIELDS
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap()
+}
+
+fn non_conflicting_insert_statements() -> [(&'static str, &'static str); 3] {
+    [
+        ("ordinary insert", COMPLETION_OBLIGATION_INSERT),
+        ("insert or replace", COMPLETION_OBLIGATION_REPLACE),
+        (
+            "admission-key upsert",
+            concat!(
+                "INSERT INTO invocation_completion_obligations (",
+                "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
+                "owner_session_id, expected_sidecar_generation, admitted_at",
+                ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ",
+                "ON CONFLICT (admission_id) DO UPDATE SET event_id = excluded.event_id"
+            ),
+        ),
+    ]
+}
+
+fn conflicting_insert_statements() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "conflicting insert or replace",
+            COMPLETION_OBLIGATION_REPLACE,
+        ),
+        (
+            "listener-key upsert",
+            concat!(
+                "INSERT INTO invocation_completion_obligations (",
+                "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
+                "owner_session_id, expected_sidecar_generation, admitted_at",
+                ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ",
+                "ON CONFLICT (event_id, owner_invocation_uuid) ",
+                "DO UPDATE SET admission_id = excluded.admission_id"
+            ),
+        ),
+    ]
 }
 
 fn direct_insert_completion_obligation(
