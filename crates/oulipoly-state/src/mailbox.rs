@@ -17,6 +17,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
@@ -771,13 +772,61 @@ pub(crate) struct MailboxAuthorityFence {
     file: std::fs::File,
 }
 
+#[derive(Debug)]
+pub(crate) enum MailboxAuthorityFenceError {
+    Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Lock(fs4::TryLockError),
+    Timeout {
+        path: PathBuf,
+        timeout: StdDuration,
+    },
+}
+
+impl fmt::Display for MailboxAuthorityFenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { path, source } => write!(
+                formatter,
+                "Failed to open PID mailbox sidecar authority fence {}: {source}",
+                path.display()
+            ),
+            Self::Lock(error) => {
+                write!(
+                    formatter,
+                    "Failed to lock PID mailbox sidecar authority: {error}"
+                )
+            }
+            Self::Timeout { path, timeout } => write!(
+                formatter,
+                "Timed out after {}ms acquiring PID mailbox sidecar authority fence {}",
+                timeout.as_millis(),
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MailboxAuthorityFenceError {}
+
 pub(crate) struct CompletionAuthorityFence<'a> {
     _tx: Transaction<'a>,
 }
 
 impl MailboxAuthorityFence {
-    pub(crate) fn acquire(path: &Path) -> Result<Self, String> {
-        ensure_parent_dir(path)?;
+    pub(crate) fn acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
+        #[cfg(not(test))]
+        const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+        #[cfg(test)]
+        const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+
+        ensure_parent_dir(path).map_err(|error| MailboxAuthorityFenceError::Open {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
         let authority_path = mailbox_authority_path(path);
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -785,15 +834,26 @@ impl MailboxAuthorityFence {
             .create(true)
             .truncate(false)
             .open(&authority_path)
-            .map_err(|error| {
-                format!(
-                    "Failed to open PID mailbox sidecar authority fence {}: {error}",
-                    authority_path.display()
-                )
+            .map_err(|source| MailboxAuthorityFenceError::Open {
+                path: authority_path.clone(),
+                source,
             })?;
-        <std::fs::File as fs4::FileExt>::lock(&file)
-            .map_err(|error| format!("Failed to lock PID mailbox sidecar authority: {error}"))?;
-        Ok(Self { file })
+        let deadline = Instant::now() + ACQUISITION_TIMEOUT;
+        loop {
+            match <std::fs::File as fs4::FileExt>::try_lock(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(fs4::TryLockError::WouldBlock) => {
+                    return Err(MailboxAuthorityFenceError::Timeout {
+                        path: authority_path,
+                        timeout: ACQUISITION_TIMEOUT,
+                    });
+                }
+                Err(error) => return Err(MailboxAuthorityFenceError::Lock(error)),
+            }
+        }
     }
 }
 
@@ -828,7 +888,7 @@ impl MailboxDb {
         if !path.exists() {
             return Ok(None);
         }
-        let authority = MailboxAuthorityFence::acquire(&path)?;
+        let authority = MailboxAuthorityFence::acquire(&path).map_err(|error| error.to_string())?;
         if !path.exists() {
             return Ok(None);
         }
@@ -836,7 +896,7 @@ impl MailboxDb {
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
-        let authority = MailboxAuthorityFence::acquire(path)?;
+        let authority = MailboxAuthorityFence::acquire(path).map_err(|error| error.to_string())?;
         Self::open_with_authority(path, &authority)
     }
 

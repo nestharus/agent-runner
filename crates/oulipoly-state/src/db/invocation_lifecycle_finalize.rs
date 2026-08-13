@@ -271,7 +271,10 @@ impl StateDb {
             .unwrap_or_default();
         let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
         let _sidecar_authority = (!obligations.is_empty())
-            .then(|| crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path))
+            .then(|| {
+                crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+                    .map_err(|error| error.to_string())
+            })
             .transpose()
             .map_err(|error| {
                 Self::format_unreadable_completion_sidecar(

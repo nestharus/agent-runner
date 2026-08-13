@@ -273,7 +273,8 @@ impl StateDb {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
         require_running_owner(&tx, owner_invocation_uuid)?;
-        let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)?;
+        let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
+            .map_err(|error| error.to_string())?;
         let mut mailbox = MailboxDb::open_with_authority(&sidecar_path, &sidecar_authority)?;
         let sidecar_generation = mailbox.sidecar_generation()?;
         record_completion_obligation_on(

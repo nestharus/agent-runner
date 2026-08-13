@@ -88,7 +88,15 @@ impl PidIdentityDb {
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
-        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(path)?;
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire(path)
+            .map_err(|error| error.to_string())?;
+        Self::open_with_authority(path, &authority)
+    }
+
+    pub(crate) fn open_with_authority(
+        path: &Path,
+        _authority: &crate::mailbox::MailboxAuthorityFence,
+    ) -> Result<Self, String> {
         ensure_parent_dir(path)?;
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
@@ -639,6 +647,34 @@ mod tests {
             .unwrap();
         opener.join().unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn sidecar_open_reuses_canonical_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+
+        let db = PidIdentityDb::open_with_authority(&path, &authority).unwrap();
+
+        assert_eq!(db.path(), path);
+    }
+
+    #[test]
+    fn nested_authority_acquisition_returns_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+
+        let error = match crate::mailbox::MailboxAuthorityFence::acquire(&path) {
+            Ok(_) => panic!("nested acquisition unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }
+        ));
     }
 
     #[test]
