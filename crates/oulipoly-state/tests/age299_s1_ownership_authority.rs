@@ -1237,20 +1237,7 @@ fn state_with_root() -> StateDb {
 }
 
 fn state_with_lineage() -> StateDb {
-    let state = state_with_root();
-    let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
-    state
-        .start_invocation(&invocation(CHILD_UUID, Some(root_id)))
-        .unwrap();
-    let child_id = state
-        .get_invocation_by_uuid(CHILD_UUID)
-        .unwrap()
-        .unwrap()
-        .id;
-    state
-        .start_invocation(&invocation(GRANDCHILD_UUID, Some(child_id)))
-        .unwrap();
-    state
+    state_with_lineage_at(Path::new(":memory:"))
 }
 
 fn state_with_lineage_at(path: &Path) -> StateDb {
