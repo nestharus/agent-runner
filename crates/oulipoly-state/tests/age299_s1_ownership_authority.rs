@@ -15,6 +15,9 @@ const CHILD_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const GRANDCHILD_UUID: &str = "33333333-3333-4333-8333-333333333333";
 const EVENT_ID: &str = "ab_age299_s1_event";
 const ADMISSION_ID: &str = "admission-age299-s1";
+const SECOND_ADMISSION_ID: &str = "admission-age299-s1-second-listener";
+const OWNER_SESSION_ID: &str = "session-age299-s1-owner";
+const SECOND_OWNER_SESSION_ID: &str = "session-age299-s1-second-owner";
 const GENERATION_ID: &str = "44444444-4444-4444-8444-444444444444";
 
 #[test]
@@ -57,10 +60,19 @@ fn fresh_and_migrated_v14_have_the_same_completion_obligation_schema() {
         "fresh and migrated databases must expose identical table, index, and constraint SQL"
     );
     assert!(ownership_schema(&fresh).iter().any(|sql| {
-        sql.contains("event_id TEXT NOT NULL UNIQUE")
+        sql.contains("UNIQUE (event_id, owner_invocation_uuid)")
             && sql.contains("REFERENCES invocations(invocation_uuid)")
+            && sql.contains("owner_session_id TEXT NOT NULL")
             && sql.contains("expected_sidecar_generation TEXT NOT NULL")
     }));
+    assert_eq!(
+        ownership_schema(&fresh)
+            .iter()
+            .filter(|sql| sql.contains("completion event sidecar generation conflict"))
+            .count(),
+        2,
+        "insert and update must preserve one immutable generation per event"
+    );
 }
 
 #[test]
@@ -70,6 +82,20 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
         state.completion_obligation_authority(ADMISSION_ID).unwrap(),
         CompletionObligationAuthority::NoAdmittedObligation
     );
+    let invalid = state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            ROOT_UUID,
+            " ",
+            GENERATION_ID,
+        ))
+        .unwrap_err();
+    assert_eq!(
+        invalid.to_string(),
+        "invalid ownership identity: owner_session_id"
+    );
 
     let recorded = state
         .record_completion_obligation(obligation(
@@ -77,6 +103,7 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
             ROOT_UUID,
             EVENT_ID,
             ROOT_UUID,
+            OWNER_SESSION_ID,
             GENERATION_ID,
         ))
         .unwrap();
@@ -86,6 +113,7 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
     assert_eq!(expectation.admission_id, ADMISSION_ID);
     assert_eq!(expectation.event_id, EVENT_ID);
     assert_eq!(expectation.owner_invocation_uuid, ROOT_UUID);
+    assert_eq!(expectation.owner_session_id, OWNER_SESSION_ID);
     assert_eq!(expectation.expected_sidecar_generation, GENERATION_ID);
     assert_eq!(
         state.completion_obligation_authority(ADMISSION_ID).unwrap(),
@@ -94,20 +122,152 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
 }
 
 #[test]
-fn exact_replay_is_idempotent_and_identity_conflicts_do_not_mutate() {
+fn schema_rejects_mixed_event_generations_without_mutation() {
     let state = state_with_lineage();
-    let exact = obligation(ADMISSION_ID, ROOT_UUID, EVENT_ID, CHILD_UUID, GENERATION_ID);
-    let CompletionObligationAdmissionResult::Recorded(recorded) =
-        state.record_completion_obligation(exact).unwrap()
+    let first = obligation(
+        ADMISSION_ID,
+        ROOT_UUID,
+        EVENT_ID,
+        CHILD_UUID,
+        OWNER_SESSION_ID,
+        GENERATION_ID,
+    );
+    let CompletionObligationAdmissionResult::Recorded(first_recorded) =
+        state.record_completion_obligation(first).unwrap()
     else {
-        panic!("first admission must be recorded")
+        panic!("first listener admission must be recorded")
     };
-    let CompletionObligationAdmissionResult::Replay(replayed) =
-        state.record_completion_obligation(exact).unwrap()
+
+    let insert_error = state
+        .connection()
+        .execute(
+            "INSERT INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                SECOND_ADMISSION_ID,
+                ROOT_UUID,
+                EVENT_ID,
+                GRANDCHILD_UUID,
+                SECOND_OWNER_SESSION_ID,
+                "mismatched-generation",
+                "2026-08-13T00:02:00Z",
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        insert_error
+            .to_string()
+            .contains("completion event sidecar generation conflict"),
+        "{insert_error}"
+    );
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap(),
+        vec![first_recorded.clone()]
+    );
+
+    let second = obligation(
+        SECOND_ADMISSION_ID,
+        ROOT_UUID,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        SECOND_OWNER_SESSION_ID,
+        GENERATION_ID,
+    );
+    let CompletionObligationAdmissionResult::Recorded(second_recorded) =
+        state.record_completion_obligation(second).unwrap()
     else {
-        panic!("exact replay must be classified as replay")
+        panic!("matching sibling listener admission must be recorded")
     };
-    assert_eq!(replayed, recorded);
+    let expected = vec![first_recorded, second_recorded];
+
+    let update_error = state
+        .connection()
+        .execute(
+            "UPDATE invocation_completion_obligations
+             SET expected_sidecar_generation = 'mismatched-generation'
+             WHERE admission_id = ?1",
+            [SECOND_ADMISSION_ID],
+        )
+        .unwrap_err();
+    assert!(
+        update_error
+            .to_string()
+            .contains("completion event sidecar generation conflict"),
+        "{update_error}"
+    );
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn event_listeners_are_independent_idempotent_obligations_with_one_generation() {
+    let state = state_with_lineage();
+    let first = obligation(
+        ADMISSION_ID,
+        ROOT_UUID,
+        EVENT_ID,
+        CHILD_UUID,
+        OWNER_SESSION_ID,
+        GENERATION_ID,
+    );
+    let second = obligation(
+        SECOND_ADMISSION_ID,
+        ROOT_UUID,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        SECOND_OWNER_SESSION_ID,
+        GENERATION_ID,
+    );
+    let CompletionObligationAdmissionResult::Recorded(first_recorded) =
+        state.record_completion_obligation(first).unwrap()
+    else {
+        panic!("first listener admission must be recorded")
+    };
+
+    let mismatched_listener = obligation(
+        SECOND_ADMISSION_ID,
+        ROOT_UUID,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        SECOND_OWNER_SESSION_ID,
+        "55555555-5555-4555-8555-555555555555",
+    );
+    assert_immutable_conflict_without_mutation(
+        &state,
+        mismatched_listener,
+        std::slice::from_ref(&first_recorded),
+    );
+
+    let CompletionObligationAdmissionResult::Recorded(second_recorded) =
+        state.record_completion_obligation(second).unwrap()
+    else {
+        panic!("sibling listener with the event generation must be recorded")
+    };
+    let expected = vec![first_recorded.clone(), second_recorded.clone()];
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap(),
+        expected,
+        "both descendant-owned listeners must remain queryable in the root scope"
+    );
+
+    for (input, recorded) in [(first, first_recorded), (second, second_recorded)] {
+        let CompletionObligationAdmissionResult::Replay(replayed) =
+            state.record_completion_obligation(input).unwrap()
+        else {
+            panic!("each exact listener replay must be classified as replay")
+        };
+        assert_eq!(replayed, recorded);
+    }
 
     for conflict in [
         obligation(
@@ -115,13 +275,7 @@ fn exact_replay_is_idempotent_and_identity_conflicts_do_not_mutate() {
             ROOT_UUID,
             "ab_conflicting_event",
             CHILD_UUID,
-            GENERATION_ID,
-        ),
-        obligation(
-            ADMISSION_ID,
-            ROOT_UUID,
-            EVENT_ID,
-            GRANDCHILD_UUID,
+            OWNER_SESSION_ID,
             GENERATION_ID,
         ),
         obligation(
@@ -129,6 +283,23 @@ fn exact_replay_is_idempotent_and_identity_conflicts_do_not_mutate() {
             ROOT_UUID,
             EVENT_ID,
             CHILD_UUID,
+            "changed-owner-session",
+            GENERATION_ID,
+        ),
+        obligation(
+            ADMISSION_ID,
+            CHILD_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ),
+        obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
             "55555555-5555-4555-8555-555555555555",
         ),
         obligation(
@@ -136,22 +307,11 @@ fn exact_replay_is_idempotent_and_identity_conflicts_do_not_mutate() {
             ROOT_UUID,
             EVENT_ID,
             CHILD_UUID,
+            OWNER_SESSION_ID,
             GENERATION_ID,
         ),
     ] {
-        let error = state.record_completion_obligation(conflict).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("conflicts with immutable admission"),
-            "{error}"
-        );
-        assert_eq!(
-            state
-                .completion_obligations_for_invocation(ROOT_UUID)
-                .unwrap(),
-            vec![recorded.clone()]
-        );
+        assert_immutable_conflict_without_mutation(&state, conflict, &expected);
     }
 }
 
@@ -170,6 +330,7 @@ fn sidecar_generation_states_preserve_absent_missing_matching_and_mismatched() {
             ROOT_UUID,
             EVENT_ID,
             ROOT_UUID,
+            OWNER_SESSION_ID,
             GENERATION_ID,
         ))
         .unwrap();
@@ -380,6 +541,7 @@ fn obligation<'a>(
     invocation_uuid: &'a str,
     event_id: &'a str,
     owner_invocation_uuid: &'a str,
+    owner_session_id: &'a str,
     expected_sidecar_generation: &'a str,
 ) -> CompletionObligationAdmission<'a> {
     CompletionObligationAdmission {
@@ -387,8 +549,29 @@ fn obligation<'a>(
         invocation_uuid,
         event_id,
         owner_invocation_uuid,
+        owner_session_id,
         expected_sidecar_generation,
     }
+}
+
+fn assert_immutable_conflict_without_mutation(
+    state: &StateDb,
+    conflict: CompletionObligationAdmission<'_>,
+    expected: &[oulipoly_state::CompletionObligationExpectation],
+) {
+    let error = state.record_completion_obligation(conflict).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with immutable admission"),
+        "{error}"
+    );
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap(),
+        expected
+    );
 }
 
 fn ownership_schema(state: &StateDb) -> Vec<String> {
@@ -398,7 +581,9 @@ fn ownership_schema(state: &StateDb) -> Vec<String> {
             "SELECT sql FROM sqlite_schema
              WHERE name IN (
                 'invocation_completion_obligations',
-                'idx_invocation_completion_obligations_invocation'
+                'idx_invocation_completion_obligations_invocation',
+                'trg_invocation_completion_obligations_generation_insert',
+                'trg_invocation_completion_obligations_generation_update'
              )
              ORDER BY type, name",
         )

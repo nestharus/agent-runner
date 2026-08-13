@@ -13,6 +13,7 @@ pub struct CompletionObligationAdmission<'a> {
     pub invocation_uuid: &'a str,
     pub event_id: &'a str,
     pub owner_invocation_uuid: &'a str,
+    pub owner_session_id: &'a str,
     pub expected_sidecar_generation: &'a str,
 }
 
@@ -22,6 +23,7 @@ pub struct CompletionObligationExpectation {
     pub invocation_uuid: String,
     pub event_id: String,
     pub owner_invocation_uuid: String,
+    pub owner_session_id: String,
     pub expected_sidecar_generation: String,
     pub admitted_at: String,
 }
@@ -160,6 +162,7 @@ pub struct OwnershipAuthoritySnapshot {
     pub sidecar_generation: SidecarGenerationState,
     pub event_state: OwnedCompletionEventState,
     pub owner_invocation_uuid: String,
+    pub owner_session_id: String,
     pub owner_relationship: OwnerLineageRelationship,
     pub listener_settlement: ListenerSettlementClass,
     pub recovery_disposition: RecoveryDisposition,
@@ -277,7 +280,14 @@ impl StateDb {
         if let Some(existing) = completion_obligation_by_admission_id(&tx, input.admission_id)? {
             return replay_or_conflict(existing, &input);
         }
-        if let Some(existing) = completion_obligation_by_event_id(&tx, input.event_id)? {
+        if let Some(existing) =
+            completion_obligation_by_listener(&tx, input.event_id, input.owner_invocation_uuid)?
+        {
+            return Err(conflicting_identity(existing));
+        }
+        if let Some(existing) = completion_obligation_by_event_id(&tx, input.event_id)?
+            && existing.expected_sidecar_generation != input.expected_sidecar_generation
+        {
             return Err(conflicting_identity(existing));
         }
         require_invocation(&tx, input.invocation_uuid, false)?;
@@ -287,13 +297,14 @@ impl StateDb {
         tx.execute(
             "INSERT INTO invocation_completion_obligations (
                 admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                expected_sidecar_generation, admitted_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             sqlite::params![
                 input.admission_id,
                 input.invocation_uuid,
                 input.event_id,
                 input.owner_invocation_uuid,
+                input.owner_session_id,
                 input.expected_sidecar_generation,
                 &admitted_at,
             ],
@@ -326,7 +337,7 @@ impl StateDb {
             .conn
             .prepare(
                 "SELECT admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                        expected_sidecar_generation, admitted_at
+                        owner_session_id, expected_sidecar_generation, admitted_at
                  FROM invocation_completion_obligations
                  WHERE invocation_uuid = ?1
                  ORDER BY admitted_at, admission_id",
@@ -411,6 +422,7 @@ fn validate_completion_obligation(
     validate_nonempty(input.invocation_uuid, "invocation_uuid")?;
     validate_nonempty(input.event_id, "event_id")?;
     validate_nonempty(input.owner_invocation_uuid, "owner_invocation_uuid")?;
+    validate_nonempty(input.owner_session_id, "owner_session_id")?;
     validate_nonempty(
         input.expected_sidecar_generation,
         "expected_sidecar_generation",
@@ -441,7 +453,31 @@ fn completion_obligation_by_event_id(
     conn: &sqlite::Connection,
     event_id: &str,
 ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
-    completion_obligation_by_identity(conn, "WHERE event_id = ?1", event_id, "event ID")
+    completion_obligation_by_identity(
+        conn,
+        "WHERE event_id = ?1 ORDER BY admitted_at, admission_id LIMIT 1",
+        event_id,
+        "event ID",
+    )
+}
+
+fn completion_obligation_by_listener(
+    conn: &sqlite::Connection,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
+    conn.query_row(
+        "SELECT admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+         FROM invocation_completion_obligations
+         WHERE event_id = ?1 AND owner_invocation_uuid = ?2",
+        sqlite::params![event_id, owner_invocation_uuid],
+        map_completion_obligation_row,
+    )
+    .optional()
+    .map_err(persistence(
+        "read completion obligation by listener identity",
+    ))
 }
 
 fn completion_obligation_by_identity(
@@ -452,7 +488,7 @@ fn completion_obligation_by_identity(
 ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
     let sql = format!(
         "SELECT admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                expected_sidecar_generation, admitted_at
+                owner_session_id, expected_sidecar_generation, admitted_at
          FROM invocation_completion_obligations {predicate}"
     );
     conn.query_row(
@@ -474,8 +510,9 @@ fn map_completion_obligation_row(
         invocation_uuid: row.get(1)?,
         event_id: row.get(2)?,
         owner_invocation_uuid: row.get(3)?,
-        expected_sidecar_generation: row.get(4)?,
-        admitted_at: row.get(5)?,
+        owner_session_id: row.get(4)?,
+        expected_sidecar_generation: row.get(5)?,
+        admitted_at: row.get(6)?,
     })
 }
 
@@ -498,6 +535,7 @@ fn completion_obligation_matches(
         && existing.invocation_uuid == input.invocation_uuid
         && existing.event_id == input.event_id
         && existing.owner_invocation_uuid == input.owner_invocation_uuid
+        && existing.owner_session_id == input.owner_session_id
         && existing.expected_sidecar_generation == input.expected_sidecar_generation
 }
 

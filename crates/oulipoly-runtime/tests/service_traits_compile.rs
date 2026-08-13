@@ -257,6 +257,7 @@ fn age299_s1_runtime_boundary_can_carry_ownership_authority_without_service_beha
         },
         event_state: oulipoly_state::OwnedCompletionEventState::Pending,
         owner_invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+        owner_session_id: "age299-compile-owner-session".to_string(),
         owner_relationship: oulipoly_state::OwnerLineageRelationship::ExactOwner,
         listener_settlement: oulipoly_state::ListenerSettlementClass::PendingOrUnsettled,
         recovery_disposition: oulipoly_state::RecoveryDisposition::NotRecorded,
