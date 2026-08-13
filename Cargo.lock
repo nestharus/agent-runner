@@ -3043,6 +3043,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "fs4",
  "libc",
  "oulipoly-agent-messenger",
  "oulipoly-config",
@@ -3181,6 +3182,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "fs4",
  "libc",
  "oulipoly-agent-messenger",
  "oulipoly-config",
