@@ -220,17 +220,25 @@ fn register_completion_event(
     let owner = parse_owner_binding(&metadata)?;
     validate_owner_binding(&owner, &metadata)?;
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
-    let mut mailbox = MailboxDb::open_default()?;
-    mailbox.register_completion_event(CompletionEventRegistrationInput {
-        event_id: args.handle,
-        delivery_mode: args.delivery_mode,
-        owner_session_id: Some(owner.session_id.as_str()),
-        owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
-        state_dir: &paths.state_dir,
-        meta_path: &paths.meta_path,
-        log_path: &paths.log_path,
-        rc_path: &paths.rc_path,
-    })
+    let mut state = StateDb::open_default()?;
+    let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
+    state.register_completion_event_with_obligation(
+        &admission_id,
+        CompletionEventRegistrationInput {
+            event_id: args.handle,
+            delivery_mode: args.delivery_mode,
+            owner_session_id: Some(owner.session_id.as_str()),
+            owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
+            state_dir: &paths.state_dir,
+            meta_path: &paths.meta_path,
+            log_path: &paths.log_path,
+            rc_path: &paths.rc_path,
+        },
+    )
+}
+
+fn completion_obligation_admission_id(event_id: &str, owner_invocation_uuid: &str) -> String {
+    format!("completion:{event_id}:owner:{owner_invocation_uuid}")
 }
 
 fn activate_completion_event(

@@ -496,6 +496,10 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     );
 
     let registration = fixture.run_register_artifacts("h-explicit-owner", "async", &artifacts);
+    let expected_generation = MailboxDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .sidecar_generation()
+        .unwrap();
     let completion = fixture.run_notify_artifacts("h-explicit-owner", &artifacts);
 
     assert!(registration.status.success(), "{registration:?}");
@@ -503,6 +507,18 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     assert_eq!(registered["status"], "registered");
     assert_eq!(registered["owner_session_id"], SESSION_A);
     assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+    let obligations = fixture
+        .open_state()
+        .completion_obligations_for_invocation(INVOCATION_A)
+        .unwrap();
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].event_id, "h-explicit-owner");
+    assert_eq!(obligations[0].owner_invocation_uuid, INVOCATION_A);
+    assert_eq!(obligations[0].owner_session_id, SESSION_A);
+    assert_eq!(
+        obligations[0].expected_sidecar_generation,
+        expected_generation
+    );
     assert!(completion.status.success(), "{completion:?}");
     let completed = stdout_json(&completion);
     assert_eq!(completed["status"], "triggered");

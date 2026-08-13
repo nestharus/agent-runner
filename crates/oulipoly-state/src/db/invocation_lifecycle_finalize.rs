@@ -227,6 +227,9 @@ impl StateDb {
 
         let invocation = Self::load_invocation_for_finalize(&tx, id)?;
         Self::validate_invocation_is_running(id, &invocation.status)?;
+        if success {
+            self.validate_completion_sidecar_authority(&tx, &invocation.invocation_uuid)?;
+        }
         Self::write_invocation_final_row(
             &tx,
             id,
@@ -247,6 +250,104 @@ impl StateDb {
 
         tx.commit().map_err(Self::format_commit_transaction_error)?;
         Ok(invocation)
+    }
+
+    fn validate_completion_sidecar_authority(
+        &self,
+        conn: &sqlite::Connection,
+        invocation_uuid: &str,
+    ) -> Result<(), String> {
+        let obligations = Self::completion_obligations_for_invocation_on(conn, invocation_uuid)
+            .map_err(|error| {
+                Self::format_completion_authority_storage_error(invocation_uuid, error)
+            })?;
+        if obligations.is_empty() {
+            return Ok(());
+        }
+
+        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        if !sidecar_path.exists() {
+            return Err(Self::format_missing_completion_sidecar(
+                invocation_uuid,
+                &obligations,
+            ));
+        }
+        let sidecar =
+            crate::mailbox::MailboxDb::open_read_only(&sidecar_path).map_err(|error| {
+                Self::format_unreadable_completion_sidecar(invocation_uuid, &obligations, error)
+            })?;
+        let observed_generation = sidecar.sidecar_generation().map_err(|error| {
+            Self::format_unreadable_completion_sidecar(invocation_uuid, &obligations, error)
+        })?;
+        if let Some(mismatch) = obligations
+            .iter()
+            .find(|obligation| obligation.expected_sidecar_generation != observed_generation)
+        {
+            return Err(format!(
+                "process_integrity: invocation {invocation_uuid} cannot succeed because completion obligation {} owned by {} expects mailbox sidecar generation {}, observed {}",
+                mismatch.admission_id,
+                mismatch.owner_invocation_uuid,
+                mismatch.expected_sidecar_generation,
+                observed_generation,
+            ));
+        }
+        for obligation in &obligations {
+            let present = sidecar
+                .contains_completion_obligation(
+                    &obligation.event_id,
+                    &obligation.owner_invocation_uuid,
+                    &obligation.owner_session_id,
+                )
+                .map_err(|error| {
+                    Self::format_unreadable_completion_sidecar(invocation_uuid, &obligations, error)
+                })?;
+            if !present {
+                return Err(format!(
+                    "process_integrity: invocation {invocation_uuid} cannot succeed because completion obligation {} owned by {} expects event {} in mailbox sidecar generation {}, but the event listener is absent",
+                    obligation.admission_id,
+                    obligation.owner_invocation_uuid,
+                    obligation.event_id,
+                    obligation.expected_sidecar_generation,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn format_completion_authority_storage_error(
+        invocation_uuid: &str,
+        error: OwnershipAuthorityError,
+    ) -> String {
+        format!(
+            "process_integrity: failed to resolve completion authority for invocation {invocation_uuid}: {error}"
+        )
+    }
+
+    fn format_missing_completion_sidecar(
+        invocation_uuid: &str,
+        obligations: &[CompletionObligationExpectation],
+    ) -> String {
+        let expectation = &obligations[0];
+        format!(
+            "process_integrity: invocation {invocation_uuid} cannot succeed because completion obligation {} owned by {} expects mailbox sidecar generation {}, but the sidecar is missing",
+            expectation.admission_id,
+            expectation.owner_invocation_uuid,
+            expectation.expected_sidecar_generation,
+        )
+    }
+
+    fn format_unreadable_completion_sidecar(
+        invocation_uuid: &str,
+        obligations: &[CompletionObligationExpectation],
+        error: String,
+    ) -> String {
+        let expectation = &obligations[0];
+        format!(
+            "process_integrity: invocation {invocation_uuid} cannot succeed because completion obligation {} owned by {} expects mailbox sidecar generation {}, but sidecar authority is unavailable: {error}",
+            expectation.admission_id,
+            expectation.owner_invocation_uuid,
+            expectation.expected_sidecar_generation,
+        )
     }
 
     pub(super) fn format_begin_transaction_error(err: sqlite::Error) -> String {

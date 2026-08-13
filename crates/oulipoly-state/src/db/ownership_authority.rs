@@ -2,9 +2,12 @@
 //!
 //! ## Declared roles
 //!
-//! `accessor`, `formatter`, `mapper`, `predicate`, `validator`
+//! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use super::{RusqliteOptionalExtension, StateDb, sqlite};
+use crate::mailbox::{
+    CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
+};
 use std::fmt;
 
 const COMPLETION_OBLIGATION_COLUMNS: &str = concat!(
@@ -226,44 +229,92 @@ impl StateDb {
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(persistence("begin completion obligation admission"))?;
 
-        if let Some(existing) = completion_obligation_by_admission_id(&tx, input.admission_id)? {
-            return replay_or_conflict(existing, &input);
-        }
-        if let Some(existing) =
-            completion_obligation_by_listener(&tx, input.event_id, input.owner_invocation_uuid)?
-        {
-            return Err(conflicting_identity(existing));
-        }
-        if let Some(existing) = completion_obligation_by_event_id(&tx, input.event_id)?
-            && existing.expected_sidecar_generation != input.expected_sidecar_generation
-        {
-            return Err(conflicting_identity(existing));
-        }
-        require_invocation(&tx, input.invocation_uuid, false)?;
-        require_invocation(&tx, input.owner_invocation_uuid, true)?;
-
-        let admitted_at = Self::current_rfc3339_timestamp();
-        tx.execute(
-            "INSERT INTO invocation_completion_obligations (
-                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                owner_session_id, expected_sidecar_generation, admitted_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            sqlite::params![
-                input.admission_id,
-                input.invocation_uuid,
-                input.event_id,
-                input.owner_invocation_uuid,
-                input.owner_session_id,
-                input.expected_sidecar_generation,
-                &admitted_at,
-            ],
-        )
-        .map_err(persistence("insert completion obligation"))?;
-        let recorded = completion_obligation_by_admission_id(&tx, input.admission_id)?
-            .ok_or_else(|| persistence_message("completion obligation disappeared after insert"))?;
+        let result = record_completion_obligation_on(&tx, input)?;
         tx.commit()
             .map_err(persistence("commit completion obligation admission"))?;
-        Ok(CompletionObligationAdmissionResult::Recorded(recorded))
+        Ok(result)
+    }
+
+    pub fn register_completion_event_with_obligation(
+        &mut self,
+        admission_id: &str,
+        registration: CompletionEventRegistrationInput<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_with_obligation_on(admission_id, registration, || {}, || {})
+    }
+
+    fn register_completion_event_with_obligation_on<BeforeCommit, AfterCommit>(
+        &mut self,
+        admission_id: &str,
+        registration: CompletionEventRegistrationInput<'_>,
+        before_state_commit: BeforeCommit,
+        after_state_commit: AfterCommit,
+    ) -> Result<CompletionEventRegistrationResult, String>
+    where
+        BeforeCommit: FnOnce(),
+        AfterCommit: FnOnce(),
+    {
+        if self.db_path == std::path::Path::new(":memory:") {
+            return Err(
+                "Completion event registration requires a durable state database".to_string(),
+            );
+        }
+        let owner_invocation_uuid = registration.owner_invocation_uuid.ok_or_else(|| {
+            "Completion event owner session and invocation are both required".to_string()
+        })?;
+        let owner_session_id = registration.owner_session_id.ok_or_else(|| {
+            "Completion event owner session and invocation are both required".to_string()
+        })?;
+        let sidecar_path = MailboxDb::path_for_state_db(&self.db_path);
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("Failed to begin completion admission transaction: {error}")
+            })?;
+        require_running_owner(&tx, owner_invocation_uuid)?;
+        let mut mailbox = MailboxDb::open(&sidecar_path)?;
+        let sidecar_generation = mailbox.sidecar_generation()?;
+        record_completion_obligation_on(
+            &tx,
+            CompletionObligationAdmission {
+                admission_id,
+                invocation_uuid: owner_invocation_uuid,
+                event_id: registration.event_id,
+                owner_invocation_uuid,
+                owner_session_id,
+                expected_sidecar_generation: &sidecar_generation,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        before_state_commit();
+        tx.commit()
+            .map_err(|error| format!("Failed to commit completion admission: {error}"))?;
+        after_state_commit();
+        mailbox.register_completion_event(registration)
+    }
+
+    pub(super) fn completion_obligations_for_invocation_on(
+        conn: &rusqlite::Connection,
+        invocation_uuid: &str,
+    ) -> Result<Vec<CompletionObligationExpectation>, OwnershipAuthorityError> {
+        validate_nonempty(invocation_uuid, "invocation_uuid")?;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT {COMPLETION_OBLIGATION_COLUMNS}
+                 FROM invocation_completion_obligations
+                 WHERE invocation_uuid = ?1
+                 ORDER BY admitted_at, admission_id"
+            ))
+            .map_err(persistence("prepare completion obligation query"))?;
+        let rows = statement
+            .query_map(
+                sqlite::params![invocation_uuid],
+                map_completion_obligation_row,
+            )
+            .map_err(persistence("query completion obligations"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(persistence("read completion obligations"))
     }
 
     pub fn completion_obligation_authority(
@@ -282,23 +333,7 @@ impl StateDb {
         invocation_uuid: &str,
     ) -> Result<Vec<CompletionObligationExpectation>, OwnershipAuthorityError> {
         validate_nonempty(invocation_uuid, "invocation_uuid")?;
-        let mut statement = self
-            .conn
-            .prepare(&format!(
-                "SELECT {COMPLETION_OBLIGATION_COLUMNS}
-                 FROM invocation_completion_obligations
-                 WHERE invocation_uuid = ?1
-                 ORDER BY admitted_at, admission_id"
-            ))
-            .map_err(persistence("prepare completion obligation query"))?;
-        let rows = statement
-            .query_map(
-                sqlite::params![invocation_uuid],
-                map_completion_obligation_row,
-            )
-            .map_err(persistence("query completion obligations"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(persistence("read completion obligations"))
+        Self::completion_obligations_for_invocation_on(&self.conn, invocation_uuid)
     }
 
     pub fn owner_lineage_relationship(
@@ -321,6 +356,66 @@ impl StateDb {
             Some(depth) => OwnerLineageRelationship::RecursiveDescendant { depth },
             None => OwnerLineageRelationship::OutsideRecursiveLineage,
         })
+    }
+}
+
+fn record_completion_obligation_on(
+    tx: &rusqlite::Transaction<'_>,
+    input: CompletionObligationAdmission<'_>,
+) -> Result<CompletionObligationAdmissionResult, OwnershipAuthorityError> {
+    validate_completion_obligation(&input)?;
+    if let Some(existing) = completion_obligation_by_admission_id(tx, input.admission_id)? {
+        return replay_or_conflict(existing, &input);
+    }
+    if let Some(existing) =
+        completion_obligation_by_listener(tx, input.event_id, input.owner_invocation_uuid)?
+    {
+        return Err(conflicting_identity(existing));
+    }
+    if let Some(existing) = completion_obligation_by_event_id(tx, input.event_id)?
+        && existing.expected_sidecar_generation != input.expected_sidecar_generation
+    {
+        return Err(conflicting_identity(existing));
+    }
+    require_invocation(tx, input.invocation_uuid, false)?;
+    require_invocation(tx, input.owner_invocation_uuid, true)?;
+
+    let admitted_at = StateDb::current_rfc3339_timestamp();
+    tx.execute(
+        "INSERT INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        sqlite::params![
+            input.admission_id,
+            input.invocation_uuid,
+            input.event_id,
+            input.owner_invocation_uuid,
+            input.owner_session_id,
+            input.expected_sidecar_generation,
+            &admitted_at,
+        ],
+    )
+    .map_err(persistence("insert completion obligation"))?;
+    completion_obligation_by_admission_id(tx, input.admission_id)?
+        .map(CompletionObligationAdmissionResult::Recorded)
+        .ok_or_else(|| persistence_message("completion obligation disappeared after insert"))
+}
+
+fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Result<(), String> {
+    let status = conn
+        .query_row(
+            "SELECT status FROM invocations WHERE invocation_uuid = ?1",
+            sqlite::params![invocation_uuid],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("Failed to lock completion listener owner: {error}"))?;
+    if status == "running" {
+        Ok(())
+    } else {
+        Err(format!(
+            "Completion listener invocation {invocation_uuid} is not running"
+        ))
     }
 }
 
@@ -525,4 +620,116 @@ fn persistence_owned(context: String) -> impl FnOnce(sqlite::Error) -> Ownership
 
 fn persistence_message(message: impl Into<String>) -> OwnershipAuthorityError {
     OwnershipAuthorityError::Persistence(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InvocationStart;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
+    const EVENT_ID: &str = "age299-s2-barrier-event";
+    const SESSION_ID: &str = "age299-s2-barrier-session";
+
+    #[test]
+    fn completion_registration_requires_a_durable_state_database() {
+        let mut state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+
+        let error = state
+            .register_completion_event_with_obligation("age299-s2-memory-admission", registration())
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Completion event registration requires a durable state database"
+        );
+    }
+
+    #[test]
+    fn completion_admission_serializes_finalization_and_partial_commit_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        drop(state);
+
+        let (admission_reached_tx, admission_reached_rx) = mpsc::channel();
+        let (admission_release_tx, admission_release_rx) = mpsc::channel();
+        let (state_committed_tx, state_committed_rx) = mpsc::channel();
+        let (sidecar_release_tx, sidecar_release_rx) = mpsc::channel();
+        let writer_state_path = state_path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut state = StateDb::open(&writer_state_path).unwrap();
+            state
+                .register_completion_event_with_obligation_on(
+                    "age299-s2-barrier-admission",
+                    registration(),
+                    || {
+                        admission_reached_tx.send(()).unwrap();
+                        admission_release_rx.recv().unwrap();
+                    },
+                    || {
+                        state_committed_tx.send(()).unwrap();
+                        sidecar_release_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+        });
+
+        admission_reached_rx.recv().unwrap();
+        let (finalize_tx, finalize_rx) = mpsc::channel();
+        let finalizer_state_path = state_path.clone();
+        let finalizer = std::thread::spawn(move || {
+            let state = StateDb::open(&finalizer_state_path).unwrap();
+            finalize_tx
+                .send(state.finalize_invocation(invocation_row_id, true, 0, None, None))
+                .unwrap();
+        });
+        assert!(
+            finalize_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "finalization must wait behind the completion-admission state writer"
+        );
+
+        admission_release_tx.send(()).unwrap();
+        state_committed_rx.recv().unwrap();
+        let error = finalize_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("process_integrity"), "{error}");
+        assert!(error.contains("event listener is absent"), "{error}");
+        finalizer.join().unwrap();
+
+        sidecar_release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        StateDb::open(&state_path)
+            .unwrap()
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap();
+    }
+
+    fn registration() -> CompletionEventRegistrationInput<'static> {
+        CompletionEventRegistrationInput {
+            event_id: EVENT_ID,
+            delivery_mode: "async",
+            owner_session_id: Some(SESSION_ID),
+            owner_invocation_uuid: Some(INVOCATION_UUID),
+            state_dir: "/tmp/age299-s2-barrier-state",
+            meta_path: "/tmp/age299-s2-barrier-meta",
+            log_path: "/tmp/age299-s2-barrier-log",
+            rc_path: "/tmp/age299-s2-barrier-rc",
+        }
+    }
 }

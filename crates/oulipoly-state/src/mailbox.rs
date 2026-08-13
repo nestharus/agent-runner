@@ -827,6 +827,45 @@ impl MailboxDb {
         &self.conn
     }
 
+    pub fn sidecar_generation(&self) -> Result<String, String> {
+        let generation = self
+            .conn
+            .query_row(
+                "SELECT generation_uuid
+                 FROM mailbox_sidecar_identity
+                 WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| format!("Failed to read PID mailbox sidecar generation: {err}"))?;
+        let parsed = Uuid::parse_str(&generation)
+            .map_err(|_| "PID mailbox sidecar generation is invalid".to_string())?;
+        if parsed.to_string() != generation {
+            return Err("PID mailbox sidecar generation is not canonical".to_string());
+        }
+        Ok(generation)
+    }
+
+    pub fn contains_completion_obligation(
+        &self,
+        event_id: &str,
+        owner_invocation_uuid: &str,
+        owner_session_id: &str,
+    ) -> Result<bool, String> {
+        let Some(event) = completion_event_by_id_on(&self.conn, event_id)? else {
+            return Ok(false);
+        };
+        if event.kind != AGENT_BASH_COMPLETE_KIND {
+            return Ok(false);
+        }
+        completion_event_listener_on(&self.conn, event_id, owner_invocation_uuid).map(|listener| {
+            listener.is_some_and(|listener| {
+                listener.owner_invocation_uuid == owner_invocation_uuid
+                    && listener.session_id == owner_session_id
+            })
+        })
+    }
+
     pub fn create_runtime_generation(
         &mut self,
         request: CreateRuntimeGeneration<'_>,
@@ -6279,7 +6318,32 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
 }
 
 fn mailbox_schema_definition() -> &'static str {
-    "CREATE TABLE IF NOT EXISTS mailbox (
+    "CREATE TABLE IF NOT EXISTS mailbox_sidecar_identity (
+            singleton       INTEGER PRIMARY KEY CHECK(singleton = 1),
+            generation_uuid TEXT NOT NULL UNIQUE,
+            created_at      TEXT NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_mailbox_sidecar_identity_update
+        BEFORE UPDATE ON mailbox_sidecar_identity
+        BEGIN
+            SELECT RAISE(ABORT, 'mailbox sidecar identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_mailbox_sidecar_identity_insert
+        BEFORE INSERT ON mailbox_sidecar_identity
+        WHEN EXISTS (SELECT 1 FROM mailbox_sidecar_identity)
+        BEGIN
+            SELECT RAISE(ABORT, 'mailbox sidecar identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_mailbox_sidecar_identity_delete
+        BEFORE DELETE ON mailbox_sidecar_identity
+        BEGIN
+            SELECT RAISE(ABORT, 'mailbox sidecar identity is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS mailbox (
             seq                          INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id                   TEXT    NOT NULL,
             kind                         TEXT    NOT NULL,
@@ -6521,12 +6585,52 @@ fn mailbox_schema_definition() -> &'static str {
 fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(mailbox_schema_definition())
         .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
+    ensure_mailbox_sidecar_identity(conn)?;
     ensure_mailbox_columns(conn)?;
     ensure_mailbox_target_index(conn)?;
     ensure_mailbox_compaction_index(conn)?;
     ensure_mailbox_delivery_owner_index(conn)?;
     ensure_session_runtime_columns(conn)?;
     ensure_runtime_generation_columns(conn)
+}
+
+fn ensure_mailbox_sidecar_identity(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|err| format!("Failed to lock PID mailbox sidecar identity: {err}"))?;
+    let result = ensure_mailbox_sidecar_identity_locked(conn);
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|err| format!("Failed to commit PID mailbox sidecar identity: {err}")),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox_sidecar_identity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|err| format!("Failed to validate PID mailbox sidecar identity: {err}"))?;
+    if count == 0 {
+        conn.execute(
+            "INSERT INTO mailbox_sidecar_identity (
+                singleton, generation_uuid, created_at
+             ) VALUES (1, ?1, ?2)",
+            params![Uuid::new_v4().to_string(), now_rfc3339()],
+        )
+        .map_err(|err| format!("Failed to initialize PID mailbox sidecar identity: {err}"))?;
+        return Ok(());
+    }
+    if count != 1 {
+        return Err("PID mailbox sidecar identity is missing".to_string());
+    }
+    Ok(())
 }
 
 fn ensure_mailbox_columns(conn: &Connection) -> Result<(), String> {
