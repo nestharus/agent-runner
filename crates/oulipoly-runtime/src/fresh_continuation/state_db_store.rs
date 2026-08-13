@@ -47,6 +47,7 @@ impl StateDbContinuationStore {
             return Ok(None);
         };
         if continuation.continuation_id != provenance.continuation_id
+            || claim.continuation_id != provenance.continuation_id
             || continuation.context.fingerprint() != provenance.validated_fingerprint
             || continuation.context.request().origin_invocation_id
                 != provenance.origin_invocation_id
@@ -84,7 +85,7 @@ impl StateDbContinuationStore {
                 rusqlite::params![
                     provenance.logical_request_key,
                     provenance.validated_fingerprint,
-                    claim.continuation_id,
+                    provenance.continuation_id,
                     provenance.origin_invocation_id,
                     provenance.resume.invocation_id,
                     provenance.resume.parent_invocation_id,
@@ -103,7 +104,7 @@ impl StateDbContinuationStore {
             HistoricalParentAdmission::new(
                 claim.parent_invocation_uuid.to_string(),
                 claim.child_invocation_uuid.to_string(),
-                claim.continuation_id.to_string(),
+                provenance.continuation_id.clone(),
             )
         }))
     }

@@ -620,6 +620,96 @@ fn validated_store_acceptance_binds_historical_authority_to_every_exact_identity
     }
 }
 
+#[test]
+fn durable_continuation_id_rewrite_cannot_replace_validated_store_provenance() {
+    let fixture = Fixture::new();
+    let context = fixture.context("continuation-id-rewrite");
+    let origin = StateDb::open(&fixture.state_path).expect("open origin state");
+    origin
+        .start_invocation(&InvocationStart {
+            invocation_uuid: context.request().origin_invocation_id.clone(),
+            model_name: "model".to_string(),
+            provider_name: "provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .expect("seed origin invocation");
+    drop(origin);
+
+    let mut store = fixture.open_store();
+    let continuation = accept(&mut store, &context);
+    let original_id = continuation.continuation_id.clone();
+    let replacement_id = "replacement-continuation-id";
+    let writer = StateDb::open(&fixture.state_path).expect("open separate public writer");
+    let before = durable_continuation_non_id_fields(&writer, &original_id);
+
+    let updated = writer
+        .connection()
+        .execute(
+            "UPDATE fresh_continuations SET continuation_id = ?1 WHERE continuation_id = ?2",
+            [replacement_id, &original_id],
+        )
+        .expect("rewrite only the durable continuation identity");
+    assert_eq!(updated, 1);
+    assert_eq!(
+        durable_continuation_non_id_fields(&writer, replacement_id),
+        before,
+        "continuation ID rewrite changed non-ID durable fields"
+    );
+
+    let replacement_claim = HistoricalParentAuthorityClaim {
+        continuation_id: replacement_id,
+        parent_invocation_uuid: &continuation.resume.parent_invocation_id,
+        child_invocation_uuid: &continuation.resume.invocation_id,
+    };
+    assert_eq!(
+        store
+            .historical_parent_admission(&continuation, replacement_claim)
+            .expect("replacement claim lookup"),
+        None,
+        "a durable rewrite must not mint authority for the replacement identity"
+    );
+    let original_claim = HistoricalParentAuthorityClaim {
+        continuation_id: &original_id,
+        parent_invocation_uuid: &continuation.resume.parent_invocation_id,
+        child_invocation_uuid: &continuation.resume.invocation_id,
+    };
+    assert_eq!(
+        store
+            .historical_parent_admission(&continuation, original_claim)
+            .expect("original claim lookup while durable identity is absent"),
+        None
+    );
+
+    let restored = writer
+        .connection()
+        .execute(
+            "UPDATE fresh_continuations SET continuation_id = ?1 WHERE continuation_id = ?2",
+            [&original_id, replacement_id],
+        )
+        .expect("restore the accepted durable continuation identity");
+    assert_eq!(restored, 1);
+    assert_eq!(
+        durable_continuation_non_id_fields(&writer, &original_id),
+        before,
+        "continuation ID restoration changed non-ID durable fields"
+    );
+
+    let admission = store
+        .historical_parent_admission(&continuation, original_claim)
+        .expect("restored original claim lookup")
+        .expect("restored provenance-bound durable identity must authorize");
+    assert_eq!(admission.continuation_id(), original_id);
+    assert_eq!(
+        admission.parent_invocation_uuid(),
+        continuation.resume.parent_invocation_id
+    );
+    assert_eq!(
+        admission.child_invocation_uuid(),
+        continuation.resume.invocation_id
+    );
+}
+
 fn assert_exact_historical_authority(
     store: &StateDbContinuationStore,
     continuation: &AcceptedContinuation,
@@ -893,6 +983,57 @@ fn artifact(
         sha256: format!("{:x}", Sha256::digest(files.get(&path).unwrap())),
         path,
     }
+}
+
+type DurableContinuationNonIdFields = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn durable_continuation_non_id_fields(
+    state: &StateDb,
+    continuation_id: &str,
+) -> DurableContinuationNonIdFields {
+    state
+        .connection()
+        .query_row(
+            "SELECT logical_request_key, validated_fingerprint,
+                    resume_invocation_id, resume_parent_invocation_id,
+                    resume_stage, resume_outcome_json,
+                    fresh_invocation_id, fresh_parent_invocation_id,
+                    fresh_stage, fresh_outcome_json,
+                    handoff_json, terminal_outcome_json
+             FROM fresh_continuations
+             WHERE continuation_id = ?1",
+            [continuation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .expect("read exact durable continuation non-ID fields")
 }
 
 fn unconfirmed_resume(invocation_id: &str) -> InvocationOutcome {
