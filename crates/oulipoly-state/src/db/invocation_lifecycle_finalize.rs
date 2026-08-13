@@ -238,18 +238,21 @@ impl StateDb {
                 finished_at,
             },
             || {},
+            || {},
         )
     }
 
-    fn finalize_invocation_transaction_on<BeforeCommit>(
+    fn finalize_invocation_transaction_on<BeforeValidation, AfterValidation>(
         &self,
         id: i64,
         success: bool,
         write: FinalizeInvocationWrite<'_>,
-        before_commit: BeforeCommit,
+        before_validation: BeforeValidation,
+        after_validation: AfterValidation,
     ) -> Result<FinalizeInvocationRow, String>
     where
-        BeforeCommit: FnOnce(),
+        BeforeValidation: FnOnce(),
+        AfterValidation: FnOnce(),
     {
         let tx =
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
@@ -267,6 +270,16 @@ impl StateDb {
             })?
             .unwrap_or_default();
         let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let _sidecar_authority = (!obligations.is_empty())
+            .then(|| crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path))
+            .transpose()
+            .map_err(|error| {
+                Self::format_unreadable_completion_sidecar(
+                    &invocation.invocation_uuid,
+                    &obligations,
+                    error,
+                )
+            })?;
         let mut sidecar = self.open_completion_authority_sidecar(
             &sidecar_path,
             &invocation.invocation_uuid,
@@ -306,12 +319,13 @@ impl StateDb {
             write.finished_at,
         )?;
 
-        before_commit();
+        before_validation();
         self.validate_completion_sidecar_authority(
             &sidecar_path,
             &invocation.invocation_uuid,
             &obligations,
         )?;
+        after_validation();
 
         tx.commit().map_err(Self::format_commit_transaction_error)?;
         Ok(invocation)
@@ -465,13 +479,15 @@ mod tests {
     use super::*;
     use crate::mailbox::{CompletionEventRegistrationInput, MailboxDb};
     use crate::{CompletionObligationAdmission, InvocationStart};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     const INVOCATION_UUID: &str = "77777777-7777-4777-8777-777777777777";
     const EVENT_ID: &str = "age299-s2-finalize-fence-event";
     const SESSION_ID: &str = "age299-s2-finalize-fence-session";
 
     #[test]
-    fn sidecar_rename_before_state_commit_rolls_back_successful_finalization() {
+    fn sidecar_namespace_mutation_after_validation_linearizes_after_state_commit() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
         let sidecar_path = MailboxDb::path_for_state_db(&state_path);
@@ -512,35 +528,57 @@ mod tests {
             })
             .unwrap();
 
-        let error = match state.finalize_invocation_transaction_on(
-            invocation_row_id,
-            true,
-            FinalizeInvocationWrite {
-                exit_code: 0,
-                error_category: None,
-                terminal_reason: None,
-                finished_at: &StateDb::current_rfc3339_timestamp(),
-            },
-            || std::fs::rename(&sidecar_path, &renamed_sidecar_path).unwrap(),
-        ) {
-            Ok(_) => panic!("sidecar rename must block successful finalization"),
-            Err(error) => error,
-        };
+        let (start_mutation_tx, start_mutation_rx) = mpsc::channel();
+        let (mutation_started_tx, mutation_started_rx) = mpsc::channel();
+        let (authority_acquired_tx, authority_acquired_rx) = mpsc::channel();
+        let mutator_sidecar_path = sidecar_path.clone();
+        let mutator_renamed_path = renamed_sidecar_path.clone();
+        let mutator = std::thread::spawn(move || {
+            start_mutation_rx.recv().unwrap();
+            mutation_started_tx.send(()).unwrap();
+            let authority =
+                crate::mailbox::MailboxAuthorityFence::acquire(&mutator_sidecar_path).unwrap();
+            authority_acquired_tx.send(()).unwrap();
+            std::fs::rename(&mutator_sidecar_path, &mutator_renamed_path).unwrap();
+            drop(authority);
+        });
 
-        assert!(error.contains("process_integrity"), "{error}");
-        assert!(error.contains("sidecar is missing"), "{error}");
+        state
+            .finalize_invocation_transaction_on(
+                invocation_row_id,
+                true,
+                FinalizeInvocationWrite {
+                    exit_code: 0,
+                    error_category: None,
+                    terminal_reason: None,
+                    finished_at: &StateDb::current_rfc3339_timestamp(),
+                },
+                || {},
+                || {
+                    start_mutation_tx.send(()).unwrap();
+                    mutation_started_rx.recv().unwrap();
+                    assert!(
+                        authority_acquired_rx
+                            .recv_timeout(Duration::from_millis(100))
+                            .is_err(),
+                        "sidecar namespace authority must remain fenced through state commit"
+                    );
+                },
+            )
+            .unwrap();
+        authority_acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        mutator.join().unwrap();
         assert_eq!(
             state
                 .get_invocation_by_uuid(INVOCATION_UUID)
                 .unwrap()
                 .unwrap()
                 .status,
-            InvocationStatus::Running
+            InvocationStatus::Succeeded
         );
 
         std::fs::rename(renamed_sidecar_path, sidecar_path).unwrap();
-        state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
-            .unwrap();
     }
 }

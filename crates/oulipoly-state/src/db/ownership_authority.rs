@@ -273,7 +273,8 @@ impl StateDb {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
         require_running_owner(&tx, owner_invocation_uuid)?;
-        let mut mailbox = MailboxDb::open(&sidecar_path)?;
+        let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)?;
+        let mut mailbox = MailboxDb::open_with_authority(&sidecar_path, &sidecar_authority)?;
         let sidecar_generation = mailbox.sidecar_generation()?;
         record_completion_obligation_on(
             &tx,
@@ -648,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_admission_serializes_finalization_and_partial_commit_fails_closed() {
+    fn completion_admission_serializes_finalization_through_sidecar_materialization() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
         let state = StateDb::open(&state_path).unwrap();
@@ -704,20 +705,20 @@ mod tests {
 
         admission_release_tx.send(()).unwrap();
         state_committed_rx.recv().unwrap();
-        let error = finalize_rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap_err();
-        assert!(error.contains("process_integrity"), "{error}");
-        assert!(error.contains("event listener is absent"), "{error}");
-        finalizer.join().unwrap();
+        assert!(
+            finalize_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "finalization must wait behind sidecar materialization"
+        );
 
         sidecar_release_tx.send(()).unwrap();
         writer.join().unwrap();
-        StateDb::open(&state_path)
+        finalize_rx
+            .recv_timeout(Duration::from_secs(5))
             .unwrap()
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
             .unwrap();
+        finalizer.join().unwrap();
     }
 
     fn registration() -> CompletionEventRegistrationInput<'static> {

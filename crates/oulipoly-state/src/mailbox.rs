@@ -765,8 +765,42 @@ pub struct MailboxDb {
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
 }
 
+/// Serializes cooperating canonical-path creation and replacement independently
+/// of SQLite's inode-scoped writer locks.
+pub(crate) struct MailboxAuthorityFence {
+    file: std::fs::File,
+}
+
 pub(crate) struct CompletionAuthorityFence<'a> {
     _tx: Transaction<'a>,
+}
+
+impl MailboxAuthorityFence {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, String> {
+        ensure_parent_dir(path)?;
+        let authority_path = mailbox_authority_path(path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&authority_path)
+            .map_err(|error| {
+                format!(
+                    "Failed to open PID mailbox sidecar authority fence {}: {error}",
+                    authority_path.display()
+                )
+            })?;
+        <std::fs::File as fs4::FileExt>::lock(&file)
+            .map_err(|error| format!("Failed to lock PID mailbox sidecar authority: {error}"))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for MailboxAuthorityFence {
+    fn drop(&mut self) {
+        let _ = <std::fs::File as fs4::FileExt>::unlock(&self.file);
+    }
 }
 
 enum BoundedMailboxRowsError {
@@ -794,11 +828,22 @@ impl MailboxDb {
         if !path.exists() {
             return Ok(None);
         }
-        Self::open(&path).map(Some)
+        let authority = MailboxAuthorityFence::acquire(&path)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        Self::open_with_authority(&path, &authority).map(Some)
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
-        ensure_parent_dir(path)?;
+        let authority = MailboxAuthorityFence::acquire(path)?;
+        Self::open_with_authority(path, &authority)
+    }
+
+    pub(crate) fn open_with_authority(
+        path: &Path,
+        _authority: &MailboxAuthorityFence,
+    ) -> Result<Self, String> {
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
         set_wal_mode(&conn)?;
@@ -6605,6 +6650,12 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_session_wake_claim_claimed_at
             ON session_wake_claim(claimed_at);"
+}
+
+fn mailbox_authority_path(sidecar_path: &Path) -> PathBuf {
+    let mut path = sidecar_path.as_os_str().to_owned();
+    path.push(".authority.lock");
+    PathBuf::from(path)
 }
 
 fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {

@@ -88,6 +88,7 @@ impl PidIdentityDb {
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
+        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(path)?;
         ensure_parent_dir(path)?;
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
@@ -560,6 +561,8 @@ fn process_group_id(_os_pid: i64) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::StateDb;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     const INVOCATION_UUID: &str = "11111111-1111-1111-1111-111111111111";
 
@@ -610,6 +613,32 @@ mod tests {
         assert_eq!(reopened.invocation_uuid, INVOCATION_UUID);
         assert_eq!(reopened.provider_name.as_deref(), Some("fixture-provider"));
         assert_eq!(reopened.model_name.as_deref(), Some("fixture~high"));
+    }
+
+    #[test]
+    fn sidecar_creation_waits_for_canonical_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener_path = path.clone();
+        let opener = std::thread::spawn(move || {
+            opened_tx.send(PidIdentityDb::open(&opener_path)).unwrap();
+        });
+
+        assert!(
+            opened_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "sidecar creation must wait behind canonical namespace authority"
+        );
+        assert!(!path.exists());
+
+        drop(authority);
+        opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        opener.join().unwrap();
+        assert!(path.exists());
     }
 
     #[test]
