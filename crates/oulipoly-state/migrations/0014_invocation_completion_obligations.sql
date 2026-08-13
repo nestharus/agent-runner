@@ -3,7 +3,7 @@
 -- `mapper`, `validator`
 
 CREATE TABLE invocation_completion_obligations (
-    admission_id TEXT PRIMARY KEY CHECK (length(trim(admission_id)) > 0),
+    admission_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(admission_id)) > 0),
     invocation_uuid TEXT NOT NULL REFERENCES invocations(invocation_uuid)
         CHECK (length(trim(invocation_uuid)) > 0),
     event_id TEXT NOT NULL CHECK (length(trim(event_id)) > 0),

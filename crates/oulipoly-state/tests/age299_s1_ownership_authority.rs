@@ -19,6 +19,8 @@ const SECOND_ADMISSION_ID: &str = "admission-age299-s1-second-listener";
 const OWNER_SESSION_ID: &str = "session-age299-s1-owner";
 const SECOND_OWNER_SESSION_ID: &str = "session-age299-s1-second-owner";
 const GENERATION_ID: &str = "44444444-4444-4444-8444-444444444444";
+const NULL_ADMISSION_ERROR: &str =
+    "NOT NULL constraint failed: invocation_completion_obligations.admission_id";
 const APPEND_ONLY_UPDATE_ERROR: &str = "completion obligation is append-only: update forbidden";
 const APPEND_ONLY_DELETE_ERROR: &str = "completion obligation is append-only: delete forbidden";
 
@@ -72,7 +74,8 @@ fn fresh_and_migrated_v14_have_the_same_completion_obligation_schema() {
         "fresh and migrated databases must expose identical table, index, and constraint SQL"
     );
     assert!(ownership_schema(&fresh).iter().any(|sql| {
-        sql.contains("UNIQUE (event_id, owner_invocation_uuid)")
+        sql.contains("admission_id TEXT NOT NULL PRIMARY KEY")
+            && sql.contains("UNIQUE (event_id, owner_invocation_uuid)")
             && sql.contains("REFERENCES invocations(invocation_uuid)")
             && sql.contains("owner_session_id TEXT NOT NULL")
             && sql.contains("expected_sidecar_generation TEXT NOT NULL")
@@ -147,6 +150,84 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
     assert_eq!(
         state.completion_obligation_authority(ADMISSION_ID).unwrap(),
         CompletionObligationAuthority::Admitted(expectation)
+    );
+}
+
+#[test]
+fn empty_table_rejects_null_admission_identity_for_every_insert_form() {
+    let state = state_with_lineage();
+
+    assert_null_admission_insert_forms_are_rejected(
+        &state,
+        "null-admission-empty-event",
+        CHILD_UUID,
+        "null-admission-empty-session",
+    );
+}
+
+#[test]
+fn singleton_listener_rejects_null_admission_identity_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_null_admission_insert_forms_are_rejected(
+        &state,
+        "null-admission-singleton-event",
+        GRANDCHILD_UUID,
+        "null-admission-singleton-session",
+    );
+    assert_null_admission_conflict_actions_are_rejected(
+        &state,
+        EVENT_ID,
+        CHILD_UUID,
+        "null-admission-singleton-replacement",
+    );
+}
+
+#[test]
+fn multi_listener_event_rejects_null_admission_identity_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+    state
+        .record_completion_obligation(obligation(
+            SECOND_ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            GRANDCHILD_UUID,
+            SECOND_OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_null_admission_insert_forms_are_rejected(
+        &state,
+        "null-admission-multi-event",
+        ROOT_UUID,
+        "null-admission-multi-session",
+    );
+    assert_null_admission_conflict_actions_are_rejected(
+        &state,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        "null-admission-multi-replacement",
     );
 }
 
@@ -760,6 +841,116 @@ fn assert_direct_delete_is_rejected(state: &StateDb, admission_id: &str) {
         before,
         "rejected delete changed a prior row"
     );
+}
+
+fn assert_null_admission_insert_forms_are_rejected(
+    state: &StateDb,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    for (operation, statement) in [
+        (
+            "ordinary insert",
+            "INSERT INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+        ),
+        (
+            "insert or replace",
+            "INSERT OR REPLACE INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+        ),
+        (
+            "upsert",
+            "INSERT INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (admission_id) DO UPDATE SET event_id = excluded.event_id",
+        ),
+    ] {
+        let before = raw_completion_obligation_rows(state);
+        let error = state
+            .connection()
+            .execute(
+                statement,
+                rusqlite::params![
+                    ROOT_UUID,
+                    event_id,
+                    owner_invocation_uuid,
+                    owner_session_id,
+                    GENERATION_ID,
+                    "2026-08-13T00:06:00Z",
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(NULL_ADMISSION_ERROR),
+            "{operation}: {error}"
+        );
+        assert_eq!(
+            raw_completion_obligation_rows(state),
+            before,
+            "rejected {operation} with NULL admission identity changed prior rows"
+        );
+    }
+}
+
+fn assert_null_admission_conflict_actions_are_rejected(
+    state: &StateDb,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    for (operation, statement) in [
+        (
+            "conflicting insert or replace",
+            "INSERT OR REPLACE INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+        ),
+        (
+            "conflicting upsert",
+            "INSERT INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (event_id, owner_invocation_uuid)
+             DO UPDATE SET admission_id = excluded.admission_id",
+        ),
+    ] {
+        let before = raw_completion_obligation_rows(state);
+        let error = state
+            .connection()
+            .execute(
+                statement,
+                rusqlite::params![
+                    ROOT_UUID,
+                    event_id,
+                    owner_invocation_uuid,
+                    owner_session_id,
+                    GENERATION_ID,
+                    "2026-08-13T00:07:00Z",
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("completion obligation immutable identity conflict"),
+            "{operation}: {error}"
+        );
+        assert_eq!(
+            raw_completion_obligation_rows(state),
+            before,
+            "rejected {operation} with NULL admission identity changed prior rows"
+        );
+    }
 }
 
 fn direct_insert_completion_obligation(
