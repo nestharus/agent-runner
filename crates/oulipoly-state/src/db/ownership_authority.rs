@@ -176,62 +176,6 @@ pub struct EffectiveTerminalDisposition {
     pub terminal_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RunningParentAdmission;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvocationParentAdmission {
-    RequireRunning(RunningParentAdmission),
-    Historical(HistoricalParentAdmission),
-}
-
-impl Default for InvocationParentAdmission {
-    fn default() -> Self {
-        Self::RequireRunning(RunningParentAdmission)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct HistoricalParentAuthorityClaim<'a> {
-    pub continuation_id: &'a str,
-    pub parent_invocation_uuid: &'a str,
-    pub child_invocation_uuid: &'a str,
-}
-
-/// Historical association authority is returned only by
-/// [`StateDb::historical_parent_admission`] after exact durable validation.
-/// It cannot be constructed from command shape or a bare parent UUID.
-///
-/// ```compile_fail
-/// use oulipoly_state::HistoricalParentAdmission;
-///
-/// let _forged = HistoricalParentAdmission {
-///     parent_invocation_uuid: "parent".to_string(),
-///     child_invocation_uuid: "child".to_string(),
-///     continuation_id: "resume-shaped".to_string(),
-/// };
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoricalParentAdmission {
-    parent_invocation_uuid: String,
-    child_invocation_uuid: String,
-    continuation_id: String,
-}
-
-impl HistoricalParentAdmission {
-    pub fn parent_invocation_uuid(&self) -> &str {
-        &self.parent_invocation_uuid
-    }
-
-    pub fn child_invocation_uuid(&self) -> &str {
-        &self.child_invocation_uuid
-    }
-
-    pub fn continuation_id(&self) -> &str {
-        &self.continuation_id
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipAuthorityError {
     InvalidIdentity(&'static str),
@@ -373,45 +317,6 @@ impl StateDb {
             Some(depth) => OwnerLineageRelationship::RecursiveDescendant { depth },
             None => OwnerLineageRelationship::OutsideRecursiveLineage,
         })
-    }
-
-    pub fn historical_parent_admission(
-        &self,
-        claim: HistoricalParentAuthorityClaim<'_>,
-    ) -> Result<Option<HistoricalParentAdmission>, OwnershipAuthorityError> {
-        validate_nonempty(claim.continuation_id, "continuation_id")?;
-        validate_nonempty(claim.parent_invocation_uuid, "parent_invocation_uuid")?;
-        validate_nonempty(claim.child_invocation_uuid, "child_invocation_uuid")?;
-        let authorized = self
-            .conn
-            .query_row(
-                "SELECT EXISTS (
-                    SELECT 1
-                    FROM fresh_continuations AS continuation
-                    JOIN invocations AS parent
-                      ON parent.invocation_uuid = ?2
-                    WHERE continuation.continuation_id = ?1
-                      AND (
-                        (continuation.resume_parent_invocation_id = ?2
-                         AND continuation.resume_invocation_id = ?3)
-                        OR
-                        (continuation.fresh_parent_invocation_id = ?2
-                         AND continuation.fresh_invocation_id = ?3)
-                      )
-                )",
-                sqlite::params![
-                    claim.continuation_id,
-                    claim.parent_invocation_uuid,
-                    claim.child_invocation_uuid,
-                ],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(persistence("validate historical parent authority"))?;
-        Ok(authorized.then(|| HistoricalParentAdmission {
-            parent_invocation_uuid: claim.parent_invocation_uuid.to_string(),
-            child_invocation_uuid: claim.child_invocation_uuid.to_string(),
-            continuation_id: claim.continuation_id.to_string(),
-        }))
     }
 }
 

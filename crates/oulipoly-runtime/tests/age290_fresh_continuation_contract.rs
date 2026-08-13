@@ -14,17 +14,20 @@
 //! ```
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use oulipoly_runtime::fresh_continuation::{
-    AcceptDecision, AcceptedContinuation, ArtifactIdentity, ContinuationBlock,
-    ContinuationBlockKind, ContinuationEvidence, ContinuationEvidenceValidator,
-    ContinuationHandoff, ContinuationStore, FreshContinuation, FreshContinuationCoordinator,
-    FreshContinuationOutcome, FreshContinuationRequest, FreshRunner, HandoffPublisher,
-    InvocationAction, InvocationDisposition, InvocationOutcome, PublishedHandoff,
-    ReservedInvocation, ResumeAcceptance, ResumeRunner, RunDecision, ValidatedContinuation,
+    AcceptDecision, AcceptedContinuation, ArtifactIdentity, ContinuationArtifactSource,
+    ContinuationBlock, ContinuationBlockKind, ContinuationEvidence, ContinuationEvidenceValidator,
+    ContinuationHandoff, ContinuationStore, DefaultContinuationEvidenceValidator,
+    FreshContinuation, FreshContinuationCoordinator, FreshContinuationOutcome,
+    FreshContinuationRequest, FreshRunner, HandoffPublisher, InvocationAction,
+    InvocationDisposition, InvocationOutcome, PublishedHandoff, ReservedInvocation,
+    ResumeAcceptance, ResumeRunner, RunDecision, ValidatedContinuation,
 };
+use sha2::{Digest, Sha256};
 
 #[derive(Default)]
 struct Calls {
@@ -320,7 +323,7 @@ fn exact_unconfirmed_resume_runs_one_fresh_invocation_and_returns_both_results()
         &[ContinuationHandoff {
             continuation_id: continuation.continuation_id.clone(),
             fresh_prompt: expected_fresh_prompt(),
-            request: context.request,
+            request: context.request().clone(),
             resume,
             fresh: Some(fresh),
         }]
@@ -944,6 +947,7 @@ impl Fixture {
 }
 
 fn request() -> FreshContinuationRequest {
+    let files = validation_files();
     FreshContinuationRequest {
         question_id: "question-1".to_string(),
         origin_invocation_id: "origin-invocation".to_string(),
@@ -954,29 +958,30 @@ fn request() -> FreshContinuationRequest {
         active_blocked_boundary: "apply".to_string(),
         target_model: "fresh-model".to_string(),
         evidence: ContinuationEvidence {
-            question: artifact("question"),
-            answer: artifact("answer"),
-            session_graph: artifact("graph"),
-            origin_trace: artifact("trace"),
-            ticket_snapshot: artifact("ticket"),
+            question: artifact(&files, "question"),
+            answer: artifact(&files, "answer"),
+            session_graph: artifact(&files, "graph"),
+            origin_trace: artifact(&files, "trace"),
+            ticket_snapshot: artifact(&files, "ticket"),
         },
     }
 }
 
 fn validated() -> ValidatedContinuation {
-    ValidatedContinuation {
-        request: request(),
-        fingerprint: "request-fingerprint".to_string(),
-    }
+    DefaultContinuationEvidenceValidator::new(ArtifactSourceFake {
+        files: validation_files(),
+    })
+    .validate(&request())
+    .expect("production evidence validation")
 }
 
 fn accepted_continuation(context: ValidatedContinuation) -> AcceptedContinuation {
-    AcceptedContinuation {
-        continuation_id: "continuation-1".to_string(),
+    AcceptedContinuation::without_historical_authority(
+        "continuation-1".to_string(),
         context,
-        resume: reservation("resume-1", "origin-invocation"),
-        fresh: reservation("fresh-1", "resume-1"),
-    }
+        reservation("resume-1", "origin-invocation"),
+        reservation("fresh-1", "resume-1"),
+    )
 }
 
 fn published_handoff() -> PublishedHandoff {
@@ -987,29 +992,75 @@ fn published_handoff() -> PublishedHandoff {
 }
 
 fn expected_fresh_prompt() -> String {
-    concat!(
-        "Continue the blocked workflow in this fresh provider session.\n",
-        "Do not retry or mutate the origin session.\n",
-        "Origin invocation: origin-invocation\n",
-        "Origin session: origin-session\n",
-        "Failed resume invocation: resume-1\n",
-        "Worktree: /worktree\n",
-        "Last successful boundary: verified\n",
-        "Active blocked boundary: apply\n",
-        "Read these exact artifacts before continuing:\n",
-        "- question: /planning/question.json (sha256 question-sha)\n",
-        "- answer: /planning/answer.json (sha256 answer-sha)\n",
-        "- session graph: /planning/graph.json (sha256 graph-sha)\n",
-        "- origin trace: /planning/trace.json (sha256 trace-sha)\n",
-        "- ticket snapshot: /planning/ticket.json (sha256 ticket-sha)\n",
+    let request = request();
+    format!(
+        concat!(
+            "Continue the blocked workflow in this fresh provider session.\n",
+            "Do not retry or mutate the origin session.\n",
+            "Origin invocation: origin-invocation\n",
+            "Origin session: origin-session\n",
+            "Failed resume invocation: resume-1\n",
+            "Worktree: /worktree\n",
+            "Last successful boundary: verified\n",
+            "Active blocked boundary: apply\n",
+            "Read these exact artifacts before continuing:\n",
+            "- question: /planning/question.json (sha256 {})\n",
+            "- answer: /planning/answer.json (sha256 {})\n",
+            "- session graph: /planning/graph.json (sha256 {})\n",
+            "- origin trace: /planning/trace.json (sha256 {})\n",
+            "- ticket snapshot: /planning/ticket.json (sha256 {})\n",
+        ),
+        request.evidence.question.sha256,
+        request.evidence.answer.sha256,
+        request.evidence.session_graph.sha256,
+        request.evidence.origin_trace.sha256,
+        request.evidence.ticket_snapshot.sha256,
     )
-    .to_string()
 }
 
-fn artifact(name: &str) -> ArtifactIdentity {
+struct ArtifactSourceFake {
+    files: HashMap<PathBuf, Vec<u8>>,
+}
+
+impl ContinuationArtifactSource for ArtifactSourceFake {
+    fn read(&mut self, artifact: &ArtifactIdentity) -> Result<Vec<u8>, ContinuationBlock> {
+        self.files
+            .get(&artifact.path)
+            .cloned()
+            .ok_or_else(|| block(ContinuationBlockKind::InvalidEvidence))
+    }
+}
+
+fn validation_files() -> HashMap<PathBuf, Vec<u8>> {
+    HashMap::from([
+        (
+            PathBuf::from("/planning/question.json"),
+            br#"{"schema_version":1,"kind":"agent_question","question_id":"question-1","origin":{"invocation_uuid":"origin-invocation","session_id":"origin-session","worktree_path":"/worktree"},"state_refs":{"session_graph_manifest":"/planning/graph.json"}}"#.to_vec(),
+        ),
+        (
+            PathBuf::from("/planning/answer.json"),
+            br#"{"schema_version":1,"kind":"agent_answer","question_id":"question-1","answered_by":"user-via-root-orchestrator","continuation_plan":{"session_graph_manifest":"/planning/graph.json"}}"#.to_vec(),
+        ),
+        (
+            PathBuf::from("/planning/graph.json"),
+            br#"{"root_invocation_uuid":"origin-invocation","invocation_ids":["origin-invocation"],"session_ids":["origin-session"],"question_ids":["question-1"]}"#.to_vec(),
+        ),
+        (
+            PathBuf::from("/planning/trace.json"),
+            br#"{"root":{"invocation":{"id":"origin-invocation"},"session":{"provider_session_id":"origin-session"}}}"#.to_vec(),
+        ),
+        (
+            PathBuf::from("/planning/ticket.json"),
+            b"ticket snapshot".to_vec(),
+        ),
+    ])
+}
+
+fn artifact(files: &HashMap<PathBuf, Vec<u8>>, name: &str) -> ArtifactIdentity {
+    let path = PathBuf::from(format!("/planning/{name}.json"));
     ArtifactIdentity {
-        path: PathBuf::from(format!("/planning/{name}.json")),
-        sha256: format!("{name}-sha"),
+        sha256: format!("{:x}", Sha256::digest(files.get(&path).unwrap())),
+        path,
     }
 }
 

@@ -173,10 +173,9 @@ pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
 pub use self::ownership_authority::{
     CompletionObligationAdmission, CompletionObligationAdmissionResult,
     CompletionObligationAuthority, CompletionObligationExpectation, EffectiveTerminalDisposition,
-    HistoricalParentAdmission, HistoricalParentAuthorityClaim, InvocationParentAdmission,
     ListenerSettlementClass, OwnedCompletionEventState, OwnerLineageRelationship,
     OwnershipAuthorityError, OwnershipAuthoritySnapshot, RecoveryDisposition,
-    RunningParentAdmission, SettlementVerifierIdentity, SidecarGenerationState,
+    SettlementVerifierIdentity, SidecarGenerationState,
 };
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,

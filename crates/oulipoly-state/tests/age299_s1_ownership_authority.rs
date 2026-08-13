@@ -3,9 +3,9 @@ use oulipoly_state::migrations;
 use oulipoly_state::repositories::ContinuationRepository;
 use oulipoly_state::{
     CURRENT_SCHEMA_VERSION, CompletionObligationAdmission, CompletionObligationAdmissionResult,
-    CompletionObligationAuthority, HistoricalParentAuthorityClaim, InvocationParentAdmission,
-    InvocationStart, ListenerSettlementClass, OwnerLineageRelationship, RecoveryDisposition,
-    RunningParentAdmission, SettlementVerifierIdentity, SidecarGenerationState, StateDb,
+    CompletionObligationAuthority, InvocationStart, ListenerSettlementClass,
+    OwnerLineageRelationship, RecoveryDisposition, SettlementVerifierIdentity,
+    SidecarGenerationState, StateDb,
 };
 use rusqlite::Connection;
 use std::path::Path;
@@ -641,7 +641,7 @@ fn exact_owner_and_recursive_descendant_owner_are_distinct() {
 }
 
 #[test]
-fn historical_parent_admission_requires_exact_durable_authority() {
+fn raw_continuation_acceptance_and_direct_tuple_have_no_historical_authority_api() {
     let mut state = state_with_root();
     let accepted = state
         .accept_continuation(&ContinuationAcceptInput {
@@ -653,46 +653,33 @@ fn historical_parent_admission_requires_exact_durable_authority() {
     let ContinuationAcceptResult::Accepted(continuation) = accepted else {
         panic!("new continuation must be accepted")
     };
+    assert_eq!(continuation.resume.parent_invocation_id, ROOT_UUID);
 
-    let running = InvocationParentAdmission::RequireRunning(RunningParentAdmission);
-    let historical = state
-        .historical_parent_admission(HistoricalParentAuthorityClaim {
-            continuation_id: &continuation.continuation_id,
-            parent_invocation_uuid: ROOT_UUID,
-            child_invocation_uuid: &continuation.resume.invocation_id,
-        })
-        .unwrap()
-        .expect("exact durable continuation identity authorizes association");
-    assert_eq!(historical.parent_invocation_uuid(), ROOT_UUID);
-    assert_eq!(
-        historical.child_invocation_uuid(),
-        continuation.resume.invocation_id
-    );
-    assert_eq!(historical.continuation_id(), continuation.continuation_id);
-    assert_ne!(
-        running,
-        InvocationParentAdmission::Historical(historical.clone())
-    );
-
-    for claim in [
-        HistoricalParentAuthorityClaim {
-            continuation_id: "resume-shaped-command",
-            parent_invocation_uuid: ROOT_UUID,
-            child_invocation_uuid: &continuation.resume.invocation_id,
-        },
-        HistoricalParentAuthorityClaim {
-            continuation_id: &continuation.continuation_id,
-            parent_invocation_uuid: ROOT_UUID,
-            child_invocation_uuid: "bare-parent-env-derived-child",
-        },
-        HistoricalParentAuthorityClaim {
-            continuation_id: &continuation.continuation_id,
-            parent_invocation_uuid: CHILD_UUID,
-            child_invocation_uuid: &continuation.resume.invocation_id,
-        },
-    ] {
-        assert_eq!(state.historical_parent_admission(claim).unwrap(), None);
-    }
+    let exact_tuple: (String, String, String, String, String) = state
+        .connection()
+        .query_row(
+            "SELECT continuation_id, validated_fingerprint,
+                    resume_parent_invocation_id, resume_invocation_id,
+                    fresh_invocation_id
+             FROM fresh_continuations
+             WHERE continuation_id = ?1",
+            [&continuation.continuation_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(exact_tuple.0, continuation.continuation_id);
+    assert_eq!(exact_tuple.1, "validated-fingerprint");
+    assert_eq!(exact_tuple.2, ROOT_UUID);
+    assert_eq!(exact_tuple.3, continuation.resume.invocation_id);
+    assert_eq!(exact_tuple.4, continuation.fresh.invocation_id);
 }
 
 fn build_schema_13_database(path: &Path) {

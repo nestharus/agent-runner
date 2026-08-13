@@ -309,7 +309,7 @@ fn continuation_handoff(
     ContinuationHandoff {
         continuation_id: continuation_id.to_string(),
         fresh_prompt: fresh_prompt(context, resume),
-        request: context.request.clone(),
+        request: context.request().clone(),
         resume: resume.clone(),
         fresh: Some(fresh.clone()),
     }

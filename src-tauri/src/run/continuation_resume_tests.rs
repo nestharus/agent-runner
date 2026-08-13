@@ -94,7 +94,7 @@ fn run_executes_exact_reserved_plan_once_then_observes_it() {
             assert_eq!(plan.invocation_id(), RESERVED_UUID);
             assert_eq!(plan.parent_invocation_row_id(), parent_row_id);
             assert_eq!(plan.max_attempts(), 1);
-            assert_eq!(context.request.origin_session_id, ORIGIN_SESSION_ID);
+            assert_eq!(context.request().origin_session_id, ORIGIN_SESSION_ID);
             seed_terminal_resume(state, plan.invocation_id(), parent_row_id);
             Ok(())
         },
@@ -238,26 +238,23 @@ fn seed_terminal_resume(state: &StateDb, invocation_uuid: &str, parent_row_id: i
 }
 
 fn validated_continuation() -> ValidatedContinuation {
-    ValidatedContinuation {
-        request: FreshContinuationRequest {
-            question_id: "question-1".to_string(),
-            origin_invocation_id: PARENT_UUID.to_string(),
-            origin_session_id: ORIGIN_SESSION_ID.to_string(),
-            planning_root: PathBuf::from("/planning"),
-            worktree: PathBuf::from("/worktree"),
-            last_successful_boundary: "verified".to_string(),
-            active_blocked_boundary: "apply".to_string(),
-            target_model: "fresh-model".to_string(),
-            evidence: ContinuationEvidence {
-                question: artifact("question"),
-                answer: artifact("answer"),
-                session_graph: artifact("graph"),
-                origin_trace: artifact("trace"),
-                ticket_snapshot: artifact("ticket"),
-            },
+    super::continuation_test_support::validated_continuation(FreshContinuationRequest {
+        question_id: "question-1".to_string(),
+        origin_invocation_id: PARENT_UUID.to_string(),
+        origin_session_id: ORIGIN_SESSION_ID.to_string(),
+        planning_root: PathBuf::from("/planning"),
+        worktree: PathBuf::from("/worktree"),
+        last_successful_boundary: "verified".to_string(),
+        active_blocked_boundary: "apply".to_string(),
+        target_model: "fresh-model".to_string(),
+        evidence: ContinuationEvidence {
+            question: artifact("question"),
+            answer: artifact("answer"),
+            session_graph: artifact("graph"),
+            origin_trace: artifact("trace"),
+            ticket_snapshot: artifact("ticket"),
         },
-        fingerprint: "request-fingerprint".to_string(),
-    }
+    })
 }
 
 fn artifact(name: &str) -> ArtifactIdentity {

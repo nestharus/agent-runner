@@ -80,10 +80,9 @@ pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{
     CompletionObligationAdmission, CompletionObligationAdmissionResult,
     CompletionObligationAuthority, CompletionObligationExpectation, EffectiveTerminalDisposition,
-    HistoricalParentAdmission, HistoricalParentAuthorityClaim, InvocationParentAdmission,
     ListenerSettlementClass, OwnedCompletionEventState, OwnerLineageRelationship,
     OwnershipAuthorityError, OwnershipAuthoritySnapshot, RecoveryDisposition,
-    RunningParentAdmission, SettlementVerifierIdentity, SidecarGenerationState,
+    SettlementVerifierIdentity, SidecarGenerationState,
 };
 pub use db::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,

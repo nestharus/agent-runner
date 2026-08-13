@@ -15,8 +15,9 @@
 
 use super::contract::{
     AcceptDecision, AcceptedContinuation, ContinuationBlock, ContinuationBlockKind,
-    ContinuationStore, FreshContinuationOutcome, InvocationDisposition, InvocationOutcome,
-    PublishedHandoff, ReservedInvocation, ResumeAcceptance, RunDecision, ValidatedContinuation,
+    ContinuationStore, FreshContinuationOutcome, HistoricalParentAdmission,
+    HistoricalParentAuthorityClaim, InvocationDisposition, InvocationOutcome, PublishedHandoff,
+    ReservedInvocation, ResumeAcceptance, RunDecision, ValidatedContinuation,
 };
 use oulipoly_state::StateDb;
 use oulipoly_state::continuation::{
@@ -35,6 +36,76 @@ pub struct StateDbContinuationStore {
 impl StateDbContinuationStore {
     pub fn new(state: StateDb) -> Self {
         Self { state }
+    }
+
+    pub fn historical_parent_admission(
+        &self,
+        continuation: &AcceptedContinuation,
+        claim: HistoricalParentAuthorityClaim<'_>,
+    ) -> Result<Option<HistoricalParentAdmission>, ContinuationBlock> {
+        let Some(provenance) = continuation.historical_provenance() else {
+            return Ok(None);
+        };
+        if continuation.continuation_id != provenance.continuation_id
+            || continuation.context.fingerprint() != provenance.validated_fingerprint
+            || continuation.context.request().origin_invocation_id
+                != provenance.origin_invocation_id
+            || continuation.resume != provenance.resume
+            || continuation.fresh != provenance.fresh
+        {
+            return Ok(None);
+        }
+        let authorized = self
+            .state
+            .connection()
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM fresh_continuations AS durable
+                    JOIN invocations AS origin
+                      ON origin.invocation_uuid = ?4
+                    JOIN invocations AS parent
+                      ON parent.invocation_uuid = ?9
+                    WHERE durable.logical_request_key = ?1
+                      AND durable.validated_fingerprint = ?2
+                      AND durable.continuation_id = ?3
+                      AND durable.resume_invocation_id = ?5
+                      AND durable.resume_parent_invocation_id = ?6
+                      AND durable.fresh_invocation_id = ?7
+                      AND durable.fresh_parent_invocation_id = ?8
+                      AND (
+                        (durable.resume_parent_invocation_id = ?9
+                         AND durable.resume_invocation_id = ?10)
+                        OR
+                        (durable.fresh_parent_invocation_id = ?9
+                         AND durable.fresh_invocation_id = ?10)
+                      )
+                )",
+                rusqlite::params![
+                    provenance.logical_request_key,
+                    provenance.validated_fingerprint,
+                    claim.continuation_id,
+                    provenance.origin_invocation_id,
+                    provenance.resume.invocation_id,
+                    provenance.resume.parent_invocation_id,
+                    provenance.fresh.invocation_id,
+                    provenance.fresh.parent_invocation_id,
+                    claim.parent_invocation_uuid,
+                    claim.child_invocation_uuid,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| ContinuationBlock {
+                kind: ContinuationBlockKind::Persistence,
+                message: format!("validate historical parent authority: {error}"),
+            })?;
+        Ok(authorized.then(|| {
+            HistoricalParentAdmission::new(
+                claim.parent_invocation_uuid.to_string(),
+                claim.child_invocation_uuid.to_string(),
+                claim.continuation_id.to_string(),
+            )
+        }))
     }
 }
 
@@ -106,8 +177,8 @@ impl ContinuationStore for StateDbContinuationStore {
 fn continuation_accept_input(context: &ValidatedContinuation) -> ContinuationAcceptInput {
     ContinuationAcceptInput {
         logical_request_key: logical_request_key(context),
-        fingerprint: context.fingerprint.clone(),
-        origin_invocation_id: context.request.origin_invocation_id.clone(),
+        fingerprint: context.fingerprint().to_string(),
+        origin_invocation_id: context.request().origin_invocation_id.clone(),
     }
 }
 
@@ -128,8 +199,11 @@ fn runtime_accept_decision(
 fn logical_request_key(context: &ValidatedContinuation) -> String {
     let mut digest = Sha256::new();
     logical_key_part(&mut digest, b"fresh-continuation-logical-request-v1");
-    logical_key_part(&mut digest, context.request.question_id.as_bytes());
-    logical_key_part(&mut digest, context.request.origin_invocation_id.as_bytes());
+    logical_key_part(&mut digest, context.request().question_id.as_bytes());
+    logical_key_part(
+        &mut digest,
+        context.request().origin_invocation_id.as_bytes(),
+    );
     format!("{:x}", digest.finalize())
 }
 
@@ -142,19 +216,20 @@ fn accepted_continuation(
     record: ContinuationRecord,
     context: ValidatedContinuation,
 ) -> AcceptedContinuation {
-    AcceptedContinuation {
-        continuation_id: record.continuation_id,
+    AcceptedContinuation::from_validated_store(
+        record.logical_request_key,
+        record.continuation_id,
         context,
-        resume: runtime_reservation(record.resume),
-        fresh: runtime_reservation(record.fresh),
-    }
+        runtime_reservation(record.resume),
+        runtime_reservation(record.fresh),
+    )
 }
 
 fn state_record(continuation: &AcceptedContinuation) -> ContinuationRecord {
     ContinuationRecord {
         logical_request_key: logical_request_key(&continuation.context),
         continuation_id: continuation.continuation_id.clone(),
-        fingerprint: continuation.context.fingerprint.clone(),
+        fingerprint: continuation.context.fingerprint().to_string(),
         resume: state_reservation(&continuation.resume),
         fresh: state_reservation(&continuation.fresh),
     }

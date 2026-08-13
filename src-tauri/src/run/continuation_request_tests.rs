@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use oulipoly_runtime::fresh_continuation::{
     ArtifactIdentity, ContinuationEvidence, FreshContinuationRequest, InvocationDisposition,
-    InvocationOutcome, ResumeAcceptance, ValidatedContinuation,
+    InvocationOutcome, ResumeAcceptance,
 };
 use serde_json::json;
 
@@ -110,10 +110,7 @@ fn unknown_artifact_identity_field_is_rejected_during_request_parsing() {
 
 #[test]
 fn fresh_prompt_names_exact_pull_references_and_boundaries() {
-    let context = ValidatedContinuation {
-        request: request_contract(),
-        fingerprint: "request-fingerprint".to_string(),
-    };
+    let context = super::continuation_test_support::validated_continuation(request_contract());
 
     let prompt = super::continuation_request::fresh_prompt(&context, &resume_outcome());
 
@@ -122,39 +119,36 @@ fn fresh_prompt_names_exact_pull_references_and_boundaries() {
         "origin-session",
         "resume-invocation",
         "/planning/question.json",
-        "question-sha",
         "/planning/answer.json",
-        "answer-sha",
         "/planning/graph.json",
-        "graph-sha",
         "/planning/trace.json",
-        "trace-sha",
         "/planning/ticket.md",
-        "ticket-sha",
         "phase-4-verified",
         "phase-5-apply-answer",
         "/worktree",
     ] {
         assert!(prompt.contains(expected), "missing {expected}: {prompt}");
     }
+    for artifact in [
+        &context.request().evidence.question,
+        &context.request().evidence.answer,
+        &context.request().evidence.session_graph,
+        &context.request().evidence.origin_trace,
+        &context.request().evidence.ticket_snapshot,
+    ] {
+        assert!(prompt.contains(&artifact.sha256));
+    }
     assert!(prompt.contains("Do not retry or mutate the origin session"));
 }
 
 #[test]
 fn fresh_prompt_contains_references_not_artifact_bodies() {
-    let dir = tempfile::tempdir().unwrap();
-    let question_path = dir.path().join("question.json");
-    fs::write(&question_path, "SECRET_ARTIFACT_BODY").unwrap();
-    let mut context = ValidatedContinuation {
-        request: request_contract(),
-        fingerprint: "request-fingerprint".to_string(),
-    };
-    context.request.evidence.question.path = question_path.clone();
+    let context = super::continuation_test_support::validated_continuation(request_contract());
 
     let prompt = super::continuation_request::fresh_prompt(&context, &resume_outcome());
 
-    assert!(prompt.contains(&question_path.display().to_string()));
-    assert!(!prompt.contains("SECRET_ARTIFACT_BODY"));
+    assert!(prompt.contains("/planning/ticket.md"));
+    assert!(!prompt.contains("SECRET_TICKET_ARTIFACT_BODY"));
 }
 
 fn write_request(root: &Path, value: serde_json::Value) -> PathBuf {

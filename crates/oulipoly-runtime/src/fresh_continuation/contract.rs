@@ -33,10 +33,44 @@ pub struct FreshContinuationRequest {
     pub evidence: ContinuationEvidence,
 }
 
+/// Complete continuation evidence validated by the production evidence validator.
+/// The request and fingerprint are read-only so callers cannot manufacture or
+/// rebind validation provenance.
+///
+/// ```compile_fail
+/// use oulipoly_runtime::fresh_continuation::{FreshContinuationRequest, ValidatedContinuation};
+///
+/// fn forge(request: FreshContinuationRequest) {
+///     let _ = ValidatedContinuation {
+///         request,
+///         fingerprint: "caller-chosen".to_string(),
+///     };
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedContinuation {
-    pub request: FreshContinuationRequest,
-    pub fingerprint: String,
+    request: FreshContinuationRequest,
+    fingerprint: String,
+}
+
+impl ValidatedContinuation {
+    pub(super) fn from_validated_evidence(
+        request: FreshContinuationRequest,
+        fingerprint: String,
+    ) -> Self {
+        Self {
+            request,
+            fingerprint,
+        }
+    }
+
+    pub fn request(&self) -> &FreshContinuationRequest {
+        &self.request
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,12 +105,157 @@ pub struct InvocationOutcome {
     pub disposition: InvocationDisposition,
 }
 
+/// A continuation and its two reservations. Only the production store can
+/// attach the private validation-and-acceptance provenance required for
+/// historical authority.
+///
+/// ```compile_fail
+/// use oulipoly_runtime::fresh_continuation::{
+///     AcceptedContinuation, ReservedInvocation, ValidatedContinuation,
+/// };
+///
+/// fn forge(context: ValidatedContinuation, reservation: ReservedInvocation) {
+///     let _ = AcceptedContinuation {
+///         continuation_id: "caller-chosen".to_string(),
+///         context,
+///         resume: reservation.clone(),
+///         fresh: reservation,
+///         historical_provenance: None,
+///     };
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedContinuation {
     pub continuation_id: String,
     pub context: ValidatedContinuation,
     pub resume: ReservedInvocation,
     pub fresh: ReservedInvocation,
+    historical_provenance: Option<ValidatedHistoricalParentProvenance>,
+}
+
+impl AcceptedContinuation {
+    /// Constructs a continuation value for non-persistence store implementations.
+    /// This value can exercise the continuation orchestration contract but can
+    /// never produce historical-parent authority.
+    pub fn without_historical_authority(
+        continuation_id: String,
+        context: ValidatedContinuation,
+        resume: ReservedInvocation,
+        fresh: ReservedInvocation,
+    ) -> Self {
+        Self {
+            continuation_id,
+            context,
+            resume,
+            fresh,
+            historical_provenance: None,
+        }
+    }
+
+    pub(super) fn from_validated_store(
+        logical_request_key: String,
+        continuation_id: String,
+        context: ValidatedContinuation,
+        resume: ReservedInvocation,
+        fresh: ReservedInvocation,
+    ) -> Self {
+        let historical_provenance = Some(ValidatedHistoricalParentProvenance {
+            logical_request_key,
+            validated_fingerprint: context.fingerprint().to_string(),
+            origin_invocation_id: context.request().origin_invocation_id.clone(),
+            continuation_id: continuation_id.clone(),
+            resume: resume.clone(),
+            fresh: fresh.clone(),
+        });
+        Self {
+            continuation_id,
+            context,
+            resume,
+            fresh,
+            historical_provenance,
+        }
+    }
+
+    pub(super) fn historical_provenance(&self) -> Option<&ValidatedHistoricalParentProvenance> {
+        self.historical_provenance.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ValidatedHistoricalParentProvenance {
+    pub(super) logical_request_key: String,
+    pub(super) validated_fingerprint: String,
+    pub(super) origin_invocation_id: String,
+    pub(super) continuation_id: String,
+    pub(super) resume: ReservedInvocation,
+    pub(super) fresh: ReservedInvocation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunningParentAdmission;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvocationParentAdmission {
+    RequireRunning(RunningParentAdmission),
+    Historical(HistoricalParentAdmission),
+}
+
+impl Default for InvocationParentAdmission {
+    fn default() -> Self {
+        Self::RequireRunning(RunningParentAdmission)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HistoricalParentAuthorityClaim<'a> {
+    pub continuation_id: &'a str,
+    pub parent_invocation_uuid: &'a str,
+    pub child_invocation_uuid: &'a str,
+}
+
+/// Historical association authority produced only after an opaque validated
+/// continuation is accepted and joined to its exact durable reservations.
+///
+/// ```compile_fail
+/// use oulipoly_runtime::fresh_continuation::HistoricalParentAdmission;
+///
+/// let _ = HistoricalParentAdmission {
+///     parent_invocation_uuid: "parent".to_string(),
+///     child_invocation_uuid: "child".to_string(),
+///     continuation_id: "continuation".to_string(),
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalParentAdmission {
+    parent_invocation_uuid: String,
+    child_invocation_uuid: String,
+    continuation_id: String,
+}
+
+impl HistoricalParentAdmission {
+    pub(super) fn new(
+        parent_invocation_uuid: String,
+        child_invocation_uuid: String,
+        continuation_id: String,
+    ) -> Self {
+        Self {
+            parent_invocation_uuid,
+            child_invocation_uuid,
+            continuation_id,
+        }
+    }
+
+    pub fn parent_invocation_uuid(&self) -> &str {
+        &self.parent_invocation_uuid
+    }
+
+    pub fn child_invocation_uuid(&self) -> &str {
+        &self.child_invocation_uuid
+    }
+
+    pub fn continuation_id(&self) -> &str {
+        &self.continuation_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +285,7 @@ pub struct ContinuationHandoff {
 }
 
 pub fn fresh_prompt(context: &ValidatedContinuation, resume: &InvocationOutcome) -> String {
-    let request = &context.request;
+    let request = context.request();
     let mut prompt = String::new();
     writeln!(
         prompt,

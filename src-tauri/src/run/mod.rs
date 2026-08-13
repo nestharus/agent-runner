@@ -41,6 +41,8 @@ mod continuation_request_tests;
 #[cfg(test)]
 mod continuation_resume_tests;
 #[cfg(test)]
+mod continuation_test_support;
+#[cfg(test)]
 mod reservation_tests;
 
 pub(crate) use repl::run_repl;

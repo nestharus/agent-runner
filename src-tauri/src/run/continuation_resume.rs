@@ -82,7 +82,7 @@ where
         continuation_outcome::observe_resume_outcome(
             self.state,
             reservation,
-            &context.request.origin_session_id,
+            &context.request().origin_session_id,
         )
         .map_err(ambiguous_state)
     }
@@ -92,7 +92,7 @@ fn validate_resume_parent(
     reservation: &ReservedInvocation,
     context: &ValidatedContinuation,
 ) -> Result<(), ContinuationBlock> {
-    if reservation.parent_invocation_id != context.request.origin_invocation_id {
+    if reservation.parent_invocation_id != context.request().origin_invocation_id {
         return Err(ContinuationBlock {
             kind: ContinuationBlockKind::Conflict,
             message: "Reserved resume parent does not match the continuation origin".to_string(),

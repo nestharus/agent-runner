@@ -270,26 +270,23 @@ fn seed_terminal_fresh(state: &StateDb, invocation_uuid: &str, parent_row_id: i6
 }
 
 fn validated_continuation() -> ValidatedContinuation {
-    ValidatedContinuation {
-        request: FreshContinuationRequest {
-            question_id: "question-1".to_string(),
-            origin_invocation_id: "origin-invocation".to_string(),
-            origin_session_id: "origin-session".to_string(),
-            planning_root: PathBuf::from("/planning"),
-            worktree: PathBuf::from("/worktree"),
-            last_successful_boundary: "verified".to_string(),
-            active_blocked_boundary: "apply".to_string(),
-            target_model: "fresh-model".to_string(),
-            evidence: ContinuationEvidence {
-                question: artifact("question"),
-                answer: artifact("answer"),
-                session_graph: artifact("graph"),
-                origin_trace: artifact("trace"),
-                ticket_snapshot: artifact("ticket"),
-            },
+    super::continuation_test_support::validated_continuation(FreshContinuationRequest {
+        question_id: "question-1".to_string(),
+        origin_invocation_id: "origin-invocation".to_string(),
+        origin_session_id: "origin-session".to_string(),
+        planning_root: PathBuf::from("/planning"),
+        worktree: PathBuf::from("/worktree"),
+        last_successful_boundary: "verified".to_string(),
+        active_blocked_boundary: "apply".to_string(),
+        target_model: "fresh-model".to_string(),
+        evidence: ContinuationEvidence {
+            question: artifact("question"),
+            answer: artifact("answer"),
+            session_graph: artifact("graph"),
+            origin_trace: artifact("trace"),
+            ticket_snapshot: artifact("ticket"),
         },
-        fingerprint: "request-fingerprint".to_string(),
-    }
+    })
 }
 
 fn artifact(name: &str) -> ArtifactIdentity {
