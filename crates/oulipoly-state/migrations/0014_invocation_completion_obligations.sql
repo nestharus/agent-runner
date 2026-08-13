@@ -41,6 +41,28 @@ CREATE TRIGGER trg_invocation_completion_obligations_generation_insert
 BEFORE INSERT ON invocation_completion_obligations
 BEGIN
     SELECT CASE
+        WHEN (
+            typeof(NEW.admission_id) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.admission_id)
+        ) OR (
+            typeof(NEW.invocation_uuid) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.invocation_uuid)
+        ) OR (
+            typeof(NEW.event_id) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.event_id)
+        ) OR (
+            typeof(NEW.owner_invocation_uuid) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.owner_invocation_uuid)
+        ) OR (
+            typeof(NEW.owner_session_id) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.owner_session_id)
+        ) OR (
+            typeof(NEW.expected_sidecar_generation) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.expected_sidecar_generation)
+        ) OR (
+            typeof(NEW.admitted_at) = 'text'
+            AND NOT oulipoly_utf8_text(NEW.admitted_at)
+        ) THEN RAISE(ABORT, 'completion obligation invalid UTF-8 TEXT')
         WHEN EXISTS (
             SELECT 1
             FROM invocation_completion_obligations

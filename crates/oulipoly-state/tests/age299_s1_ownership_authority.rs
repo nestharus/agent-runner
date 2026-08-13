@@ -24,6 +24,7 @@ const NULL_ADMISSION_ERROR: &str =
     "NOT NULL constraint failed: invocation_completion_obligations.admission_id";
 const APPEND_ONLY_UPDATE_ERROR: &str = "completion obligation is append-only: update forbidden";
 const APPEND_ONLY_DELETE_ERROR: &str = "completion obligation is append-only: delete forbidden";
+const INVALID_UTF8_TEXT_ERROR: &str = "completion obligation invalid UTF-8 TEXT";
 const NON_TEXT_ADMISSION_ID: &str = "malformed-storage-admission";
 const NUMERIC_ADMISSION_ID: &str = "299";
 const STRING_DECODED_FIELDS: [&str; 7] = [
@@ -80,6 +81,89 @@ fn schema_13_migrates_through_ordered_v14_and_preserves_invocation_data() {
         state.connection(),
         "invocation_completion_obligations"
     ));
+    assert_invalid_utf8_insert_is_rejected(
+        &state,
+        "admission_id",
+        "migration 14 ordinary insert",
+        COMPLETION_OBLIGATION_INSERT,
+        &completion_obligation_values(
+            NON_TEXT_ADMISSION_ID,
+            "migration-utf8-event",
+            ROOT_UUID,
+            "migration-utf8-session",
+            "2026-08-13T00:00:01Z",
+        ),
+        INVALID_UTF8_TEXT_ERROR,
+    );
+    direct_insert_completion_obligation(
+        &state,
+        obligation(
+            "migration-valid-admission",
+            ROOT_UUID,
+            "migration-valid-event",
+            ROOT_UUID,
+            "migration-valid-session",
+            GENERATION_ID,
+        ),
+        "2026-08-13T00:00:02Z",
+    )
+    .unwrap();
+}
+
+#[test]
+fn production_migration_runner_registers_utf8_validation_before_v14_sql() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    build_schema_13_database(&path);
+    let mut connection = Connection::open(&path).unwrap();
+    let plan = migrations::current_plan_from(13).unwrap();
+
+    migrations::run_with_db_path(&mut connection, &plan, path.clone()).unwrap();
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
+
+    let values = completion_obligation_values(
+        NON_TEXT_ADMISSION_ID,
+        "migration-runner-invalid-event",
+        ROOT_UUID,
+        "migration-runner-invalid-session",
+        "2026-08-13T00:00:03Z",
+    );
+    let error = connection
+        .execute(
+            &invalid_utf8_statement(COMPLETION_OBLIGATION_INSERT, "admission_id"),
+            params_from_iter(values.iter()),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(INVALID_UTF8_TEXT_ERROR),
+        "{error}"
+    );
+    assert!(raw_completion_obligation_rows_for_connection(&connection).is_empty());
+    let typed = StateDb::open(&path).unwrap();
+    assert!(
+        typed
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        typed
+            .completion_obligation_authority(NON_TEXT_ADMISSION_ID)
+            .unwrap(),
+        CompletionObligationAuthority::NoAdmittedObligation
+    );
+    drop(typed);
+
+    connection
+        .execute(
+            COMPLETION_OBLIGATION_INSERT,
+            params_from_iter(values.iter()),
+        )
+        .unwrap();
+    assert_eq!(
+        raw_completion_obligation_rows_for_connection(&connection).len(),
+        1
+    );
 }
 
 #[test]
@@ -115,6 +199,17 @@ fn fresh_and_migrated_v14_have_the_same_completion_obligation_schema() {
         );
     }
     let schema = ownership_schema(&fresh);
+    let insert_trigger = schema
+        .iter()
+        .find(|sql| sql.contains("trg_invocation_completion_obligations_generation_insert"))
+        .unwrap();
+    for field in STRING_DECODED_FIELDS {
+        assert!(
+            insert_trigger.contains(&format!("oulipoly_utf8_text(NEW.{field})")),
+            "missing raw UTF-8 validation for {field}: {insert_trigger}"
+        );
+    }
+    assert!(insert_trigger.contains(INVALID_UTF8_TEXT_ERROR));
     assert_eq!(
         schema
             .iter()
@@ -344,6 +439,214 @@ fn multi_listener_event_rejects_non_text_storage_without_mutation() {
         GRANDCHILD_UUID,
         SECOND_OWNER_SESSION_ID,
     );
+}
+
+#[test]
+fn empty_table_rejects_invalid_utf8_text_for_every_string_projection() {
+    let state = state_with_lineage();
+
+    assert_invalid_utf8_insert_forms_are_rejected(
+        &state,
+        "invalid-utf8-empty-event",
+        CHILD_UUID,
+        "invalid-utf8-empty-session",
+    );
+}
+
+#[test]
+fn singleton_listener_rejects_invalid_utf8_text_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_invalid_utf8_insert_forms_are_rejected(
+        &state,
+        "invalid-utf8-singleton-event",
+        GRANDCHILD_UUID,
+        "invalid-utf8-singleton-session",
+    );
+    assert_invalid_utf8_conflict_actions_are_rejected(
+        &state,
+        ADMISSION_ID,
+        EVENT_ID,
+        CHILD_UUID,
+        OWNER_SESSION_ID,
+    );
+}
+
+#[test]
+fn multi_listener_event_rejects_invalid_utf8_text_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+    state
+        .record_completion_obligation(obligation(
+            SECOND_ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            GRANDCHILD_UUID,
+            SECOND_OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_invalid_utf8_insert_forms_are_rejected(
+        &state,
+        "invalid-utf8-multi-event",
+        ROOT_UUID,
+        "invalid-utf8-multi-session",
+    );
+    assert_invalid_utf8_conflict_actions_are_rejected(
+        &state,
+        SECOND_ADMISSION_ID,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        SECOND_OWNER_SESSION_ID,
+    );
+}
+
+#[test]
+fn current_v14_reopen_registers_utf8_validation_with_an_empty_migration_plan() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    let state = state_with_lineage_at(&path);
+    drop(state);
+
+    assert!(
+        migrations::current_plan_from(CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .is_empty()
+    );
+    let state = StateDb::open(&path).unwrap();
+    let values = completion_obligation_values(
+        NON_TEXT_ADMISSION_ID,
+        "reopened-invalid-utf8-event",
+        CHILD_UUID,
+        "reopened-invalid-utf8-session",
+        "2026-08-13T00:10:01Z",
+    );
+    assert_invalid_utf8_insert_is_rejected(
+        &state,
+        "admission_id",
+        "current v14 reopen ordinary insert",
+        COMPLETION_OBLIGATION_INSERT,
+        &values,
+        INVALID_UTF8_TEXT_ERROR,
+    );
+
+    direct_insert_completion_obligation(
+        &state,
+        obligation(
+            "reopened-valid-admission",
+            ROOT_UUID,
+            "reopened-valid-event",
+            CHILD_UUID,
+            "reopened-valid-session",
+            GENERATION_ID,
+        ),
+        "2026-08-13T00:10:02Z",
+    )
+    .unwrap();
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn external_writer_without_utf8_primitive_fails_closed_for_all_direct_inserts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.db");
+    drop(state_with_lineage_at(&path));
+
+    let external = Connection::open(&path).unwrap();
+    let valid_values = completion_obligation_values(
+        "external-valid-admission",
+        "external-valid-event",
+        CHILD_UUID,
+        "external-valid-session",
+        "2026-08-13T00:11:00Z",
+    );
+    for (operation, statement) in [
+        (
+            "valid direct insert",
+            COMPLETION_OBLIGATION_INSERT.to_string(),
+        ),
+        (
+            "invalid UTF-8 direct insert",
+            invalid_utf8_statement(COMPLETION_OBLIGATION_INSERT, "admission_id"),
+        ),
+    ] {
+        let error = external
+            .execute(&statement, params_from_iter(valid_values.iter()))
+            .unwrap_err();
+        assert!(
+            (error.to_string().contains("unknown function")
+                || error.to_string().contains("no such function"))
+                && error.to_string().contains("oulipoly_utf8_text"),
+            "{operation}: {error}"
+        );
+        assert!(
+            raw_completion_obligation_rows_for_connection(&external).is_empty(),
+            "{operation} bypassed the schema without the owned primitive"
+        );
+        let owned = StateDb::open(&path).unwrap();
+        assert!(
+            owned
+                .completion_obligations_for_invocation(ROOT_UUID)
+                .unwrap()
+                .is_empty(),
+            "{operation} made the typed invocation projection non-empty"
+        );
+        assert_eq!(
+            owned
+                .completion_obligation_authority("external-valid-admission")
+                .unwrap(),
+            CompletionObligationAuthority::NoAdmittedObligation,
+            "{operation} changed typed admission authority"
+        );
+    }
+    drop(external);
+
+    let state = StateDb::open(&path).unwrap();
+    direct_insert_completion_obligation(
+        &state,
+        obligation(
+            "owned-valid-admission",
+            ROOT_UUID,
+            "owned-valid-event",
+            CHILD_UUID,
+            "owned-valid-session-\u{00e9}",
+            GENERATION_ID,
+        ),
+        "2026-08-13T00:11:01Z",
+    )
+    .unwrap();
+    assert!(matches!(
+        state
+            .completion_obligation_authority("owned-valid-admission")
+            .unwrap(),
+        CompletionObligationAuthority::Admitted(_)
+    ));
 }
 
 #[test]
@@ -841,6 +1144,26 @@ fn state_with_lineage() -> StateDb {
     state
 }
 
+fn state_with_lineage_at(path: &Path) -> StateDb {
+    let state = StateDb::open(path).unwrap();
+    state
+        .start_invocation(&invocation(ROOT_UUID, None))
+        .unwrap();
+    let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
+    state
+        .start_invocation(&invocation(CHILD_UUID, Some(root_id)))
+        .unwrap();
+    let child_id = state
+        .get_invocation_by_uuid(CHILD_UUID)
+        .unwrap()
+        .unwrap()
+        .id;
+    state
+        .start_invocation(&invocation(GRANDCHILD_UUID, Some(child_id)))
+        .unwrap();
+    state
+}
+
 fn invocation(invocation_uuid: &str, parent_invocation_id: Option<i64>) -> InvocationStart {
     InvocationStart {
         invocation_uuid: invocation_uuid.to_string(),
@@ -1123,6 +1446,91 @@ fn assert_non_text_conflict_actions_are_rejected(
     }
 }
 
+fn assert_invalid_utf8_insert_forms_are_rejected(
+    state: &StateDb,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    for field in STRING_DECODED_FIELDS {
+        let values = completion_obligation_values(
+            NON_TEXT_ADMISSION_ID,
+            event_id,
+            owner_invocation_uuid,
+            owner_session_id,
+            "2026-08-13T00:09:30Z",
+        );
+        for (operation, statement) in non_conflicting_insert_statements() {
+            assert_invalid_utf8_insert_is_rejected(
+                state,
+                field,
+                operation,
+                statement,
+                &values,
+                INVALID_UTF8_TEXT_ERROR,
+            );
+        }
+    }
+}
+
+fn assert_invalid_utf8_conflict_actions_are_rejected(
+    state: &StateDb,
+    admission_id: &str,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    for field in STRING_DECODED_FIELDS {
+        let values = completion_obligation_values(
+            admission_id,
+            event_id,
+            owner_invocation_uuid,
+            owner_session_id,
+            "2026-08-13T00:09:31Z",
+        );
+        for (operation, statement) in conflicting_insert_statements() {
+            assert_invalid_utf8_insert_is_rejected(
+                state,
+                field,
+                operation,
+                statement,
+                &values,
+                INVALID_UTF8_TEXT_ERROR,
+            );
+        }
+    }
+}
+
+fn assert_invalid_utf8_insert_is_rejected(
+    state: &StateDb,
+    field: &str,
+    operation: &str,
+    statement: &str,
+    values: &[Value],
+    expected_error: &str,
+) {
+    assert_malformed_statement_is_rejected(
+        state,
+        field,
+        operation,
+        &invalid_utf8_statement(statement, field),
+        values,
+        expected_error,
+    );
+}
+
+fn invalid_utf8_statement(statement: &str, field: &str) -> String {
+    let parameter = format!("?{}", field_index(field) + 1);
+    statement.replacen(
+        &parameter,
+        &format!(
+            "CASE WHEN {parameter} IS NULL \
+             THEN CAST(X'80' AS TEXT) ELSE CAST(X'80' AS TEXT) END"
+        ),
+        1,
+    )
+}
+
 fn assert_equivalent_blob_admission_is_rejected(state: &StateDb, text_admission_id: &str) {
     let before = raw_completion_obligation_rows(state);
     let authority_before = state
@@ -1194,7 +1602,11 @@ fn assert_malformed_statement_is_rejected(
         .unwrap_err();
     assert!(
         error.to_string().contains(expected_error),
-        "{operation} with non-text {field}: {error}"
+        "{operation} with malformed {field}: {error}"
+    );
+    assert!(
+        !error.to_string().contains("invalid utf-8"),
+        "{operation} decoded malformed {field} before constraint rejection: {error}"
     );
     assert_eq!(
         raw_completion_obligation_rows(state),
@@ -1231,6 +1643,26 @@ fn assert_malformed_statement_is_rejected(
         numeric_text_before,
         "numeric and equivalent TEXT admission identities must not coexist"
     );
+    assert_no_malformed_utf8_text(state);
+}
+
+fn assert_no_malformed_utf8_text(state: &StateDb) {
+    let malformed_count: i64 = state
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM invocation_completion_obligations
+             WHERE NOT oulipoly_utf8_text(admission_id)
+                OR NOT oulipoly_utf8_text(invocation_uuid)
+                OR NOT oulipoly_utf8_text(event_id)
+                OR NOT oulipoly_utf8_text(owner_invocation_uuid)
+                OR NOT oulipoly_utf8_text(owner_session_id)
+                OR NOT oulipoly_utf8_text(expected_sidecar_generation)
+                OR NOT oulipoly_utf8_text(admitted_at)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(malformed_count, 0, "malformed UTF-8 TEXT persisted");
 }
 
 fn malformed_storage_values() -> [Value; 2] {
@@ -1285,11 +1717,21 @@ fn non_conflicting_insert_statements() -> [(&'static str, &'static str); 3] {
     ]
 }
 
-fn conflicting_insert_statements() -> [(&'static str, &'static str); 2] {
+fn conflicting_insert_statements() -> [(&'static str, &'static str); 3] {
     [
         (
             "conflicting insert or replace",
             COMPLETION_OBLIGATION_REPLACE,
+        ),
+        (
+            "admission-key conflicting upsert",
+            concat!(
+                "INSERT INTO invocation_completion_obligations (",
+                "admission_id, invocation_uuid, event_id, owner_invocation_uuid, ",
+                "owner_session_id, expected_sidecar_generation, admitted_at",
+                ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ",
+                "ON CONFLICT (admission_id) DO UPDATE SET event_id = excluded.event_id"
+            ),
         ),
         (
             "listener-key upsert",
@@ -1328,8 +1770,13 @@ fn direct_insert_completion_obligation(
 }
 
 fn raw_completion_obligation_rows(state: &StateDb) -> Vec<RawCompletionObligationRow> {
-    let mut statement = state
-        .connection()
+    raw_completion_obligation_rows_for_connection(state.connection())
+}
+
+fn raw_completion_obligation_rows_for_connection(
+    connection: &Connection,
+) -> Vec<RawCompletionObligationRow> {
+    let mut statement = connection
         .prepare(
             "SELECT CAST(admission_id AS BLOB), CAST(invocation_uuid AS BLOB),
                     CAST(event_id AS BLOB), CAST(owner_invocation_uuid AS BLOB),
