@@ -1,4 +1,7 @@
 -- Immutable state-side identity for sidecar-owned completion obligations.
+-- DML requires every writing connection to register `oulipoly_utf8_text`.
+-- Plain sqlite3 restores and future table-rebuild migrations must register that
+-- function or explicitly account for the insert trigger before copying rows.
 -- ## Declared roles
 -- `mapper`, `validator`
 
