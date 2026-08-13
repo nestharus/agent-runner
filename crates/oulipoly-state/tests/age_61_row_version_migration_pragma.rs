@@ -304,6 +304,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0011_durable_session_lifecycle",
             "0012_session_ingress_evidence",
             "0013_fresh_continuations",
+            "0014_invocation_completion_obligations",
         ]
     );
 }

@@ -751,10 +751,10 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
 }
 
 #[test]
-fn schema_v13_is_created_fresh_and_upgrades_from_schema_v10() {
+fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
-    assert_eq!(user_version(fresh.connection()), 13);
+    assert_eq!(user_version(fresh.connection()), 14);
     let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
@@ -773,6 +773,10 @@ fn schema_v13_is_created_fresh_and_upgrades_from_schema_v10() {
         table_exists(fresh.connection(), "fresh_continuations"),
         "missing fresh_continuations"
     );
+    assert!(
+        table_exists(fresh.connection(), "invocation_completion_obligations"),
+        "missing invocation_completion_obligations"
+    );
 
     let upgrade_path = dir.path().join("upgrade.db");
     let mut conn = rusqlite::Connection::open(&upgrade_path).unwrap();
@@ -782,7 +786,7 @@ fn schema_v13_is_created_fresh_and_upgrades_from_schema_v10() {
          PRAGMA user_version = 10;",
     )
     .unwrap();
-    let plan = oulipoly_state::migrations::plan(10, 13).unwrap();
+    let plan = oulipoly_state::migrations::plan(10, 14).unwrap();
     assert_eq!(
         plan.iter()
             .map(|migration| migration.id)
@@ -790,17 +794,22 @@ fn schema_v13_is_created_fresh_and_upgrades_from_schema_v10() {
         vec![
             "0011_durable_session_lifecycle",
             "0012_session_ingress_evidence",
-            "0013_fresh_continuations"
+            "0013_fresh_continuations",
+            "0014_invocation_completion_obligations"
         ]
     );
     oulipoly_state::migrations::run_with_db_path(&mut conn, &plan, upgrade_path).unwrap();
-    assert_eq!(user_version(&conn), 13);
+    assert_eq!(user_version(&conn), 14);
     for table in lifecycle_tables {
         assert!(table_exists(&conn, table), "missing {table}");
     }
     assert!(
         table_exists(&conn, "fresh_continuations"),
         "missing fresh_continuations"
+    );
+    assert!(
+        table_exists(&conn, "invocation_completion_obligations"),
+        "missing invocation_completion_obligations"
     );
     assert_eq!(
         conn.query_row("SELECT label FROM preserved_rows WHERE id = 1", [], |row| {

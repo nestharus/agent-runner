@@ -58,7 +58,7 @@
 //!       - invocation_window, lifecycle_invocation_row, lifecycle_log_adapter, model_parameters
 //!       - opening_migrations, opening_read_only, opening_write, owned_turn_event_read, owned_turn_event_write
 //!       - provider_quota_reads, provider_quota_refresh, provider_quota_status, provider_quota_test_support, provider_quota_window_writes, provider_quotas
-//!       - provider_schema_migration, provider_schema_validation, provider_session_binding, providers
+//!       - ownership_authority, provider_schema_migration, provider_schema_validation, provider_session_binding, providers
 //!       - resume_active_segment, resume_lookup, resume_preview, resume_resolution, resume_types
 //!       - returned_artifacts_codec, returned_artifacts_read, returned_artifacts_write
 //!       - schema_types, session_capture, session_markers, session_turns_ingest, session_turns_query, sqlite_adapter, timestamps
@@ -120,6 +120,7 @@ mod opening_read_only;
 mod opening_write;
 mod owned_turn_event_read;
 mod owned_turn_event_write;
+mod ownership_authority;
 mod provider_quota_reads;
 mod provider_quota_refresh;
 mod provider_quota_status;
@@ -169,6 +170,14 @@ pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
+pub use self::ownership_authority::{
+    CompletionObligationAdmission, CompletionObligationAdmissionResult,
+    CompletionObligationAuthority, CompletionObligationExpectation, EffectiveTerminalDisposition,
+    HistoricalParentAdmission, HistoricalParentAuthorityClaim, InvocationParentAdmission,
+    ListenerSettlementClass, OwnedCompletionEventState, OwnerLineageRelationship,
+    OwnershipAuthorityError, OwnershipAuthoritySnapshot, RecoveryDisposition,
+    RunningParentAdmission, SettlementVerifierIdentity, SidecarGenerationState,
+};
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,
     QuotaAggregateProjection, QuotaWindowDelta,

@@ -242,6 +242,42 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
 }
 
 #[test]
+fn age299_s1_runtime_boundary_can_carry_ownership_authority_without_service_behavior_changes() {
+    fn carry_snapshot(
+        snapshot: oulipoly_state::OwnershipAuthoritySnapshot,
+    ) -> oulipoly_state::OwnershipAuthoritySnapshot {
+        snapshot
+    }
+
+    let snapshot = carry_snapshot(oulipoly_state::OwnershipAuthoritySnapshot {
+        invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+        event_id: "ab_age299_compile".to_string(),
+        sidecar_generation: oulipoly_state::SidecarGenerationState::ExpectedButUnobserved {
+            expected: "22222222-2222-4222-8222-222222222222".to_string(),
+        },
+        event_state: oulipoly_state::OwnedCompletionEventState::Pending,
+        owner_invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+        owner_relationship: oulipoly_state::OwnerLineageRelationship::ExactOwner,
+        listener_settlement: oulipoly_state::ListenerSettlementClass::PendingOrUnsettled,
+        recovery_disposition: oulipoly_state::RecoveryDisposition::NotRecorded,
+    });
+    assert_eq!(snapshot.event_id, "ab_age299_compile");
+    let disposition = oulipoly_state::EffectiveTerminalDisposition {
+        success: false,
+        exit_code: 1,
+        error_category: Some("process_integrity".to_string()),
+        terminal_reason: Some("compile-only typed representation".to_string()),
+    };
+    assert!(!disposition.success);
+
+    let start_request_type = std::any::type_name::<InvocationLifecycleStartRequest<'static>>();
+    let finalize_request_type =
+        std::any::type_name::<InvocationLifecycleFinalizeRequest<'static>>();
+    assert!(start_request_type.contains("InvocationLifecycleStartRequest"));
+    assert!(finalize_request_type.contains("InvocationLifecycleFinalizeRequest"));
+}
+
+#[test]
 fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos() {
     let resume: Arc<dyn ResumeServicePort + Send + Sync> = Arc::new(StubService);
     let session_lifecycle: Arc<dyn SessionLifecycleServicePort + Send + Sync> =

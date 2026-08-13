@@ -240,8 +240,8 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
 
     assert_eq!(
         plan_target_versions(&plan),
-        vec![5, 6, 7, 8, 9, 10, 11, 12, CURRENT_SCHEMA_VERSION],
-        "schema-4 DBs must take every ordered migration through fresh continuation schema 13"
+        vec![5, 6, 7, 8, 9, 10, 11, 12, 13, CURRENT_SCHEMA_VERSION],
+        "schema-4 DBs must take every ordered migration through ownership authority schema 14"
     );
     assert_eq!(
         plan_ids(&plan),
@@ -255,6 +255,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0011_durable_session_lifecycle",
             "0012_session_ingress_evidence",
             "0013_fresh_continuations",
+            "0014_invocation_completion_obligations",
         ]
     );
 }
