@@ -25,26 +25,34 @@ CREATE INDEX idx_invocation_completion_obligations_invocation
 
 CREATE TRIGGER trg_invocation_completion_obligations_generation_insert
 BEFORE INSERT ON invocation_completion_obligations
-WHEN EXISTS (
-    SELECT 1
-    FROM invocation_completion_obligations
-    WHERE event_id = NEW.event_id
-      AND expected_sidecar_generation <> NEW.expected_sidecar_generation
-)
 BEGIN
-    SELECT RAISE(ABORT, 'completion event sidecar generation conflict');
+    SELECT CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM invocation_completion_obligations
+            WHERE admission_id = NEW.admission_id
+               OR (
+                   event_id = NEW.event_id
+                   AND owner_invocation_uuid = NEW.owner_invocation_uuid
+               )
+        ) THEN RAISE(ABORT, 'completion obligation immutable identity conflict')
+        WHEN EXISTS (
+            SELECT 1
+            FROM invocation_completion_obligations
+            WHERE event_id = NEW.event_id
+              AND expected_sidecar_generation <> NEW.expected_sidecar_generation
+        ) THEN RAISE(ABORT, 'completion event sidecar generation conflict')
+    END;
 END;
 
-CREATE TRIGGER trg_invocation_completion_obligations_generation_update
-BEFORE UPDATE OF event_id, expected_sidecar_generation
-ON invocation_completion_obligations
-WHEN EXISTS (
-    SELECT 1
-    FROM invocation_completion_obligations
-    WHERE event_id = NEW.event_id
-      AND admission_id <> OLD.admission_id
-      AND expected_sidecar_generation <> NEW.expected_sidecar_generation
-)
+CREATE TRIGGER trg_invocation_completion_obligations_append_only_update
+BEFORE UPDATE ON invocation_completion_obligations
 BEGIN
-    SELECT RAISE(ABORT, 'completion event sidecar generation conflict');
+    SELECT RAISE(ABORT, 'completion obligation is append-only: update forbidden');
+END;
+
+CREATE TRIGGER trg_invocation_completion_obligations_append_only_delete
+BEFORE DELETE ON invocation_completion_obligations
+BEGIN
+    SELECT RAISE(ABORT, 'completion obligation is append-only: delete forbidden');
 END;

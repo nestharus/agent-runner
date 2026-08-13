@@ -19,6 +19,18 @@ const SECOND_ADMISSION_ID: &str = "admission-age299-s1-second-listener";
 const OWNER_SESSION_ID: &str = "session-age299-s1-owner";
 const SECOND_OWNER_SESSION_ID: &str = "session-age299-s1-second-owner";
 const GENERATION_ID: &str = "44444444-4444-4444-8444-444444444444";
+const APPEND_ONLY_UPDATE_ERROR: &str = "completion obligation is append-only: update forbidden";
+const APPEND_ONLY_DELETE_ERROR: &str = "completion obligation is append-only: delete forbidden";
+
+type RawCompletionObligationRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+);
 
 #[test]
 fn schema_13_migrates_through_ordered_v14_and_preserves_invocation_data() {
@@ -65,13 +77,30 @@ fn fresh_and_migrated_v14_have_the_same_completion_obligation_schema() {
             && sql.contains("owner_session_id TEXT NOT NULL")
             && sql.contains("expected_sidecar_generation TEXT NOT NULL")
     }));
+    let schema = ownership_schema(&fresh);
     assert_eq!(
-        ownership_schema(&fresh)
+        schema
             .iter()
             .filter(|sql| sql.contains("completion event sidecar generation conflict"))
             .count(),
-        2,
-        "insert and update must preserve one immutable generation per event"
+        1,
+        "inserts must preserve one immutable generation per event"
+    );
+    assert_eq!(
+        schema
+            .iter()
+            .filter(|sql| sql.contains(APPEND_ONLY_UPDATE_ERROR))
+            .count(),
+        1,
+        "every direct update must be rejected"
+    );
+    assert_eq!(
+        schema
+            .iter()
+            .filter(|sql| sql.contains(APPEND_ONLY_DELETE_ERROR))
+            .count(),
+        1,
+        "every direct delete must be rejected"
     );
 }
 
@@ -122,7 +151,7 @@ fn absent_obligation_and_exact_admitted_expectation_are_distinct() {
 }
 
 #[test]
-fn schema_rejects_mixed_event_generations_without_mutation() {
+fn direct_inserts_allow_sibling_listeners_only_for_the_admitted_generation() {
     let state = state_with_lineage();
     let first = obligation(
         ADMISSION_ID,
@@ -138,36 +167,25 @@ fn schema_rejects_mixed_event_generations_without_mutation() {
         panic!("first listener admission must be recorded")
     };
 
-    let insert_error = state
-        .connection()
-        .execute(
-            "INSERT INTO invocation_completion_obligations (
-                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
-                owner_session_id, expected_sidecar_generation, admitted_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                SECOND_ADMISSION_ID,
-                ROOT_UUID,
-                EVENT_ID,
-                GRANDCHILD_UUID,
-                SECOND_OWNER_SESSION_ID,
-                "mismatched-generation",
-                "2026-08-13T00:02:00Z",
-            ],
-        )
-        .unwrap_err();
+    let before = raw_completion_obligation_rows(&state);
+    let mismatched_sibling = obligation(
+        SECOND_ADMISSION_ID,
+        ROOT_UUID,
+        EVENT_ID,
+        GRANDCHILD_UUID,
+        SECOND_OWNER_SESSION_ID,
+        "mismatched-generation",
+    );
+    let insert_error =
+        direct_insert_completion_obligation(&state, mismatched_sibling, "2026-08-13T00:02:00Z")
+            .unwrap_err();
     assert!(
         insert_error
             .to_string()
             .contains("completion event sidecar generation conflict"),
         "{insert_error}"
     );
-    assert_eq!(
-        state
-            .completion_obligations_for_invocation(ROOT_UUID)
-            .unwrap(),
-        vec![first_recorded.clone()]
-    );
+    assert_eq!(raw_completion_obligation_rows(&state), before);
 
     let second = obligation(
         SECOND_ADMISSION_ID,
@@ -177,34 +195,148 @@ fn schema_rejects_mixed_event_generations_without_mutation() {
         SECOND_OWNER_SESSION_ID,
         GENERATION_ID,
     );
-    let CompletionObligationAdmissionResult::Recorded(second_recorded) =
+    direct_insert_completion_obligation(&state, second, "9999-12-31T23:59:59Z").unwrap();
+    let CompletionObligationAdmissionResult::Replay(second_recorded) =
         state.record_completion_obligation(second).unwrap()
     else {
-        panic!("matching sibling listener admission must be recorded")
+        panic!("the directly inserted sibling must replay exactly through the API")
     };
-    let expected = vec![first_recorded, second_recorded];
-
-    let update_error = state
-        .connection()
-        .execute(
-            "UPDATE invocation_completion_obligations
-             SET expected_sidecar_generation = 'mismatched-generation'
-             WHERE admission_id = ?1",
-            [SECOND_ADMISSION_ID],
-        )
-        .unwrap_err();
-    assert!(
-        update_error
-            .to_string()
-            .contains("completion event sidecar generation conflict"),
-        "{update_error}"
-    );
     assert_eq!(
         state
             .completion_obligations_for_invocation(ROOT_UUID)
             .unwrap(),
-        expected
+        vec![first_recorded, second_recorded]
     );
+}
+
+#[test]
+fn singleton_listener_rejects_every_direct_update_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_every_direct_update_is_rejected(&state, ADMISSION_ID);
+}
+
+#[test]
+fn multi_listener_event_rejects_every_direct_update_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+    state
+        .record_completion_obligation(obligation(
+            SECOND_ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            GRANDCHILD_UUID,
+            SECOND_OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_every_direct_update_is_rejected(&state, ADMISSION_ID);
+}
+
+#[test]
+fn singleton_listener_rejects_direct_delete_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_direct_delete_is_rejected(&state, ADMISSION_ID);
+}
+
+#[test]
+fn multi_listener_event_rejects_direct_delete_without_mutation() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+    state
+        .record_completion_obligation(obligation(
+            SECOND_ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            GRANDCHILD_UUID,
+            SECOND_OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+
+    assert_direct_delete_is_rejected(&state, ADMISSION_ID);
+}
+
+#[test]
+fn replace_cannot_bypass_append_only_identity() {
+    let state = state_with_lineage();
+    state
+        .record_completion_obligation(obligation(
+            ADMISSION_ID,
+            ROOT_UUID,
+            EVENT_ID,
+            CHILD_UUID,
+            OWNER_SESSION_ID,
+            GENERATION_ID,
+        ))
+        .unwrap();
+    let before = raw_completion_obligation_rows(&state);
+
+    let error = state
+        .connection()
+        .execute(
+            "INSERT OR REPLACE INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                ADMISSION_ID,
+                ROOT_UUID,
+                "replacement-event",
+                GRANDCHILD_UUID,
+                "replacement-session",
+                "replacement-generation",
+                "2026-08-13T00:04:00Z",
+            ],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completion obligation immutable identity conflict"),
+        "{error}"
+    );
+    assert_eq!(raw_completion_obligation_rows(&state), before);
 }
 
 #[test]
@@ -574,16 +706,125 @@ fn assert_immutable_conflict_without_mutation(
     );
 }
 
+fn assert_every_direct_update_is_rejected(state: &StateDb, admission_id: &str) {
+    for (field, replacement) in [
+        ("admission_id", "replacement-admission"),
+        ("invocation_uuid", CHILD_UUID),
+        ("event_id", "replacement-event"),
+        ("owner_invocation_uuid", GRANDCHILD_UUID),
+        ("owner_session_id", "replacement-owner-session"),
+        (
+            "expected_sidecar_generation",
+            "55555555-5555-4555-8555-555555555555",
+        ),
+        ("admitted_at", "2026-08-13T00:05:00Z"),
+    ] {
+        let before = raw_completion_obligation_rows(state);
+        let error = state
+            .connection()
+            .execute(
+                &format!(
+                    "UPDATE invocation_completion_obligations
+                     SET {field} = ?1 WHERE admission_id = ?2"
+                ),
+                rusqlite::params![replacement, admission_id],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(APPEND_ONLY_UPDATE_ERROR),
+            "{field}: {error}"
+        );
+        assert_eq!(
+            raw_completion_obligation_rows(state),
+            before,
+            "rejected update of {field} changed a prior row"
+        );
+    }
+}
+
+fn assert_direct_delete_is_rejected(state: &StateDb, admission_id: &str) {
+    let before = raw_completion_obligation_rows(state);
+    let error = state
+        .connection()
+        .execute(
+            "DELETE FROM invocation_completion_obligations WHERE admission_id = ?1",
+            [admission_id],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(APPEND_ONLY_DELETE_ERROR),
+        "{error}"
+    );
+    assert_eq!(
+        raw_completion_obligation_rows(state),
+        before,
+        "rejected delete changed a prior row"
+    );
+}
+
+fn direct_insert_completion_obligation(
+    state: &StateDb,
+    input: CompletionObligationAdmission<'_>,
+    admitted_at: &str,
+) -> rusqlite::Result<usize> {
+    state.connection().execute(
+        "INSERT INTO invocation_completion_obligations (
+            admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+            owner_session_id, expected_sidecar_generation, admitted_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            input.admission_id,
+            input.invocation_uuid,
+            input.event_id,
+            input.owner_invocation_uuid,
+            input.owner_session_id,
+            input.expected_sidecar_generation,
+            admitted_at,
+        ],
+    )
+}
+
+fn raw_completion_obligation_rows(state: &StateDb) -> Vec<RawCompletionObligationRow> {
+    let mut statement = state
+        .connection()
+        .prepare(
+            "SELECT CAST(admission_id AS BLOB), CAST(invocation_uuid AS BLOB),
+                    CAST(event_id AS BLOB), CAST(owner_invocation_uuid AS BLOB),
+                    CAST(owner_session_id AS BLOB),
+                    CAST(expected_sidecar_generation AS BLOB),
+                    CAST(admitted_at AS BLOB)
+             FROM invocation_completion_obligations
+             ORDER BY admission_id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
 fn ownership_schema(state: &StateDb) -> Vec<String> {
     let mut statement = state
         .connection()
         .prepare(
             "SELECT sql FROM sqlite_schema
              WHERE name IN (
-                'invocation_completion_obligations',
-                'idx_invocation_completion_obligations_invocation',
-                'trg_invocation_completion_obligations_generation_insert',
-                'trg_invocation_completion_obligations_generation_update'
+                 'invocation_completion_obligations',
+                 'idx_invocation_completion_obligations_invocation',
+                 'trg_invocation_completion_obligations_generation_insert',
+                 'trg_invocation_completion_obligations_append_only_update',
+                 'trg_invocation_completion_obligations_append_only_delete'
              )
              ORDER BY type, name",
         )
