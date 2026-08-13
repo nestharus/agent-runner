@@ -23,9 +23,10 @@ pub use contract::{
     AcceptDecision, AcceptedContinuation, ArtifactIdentity, ContinuationArtifactSource,
     ContinuationBlock, ContinuationBlockKind, ContinuationEvidence, ContinuationEvidenceValidator,
     ContinuationHandoff, ContinuationStore, FreshContinuation, FreshContinuationOutcome,
-    FreshContinuationRequest, FreshRunner, HandoffPublisher, InvocationAction,
-    InvocationDisposition, InvocationOutcome, PublishedHandoff, ReservedInvocation,
-    ResumeAcceptance, ResumeRunner, RunDecision, ValidatedContinuation, fresh_prompt,
+    FreshContinuationRequest, FreshRunner, HandoffPublisher, HistoricalParentAdmission,
+    HistoricalParentAuthorityClaim, InvocationAction, InvocationDisposition, InvocationOutcome,
+    InvocationParentAdmission, PublishedHandoff, ReservedInvocation, ResumeAcceptance,
+    ResumeRunner, RunDecision, RunningParentAdmission, ValidatedContinuation, fresh_prompt,
 };
 pub use coordinator::FreshContinuationCoordinator;
 pub use evidence::DefaultContinuationEvidenceValidator;

@@ -7,14 +7,25 @@
 
 use std::process::Command;
 
-fn cmd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
+fn cmd() -> (Command, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    command
+        .current_dir(dir.path())
+        .env("OULIPOLY_DATA_DIR", dir.path().join("app-data"))
+        .env("XDG_DATA_HOME", dir.path().join("xdg-data"))
+        .env("XDG_CONFIG_HOME", dir.path().join("xdg-config"))
+        .env("XDG_STATE_HOME", dir.path().join("xdg-state"))
+        .env("HOME", dir.path().join("home"))
+        .env_remove("OULIPOLY_PARENT_INVOCATION");
+    (command, dir)
 }
 
 #[test]
 fn rotate_provider_absent_honors_bound_provider() {
     // Parser-level only: a bare `--help` invocation must list the new flag.
-    let output = cmd().arg("--help").output().unwrap();
+    let (mut command, _dir) = cmd();
+    let output = command.arg("--help").output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -29,7 +40,8 @@ fn rotate_provider_no_value_parses_as_auto_rotate_signal() {
     // Parsed under `--resume` to exercise the top-level Cli's tri-state field;
     // we only need clap to accept the form. Failure during downstream
     // execution (missing fixtures) is fine — parsing must succeed.
-    let output = cmd()
+    let (mut command, _dir) = cmd();
+    let output = command
         .arg("--resume")
         .arg("5169694d-de0f-40d1-890c-6e28e55bab27")
         .arg("--rotate-provider")
@@ -46,7 +58,8 @@ fn rotate_provider_no_value_parses_as_auto_rotate_signal() {
 
 #[test]
 fn rotate_provider_with_target_parses_with_target_value() {
-    let output = cmd()
+    let (mut command, _dir) = cmd();
+    let output = command
         .arg("--resume")
         .arg("5169694d-de0f-40d1-890c-6e28e55bab27")
         .arg("--rotate-provider")
@@ -67,7 +80,8 @@ fn rotate_provider_unknown_flag_migrate_is_now_rejected() {
     // the top level / under `resume` / under `repl`. Per AGE-163 WU-A.6,
     // it has been renamed to `--rotate-provider`. clap must reject the
     // old spelling.
-    let output = cmd()
+    let (mut command, _dir) = cmd();
+    let output = command
         .arg("--resume")
         .arg("5169694d-de0f-40d1-890c-6e28e55bab27")
         .arg("--migrate")

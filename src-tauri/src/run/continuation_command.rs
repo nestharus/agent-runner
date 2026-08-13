@@ -140,7 +140,7 @@ impl FreshExecution<'_> {
         resume: &InvocationOutcome,
     ) -> Result<(), ContinuationBlock> {
         let (model, all_models, models_dir) =
-            load_target_model(&context.request.target_model, self.models_dir_override)?;
+            load_target_model(&context.request().target_model, self.models_dir_override)?;
         let fresh_prompt = continuation_request::fresh_prompt(context, resume);
         run_reserved_with_balancing(
             self.agent_runtime_services,
@@ -149,7 +149,7 @@ impl FreshExecution<'_> {
             &fresh_prompt,
             &all_models,
             &models_dir,
-            Some(&context.request.worktree),
+            Some(&context.request().worktree),
             &HashMap::new(),
             reserved,
         )

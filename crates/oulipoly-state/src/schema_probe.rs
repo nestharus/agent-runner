@@ -232,13 +232,14 @@ fn safe_for_import_replace(
         && supported_storage_types == self::supported_storage_types()
 }
 
-fn required_tables() -> [(&'static str, i32); 5] {
+fn required_tables() -> [(&'static str, i32); 6] {
     [
         ("invocations", MINIMUM_SUPPORTED_SCHEMA_VERSION),
         ("session_turns", MINIMUM_SUPPORTED_SCHEMA_VERSION),
         ("session_chains", MINIMUM_SUPPORTED_SCHEMA_VERSION),
         ("session_chain_segments", MINIMUM_SUPPORTED_SCHEMA_VERSION),
-        ("fresh_continuations", CURRENT_SCHEMA_VERSION),
+        ("fresh_continuations", 13),
+        ("invocation_completion_obligations", 14),
     ]
 }
 

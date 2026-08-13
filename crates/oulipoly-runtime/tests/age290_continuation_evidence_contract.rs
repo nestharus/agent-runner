@@ -51,15 +51,15 @@ fn matching_artifacts_produce_a_stable_validated_context() {
     let first = fixture.validated();
     let second = fixture.validated();
 
-    assert_eq!(first.request, fixture.request);
-    assert_eq!(first.fingerprint, second.fingerprint);
-    assert!(!first.fingerprint.is_empty());
+    assert_eq!(first.request(), &fixture.request);
+    assert_eq!(first.fingerprint(), second.fingerprint());
+    assert!(!first.fingerprint().is_empty());
 }
 
 #[test]
 fn uppercase_artifact_hash_is_accepted() {
     let mut fixture = EvidenceFixture::valid();
-    let lowercase_fingerprint = fixture.validated().fingerprint;
+    let lowercase_fingerprint = fixture.validated().fingerprint().to_string();
     fixture.request.evidence.question.sha256 = fixture
         .request
         .evidence
@@ -67,7 +67,7 @@ fn uppercase_artifact_hash_is_accepted() {
         .sha256
         .to_ascii_uppercase();
 
-    let uppercase_fingerprint = fixture.validated().fingerprint;
+    let uppercase_fingerprint = fixture.validated().fingerprint().to_string();
 
     assert_eq!(uppercase_fingerprint, lowercase_fingerprint);
 }
@@ -576,7 +576,7 @@ impl EvidenceFixture {
     }
 
     fn fingerprint(&self) -> String {
-        self.validated().fingerprint
+        self.validated().fingerprint().to_string()
     }
 
     fn validation_error(&self) -> ContinuationBlock {

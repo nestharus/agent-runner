@@ -78,6 +78,13 @@ pub use db::{
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{
+    CompletionObligationAdmission, CompletionObligationAdmissionResult,
+    CompletionObligationAuthority, CompletionObligationExpectation, EffectiveTerminalDisposition,
+    ListenerSettlementClass, OwnedCompletionEventState, OwnerLineageRelationship,
+    OwnershipAuthorityError, OwnershipAuthoritySnapshot, RecoveryDisposition,
+    SettlementVerifierIdentity, SidecarGenerationState,
+};
+pub use db::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,
 };
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};

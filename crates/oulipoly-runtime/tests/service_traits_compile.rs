@@ -242,6 +242,52 @@ fn age_35_routing_and_invocation_lifecycle_services_are_object_safe_with_contrac
 }
 
 #[test]
+fn age299_s1_runtime_boundary_can_carry_ownership_authority_without_service_behavior_changes() {
+    fn carry_snapshot(
+        snapshot: oulipoly_state::OwnershipAuthoritySnapshot,
+    ) -> oulipoly_state::OwnershipAuthoritySnapshot {
+        snapshot
+    }
+
+    let snapshot = carry_snapshot(oulipoly_state::OwnershipAuthoritySnapshot {
+        invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+        event_id: "ab_age299_compile".to_string(),
+        sidecar_generation: oulipoly_state::SidecarGenerationState::ExpectedButUnobserved {
+            expected: "22222222-2222-4222-8222-222222222222".to_string(),
+        },
+        event_state: oulipoly_state::OwnedCompletionEventState::Pending,
+        owner_invocation_uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+        owner_session_id: "age299-compile-owner-session".to_string(),
+        owner_relationship: oulipoly_state::OwnerLineageRelationship::ExactOwner,
+        listener_settlement: oulipoly_state::ListenerSettlementClass::PendingOrUnsettled,
+        recovery_disposition: oulipoly_state::RecoveryDisposition::NotRecorded,
+    });
+    let oulipoly_state::OwnershipAuthoritySnapshot {
+        invocation_uuid: _,
+        event_id: _,
+        sidecar_generation: _,
+        event_state: _,
+        owner_invocation_uuid: _,
+        owner_session_id: _,
+        owner_relationship: _,
+        listener_settlement: _,
+        recovery_disposition: _,
+    } = snapshot;
+    let disposition = oulipoly_state::EffectiveTerminalDisposition {
+        success: false,
+        exit_code: 1,
+        error_category: Some("process_integrity".to_string()),
+        terminal_reason: Some("compile-only typed representation".to_string()),
+    };
+    let oulipoly_state::EffectiveTerminalDisposition {
+        success: _,
+        exit_code: _,
+        error_category: _,
+        terminal_reason: _,
+    } = disposition;
+}
+
+#[test]
 fn age_36_resume_session_migration_services_are_object_safe_with_contract_dtos() {
     let resume: Arc<dyn ResumeServicePort + Send + Sync> = Arc::new(StubService);
     let session_lifecycle: Arc<dyn SessionLifecycleServicePort + Send + Sync> =

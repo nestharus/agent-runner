@@ -216,10 +216,10 @@ where
             "origin trace artifact session identity does not match the request origin",
         )?;
 
-        Ok(ValidatedContinuation {
-            request: request.clone(),
-            fingerprint: continuation_fingerprint(request),
-        })
+        Ok(ValidatedContinuation::from_validated_evidence(
+            request.clone(),
+            continuation_fingerprint(request),
+        ))
     }
 }
 

@@ -3,6 +3,8 @@
 
 use crate::schema::{self, CURRENT_SCHEMA_VERSION};
 use rusqlite::Connection;
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::ValueRef;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +81,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0013_fresh_continuations.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 14,
+        id: "0014_invocation_completion_obligations",
+        sql: include_str!("../migrations/0014_invocation_completion_obligations.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -135,10 +143,32 @@ pub fn run_with_db_path(
     plan: &[&Migration],
     db_path: PathBuf,
 ) -> Result<(), MigrationError> {
+    register_connection_primitives(conn)
+        .map_err(|source| map_primitive_registration_error(db_path.clone(), source))?;
     for migration in plan {
         run_planned_step_with_path(conn, migration, db_path.clone())?;
     }
     Ok(())
+}
+
+pub(crate) fn register_connection_primitives(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.create_scalar_function(
+        "oulipoly_utf8_text",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |context| {
+            Ok(matches!(
+                context.get_raw(0),
+                ValueRef::Text(bytes) if std::str::from_utf8(bytes).is_ok()
+            ))
+        },
+    )
+}
+
+fn map_primitive_registration_error(db_path: PathBuf, source: rusqlite::Error) -> MigrationError {
+    MigrationError::PrimitiveRegistrationFailed { db_path, source }
 }
 
 fn run_planned_step_with_path(
@@ -339,6 +369,10 @@ pub(crate) fn classify_versionless(
 
 #[derive(Debug)]
 pub enum MigrationError {
+    PrimitiveRegistrationFailed {
+        db_path: PathBuf,
+        source: rusqlite::Error,
+    },
     Incompatible {
         db_path: PathBuf,
         stored: i32,
@@ -363,6 +397,10 @@ impl fmt::Display for MigrationError {
 
 fn format_migration_error(error: &MigrationError) -> String {
     match error {
+        MigrationError::PrimitiveRegistrationFailed { db_path, source } => format!(
+            "failed to register state DB migration primitives: {source}; db={}",
+            db_path.display()
+        ),
         MigrationError::Incompatible {
             db_path,
             stored,
@@ -414,7 +452,8 @@ fn map_migration_error_source(
     error: &MigrationError,
 ) -> Option<&(dyn std::error::Error + 'static)> {
     match error {
-        MigrationError::StepFailed { source, .. } => Some(source),
+        MigrationError::PrimitiveRegistrationFailed { source, .. }
+        | MigrationError::StepFailed { source, .. } => Some(source),
         _ => None,
     }
 }
