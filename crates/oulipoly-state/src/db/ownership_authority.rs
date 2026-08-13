@@ -404,13 +404,19 @@ fn record_completion_obligation_on(
 }
 
 fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Result<(), String> {
-    let status = conn
+    let status: Option<String> = conn
         .query_row(
             "SELECT status FROM invocations WHERE invocation_uuid = ?1",
             sqlite::params![invocation_uuid],
             |row| row.get::<_, String>(0),
         )
+        .optional()
         .map_err(|error| format!("Failed to lock completion listener owner: {error}"))?;
+    let Some(status) = status else {
+        return Err(format!(
+            "Completion listener invocation {invocation_uuid} does not exist"
+        ));
+    };
     if status == "running" {
         Ok(())
     } else {
@@ -645,6 +651,18 @@ mod tests {
         assert_eq!(
             error,
             "Completion event registration requires a durable state database"
+        );
+    }
+
+    #[test]
+    fn completion_registration_reports_an_unknown_owner_invocation() {
+        let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
+
+        let error = require_running_owner(&state.conn, INVOCATION_UUID).unwrap_err();
+
+        assert_eq!(
+            error,
+            format!("Completion listener invocation {INVOCATION_UUID} does not exist")
         );
     }
 
