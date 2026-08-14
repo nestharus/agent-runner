@@ -364,6 +364,13 @@ impl StateDb {
         StateReadConnection { conn: &self.conn }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn disable_wal_autocheckpoint_for_test(&self) -> Result<(), String> {
+        self.conn
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(|err| format!("Failed to disable state DB WAL auto-checkpointing: {err}"))
+    }
+
     pub(crate) fn raw_connection(&self) -> &sqlite::Connection {
         &self.conn
     }
