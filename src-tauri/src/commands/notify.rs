@@ -216,10 +216,10 @@ pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result
 fn register_completion_event(
     args: &AgentBashRegisterArgs<'_>,
 ) -> Result<CompletionEventRegistrationResult, String> {
+    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
     validate_owner_binding(&owner, &metadata)?;
-    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut state = StateDb::open_default()?;
     let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
     state.register_completion_event_with_obligation(
@@ -270,9 +270,9 @@ fn trigger_completion_event(
     ),
     String,
 > {
+    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let rc = read_rc(args.rc)?;
-    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut mailbox = MailboxDb::open_default()?;
     let event = mailbox
         .completion_event(args.handle)?
@@ -524,17 +524,24 @@ fn render_payload_json(payload: &Value) -> Result<String, String> {
         .map_err(|err| format!("failed to serialize completion event payload: {err}"))
 }
 
-fn notify_path_strings(state_dir: &Path, meta: &Path, log: &Path, rc: &Path) -> NotifyPathStrings {
-    NotifyPathStrings {
-        state_dir: path_string(state_dir),
-        meta_path: path_string(meta),
-        log_path: path_string(log),
-        rc_path: path_string(rc),
-    }
+fn notify_path_strings(
+    state_dir: &Path,
+    meta: &Path,
+    log: &Path,
+    rc: &Path,
+) -> Result<NotifyPathStrings, String> {
+    Ok(NotifyPathStrings {
+        state_dir: notify_path_string("state directory", state_dir)?,
+        meta_path: notify_path_string("metadata", meta)?,
+        log_path: notify_path_string("log", log)?,
+        rc_path: notify_path_string("return-code", rc)?,
+    })
 }
 
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+fn notify_path_string(kind: &str, path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("agent-bash {kind} path must be valid UTF-8"))
 }
 
 fn render<T: Serialize>(response: &T, json: bool) -> Result<(), String> {
@@ -568,7 +575,8 @@ fn render_error(handle: &str, json: bool, message: String) -> Result<i32, String
 
 #[cfg(test)]
 mod tests {
-    use super::completion_obligation_admission_id;
+    use super::{completion_obligation_admission_id, notify_path_strings};
+    use std::path::Path;
 
     #[test]
     fn completion_obligation_admission_id_disambiguates_delimiters_in_components() {
@@ -576,5 +584,25 @@ mod tests {
             completion_obligation_admission_id("a", "b:owner:c"),
             completion_obligation_admission_id("a:owner:b", "c")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_paths_reject_non_utf8_before_lossy_identity_projection() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"artifact-\xff".to_vec()));
+        let valid = Path::new("artifact");
+
+        for paths in [
+            [&invalid as &Path, valid, valid, valid],
+            [valid, &invalid, valid, valid],
+            [valid, valid, &invalid, valid],
+            [valid, valid, valid, &invalid],
+        ] {
+            let error = notify_path_strings(paths[0], paths[1], paths[2], paths[3]).unwrap_err();
+            assert!(error.contains("valid UTF-8"), "{error}");
+        }
     }
 }

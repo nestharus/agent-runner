@@ -373,7 +373,39 @@ fn rebuild_rejects_a_leaf_symlink_before_backup_or_removal() {
         .data_home
         .join("oulipoly-agent-runner")
         .join("state-backups");
-    assert!(backup_dirs(&backup_root).is_empty());
+    assert!(!backup_root.exists());
+}
+
+#[test]
+fn rebuild_rejects_a_dangling_leaf_symlink_before_no_work_or_backup() {
+    let fixture = CliFixture::new();
+    fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
+    symlink(
+        fixture.db_path().with_file_name("missing.db"),
+        fixture.db_path(),
+    )
+    .unwrap();
+
+    let output = fixture.run_rebuild();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("leaf symlink"), "{stderr}");
+    assert!(!stdout.contains("no state.db"), "{stdout}");
+    assert!(
+        fs::symlink_metadata(fixture.db_path())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !fixture
+            .data_home
+            .join("oulipoly-agent-runner")
+            .join("state-backups")
+            .exists()
+    );
 }
 
 #[test]

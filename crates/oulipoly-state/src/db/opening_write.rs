@@ -330,6 +330,7 @@ impl StateDb {
         path: &Path,
         authority: &StateDbRebuildAuthority,
     ) -> Result<(), String> {
+        Self::validate_rebuild_path(path)?;
         let db_path = Self::normalized_state_open_path(path);
         if db_path != authority.db_path {
             return Err("State DB rebuild authority does not match the requested path".to_string());
@@ -354,7 +355,8 @@ impl StateDb {
             return Err("State DB rebuild authority requires a local file path".to_string());
         }
         Self::validate_local_state_path(path)?;
-        Self::validate_local_state_path(&Self::normalized_state_open_path(path))
+        Self::validate_local_state_path(&Self::normalized_state_open_path(path))?;
+        Self::reject_rebuild_leaf_symlink(path)
     }
 
     pub fn connection(&self) -> StateReadConnection<'_> {
@@ -435,11 +437,20 @@ impl StateDb {
     }
 
     fn validate_local_state_path(path: &Path) -> Result<(), String> {
-        if path.to_str().is_some() {
-            Ok(())
-        } else {
-            Err("State DB local file paths must be valid UTF-8".to_string())
+        if path.to_str().is_none() {
+            return Err("State DB local file paths must be valid UTF-8".to_string());
         }
+        if path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(reserved_state_storage_name)
+        {
+            return Err(format!(
+                "State DB local file path uses a reserved storage role: {}",
+                path.display()
+            ));
+        }
+        Ok(())
     }
 
     fn reject_rebuild_leaf_symlink(path: &Path) -> Result<(), String> {
@@ -631,6 +642,17 @@ fn state_namespace_authority_path(state_path: &Path) -> Result<PathBuf, String> 
     let mut authority_name = file_name.to_os_string();
     authority_name.push(".namespace.lock");
     Ok(state_path.with_file_name(authority_name))
+}
+
+fn reserved_state_storage_name(file_name: &str) -> bool {
+    let file_name = file_name.to_ascii_lowercase();
+    file_name == "pid-identity.db"
+        || file_name.ends_with(".pid-identity.db")
+        || file_name.ends_with(".namespace.lock")
+        || file_name.ends_with(".authority.lock")
+        || file_name.ends_with("-journal")
+        || file_name.ends_with("-wal")
+        || file_name.ends_with("-shm")
 }
 
 impl StateDbWriterAuthority {
@@ -857,5 +879,55 @@ mod state_namespace_tests {
         }
         assert_eq!(std::fs::read(&target_path).unwrap(), b"unchanged");
         assert!(!target_parent.join("state.db.namespace.lock").exists());
+    }
+
+    #[test]
+    fn writable_state_authorities_reject_reserved_storage_roles() {
+        let directory = tempfile::tempdir().unwrap();
+
+        for file_name in [
+            "pid-identity.db",
+            "alternate.db.pid-identity.db",
+            "alternate.db.namespace.lock",
+            "alternate.db.pid-identity.db.authority.lock",
+            "alternate.db-journal",
+            "alternate.db-wal",
+            "alternate.db-shm",
+            "ALTERNATE.DB.NAMESPACE.LOCK",
+        ] {
+            let path = directory.path().join(file_name);
+            for error in [
+                StateDb::open(&path).err().unwrap(),
+                StateDb::acquire_writer_authority(&path).err().unwrap(),
+                StateDb::acquire_rebuild_authority(&path).err().unwrap(),
+            ] {
+                assert!(error.contains("reserved storage role"), "{error}");
+            }
+            assert!(!path.exists());
+            assert!(!state_namespace_authority_path(&path).unwrap().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_initializer_rejects_a_non_utf8_requested_alias() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_parent = directory.path().join("target");
+        std::fs::create_dir(&target_parent).unwrap();
+        let target_path = target_parent.join("state.db");
+        let authority = StateDb::acquire_rebuild_authority(&target_path).unwrap();
+        let alias_parent = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"alias-\xff".to_vec()));
+        symlink(&target_parent, &alias_parent).unwrap();
+
+        let error = StateDb::initialize_after_rebuild(&alias_parent.join("state.db"), &authority)
+            .unwrap_err();
+
+        assert!(error.contains("valid UTF-8"), "{error}");
+        assert!(!target_path.exists());
     }
 }

@@ -6854,9 +6854,28 @@ fn mailbox_authority_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
         }
         Err(error) => return Err(error),
     };
+    validate_mailbox_storage_path(&canonical_sidecar)?;
     let mut path = canonical_sidecar.as_os_str().to_owned();
     path.push(".authority.lock");
     Ok(PathBuf::from(path))
+}
+
+fn validate_mailbox_storage_path(path: &Path) -> std::io::Result<()> {
+    let valid_role = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|file_name| {
+            file_name == "pid-identity.db" || file_name.ends_with(".pid-identity.db")
+        });
+    if valid_role {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "PID mailbox sidecar path must use a reserved sidecar storage role",
+        ))
+    }
 }
 
 fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {
@@ -7242,6 +7261,24 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::StateDb;
+
+    #[test]
+    fn sidecar_writers_reject_a_state_database_storage_role() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+
+        for error in [
+            MailboxDb::open(&state_path).err().unwrap(),
+            crate::pid_identity::PidIdentityDb::open(&state_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(error.contains("reserved sidecar storage role"), "{error}");
+        }
+        assert!(!directory.path().join("state.db.authority.lock").exists());
+        assert_eq!(state.path(), state_path);
+    }
 
     fn input<'a>(handle: &'a str, session_id: &'a str) -> AgentBashCompleteEnqueue<'a> {
         AgentBashCompleteEnqueue {
