@@ -772,8 +772,6 @@ mod tests {
     use crate::mailbox::CompletionEventTriggerInput;
     use std::sync::mpsc;
     use std::time::Duration;
-    use uuid::Uuid;
-
     const INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
     const SECOND_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
     const THIRD_INVOCATION_UUID: &str = "33333333-3333-4333-8333-333333333333";
@@ -795,37 +793,24 @@ mod tests {
     }
 
     #[test]
-    fn completion_registration_rejects_sqlite_uri_state() {
+    fn writable_state_open_rejects_sqlite_uri_paths() {
         let directory = tempfile::tempdir().unwrap();
         let uris = [
-            format!(
-                "file:age299-s2-memory-{}?mode=memory&cache=shared",
-                Uuid::new_v4()
-            ),
+            "file:age299-s2-memory?mode=memory&cache=shared".to_string(),
             format!(
                 "file:{}?mode=rwc",
                 directory.path().join("uri-state.db").display()
             ),
         ];
 
-        for (index, uri) in uris.iter().enumerate() {
-            let mut state = StateDb::open(std::path::Path::new(uri)).unwrap();
-            let error = state
-                .register_completion_event_with_obligation(
-                    &format!("age299-s2-uri-admission-{index}"),
-                    registration(),
-                )
-                .unwrap_err();
+        for uri in uris {
+            let error = StateDb::open(std::path::Path::new(&uri))
+                .err()
+                .expect("SQLite URI writable open must fail");
 
             assert_eq!(
                 error,
-                "Completion event registration requires an absolute, non-symlink, single-link local state database"
-            );
-            assert!(
-                state
-                    .completion_obligations_for_invocation(INVOCATION_UUID)
-                    .unwrap()
-                    .is_empty()
+                "State DB writable open does not accept SQLite URI paths"
             );
         }
     }

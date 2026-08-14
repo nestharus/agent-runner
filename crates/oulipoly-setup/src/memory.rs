@@ -5,6 +5,7 @@ use std::path::Path;
 
 pub struct MemoryGraph {
     connection: rusqlite::Connection,
+    _state_authority: StateDb,
     _temporary_directory: Option<tempfile::TempDir>,
 }
 
@@ -43,8 +44,8 @@ impl MemoryGraph {
             .as_ref()
             .map(|directory| directory.path().join("state.db"))
             .unwrap_or_else(|| path.to_path_buf());
-        drop(StateDb::open_for_memory(&database_path)?);
-        let connection = rusqlite::Connection::open(&database_path)
+        let state_authority = StateDb::open_for_memory(&database_path)?;
+        let connection = rusqlite::Connection::open(state_authority.path())
             .map_err(|error| format!("Failed to open setup memory database: {error}"))?;
         connection
             .pragma_update(None, "foreign_keys", true)
@@ -54,6 +55,7 @@ impl MemoryGraph {
             .map_err(|error| format!("Failed to configure setup memory timeout: {error}"))?;
         Ok(MemoryGraph {
             connection,
+            _state_authority: state_authority,
             _temporary_directory: temporary_directory,
         })
     }
@@ -412,5 +414,43 @@ mod tests {
     fn missing_node_returns_none() {
         let g = test_graph();
         assert!(g.get_node("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn file_backed_graph_and_rebuild_authority_exclude_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let graph = MemoryGraph::open(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let rebuild_path = state_path.clone();
+        let rebuild = std::thread::spawn(move || {
+            sender
+                .send(StateDb::acquire_rebuild_authority(&rebuild_path))
+                .unwrap()
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "rebuild escaped a live file-backed memory graph"
+        );
+        drop(graph);
+        drop(receiver.recv().unwrap().unwrap());
+        rebuild.join().unwrap();
+
+        let authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let graph_path = state_path.clone();
+        let opener =
+            std::thread::spawn(move || sender.send(MemoryGraph::open(&graph_path)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "file-backed memory graph escaped rebuild authority"
+        );
+        drop(authority);
+        drop(receiver.recv().unwrap().unwrap());
+        opener.join().unwrap();
     }
 }

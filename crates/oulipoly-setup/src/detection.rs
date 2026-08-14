@@ -1,3 +1,4 @@
+use oulipoly_state::StateDb;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -66,6 +67,7 @@ pub struct WrapperInfo {
 /// path.
 pub struct VersionTracker {
     conn: Connection,
+    _state_authority: Option<StateDb>,
 }
 
 /// A single row from the `cli_versions` table.
@@ -81,12 +83,17 @@ impl VersionTracker {
     /// Open (or create) the version-tracking table inside the given SQLite
     /// database file.
     pub fn open(db_path: &Path) -> Result<Self, String> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory for version DB: {e}"))?;
-        }
-        let conn =
-            Connection::open(db_path).map_err(|e| format!("Failed to open version DB: {e}"))?;
+        let state_authority = if db_path == Path::new(":memory:") {
+            None
+        } else {
+            Some(StateDb::open(db_path)?)
+        };
+        let connection_path = state_authority
+            .as_ref()
+            .map(StateDb::path)
+            .unwrap_or(db_path);
+        let conn = Connection::open(connection_path)
+            .map_err(|e| format!("Failed to open version DB: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
@@ -112,7 +119,10 @@ impl VersionTracker {
         )
         .map_err(|e| format!("Failed to create cli_versions tables: {e}"))?;
 
-        Ok(VersionTracker { conn })
+        Ok(VersionTracker {
+            conn,
+            _state_authority: state_authority,
+        })
     }
 
     /// Return the most-recently stored version for `cli_name`, if any.
@@ -880,6 +890,30 @@ mod tests {
     fn version_tracker_missing_cli_returns_none() {
         let tracker = VersionTracker::open(Path::new(":memory:")).unwrap();
         assert!(tracker.get_current("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn file_backed_version_tracker_excludes_rebuild() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let tracker = VersionTracker::open(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let rebuild_path = state_path.clone();
+        let rebuild = std::thread::spawn(move || {
+            sender
+                .send(StateDb::acquire_rebuild_authority(&rebuild_path))
+                .unwrap()
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "rebuild escaped a live file-backed version tracker"
+        );
+        drop(tracker);
+        drop(receiver.recv().unwrap().unwrap());
+        rebuild.join().unwrap();
     }
 
     #[test]

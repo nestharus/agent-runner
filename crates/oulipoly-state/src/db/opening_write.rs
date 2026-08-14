@@ -166,6 +166,9 @@ impl StateDb {
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
     ) -> Result<Self, String> {
+        if Self::is_sqlite_uri_path(path) {
+            return Err("State DB writable open does not accept SQLite URI paths".to_string());
+        }
         let nonlocal = Self::is_nonlocal_sqlite_path(path);
         if !nonlocal {
             Self::ensure_state_parent_dir(path)?;
@@ -299,6 +302,18 @@ impl StateDb {
         })
     }
 
+    pub fn acquire_writer_authority(path: &Path) -> Result<StateDbWriterAuthority, String> {
+        if Self::is_nonlocal_sqlite_path(path) {
+            return Err("State DB writer authority requires a local file path".to_string());
+        }
+        Self::ensure_state_parent_dir(path)?;
+        let db_path = Self::normalized_state_open_path(path);
+        Ok(StateDbWriterAuthority {
+            _guard: StateNamespaceGuard::acquire(&db_path, false)?,
+            db_path,
+        })
+    }
+
     pub fn initialize_after_rebuild(
         path: &Path,
         authority: &StateDbRebuildAuthority,
@@ -392,7 +407,11 @@ impl StateDb {
     }
 
     fn is_nonlocal_sqlite_path(path: &Path) -> bool {
-        path == Path::new(":memory:") || path.as_os_str().as_encoded_bytes().starts_with(b"file:")
+        path == Path::new(":memory:") || Self::is_sqlite_uri_path(path)
+    }
+
+    fn is_sqlite_uri_path(path: &Path) -> bool {
+        path.as_os_str().as_encoded_bytes().starts_with(b"file:")
     }
 
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
@@ -530,6 +549,12 @@ fn state_namespace_authority_path(state_path: &Path) -> Result<PathBuf, String> 
     Ok(state_path.with_file_name(authority_name))
 }
 
+impl StateDbWriterAuthority {
+    pub fn path(&self) -> &Path {
+        &self.db_path
+    }
+}
+
 #[cfg(test)]
 mod state_namespace_tests {
     use super::*;
@@ -570,5 +595,21 @@ mod state_namespace_tests {
         drop(authority);
         drop(receiver.recv().unwrap().unwrap());
         opener.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_writer_authority_participates_in_rebuild_exclusion() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let writer = StateDb::acquire_writer_authority(&state_path).unwrap();
+
+        let error = StateDb::acquire_rebuild_authority(&state_path)
+            .err()
+            .expect("legacy writer must exclude rebuild");
+
+        assert!(error.contains("Timed out"), "{error}");
+        drop(writer);
+        drop(StateDb::acquire_rebuild_authority(&state_path).unwrap());
     }
 }

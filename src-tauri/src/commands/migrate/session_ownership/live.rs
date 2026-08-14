@@ -7,7 +7,9 @@ use super::preflight;
 use super::report::{self, ProviderProofStatus};
 use super::sql;
 use super::target_resolution;
+use oulipoly_state::{StateDb, StateDbWriterAuthority};
 use rusqlite::Connection;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -25,10 +27,23 @@ pub(crate) struct ApplyOutcome {
     pub(crate) backup_path: PathBuf,
 }
 
+pub(crate) struct LiveMigrationConnection {
+    connection: Connection,
+    _authority: StateDbWriterAuthority,
+}
+
+impl Deref for LiveMigrationConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
 pub(crate) fn run_session_ownership_apply(opts: ApplyOptions) -> Result<ApplyOutcome, DryRunError> {
+    let conn = open_live_migration_connection(&opts.live_state_db_path)?;
     let backup_path =
         db_copy::create_verified_live_backup(&opts.live_state_db_path, &opts.backup_dir)?;
-    let conn = open_live_migration_connection(&opts.live_state_db_path)?;
     let before = preflight::preflight(&conn)?;
     let target = target_resolution::resolve_target(opts.models_dir.as_deref())?;
     let provider_proof = prove_or_skip_provider(&target, opts.skip_provider_proof)?;
@@ -65,9 +80,9 @@ pub(crate) fn run_session_ownership_apply(opts: ApplyOptions) -> Result<ApplyOut
 pub(crate) fn run_session_ownership_corrective_apply(
     opts: ApplyOptions,
 ) -> Result<ApplyOutcome, DryRunError> {
+    let conn = open_live_migration_connection(&opts.live_state_db_path)?;
     let backup_path =
         db_copy::create_verified_live_backup(&opts.live_state_db_path, &opts.backup_dir)?;
-    let conn = open_live_migration_connection(&opts.live_state_db_path)?;
     let before = preflight::preflight(&conn)?;
     let target = target_resolution::resolve_target(opts.models_dir.as_deref())?;
     let provider_proof = prove_or_skip_provider(&target, opts.skip_provider_proof)?;
@@ -107,10 +122,14 @@ pub(crate) fn run_session_ownership_corrective_apply(
 
 pub(crate) fn open_live_migration_connection(
     path: &std::path::Path,
-) -> Result<Connection, DryRunError> {
-    let conn = Connection::open(path)?;
+) -> Result<LiveMigrationConnection, DryRunError> {
+    let authority = StateDb::acquire_writer_authority(path).map_err(DryRunError::new)?;
+    let conn = Connection::open(authority.path())?;
     conn.busy_timeout(Duration::from_millis(1000))?;
-    Ok(conn)
+    Ok(LiveMigrationConnection {
+        connection: conn,
+        _authority: authority,
+    })
 }
 
 fn prove_or_skip_provider(
@@ -157,4 +176,51 @@ fn corrective_rollback_after_failed_verify<T>(
 
 fn absolute_path(path: &std::path::Path) -> Result<PathBuf, DryRunError> {
     path.canonicalize().map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_migration_connection_and_rebuild_authority_exclude_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let migration = open_live_migration_connection(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let rebuild_path = state_path.clone();
+        let rebuild = std::thread::spawn(move || {
+            sender
+                .send(StateDb::acquire_rebuild_authority(&rebuild_path))
+                .unwrap()
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "rebuild escaped a live migration connection"
+        );
+        drop(migration);
+        drop(receiver.recv().unwrap().unwrap());
+        rebuild.join().unwrap();
+
+        let authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let migration_path = state_path.clone();
+        let opener = std::thread::spawn(move || {
+            sender
+                .send(open_live_migration_connection(&migration_path))
+                .unwrap()
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "live migration connection escaped rebuild authority"
+        );
+        drop(authority);
+        drop(receiver.recv().unwrap().unwrap());
+        opener.join().unwrap();
+    }
 }

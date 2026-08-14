@@ -272,6 +272,13 @@ pub struct StateDbRebuildAuthority {
     _guard: StateNamespaceGuard,
 }
 
+/// Shared authority for a cooperating legacy writer that must retain its own
+/// SQLite connection. The carrier is path-bound and intentionally not cloneable.
+pub struct StateDbWriterAuthority {
+    db_path: PathBuf,
+    _guard: StateNamespaceGuard,
+}
+
 #[derive(Debug, Clone)]
 pub enum ReadOnlyOpenError {
     Missing { path: PathBuf },
