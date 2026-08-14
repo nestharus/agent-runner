@@ -908,11 +908,11 @@ impl MailboxDb {
         path: &Path,
         _authority: &MailboxAuthorityFence,
     ) -> Result<Self, String> {
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
         set_wal_mode(&conn)?;
         pid_identity::ensure_identity_schema(&conn)?;
-        ensure_mailbox_schema(&conn)?;
+        ensure_mailbox_schema(&mut conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -6741,7 +6741,7 @@ fn mailbox_authority_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
+fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {
     conn.execute_batch(mailbox_schema_definition())
         .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
     ensure_mailbox_sidecar_identity(conn)?;
@@ -6753,19 +6753,13 @@ fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
     ensure_runtime_generation_columns(conn)
 }
 
-fn ensure_mailbox_sidecar_identity(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("BEGIN IMMEDIATE")
+fn ensure_mailbox_sidecar_identity(conn: &mut Connection) -> Result<(), String> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("Failed to lock PID mailbox sidecar identity: {err}"))?;
-    let result = ensure_mailbox_sidecar_identity_locked(conn);
-    match result {
-        Ok(()) => conn
-            .execute_batch("COMMIT")
-            .map_err(|err| format!("Failed to commit PID mailbox sidecar identity: {err}")),
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        }
-    }
+    ensure_mailbox_sidecar_identity_locked(&tx)?;
+    tx.commit()
+        .map_err(|err| format!("Failed to commit PID mailbox sidecar identity: {err}"))
 }
 
 fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), String> {
