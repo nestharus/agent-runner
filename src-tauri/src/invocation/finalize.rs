@@ -84,6 +84,7 @@ fn emit_finalizer_guard_warning(err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
     use oulipoly_state::{InvocationStart, InvocationStatus};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
@@ -220,6 +221,80 @@ mod tests {
         assert_eq!(row.status, InvocationStatus::Running);
         assert_eq!(row.success, None);
         assert_eq!(row.exit_code, None);
+    }
+
+    #[test]
+    fn finalizer_guard_preserves_running_after_completion_authority_contention() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut db = open_test_db(&state_path);
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+        db.register_completion_event_with_obligation(
+            "finalizer-guard-contention-admission",
+            CompletionEventRegistrationInput {
+                event_id: "finalizer-guard-contention-event",
+                delivery_mode: "async",
+                owner_session_id: Some("finalizer-guard-contention-session"),
+                owner_invocation_uuid: Some(&start.invocation_uuid),
+                state_dir: "/tmp/finalizer-guard-contention-state",
+                meta_path: "/tmp/finalizer-guard-contention-meta",
+                log_path: "/tmp/finalizer-guard-contention-log",
+                rc_path: "/tmp/finalizer-guard-contention-rc",
+            },
+        )
+        .unwrap();
+        let mut authority_path = sidecar_path.as_os_str().to_os_string();
+        authority_path.push(".authority.lock");
+        let authority_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(std::path::PathBuf::from(authority_path))
+            .unwrap();
+        <std::fs::File as fs4::FileExt>::lock(&authority_file).unwrap();
+
+        let started = std::time::Instant::now();
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            let message = db
+                .finalize_invocation(invocation_id, true, 0, None, None)
+                .unwrap_err();
+            assert!(started.elapsed() < std::time::Duration::from_secs(7));
+            assert!(
+                message.starts_with("process_integrity: completion_authority_contention:"),
+                "{message}"
+            );
+            guard.preserve_running_after_process_integrity(&ServiceError::Dependency { message });
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
+        assert_eq!(row.error_category, None);
+        assert_eq!(row.terminal_reason, None);
+
+        <std::fs::File as fs4::FileExt>::unlock(&authority_file).unwrap();
+        drop(authority_file);
+        db.finalize_invocation(invocation_id, true, 0, None, None)
+            .unwrap();
+        assert_eq!(
+            db.get_invocation_by_uuid(&start.invocation_uuid)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Succeeded
+        );
     }
 
     #[test]

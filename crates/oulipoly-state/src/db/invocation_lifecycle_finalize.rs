@@ -36,8 +36,6 @@ struct FinalizeInvocationWrite<'a> {
     finished_at: &'a str,
 }
 
-const FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS: usize = 2;
-
 impl StateDb {
     pub fn finalize_invocation(
         &self,
@@ -352,28 +350,17 @@ impl StateDb {
         invocation_uuid: &str,
         obligations: &[CompletionObligationExpectation],
     ) -> Result<crate::mailbox::MailboxAuthorityFence, String> {
-        for attempt in 1..=FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS {
-            match crate::mailbox::MailboxAuthorityFence::acquire(sidecar_path) {
-                Ok(authority) => return Ok(authority),
-                Err(crate::mailbox::MailboxAuthorityFenceError::Timeout { .. })
-                    if attempt < FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS => {}
-                Err(error @ crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }) => {
-                    return Err(Self::format_completion_sidecar_contention(
-                        invocation_uuid,
-                        obligations,
-                        error,
-                    ));
-                }
-                Err(error) => {
-                    return Err(Self::format_unreadable_completion_sidecar(
-                        invocation_uuid,
-                        obligations,
-                        error.to_string(),
-                    ));
-                }
-            }
+        match crate::mailbox::MailboxAuthorityFence::acquire(sidecar_path) {
+            Ok(authority) => Ok(authority),
+            Err(error @ crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }) => Err(
+                Self::format_completion_sidecar_contention(invocation_uuid, obligations, error),
+            ),
+            Err(error) => Err(Self::format_unreadable_completion_sidecar(
+                invocation_uuid,
+                obligations,
+                error.to_string(),
+            )),
         }
-        unreachable!("finalization sidecar authority attempts are nonzero")
     }
 
     fn open_completion_authority_sidecar(
@@ -491,7 +478,7 @@ impl StateDb {
     ) -> String {
         let expectation = &obligations[0];
         format!(
-            "completion_authority_contention: invocation {invocation_uuid} could not acquire mailbox sidecar authority for completion obligation {} owned by {} after {FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS} attempts: {error}",
+            "process_integrity: completion_authority_contention: invocation {invocation_uuid} could not acquire mailbox sidecar authority for completion obligation {} owned by {}: {error}",
             expectation.admission_id, expectation.owner_invocation_uuid,
         )
     }
@@ -569,12 +556,12 @@ mod tests {
     }
 
     #[test]
-    fn finalization_retries_transient_sidecar_authority_contention() {
+    fn finalization_waits_within_one_sidecar_authority_budget() {
         let (_directory, state, invocation_row_id, sidecar_path) =
             state_with_completion_obligation();
         let authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(600));
+            std::thread::sleep(Duration::from_millis(100));
             drop(authority);
         });
 
@@ -603,10 +590,9 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error.starts_with("completion_authority_contention:"),
+            error.starts_with("process_integrity: completion_authority_contention:"),
             "{error}"
         );
-        assert!(error.contains("after 2 attempts"), "{error}");
         assert!(
             !error.contains("sidecar authority is unavailable"),
             "{error}"

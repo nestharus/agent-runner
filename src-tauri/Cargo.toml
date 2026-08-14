@@ -42,6 +42,7 @@ tauri-build.workspace = true
 
 [dev-dependencies]
 base64 = "0.22"
+fs4.workspace = true
 oulipoly-agent-messenger = { path = "../crates/oulipoly-agent-messenger" }
 rusqlite.workspace = true
 serde_yaml_ng.workspace = true
