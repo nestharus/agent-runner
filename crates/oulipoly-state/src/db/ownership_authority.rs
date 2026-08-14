@@ -847,12 +847,22 @@ mod tests {
     #[test]
     fn completion_registration_rejects_a_relative_state_path() {
         let current_directory = std::env::current_dir().unwrap();
-        let directory = tempfile::tempdir_in(&current_directory).unwrap();
-        let relative_path = directory
-            .path()
-            .strip_prefix(&current_directory)
+        let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
             .unwrap()
-            .join("state.db");
+            .parent()
+            .unwrap();
+        let directory = tempfile::tempdir_in(repository_root.parent().unwrap()).unwrap();
+        let mut relative_path = std::path::PathBuf::from("..");
+        for _ in current_directory
+            .strip_prefix(repository_root)
+            .unwrap()
+            .components()
+        {
+            relative_path.push("..");
+        }
+        relative_path.push(directory.path().file_name().unwrap());
+        relative_path.push("state.db");
 
         let mut state = StateDb::open(&relative_path).unwrap();
 
