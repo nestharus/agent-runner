@@ -8,6 +8,7 @@ use super::{RusqliteOptionalExtension, StateDb, sqlite};
 use crate::mailbox::{
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
 };
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 const COMPLETION_OBLIGATION_COLUMNS: &str = concat!(
@@ -265,6 +266,8 @@ impl StateDb {
         let owner_session_id = registration.owner_session_id.ok_or_else(|| {
             "Completion event owner session and invocation are both required".to_string()
         })?;
+        validate_nonempty(admission_id, "admission_id").map_err(|error| error.to_string())?;
+        let admission_id = completion_registration_admission_id(admission_id, &registration);
         let sidecar_path = MailboxDb::path_for_state_db(&self.db_path);
         let tx = self
             .conn
@@ -309,13 +312,13 @@ impl StateDb {
         validate_existing_completion_listeners(
             &mailbox,
             &existing_obligations,
-            admission_id,
+            &admission_id,
             owner_invocation_uuid,
         )?;
         record_completion_obligation_on(
             &tx,
             CompletionObligationAdmission {
-                admission_id,
+                admission_id: &admission_id,
                 invocation_uuid: owner_invocation_uuid,
                 event_id: registration.event_id,
                 owner_invocation_uuid,
@@ -394,6 +397,35 @@ impl StateDb {
             None => OwnerLineageRelationship::OutsideRecursiveLineage,
         })
     }
+}
+
+fn completion_registration_admission_id(
+    caller_admission_id: &str,
+    registration: &CompletionEventRegistrationInput<'_>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"oulipoly-completion-registration-v1");
+    for field in [
+        caller_admission_id,
+        registration.event_id,
+        registration.delivery_mode,
+        registration.owner_session_id.unwrap_or_default(),
+        registration.owner_invocation_uuid.unwrap_or_default(),
+        registration.state_dir,
+        registration.meta_path,
+        registration.log_path,
+        registration.rc_path,
+    ] {
+        let field_length = u64::try_from(field.len()).expect("registration field length fits u64");
+        digest.update(field_length.to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    let hash = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{caller_admission_id}:registration-v1:{hash}")
 }
 
 fn record_completion_obligation_on(
@@ -1250,11 +1282,46 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER reject_completion_registration;")
             .unwrap();
+        let original = registration();
+        for changed in [
+            CompletionEventRegistrationInput {
+                delivery_mode: "sync",
+                ..original
+            },
+            CompletionEventRegistrationInput {
+                state_dir: "/tmp/changed-state",
+                ..original
+            },
+            CompletionEventRegistrationInput {
+                meta_path: "/tmp/changed-meta",
+                ..original
+            },
+            CompletionEventRegistrationInput {
+                log_path: "/tmp/changed-log",
+                ..original
+            },
+            CompletionEventRegistrationInput {
+                rc_path: "/tmp/changed-rc",
+                ..original
+            },
+        ] {
+            let changed_error = state
+                .register_completion_event_with_obligation("age299-s2-partial-admission", changed)
+                .unwrap_err();
+            assert!(
+                changed_error.contains("event listener is absent"),
+                "{changed_error}"
+            );
+            assert!(
+                MailboxDb::open(&sidecar_path)
+                    .unwrap()
+                    .completion_event(EVENT_ID)
+                    .unwrap()
+                    .is_none()
+            );
+        }
         state
-            .register_completion_event_with_obligation(
-                "age299-s2-partial-admission",
-                registration(),
-            )
+            .register_completion_event_with_obligation("age299-s2-partial-admission", original)
             .unwrap();
         assert!(
             MailboxDb::open(&sidecar_path)

@@ -57,13 +57,23 @@ impl StateReadConnection<'_> {
 }
 
 fn read_projection_allows(sql: &str, sqlite_readonly: bool) -> bool {
-    let trimmed = sql.trim_start();
+    let Some(trimmed) = sql_without_leading_trivia(sql) else {
+        return false;
+    };
     let Some(directive) = trimmed
         .get(..6)
         .filter(|prefix| prefix.eq_ignore_ascii_case("pragma"))
         .map(|_| trimmed[6..].trim_start())
     else {
-        return sqlite_readonly;
+        if !sqlite_readonly {
+            return false;
+        }
+        let statement_class = trimmed
+            .split(|character: char| character.is_whitespace() || character == '(')
+            .next()
+            .unwrap_or_default();
+        return statement_class.eq_ignore_ascii_case("select")
+            || statement_class.eq_ignore_ascii_case("with");
     };
     if directive.contains('=') {
         return false;
@@ -106,6 +116,21 @@ fn read_projection_allows(sql: &str, sqlite_readonly: bool) -> bool {
     ]
     .iter()
     .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+fn sql_without_leading_trivia(mut sql: &str) -> Option<&str> {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment.split_once('\n')?.1;
+            continue;
+        }
+        if let Some(comment) = sql.strip_prefix("/*") {
+            sql = comment.split_once("*/")?.1;
+            continue;
+        }
+        return (!sql.is_empty()).then_some(sql);
+    }
 }
 
 impl StateDb {

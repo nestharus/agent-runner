@@ -86,6 +86,15 @@ fn state_read_projection_rejects_dml_ddl_and_writable_schema_pragma() {
         "PRAGMA busy_timeout(0)",
         "PRAGMA journal_mode(DELETE)",
         "PRAGMA user_version(0)",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT caller_owned",
+        "RELEASE caller_owned",
+        "ATTACH DATABASE '/tmp/other.db' AS other",
+        "DETACH DATABASE other",
+        "/* misleading read prefix */ PRAGMA user_version(0)",
+        "-- misleading read prefix\nBEGIN",
     ] {
         assert!(
             matches!(
@@ -102,6 +111,32 @@ fn state_read_projection_rejects_dml_ddl_and_writable_schema_pragma() {
     connection
         .prepare("PRAGMA table_info(invocation_completion_obligations)")
         .unwrap();
+}
+
+#[test]
+fn state_read_projection_cannot_roll_back_a_successful_typed_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = oulipoly_state::StateDb::open(&directory.path().join("state.db")).unwrap();
+    let connection = state.connection();
+    assert!(connection.prepare("BEGIN").is_err());
+
+    state
+        .start_invocation(&oulipoly_state::InvocationStart {
+            invocation_uuid: "3d457a98-d875-418d-af9c-7f1c9e026ee8".to_string(),
+            model_name: "age299-s2-read-projection".to_string(),
+            provider_name: "test-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+
+    assert!(state.connection().prepare("ROLLBACK").is_err());
+    assert!(
+        state
+            .get_invocation_by_uuid("3d457a98-d875-418d-af9c-7f1c9e026ee8")
+            .unwrap()
+            .is_some()
+    );
 }
 
 fn public_boundary_source() -> String {
