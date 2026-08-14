@@ -1067,6 +1067,7 @@ impl MailboxDb {
         let mut conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
         authority.validate_opened_target()?;
+        configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
         pid_identity::ensure_identity_schema(&conn)?;
         ensure_mailbox_schema(&mut conn)?;
@@ -1096,10 +1097,7 @@ impl MailboxDb {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
-        conn.pragma_update(None, "foreign_keys", true)
-            .map_err(|err| {
-                format!("Failed to enable PID mailbox sidecar authority foreign keys: {err}")
-            })?;
+        configure_writable_sidecar_connection(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
@@ -6679,6 +6677,11 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
         .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
 }
 
+pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result<(), String> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))
+}
+
 fn mailbox_schema_definition() -> &'static str {
     "CREATE TABLE IF NOT EXISTS mailbox_sidecar_identity (
             singleton       INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -7496,23 +7499,62 @@ mod tests {
     use crate::StateDb;
 
     #[test]
-    fn completion_authority_connection_enforces_foreign_keys() {
+    fn every_writable_sidecar_constructor_enforces_foreign_keys() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar_path = directory.path().join("pid-identity.db");
-        drop(MailboxDb::open(&sidecar_path).unwrap());
         let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
-        let db = MailboxDb::open_existing_for_completion_authority(&authority).unwrap();
+        let mut first_admission = MailboxDb::open_with_authority(&authority).unwrap();
+        assert_writable_sidecar_rejects_orphan(first_admission.connection(), "first-admission");
+        first_admission
+            .register_completion_event(completion_registration(
+                "foreign-key-normal-event",
+                "async",
+                "foreign-key-session",
+                "foreign-key-invocation",
+            ))
+            .unwrap();
+        drop(first_admission);
+        drop(authority);
 
-        let error = db
-            .connection()
+        let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let existing = MailboxDb::open_existing_for_completion_authority(&authority).unwrap();
+        assert_writable_sidecar_rejects_orphan(existing.connection(), "existing-authority");
+        drop(existing);
+        drop(authority);
+
+        let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let pid = crate::pid_identity::PidIdentityDb::open_with_authority(&authority).unwrap();
+        assert_writable_sidecar_rejects_orphan(pid.connection(), "pid-identity");
+        let identity = crate::pid_identity::ProcessIdentity {
+            os_pid: 101,
+            os_boot_id: "foreign-key-boot".to_string(),
+            os_pid_starttime_ticks: 202,
+        };
+        pid.record_identity(crate::pid_identity::PidIdentityRecord {
+            identity: &identity,
+            os_pgid: Some(101),
+            invocation_uuid: "foreign-key-invocation",
+            session_id: Some("foreign-key-session"),
+            provider_name: Some("test-provider"),
+            model_name: Some("test-model"),
+            recorded_at: "2026-08-14T00:00:00Z",
+        })
+        .unwrap();
+    }
+
+    fn assert_writable_sidecar_rejects_orphan(conn: &Connection, listener_id: &str) {
+        let foreign_keys = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        let error = conn
             .execute(
                 "INSERT INTO completion_event_listener (
                     event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
-                 ) VALUES ('missing-event', 'listener', 'session', 'invocation', 0, 'now')",
-                [],
+                 ) VALUES ('missing-event', ?1, 'session', 'invocation', 0, 'now')",
+                params![listener_id],
             )
             .unwrap_err();
-
         assert!(
             error.to_string().contains("FOREIGN KEY constraint failed"),
             "{error}"

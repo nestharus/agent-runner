@@ -109,6 +109,7 @@ impl PidIdentityDb {
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
         authority.validate_opened_target()?;
+        crate::mailbox::configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
         ensure_identity_schema(&conn)?;
         Ok(Self {
