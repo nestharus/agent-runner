@@ -36,6 +36,8 @@ struct FinalizeInvocationWrite<'a> {
     finished_at: &'a str,
 }
 
+const FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS: usize = 2;
+
 impl StateDb {
     pub fn finalize_invocation(
         &self,
@@ -283,17 +285,13 @@ impl StateDb {
             crate::mailbox::MailboxDb::path_for_state_db(completion_authority_state_path);
         let sidecar_authority = (!obligations.is_empty())
             .then(|| {
-                crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()
-            .map_err(|error| {
-                Self::format_unreadable_completion_sidecar(
+                Self::acquire_finalize_sidecar_authority(
+                    &sidecar_path,
                     &invocation.invocation_uuid,
                     &obligations,
-                    error,
                 )
-            })?;
+            })
+            .transpose()?;
         let mut sidecar = self.open_completion_authority_sidecar(
             sidecar_authority.as_ref(),
             &invocation.invocation_uuid,
@@ -347,6 +345,35 @@ impl StateDb {
 
         tx.commit().map_err(Self::format_commit_transaction_error)?;
         Ok(invocation)
+    }
+
+    fn acquire_finalize_sidecar_authority(
+        sidecar_path: &std::path::Path,
+        invocation_uuid: &str,
+        obligations: &[CompletionObligationExpectation],
+    ) -> Result<crate::mailbox::MailboxAuthorityFence, String> {
+        for attempt in 1..=FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS {
+            match crate::mailbox::MailboxAuthorityFence::acquire(sidecar_path) {
+                Ok(authority) => return Ok(authority),
+                Err(crate::mailbox::MailboxAuthorityFenceError::Timeout { .. })
+                    if attempt < FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS => {}
+                Err(error @ crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }) => {
+                    return Err(Self::format_completion_sidecar_contention(
+                        invocation_uuid,
+                        obligations,
+                        error,
+                    ));
+                }
+                Err(error) => {
+                    return Err(Self::format_unreadable_completion_sidecar(
+                        invocation_uuid,
+                        obligations,
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+        unreachable!("finalization sidecar authority attempts are nonzero")
     }
 
     fn open_completion_authority_sidecar(
@@ -457,6 +484,18 @@ impl StateDb {
         )
     }
 
+    fn format_completion_sidecar_contention(
+        invocation_uuid: &str,
+        obligations: &[CompletionObligationExpectation],
+        error: crate::mailbox::MailboxAuthorityFenceError,
+    ) -> String {
+        let expectation = &obligations[0];
+        format!(
+            "completion_authority_contention: invocation {invocation_uuid} could not acquire mailbox sidecar authority for completion obligation {} owned by {} after {FINALIZE_SIDECAR_AUTHORITY_ATTEMPTS} attempts: {error}",
+            expectation.admission_id, expectation.owner_invocation_uuid,
+        )
+    }
+
     pub(super) fn format_begin_transaction_error(err: sqlite::Error) -> String {
         format!("Failed to begin invocation finalize tx: {err}")
     }
@@ -496,6 +535,91 @@ mod tests {
     const INVOCATION_UUID: &str = "77777777-7777-4777-8777-777777777777";
     const EVENT_ID: &str = "age299-s2-finalize-fence-event";
     const SESSION_ID: &str = "age299-s2-finalize-fence-session";
+
+    fn state_with_completion_obligation() -> (tempfile::TempDir, StateDb, i64, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-finalize-contention-admission",
+                CompletionEventRegistrationInput {
+                    event_id: EVENT_ID,
+                    delivery_mode: "async",
+                    owner_session_id: Some(SESSION_ID),
+                    owner_invocation_uuid: Some(INVOCATION_UUID),
+                    state_dir: "/tmp/age299-s2-finalize-contention-state",
+                    meta_path: "/tmp/age299-s2-finalize-contention-meta",
+                    log_path: "/tmp/age299-s2-finalize-contention-log",
+                    rc_path: "/tmp/age299-s2-finalize-contention-rc",
+                },
+            )
+            .unwrap();
+        (directory, state, invocation_row_id, sidecar_path)
+    }
+
+    #[test]
+    fn finalization_retries_transient_sidecar_authority_contention() {
+        let (_directory, state, invocation_row_id, sidecar_path) =
+            state_with_completion_obligation();
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            drop(authority);
+        });
+
+        state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap();
+        releaser.join().unwrap();
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn exhausted_sidecar_authority_contention_is_distinct_from_identity_failure() {
+        let (_directory, state, invocation_row_id, sidecar_path) =
+            state_with_completion_obligation();
+        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+
+        let error = state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap_err();
+
+        assert!(
+            error.starts_with("completion_authority_contention:"),
+            "{error}"
+        );
+        assert!(error.contains("after 2 attempts"), "{error}");
+        assert!(
+            !error.contains("sidecar authority is unavailable"),
+            "{error}"
+        );
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
+    }
 
     #[test]
     fn sidecar_namespace_mutation_after_validation_linearizes_after_state_commit() {
