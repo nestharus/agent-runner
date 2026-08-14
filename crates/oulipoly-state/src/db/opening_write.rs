@@ -166,21 +166,46 @@ impl StateDb {
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
     ) -> Result<Self, String> {
-        if !Self::is_nonlocal_sqlite_path(path) {
+        let nonlocal = Self::is_nonlocal_sqlite_path(path);
+        if !nonlocal {
             Self::ensure_state_parent_dir(path)?;
         }
         let db_path = Self::normalized_state_open_path(path);
+        let state_namespace_guard = if nonlocal {
+            None
+        } else {
+            // Keep supported rebuild from replacing the inode behind this connection.
+            Some(StateNamespaceGuard::acquire(&db_path, false)?)
+        };
+        Self::open_with_prepared_namespace(
+            path,
+            db_path,
+            sink,
+            provider_names,
+            state_namespace_guard,
+        )
+    }
+
+    fn open_with_prepared_namespace(
+        source_path: &Path,
+        db_path: PathBuf,
+        sink: Box<dyn LifecycleEventSink + Send>,
+        provider_names: &LegacyProviderNames,
+        state_namespace_guard: Option<StateNamespaceGuard>,
+    ) -> Result<Self, String> {
         let mut conn = Self::open_state_connection(&db_path)?;
 
         let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
-        let completion_authority_state = Self::durable_completion_authority_path(path, &db_path);
+        let completion_authority_state =
+            Self::durable_completion_authority_path(source_path, &db_path);
         let db = StateDb {
             conn,
             db_path,
             completion_authority_state,
             lifecycle_sink: Mutex::new(sink),
             _read_only_snapshot: None,
+            _state_namespace_guard: state_namespace_guard,
         };
         db.complete_open_backfill()?;
 
@@ -249,6 +274,7 @@ impl StateDb {
             completion_authority_state: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
             _read_only_snapshot: Some(snapshot),
+            _state_namespace_guard: None,
         })
     }
 
@@ -259,6 +285,37 @@ impl StateDb {
 
     pub fn open_for_memory(path: impl AsRef<Path>) -> Result<Self, String> {
         Self::open(path.as_ref())
+    }
+
+    pub fn acquire_rebuild_authority(path: &Path) -> Result<StateDbRebuildAuthority, String> {
+        if Self::is_nonlocal_sqlite_path(path) {
+            return Err("State DB rebuild authority requires a local file path".to_string());
+        }
+        Self::ensure_state_parent_dir(path)?;
+        let db_path = Self::normalized_state_open_path(path);
+        Ok(StateDbRebuildAuthority {
+            _guard: StateNamespaceGuard::acquire(&db_path, true)?,
+            db_path,
+        })
+    }
+
+    pub fn initialize_after_rebuild(
+        path: &Path,
+        authority: &StateDbRebuildAuthority,
+    ) -> Result<(), String> {
+        let db_path = Self::normalized_state_open_path(path);
+        if db_path != authority.db_path {
+            return Err("State DB rebuild authority does not match the requested path".to_string());
+        }
+        let db = Self::open_with_prepared_namespace(
+            path,
+            db_path,
+            Box::new(NoopLifecycleEventSink),
+            &LegacyProviderNames::new(),
+            None,
+        )?;
+        drop(db);
+        Ok(())
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -406,4 +463,112 @@ fn state_file_has_one_link(_metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn state_file_identity(_metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
     None
+}
+
+impl StateNamespaceGuard {
+    fn acquire(state_path: &Path, exclusive: bool) -> Result<Self, String> {
+        const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        #[cfg(not(test))]
+        const ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        #[cfg(test)]
+        const ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+        let authority_path = state_namespace_authority_path(state_path)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&authority_path)
+            .map_err(|error| {
+                format!(
+                    "Failed to open State DB namespace authority fence {}: {error}",
+                    authority_path.display()
+                )
+            })?;
+        let deadline = std::time::Instant::now() + ACQUISITION_TIMEOUT;
+        loop {
+            let result = if exclusive {
+                <std::fs::File as fs4::FileExt>::try_lock(&file)
+            } else {
+                <std::fs::File as fs4::FileExt>::try_lock_shared(&file)
+            };
+            match result {
+                Ok(()) => return Ok(Self { file }),
+                Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(fs4::TryLockError::WouldBlock) => {
+                    return Err(format!(
+                        "Timed out after {}ms acquiring State DB namespace authority fence {}",
+                        ACQUISITION_TIMEOUT.as_millis(),
+                        authority_path.display()
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to lock State DB namespace authority: {error}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StateNamespaceGuard {
+    fn drop(&mut self) {
+        let _ = <std::fs::File as fs4::FileExt>::unlock(&self.file);
+    }
+}
+
+fn state_namespace_authority_path(state_path: &Path) -> Result<PathBuf, String> {
+    let file_name = state_path
+        .file_name()
+        .ok_or_else(|| format!("State DB path has no file name: {}", state_path.display()))?;
+    let mut authority_name = file_name.to_os_string();
+    authority_name.push(".namespace.lock");
+    Ok(state_path.with_file_name(authority_name))
+}
+
+#[cfg(test)]
+mod state_namespace_tests {
+    use super::*;
+
+    #[test]
+    fn writable_state_holds_shared_namespace_authority_for_its_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+
+        let error = StateDb::acquire_rebuild_authority(&state_path)
+            .err()
+            .expect("live writable state must exclude rebuild");
+
+        assert!(error.contains("Timed out"), "{error}");
+        drop(state);
+        drop(StateDb::acquire_rebuild_authority(&state_path).unwrap());
+    }
+
+    #[test]
+    fn rebuild_authority_excludes_writable_open_and_covers_fresh_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+        std::fs::remove_file(&state_path).unwrap();
+        StateDb::initialize_after_rebuild(&state_path, &authority).unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let opener_path = state_path.clone();
+        let opener = std::thread::spawn(move || sender.send(StateDb::open(&opener_path)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "writable open escaped the rebuild namespace fence"
+        );
+        drop(authority);
+        drop(receiver.recv().unwrap().unwrap());
+        opener.join().unwrap();
+    }
 }

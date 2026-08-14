@@ -247,6 +247,7 @@ pub struct StateDb {
     completion_authority_state: Option<CompletionAuthorityStateIdentity>,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+    _state_namespace_guard: Option<StateNamespaceGuard>,
 }
 
 struct CompletionAuthorityStateIdentity {
@@ -258,6 +259,17 @@ struct CompletionAuthorityStateIdentity {
 struct StateFileIdentity {
     volume: u64,
     file: u64,
+}
+
+struct StateNamespaceGuard {
+    file: std::fs::File,
+}
+
+/// Exclusive authority for the supported destructive state rebuild operation.
+/// Writable StateDb handles hold the shared form for their complete lifetime.
+pub struct StateDbRebuildAuthority {
+    db_path: PathBuf,
+    _guard: StateNamespaceGuard,
 }
 
 #[derive(Debug, Clone)]

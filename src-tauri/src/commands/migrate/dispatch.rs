@@ -167,9 +167,9 @@ fn run_migrate_rebuild() -> Result<i32, String> {
     let Some(plan) = migrate_rebuild_plan()? else {
         return Ok(0);
     };
+    let authority = super::accessor::acquire_rebuild_authority(&plan.db_path)?;
     execute_migrate_rebuild(&plan)?;
-    let fresh = super::accessor::open_state_db(&plan.db_path)?;
-    drop(fresh);
+    super::accessor::initialize_after_rebuild(&plan.db_path, &authority)?;
     render_migrate_rebuild_report(&plan);
     Ok(0)
 }
