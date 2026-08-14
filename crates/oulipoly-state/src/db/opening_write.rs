@@ -300,6 +300,7 @@ impl StateDb {
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
         let guard = StateNamespaceGuard::acquire(&db_path, true)?;
+        Self::reject_rebuild_leaf_symlink(path)?;
         Self::validate_state_namespace_file(&db_path)?;
         Ok(StateDbRebuildAuthority {
             _guard: guard,
@@ -419,6 +420,21 @@ impl StateDb {
 
     fn is_sqlite_uri_path(path: &Path) -> bool {
         path.as_os_str().as_encoded_bytes().starts_with(b"file:")
+    }
+
+    fn reject_rebuild_leaf_symlink(path: &Path) -> Result<(), String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                "State DB rebuild does not accept a leaf symlink: {}",
+                path.display()
+            )),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "Failed to inspect state DB rebuild source {}: {error}",
+                path.display()
+            )),
+        }
     }
 
     #[cfg(any(unix, windows))]
@@ -670,5 +686,32 @@ mod state_namespace_tests {
         ] {
             assert!(error.contains("exactly one hard link"), "{error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_rejects_a_leaf_symlink_without_mutating_it_or_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_path = directory.path().join("target.db");
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&target_path).unwrap());
+        symlink(&target_path, &state_path).unwrap();
+        drop(StateDb::open(&state_path).unwrap());
+        let target_before = std::fs::read(&target_path).unwrap();
+
+        let error = StateDb::acquire_rebuild_authority(&state_path)
+            .err()
+            .expect("leaf-symlink rebuild authority must fail");
+
+        assert!(error.contains("leaf symlink"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(&state_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target_path).unwrap(), target_before);
     }
 }

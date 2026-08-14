@@ -15,7 +15,7 @@ use state_fixtures::versionless_drifted_setup::build_versionless_drifted_setup_d
 use state_fixtures::versionless_unrecognized::build_versionless_unrecognized_db;
 use state_fixtures::{ROOT_INVOCATION_UUID, default_state_path, user_version};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -338,6 +338,34 @@ fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_d
         old_rows, 0,
         "destructive rebuild should create a fresh live DB"
     );
+}
+
+#[test]
+fn rebuild_rejects_a_leaf_symlink_before_backup_or_removal() {
+    let fixture = CliFixture::new();
+    let target_path = fixture.db_path().with_file_name("target.db");
+    build_v3_full_state_db(&target_path);
+    symlink(&target_path, fixture.db_path()).unwrap();
+    let target_before = fs::read(&target_path).unwrap();
+
+    let output = fixture.run_rebuild();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("leaf symlink"), "{stderr}");
+    assert!(
+        fs::symlink_metadata(fixture.db_path())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "rebuild must preserve the canonical symlink on refusal"
+    );
+    assert_eq!(fs::read(&target_path).unwrap(), target_before);
+    let backup_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner")
+        .join("state-backups");
+    assert!(backup_dirs(&backup_root).is_empty());
 }
 
 #[test]
