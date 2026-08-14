@@ -26,6 +26,7 @@ pub(super) fn migrate_rebuild_plan() -> Result<Option<MigrateRebuildPlan>, Strin
     let db_path = default_state_db_path()?;
     super::accessor::validate_rebuild_path(&db_path)?;
     if missing_state_db(&db_path)? {
+        reject_orphaned_rebuild_artifacts(&db_path)?;
         render_missing_state_db_rebuild_message(&db_path);
         return Ok(None);
     }
@@ -64,9 +65,31 @@ fn migrate_rebuild_plan_value(db_path: PathBuf, backup_dir: PathBuf) -> MigrateR
 fn db_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
     vec![
         db_path.to_path_buf(),
+        format_db_sidecar_path(db_path, "-journal"),
         format_db_sidecar_path(db_path, "-wal"),
         format_db_sidecar_path(db_path, "-shm"),
     ]
+}
+
+fn reject_orphaned_rebuild_artifacts(db_path: &Path) -> Result<(), String> {
+    for artifact in db_sidecar_paths(db_path).into_iter().skip(1) {
+        match std::fs::symlink_metadata(&artifact) {
+            Ok(_) => {
+                return Err(format!(
+                    "State DB rebuild source is missing but a recovery artifact remains: {}",
+                    artifact.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect State DB rebuild recovery artifact {}: {error}",
+                    artifact.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn execute_migrate_rebuild(plan: &MigrateRebuildPlan) -> Result<(), String> {
@@ -91,5 +114,23 @@ mod tests {
 
         assert_eq!(plan.db_path, authority_path);
         assert_eq!(plan.sidecars, db_sidecar_paths(authority_path));
+    }
+
+    #[test]
+    fn missing_main_rejects_every_surviving_recovery_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("state.db");
+
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let artifact = format_db_sidecar_path(&db_path, suffix);
+            std::fs::write(&artifact, b"recovery").unwrap();
+
+            let error = reject_orphaned_rebuild_artifacts(&db_path).unwrap_err();
+
+            assert!(error.contains("recovery artifact remains"), "{error}");
+            assert!(error.contains(suffix), "{error}");
+            std::fs::remove_file(artifact).unwrap();
+        }
+        reject_orphaned_rebuild_artifacts(&db_path).unwrap();
     }
 }

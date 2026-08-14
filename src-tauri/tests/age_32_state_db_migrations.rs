@@ -20,6 +20,9 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+const HOT_JOURNAL_HELPER_ENV: &str = "AGE_32_HOT_JOURNAL_HELPER";
+const HOT_JOURNAL_PATH_ENV: &str = "AGE_32_HOT_JOURNAL_PATH";
+
 struct CliFixture {
     _dir: tempfile::TempDir,
     config_home: PathBuf,
@@ -314,6 +317,7 @@ fn ti_17_migrate_rebuild_command_is_accepted_by_cli() {
 fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_db() {
     let fixture = CliFixture::new();
     build_v3_full_state_db(&fixture.db_path());
+    fs::write(journal_path(&fixture.db_path()), "journal-sidecar").unwrap();
     fs::write(wal_path(&fixture.db_path()), "wal-sidecar").unwrap();
     fs::write(shm_path(&fixture.db_path()), "shm-sidecar").unwrap();
 
@@ -334,6 +338,7 @@ fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_d
     let backups = backup_dirs(&backup_root);
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert!(backups[0].join("state.db").is_file());
+    assert!(backups[0].join("state.db-journal").is_file());
     assert!(backups[0].join("state.db-wal").is_file());
     assert!(backups[0].join("state.db-shm").is_file());
 
@@ -345,6 +350,110 @@ fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_d
     assert_eq!(
         old_rows, 0,
         "destructive rebuild should create a fresh live DB"
+    );
+}
+
+#[test]
+fn rebuild_backs_up_and_removes_a_hot_rollback_journal_before_fresh_initialization() {
+    let fixture = CliFixture::new();
+    drop(StateDb::open(&fixture.db_path()).unwrap());
+    leave_hot_rollback_journal(&fixture.db_path());
+    let journal = journal_path(&fixture.db_path());
+    let journal_before = fs::read(&journal).unwrap();
+    assert!(journal_before.len() > 512, "journal was not populated");
+
+    let output = fixture.run_rebuild();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let backup_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner")
+        .join("state-backups");
+    let backups = backup_dirs(&backup_root);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        fs::read(backups[0].join("state.db-journal")).unwrap(),
+        journal_before
+    );
+    assert!(!journal.exists());
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    let probe_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'hot_journal_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(probe_exists, 0, "hot journal restored pre-rebuild state");
+}
+
+#[test]
+fn rebuild_rejects_orphaned_recovery_artifacts_instead_of_reporting_no_work() {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let fixture = CliFixture::new();
+        fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
+        let artifact = sidecar_path(&fixture.db_path(), suffix);
+        fs::write(&artifact, b"orphaned recovery state").unwrap();
+
+        let output = fixture.run_rebuild();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "{output:?}");
+        assert!(stderr.contains("recovery artifact remains"), "{stderr}");
+        assert!(stderr.contains(suffix), "{stderr}");
+        assert!(!stdout.contains("no state.db"), "{stdout}");
+        assert_eq!(fs::read(&artifact).unwrap(), b"orphaned recovery state");
+        assert!(
+            !fixture
+                .data_home
+                .join("oulipoly-agent-runner")
+                .join("state-backups")
+                .exists()
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawned by rebuild_backs_up_and_removes_a_hot_rollback_journal_before_fresh_initialization"]
+fn hot_rollback_journal_helper() {
+    if std::env::var_os(HOT_JOURNAL_HELPER_ENV).is_none() {
+        return;
+    }
+    let db_path = PathBuf::from(std::env::var_os(HOT_JOURNAL_PATH_ENV).unwrap());
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=DELETE;
+         PRAGMA synchronous=FULL;
+         PRAGMA cache_size=1;
+         BEGIN IMMEDIATE;
+         CREATE TABLE hot_journal_probe(value BLOB NOT NULL);
+         INSERT INTO hot_journal_probe(value) VALUES (zeroblob(1048576));",
+    )
+    .unwrap();
+    let journal = journal_path(&db_path);
+    let bytes = fs::read(&journal).unwrap();
+    assert!(bytes.len() > 512, "journal was not populated");
+    std::process::exit(86);
+}
+
+fn leave_hot_rollback_journal(db_path: &Path) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("hot_rollback_journal_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(HOT_JOURNAL_HELPER_ENV, "1")
+        .env(HOT_JOURNAL_PATH_ENV, db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -673,11 +782,21 @@ fn backup_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 fn wal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-wal", path.display()))
+    sidecar_path(path, "-wal")
 }
 
 fn shm_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-shm", path.display()))
+    sidecar_path(path, "-shm")
+}
+
+fn journal_path(path: &Path) -> PathBuf {
+    sidecar_path(path, "-journal")
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn memory_edges_has_foreign_keys(conn: &Connection) -> bool {
