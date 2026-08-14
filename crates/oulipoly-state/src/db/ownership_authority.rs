@@ -4,7 +4,7 @@
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
-use super::{InvocationStatus, RusqliteOptionalExtension, StateDb, sqlite};
+use super::{RusqliteOptionalExtension, StateDb, sqlite};
 use crate::mailbox::{
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
     validate_completion_event_registration,
@@ -579,10 +579,7 @@ fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Re
             "Completion listener invocation {invocation_uuid} does not exist"
         ));
     };
-    let status = status
-        .parse::<InvocationStatus>()
-        .map_err(|error| format!("Failed to lock completion listener owner: {error}"))?;
-    if status == InvocationStatus::Running {
+    if status == "running" {
         Ok(())
     } else {
         Err(format!(
