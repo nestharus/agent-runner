@@ -445,9 +445,8 @@ fn notify_control_ack_immediately_delivers_without_provider_observation() {
         .unwrap()
         .unwrap();
     assert!(attempt.acknowledged_at.is_some());
-    let resolved_at: Option<String> = fixture
-        .mailbox()
-        .connection()
+    let resolved_at: Option<String> = Connection::open(fixture.sidecar_path())
+        .unwrap()
         .query_row(
             "SELECT resolved_at FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
             params![attempt_id],
@@ -1470,9 +1469,8 @@ fn delivery_attempt_id(payload: &str) -> String {
 }
 
 fn unresolved_delivery_attempt_count(fixture: &Fixture) -> i64 {
-    fixture
-        .mailbox()
-        .connection()
+    Connection::open(fixture.sidecar_path())
+        .unwrap()
         .query_row(
             "SELECT COUNT(*) FROM mailbox_delivery_attempts WHERE resolved_at IS NULL",
             [],

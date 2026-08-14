@@ -157,6 +157,7 @@ fn mailbox_sidecar_generation_is_stable_and_rejects_direct_identity_replacement(
     let sidecar_path = directory.path().join("pid-identity.db");
     let mailbox = MailboxDb::open(&sidecar_path).unwrap();
     let generation = mailbox.sidecar_generation().unwrap();
+    let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
 
     for statement in [
         "UPDATE mailbox_sidecar_identity SET generation_uuid = '55555555-5555-4555-8555-555555555555' WHERE singleton = 1",
@@ -164,7 +165,7 @@ fn mailbox_sidecar_generation_is_stable_and_rejects_direct_identity_replacement(
         "INSERT OR REPLACE INTO mailbox_sidecar_identity (singleton, generation_uuid, created_at) VALUES (1, '55555555-5555-4555-8555-555555555555', '2026-08-13T00:00:00Z')",
         "INSERT INTO mailbox_sidecar_identity (singleton, generation_uuid, created_at) VALUES (1, '55555555-5555-4555-8555-555555555555', '2026-08-13T00:00:00Z') ON CONFLICT(singleton) DO UPDATE SET generation_uuid = excluded.generation_uuid",
     ] {
-        let error = mailbox.connection().execute(statement, []).unwrap_err();
+        let error = connection.execute(statement, []).unwrap_err();
         assert!(
             error
                 .to_string()

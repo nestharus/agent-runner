@@ -978,7 +978,8 @@ fn published_payload_without_metadata_commit_is_not_accepted() {
     let payload = r#"{"schema_version":1,"kind":"agent_bash_complete","body":"durable"}"#;
     let sidecar_path = fixture.sidecar_path();
     let mut db = MailboxDb::open(&sidecar_path).unwrap();
-    db.connection()
+    Connection::open(&sidecar_path)
+        .unwrap()
         .execute_batch(
             "CREATE TRIGGER reject_mailbox_acceptance
              BEFORE INSERT ON mailbox
@@ -1033,8 +1034,10 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
     let fixture = Fixture::new();
     let row = fixture.seed_mailbox(SESSION_A, "h-compact", 0);
     let original_payload = fs::read_to_string(row.payload_file_path.as_deref().unwrap()).unwrap();
-    let mut db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
-    db.connection()
+    let sidecar_path = fixture.sidecar_path();
+    let mut db = MailboxDb::open(&sidecar_path).unwrap();
+    Connection::open(&sidecar_path)
+        .unwrap()
         .execute(
             "UPDATE mailbox
              SET payload_json = ?2, payload_compacted_at = NULL
@@ -1052,9 +1055,9 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
     assert_eq!(dry_run_json["applied"], false);
     assert_eq!(dry_run_json["before"]["eligible_rows"], 1);
     assert!(dry_run_json["report"].is_null());
-    let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
     assert_eq!(
-        db.connection()
+        Connection::open(&sidecar_path)
+            .unwrap()
             .query_row(
                 "SELECT payload_compacted_at FROM mailbox WHERE seq = ?1",
                 params![row.seq],
@@ -1063,7 +1066,6 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
             .unwrap(),
         None
     );
-    drop(db);
 
     let apply = fixture.run_mailbox_compact(1, true);
     assert!(apply.status.success(), "{apply:?}");
@@ -1327,8 +1329,8 @@ fn chain_input_remains_reachable_after_active_segment_reselection() {
         .list_pending_for_delivery(SESSION_B, Some(CHAIN_ID))
         .unwrap();
     assert!(row.is_empty());
-    let stored = db
-        .connection()
+    let stored = Connection::open(fixture.sidecar_path())
+        .unwrap()
         .query_row(
             "SELECT delivered_at, target_kind, target_id FROM mailbox WHERE seq = ?1",
             params![accepted.seq],

@@ -760,6 +760,16 @@ struct WakeSweepSessionState {
     claim: Option<WakeClaimRow>,
 }
 
+/// Typed mailbox operations intentionally retain the writable connection.
+/// External callers cannot bypass those operations with raw SQL.
+///
+/// ```compile_fail
+/// use oulipoly_state::mailbox::MailboxDb;
+///
+/// fn raw_write_capability(mailbox: &MailboxDb) {
+///     let _ = mailbox.connection();
+/// }
+/// ```
 pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
@@ -959,7 +969,8 @@ impl MailboxDb {
         &self.path
     }
 
-    pub fn connection(&self) -> &Connection {
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
 

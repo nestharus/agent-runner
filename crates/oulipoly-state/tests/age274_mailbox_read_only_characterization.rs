@@ -12,6 +12,7 @@ use oulipoly_state::mailbox::{
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{CURRENT_SCHEMA_VERSION, InvocationStart, SessionTurnIngest, StateDb};
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 const SESSION: &str = "age274-read-only-session";
@@ -182,10 +183,6 @@ fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source()
     let parent = fixture.sidecar_path.parent().unwrap();
     let main_before = std::fs::read(&fixture.sidecar_path).unwrap();
     let mut writer = MailboxDb::open(&fixture.sidecar_path).unwrap();
-    writer
-        .connection()
-        .execute_batch("PRAGMA wal_autocheckpoint=0;")
-        .unwrap();
     writer
         .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
             session_id: SESSION,
@@ -360,12 +357,11 @@ fn writer_open_paths_retain_current_schema_and_wal_behavior() {
     assert_eq!(schema_version, CURRENT_SCHEMA_VERSION);
 
     let mailbox = MailboxDb::open(&sidecar_path).unwrap();
-    let mailbox_journal: String = mailbox
-        .connection()
+    let mailbox_connection = Connection::open(&sidecar_path).unwrap();
+    let mailbox_journal: String = mailbox_connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
-    let mailbox_table_count: u32 = mailbox
-        .connection()
+    let mailbox_table_count: u32 = mailbox_connection
         .query_row(
             "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'mailbox'",
             [],
@@ -374,6 +370,7 @@ fn writer_open_paths_retain_current_schema_and_wal_behavior() {
         .unwrap();
     assert_eq!(mailbox_journal.to_ascii_lowercase(), "wal");
     assert_eq!(mailbox_table_count, 1);
+    drop(mailbox);
 }
 
 #[test]

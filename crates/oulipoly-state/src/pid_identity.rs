@@ -71,6 +71,15 @@ pub struct LiveProcessIdentityRecord<'a> {
     pub model_name: Option<&'a str>,
 }
 
+/// External callers use typed identity operations rather than raw writable SQL.
+///
+/// ```compile_fail
+/// use oulipoly_state::pid_identity::PidIdentityDb;
+///
+/// fn raw_write_capability(identity: &PidIdentityDb) {
+///     let _ = identity.connection();
+/// }
+/// ```
 pub struct PidIdentityDb {
     conn: Connection,
     path: PathBuf,
@@ -131,7 +140,8 @@ impl PidIdentityDb {
         &self.path
     }
 
-    pub fn connection(&self) -> &Connection {
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
 

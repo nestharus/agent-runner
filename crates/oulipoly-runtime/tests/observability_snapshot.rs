@@ -715,10 +715,6 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
     let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
     seed_invocation(&state, CHILD_UUID, Some(root_id));
     let mut mailbox = fixture.open_mailbox();
-    mailbox
-        .connection()
-        .execute_batch("PRAGMA wal_autocheckpoint=0;")
-        .unwrap();
     let row = match mailbox
         .enqueue_agent_bash_complete(&mailbox_input("handle-physical-read-only", SESSION_ID))
         .unwrap()
