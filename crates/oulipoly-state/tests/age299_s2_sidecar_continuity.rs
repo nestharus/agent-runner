@@ -282,6 +282,9 @@ fn insert_completion_obligation(state: &StateDb, input: CompletionObligationAdmi
     connection
         .pragma_update(None, "foreign_keys", true)
         .unwrap();
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     migrations::run_with_db_path(&mut connection, &[], state.path().to_path_buf()).unwrap();
     connection
         .execute(
