@@ -780,6 +780,14 @@ pub struct MailboxDb {
 /// of SQLite's inode-scoped writer locks.
 pub(crate) struct MailboxAuthorityFence {
     file: std::fs::File,
+    sidecar_path: PathBuf,
+    target_identity: Option<MailboxFileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MailboxFileIdentity {
+    volume: u64,
+    file: u64,
 }
 
 #[derive(Debug)]
@@ -876,11 +884,24 @@ impl MailboxAuthorityFence {
             path: path.to_path_buf(),
             source: std::io::Error::other(error),
         })?;
-        let authority_path =
-            mailbox_authority_path(path).map_err(|source| MailboxAuthorityFenceError::Open {
+        let sidecar_path =
+            normalized_mailbox_path(path).map_err(|source| MailboxAuthorityFenceError::Open {
                 path: path.to_path_buf(),
                 source,
             })?;
+        validate_mailbox_storage_path(&sidecar_path).map_err(|source| {
+            MailboxAuthorityFenceError::Open {
+                path: sidecar_path.clone(),
+                source,
+            }
+        })?;
+        let target_identity = inspect_mailbox_namespace_file(&sidecar_path).map_err(|source| {
+            MailboxAuthorityFenceError::Open {
+                path: sidecar_path.clone(),
+                source,
+            }
+        })?;
+        let authority_path = mailbox_authority_path(&sidecar_path);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -894,7 +915,19 @@ impl MailboxAuthorityFence {
         let deadline = Instant::now() + ACQUISITION_TIMEOUT;
         loop {
             match <std::fs::File as fs4::FileExt>::try_lock(&file) {
-                Ok(()) => return Ok(Self { file }),
+                Ok(()) => {
+                    validate_mailbox_source(path, &sidecar_path, target_identity).map_err(
+                        |source| MailboxAuthorityFenceError::Open {
+                            path: sidecar_path.clone(),
+                            source,
+                        },
+                    )?;
+                    return Ok(Self {
+                        file,
+                        sidecar_path,
+                        target_identity,
+                    });
+                }
                 Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(RETRY_INTERVAL);
                 }
@@ -907,6 +940,23 @@ impl MailboxAuthorityFence {
                 Err(error) => return Err(MailboxAuthorityFenceError::Lock(error)),
             }
         }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.sidecar_path
+    }
+
+    pub(crate) fn validate_opened_target(&self) -> Result<(), String> {
+        let observed = inspect_mailbox_namespace_file(&self.sidecar_path)
+            .map_err(|error| format!("Failed to validate PID mailbox sidecar target: {error}"))?
+            .ok_or_else(|| "PID mailbox sidecar target is missing after open".to_string())?;
+        if self
+            .target_identity
+            .is_some_and(|expected| expected != observed)
+        {
+            return Err("PID mailbox sidecar target changed during open".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -953,20 +1003,19 @@ impl MailboxDb {
         if !path.exists() {
             return Ok(None);
         }
-        Self::open_with_authority(&path, &authority).map(Some)
+        Self::open_with_authority(&authority).map(Some)
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
         let authority = MailboxAuthorityFence::acquire(path).map_err(|error| error.to_string())?;
-        Self::open_with_authority(path, &authority)
+        Self::open_with_authority(&authority)
     }
 
-    pub(crate) fn open_with_authority(
-        path: &Path,
-        _authority: &MailboxAuthorityFence,
-    ) -> Result<Self, String> {
+    pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
+        let path = authority.path();
         let mut conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
+        authority.validate_opened_target()?;
         set_wal_mode(&conn)?;
         pid_identity::ensure_identity_schema(&conn)?;
         ensure_mailbox_schema(&mut conn)?;
@@ -989,9 +1038,13 @@ impl MailboxDb {
         })
     }
 
-    pub(crate) fn open_existing_for_completion_authority(path: &Path) -> Result<Self, String> {
+    pub(crate) fn open_existing_for_completion_authority(
+        authority: &MailboxAuthorityFence,
+    ) -> Result<Self, String> {
+        let path = authority.path();
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
+        authority.validate_opened_target()?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
@@ -6836,9 +6889,9 @@ fn mailbox_schema_definition() -> &'static str {
             ON session_wake_claim(claimed_at);"
 }
 
-fn mailbox_authority_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
-    let canonical_sidecar = match fs::canonicalize(sidecar_path) {
-        Ok(path) => path,
+fn normalized_mailbox_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(sidecar_path) {
+        Ok(path) => Ok(path),
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let parent = sidecar_path
                 .parent()
@@ -6850,14 +6903,16 @@ fn mailbox_authority_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
                     "PID mailbox sidecar path must name a file",
                 )
             })?;
-            fs::canonicalize(parent)?.join(file_name)
+            Ok(fs::canonicalize(parent)?.join(file_name))
         }
-        Err(error) => return Err(error),
-    };
-    validate_mailbox_storage_path(&canonical_sidecar)?;
-    let mut path = canonical_sidecar.as_os_str().to_owned();
+        Err(error) => Err(error),
+    }
+}
+
+fn mailbox_authority_path(sidecar_path: &Path) -> PathBuf {
+    let mut path = sidecar_path.as_os_str().to_owned();
     path.push(".authority.lock");
-    Ok(PathBuf::from(path))
+    PathBuf::from(path)
 }
 
 fn validate_mailbox_storage_path(path: &Path) -> std::io::Result<()> {
@@ -6876,6 +6931,90 @@ fn validate_mailbox_storage_path(path: &Path) -> std::io::Result<()> {
             "PID mailbox sidecar path must use a reserved sidecar storage role",
         ))
     }
+}
+
+fn validate_mailbox_source(
+    source_path: &Path,
+    retained_path: &Path,
+    expected_identity: Option<MailboxFileIdentity>,
+) -> std::io::Result<()> {
+    if normalized_mailbox_path(source_path)? != retained_path {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "PID mailbox sidecar source changed during authority acquisition",
+        ));
+    }
+    if inspect_mailbox_namespace_file(retained_path)? != expected_identity {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "PID mailbox sidecar target changed during authority acquisition",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "PID mailbox sidecar requires a regular file with exactly one hard link: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(Some(mailbox_file_identity(&metadata)?))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        format!(
+            "PID mailbox sidecar file identity is unsupported on this platform: {}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(unix)]
+fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(MailboxFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
+}
+
+#[cfg(windows)]
+fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+    Ok(MailboxFileIdentity {
+        volume: u64::from(metadata.volume_serial_number().ok_or_else(|| {
+            std::io::Error::new(ErrorKind::Unsupported, "missing volume serial number")
+        })?),
+        file: metadata
+            .file_index()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::Unsupported, "missing file index"))?,
+    })
 }
 
 fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {
@@ -7278,6 +7417,86 @@ mod tests {
         }
         assert!(!directory.path().join("state.db.authority.lock").exists());
         assert_eq!(state.path(), state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_writers_reject_hard_links_to_state_and_control_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let journal_path = path_with_suffix(&state_path, "-journal");
+        fs::write(&journal_path, b"journal-role").unwrap();
+
+        for (index, target) in [
+            state_path.clone(),
+            path_with_suffix(&state_path, ".namespace.lock"),
+            journal_path,
+            path_with_suffix(&state_path, "-wal"),
+            path_with_suffix(&state_path, "-shm"),
+            sidecar_path.clone(),
+            path_with_suffix(&sidecar_path, ".authority.lock"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(target.exists(), "missing storage role {}", target.display());
+            for kind in ["mailbox", "pid"] {
+                let alias = directory
+                    .path()
+                    .join(format!("hard-link-{index}-{kind}.pid-identity.db"));
+                fs::hard_link(&target, &alias).unwrap();
+                let error = if kind == "mailbox" {
+                    MailboxDb::open(&alias).err().unwrap()
+                } else {
+                    crate::pid_identity::PidIdentityDb::open(&alias)
+                        .err()
+                        .unwrap()
+                };
+                assert!(error.contains("exactly one hard link"), "{error}");
+                assert!(!path_with_suffix(&alias, ".authority.lock").exists());
+                fs::remove_file(alias).unwrap();
+            }
+        }
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_authority_retains_its_target_across_parent_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_parent = directory.path().join("first");
+        let second_parent = directory.path().join("second");
+        let alias_parent = directory.path().join("current");
+        fs::create_dir(&first_parent).unwrap();
+        fs::create_dir(&second_parent).unwrap();
+        let first_path = first_parent.join("pid-identity.db");
+        let second_path = second_parent.join("pid-identity.db");
+        drop(MailboxDb::open(&first_path).unwrap());
+        drop(MailboxDb::open(&second_path).unwrap());
+        symlink(&first_parent, &alias_parent).unwrap();
+        let alias_path = alias_parent.join("pid-identity.db");
+
+        let first_authority = MailboxAuthorityFence::acquire(&alias_path).unwrap();
+        fs::remove_file(&alias_parent).unwrap();
+        symlink(&second_parent, &alias_parent).unwrap();
+        let first = MailboxDb::open_with_authority(&first_authority).unwrap();
+        let second_authority = MailboxAuthorityFence::acquire(&alias_path).unwrap();
+        let second =
+            crate::pid_identity::PidIdentityDb::open_with_authority(&second_authority).unwrap();
+
+        assert_eq!(first.path(), first_path.canonicalize().unwrap());
+        assert_eq!(second.path(), second_path.canonicalize().unwrap());
+    }
+
+    fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
     }
 
     fn input<'a>(handle: &'a str, session_id: &'a str) -> AgentBashCompleteEnqueue<'a> {

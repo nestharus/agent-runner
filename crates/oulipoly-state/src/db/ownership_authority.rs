@@ -283,9 +283,9 @@ impl StateDb {
         let existing_obligations =
             all_completion_obligations_on(&tx).map_err(|error| error.to_string())?;
         let mut mailbox = if existing_obligations.is_empty() {
-            MailboxDb::open_with_authority(&sidecar_path, &sidecar_authority)?
+            MailboxDb::open_with_authority(&sidecar_authority)?
         } else {
-            MailboxDb::open_existing_for_completion_authority(&sidecar_path).map_err(|error| {
+            MailboxDb::open_existing_for_completion_authority(&sidecar_authority).map_err(|error| {
                 format!(
                     "process_integrity: invocation {owner_invocation_uuid} has admitted completion authority but the sidecar is unavailable: {error}"
                 )

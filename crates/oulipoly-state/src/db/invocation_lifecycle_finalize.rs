@@ -281,7 +281,7 @@ impl StateDb {
         };
         let sidecar_path =
             crate::mailbox::MailboxDb::path_for_state_db(completion_authority_state_path);
-        let _sidecar_authority = (!obligations.is_empty())
+        let sidecar_authority = (!obligations.is_empty())
             .then(|| {
                 crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
                     .map_err(|error| error.to_string())
@@ -294,8 +294,12 @@ impl StateDb {
                     error,
                 )
             })?;
+        let retained_sidecar_path = sidecar_authority
+            .as_ref()
+            .map(crate::mailbox::MailboxAuthorityFence::path)
+            .unwrap_or(&sidecar_path);
         let mut sidecar = self.open_completion_authority_sidecar(
-            &sidecar_path,
+            sidecar_authority.as_ref(),
             &invocation.invocation_uuid,
             &obligations,
         )?;
@@ -311,7 +315,7 @@ impl StateDb {
                 )
             })?;
         self.validate_completion_sidecar_authority(
-            &sidecar_path,
+            retained_sidecar_path,
             &invocation.invocation_uuid,
             &obligations,
         )?;
@@ -335,7 +339,7 @@ impl StateDb {
 
         before_validation();
         self.validate_completion_sidecar_authority(
-            &sidecar_path,
+            retained_sidecar_path,
             &invocation.invocation_uuid,
             &obligations,
         )?;
@@ -347,20 +351,26 @@ impl StateDb {
 
     fn open_completion_authority_sidecar(
         &self,
-        sidecar_path: &std::path::Path,
+        authority: Option<&crate::mailbox::MailboxAuthorityFence>,
         invocation_uuid: &str,
         obligations: &[CompletionObligationExpectation],
     ) -> Result<Option<crate::mailbox::MailboxDb>, String> {
         if obligations.is_empty() {
             return Ok(None);
         }
+        let authority = authority.ok_or_else(|| {
+            format!(
+                "process_integrity: invocation {invocation_uuid} has completion obligations but no sidecar authority"
+            )
+        })?;
+        let sidecar_path = authority.path();
         if !sidecar_path.exists() {
             return Err(Self::format_missing_completion_sidecar(
                 invocation_uuid,
                 obligations,
             ));
         }
-        crate::mailbox::MailboxDb::open_existing_for_completion_authority(sidecar_path)
+        crate::mailbox::MailboxDb::open_existing_for_completion_authority(authority)
             .map(Some)
             .map_err(|error| {
                 Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)

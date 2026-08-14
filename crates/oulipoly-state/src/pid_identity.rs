@@ -99,16 +99,16 @@ impl PidIdentityDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         let authority = crate::mailbox::MailboxAuthorityFence::acquire(path)
             .map_err(|error| error.to_string())?;
-        Self::open_with_authority(path, &authority)
+        Self::open_with_authority(&authority)
     }
 
     pub(crate) fn open_with_authority(
-        path: &Path,
-        _authority: &crate::mailbox::MailboxAuthorityFence,
+        authority: &crate::mailbox::MailboxAuthorityFence,
     ) -> Result<Self, String> {
-        ensure_parent_dir(path)?;
+        let path = authority.path();
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
+        authority.validate_opened_target()?;
         set_wal_mode(&conn)?;
         ensure_identity_schema(&conn)?;
         Ok(Self {
@@ -265,14 +265,6 @@ fn observe_live_process_identity_impl(os_pid: i64) -> ProcessIdentityObservation
 #[cfg(not(target_os = "linux"))]
 fn observe_live_process_identity_impl(_os_pid: i64) -> ProcessIdentityObservation {
     ProcessIdentityObservation::Unsupported
-}
-
-fn ensure_parent_dir(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create PID identity sidecar directory: {err}"))?;
-    }
-    Ok(())
 }
 
 fn set_wal_mode(conn: &Connection) -> Result<(), String> {
@@ -665,7 +657,7 @@ mod tests {
         let path = dir.path().join("pid-identity.db");
         let authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
 
-        let db = PidIdentityDb::open_with_authority(&path, &authority).unwrap();
+        let db = PidIdentityDb::open_with_authority(&authority).unwrap();
 
         assert_eq!(db.path(), path);
     }
