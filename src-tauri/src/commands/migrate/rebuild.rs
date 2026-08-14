@@ -24,6 +24,7 @@ impl MigrateRebuildPlan {
 
 pub(super) fn migrate_rebuild_plan() -> Result<Option<MigrateRebuildPlan>, String> {
     let db_path = default_state_db_path()?;
+    super::accessor::validate_rebuild_path(&db_path)?;
     if missing_state_db(&db_path) {
         render_missing_state_db_rebuild_message(&db_path);
         return Ok(None);

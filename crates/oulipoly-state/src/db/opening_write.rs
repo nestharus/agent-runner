@@ -175,6 +175,9 @@ impl StateDb {
             Self::ensure_state_parent_dir(path)?;
         }
         let db_path = Self::normalized_state_open_path(path);
+        if !nonlocal {
+            Self::validate_local_state_path(&db_path)?;
+        }
         let state_namespace_guard = if nonlocal {
             None
         } else {
@@ -295,12 +298,10 @@ impl StateDb {
     }
 
     pub fn acquire_rebuild_authority(path: &Path) -> Result<StateDbRebuildAuthority, String> {
-        if Self::is_nonlocal_sqlite_path(path) {
-            return Err("State DB rebuild authority requires a local file path".to_string());
-        }
-        Self::validate_local_state_path(path)?;
+        Self::validate_rebuild_path(path)?;
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
+        Self::validate_local_state_path(&db_path)?;
         let guard = StateNamespaceGuard::acquire(&db_path, true)?;
         Self::validate_rebuild_source(path, &db_path)?;
         Ok(StateDbRebuildAuthority {
@@ -316,6 +317,7 @@ impl StateDb {
         Self::validate_local_state_path(path)?;
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
+        Self::validate_local_state_path(&db_path)?;
         let guard = StateNamespaceGuard::acquire(&db_path, false)?;
         Self::validate_state_namespace_file(&db_path)?;
         Ok(StateDbWriterAuthority {
@@ -345,6 +347,14 @@ impl StateDb {
 
     pub fn default_path() -> Result<PathBuf, String> {
         Ok(crate::paths::data_dir()?.join("state.db"))
+    }
+
+    pub fn validate_rebuild_path(path: &Path) -> Result<(), String> {
+        if Self::is_nonlocal_sqlite_path(path) {
+            return Err("State DB rebuild authority requires a local file path".to_string());
+        }
+        Self::validate_local_state_path(path)?;
+        Self::validate_local_state_path(&Self::normalized_state_open_path(path))
     }
 
     pub fn connection(&self) -> StateReadConnection<'_> {
@@ -812,5 +822,40 @@ mod state_namespace_tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_state_authorities_reject_utf8_aliases_to_non_utf8_targets() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_parent = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"target-\xff".to_vec()));
+        let target_path = target_parent.join("state.db");
+        std::fs::create_dir(&target_parent).unwrap();
+        std::fs::write(&target_path, b"unchanged").unwrap();
+        let parent_alias = directory.path().join("parent-alias");
+        symlink(&target_parent, &parent_alias).unwrap();
+        let leaf_alias = directory.path().join("leaf-alias.db");
+        symlink(&target_path, &leaf_alias).unwrap();
+
+        for state_path in [parent_alias.join("state.db"), leaf_alias] {
+            for error in [
+                StateDb::open(&state_path).err().unwrap(),
+                StateDb::acquire_writer_authority(&state_path)
+                    .err()
+                    .unwrap(),
+                StateDb::acquire_rebuild_authority(&state_path)
+                    .err()
+                    .unwrap(),
+            ] {
+                assert!(error.contains("valid UTF-8"), "{error}");
+            }
+        }
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"unchanged");
+        assert!(!target_parent.join("state.db.namespace.lock").exists());
     }
 }

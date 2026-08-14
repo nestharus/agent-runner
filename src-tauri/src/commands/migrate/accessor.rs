@@ -50,6 +50,10 @@ pub(super) fn acquire_rebuild_authority(path: &Path) -> Result<StateDbRebuildAut
     StateDb::acquire_rebuild_authority(path)
 }
 
+pub(super) fn validate_rebuild_path(path: &Path) -> Result<(), String> {
+    StateDb::validate_rebuild_path(path)
+}
+
 pub(super) fn initialize_after_rebuild(
     path: &Path,
     authority: &StateDbRebuildAuthority,

@@ -15,6 +15,7 @@ use state_fixtures::versionless_drifted_setup::build_versionless_drifted_setup_d
 use state_fixtures::versionless_unrecognized::build_versionless_unrecognized_db;
 use state_fixtures::{ROOT_INVOCATION_UUID, default_state_path, user_version};
 use std::fs;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -107,6 +108,13 @@ impl CliFixture {
 
     fn run_rebuild(&self) -> Output {
         let mut cmd = self.command();
+        cmd.arg("migrate").arg("--rebuild");
+        cmd.output().unwrap()
+    }
+
+    fn run_rebuild_in(&self, data_dir: &Path) -> Output {
+        let mut cmd = self.command();
+        cmd.env("OULIPOLY_DATA_DIR", data_dir);
         cmd.arg("migrate").arg("--rebuild");
         cmd.output().unwrap()
     }
@@ -366,6 +374,33 @@ fn rebuild_rejects_a_leaf_symlink_before_backup_or_removal() {
         .join("oulipoly-agent-runner")
         .join("state-backups");
     assert!(backup_dirs(&backup_root).is_empty());
+}
+
+#[test]
+fn rebuild_rejects_a_non_utf8_default_before_planning_or_reporting() {
+    let fixture = CliFixture::new();
+    let data_dir = fixture
+        ._dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"data-\xff".to_vec()));
+
+    let missing = fixture.run_rebuild_in(&data_dir);
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(missing_stderr.contains("valid UTF-8"), "{missing_stderr}");
+    assert!(!String::from_utf8_lossy(&missing.stdout).contains("no state.db"));
+    assert!(!data_dir.exists());
+
+    fs::create_dir(&data_dir).unwrap();
+    let state_path = data_dir.join("state.db");
+    fs::write(&state_path, b"unchanged").unwrap();
+    let existing = fixture.run_rebuild_in(&data_dir);
+    let existing_stderr = String::from_utf8_lossy(&existing.stderr);
+    assert!(!existing.status.success(), "{existing:?}");
+    assert!(existing_stderr.contains("valid UTF-8"), "{existing_stderr}");
+    assert_eq!(fs::read(&state_path).unwrap(), b"unchanged");
+    assert!(!data_dir.join("state-backups").exists());
+    assert!(!data_dir.join("state.db.namespace.lock").exists());
 }
 
 #[test]
