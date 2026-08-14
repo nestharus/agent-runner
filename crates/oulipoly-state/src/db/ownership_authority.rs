@@ -291,7 +291,18 @@ impl StateDb {
                 )
             })?
         };
-        let sidecar_generation = mailbox.sidecar_generation().map_err(|error| {
+        let sidecar_fence = mailbox
+            .begin_completion_authority_fence()
+            .map_err(|error| {
+                if existing_obligations.is_empty() {
+                    error
+                } else {
+                    format!(
+                        "process_integrity: invocation {owner_invocation_uuid} cannot fence admitted completion authority: {error}"
+                    )
+                }
+            })?;
+        let sidecar_generation = sidecar_fence.sidecar_generation().map_err(|error| {
             if existing_obligations.is_empty() {
                 error
             } else {
@@ -312,11 +323,12 @@ impl StateDb {
             ));
         }
         validate_existing_completion_listeners(
-            &mailbox,
+            &sidecar_fence,
             &existing_obligations,
             &admission_id,
             owner_invocation_uuid,
         )?;
+        sidecar_fence.preflight_completion_event_registration(&registration)?;
         record_completion_obligation_on(
             &tx,
             CompletionObligationAdmission {
@@ -333,7 +345,7 @@ impl StateDb {
         tx.commit()
             .map_err(|error| format!("Failed to commit completion admission: {error}"))?;
         after_state_commit();
-        mailbox.register_completion_event(registration)
+        sidecar_fence.register_completion_event(registration)
     }
 
     pub(super) fn completion_obligations_for_invocation_on(
@@ -494,7 +506,7 @@ fn all_completion_obligations_on(
 }
 
 fn validate_existing_completion_listeners(
-    mailbox: &MailboxDb,
+    sidecar: &crate::mailbox::CompletionAuthorityFence<'_>,
     obligations: &[CompletionObligationExpectation],
     replay_admission_id: &str,
     owner_invocation_uuid: &str,
@@ -503,7 +515,7 @@ fn validate_existing_completion_listeners(
         if obligation.admission_id == replay_admission_id {
             continue;
         }
-        let present = mailbox.contains_completion_obligation(
+        let present = sidecar.contains_completion_obligation(
             &obligation.event_id,
             &obligation.owner_invocation_uuid,
             &obligation.owner_session_id,
@@ -757,6 +769,7 @@ fn persistence_message(message: impl Into<String>) -> OwnershipAuthorityError {
 mod tests {
     use super::*;
     use crate::InvocationStart;
+    use crate::mailbox::CompletionEventTriggerInput;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -861,6 +874,109 @@ mod tests {
                 .unwrap()
                 .contains_completion_obligation(EVENT_ID, INVOCATION_UUID, SESSION_ID)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn retained_sidecar_conflicts_are_rejected_before_state_admission() {
+        const EVENT_CONFLICT: &str = "age299-s2-retained-event-conflict";
+        const LISTENER_CONFLICT: &str = "age299-s2-retained-listener-conflict";
+        const TRIGGERED_CONFLICT: &str = "age299-s2-retained-triggered-conflict";
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+
+        let mut sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        sidecar
+            .register_completion_event(CompletionEventRegistrationInput {
+                delivery_mode: "sync",
+                ..registration_for(EVENT_CONFLICT, SESSION_ID, INVOCATION_UUID)
+            })
+            .unwrap();
+        sidecar
+            .register_completion_event(registration_for(
+                LISTENER_CONFLICT,
+                "age299-s2-conflicting-session",
+                INVOCATION_UUID,
+            ))
+            .unwrap();
+        let triggered_registration = registration_for(
+            TRIGGERED_CONFLICT,
+            "age299-s2-triggered-session",
+            SECOND_INVOCATION_UUID,
+        );
+        sidecar
+            .register_completion_event(triggered_registration)
+            .unwrap();
+        sidecar
+            .trigger_completion_event(CompletionEventTriggerInput {
+                event_id: TRIGGERED_CONFLICT,
+                payload_json: r#"{"schema_version":2,"handle":"age299-s2-retained-triggered-conflict"}"#,
+                state_dir: triggered_registration.state_dir,
+                meta_path: triggered_registration.meta_path,
+                log_path: triggered_registration.log_path,
+                rc_path: triggered_registration.rc_path,
+                rc: 0,
+                consumed: false,
+            })
+            .unwrap();
+        drop(sidecar);
+
+        for (admission_id, registration, expected_error) in [
+            (
+                "age299-s2-event-conflict-admission",
+                registration_for(EVENT_CONFLICT, SESSION_ID, INVOCATION_UUID),
+                "conflicts with its durable identity",
+            ),
+            (
+                "age299-s2-listener-conflict-admission",
+                registration_for(LISTENER_CONFLICT, SESSION_ID, INVOCATION_UUID),
+                "listener registration conflicts",
+            ),
+            (
+                "age299-s2-triggered-conflict-admission",
+                registration_for(TRIGGERED_CONFLICT, SESSION_ID, INVOCATION_UUID),
+                "after it was triggered",
+            ),
+        ] {
+            let error = state
+                .register_completion_event_with_obligation(admission_id, registration)
+                .unwrap_err();
+            assert!(error.contains(expected_error), "{error}");
+            assert!(
+                state
+                    .completion_obligations_for_invocation(INVOCATION_UUID)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let retained = MailboxDb::open(&sidecar_path).unwrap();
+        assert_eq!(
+            retained
+                .completion_event(TRIGGERED_CONFLICT)
+                .unwrap()
+                .unwrap()
+                .state,
+            "triggered"
+        );
+        assert_eq!(
+            retained
+                .completion_event_listeners(LISTENER_CONFLICT)
+                .unwrap()
+                .len(),
+            1
         );
     }
 

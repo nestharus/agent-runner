@@ -822,7 +822,46 @@ impl fmt::Display for MailboxAuthorityFenceError {
 impl std::error::Error for MailboxAuthorityFenceError {}
 
 pub(crate) struct CompletionAuthorityFence<'a> {
-    _tx: Transaction<'a>,
+    tx: Transaction<'a>,
+}
+
+impl CompletionAuthorityFence<'_> {
+    pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
+        sidecar_generation_on(&self.tx)
+    }
+
+    pub(crate) fn contains_completion_obligation(
+        &self,
+        event_id: &str,
+        owner_invocation_uuid: &str,
+        owner_session_id: &str,
+    ) -> Result<bool, String> {
+        contains_completion_obligation_on(
+            &self.tx,
+            event_id,
+            owner_invocation_uuid,
+            owner_session_id,
+        )
+    }
+
+    pub(crate) fn preflight_completion_event_registration(
+        &self,
+        input: &CompletionEventRegistrationInput<'_>,
+    ) -> Result<(), String> {
+        preflight_completion_event_registration_on(&self.tx, input)
+    }
+
+    pub(crate) fn register_completion_event(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
+        let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
+        self.tx
+            .commit()
+            .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
+        Ok(result)
+    }
 }
 
 impl MailboxAuthorityFence {
@@ -969,7 +1008,7 @@ impl MailboxDb {
         // state commit. This deliberately accepts writer contention to close that TOCTOU window.
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map(|tx| CompletionAuthorityFence { _tx: tx })
+            .map(|tx| CompletionAuthorityFence { tx })
             .map_err(|err| format!("Failed to fence PID mailbox sidecar authority: {err}"))
     }
 
@@ -983,22 +1022,7 @@ impl MailboxDb {
     }
 
     pub fn sidecar_generation(&self) -> Result<String, String> {
-        let generation = self
-            .conn
-            .query_row(
-                "SELECT generation_uuid
-                 FROM mailbox_sidecar_identity
-                 WHERE singleton = 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|err| format!("Failed to read PID mailbox sidecar generation: {err}"))?;
-        let parsed = Uuid::parse_str(&generation)
-            .map_err(|_| "PID mailbox sidecar generation is invalid".to_string())?;
-        if parsed.to_string() != generation {
-            return Err("PID mailbox sidecar generation is not canonical".to_string());
-        }
-        Ok(generation)
+        sidecar_generation_on(&self.conn)
     }
 
     pub fn contains_completion_obligation(
@@ -1007,18 +1031,12 @@ impl MailboxDb {
         owner_invocation_uuid: &str,
         owner_session_id: &str,
     ) -> Result<bool, String> {
-        let Some(event) = completion_event_by_id_on(&self.conn, event_id)? else {
-            return Ok(false);
-        };
-        if event.kind != AGENT_BASH_COMPLETE_KIND {
-            return Ok(false);
-        }
-        completion_event_listener_on(&self.conn, event_id, owner_invocation_uuid).map(|listener| {
-            listener.is_some_and(|listener| {
-                listener.owner_invocation_uuid == owner_invocation_uuid
-                    && listener.session_id == owner_session_id
-            })
-        })
+        contains_completion_obligation_on(
+            &self.conn,
+            event_id,
+            owner_invocation_uuid,
+            owner_session_id,
+        )
     }
 
     pub fn create_runtime_generation(
@@ -1841,6 +1859,7 @@ impl MailboxDb {
         Ok(map_finished_drain(row))
     }
 
+    #[cfg(test)]
     pub(crate) fn register_completion_event(
         &mut self,
         input: CompletionEventRegistrationInput<'_>,
@@ -1853,23 +1872,11 @@ impl MailboxDb {
             .map_err(|err| {
                 format!("Failed to start completion event registration transaction: {err}")
             })?;
-        let existing = completion_event_by_id_on(&tx, input.event_id)?;
-        let inserted = if let Some(existing) = existing.as_ref() {
-            validate_completion_event_registration_replay(existing, &input)?;
-            false
-        } else {
-            insert_completion_event(&tx, &input, &now)?;
-            true
-        };
-        register_completion_event_listener(
-            &tx,
-            &input,
-            existing.is_some_and(|event| event.state == "triggered"),
-            &now,
-        )?;
+        let inserted = register_completion_event_on(&tx, &input, &now)?;
+        let result = completion_event_registration_on(&tx, input.event_id, inserted)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
-        self.completion_event_registration(input.event_id, inserted)
+        Ok(result)
     }
 
     pub fn activate_completion_event_listeners(
@@ -1974,22 +1981,6 @@ impl MailboxDb {
         resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
         commit_consumed_completion_acknowledgement(tx)?;
         Ok(Some(binding.event_id))
-    }
-
-    fn completion_event_registration(
-        &self,
-        event_id: &str,
-        inserted: bool,
-    ) -> Result<CompletionEventRegistrationResult, String> {
-        let event = self
-            .completion_event(event_id)?
-            .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
-        let listeners = self.completion_event_listeners(event_id)?;
-        Ok(CompletionEventRegistrationResult {
-            inserted,
-            event,
-            listeners,
-        })
     }
 
     fn completion_event_trigger_result(
@@ -5948,6 +5939,114 @@ pub(crate) fn validate_completion_event_registration(
         }
         _ => Err("Completion event owner session and invocation are both required".to_string()),
     }
+}
+
+fn sidecar_generation_on(conn: &Connection) -> Result<String, String> {
+    let generation = conn
+        .query_row(
+            "SELECT generation_uuid
+             FROM mailbox_sidecar_identity
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|err| format!("Failed to read PID mailbox sidecar generation: {err}"))?;
+    let parsed = Uuid::parse_str(&generation)
+        .map_err(|_| "PID mailbox sidecar generation is invalid".to_string())?;
+    if parsed.to_string() != generation {
+        return Err("PID mailbox sidecar generation is not canonical".to_string());
+    }
+    Ok(generation)
+}
+
+fn contains_completion_obligation_on(
+    conn: &Connection,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) -> Result<bool, String> {
+    let Some(event) = completion_event_by_id_on(conn, event_id)? else {
+        return Ok(false);
+    };
+    if event.kind != AGENT_BASH_COMPLETE_KIND {
+        return Ok(false);
+    }
+    completion_event_listener_on(conn, event_id, owner_invocation_uuid).map(|listener| {
+        listener.is_some_and(|listener| {
+            listener.owner_invocation_uuid == owner_invocation_uuid
+                && listener.session_id == owner_session_id
+        })
+    })
+}
+
+fn preflight_completion_event_registration_on(
+    conn: &Connection,
+    input: &CompletionEventRegistrationInput<'_>,
+) -> Result<(), String> {
+    validate_completion_event_registration(input)?;
+    let Some(event) = completion_event_by_id_on(conn, input.event_id)? else {
+        return Ok(());
+    };
+    validate_completion_event_registration_replay(&event, input)?;
+    let owner_invocation_uuid = input
+        .owner_invocation_uuid
+        .expect("validated completion registration has an owner");
+    let owner_session_id = input
+        .owner_session_id
+        .expect("validated completion registration has a session");
+    if let Some(listener) =
+        completion_event_listener_on(conn, input.event_id, owner_invocation_uuid)?
+    {
+        return validate_completion_event_listener_replay(
+            &listener,
+            owner_session_id,
+            owner_invocation_uuid,
+        );
+    }
+    if event.state == "triggered" {
+        return Err(format!(
+            "Completion event {} cannot register a listener after it was triggered",
+            input.event_id
+        ));
+    }
+    Ok(())
+}
+
+fn register_completion_event_on(
+    tx: &Transaction<'_>,
+    input: &CompletionEventRegistrationInput<'_>,
+    now: &str,
+) -> Result<bool, String> {
+    let existing = completion_event_by_id_on(tx, input.event_id)?;
+    let inserted = if let Some(existing) = existing.as_ref() {
+        validate_completion_event_registration_replay(existing, input)?;
+        false
+    } else {
+        insert_completion_event(tx, input, now)?;
+        true
+    };
+    register_completion_event_listener(
+        tx,
+        input,
+        existing.is_some_and(|event| event.state == "triggered"),
+        now,
+    )?;
+    Ok(inserted)
+}
+
+fn completion_event_registration_on(
+    conn: &Connection,
+    event_id: &str,
+    inserted: bool,
+) -> Result<CompletionEventRegistrationResult, String> {
+    let event = completion_event_by_id_on(conn, event_id)?
+        .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
+    let listeners = completion_event_listeners_on(conn, event_id)?;
+    Ok(CompletionEventRegistrationResult {
+        inserted,
+        event,
+        listeners,
+    })
 }
 
 fn validate_completion_event_trigger(
