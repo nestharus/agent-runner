@@ -6,6 +6,7 @@
 
 use super::{RusqliteOptionalExtension, StateDb, sqlite};
 use crate::mailbox::{
+    COMPLETION_CONTINUITY_GENESIS_DIGEST, CompletionContinuityHead,
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
     validate_completion_event_registration,
 };
@@ -232,7 +233,9 @@ impl StateDb {
             sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
                 .map_err(persistence("begin completion obligation admission"))?;
 
-        let result = record_completion_obligation_on(&tx, input)?;
+        let state_head = completion_continuity_head_on(&tx)?;
+        let (result, _) =
+            record_completion_obligation_with_continuity_on(&tx, input, state_head.as_ref())?;
         tx.commit()
             .map_err(persistence("commit completion obligation admission"))?;
         Ok(result)
@@ -280,9 +283,8 @@ impl StateDb {
         require_running_owner(&tx, owner_invocation_uuid)?;
         let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
-        let existing_obligations =
-            active_completion_obligations_on(&tx).map_err(|error| error.to_string())?;
-        let mut mailbox = if existing_obligations.is_empty() {
+        let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
+        let mut mailbox = if state_head.is_none() {
             MailboxDb::open_with_authority(&sidecar_authority)?
         } else {
             MailboxDb::open_existing_for_completion_authority(&sidecar_authority).map_err(|error| {
@@ -294,7 +296,7 @@ impl StateDb {
         let sidecar_fence = mailbox
             .begin_completion_authority_fence()
             .map_err(|error| {
-                if existing_obligations.is_empty() {
+                if state_head.is_none() {
                     error
                 } else {
                     format!(
@@ -303,7 +305,7 @@ impl StateDb {
                 }
             })?;
         let sidecar_generation = sidecar_fence.sidecar_generation().map_err(|error| {
-            if existing_obligations.is_empty() {
+            if state_head.is_none() {
                 error
             } else {
                 format!(
@@ -311,41 +313,33 @@ impl StateDb {
                 )
             }
         })?;
-        if let Some(mismatch) = existing_obligations
-            .iter()
-            .find(|obligation| obligation.expected_sidecar_generation != sidecar_generation)
-        {
-            return Err(format!(
-                "process_integrity: invocation {owner_invocation_uuid} completion sidecar generation changed before admission {} for active invocation {}: expected {}, observed {sidecar_generation}",
-                mismatch.admission_id,
-                mismatch.invocation_uuid,
-                mismatch.expected_sidecar_generation
-            ));
-        }
-        validate_existing_completion_listeners(
-            &sidecar_fence,
-            &existing_obligations,
-            &admission_id,
+        let sidecar_head = sidecar_fence.completion_continuity_head().map_err(|error| {
+            format!(
+                "process_integrity: invocation {owner_invocation_uuid} cannot read completion continuity authority: {error}"
+            )
+        })?;
+        let obligation = CompletionObligationAdmission {
+            admission_id: &admission_id,
+            invocation_uuid: owner_invocation_uuid,
+            event_id: registration.event_id,
             owner_invocation_uuid,
+            owner_session_id,
+            expected_sidecar_generation: &sidecar_generation,
+        };
+        validate_completion_continuity_alignment(
+            state_head.as_ref(),
+            sidecar_head.as_ref(),
+            &obligation,
         )?;
         sidecar_fence.preflight_completion_event_registration(&registration)?;
-        record_completion_obligation_on(
-            &tx,
-            CompletionObligationAdmission {
-                admission_id: &admission_id,
-                invocation_uuid: owner_invocation_uuid,
-                event_id: registration.event_id,
-                owner_invocation_uuid,
-                owner_session_id,
-                expected_sidecar_generation: &sidecar_generation,
-            },
-        )
-        .map_err(|error| error.to_string())?;
+        let (_, continuity) =
+            record_completion_obligation_with_continuity_on(&tx, obligation, state_head.as_ref())
+                .map_err(|error| error.to_string())?;
         before_state_commit();
         tx.commit()
             .map_err(|error| format!("Failed to commit completion admission: {error}"))?;
         after_state_commit();
-        sidecar_fence.register_completion_event(registration)
+        sidecar_fence.register_completion_event(registration, &continuity)
     }
 
     pub(super) fn completion_obligations_for_invocation_on(
@@ -485,6 +479,260 @@ fn record_completion_obligation_on(
         .ok_or_else(|| persistence_message("completion obligation disappeared after insert"))
 }
 
+fn record_completion_obligation_with_continuity_on(
+    tx: &rusqlite::Transaction<'_>,
+    input: CompletionObligationAdmission<'_>,
+    state_head: Option<&CompletionContinuityHead>,
+) -> Result<
+    (
+        CompletionObligationAdmissionResult,
+        CompletionContinuityHead,
+    ),
+    OwnershipAuthorityError,
+> {
+    let result = record_completion_obligation_on(tx, input)?;
+    let continuity = match &result {
+        CompletionObligationAdmissionResult::Recorded(expectation) => {
+            let continuity = next_completion_continuity(state_head, expectation);
+            append_completion_continuity_on(tx, &continuity)?;
+            continuity
+        }
+        CompletionObligationAdmissionResult::Replay(expectation) => {
+            let continuity = completion_continuity_by_admission_on(tx, &expectation.admission_id)?
+                .ok_or_else(|| {
+                    persistence_message(format!(
+                        "completion obligation {} has no continuity admission",
+                        expectation.admission_id
+                    ))
+                })?;
+            if completion_continuity_matches_expectation(&continuity, expectation) {
+                continuity
+            } else {
+                return Err(persistence_message(format!(
+                    "completion obligation {} continuity identity mismatch",
+                    expectation.admission_id
+                )));
+            }
+        }
+    };
+    Ok((result, continuity))
+}
+
+fn next_completion_continuity(
+    state_head: Option<&CompletionContinuityHead>,
+    expectation: &CompletionObligationExpectation,
+) -> CompletionContinuityHead {
+    let authority_ordinal = state_head.map_or(1, |head| head.authority_ordinal + 1);
+    let previous_continuity_digest = state_head.map_or_else(
+        || COMPLETION_CONTINUITY_GENESIS_DIGEST.to_string(),
+        |head| head.continuity_digest.clone(),
+    );
+    let continuity_digest =
+        completion_continuity_digest(authority_ordinal, &previous_continuity_digest, expectation);
+    CompletionContinuityHead {
+        authority_ordinal,
+        admission_id: expectation.admission_id.clone(),
+        sidecar_generation: expectation.expected_sidecar_generation.clone(),
+        invocation_uuid: expectation.invocation_uuid.clone(),
+        event_id: expectation.event_id.clone(),
+        owner_invocation_uuid: expectation.owner_invocation_uuid.clone(),
+        owner_session_id: expectation.owner_session_id.clone(),
+        previous_continuity_digest,
+        continuity_digest,
+    }
+}
+
+fn completion_continuity_digest(
+    authority_ordinal: i64,
+    previous_continuity_digest: &str,
+    expectation: &CompletionObligationExpectation,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"oulipoly-completion-continuity-v1");
+    digest.update(authority_ordinal.to_be_bytes());
+    for field in [
+        previous_continuity_digest,
+        expectation.expected_sidecar_generation.as_str(),
+        expectation.admission_id.as_str(),
+        expectation.invocation_uuid.as_str(),
+        expectation.event_id.as_str(),
+        expectation.owner_invocation_uuid.as_str(),
+        expectation.owner_session_id.as_str(),
+    ] {
+        let field_length = u64::try_from(field.len()).expect("continuity field length fits u64");
+        digest.update(field_length.to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn append_completion_continuity_on(
+    conn: &sqlite::Connection,
+    continuity: &CompletionContinuityHead,
+) -> Result<(), OwnershipAuthorityError> {
+    conn.execute(
+        "INSERT INTO invocation_completion_continuity (
+            authority_ordinal, admission_id, expected_sidecar_generation,
+            invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+            previous_continuity_digest, continuity_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        sqlite::params![
+            continuity.authority_ordinal,
+            continuity.admission_id,
+            continuity.sidecar_generation,
+            continuity.invocation_uuid,
+            continuity.event_id,
+            continuity.owner_invocation_uuid,
+            continuity.owner_session_id,
+            continuity.previous_continuity_digest,
+            continuity.continuity_digest,
+        ],
+    )
+    .map(|_| ())
+    .map_err(persistence("append completion continuity"))
+}
+
+fn completion_continuity_head_on(
+    conn: &sqlite::Connection,
+) -> Result<Option<CompletionContinuityHead>, OwnershipAuthorityError> {
+    #[cfg(test)]
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(count.get() + 1));
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, expected_sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM invocation_completion_continuity
+         ORDER BY authority_ordinal DESC
+         LIMIT 1",
+        [],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(persistence("read completion continuity head"))
+}
+
+fn completion_continuity_by_admission_on(
+    conn: &sqlite::Connection,
+    admission_id: &str,
+) -> Result<Option<CompletionContinuityHead>, OwnershipAuthorityError> {
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, expected_sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM invocation_completion_continuity
+         WHERE admission_id = ?1",
+        sqlite::params![admission_id],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(persistence("read completion continuity admission"))
+}
+
+fn map_completion_continuity_head(
+    row: &sqlite::Row<'_>,
+) -> sqlite::Result<CompletionContinuityHead> {
+    Ok(CompletionContinuityHead {
+        authority_ordinal: row.get(0)?,
+        admission_id: row.get(1)?,
+        sidecar_generation: row.get(2)?,
+        invocation_uuid: row.get(3)?,
+        event_id: row.get(4)?,
+        owner_invocation_uuid: row.get(5)?,
+        owner_session_id: row.get(6)?,
+        previous_continuity_digest: row.get(7)?,
+        continuity_digest: row.get(8)?,
+    })
+}
+
+fn validate_completion_continuity_alignment(
+    state_head: Option<&CompletionContinuityHead>,
+    sidecar_head: Option<&CompletionContinuityHead>,
+    admission: &CompletionObligationAdmission<'_>,
+) -> Result<(), String> {
+    let generation_matches = state_head
+        .into_iter()
+        .chain(sidecar_head)
+        .all(|head| head.sidecar_generation == admission.expected_sidecar_generation);
+    if generation_matches && state_head == sidecar_head {
+        return Ok(());
+    }
+    if generation_matches
+        && state_head.is_some_and(|head| {
+            completion_continuity_is_one_ahead(head, sidecar_head)
+                && completion_continuity_matches_admission(head, admission)
+        })
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "process_integrity: invocation {} cannot admit completion authority because state and sidecar continuity heads do not match: observed_generation={}, state={}, sidecar={}",
+        admission.owner_invocation_uuid,
+        admission.expected_sidecar_generation,
+        format_completion_continuity_head(state_head),
+        format_completion_continuity_head(sidecar_head),
+    ))
+}
+
+fn completion_continuity_is_one_ahead(
+    state_head: &CompletionContinuityHead,
+    sidecar_head: Option<&CompletionContinuityHead>,
+) -> bool {
+    let sidecar_ordinal = sidecar_head.map_or(0, |head| head.authority_ordinal);
+    let sidecar_digest = sidecar_head.map_or(COMPLETION_CONTINUITY_GENESIS_DIGEST, |head| {
+        head.continuity_digest.as_str()
+    });
+    state_head.authority_ordinal == sidecar_ordinal + 1
+        && state_head.previous_continuity_digest == sidecar_digest
+        && sidecar_head.is_none_or(|head| head.sidecar_generation == state_head.sidecar_generation)
+}
+
+fn completion_continuity_matches_admission(
+    continuity: &CompletionContinuityHead,
+    admission: &CompletionObligationAdmission<'_>,
+) -> bool {
+    continuity.admission_id == admission.admission_id
+        && continuity.sidecar_generation == admission.expected_sidecar_generation
+        && continuity.invocation_uuid == admission.invocation_uuid
+        && continuity.event_id == admission.event_id
+        && continuity.owner_invocation_uuid == admission.owner_invocation_uuid
+        && continuity.owner_session_id == admission.owner_session_id
+}
+
+fn completion_continuity_matches_expectation(
+    continuity: &CompletionContinuityHead,
+    expectation: &CompletionObligationExpectation,
+) -> bool {
+    continuity.admission_id == expectation.admission_id
+        && continuity.sidecar_generation == expectation.expected_sidecar_generation
+        && continuity.invocation_uuid == expectation.invocation_uuid
+        && continuity.event_id == expectation.event_id
+        && continuity.owner_invocation_uuid == expectation.owner_invocation_uuid
+        && continuity.owner_session_id == expectation.owner_session_id
+}
+
+fn format_completion_continuity_head(head: Option<&CompletionContinuityHead>) -> String {
+    head.map_or_else(
+        || "none".to_string(),
+        |head| {
+            format!(
+                "generation {generation}, ordinal {ordinal}, digest {digest}",
+                generation = head.sidecar_generation,
+                ordinal = head.authority_ordinal,
+                digest = head.continuity_digest,
+            )
+        },
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETION_CONTINUITY_HEAD_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 fn all_completion_obligations_on(
     conn: &rusqlite::Connection,
@@ -504,65 +752,6 @@ fn all_completion_obligations_on(
         .map_err(persistence("query completion obligation authority"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(persistence("read completion obligation authority"))
-}
-
-fn active_completion_obligations_on(
-    conn: &rusqlite::Connection,
-) -> Result<Vec<CompletionObligationExpectation>, OwnershipAuthorityError> {
-    let mut statement = conn
-        .prepare(
-            "SELECT obligation.admission_id, obligation.invocation_uuid,
-                    obligation.event_id, obligation.owner_invocation_uuid,
-                    obligation.owner_session_id, obligation.expected_sidecar_generation,
-                    obligation.admitted_at
-             FROM invocation_completion_obligations AS obligation
-             JOIN invocations AS invocation
-               ON invocation.invocation_uuid = obligation.invocation_uuid
-             WHERE invocation.status = 'running'
-             ORDER BY obligation.admitted_at, obligation.admission_id",
-        )
-        .map_err(persistence(
-            "prepare active completion obligation authority query",
-        ))?;
-    let rows = statement
-        .query_map([], map_completion_obligation_row)
-        .map_err(persistence("query active completion obligation authority"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(persistence("read active completion obligation authority"))
-}
-
-fn validate_existing_completion_listeners(
-    sidecar: &crate::mailbox::CompletionAuthorityFence<'_>,
-    obligations: &[CompletionObligationExpectation],
-    replay_admission_id: &str,
-    owner_invocation_uuid: &str,
-) -> Result<(), String> {
-    for obligation in obligations {
-        if obligation.admission_id == replay_admission_id {
-            continue;
-        }
-        let present = sidecar.contains_completion_obligation(
-            &obligation.event_id,
-            &obligation.owner_invocation_uuid,
-            &obligation.owner_session_id,
-        )
-        .map_err(|error| {
-            format!(
-                "process_integrity: invocation {owner_invocation_uuid} cannot validate completion obligation {} before new admission: {error}",
-                obligation.admission_id,
-            )
-        })?;
-        if !present {
-            return Err(format!(
-                "process_integrity: invocation {owner_invocation_uuid} cannot admit new completion authority because obligation {} owned by {} expects event {} in mailbox sidecar generation {}, but the event listener is absent",
-                obligation.admission_id,
-                obligation.owner_invocation_uuid,
-                obligation.event_id,
-                obligation.expected_sidecar_generation,
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Result<(), String> {
@@ -1426,6 +1615,22 @@ mod tests {
                 .is_empty()
         );
 
+        std::fs::File::create(&sidecar_path).unwrap();
+        let empty_error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-other-invocation-admission",
+                second_registration,
+            )
+            .unwrap_err();
+        assert!(empty_error.contains("process_integrity"), "{empty_error}");
+        assert!(
+            empty_error.contains("sidecar is unavailable")
+                || empty_error.contains("invalid admitted completion authority")
+                || empty_error.contains("completion continuity authority"),
+            "{empty_error}"
+        );
+        std::fs::remove_file(&sidecar_path).unwrap();
+
         let replacement_generation = MailboxDb::open(&sidecar_path)
             .unwrap()
             .sidecar_generation()
@@ -1470,93 +1675,153 @@ mod tests {
     }
 
     #[test]
-    fn terminal_obligations_remain_recorded_without_gating_new_admission() {
+    fn mature_terminal_and_running_history_retains_authority_with_bounded_head_queries() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
         let sidecar_path = MailboxDb::path_for_state_db(&state_path);
         let mut state = StateDb::open(&state_path).unwrap();
         let mut invocation_ids = Vec::new();
-        for invocation_uuid in [
-            INVOCATION_UUID,
-            SECOND_INVOCATION_UUID,
-            THIRD_INVOCATION_UUID,
-        ] {
-            invocation_ids.push(
-                state
-                    .start_invocation(&InvocationStart {
-                        invocation_uuid: invocation_uuid.to_string(),
-                        model_name: "age299-s2".to_string(),
-                        provider_name: "test-provider".to_string(),
-                        provider_index: 0,
-                        parent_invocation_id: None,
-                    })
-                    .unwrap(),
-            );
+        for index in 0..64 {
+            let invocation_uuid = format!("10000000-0000-4000-8000-{index:012}");
+            let event_id = format!("age299-s2-mature-event-{index}");
+            let session_id = format!("age299-s2-mature-session-{index}");
+            let admission_id = format!("age299-s2-mature-admission-{index}");
+            let invocation_id = state
+                .start_invocation(&InvocationStart {
+                    invocation_uuid: invocation_uuid.clone(),
+                    model_name: "age299-s2".to_string(),
+                    provider_name: "test-provider".to_string(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .unwrap();
+            state
+                .register_completion_event_with_obligation(
+                    &admission_id,
+                    CompletionEventRegistrationInput {
+                        event_id: &event_id,
+                        delivery_mode: "async",
+                        owner_session_id: Some(&session_id),
+                        owner_invocation_uuid: Some(&invocation_uuid),
+                        state_dir: "/tmp/age299-s2-mature-state",
+                        meta_path: "/tmp/age299-s2-mature-meta",
+                        log_path: "/tmp/age299-s2-mature-log",
+                        rc_path: "/tmp/age299-s2-mature-rc",
+                    },
+                )
+                .unwrap();
+            invocation_ids.push(invocation_id);
         }
+        for invocation_id in invocation_ids.into_iter().take(32) {
+            state
+                .finalize_invocation(invocation_id, true, 0, None, None)
+                .unwrap();
+        }
+        COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(0));
+        crate::mailbox::reset_completion_continuity_head_query_count();
         state
-            .register_completion_event_with_obligation(
-                "age299-s2-terminal-success-admission",
-                registration_for(
-                    "age299-s2-terminal-success-event",
-                    "age299-s2-terminal-success-session",
-                    INVOCATION_UUID,
-                ),
-            )
+            .start_invocation(&InvocationStart {
+                invocation_uuid: THIRD_INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
             .unwrap();
         state
             .register_completion_event_with_obligation(
-                "age299-s2-terminal-failure-admission",
+                "age299-s2-post-mature-admission",
                 registration_for(
-                    "age299-s2-terminal-failure-event",
-                    "age299-s2-terminal-failure-session",
-                    SECOND_INVOCATION_UUID,
+                    "age299-s2-post-mature-event",
+                    "age299-s2-post-mature-session",
+                    THIRD_INVOCATION_UUID,
                 ),
             )
             .unwrap();
+
+        assert_eq!(
+            COMPLETION_CONTINUITY_HEAD_QUERIES.with(std::cell::Cell::get),
+            1
+        );
+        assert_eq!(crate::mailbox::completion_continuity_head_query_count(), 1);
+        let state_plan = state
+            .raw_connection()
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT authority_ordinal
+                 FROM invocation_completion_continuity
+                 ORDER BY authority_ordinal DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            state_plan.contains("invocation_completion_continuity"),
+            "{state_plan}"
+        );
+        let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        let sidecar_plan = sidecar
+            .connection()
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT authority_ordinal
+                 FROM completion_authority_continuity
+                 ORDER BY authority_ordinal DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap();
+        assert!(
+            sidecar_plan.contains("completion_authority_continuity"),
+            "{sidecar_plan}"
+        );
+        drop(sidecar);
+        let obligations = all_completion_obligations_on(state.raw_connection()).unwrap();
+        assert_eq!(obligations.len(), 65);
+
         let retained_generation = MailboxDb::open(&sidecar_path)
             .unwrap()
             .sidecar_generation()
             .unwrap();
-        state
-            .finalize_invocation(invocation_ids[0], true, 0, None, None)
-            .unwrap();
-        state
-            .finalize_invocation(
-                invocation_ids[1],
-                false,
-                1,
-                Some("test_failure"),
-                Some("test_failure"),
-            )
-            .unwrap();
         std::fs::remove_file(&sidecar_path).unwrap();
-        let third_registration = registration_for(
-            "age299-s2-post-terminal-event",
-            "age299-s2-post-terminal-session",
+        let distinct_registration = registration_for(
+            "age299-s2-after-terminal-history-event",
+            "age299-s2-after-terminal-history-session",
             THIRD_INVOCATION_UUID,
         );
-
-        state
+        let missing_error = state
             .register_completion_event_with_obligation(
-                "age299-s2-post-terminal-admission",
-                third_registration,
+                "age299-s2-after-terminal-history-admission",
+                distinct_registration,
             )
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            missing_error.contains("process_integrity"),
+            "{missing_error}"
+        );
+        assert!(!sidecar_path.exists());
         let replacement_generation = MailboxDb::open(&sidecar_path)
             .unwrap()
             .sidecar_generation()
             .unwrap();
         assert_ne!(replacement_generation, retained_generation);
-        let obligations = all_completion_obligations_on(state.raw_connection()).unwrap();
-        assert_eq!(obligations.len(), 3);
+        let replacement_error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-after-terminal-history-admission",
+                distinct_registration,
+            )
+            .unwrap_err();
         assert!(
-            obligations[..2].iter().all(|obligation| {
-                obligation.expected_sidecar_generation == retained_generation
-            })
+            replacement_error.contains("continuity heads do not match"),
+            "{replacement_error}"
         );
         assert_eq!(
-            obligations[2].expected_sidecar_generation,
-            replacement_generation
+            all_completion_obligations_on(state.raw_connection())
+                .unwrap()
+                .len(),
+            65
         );
     }
 
@@ -1601,7 +1866,7 @@ mod tests {
                 second_registration,
             )
             .unwrap_err();
-        assert!(error.contains("event listener is absent"), "{error}");
+        assert!(error.contains("continuity heads do not match"), "{error}");
         assert!(
             state
                 .completion_obligations_for_invocation(SECOND_INVOCATION_UUID)
@@ -1687,8 +1952,15 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            distinct_error.contains("event listener is absent"),
+            distinct_error.contains("continuity heads do not match"),
             "{distinct_error}"
+        );
+        assert_eq!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .len(),
+            1
         );
 
         rusqlite::Connection::open(&sidecar_path)
@@ -1722,7 +1994,7 @@ mod tests {
                 .register_completion_event_with_obligation("age299-s2-partial-admission", changed)
                 .unwrap_err();
             assert!(
-                changed_error.contains("event listener is absent"),
+                changed_error.contains("continuity heads do not match"),
                 "{changed_error}"
             );
             assert!(
@@ -1741,6 +2013,96 @@ mod tests {
                 .unwrap()
                 .contains_completion_obligation(EVENT_ID, INVOCATION_UUID, SESSION_ID)
                 .unwrap()
+        );
+        let state_continuity: (i64, String) = state
+            .raw_connection()
+            .query_row(
+                "SELECT authority_ordinal, continuity_digest
+                 FROM invocation_completion_continuity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        let sidecar_continuity: (i64, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT authority_ordinal, continuity_digest
+                 FROM completion_authority_continuity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state_continuity, sidecar_continuity);
+    }
+
+    #[test]
+    fn completion_continuity_and_listener_identity_are_immutable() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-immutable-continuity-admission",
+                registration(),
+            )
+            .unwrap();
+
+        for statement in [
+            "UPDATE invocation_completion_continuity
+             SET continuity_digest = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+            "DELETE FROM invocation_completion_continuity",
+        ] {
+            let error = state.raw_connection().execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("append-only"), "{error}");
+        }
+
+        let sidecar = rusqlite::Connection::open(&sidecar_path).unwrap();
+        for statement in [
+            "UPDATE completion_authority_continuity
+             SET continuity_digest = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+            "DELETE FROM completion_authority_continuity",
+        ] {
+            let error = sidecar.execute(statement, []).unwrap_err();
+            assert!(error.to_string().contains("append-only"), "{error}");
+        }
+        let update_error = sidecar
+            .execute(
+                "UPDATE completion_event_listener
+                 SET owner_invocation_uuid = 'changed-owner'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            update_error
+                .to_string()
+                .contains("listener identity is immutable"),
+            "{update_error}"
+        );
+        let delete_error = sidecar
+            .execute("DELETE FROM completion_event_listener", [])
+            .unwrap_err();
+        assert!(
+            delete_error
+                .to_string()
+                .contains("listener continuity identity is immutable"),
+            "{delete_error}"
+        );
+        assert_eq!(
+            sidecar
+                .execute("UPDATE completion_event_listener SET active = 0", [])
+                .unwrap(),
+            1
         );
     }
 

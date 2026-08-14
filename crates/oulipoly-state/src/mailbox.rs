@@ -833,9 +833,31 @@ pub(crate) struct CompletionAuthorityFence<'a> {
     tx: Transaction<'a>,
 }
 
+pub(crate) const COMPLETION_CONTINUITY_GENESIS_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionContinuityHead {
+    pub authority_ordinal: i64,
+    pub admission_id: String,
+    pub sidecar_generation: String,
+    pub invocation_uuid: String,
+    pub event_id: String,
+    pub owner_invocation_uuid: String,
+    pub owner_session_id: String,
+    pub previous_continuity_digest: String,
+    pub continuity_digest: String,
+}
+
 impl CompletionAuthorityFence<'_> {
     pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
         sidecar_generation_on(&self.tx)
+    }
+
+    pub(crate) fn completion_continuity_head(
+        &self,
+    ) -> Result<Option<CompletionContinuityHead>, String> {
+        completion_continuity_head_on(&self.tx)
     }
 
     pub(crate) fn contains_completion_obligation(
@@ -862,8 +884,10 @@ impl CompletionAuthorityFence<'_> {
     pub(crate) fn register_completion_event(
         self,
         input: CompletionEventRegistrationInput<'_>,
+        continuity: &CompletionContinuityHead,
     ) -> Result<CompletionEventRegistrationResult, String> {
         let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
+        append_completion_continuity_on(&self.tx, continuity)?;
         let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
         self.tx
             .commit()
@@ -6065,6 +6089,109 @@ fn sidecar_generation_on(conn: &Connection) -> Result<String, String> {
     Ok(generation)
 }
 
+fn completion_continuity_head_on(
+    conn: &Connection,
+) -> Result<Option<CompletionContinuityHead>, String> {
+    #[cfg(test)]
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(count.get() + 1));
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM completion_authority_continuity
+         ORDER BY authority_ordinal DESC
+         LIMIT 1",
+        [],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read completion continuity head: {err}"))
+}
+
+fn completion_continuity_by_admission_on(
+    conn: &Connection,
+    admission_id: &str,
+) -> Result<Option<CompletionContinuityHead>, String> {
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM completion_authority_continuity
+         WHERE admission_id = ?1",
+        params![admission_id],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read completion continuity admission: {err}"))
+}
+
+fn map_completion_continuity_head(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CompletionContinuityHead> {
+    Ok(CompletionContinuityHead {
+        authority_ordinal: row.get(0)?,
+        admission_id: row.get(1)?,
+        sidecar_generation: row.get(2)?,
+        invocation_uuid: row.get(3)?,
+        event_id: row.get(4)?,
+        owner_invocation_uuid: row.get(5)?,
+        owner_session_id: row.get(6)?,
+        previous_continuity_digest: row.get(7)?,
+        continuity_digest: row.get(8)?,
+    })
+}
+
+fn append_completion_continuity_on(
+    conn: &Connection,
+    continuity: &CompletionContinuityHead,
+) -> Result<(), String> {
+    if let Some(existing) = completion_continuity_by_admission_on(conn, &continuity.admission_id)? {
+        return if existing == *continuity {
+            Ok(())
+        } else {
+            Err(format!(
+                "Completion continuity admission {} conflicts with its durable identity",
+                continuity.admission_id
+            ))
+        };
+    }
+    conn.execute(
+        "INSERT INTO completion_authority_continuity (
+            authority_ordinal, admission_id, sidecar_generation, invocation_uuid,
+            event_id, owner_invocation_uuid, owner_session_id,
+            previous_continuity_digest, continuity_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            continuity.authority_ordinal,
+            continuity.admission_id,
+            continuity.sidecar_generation,
+            continuity.invocation_uuid,
+            continuity.event_id,
+            continuity.owner_invocation_uuid,
+            continuity.owner_session_id,
+            continuity.previous_continuity_digest,
+            continuity.continuity_digest,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|err| format!("Failed to append completion continuity: {err}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETION_CONTINUITY_HEAD_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_completion_continuity_head_query_count() {
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn completion_continuity_head_query_count() -> usize {
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(std::cell::Cell::get)
+}
+
 fn contains_completion_obligation_on(
     conn: &Connection,
     event_id: &str,
@@ -6817,6 +6944,95 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_completion_event_listener_pending
             ON completion_event_listener(session_id, active, acknowledged_at, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_listener_identity_update
+        BEFORE UPDATE OF event_id, listener_id, session_id, owner_invocation_uuid, created_at
+        ON completion_event_listener
+        WHEN OLD.event_id IS NOT NEW.event_id
+          OR OLD.listener_id IS NOT NEW.listener_id
+          OR OLD.session_id IS NOT NEW.session_id
+          OR OLD.owner_invocation_uuid IS NOT NEW.owner_invocation_uuid
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'completion listener identity is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS completion_authority_continuity (
+            authority_ordinal          INTEGER PRIMARY KEY CHECK(authority_ordinal > 0),
+            admission_id              TEXT NOT NULL UNIQUE,
+            sidecar_generation        TEXT NOT NULL,
+            invocation_uuid           TEXT NOT NULL,
+            event_id                  TEXT NOT NULL,
+            owner_invocation_uuid     TEXT NOT NULL,
+            owner_session_id          TEXT NOT NULL,
+            previous_continuity_digest TEXT NOT NULL
+                CHECK(length(previous_continuity_digest) = 64
+                    AND previous_continuity_digest NOT GLOB '*[^0-9a-f]*'),
+            continuity_digest         TEXT NOT NULL UNIQUE
+                CHECK(length(continuity_digest) = 64
+                    AND continuity_digest NOT GLOB '*[^0-9a-f]*'),
+            FOREIGN KEY(sidecar_generation)
+                REFERENCES mailbox_sidecar_identity(generation_uuid),
+            FOREIGN KEY(event_id, owner_invocation_uuid)
+                REFERENCES completion_event_listener(event_id, listener_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_completion_authority_continuity_head
+            ON completion_authority_continuity(authority_ordinal DESC);
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_insert
+        BEFORE INSERT ON completion_authority_continuity
+        BEGIN
+            SELECT CASE
+                WHEN NEW.authority_ordinal <> COALESCE(
+                    (
+                        SELECT authority_ordinal + 1
+                        FROM completion_authority_continuity
+                        ORDER BY authority_ordinal DESC
+                        LIMIT 1
+                    ),
+                    1
+                ) THEN RAISE(ABORT, 'completion continuity ordinal is not append-only')
+                WHEN NEW.previous_continuity_digest <> COALESCE(
+                    (
+                        SELECT continuity_digest
+                        FROM completion_authority_continuity
+                        ORDER BY authority_ordinal DESC
+                        LIMIT 1
+                    ),
+                    '0000000000000000000000000000000000000000000000000000000000000000'
+                ) THEN RAISE(ABORT, 'completion continuity previous digest mismatch')
+                WHEN NEW.sidecar_generation <> (
+                    SELECT generation_uuid
+                    FROM mailbox_sidecar_identity
+                    WHERE singleton = 1
+                ) THEN RAISE(ABORT, 'completion continuity sidecar generation mismatch')
+            END;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_update
+        BEFORE UPDATE ON completion_authority_continuity
+        BEGIN
+            SELECT RAISE(ABORT, 'completion continuity is append-only: update forbidden');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_delete
+        BEFORE DELETE ON completion_authority_continuity
+        BEGIN
+            SELECT RAISE(ABORT, 'completion continuity is append-only: delete forbidden');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_listener_continuity_delete
+        BEFORE DELETE ON completion_event_listener
+        WHEN EXISTS (
+            SELECT 1
+            FROM completion_authority_continuity
+            WHERE event_id = OLD.event_id
+              AND owner_invocation_uuid = OLD.listener_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'completion listener continuity identity is immutable');
+        END;
 
         CREATE TABLE IF NOT EXISTS mailbox_notification_control (
             session_id                    TEXT PRIMARY KEY,
