@@ -943,6 +943,8 @@ impl MailboxDb {
     pub(crate) fn begin_completion_authority_fence(
         &mut self,
     ) -> Result<CompletionAuthorityFence<'_>, String> {
+        // A write transaction excludes sidecar writers between authority validation and the
+        // state commit. This deliberately accepts writer contention to close that TOCTOU window.
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map(|tx| CompletionAuthorityFence { _tx: tx })
