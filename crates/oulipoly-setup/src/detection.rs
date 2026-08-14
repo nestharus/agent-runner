@@ -129,28 +129,7 @@ impl VersionTracker {
 
     /// Return the most-recently stored version for `cli_name`, if any.
     pub fn get_current(&self, cli_name: &str) -> Result<Option<VersionRecord>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT cli_name, version, path, detected_at
-                 FROM cli_versions WHERE cli_name = ?1",
-            )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-        let result = stmt.query_row(params![cli_name], |row| {
-            Ok(VersionRecord {
-                cli_name: row.get(0)?,
-                version: row.get(1)?,
-                path: row.get(2)?,
-                detected_at: row.get(3)?,
-            })
-        });
-
-        match result {
-            Ok(rec) => Ok(Some(rec)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query cli_versions: {e}")),
-        }
+        get_current_on(&self.conn, cli_name)
     }
 
     /// Upsert the current version.  If the version changed, a row is also
@@ -164,28 +143,32 @@ impl VersionTracker {
         path: Option<&str>,
     ) -> Result<bool, String> {
         let now = chrono::Utc::now().to_rfc3339();
-        let prev = self.get_current(cli_name)?;
-
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| format!("Failed to begin version record transaction: {e}"))?;
+        let prev = get_current_on(&tx, cli_name)?;
         let changed = prev.as_ref().map(|r| r.version != version).unwrap_or(false);
 
-        self.conn
-            .execute(
-                "INSERT INTO cli_versions (cli_name, version, path, detected_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (cli_name) DO UPDATE SET
-                    version = ?2, path = ?3, detected_at = ?4",
-                params![cli_name, version, path, &now],
-            )
-            .map_err(|e| format!("Failed to upsert cli_versions: {e}"))?;
+        tx.execute(
+            "INSERT INTO cli_versions (cli_name, version, path, detected_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (cli_name) DO UPDATE SET
+                version = ?2, path = ?3, detected_at = ?4",
+            params![cli_name, version, path, &now],
+        )
+        .map_err(|e| format!("Failed to upsert cli_versions: {e}"))?;
 
         // Always append to history so we have a timeline.
-        self.conn
-            .execute(
-                "INSERT INTO cli_version_history (cli_name, version, path, detected_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![cli_name, version, path, &now],
-            )
-            .map_err(|e| format!("Failed to insert cli_version_history: {e}"))?;
+        tx.execute(
+            "INSERT INTO cli_version_history (cli_name, version, path, detected_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![cli_name, version, path, &now],
+        )
+        .map_err(|e| format!("Failed to insert cli_version_history: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit version record transaction: {e}"))?;
 
         Ok(changed)
     }
@@ -216,6 +199,30 @@ impl VersionTracker {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect history rows: {e}"))
+    }
+}
+
+fn get_current_on(conn: &Connection, cli_name: &str) -> Result<Option<VersionRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT cli_name, version, path, detected_at
+             FROM cli_versions WHERE cli_name = ?1",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let result = stmt.query_row(params![cli_name], |row| {
+        Ok(VersionRecord {
+            cli_name: row.get(0)?,
+            version: row.get(1)?,
+            path: row.get(2)?,
+            detected_at: row.get(3)?,
+        })
+    });
+
+    match result {
+        Ok(record) => Ok(Some(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to query cli_versions: {e}")),
     }
 }
 
@@ -886,6 +893,83 @@ mod tests {
         // Newest first
         assert_eq!(history[0].version, "0.104.0");
         assert_eq!(history[2].version, "0.100.0");
+    }
+
+    #[test]
+    fn version_tracker_record_waits_for_bounded_contention_and_commits_both_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let tracker = VersionTracker::open(&state_path).unwrap();
+        let blocker = Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        assert!(!tracker.record("codex", "0.200.0", None).unwrap());
+        release.join().unwrap();
+
+        assert_eq!(
+            tracker.get_current("codex").unwrap().unwrap().version,
+            "0.200.0"
+        );
+        let history = tracker.history("codex", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "0.200.0");
+    }
+
+    #[test]
+    fn version_tracker_record_contention_timeout_commits_neither_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let tracker = VersionTracker::open(&state_path).unwrap();
+        tracker
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let blocker = Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+
+        let error = tracker.record("codex", "0.200.0", None).unwrap_err();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.contains("database is locked"), "{error}");
+        assert!(tracker.get_current("codex").unwrap().is_none());
+        assert!(tracker.history("codex", 10).unwrap().is_empty());
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn version_tracker_record_rolls_back_upsert_when_history_insert_fails() {
+        let tracker = VersionTracker::open(Path::new(":memory:")).unwrap();
+        tracker
+            .record("codex", "0.100.0", Some("/old/codex"))
+            .unwrap();
+        tracker
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_version_history
+                 BEFORE INSERT ON cli_version_history
+                 WHEN NEW.version = '0.200.0'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced history failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = tracker
+            .record("codex", "0.200.0", Some("/new/codex"))
+            .unwrap_err();
+
+        assert!(error.contains("forced history failure"), "{error}");
+        let current = tracker.get_current("codex").unwrap().unwrap();
+        assert_eq!(current.version, "0.100.0");
+        assert_eq!(current.path.as_deref(), Some("/old/codex"));
+        let history = tracker.history("codex", 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "0.100.0");
     }
 
     #[test]
