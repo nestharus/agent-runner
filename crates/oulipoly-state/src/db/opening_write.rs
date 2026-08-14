@@ -174,7 +174,7 @@ impl StateDb {
 
         let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
-        let completion_authority_db_path = Self::durable_completion_authority_path(&db_path);
+        let completion_authority_db_path = Self::durable_completion_authority_path(path, &db_path);
         let db = StateDb {
             conn,
             db_path,
@@ -305,11 +305,20 @@ impl StateDb {
             .unwrap_or_else(|_| path.to_path_buf())
     }
 
-    fn durable_completion_authority_path(path: &Path) -> Option<PathBuf> {
-        if Self::is_nonlocal_sqlite_path(path) {
+    fn durable_completion_authority_path(
+        source_path: &Path,
+        normalized_path: &Path,
+    ) -> Option<PathBuf> {
+        if !source_path.is_absolute()
+            || Self::is_nonlocal_sqlite_path(source_path)
+            || std::fs::symlink_metadata(source_path)
+                .ok()?
+                .file_type()
+                .is_symlink()
+        {
             return None;
         }
-        let canonical = std::fs::canonicalize(path).ok()?;
+        let canonical = std::fs::canonicalize(normalized_path).ok()?;
         Self::state_file_is_unaliased(&canonical).then_some(canonical)
     }
 

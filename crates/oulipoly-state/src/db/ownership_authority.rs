@@ -258,8 +258,7 @@ impl StateDb {
     {
         let completion_authority_state_path =
             self.completion_authority_state_path().ok_or_else(|| {
-                "Completion event registration requires a durable, unaliased local state database"
-                    .to_string()
+                "Completion event registration requires an absolute, non-symlink, single-link local state database".to_string()
             })?;
         validate_completion_event_registration(&registration)?;
         let owner_invocation_uuid = registration.owner_invocation_uuid.ok_or_else(|| {
@@ -790,7 +789,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "Completion event registration requires a durable, unaliased local state database"
+            "Completion event registration requires an absolute, non-symlink, single-link local state database"
         );
     }
 
@@ -819,7 +818,7 @@ mod tests {
 
             assert_eq!(
                 error,
-                "Completion event registration requires a durable, unaliased local state database"
+                "Completion event registration requires an absolute, non-symlink, single-link local state database"
             );
             assert!(
                 state
@@ -831,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn relative_state_open_retains_an_absolute_completion_authority_identity() {
+    fn completion_registration_rejects_a_relative_state_path() {
         let current_directory = std::env::current_dir().unwrap();
         let directory = tempfile::tempdir_in(&current_directory).unwrap();
         let relative_path = directory
@@ -840,23 +839,38 @@ mod tests {
             .unwrap()
             .join("state.db");
 
-        let state = StateDb::open(&relative_path).unwrap();
+        let mut state = StateDb::open(&relative_path).unwrap();
 
         assert_eq!(state.path(), std::fs::canonicalize(&relative_path).unwrap());
         assert!(state.path().is_absolute());
-        assert_eq!(state.completion_authority_state_path(), Some(state.path()));
+        let error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-relative-path-admission",
+                registration(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Completion event registration requires an absolute, non-symlink, single-link local state database"
+        );
+        assert!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn completion_authority_converges_across_state_file_symlink_aliases() {
+    fn completion_registration_rejects_a_state_file_symlink_alias() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
         let alias_path = directory.path().join("state-alias.db");
         let state = StateDb::open(&state_path).unwrap();
-        let invocation_row_id = state
+        state
             .start_invocation(&InvocationStart {
                 invocation_uuid: INVOCATION_UUID.to_string(),
                 model_name: "age299-s2".to_string(),
@@ -865,23 +879,33 @@ mod tests {
                 parent_invocation_id: None,
             })
             .unwrap();
+        drop(state);
         symlink(&state_path, &alias_path).unwrap();
 
         let mut alias_state = StateDb::open(&alias_path).unwrap();
-        assert_eq!(alias_state.path(), state.path());
-        alias_state
+        assert_eq!(
+            alias_state.path(),
+            std::fs::canonicalize(&state_path).unwrap()
+        );
+        let error = alias_state
             .register_completion_event_with_obligation(
                 "age299-s2-symlink-admission",
                 registration(),
             )
-            .unwrap();
-        drop(alias_state);
+            .unwrap_err();
 
-        assert!(MailboxDb::path_for_state_db(state.path()).exists());
+        assert_eq!(
+            error,
+            "Completion event registration requires an absolute, non-symlink, single-link local state database"
+        );
+        assert!(
+            alias_state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!MailboxDb::path_for_state_db(&state_path).exists());
         assert!(!MailboxDb::path_for_state_db(&alias_path).exists());
-        state
-            .finalize_invocation(invocation_row_id, true, 0, None, None)
-            .unwrap();
     }
 
     #[cfg(unix)]
@@ -911,7 +935,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "Completion event registration requires a durable, unaliased local state database"
+            "Completion event registration requires an absolute, non-symlink, single-link local state database"
         );
         assert!(
             state

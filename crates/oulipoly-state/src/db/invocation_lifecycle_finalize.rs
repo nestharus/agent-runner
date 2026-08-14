@@ -274,7 +274,7 @@ impl StateDb {
         } else {
             self.completion_authority_state_path().ok_or_else(|| {
                 format!(
-                    "process_integrity: invocation {} has admitted completion authority but the state database is not a durable, unaliased local file",
+                    "process_integrity: invocation {} has admitted completion authority but the state database no longer has an absolute, non-symlink, single-link local identity",
                     invocation.invocation_uuid
                 )
             })?

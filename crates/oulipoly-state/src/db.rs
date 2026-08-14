@@ -243,7 +243,7 @@ use uuid::Uuid;
 pub struct StateDb {
     conn: sqlite::Connection,
     db_path: PathBuf,
-    // Completion authority accepts one canonical single-link local file identity.
+    // Completion authority accepts one absolute, non-symlink, single-link local file identity.
     completion_authority_db_path: Option<PathBuf>,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
