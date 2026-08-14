@@ -281,7 +281,7 @@ impl StateDb {
         let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
         let existing_obligations =
-            all_completion_obligations_on(&tx).map_err(|error| error.to_string())?;
+            active_completion_obligations_on(&tx).map_err(|error| error.to_string())?;
         let mut mailbox = if existing_obligations.is_empty() {
             MailboxDb::open_with_authority(&sidecar_authority)?
         } else {
@@ -485,6 +485,7 @@ fn record_completion_obligation_on(
         .ok_or_else(|| persistence_message("completion obligation disappeared after insert"))
 }
 
+#[cfg(test)]
 fn all_completion_obligations_on(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<CompletionObligationExpectation>, OwnershipAuthorityError> {
@@ -503,6 +504,31 @@ fn all_completion_obligations_on(
         .map_err(persistence("query completion obligation authority"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(persistence("read completion obligation authority"))
+}
+
+fn active_completion_obligations_on(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<CompletionObligationExpectation>, OwnershipAuthorityError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT obligation.admission_id, obligation.invocation_uuid,
+                    obligation.event_id, obligation.owner_invocation_uuid,
+                    obligation.owner_session_id, obligation.expected_sidecar_generation,
+                    obligation.admitted_at
+             FROM invocation_completion_obligations AS obligation
+             JOIN invocations AS invocation
+               ON invocation.invocation_uuid = obligation.invocation_uuid
+             WHERE invocation.status = 'running'
+             ORDER BY obligation.admitted_at, obligation.admission_id",
+        )
+        .map_err(persistence(
+            "prepare active completion obligation authority query",
+        ))?;
+    let rows = statement
+        .query_map([], map_completion_obligation_row)
+        .map_err(persistence("query active completion obligation authority"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(persistence("read active completion obligation authority"))
 }
 
 fn validate_existing_completion_listeners(
@@ -1434,11 +1460,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_invocations_do_not_implicitly_retire_completion_authority() {
+    fn terminal_obligations_remain_recorded_without_gating_new_admission() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
         let sidecar_path = MailboxDb::path_for_state_db(&state_path);
-        let held_sidecar_path = directory.path().join("pid-identity.held");
         let mut state = StateDb::open(&state_path).unwrap();
         let mut invocation_ids = Vec::new();
         for invocation_uuid in [
@@ -1494,61 +1519,34 @@ mod tests {
                 Some("test_failure"),
             )
             .unwrap();
-        std::fs::rename(&sidecar_path, &held_sidecar_path).unwrap();
+        std::fs::remove_file(&sidecar_path).unwrap();
         let third_registration = registration_for(
             "age299-s2-post-terminal-event",
             "age299-s2-post-terminal-session",
             THIRD_INVOCATION_UUID,
         );
 
-        let missing_error = state
-            .register_completion_event_with_obligation(
-                "age299-s2-post-terminal-admission",
-                third_registration,
-            )
-            .unwrap_err();
-        assert!(
-            missing_error.contains("process_integrity"),
-            "{missing_error}"
-        );
-        assert!(!sidecar_path.exists());
-
-        let replacement_generation = MailboxDb::open(&sidecar_path)
-            .unwrap()
-            .sidecar_generation()
-            .unwrap();
-        assert_ne!(replacement_generation, retained_generation);
-        let replacement_error = state
-            .register_completion_event_with_obligation(
-                "age299-s2-post-terminal-admission",
-                third_registration,
-            )
-            .unwrap_err();
-        assert!(
-            replacement_error.contains(&retained_generation),
-            "{replacement_error}"
-        );
-        assert!(
-            state
-                .completion_obligations_for_invocation(THIRD_INVOCATION_UUID)
-                .unwrap()
-                .is_empty()
-        );
-
-        std::fs::remove_file(&sidecar_path).unwrap();
-        std::fs::rename(&held_sidecar_path, &sidecar_path).unwrap();
         state
             .register_completion_event_with_obligation(
                 "age299-s2-post-terminal-admission",
                 third_registration,
             )
             .unwrap();
+        let replacement_generation = MailboxDb::open(&sidecar_path)
+            .unwrap()
+            .sidecar_generation()
+            .unwrap();
+        assert_ne!(replacement_generation, retained_generation);
         let obligations = all_completion_obligations_on(state.raw_connection()).unwrap();
         assert_eq!(obligations.len(), 3);
         assert!(
-            obligations.iter().all(|obligation| {
+            obligations[..2].iter().all(|obligation| {
                 obligation.expected_sidecar_generation == retained_generation
             })
+        );
+        assert_eq!(
+            obligations[2].expected_sidecar_generation,
+            replacement_generation
         );
     }
 
