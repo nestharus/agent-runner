@@ -275,8 +275,36 @@ impl StateDb {
         require_running_owner(&tx, owner_invocation_uuid)?;
         let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
-        let mut mailbox = MailboxDb::open_with_authority(&sidecar_path, &sidecar_authority)?;
-        let sidecar_generation = mailbox.sidecar_generation()?;
+        let existing_obligations =
+            Self::completion_obligations_for_invocation_on(&tx, owner_invocation_uuid)
+                .map_err(|error| error.to_string())?;
+        let mut mailbox = if existing_obligations.is_empty() {
+            MailboxDb::open_with_authority(&sidecar_path, &sidecar_authority)?
+        } else {
+            MailboxDb::open_existing_for_completion_authority(&sidecar_path).map_err(|error| {
+                format!(
+                    "process_integrity: invocation {owner_invocation_uuid} has admitted completion authority but the sidecar is unavailable: {error}"
+                )
+            })?
+        };
+        let sidecar_generation = mailbox.sidecar_generation().map_err(|error| {
+            if existing_obligations.is_empty() {
+                error
+            } else {
+                format!(
+                    "process_integrity: invocation {owner_invocation_uuid} has invalid admitted completion authority: {error}"
+                )
+            }
+        })?;
+        if let Some(mismatch) = existing_obligations
+            .iter()
+            .find(|obligation| obligation.expected_sidecar_generation != sidecar_generation)
+        {
+            return Err(format!(
+                "process_integrity: invocation {owner_invocation_uuid} completion sidecar generation changed before admission {}: expected {}, observed {sidecar_generation}",
+                mismatch.admission_id, mismatch.expected_sidecar_generation
+            ));
+        }
         record_completion_obligation_on(
             &tx,
             CompletionObligationAdmission {
@@ -738,6 +766,77 @@ mod tests {
             .unwrap()
             .unwrap();
         finalizer.join().unwrap();
+    }
+
+    #[test]
+    fn completion_registration_rejects_a_second_generation_until_authority_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let held_sidecar_path = directory.path().join("pid-identity.held");
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .register_completion_event_with_obligation("age299-s2-first-admission", registration())
+            .unwrap();
+        let generation = MailboxDb::open(&sidecar_path)
+            .unwrap()
+            .sidecar_generation()
+            .unwrap();
+        std::fs::rename(&sidecar_path, &held_sidecar_path).unwrap();
+
+        let second_registration = CompletionEventRegistrationInput {
+            event_id: "age299-s2-second-event",
+            delivery_mode: "async",
+            owner_session_id: Some(SESSION_ID),
+            owner_invocation_uuid: Some(INVOCATION_UUID),
+            state_dir: "/tmp/age299-s2-second-state",
+            meta_path: "/tmp/age299-s2-second-meta",
+            log_path: "/tmp/age299-s2-second-log",
+            rc_path: "/tmp/age299-s2-second-rc",
+        };
+        let error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-second-admission",
+                second_registration,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("process_integrity"), "{error}");
+        assert!(error.contains(INVOCATION_UUID), "{error}");
+        assert!(!sidecar_path.exists());
+        assert_eq!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::fs::rename(&held_sidecar_path, &sidecar_path).unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-second-admission",
+                second_registration,
+            )
+            .unwrap();
+        let obligations = state
+            .completion_obligations_for_invocation(INVOCATION_UUID)
+            .unwrap();
+        assert_eq!(obligations.len(), 2);
+        assert!(
+            obligations
+                .iter()
+                .all(|obligation| obligation.expected_sidecar_generation == generation)
+        );
     }
 
     fn registration() -> CompletionEventRegistrationInput<'static> {
