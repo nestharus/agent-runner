@@ -917,6 +917,19 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_version_tracker_rejects_a_preexisting_hard_link_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let alias_path = directory.path().join("alternate.db");
+        drop(StateDb::open(&state_path).unwrap());
+        std::fs::hard_link(&state_path, &alias_path).unwrap();
+
+        let error = VersionTracker::open(&alias_path).err().unwrap();
+
+        assert!(error.contains("exactly one hard link"), "{error}");
+    }
+
+    #[test]
     fn base64_jwt_email_extraction() {
         // A minimal JWT payload: {"email":"test@example.com","sub":"123"}
         // base64url of that is: eyJlbWFpbCI6InRlc3RAZXhhbXBsZS5jb20iLCJzdWIiOiIxMjMifQ

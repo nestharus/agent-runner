@@ -180,6 +180,9 @@ impl StateDb {
             // Keep supported rebuild from replacing the inode behind this connection.
             Some(StateNamespaceGuard::acquire(&db_path, false)?)
         };
+        if !nonlocal {
+            Self::validate_state_namespace_file(&db_path)?;
+        }
         Self::open_with_prepared_namespace(
             path,
             db_path,
@@ -296,8 +299,10 @@ impl StateDb {
         }
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
+        let guard = StateNamespaceGuard::acquire(&db_path, true)?;
+        Self::validate_state_namespace_file(&db_path)?;
         Ok(StateDbRebuildAuthority {
-            _guard: StateNamespaceGuard::acquire(&db_path, true)?,
+            _guard: guard,
             db_path,
         })
     }
@@ -308,8 +313,10 @@ impl StateDb {
         }
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
+        let guard = StateNamespaceGuard::acquire(&db_path, false)?;
+        Self::validate_state_namespace_file(&db_path)?;
         Ok(StateDbWriterAuthority {
-            _guard: StateNamespaceGuard::acquire(&db_path, false)?,
+            _guard: guard,
             db_path,
         })
     }
@@ -412,6 +419,36 @@ impl StateDb {
 
     fn is_sqlite_uri_path(path: &Path) -> bool {
         path.as_os_str().as_encoded_bytes().starts_with(b"file:")
+    }
+
+    #[cfg(any(unix, windows))]
+    fn validate_state_namespace_file(path: &Path) -> Result<(), String> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "Failed to inspect state DB namespace file {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        if metadata.is_file() && state_file_has_one_link(&metadata) {
+            Ok(())
+        } else {
+            Err(format!(
+                "State DB namespace requires a regular file with exactly one hard link: {}",
+                path.display()
+            ))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn validate_state_namespace_file(path: &Path) -> Result<(), String> {
+        Err(format!(
+            "State DB namespace file identity is unsupported on this platform: {}",
+            path.display()
+        ))
     }
 
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
@@ -611,5 +648,27 @@ mod state_namespace_tests {
         assert!(error.contains("Timed out"), "{error}");
         drop(writer);
         drop(StateDb::acquire_rebuild_authority(&state_path).unwrap());
+    }
+
+    #[test]
+    fn preexisting_hard_links_are_rejected_by_every_state_namespace_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let alias_path = directory.path().join("alternate.db");
+        drop(StateDb::open(&state_path).unwrap());
+        std::fs::hard_link(&state_path, &alias_path).unwrap();
+
+        for error in [
+            StateDb::open(&state_path).err().unwrap(),
+            StateDb::open(&alias_path).err().unwrap(),
+            StateDb::acquire_writer_authority(&alias_path)
+                .err()
+                .unwrap(),
+            StateDb::acquire_rebuild_authority(&state_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(error.contains("exactly one hard link"), "{error}");
+        }
     }
 }
