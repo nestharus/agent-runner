@@ -6764,11 +6764,9 @@ fn ensure_mailbox_sidecar_identity(conn: &mut Connection) -> Result<(), String> 
 
 fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), String> {
     let count = conn
-        .query_row(
-            "SELECT COUNT(*) FROM mailbox_sidecar_identity WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
+        .query_row("SELECT COUNT(*) FROM mailbox_sidecar_identity", [], |row| {
+            row.get::<_, i64>(0)
+        })
         .map_err(|err| format!("Failed to validate PID mailbox sidecar identity: {err}"))?;
     if count == 0 {
         conn.execute(
@@ -6781,7 +6779,9 @@ fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), Strin
         return Ok(());
     }
     if count != 1 {
-        return Err("PID mailbox sidecar identity is missing".to_string());
+        return Err(format!(
+            "PID mailbox sidecar identity is not a singleton: {count} rows"
+        ));
     }
     Ok(())
 }
