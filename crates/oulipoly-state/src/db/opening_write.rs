@@ -166,14 +166,19 @@ impl StateDb {
         sink: Box<dyn LifecycleEventSink + Send>,
         provider_names: &LegacyProviderNames,
     ) -> Result<Self, String> {
-        Self::ensure_state_parent_dir(path)?;
-        let mut conn = Self::open_state_connection(path)?;
+        if !Self::is_nonlocal_sqlite_path(path) {
+            Self::ensure_state_parent_dir(path)?;
+        }
+        let db_path = Self::normalized_state_open_path(path);
+        let mut conn = Self::open_state_connection(&db_path)?;
 
-        let ran_open_migrations = Self::run_open_migrations(path, &mut conn)?;
+        let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
+        let completion_authority_db_path = Self::durable_completion_authority_path(&db_path);
         let db = StateDb {
             conn,
-            db_path: path.to_path_buf(),
+            db_path,
+            completion_authority_db_path,
             lifecycle_sink: Mutex::new(sink),
             _read_only_snapshot: None,
         };
@@ -241,6 +246,7 @@ impl StateDb {
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
+            completion_authority_db_path: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
             _read_only_snapshot: Some(snapshot),
         })
@@ -271,6 +277,53 @@ impl StateDb {
         &self.db_path
     }
 
+    pub(super) fn completion_authority_state_path(&self) -> Option<&Path> {
+        let path = self.completion_authority_db_path.as_deref()?;
+        let canonical = std::fs::canonicalize(path).ok()?;
+        if canonical != path || !Self::state_file_is_unaliased(&canonical) {
+            return None;
+        }
+        Some(path)
+    }
+
+    fn normalized_state_open_path(path: &Path) -> PathBuf {
+        if Self::is_nonlocal_sqlite_path(path) {
+            return path.to_path_buf();
+        }
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return canonical;
+        }
+        let Some(file_name) = path.file_name() else {
+            return path.to_path_buf();
+        };
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::canonicalize(parent)
+            .map(|parent| parent.join(file_name))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn durable_completion_authority_path(path: &Path) -> Option<PathBuf> {
+        if Self::is_nonlocal_sqlite_path(path) {
+            return None;
+        }
+        let canonical = std::fs::canonicalize(path).ok()?;
+        Self::state_file_is_unaliased(&canonical).then_some(canonical)
+    }
+
+    fn is_nonlocal_sqlite_path(path: &Path) -> bool {
+        path == Path::new(":memory:") || path.as_os_str().as_encoded_bytes().starts_with(b"file:")
+    }
+
+    fn state_file_is_unaliased(path: &Path) -> bool {
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        metadata.is_file() && state_file_has_one_link(&metadata)
+    }
+
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             Self::create_state_parent_dir(parent)?;
@@ -295,4 +348,23 @@ impl StateDb {
         Self::dispatch_open_migration_plan(path, conn, compatibility)?;
         Ok(ran_open_migrations)
     }
+}
+
+#[cfg(unix)]
+fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.nlink() == 1
+}
+
+#[cfg(windows)]
+fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.number_of_links() == Some(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn state_file_has_one_link(_metadata: &std::fs::Metadata) -> bool {
+    false
 }

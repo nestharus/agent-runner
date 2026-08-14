@@ -256,11 +256,11 @@ impl StateDb {
         BeforeCommit: FnOnce(),
         AfterCommit: FnOnce(),
     {
-        if self.db_path == std::path::Path::new(":memory:") {
-            return Err(
-                "Completion event registration requires a durable state database".to_string(),
-            );
-        }
+        let completion_authority_state_path =
+            self.completion_authority_state_path().ok_or_else(|| {
+                "Completion event registration requires a durable, unaliased local state database"
+                    .to_string()
+            })?;
         validate_completion_event_registration(&registration)?;
         let owner_invocation_uuid = registration.owner_invocation_uuid.ok_or_else(|| {
             "Completion event owner session and invocation are both required".to_string()
@@ -270,7 +270,7 @@ impl StateDb {
         })?;
         validate_nonempty(admission_id, "admission_id").map_err(|error| error.to_string())?;
         let admission_id = completion_registration_admission_id(admission_id, &registration);
-        let sidecar_path = MailboxDb::path_for_state_db(&self.db_path);
+        let sidecar_path = MailboxDb::path_for_state_db(completion_authority_state_path);
         let tx = self
             .conn
             .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
@@ -772,6 +772,7 @@ mod tests {
     use crate::mailbox::CompletionEventTriggerInput;
     use std::sync::mpsc;
     use std::time::Duration;
+    use uuid::Uuid;
 
     const INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
     const SECOND_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
@@ -789,8 +790,137 @@ mod tests {
 
         assert_eq!(
             error,
-            "Completion event registration requires a durable state database"
+            "Completion event registration requires a durable, unaliased local state database"
         );
+    }
+
+    #[test]
+    fn completion_registration_rejects_sqlite_uri_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let uris = [
+            format!(
+                "file:age299-s2-memory-{}?mode=memory&cache=shared",
+                Uuid::new_v4()
+            ),
+            format!(
+                "file:{}?mode=rwc",
+                directory.path().join("uri-state.db").display()
+            ),
+        ];
+
+        for (index, uri) in uris.iter().enumerate() {
+            let mut state = StateDb::open(std::path::Path::new(uri)).unwrap();
+            let error = state
+                .register_completion_event_with_obligation(
+                    &format!("age299-s2-uri-admission-{index}"),
+                    registration(),
+                )
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                "Completion event registration requires a durable, unaliased local state database"
+            );
+            assert!(
+                state
+                    .completion_obligations_for_invocation(INVOCATION_UUID)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn relative_state_open_retains_an_absolute_completion_authority_identity() {
+        let current_directory = std::env::current_dir().unwrap();
+        let directory = tempfile::tempdir_in(&current_directory).unwrap();
+        let relative_path = directory
+            .path()
+            .strip_prefix(&current_directory)
+            .unwrap()
+            .join("state.db");
+
+        let state = StateDb::open(&relative_path).unwrap();
+
+        assert_eq!(state.path(), std::fs::canonicalize(&relative_path).unwrap());
+        assert!(state.path().is_absolute());
+        assert_eq!(state.completion_authority_state_path(), Some(state.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_authority_converges_across_state_file_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let alias_path = directory.path().join("state-alias.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        symlink(&state_path, &alias_path).unwrap();
+
+        let mut alias_state = StateDb::open(&alias_path).unwrap();
+        assert_eq!(alias_state.path(), state.path());
+        alias_state
+            .register_completion_event_with_obligation(
+                "age299-s2-symlink-admission",
+                registration(),
+            )
+            .unwrap();
+        drop(alias_state);
+
+        assert!(MailboxDb::path_for_state_db(state.path()).exists());
+        assert!(!MailboxDb::path_for_state_db(&alias_path).exists());
+        state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_registration_rejects_a_hard_linked_state_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let alias_path = directory.path().join("state-hard-link.db");
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        std::fs::hard_link(&state_path, &alias_path).unwrap();
+
+        let error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-hard-link-admission",
+                registration(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Completion event registration requires a durable, unaliased local state database"
+        );
+        assert!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!MailboxDb::path_for_state_db(&state_path).exists());
+        assert!(!MailboxDb::path_for_state_db(&alias_path).exists());
     }
 
     #[test]

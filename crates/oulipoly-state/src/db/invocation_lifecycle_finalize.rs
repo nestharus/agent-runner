@@ -269,7 +269,18 @@ impl StateDb {
                 Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
             })?
             .unwrap_or_default();
-        let sidecar_path = crate::mailbox::MailboxDb::path_for_state_db(&self.db_path);
+        let completion_authority_state_path = if obligations.is_empty() {
+            self.db_path.as_path()
+        } else {
+            self.completion_authority_state_path().ok_or_else(|| {
+                format!(
+                    "process_integrity: invocation {} has admitted completion authority but the state database is not a durable, unaliased local file",
+                    invocation.invocation_uuid
+                )
+            })?
+        };
+        let sidecar_path =
+            crate::mailbox::MailboxDb::path_for_state_db(completion_authority_state_path);
         let _sidecar_authority = (!obligations.is_empty())
             .then(|| {
                 crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
