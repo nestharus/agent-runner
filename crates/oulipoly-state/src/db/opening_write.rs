@@ -356,6 +356,7 @@ impl StateDb {
         }
         Self::validate_local_state_path(path)?;
         Self::validate_local_state_path(&Self::normalized_state_open_path(path))?;
+        Self::reject_dangling_rebuild_ancestor_symlink(path)?;
         Self::reject_rebuild_leaf_symlink(path)
     }
 
@@ -468,6 +469,30 @@ impl StateDb {
         }
     }
 
+    fn reject_dangling_rebuild_ancestor_symlink(path: &Path) -> Result<(), String> {
+        for ancestor in path.ancestors().skip(1) {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    std::fs::canonicalize(ancestor).map_err(|error| {
+                        format!(
+                            "State DB rebuild does not accept a dangling ancestor symlink {}: {error}",
+                            ancestor.display()
+                        )
+                    })?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to inspect state DB rebuild ancestor {}: {error}",
+                        ancestor.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_rebuild_source(path: &Path, authority_path: &Path) -> Result<(), String> {
         Self::reject_rebuild_leaf_symlink(path)?;
         if Self::normalized_state_open_path(path) != authority_path {
@@ -479,36 +504,56 @@ impl StateDb {
         Self::validate_state_namespace_file(authority_path)
     }
 
-    #[cfg(any(unix, windows))]
     fn validate_state_namespace_file(path: &Path) -> Result<(), String> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(format!(
-                    "Failed to inspect state DB namespace file {}: {error}",
-                    path.display()
-                ));
-            }
-        };
-        if metadata.is_file() && state_file_has_one_link(&metadata) {
-            Ok(())
-        } else {
-            Err(format!(
-                "State DB namespace requires a regular file with exactly one hard link: {}",
-                path.display()
-            ))
+        inspect_state_storage_file(path, "namespace file")?;
+        for artifact in state_sqlite_artifact_paths(path) {
+            inspect_state_storage_file(&artifact, "SQLite artifact")?;
         }
+        Ok(())
     }
+}
 
-    #[cfg(not(any(unix, windows)))]
-    fn validate_state_namespace_file(path: &Path) -> Result<(), String> {
-        Err(format!(
-            "State DB namespace file identity is unsupported on this platform: {}",
+#[cfg(any(unix, windows))]
+fn inspect_state_storage_file(
+    path: &Path,
+    role: &str,
+) -> Result<Option<StateFileIdentity>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect State DB {role} {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+        return Err(format!(
+            "State DB {role} requires a regular file with exactly one hard link: {}",
+            path.display(),
+        ));
+    }
+    state_file_identity(&metadata).map(Some).ok_or_else(|| {
+        format!(
+            "State DB {role} file identity is unavailable: {}",
             path.display()
-        ))
-    }
+        )
+    })
+}
 
+#[cfg(not(any(unix, windows)))]
+fn inspect_state_storage_file(
+    path: &Path,
+    role: &str,
+) -> Result<Option<StateFileIdentity>, String> {
+    Err(format!(
+        "State DB {role} file identity is unsupported on this platform: {}",
+        path.display()
+    ))
+}
+
+impl StateDb {
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             Self::create_state_parent_dir(parent)?;
@@ -588,6 +633,8 @@ impl StateNamespaceGuard {
         const ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
         let authority_path = state_namespace_authority_path(state_path)?;
+        let initial_identity =
+            inspect_state_storage_file(&authority_path, "namespace authority fence")?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -600,6 +647,17 @@ impl StateNamespaceGuard {
                     authority_path.display()
                 )
             })?;
+        let opened_identity = opened_state_storage_file_identity(
+            &file,
+            &authority_path,
+            "namespace authority fence",
+        )?;
+        if initial_identity.is_some_and(|identity| identity != opened_identity) {
+            return Err(format!(
+                "State DB namespace authority fence changed during open: {}",
+                authority_path.display()
+            ));
+        }
         let deadline = std::time::Instant::now() + ACQUISITION_TIMEOUT;
         loop {
             let result = if exclusive {
@@ -608,7 +666,23 @@ impl StateNamespaceGuard {
                 <std::fs::File as fs4::FileExt>::try_lock_shared(&file)
             };
             match result {
-                Ok(()) => return Ok(Self { file }),
+                Ok(()) => {
+                    let retained_identity =
+                        inspect_state_storage_file(&authority_path, "namespace authority fence")?
+                            .ok_or_else(|| {
+                            format!(
+                                "State DB namespace authority fence is missing after lock: {}",
+                                authority_path.display()
+                            )
+                        })?;
+                    if retained_identity != opened_identity {
+                        return Err(format!(
+                            "State DB namespace authority fence changed during lock acquisition: {}",
+                            authority_path.display()
+                        ));
+                    }
+                    return Ok(Self { file });
+                }
                 Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(RETRY_INTERVAL);
                 }
@@ -629,6 +703,31 @@ impl StateNamespaceGuard {
     }
 }
 
+fn opened_state_storage_file_identity(
+    file: &std::fs::File,
+    path: &Path,
+    role: &str,
+) -> Result<StateFileIdentity, String> {
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "Failed to inspect opened State DB {role} {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+        return Err(format!(
+            "State DB {role} requires a regular file with exactly one hard link: {}",
+            path.display()
+        ));
+    }
+    state_file_identity(&metadata).ok_or_else(|| {
+        format!(
+            "State DB {role} file identity is unavailable: {}",
+            path.display()
+        )
+    })
+}
+
 impl Drop for StateNamespaceGuard {
     fn drop(&mut self) {
         let _ = <std::fs::File as fs4::FileExt>::unlock(&self.file);
@@ -642,6 +741,20 @@ fn state_namespace_authority_path(state_path: &Path) -> Result<PathBuf, String> 
     let mut authority_name = file_name.to_os_string();
     authority_name.push(".namespace.lock");
     Ok(state_path.with_file_name(authority_name))
+}
+
+fn state_sqlite_artifact_paths(state_path: &Path) -> [PathBuf; 3] {
+    [
+        state_path_with_suffix(state_path, "-journal"),
+        state_path_with_suffix(state_path, "-wal"),
+        state_path_with_suffix(state_path, "-shm"),
+    ]
+}
+
+fn state_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn reserved_state_storage_name(file_name: &str) -> bool {
@@ -749,6 +862,69 @@ mod state_namespace_tests {
 
     #[cfg(unix)]
     #[test]
+    fn state_writers_reject_aliased_namespace_fences_and_sqlite_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let other_state_path = directory.path().join("other.db");
+        drop(StateDb::open(&state_path).unwrap());
+        drop(StateDb::open(&other_state_path).unwrap());
+        let state_before = std::fs::read(&state_path).unwrap();
+        let other_before = std::fs::read(&other_state_path).unwrap();
+
+        let authority_path = state_namespace_authority_path(&state_path).unwrap();
+        std::fs::remove_file(&authority_path).unwrap();
+        symlink(&other_state_path, &authority_path).unwrap();
+        for error in [
+            StateDb::open(&state_path).err().unwrap(),
+            StateDb::acquire_writer_authority(&state_path)
+                .err()
+                .unwrap(),
+            StateDb::acquire_rebuild_authority(&state_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(
+                error.contains("namespace authority fence")
+                    && error.contains("exactly one hard link"),
+                "{error}"
+            );
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(std::fs::read(&other_state_path).unwrap(), other_before);
+
+        std::fs::remove_file(&authority_path).unwrap();
+        drop(StateDb::open(&state_path).unwrap());
+        let state_before_artifacts = std::fs::read(&state_path).unwrap();
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let artifact = state_path_with_suffix(&state_path, suffix);
+            if artifact.exists() {
+                std::fs::remove_file(&artifact).unwrap();
+            }
+            std::fs::hard_link(&other_state_path, &artifact).unwrap();
+            for error in [
+                StateDb::open(&state_path).err().unwrap(),
+                StateDb::acquire_writer_authority(&state_path)
+                    .err()
+                    .unwrap(),
+                StateDb::acquire_rebuild_authority(&state_path)
+                    .err()
+                    .unwrap(),
+            ] {
+                assert!(
+                    error.contains("SQLite artifact") && error.contains("exactly one hard link"),
+                    "{error}"
+                );
+            }
+            std::fs::remove_file(artifact).unwrap();
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before_artifacts);
+        assert_eq!(std::fs::read(&other_state_path).unwrap(), other_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rebuild_rejects_a_leaf_symlink_without_mutating_it_or_its_target() {
         use std::os::unix::fs::symlink;
 
@@ -815,6 +991,28 @@ mod state_namespace_tests {
         let error = StateDb::validate_rebuild_source(&state_path, &authority_path).unwrap_err();
 
         assert!(error.contains("source changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_path_rejects_a_dangling_ancestor_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_parent = directory.path().join("missing-parent");
+        let alias_parent = directory.path().join("data");
+        symlink(&missing_parent, &alias_parent).unwrap();
+        let state_path = alias_parent.join("state.db");
+
+        let error = StateDb::validate_rebuild_path(&state_path).unwrap_err();
+
+        assert!(error.contains("dangling ancestor symlink"), "{error}");
+        assert!(!missing_parent.exists());
+        assert!(
+            !state_namespace_authority_path(&state_path)
+                .unwrap()
+                .exists()
+        );
     }
 
     #[cfg(unix)]

@@ -895,13 +895,26 @@ impl MailboxAuthorityFence {
                 source,
             }
         })?;
-        let target_identity = inspect_mailbox_namespace_file(&sidecar_path).map_err(|source| {
+        let target_identity = inspect_mailbox_storage_file(&sidecar_path).map_err(|source| {
+            MailboxAuthorityFenceError::Open {
+                path: sidecar_path.clone(),
+                source,
+            }
+        })?;
+        validate_mailbox_sqlite_artifacts(&sidecar_path).map_err(|source| {
             MailboxAuthorityFenceError::Open {
                 path: sidecar_path.clone(),
                 source,
             }
         })?;
         let authority_path = mailbox_authority_path(&sidecar_path);
+        let initial_authority_identity =
+            inspect_mailbox_storage_file(&authority_path).map_err(|source| {
+                MailboxAuthorityFenceError::Open {
+                    path: authority_path.clone(),
+                    source,
+                }
+            })?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -912,10 +925,46 @@ impl MailboxAuthorityFence {
                 path: authority_path.clone(),
                 source,
             })?;
+        let opened_authority_identity = opened_mailbox_file_identity(&file, &authority_path)
+            .map_err(|source| MailboxAuthorityFenceError::Open {
+                path: authority_path.clone(),
+                source,
+            })?;
+        if initial_authority_identity.is_some_and(|identity| identity != opened_authority_identity)
+        {
+            return Err(MailboxAuthorityFenceError::Open {
+                path: authority_path,
+                source: std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "PID mailbox authority fence changed during open",
+                ),
+            });
+        }
         let deadline = Instant::now() + ACQUISITION_TIMEOUT;
         loop {
             match <std::fs::File as fs4::FileExt>::try_lock(&file) {
                 Ok(()) => {
+                    let retained_authority_identity = inspect_mailbox_storage_file(&authority_path)
+                        .map_err(|source| MailboxAuthorityFenceError::Open {
+                            path: authority_path.clone(),
+                            source,
+                        })?
+                        .ok_or_else(|| MailboxAuthorityFenceError::Open {
+                            path: authority_path.clone(),
+                            source: std::io::Error::new(
+                                ErrorKind::NotFound,
+                                "PID mailbox authority fence is missing after lock",
+                            ),
+                        })?;
+                    if retained_authority_identity != opened_authority_identity {
+                        return Err(MailboxAuthorityFenceError::Open {
+                            path: authority_path,
+                            source: std::io::Error::new(
+                                ErrorKind::InvalidInput,
+                                "PID mailbox authority fence changed during lock acquisition",
+                            ),
+                        });
+                    }
                     validate_mailbox_source(path, &sidecar_path, target_identity).map_err(
                         |source| MailboxAuthorityFenceError::Open {
                             path: sidecar_path.clone(),
@@ -947,7 +996,7 @@ impl MailboxAuthorityFence {
     }
 
     pub(crate) fn validate_opened_target(&self) -> Result<(), String> {
-        let observed = inspect_mailbox_namespace_file(&self.sidecar_path)
+        let observed = inspect_mailbox_storage_file(&self.sidecar_path)
             .map_err(|error| format!("Failed to validate PID mailbox sidecar target: {error}"))?
             .ok_or_else(|| "PID mailbox sidecar target is missing after open".to_string())?;
         if self
@@ -956,6 +1005,8 @@ impl MailboxAuthorityFence {
         {
             return Err("PID mailbox sidecar target changed during open".to_string());
         }
+        validate_mailbox_sqlite_artifacts(&self.sidecar_path)
+            .map_err(|error| format!("Failed to validate PID mailbox SQLite artifacts: {error}"))?;
         Ok(())
     }
 }
@@ -6944,17 +6995,18 @@ fn validate_mailbox_source(
             "PID mailbox sidecar source changed during authority acquisition",
         ));
     }
-    if inspect_mailbox_namespace_file(retained_path)? != expected_identity {
+    if inspect_mailbox_storage_file(retained_path)? != expected_identity {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "PID mailbox sidecar target changed during authority acquisition",
         ));
     }
+    validate_mailbox_sqlite_artifacts(retained_path)?;
     Ok(())
 }
 
 #[cfg(any(unix, windows))]
-fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
+fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -6964,7 +7016,7 @@ fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<Mailbox
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "PID mailbox sidecar requires a regular file with exactly one hard link: {}",
+                "PID mailbox storage requires a regular file with exactly one hard link: {}",
                 path.display()
             ),
         ));
@@ -6973,7 +7025,7 @@ fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<Mailbox
 }
 
 #[cfg(not(any(unix, windows)))]
-fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
+fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
     Err(std::io::Error::new(
         ErrorKind::Unsupported,
         format!(
@@ -6981,6 +7033,44 @@ fn inspect_mailbox_namespace_file(path: &Path) -> std::io::Result<Option<Mailbox
             path.display()
         ),
     ))
+}
+
+fn validate_mailbox_sqlite_artifacts(sidecar_path: &Path) -> std::io::Result<()> {
+    for artifact in mailbox_sqlite_artifact_paths(sidecar_path) {
+        inspect_mailbox_storage_file(&artifact)?;
+    }
+    Ok(())
+}
+
+fn mailbox_sqlite_artifact_paths(sidecar_path: &Path) -> [PathBuf; 3] {
+    [
+        path_with_storage_suffix(sidecar_path, "-journal"),
+        path_with_storage_suffix(sidecar_path, "-wal"),
+        path_with_storage_suffix(sidecar_path, "-shm"),
+    ]
+}
+
+fn path_with_storage_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn opened_mailbox_file_identity(
+    file: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<MailboxFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "PID mailbox storage requires a regular file with exactly one hard link: {}",
+                path.display()
+            ),
+        ));
+    }
+    mailbox_file_identity(&metadata)
 }
 
 #[cfg(unix)]
@@ -7461,6 +7551,52 @@ mod tests {
             }
         }
         drop(state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_writers_reject_aliased_authority_fences_and_sqlite_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let state_before = fs::read(&state_path).unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let authority_path = path_with_suffix(&sidecar_path, ".authority.lock");
+
+        fs::remove_file(&authority_path).unwrap();
+        symlink(&state_path, &authority_path).unwrap();
+        for error in [
+            MailboxDb::open(&sidecar_path).err().unwrap(),
+            crate::pid_identity::PidIdentityDb::open(&sidecar_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(error.contains("exactly one hard link"), "{error}");
+        }
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+        fs::remove_file(&authority_path).unwrap();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let artifact = path_with_suffix(&sidecar_path, suffix);
+            if artifact.exists() {
+                fs::remove_file(&artifact).unwrap();
+            }
+            fs::hard_link(&state_path, &artifact).unwrap();
+            for error in [
+                MailboxDb::open(&sidecar_path).err().unwrap(),
+                crate::pid_identity::PidIdentityDb::open(&sidecar_path)
+                    .err()
+                    .unwrap(),
+            ] {
+                assert!(error.contains("exactly one hard link"), "{error}");
+            }
+            fs::remove_file(artifact).unwrap();
+        }
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
     }
 
     #[cfg(unix)]

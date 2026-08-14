@@ -409,6 +409,29 @@ fn rebuild_rejects_a_dangling_leaf_symlink_before_no_work_or_backup() {
 }
 
 #[test]
+fn rebuild_rejects_a_dangling_ancestor_symlink_before_no_work_or_backup() {
+    let fixture = CliFixture::new();
+    let missing_data_dir = fixture._dir.path().join("missing-data");
+    let data_alias = fixture._dir.path().join("data-alias");
+    symlink(&missing_data_dir, &data_alias).unwrap();
+
+    let output = fixture.run_rebuild_in(&data_alias);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("dangling ancestor symlink"), "{stderr}");
+    assert!(!stdout.contains("no state.db"), "{stdout}");
+    assert!(!missing_data_dir.exists());
+    assert!(
+        fs::symlink_metadata(&data_alias)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn rebuild_rejects_a_non_utf8_default_before_planning_or_reporting() {
     let fixture = CliFixture::new();
     let data_dir = fixture
