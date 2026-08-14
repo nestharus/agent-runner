@@ -1096,6 +1096,10 @@ impl MailboxDb {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
+        conn.pragma_update(None, "foreign_keys", true)
+            .map_err(|err| {
+                format!("Failed to enable PID mailbox sidecar authority foreign keys: {err}")
+            })?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
@@ -7490,6 +7494,30 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::StateDb;
+
+    #[test]
+    fn completion_authority_connection_enforces_foreign_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let db = MailboxDb::open_existing_for_completion_authority(&authority).unwrap();
+
+        let error = db
+            .connection()
+            .execute(
+                "INSERT INTO completion_event_listener (
+                    event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
+                 ) VALUES ('missing-event', 'listener', 'session', 'invocation', 0, 'now')",
+                [],
+            )
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn sidecar_writers_reject_a_state_database_storage_role() {
