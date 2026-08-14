@@ -94,6 +94,8 @@ impl VersionTracker {
             .unwrap_or(db_path);
         let conn = Connection::open(connection_path)
             .map_err(|e| format!("Failed to open version DB: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("Failed to configure version DB busy timeout: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
