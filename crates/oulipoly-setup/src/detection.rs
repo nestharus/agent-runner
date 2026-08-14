@@ -836,6 +836,8 @@ pub fn summarize(report: &DetectionReport) -> Vec<super::actions::CliSummaryItem
 mod tests {
     use super::*;
 
+    const FIXTURE_CLI: &str = "fixture-cli";
+
     #[test]
     fn detect_os_info() {
         let info = detect_os();
@@ -907,14 +909,14 @@ mod tests {
             blocker.execute_batch("COMMIT").unwrap();
         });
 
-        assert!(!tracker.record("codex", "0.200.0", None).unwrap());
+        assert!(!tracker.record(FIXTURE_CLI, "0.200.0", None).unwrap());
         release.join().unwrap();
 
         assert_eq!(
-            tracker.get_current("codex").unwrap().unwrap().version,
+            tracker.get_current(FIXTURE_CLI).unwrap().unwrap().version,
             "0.200.0"
         );
-        let history = tracker.history("codex", 10).unwrap();
+        let history = tracker.history(FIXTURE_CLI, 10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, "0.200.0");
     }
@@ -932,12 +934,12 @@ mod tests {
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         let started = std::time::Instant::now();
 
-        let error = tracker.record("codex", "0.200.0", None).unwrap_err();
+        let error = tracker.record(FIXTURE_CLI, "0.200.0", None).unwrap_err();
 
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         assert!(error.contains("database is locked"), "{error}");
-        assert!(tracker.get_current("codex").unwrap().is_none());
-        assert!(tracker.history("codex", 10).unwrap().is_empty());
+        assert!(tracker.get_current(FIXTURE_CLI).unwrap().is_none());
+        assert!(tracker.history(FIXTURE_CLI, 10).unwrap().is_empty());
         blocker.execute_batch("ROLLBACK").unwrap();
     }
 
@@ -945,7 +947,7 @@ mod tests {
     fn version_tracker_record_rolls_back_upsert_when_history_insert_fails() {
         let tracker = VersionTracker::open(Path::new(":memory:")).unwrap();
         tracker
-            .record("codex", "0.100.0", Some("/old/codex"))
+            .record(FIXTURE_CLI, "0.100.0", Some("/old/fixture-cli"))
             .unwrap();
         tracker
             .conn
@@ -960,14 +962,14 @@ mod tests {
             .unwrap();
 
         let error = tracker
-            .record("codex", "0.200.0", Some("/new/codex"))
+            .record(FIXTURE_CLI, "0.200.0", Some("/new/fixture-cli"))
             .unwrap_err();
 
         assert!(error.contains("forced history failure"), "{error}");
-        let current = tracker.get_current("codex").unwrap().unwrap();
+        let current = tracker.get_current(FIXTURE_CLI).unwrap().unwrap();
         assert_eq!(current.version, "0.100.0");
-        assert_eq!(current.path.as_deref(), Some("/old/codex"));
-        let history = tracker.history("codex", 10).unwrap();
+        assert_eq!(current.path.as_deref(), Some("/old/fixture-cli"));
+        let history = tracker.history(FIXTURE_CLI, 10).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].version, "0.100.0");
     }
