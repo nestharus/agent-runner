@@ -244,9 +244,20 @@ pub struct StateDb {
     conn: sqlite::Connection,
     db_path: PathBuf,
     // Completion authority accepts one absolute, non-symlink, single-link local file identity.
-    completion_authority_db_path: Option<PathBuf>,
+    completion_authority_state: Option<CompletionAuthorityStateIdentity>,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+}
+
+struct CompletionAuthorityStateIdentity {
+    path: PathBuf,
+    file: StateFileIdentity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StateFileIdentity {
+    volume: u64,
+    file: u64,
 }
 
 #[derive(Debug, Clone)]

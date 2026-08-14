@@ -1,4 +1,5 @@
 use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
+use oulipoly_state::migrations;
 use oulipoly_state::{CompletionObligationAdmission, InvocationStart, StateDb};
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const EVENT_ID: &str = "ab_age299_s2_event";
@@ -88,16 +89,17 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
 
     let missing_uuid = "55555555-5555-4555-8555-555555555555";
     let missing_row_id = start_invocation(&state, missing_uuid);
-    state
-        .record_completion_obligation(obligation(
+    insert_completion_obligation(
+        &state,
+        obligation(
             "admission-missing-sidecar",
             missing_uuid,
             "event-missing-sidecar",
             missing_uuid,
             "session-missing-sidecar",
             &matching_generation,
-        ))
-        .unwrap();
+        ),
+    );
     drop(state);
     std::fs::remove_file(&sidecar_path).unwrap();
 
@@ -178,16 +180,17 @@ fn admitted_completion_authority_refuses_an_absent_event_in_the_matching_sidecar
         .unwrap()
         .sidecar_generation()
         .unwrap();
-    state
-        .record_completion_obligation(obligation(
+    insert_completion_obligation(
+        &state,
+        obligation(
             ADMISSION_ID,
             ROOT_UUID,
             EVENT_ID,
             ROOT_UUID,
             OWNER_SESSION_ID,
             &sidecar_generation,
-        ))
-        .unwrap();
+        ),
+    );
 
     let error = state
         .finalize_invocation(invocation_row_id, true, 0, None, None)
@@ -272,6 +275,31 @@ fn obligation<'a>(
         owner_session_id,
         expected_sidecar_generation,
     }
+}
+
+fn insert_completion_obligation(state: &StateDb, input: CompletionObligationAdmission<'_>) {
+    let mut connection = rusqlite::Connection::open(state.path()).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    migrations::run_with_db_path(&mut connection, &[], state.path().to_path_buf()).unwrap();
+    connection
+        .execute(
+            "INSERT INTO invocation_completion_obligations (
+                admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                owner_session_id, expected_sidecar_generation, admitted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                input.admission_id,
+                input.invocation_uuid,
+                input.event_id,
+                input.owner_invocation_uuid,
+                input.owner_session_id,
+                input.expected_sidecar_generation,
+                "2026-08-13T00:00:00Z",
+            ],
+        )
+        .unwrap();
 }
 
 fn completion_registration<'a>(

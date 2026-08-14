@@ -59,6 +59,75 @@ type RawCompletionObligationRow = (
     Vec<u8>,
 );
 
+trait CompletionObligationFixtureWrite {
+    fn record_completion_obligation(
+        &self,
+        input: CompletionObligationAdmission<'_>,
+    ) -> Result<CompletionObligationAdmissionResult, String>;
+}
+
+impl CompletionObligationFixtureWrite for StateDb {
+    fn record_completion_obligation(
+        &self,
+        input: CompletionObligationAdmission<'_>,
+    ) -> Result<CompletionObligationAdmissionResult, String> {
+        for (value, field) in [
+            (input.admission_id, "admission_id"),
+            (input.invocation_uuid, "invocation_uuid"),
+            (input.event_id, "event_id"),
+            (input.owner_invocation_uuid, "owner_invocation_uuid"),
+            (input.owner_session_id, "owner_session_id"),
+            (
+                input.expected_sidecar_generation,
+                "expected_sidecar_generation",
+            ),
+        ] {
+            if value.is_empty() || value.trim() != value {
+                return Err(format!("invalid ownership identity: {field}"));
+            }
+        }
+        if let CompletionObligationAuthority::Admitted(existing) = self
+            .completion_obligation_authority(input.admission_id)
+            .map_err(|error| error.to_string())?
+        {
+            if existing.invocation_uuid == input.invocation_uuid
+                && existing.event_id == input.event_id
+                && existing.owner_invocation_uuid == input.owner_invocation_uuid
+                && existing.owner_session_id == input.owner_session_id
+                && existing.expected_sidecar_generation == input.expected_sidecar_generation
+            {
+                return Ok(CompletionObligationAdmissionResult::Replay(existing));
+            }
+            return Err(format!(
+                "completion obligation {} conflicts with immutable admission",
+                input.admission_id
+            ));
+        }
+        direct_insert_completion_obligation(self, input, "2026-08-13T00:00:00Z").map_err(
+            |error| {
+                let message = error.to_string();
+                if message.contains("completion obligation immutable identity conflict")
+                    || message.contains("completion event sidecar generation conflict")
+                {
+                    format!(
+                        "completion obligation {} conflicts with immutable admission",
+                        input.admission_id
+                    )
+                } else {
+                    message
+                }
+            },
+        )?;
+        let CompletionObligationAuthority::Admitted(recorded) = self
+            .completion_obligation_authority(input.admission_id)
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("fixture obligation disappeared after insert".to_string());
+        };
+        Ok(CompletionObligationAdmissionResult::Recorded(recorded))
+    }
+}
+
 #[test]
 fn state_db_rejects_completion_obligations_for_unknown_invocations() {
     let state = StateDb::open(&file_backed_test_state_path()).unwrap();

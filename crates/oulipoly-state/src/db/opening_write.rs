@@ -174,11 +174,11 @@ impl StateDb {
 
         let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
         Self::apply_current_schema_repairs(&mut conn, ran_open_migrations, provider_names)?;
-        let completion_authority_db_path = Self::durable_completion_authority_path(path, &db_path);
+        let completion_authority_state = Self::durable_completion_authority_path(path, &db_path);
         let db = StateDb {
             conn,
             db_path,
-            completion_authority_db_path,
+            completion_authority_state,
             lifecycle_sink: Mutex::new(sink),
             _read_only_snapshot: None,
         };
@@ -246,7 +246,7 @@ impl StateDb {
         Ok(Self {
             conn,
             db_path: path.to_path_buf(),
-            completion_authority_db_path: None,
+            completion_authority_state: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
             _read_only_snapshot: Some(snapshot),
         })
@@ -278,12 +278,17 @@ impl StateDb {
     }
 
     pub(super) fn completion_authority_state_path(&self) -> Option<&Path> {
-        let path = self.completion_authority_db_path.as_deref()?;
-        let canonical = std::fs::canonicalize(path).ok()?;
-        if canonical != path || !Self::state_file_is_unaliased(&canonical) {
+        let authority = self.completion_authority_state.as_ref()?;
+        let canonical = std::fs::canonicalize(&authority.path).ok()?;
+        let metadata = std::fs::metadata(&canonical).ok()?;
+        if canonical != authority.path
+            || !metadata.is_file()
+            || !state_file_has_one_link(&metadata)
+            || state_file_identity(&metadata)? != authority.file
+        {
             return None;
         }
-        Some(path)
+        Some(&authority.path)
     }
 
     fn normalized_state_open_path(path: &Path) -> PathBuf {
@@ -308,29 +313,29 @@ impl StateDb {
     fn durable_completion_authority_path(
         source_path: &Path,
         normalized_path: &Path,
-    ) -> Option<PathBuf> {
+    ) -> Option<CompletionAuthorityStateIdentity> {
         if !source_path.is_absolute()
             || Self::is_nonlocal_sqlite_path(source_path)
-            || std::fs::symlink_metadata(source_path)
-                .ok()?
-                .file_type()
-                .is_symlink()
+            || !source_path.ancestors().all(|component| {
+                std::fs::symlink_metadata(component)
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+            })
         {
             return None;
         }
         let canonical = std::fs::canonicalize(normalized_path).ok()?;
-        Self::state_file_is_unaliased(&canonical).then_some(canonical)
+        let metadata = std::fs::metadata(&canonical).ok()?;
+        if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+            return None;
+        }
+        Some(CompletionAuthorityStateIdentity {
+            path: canonical,
+            file: state_file_identity(&metadata)?,
+        })
     }
 
     fn is_nonlocal_sqlite_path(path: &Path) -> bool {
         path == Path::new(":memory:") || path.as_os_str().as_encoded_bytes().starts_with(b"file:")
-    }
-
-    fn state_file_is_unaliased(path: &Path) -> bool {
-        let Ok(metadata) = std::fs::metadata(path) else {
-            return false;
-        };
-        metadata.is_file() && state_file_has_one_link(&metadata)
     }
 
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {
@@ -366,6 +371,16 @@ fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
     metadata.nlink() == 1
 }
 
+#[cfg(unix)]
+fn state_file_identity(metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(StateFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
 #[cfg(windows)]
 fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -373,7 +388,22 @@ fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
     metadata.number_of_links() == Some(1)
 }
 
+#[cfg(windows)]
+fn state_file_identity(metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    Some(StateFileIdentity {
+        volume: u64::from(metadata.volume_serial_number()?),
+        file: metadata.file_index()?,
+    })
+}
+
 #[cfg(not(any(unix, windows)))]
 fn state_file_has_one_link(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(not(any(unix, windows)))]
+fn state_file_identity(_metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
+    None
 }

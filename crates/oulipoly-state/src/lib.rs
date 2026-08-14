@@ -166,6 +166,20 @@ pub mod age_32_connection_boundary_doctest {
     ///     ).map_err(|error| error.to_string())
     /// }).unwrap();
     /// ```
+    ///
+    /// ```compile_fail
+    /// use oulipoly_state::{CompletionObligationAdmission, StateDb};
+    ///
+    /// let state = StateDb::open_default().unwrap();
+    /// state.record_completion_obligation(CompletionObligationAdmission {
+    ///     admission_id: "forbidden-state-only-admission",
+    ///     invocation_uuid: "11111111-1111-4111-8111-111111111111",
+    ///     event_id: "forbidden-event",
+    ///     owner_invocation_uuid: "11111111-1111-4111-8111-111111111111",
+    ///     owner_session_id: "forbidden-session",
+    ///     expected_sidecar_generation: "22222222-2222-4222-8222-222222222222",
+    /// }).unwrap();
+    /// ```
     pub struct StateDbRawConnectionEscapeMustNotCompile;
 }
 

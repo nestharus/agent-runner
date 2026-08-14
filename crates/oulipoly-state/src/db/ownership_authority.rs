@@ -222,7 +222,8 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
-    pub fn record_completion_obligation(
+    #[cfg(test)]
+    pub(crate) fn record_completion_obligation(
         &self,
         input: CompletionObligationAdmission<'_>,
     ) -> Result<CompletionObligationAdmissionResult, OwnershipAuthorityError> {
@@ -910,6 +911,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn completion_registration_rejects_a_parent_directory_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_directory = directory.path().join("state-directory");
+        let alias_directory = directory.path().join("state-directory-alias");
+        std::fs::create_dir(&state_directory).unwrap();
+        symlink(&state_directory, &alias_directory).unwrap();
+        let state_path = alias_directory.join("state.db");
+        let mut state = StateDb::open(&state_path).unwrap();
+
+        let error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-parent-symlink-admission",
+                registration(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Completion event registration requires an absolute, non-symlink, single-link local state database"
+        );
+        assert!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!MailboxDb::path_for_state_db(&state_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn completion_registration_rejects_a_hard_linked_state_file() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
@@ -945,6 +979,48 @@ mod tests {
         );
         assert!(!MailboxDb::path_for_state_db(&state_path).exists());
         assert!(!MailboxDb::path_for_state_db(&alias_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obligation_bearing_finalization_rejects_same_path_state_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let displaced_path = directory.path().join("state.displaced.db");
+        let mut state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-state-replacement-admission",
+                registration(),
+            )
+            .unwrap();
+        std::fs::rename(&state_path, &displaced_path).unwrap();
+        std::fs::File::create(&state_path).unwrap();
+
+        let error = state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap_err();
+
+        assert!(error.contains("process_integrity"), "{error}");
+        assert!(error.contains(INVOCATION_UUID), "{error}");
+        assert!(error.contains("no longer has"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::InvocationStatus::Running
+        );
     }
 
     #[test]
