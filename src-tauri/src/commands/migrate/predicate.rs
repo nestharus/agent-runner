@@ -25,6 +25,7 @@ pub(super) fn missing_state_db(db_path: &Path) -> Result<bool, String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn missing_state_db_preserves_metadata_errors() {
         let directory = tempfile::tempdir().unwrap();
