@@ -204,7 +204,12 @@ mod tests {
             "rebuild escaped a live migration connection"
         );
         drop(migration);
-        drop(receiver.recv().unwrap().unwrap());
+        drop(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("rebuild authority never became available")
+                .unwrap(),
+        );
         rebuild.join().unwrap();
 
         let authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
@@ -222,7 +227,12 @@ mod tests {
             "live migration connection escaped rebuild authority"
         );
         drop(authority);
-        drop(receiver.recv().unwrap().unwrap());
+        drop(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("live migration connection never became available")
+                .unwrap(),
+        );
         opener.join().unwrap();
     }
 
