@@ -294,16 +294,12 @@ impl StateDb {
                     error,
                 )
             })?;
-        let retained_sidecar_path = sidecar_authority
-            .as_ref()
-            .map(crate::mailbox::MailboxAuthorityFence::path)
-            .unwrap_or(&sidecar_path);
         let mut sidecar = self.open_completion_authority_sidecar(
             sidecar_authority.as_ref(),
             &invocation.invocation_uuid,
             &obligations,
         )?;
-        let _sidecar_fence = sidecar
+        let sidecar_fence = sidecar
             .as_mut()
             .map(crate::mailbox::MailboxDb::begin_completion_authority_fence)
             .transpose()
@@ -314,11 +310,13 @@ impl StateDb {
                     error,
                 )
             })?;
-        self.validate_completion_sidecar_authority(
-            retained_sidecar_path,
-            &invocation.invocation_uuid,
-            &obligations,
-        )?;
+        if let Some(sidecar_fence) = sidecar_fence.as_ref() {
+            self.validate_completion_sidecar_authority(
+                sidecar_fence,
+                &invocation.invocation_uuid,
+                &obligations,
+            )?;
+        }
         Self::write_invocation_final_row(
             &tx,
             id,
@@ -338,11 +336,13 @@ impl StateDb {
         )?;
 
         before_validation();
-        self.validate_completion_sidecar_authority(
-            retained_sidecar_path,
-            &invocation.invocation_uuid,
-            &obligations,
-        )?;
+        if let Some(sidecar_fence) = sidecar_fence.as_ref() {
+            self.validate_completion_sidecar_authority(
+                sidecar_fence,
+                &invocation.invocation_uuid,
+                &obligations,
+            )?;
+        }
         after_validation();
 
         tx.commit().map_err(Self::format_commit_transaction_error)?;
@@ -379,23 +379,10 @@ impl StateDb {
 
     fn validate_completion_sidecar_authority(
         &self,
-        sidecar_path: &std::path::Path,
+        sidecar: &crate::mailbox::CompletionAuthorityFence<'_>,
         invocation_uuid: &str,
         obligations: &[CompletionObligationExpectation],
     ) -> Result<(), String> {
-        if obligations.is_empty() {
-            return Ok(());
-        }
-
-        if !sidecar_path.exists() {
-            return Err(Self::format_missing_completion_sidecar(
-                invocation_uuid,
-                obligations,
-            ));
-        }
-        let sidecar = crate::mailbox::MailboxDb::open_read_only(sidecar_path).map_err(|error| {
-            Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)
-        })?;
         let observed_generation = sidecar.sidecar_generation().map_err(|error| {
             Self::format_unreadable_completion_sidecar(invocation_uuid, obligations, error)
         })?;
