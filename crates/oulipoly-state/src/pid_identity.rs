@@ -677,6 +677,27 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_sidecar_reuses_canonical_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        PidIdentityDb::open(&path).unwrap();
+        let alias = dir.path().join("pid-identity-alias.db");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+
+        let error = match crate::mailbox::MailboxAuthorityFence::acquire(&alias) {
+            Ok(_) => panic!("symlinked sidecar acquired a separate authority fence"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }
+        ));
+    }
+
     #[test]
     fn set_session_id_fills_existing_identity() {
         let dir = tempfile::tempdir().unwrap();

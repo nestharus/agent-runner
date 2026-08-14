@@ -827,7 +827,11 @@ impl MailboxAuthorityFence {
             path: path.to_path_buf(),
             source: std::io::Error::other(error),
         })?;
-        let authority_path = mailbox_authority_path(path);
+        let authority_path =
+            mailbox_authority_path(path).map_err(|source| MailboxAuthorityFenceError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -6714,10 +6718,27 @@ fn mailbox_schema_definition() -> &'static str {
             ON session_wake_claim(claimed_at);"
 }
 
-fn mailbox_authority_path(sidecar_path: &Path) -> PathBuf {
-    let mut path = sidecar_path.as_os_str().to_owned();
+fn mailbox_authority_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
+    let canonical_sidecar = match fs::canonicalize(sidecar_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let parent = sidecar_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let file_name = sidecar_path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "PID mailbox sidecar path must name a file",
+                )
+            })?;
+            fs::canonicalize(parent)?.join(file_name)
+        }
+        Err(error) => return Err(error),
+    };
+    let mut path = canonical_sidecar.as_os_str().to_owned();
     path.push(".authority.lock");
-    PathBuf::from(path)
+    Ok(PathBuf::from(path))
 }
 
 fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
