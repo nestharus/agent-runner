@@ -87,8 +87,8 @@ pub fn run_schema_probe_with_routing_port(
         Err(error) => return Err(ProbeError::Open { error }),
     };
 
-    let state_db =
-        inspect_schema(db.connection(), path).map_err(|message| ProbeError::Inspect { message })?;
+    let state_db = inspect_schema(db.raw_connection(), path)
+        .map_err(|message| ProbeError::Inspect { message })?;
     Ok(report_from_state_db(state_db))
 }
 

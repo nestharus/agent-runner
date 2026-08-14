@@ -236,13 +236,12 @@ fn state_open_read_only_recovers_committed_wal_invocation_and_turn_without_mutat
     drop(initial);
 
     let writer = StateDb::open(&state_path).unwrap();
-    writer
-        .connection()
+    let writer_connection = Connection::open(&state_path).unwrap();
+    writer_connection
         .execute_batch("PRAGMA wal_autocheckpoint=0;")
         .unwrap();
     let main_before = std::fs::read(&state_path).unwrap();
-    writer
-        .connection()
+    writer_connection
         .execute(
             "UPDATE invocations SET model_name = 'model-committed-in-wal' WHERE invocation_uuid = ?1",
             [INVOCATION],

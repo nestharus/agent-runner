@@ -26,10 +26,11 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
 fn fresh_open_creates_imported_session_display_metadata_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
+    let connection = Connection::open(db.path()).unwrap();
 
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
     assert!(table_exists(
-        db.connection(),
+        &connection,
         "imported_session_display_metadata"
     ));
 }

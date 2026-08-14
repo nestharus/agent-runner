@@ -374,14 +374,15 @@ storage_type = "{storage_type}"
 
     fn seed_state(&self) {
         let db = StateDb::open(&self.data_root.join("state.db")).expect("state db");
-        db.connection()
+        let connection = rusqlite::Connection::open(db.path()).unwrap();
+        connection
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                  VALUES (?1, '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z', ?2)",
                 params![CHAIN_ID, MODEL],
             )
             .expect("chain");
-        db.connection()
+        connection
             .execute(
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, last_turn_id, transition_reason)
@@ -393,7 +394,7 @@ storage_type = "{storage_type}"
             ("old-turn-1", "user", 0_i64),
             ("old-turn-2", "assistant", 1_i64),
         ] {
-            db.connection()
+            connection
                 .execute(
                     "INSERT INTO session_turns
                         (provider_name, session_id, turn_id, timestamp, role,

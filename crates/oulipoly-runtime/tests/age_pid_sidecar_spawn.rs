@@ -314,10 +314,8 @@ fn spawn_preserves_preexisting_oulipoly_data_dir_in_provider_child() {
 
 fn create_state_schema_snapshot(path: &Path) -> (i64, Vec<String>) {
     let db = StateDb::open(path).unwrap();
-    (
-        user_version(db.connection()),
-        invocation_columns(db.connection()),
-    )
+    let connection = Connection::open(db.path()).unwrap();
+    (user_version(&connection), invocation_columns(&connection))
 }
 
 fn read_state_schema_snapshot(path: &Path) -> (i64, Vec<String>) {

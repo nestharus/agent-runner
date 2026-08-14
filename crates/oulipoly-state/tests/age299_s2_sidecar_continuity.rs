@@ -6,6 +6,66 @@ const ADMISSION_ID: &str = "admission-age299-s2";
 const OWNER_SESSION_ID: &str = "session-age299-s2-owner";
 
 #[test]
+fn each_state_database_path_derives_a_distinct_sidecar_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let canonical_state = directory.path().join("state.db");
+    let alternate_state = directory.path().join("alternate.db");
+
+    assert_eq!(
+        MailboxDb::path_for_state_db(&canonical_state),
+        directory.path().join("pid-identity.db")
+    );
+    assert_eq!(
+        MailboxDb::path_for_state_db(&alternate_state),
+        directory.path().join("alternate.db.pid-identity.db")
+    );
+    assert_ne!(
+        MailboxDb::path_for_state_db(&canonical_state),
+        MailboxDb::path_for_state_db(&alternate_state)
+    );
+}
+
+#[test]
+fn sibling_state_databases_cannot_register_into_one_sidecar_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let canonical_path = directory.path().join("state.db");
+    let alternate_path = directory.path().join("alternate.db");
+    let canonical = StateDb::open(&canonical_path).unwrap();
+    let mut alternate = StateDb::open(&alternate_path).unwrap();
+    let canonical_row_id = start_invocation(&canonical, ROOT_UUID);
+    start_invocation(&alternate, ROOT_UUID);
+
+    alternate
+        .register_completion_event_with_obligation(
+            "alternate-state-admission",
+            completion_registration("alternate-state-event", ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap();
+
+    let canonical_sidecar = MailboxDb::path_for_state_db(&canonical_path);
+    let alternate_sidecar = MailboxDb::path_for_state_db(&alternate_path);
+    assert_ne!(canonical_sidecar, alternate_sidecar);
+    assert!(!canonical_sidecar.exists());
+    assert!(alternate_sidecar.exists());
+    assert!(
+        canonical
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        alternate
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap()
+            .len(),
+        1
+    );
+    canonical
+        .finalize_invocation(canonical_row_id, true, 0, None, None)
+        .unwrap();
+}
+
+#[test]
 fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_sidecars() {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");

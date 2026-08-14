@@ -57,7 +57,12 @@ fn schema_probe_report_uses_resolved_primary_path_and_version_when_given_routing
         .resolve_read_only()
         .expect("routing port should provide read-only primary");
     let db = StateDb::open_read_only(&routed.path).unwrap();
-    let state_db = schema_probe::inspect_schema(db.connection(), routed.path.clone()).unwrap();
+    let connection = rusqlite::Connection::open_with_flags(
+        db.path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let state_db = schema_probe::inspect_schema(&connection, routed.path.clone()).unwrap();
     let report = schema_probe::report_from_state_db(state_db);
 
     assert_eq!(report.state_db.path, resolved.path);

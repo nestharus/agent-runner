@@ -3172,6 +3172,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 1.0.3+spec-1.1.0",
 ]
 

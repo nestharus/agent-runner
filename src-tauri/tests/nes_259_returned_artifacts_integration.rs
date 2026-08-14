@@ -7,6 +7,7 @@ use chrono::{TimeZone, Utc};
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
 use oulipoly_state::{
     InvocationStart, InvocationStatus, MINIMUM_SUPPORTED_SCHEMA_VERSION, StateDb,
+    StateReadConnection,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -238,7 +239,10 @@ fn returned_ref(invocation_uuid: Uuid, name: &str, version: u64) -> ReturnedArti
     }
 }
 
-fn returned_rows(conn: &Connection, invocation_row_id: i64) -> Vec<(i64, String, String, String)> {
+fn returned_rows(
+    conn: StateReadConnection<'_>,
+    invocation_row_id: i64,
+) -> Vec<(i64, String, String, String)> {
     let mut stmt = conn
         .prepare(
             "SELECT ordinal, version_id, name, sha256

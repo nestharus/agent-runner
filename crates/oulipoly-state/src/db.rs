@@ -61,7 +61,7 @@
 //!       - ownership_authority, provider_schema_migration, provider_schema_validation, provider_session_binding, providers
 //!       - resume_active_segment, resume_lookup, resume_preview, resume_resolution, resume_types
 //!       - returned_artifacts_codec, returned_artifacts_read, returned_artifacts_write
-//!       - schema_types, session_capture, session_markers, session_turns_ingest, session_turns_query, sqlite_adapter, timestamps
+//!       - schema_types, session_capture, session_markers, session_turns_ingest, session_turns_query, session_turns_replace, sqlite_adapter, timestamps
 //! ```
 
 macro_rules! invocation_returned_artifacts_schema_sql {
@@ -146,6 +146,7 @@ mod session_lifecycle;
 mod session_markers;
 mod session_turns_ingest;
 mod session_turns_query;
+mod session_turns_replace;
 mod sqlite_adapter;
 mod timestamps;
 
@@ -169,6 +170,7 @@ pub use self::invocation_records::{InvocationRecord, InvocationStart, Invocation
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
+pub use self::opening_write::StateReadConnection;
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
 pub use self::ownership_authority::{
     CompletionObligationAdmission, CompletionObligationAdmissionResult,
@@ -217,6 +219,9 @@ pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]
 pub use self::session_turns_ingest::SessionTurnRecord;
 pub use self::session_turns_ingest::{SessionTurnCounts, SessionTurnIngest};
+pub use self::session_turns_replace::{
+    SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
+};
 
 use self::lifecycle_log_adapter as lc_log_adapter;
 use self::sqlite_adapter as sqlite;

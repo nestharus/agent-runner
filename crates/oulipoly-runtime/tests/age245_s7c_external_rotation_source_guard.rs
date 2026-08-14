@@ -1153,13 +1153,14 @@ impl RuntimeFixture {
     }
 
     fn snapshot(&self) -> DbSnapshot {
+        let connection = rusqlite::Connection::open(self.state.path()).expect("state connection");
         DbSnapshot {
             chains: full_rows(
-                self.state.connection(),
+                &connection,
                 "SELECT chain_id, created_at, last_used_at, model_name FROM session_chains ORDER BY chain_id",
             ),
             segments: full_rows(
-                self.state.connection(),
+                &connection,
                 "SELECT id, chain_id, provider_name, session_id, started_at, ended_at, last_turn_id, transition_reason FROM session_chain_segments ORDER BY id",
             ),
         }
@@ -1279,8 +1280,8 @@ impl RuntimeFixture {
     }
 
     fn install_open_failure_trigger(&self) {
-        self.state
-            .connection()
+        rusqlite::Connection::open(self.state.path())
+            .expect("state connection")
             .execute_batch(
                 "CREATE TRIGGER fail_target_open
                  BEFORE INSERT ON session_chain_segments
@@ -1293,8 +1294,8 @@ impl RuntimeFixture {
     }
 
     fn drop_open_failure_trigger(&self) {
-        self.state
-            .connection()
+        rusqlite::Connection::open(self.state.path())
+            .expect("state connection")
             .execute_batch("DROP TRIGGER fail_target_open;")
             .expect("drop trigger");
     }

@@ -9,8 +9,7 @@
 //!     Owns:
 //!       - StateDb public API source scanning and forbidden raw connection signature assertions
 //!       - db.rs and db/*.rs include_str aggregation for boundary checks
-//!       - oulipoly_state::StateDb read-only connection smoke test surface
-//!       - rusqlite::Connection read-only smoke test support surface
+//!       - StateDb raw connection and transaction compile-boundary assertions
 //!       - tempfile::tempdir database fixture directory surface
 //!       - session_replace source include_str write-transaction boundary check
 
@@ -21,8 +20,8 @@ fn ti_39_state_db_public_api_has_no_raw_mutable_connection_escape() {
 
     assert_no_raw_mutable_connection_escape(&public_boundary_source);
     assert_no_forbidden_state_db_impl_escape(&public_boundary_source);
-    assert_read_only_connection_smoke();
-    assert_with_write_txn_surface(opening_source);
+    assert_no_public_raw_connection(opening_source);
+    assert_no_public_write_transaction(opening_source);
 }
 
 fn assert_no_raw_mutable_connection_escape(public_boundary_source: &str) {
@@ -38,7 +37,7 @@ fn assert_no_raw_mutable_connection_escape(public_boundary_source: &str) {
     ] {
         assert!(
             !public_boundary_source.contains(forbidden),
-            "StateDb must expose writes through with_write_txn only; found forbidden signature fragment {forbidden}"
+            "StateDb must not expose a raw writable connection; found forbidden signature fragment {forbidden}"
         );
     }
 }
@@ -52,30 +51,57 @@ fn assert_no_forbidden_state_db_impl_escape(state_db_impl: &str) {
     }
 }
 
-fn assert_read_only_connection_smoke() {
-    assert_eq!(read_only_connection_smoke_value(), 1);
-}
-
-fn read_only_connection_smoke_value() -> i64 {
-    let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join("state.db");
-    let state = oulipoly_state::StateDb::open(&db_path).unwrap();
-    let read_only_connection: &rusqlite::Connection = state.connection();
-    read_only_connection
-        .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
-        .unwrap()
-}
-
-fn assert_with_write_txn_surface(opening_source: &str) {
+fn assert_no_public_raw_connection(opening_source: &str) {
     assert!(
-        opening_source.contains("pub fn with_write_txn"),
-        "StateDb must expose the closure-scoped write transaction API"
+        opening_source.contains("pub fn connection(&self) -> StateReadConnection<'_>"),
+        "StateDb must expose only the validated read projection"
     );
     assert!(
-        opening_source.contains("FnOnce(&mut rusqlite::Transaction<'_>)")
-            || opening_source.contains("FnOnce(&mut Transaction<'_>)"),
-        "with_write_txn must scope writes to a non-escaping rusqlite transaction"
+        opening_source.contains("pub(crate) fn raw_connection(&self)"),
+        "StateDb internals still require crate-scoped persistence access"
     );
+}
+
+fn assert_no_public_write_transaction(opening_source: &str) {
+    assert!(
+        !opening_source.contains("pub fn with_write_txn"),
+        "StateDb must not expose arbitrary closure-scoped write SQL"
+    );
+    assert!(
+        !opening_source.contains("fn with_write_txn"),
+        "arbitrary closure-scoped write SQL is no longer part of StateDb"
+    );
+}
+
+#[test]
+fn state_read_projection_rejects_dml_ddl_and_writable_schema_pragma() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = oulipoly_state::StateDb::open(&directory.path().join("state.db")).unwrap();
+    let connection = state.connection();
+
+    for statement in [
+        "DELETE FROM invocation_completion_obligations",
+        "DROP TRIGGER trg_invocation_completion_obligations_append_only_delete",
+        "PRAGMA writable_schema = ON",
+        "PRAGMA busy_timeout(0)",
+        "PRAGMA journal_mode(DELETE)",
+        "PRAGMA user_version(0)",
+    ] {
+        assert!(
+            matches!(
+                connection.prepare(statement),
+                Err(rusqlite::Error::InvalidQuery)
+            ),
+            "read projection accepted writable SQL: {statement}"
+        );
+    }
+    connection
+        .prepare("SELECT COUNT(*) FROM invocation_completion_obligations")
+        .unwrap();
+    connection.prepare("PRAGMA journal_mode").unwrap();
+    connection
+        .prepare("PRAGMA table_info(invocation_completion_obligations)")
+        .unwrap();
 }
 
 fn public_boundary_source() -> String {
@@ -147,32 +173,8 @@ fn db_module_sources() -> &'static str {
         include_str!("../src/db/session_markers.rs"),
         include_str!("../src/db/session_turns_ingest.rs"),
         include_str!("../src/db/session_turns_query.rs"),
+        include_str!("../src/db/session_turns_replace.rs"),
         include_str!("../src/db/sqlite_adapter.rs"),
         include_str!("../src/db/timestamps.rs"),
     )
-}
-
-#[test]
-fn ti_39_session_replace_uses_state_db_write_transaction_not_raw_connection_writes() {
-    assert_session_replace_uses_state_db_write_transaction(session_replace_source());
-}
-
-fn assert_session_replace_uses_state_db_write_transaction(source: &str) {
-    assert!(
-        source.contains("with_write_txn"),
-        "session_replace replacement writes must route through StateDb::with_write_txn"
-    );
-    assert!(
-        !source.contains("Connection::open(data_root.join(\"state.db\"))")
-            && !source.contains("Connection::open(&db_path)"),
-        "session_replace must not reopen state.db as a raw writable rusqlite::Connection"
-    );
-    assert!(
-        !source.contains("replace_db_turns(&mut conn"),
-        "replace_db_turns must receive the transaction from with_write_txn, not a raw Connection"
-    );
-}
-
-fn session_replace_source() -> &'static str {
-    include_str!("../../../crates/oulipoly-runtime/src/session_replace/mod.rs")
 }

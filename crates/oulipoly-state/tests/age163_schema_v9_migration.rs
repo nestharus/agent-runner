@@ -29,24 +29,26 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 fn fresh_open_has_current_schema_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
+    let conn = Connection::open(db.path()).unwrap();
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
 }
 
 #[test]
 fn fresh_open_creates_round_robin_cursor_table() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-    assert!(table_exists(db.connection(), "model_round_robin_cursor"));
+    let conn = Connection::open(db.path()).unwrap();
+    assert!(table_exists(&conn, "model_round_robin_cursor"));
 }
 
 #[test]
 fn fresh_open_has_working_set_columns_on_provider_quotas() {
     let dir = tempfile::tempdir().unwrap();
     let db = StateDb::open(&dir.path().join("state.db")).unwrap();
-    let conn = db.connection();
-    assert!(column_exists(conn, "provider_quotas", "next_available_at"));
-    assert!(column_exists(conn, "provider_quotas", "last_refresh_at"));
-    assert!(column_exists(conn, "provider_quotas", "failure_class"));
+    let conn = Connection::open(db.path()).unwrap();
+    assert!(column_exists(&conn, "provider_quotas", "next_available_at"));
+    assert!(column_exists(&conn, "provider_quotas", "last_refresh_at"));
+    assert!(column_exists(&conn, "provider_quotas", "failure_class"));
 }
 
 #[test]
@@ -60,12 +62,12 @@ fn schema_v8_db_migrates_forward_to_current() {
     drop(conn);
 
     let db = StateDb::open(&path).unwrap();
-    let conn = db.connection();
-    assert_eq!(user_version(conn), CURRENT_SCHEMA_VERSION);
-    assert!(table_exists(conn, "model_round_robin_cursor"));
-    assert!(column_exists(conn, "provider_quotas", "next_available_at"));
-    assert!(column_exists(conn, "provider_quotas", "last_refresh_at"));
-    assert!(column_exists(conn, "provider_quotas", "failure_class"));
+    let conn = Connection::open(db.path()).unwrap();
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    assert!(table_exists(&conn, "model_round_robin_cursor"));
+    assert!(column_exists(&conn, "provider_quotas", "next_available_at"));
+    assert!(column_exists(&conn, "provider_quotas", "last_refresh_at"));
+    assert!(column_exists(&conn, "provider_quotas", "failure_class"));
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM provider_quotas", [], |row| row.get(0))

@@ -417,13 +417,21 @@ fn marker_with_fresh_cache_and_healthy_windows_is_cleared() {
 #[test]
 fn clear_marker_failure_does_not_panic_and_leaves_marker_intact() {
     let (_lock_dir, _env_guard) = isolated_lock_dir();
-    let db = open_db();
+    let state_directory = tempdir().unwrap();
+    let db = StateDb::open(&state_directory.path().join("state.db")).unwrap();
     let now = Utc::now();
     let marker_at = now + Duration::hours(1);
     seed_window(&db, "p", 0.10, 5);
     seed_marker(&db, "p", marker_at);
-    db.connection()
-        .execute("PRAGMA query_only = ON", [])
+    rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_quota_marker_clear
+             BEFORE UPDATE ON provider_quotas
+             BEGIN
+               SELECT RAISE(ABORT, 'forced marker clear failure');
+             END;",
+        )
         .unwrap();
 
     let providers = providers_with_script("p", "exit 1");

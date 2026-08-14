@@ -49,9 +49,9 @@ fn ti_01_fresh_state_db_open_sets_current_user_version_and_required_tables() {
     let db_path = dir.path().join("state.db");
 
     let db = StateDb::open(&db_path).unwrap();
-    let conn = db.connection();
+    let conn = Connection::open(db.path()).unwrap();
 
-    assert_eq!(user_version(conn), CURRENT_SCHEMA_VERSION);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
     for table in [
         "invocations",
         "providers",
@@ -66,7 +66,7 @@ fn ti_01_fresh_state_db_open_sets_current_user_version_and_required_tables() {
         "session_chain_segments",
     ] {
         assert!(
-            table_names(conn).contains(&table.to_string()),
+            table_names(&conn).contains(&table.to_string()),
             "fresh DB is missing required table {table}"
         );
     }
@@ -84,7 +84,8 @@ fn ti_02_ti_23_previous_version_db_migrates_forward_and_preserves_representative
     drop(before_conn);
 
     let db = StateDb::open(&db_path).unwrap();
-    let after = assert_representative_state_rows_preserved(db.connection());
+    let connection = Connection::open(db.path()).unwrap();
+    let after = assert_representative_state_rows_preserved(&connection);
 
     assert_eq!(after.user_version, CURRENT_SCHEMA_VERSION);
     assert_eq!(after.invocations, before.invocations);
@@ -105,15 +106,18 @@ fn ti_03_current_version_open_is_noop_for_rows_and_duplicates() {
     build_current_full_state_db(&db_path);
 
     let db = StateDb::open(&db_path).unwrap();
-    let first = fixtures::representative_snapshot(db.connection());
+    let connection = Connection::open(db.path()).unwrap();
+    let first = fixtures::representative_snapshot(&connection);
+    drop(connection);
     drop(db);
 
     let db = StateDb::open(&db_path).unwrap();
-    let second = fixtures::representative_snapshot(db.connection());
+    let connection = Connection::open(db.path()).unwrap();
+    let second = fixtures::representative_snapshot(&connection);
 
     assert_eq!(second, first);
-    assert_eq!(duplicate_segment_count(db.connection()), 1);
-    assert_eq!(duplicate_provider_count(db.connection()), 1);
+    assert_eq!(duplicate_segment_count(&connection), 1);
+    assert_eq!(duplicate_provider_count(&connection), 1);
 }
 
 #[test]
@@ -157,7 +161,8 @@ fn ti_07_ti_22_schema_constants_are_single_source_for_probe_and_fixtures() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let db = StateDb::open(&db_path).unwrap();
-    let report = schema_probe::inspect_schema(db.connection(), db_path).unwrap();
+    let connection = Connection::open(db.path()).unwrap();
+    let report = schema_probe::inspect_schema(&connection, db_path).unwrap();
 
     assert_eq!(report.tables.get("fresh_continuations"), Some(&true));
     assert_eq!(
@@ -270,10 +275,11 @@ fn ti_23_age_54_schema4_invocation_fixture_migrates_without_row_loss() {
     drop(before_conn);
 
     let db = StateDb::open(&db_path).unwrap();
+    let connection = Connection::open(db.path()).unwrap();
 
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
     assert_eq!(
-        fixtures::count_rows(db.connection(), "invocations"),
+        fixtures::count_rows(&connection, "invocations"),
         before_count
     );
 }
@@ -285,12 +291,15 @@ fn ti_11_fresh_schema_and_migrated_schema_are_structurally_equivalent() {
     let migrated_path = dir.path().join("migrated.db");
 
     let fresh = StateDb::open(&fresh_path).unwrap();
-    let fresh_schema = normalized_schema(fresh.connection());
+    let fresh_connection = Connection::open(fresh.path()).unwrap();
+    let fresh_schema = normalized_schema(&fresh_connection);
+    drop(fresh_connection);
     drop(fresh);
 
     build_v3_full_state_db(&migrated_path);
     let migrated = StateDb::open(&migrated_path).unwrap();
-    let migrated_schema = normalized_schema(migrated.connection());
+    let migrated_connection = Connection::open(migrated.path()).unwrap();
+    let migrated_schema = normalized_schema(&migrated_connection);
 
     assert_eq!(migrated_schema, fresh_schema);
 }
@@ -302,14 +311,14 @@ fn ti_30_versionless_setup_only_db_migrates_to_current_and_preserves_setup_rows(
     build_versionless_setup_only_db(&db_path);
 
     let db = StateDb::open(&db_path).unwrap();
-    let conn = db.connection();
+    let conn = Connection::open(db.path()).unwrap();
 
-    assert_eq!(user_version(conn), CURRENT_SCHEMA_VERSION);
-    assert_eq!(fixtures::count_rows(conn, "memory_nodes"), 2);
-    assert_eq!(fixtures::count_rows(conn, "memory_edges"), 1);
-    assert_eq!(fixtures::count_rows(conn, "setup_sessions"), 1);
-    assert_eq!(fixtures::count_rows(conn, "setup_turns"), 1);
-    let foreign_keys = memory_edge_foreign_keys(conn);
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    assert_eq!(fixtures::count_rows(&conn, "memory_nodes"), 2);
+    assert_eq!(fixtures::count_rows(&conn, "memory_edges"), 1);
+    assert_eq!(fixtures::count_rows(&conn, "setup_sessions"), 1);
+    assert_eq!(fixtures::count_rows(&conn, "setup_turns"), 1);
+    let foreign_keys = memory_edge_foreign_keys(&conn);
     assert!(has_required_memory_edge_foreign_keys(&foreign_keys));
 }
 
@@ -327,7 +336,8 @@ fn ti_35_migrations_are_embedded_and_independent_of_current_working_directory() 
     std::env::set_current_dir(cwd).unwrap();
 
     let db = result.unwrap();
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
+    let connection = Connection::open(db.path()).unwrap();
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
 }
 
 #[test]

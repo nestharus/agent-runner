@@ -143,7 +143,8 @@ prompt_mode = "arg"
             })
             .unwrap();
         let created_at = (Utc::now() - Duration::minutes(31)).to_rfc3339();
-        db.connection()
+        rusqlite::Connection::open(db.path())
+            .unwrap()
             .execute(
                 "UPDATE invocations SET created_at = ?1 WHERE id = ?2",
                 params![created_at, row_id],

@@ -29,6 +29,85 @@
 use super::*;
 use crate::migrations;
 
+pub struct StateReadConnection<'a> {
+    conn: &'a sqlite::Connection,
+}
+
+impl StateReadConnection<'_> {
+    pub fn prepare<'connection>(
+        &'connection self,
+        sql: &str,
+    ) -> rusqlite::Result<rusqlite::Statement<'connection>> {
+        let statement = self.conn.prepare(sql)?;
+        if read_projection_allows(sql, statement.readonly()) {
+            Ok(statement)
+        } else {
+            Err(rusqlite::Error::InvalidQuery)
+        }
+    }
+
+    pub fn query_row<T, P, F>(&self, sql: &str, params: P, map: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        let mut statement = self.prepare(sql)?;
+        statement.query_row(params, map)
+    }
+}
+
+fn read_projection_allows(sql: &str, sqlite_readonly: bool) -> bool {
+    let trimmed = sql.trim_start();
+    let Some(directive) = trimmed
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("pragma"))
+        .map(|_| trimmed[6..].trim_start())
+    else {
+        return sqlite_readonly;
+    };
+    if directive.contains('=') {
+        return false;
+    }
+    let name = directive
+        .split(|character: char| character == '(' || character == ';' || character.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default();
+    let has_argument = directive.contains('(');
+    if has_argument
+        && ![
+            "foreign_key_list",
+            "index_info",
+            "index_list",
+            "integrity_check",
+            "quick_check",
+            "table_info",
+            "table_xinfo",
+        ]
+        .iter()
+        .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    {
+        return false;
+    }
+    [
+        "busy_timeout",
+        "database_list",
+        "foreign_key_list",
+        "index_info",
+        "index_list",
+        "integrity_check",
+        "journal_mode",
+        "quick_check",
+        "table_info",
+        "table_xinfo",
+        "user_version",
+    ]
+    .iter()
+    .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
 impl StateDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_sink(path, Box::new(NoopLifecycleEventSink))
@@ -129,39 +208,6 @@ impl StateDb {
         Ok(())
     }
 
-    pub fn with_write_txn<R, F>(&mut self, f: F) -> Result<R, String>
-    where
-        F: FnOnce(&mut Transaction<'_>) -> Result<R, String>,
-    {
-        let mut tx = self.begin_state_db_transaction()?;
-        match f(&mut tx) {
-            Ok(value) => {
-                Self::commit_state_db_transaction(tx)?;
-                Ok(value)
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn begin_state_db_transaction(&mut self) -> Result<Transaction<'_>, String> {
-        self.conn
-            .transaction()
-            .map_err(Self::format_state_db_transaction_begin_error)
-    }
-
-    fn format_state_db_transaction_begin_error(err: sqlite::Error) -> String {
-        format!("Failed to begin state DB transaction: {err}")
-    }
-
-    fn commit_state_db_transaction(tx: Transaction<'_>) -> Result<(), String> {
-        tx.commit()
-            .map_err(Self::format_state_db_transaction_commit_error)
-    }
-
-    fn format_state_db_transaction_commit_error(err: sqlite::Error) -> String {
-        format!("Failed to commit state DB transaction: {err}")
-    }
-
     pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
         Self::validate_read_only_paths(path)?;
         let (conn, snapshot) = Self::open_read_only_connection(path)?;
@@ -188,8 +234,16 @@ impl StateDb {
         Ok(crate::paths::data_dir()?.join("state.db"))
     }
 
-    pub fn connection(&self) -> &sqlite::Connection {
+    pub fn connection(&self) -> StateReadConnection<'_> {
+        StateReadConnection { conn: &self.conn }
+    }
+
+    pub(crate) fn raw_connection(&self) -> &sqlite::Connection {
         &self.conn
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.db_path
     }
 
     pub(super) fn ensure_state_parent_dir(path: &Path) -> Result<(), String> {

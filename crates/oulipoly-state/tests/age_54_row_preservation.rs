@@ -120,7 +120,8 @@ fn schema4_dual_id_column_or_index_drift_preserves_rows_or_rolls_back() {
     assert_eq!(after.uuids, before.uuids);
     match result {
         Ok(db) => {
-            assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
+            let connection = Connection::open(db.path()).unwrap();
+            assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
             assert_provider_session_index_exists(&invocation_index_names(&db_path));
         }
         Err(_) => {
@@ -163,7 +164,10 @@ fn current_version_missing_dual_id_column_does_not_drop_invocations() {
         "ensure_invocations_schema must not silently add durable schema-5 columns on populated current tables"
     );
     match result {
-        Ok(db) => assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION),
+        Ok(db) => {
+            let connection = Connection::open(db.path()).unwrap();
+            assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
+        }
         Err(_) => assert_eq!(user_version(&Connection::open(&db_path).unwrap()), 5),
     }
 }
@@ -228,7 +232,8 @@ fn modern_invocations_missing_repair_column_does_not_enter_legacy_rebuild() {
 
     assert_eq!(after_count, before_count);
     assert!(invocation_uuids(&db_path).contains(&MODERN_SHAPE_UUID.to_string()));
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
+    let connection = Connection::open(db.path()).unwrap();
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
 }
 
 // Risk: accidental table replacement
@@ -242,7 +247,8 @@ fn exact_legacy_pre_uuid_shape_can_rebuild_without_row_loss() {
 
     let before_count = raw_invocation_count(&db_path);
     let db = StateDb::open(&db_path).unwrap();
-    let after_count = count_rows(db.connection(), "invocations");
+    let connection = Connection::open(db.path()).unwrap();
+    let after_count = count_rows(&connection, "invocations");
 
     assert_eq!(before_count, 2);
     assert_eq!(after_count, before_count);

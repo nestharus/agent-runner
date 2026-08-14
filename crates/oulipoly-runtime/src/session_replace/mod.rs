@@ -18,8 +18,11 @@ use crate::session_metadata::{
 };
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
-use oulipoly_state::StateDb;
-use rusqlite::{Connection, Transaction, params};
+use oulipoly_state::{
+    SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
+    StateDb, StateReadConnection,
+};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -758,8 +761,9 @@ fn apply_replace_sqlite(
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
+    let input = replacement_from_metadata(metadata, records)?;
     state
-        .with_write_txn(|tx| replace_db_turns(tx, metadata, records).map_err(|e| format!("{e:?}")))
+        .replace_session_turns(&input)
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to update state db: {e}"),
         })
@@ -772,10 +776,9 @@ pub(crate) fn apply_provider_owned_replace_sqlite(
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
+    let input = replacement_for_target(target, records)?;
     state
-        .with_write_txn(|tx| {
-            replace_db_turns_for_target(tx, target, records).map_err(|e| format!("{e:?}"))
-        })
+        .replace_session_turns(&input)
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to update state db: {e}"),
         })
@@ -788,10 +791,9 @@ pub(crate) fn restore_provider_owned_db_preimage(
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
+    let input = restoration_for_target(target, preimage)?;
     state
-        .with_write_txn(|tx| {
-            restore_db_preimage_for_target(tx, target, preimage).map_err(|e| format!("{e:?}"))
-        })
+        .restore_session_turns(&input)
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to restore state db: {e}"),
         })
@@ -855,7 +857,7 @@ pub(crate) fn provider_replace_db_preimage(
         message: format!("failed to open state db: {e}"),
     })?;
     let conn = state.connection();
-    db_preimage_from_conn(conn, target)
+    db_preimage_from_conn(&conn, target)
 }
 
 fn cleanup_replace_journal_publication(
@@ -1035,8 +1037,9 @@ fn roll_forward_replace_journal(
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db during recovery: {e}"),
     })?;
+    let input = replacement_from_metadata(metadata, &records)?;
     state
-        .with_write_txn(|tx| replace_db_turns(tx, metadata, &records).map_err(|e| format!("{e:?}")))
+        .replace_session_turns(&input)
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to update state db during recovery: {e}"),
         })?;
@@ -1295,11 +1298,10 @@ fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, Replace
         .map_err(map_metadata_error)
 }
 
-fn replace_db_turns(
-    tx: &mut Transaction<'_>,
+fn replacement_from_metadata(
     metadata: &SessionMetadata,
     records: &[CanonicalRecord],
-) -> Result<(), ReplaceError> {
+) -> Result<SessionTurnsReplacement, ReplaceError> {
     let target = ProviderReplaceDbTarget {
         provider_name: metadata.provider_name.clone(),
         session_id: metadata.session_id.clone(),
@@ -1307,68 +1309,32 @@ fn replace_db_turns(
         active_segment_id: metadata.active_segment_id,
         source_file: metadata.jsonl_path.to_string_lossy().to_string(),
     };
-    replace_db_turns_for_target(tx, &target, records)
+    replacement_for_target(&target, records)
 }
 
-fn replace_db_turns_for_target(
-    tx: &mut Transaction<'_>,
+fn replacement_for_target(
     target: &ProviderReplaceDbTarget,
     records: &[CanonicalRecord],
-) -> Result<(), ReplaceError> {
-    tx.execute(
-        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-        params![target.provider_name, target.session_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to delete old turns: {e}"),
-    })?;
-    let now = Utc::now().to_rfc3339();
-    // Canonical v1 records intentionally do not carry parentage, sidechain, or
-    // compaction metadata, so imported rows reset those lineage fields.
-    for record in records {
-        let body = replacement_body_json(&record.content)?;
-        tx.execute(
-            "INSERT INTO session_turns
-                (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7, ?8)",
-            params![
-                target.provider_name,
-                target.session_id,
-                record.turn_id,
-                record.timestamp,
-                record.role,
-                target.source_file,
-                now,
-                body,
-            ],
-        )
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to insert replacement turn: {e}"),
-        })?;
-    }
-    let last = records
-        .last()
-        .ok_or_else(|| ReplaceError::OperationalError {
-            message: "cannot replace db with empty records".to_string(),
-        })?;
-    tx.execute(
-        "UPDATE session_chain_segments
-         SET last_turn_id = ?2
-         WHERE id = ?1",
-        params![target.active_segment_id, last.turn_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to refresh active segment: {e}"),
-    })?;
-    tx.execute(
-        "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-        params![target.chain_id, last.timestamp],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to refresh chain: {e}"),
-    })?;
-    Ok(())
+) -> Result<SessionTurnsReplacement, ReplaceError> {
+    let turns = records
+        .iter()
+        .map(|record| {
+            Ok(SessionTurnReplacement {
+                turn_id: record.turn_id.clone(),
+                timestamp: record.timestamp.clone(),
+                role: record.role.clone(),
+                body: replacement_body_json(&record.content)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplaceError>>()?;
+    Ok(SessionTurnsReplacement {
+        provider_name: target.provider_name.clone(),
+        session_id: target.session_id.clone(),
+        chain_id: target.chain_id.clone(),
+        active_segment_id: target.active_segment_id,
+        source_file: target.source_file.clone(),
+        turns,
+    })
 }
 
 fn replacement_body_json(content: &[ContentChunk]) -> Result<String, ReplaceError> {
@@ -1392,82 +1358,50 @@ fn replacement_body_json(content: &[ContentChunk]) -> Result<String, ReplaceErro
     Ok(format!("[{}]", chunks.join(",")))
 }
 
-fn restore_db_preimage_for_target(
-    tx: &mut Transaction<'_>,
+fn restoration_for_target(
     target: &ProviderReplaceDbTarget,
     preimage: &ProviderReplaceDbPreimage,
-) -> Result<(), ReplaceError> {
-    tx.execute(
-        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-        params![target.provider_name, target.session_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to delete replacement turns: {e}"),
-    })?;
+) -> Result<SessionTurnsRestore, ReplaceError> {
     let Some(rows) = preimage.session_turns.as_array() else {
         return Err(ReplaceError::OperationalError {
             message: "invalid_provider_owned_db_preimage".to_string(),
         });
     };
-    let now = Utc::now().to_rfc3339();
-    for row in rows {
-        let Some(values) = row.as_array() else {
-            return Err(ReplaceError::OperationalError {
-                message: "invalid_provider_owned_db_preimage".to_string(),
-            });
-        };
-        let provider_name = value_str(values, 0)?;
-        let session_id = value_str(values, 1)?;
-        let turn_id = value_str(values, 2)?;
-        let timestamp = value_str(values, 3)?;
-        let role = value_str(values, 4)?;
-        let parent_turn_id = values.get(5).and_then(Value::as_str);
-        let is_sidechain = values.get(6).and_then(Value::as_i64).unwrap_or(0);
-        let is_compaction_boundary = values.get(7).and_then(Value::as_i64).unwrap_or(0);
-        let source_file = value_str(values, 8)?;
-        let body = values.get(9).and_then(Value::as_str);
-        tx.execute(
-            "INSERT INTO session_turns
-                (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                provider_name,
-                session_id,
-                turn_id,
-                timestamp,
-                role,
-                parent_turn_id,
-                is_sidechain,
-                is_compaction_boundary,
-                source_file,
-                now,
-                body,
-            ],
-        )
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to restore preimage turn: {e}"),
-        })?;
-    }
-    tx.execute(
-        "UPDATE session_chain_segments SET last_turn_id = ?2 WHERE id = ?1",
-        params![target.active_segment_id, preimage.last_turn_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to restore active segment: {e}"),
-    })?;
-    tx.execute(
-        "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-        params![target.chain_id, preimage.last_used_at],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to restore chain: {e}"),
-    })?;
-    Ok(())
+    let turns = rows
+        .iter()
+        .map(|row| {
+            let Some(values) = row.as_array() else {
+                return Err(ReplaceError::OperationalError {
+                    message: "invalid_provider_owned_db_preimage".to_string(),
+                });
+            };
+            Ok(SessionTurnRestoreRow {
+                provider_name: value_str(values, 0)?.to_string(),
+                session_id: value_str(values, 1)?.to_string(),
+                turn_id: value_str(values, 2)?.to_string(),
+                timestamp: value_str(values, 3)?.to_string(),
+                role: value_str(values, 4)?.to_string(),
+                parent_turn_id: values.get(5).and_then(Value::as_str).map(str::to_string),
+                is_sidechain: values.get(6).and_then(Value::as_i64).unwrap_or(0),
+                is_compaction_boundary: values.get(7).and_then(Value::as_i64).unwrap_or(0),
+                source_file: value_str(values, 8)?.to_string(),
+                body: values.get(9).and_then(Value::as_str).map(str::to_string),
+            })
+        })
+        .collect::<Result<Vec<_>, ReplaceError>>()?;
+    Ok(SessionTurnsRestore {
+        provider_name: target.provider_name.clone(),
+        session_id: target.session_id.clone(),
+        chain_id: target.chain_id.clone(),
+        active_segment_id: target.active_segment_id,
+        last_turn_id: preimage.last_turn_id.clone(),
+        last_used_at: preimage.last_used_at.clone(),
+        turns,
+    })
 }
 
 fn db_preimage_from_conn(
-    conn: &Connection,
+    conn: &StateReadConnection<'_>,
     target: &ProviderReplaceDbTarget,
 ) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
     let mut turns = conn
@@ -1979,14 +1913,15 @@ sessions_dir = "{}"
 
         with_homes(&config_home, &data_home, || {
             let db = StateDb::open_default().unwrap();
-            db.connection()
+            let connection = rusqlite::Connection::open(db.path()).unwrap();
+            connection
                 .execute(
                     "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                      VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:01Z', ?2)",
                     params![CHAIN_ID, MODEL],
                 )
                 .unwrap();
-            db.connection()
+            connection
                 .execute(
                     "INSERT INTO session_chain_segments
                         (chain_id, provider_name, session_id, started_at, last_turn_id, transition_reason)
@@ -1995,7 +1930,7 @@ sessions_dir = "{}"
                 )
                 .unwrap();
             for (turn_id, role) in [("old-user", "user"), ("old-assistant", "assistant")] {
-                db.connection()
+                connection
                     .execute(
                         "INSERT INTO session_turns
                             (provider_name, session_id, turn_id, timestamp, role,

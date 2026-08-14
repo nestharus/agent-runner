@@ -276,7 +276,7 @@ impl StateDb {
         let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
         let existing_obligations =
-            active_completion_obligations_on(&tx).map_err(|error| error.to_string())?;
+            all_completion_obligations_on(&tx).map_err(|error| error.to_string())?;
         let mut mailbox = if existing_obligations.is_empty() {
             MailboxDb::open_with_authority(&sidecar_path, &sidecar_authority)?
         } else {
@@ -306,6 +306,12 @@ impl StateDb {
                 mismatch.expected_sidecar_generation
             ));
         }
+        validate_existing_completion_listeners(
+            &mailbox,
+            &existing_obligations,
+            admission_id,
+            owner_invocation_uuid,
+        )?;
         record_completion_obligation_on(
             &tx,
             CompletionObligationAdmission {
@@ -433,7 +439,7 @@ fn record_completion_obligation_on(
         .ok_or_else(|| persistence_message("completion obligation disappeared after insert"))
 }
 
-fn active_completion_obligations_on(
+fn all_completion_obligations_on(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<CompletionObligationExpectation>, OwnershipAuthorityError> {
     let mut statement = conn
@@ -443,17 +449,48 @@ fn active_completion_obligations_on(
                     obligation.owner_session_id, obligation.expected_sidecar_generation,
                     obligation.admitted_at
              FROM invocation_completion_obligations AS obligation
-             JOIN invocations AS invocation
-               ON invocation.invocation_uuid = obligation.invocation_uuid
-             WHERE invocation.status = 'running'
              ORDER BY obligation.admitted_at, obligation.admission_id",
         )
-        .map_err(persistence("prepare active completion obligation query"))?;
+        .map_err(persistence("prepare completion obligation authority query"))?;
     let rows = statement
         .query_map([], map_completion_obligation_row)
-        .map_err(persistence("query active completion obligations"))?;
+        .map_err(persistence("query completion obligation authority"))?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(persistence("read active completion obligations"))
+        .map_err(persistence("read completion obligation authority"))
+}
+
+fn validate_existing_completion_listeners(
+    mailbox: &MailboxDb,
+    obligations: &[CompletionObligationExpectation],
+    replay_admission_id: &str,
+    owner_invocation_uuid: &str,
+) -> Result<(), String> {
+    for obligation in obligations {
+        if obligation.admission_id == replay_admission_id {
+            continue;
+        }
+        let present = mailbox.contains_completion_obligation(
+            &obligation.event_id,
+            &obligation.owner_invocation_uuid,
+            &obligation.owner_session_id,
+        )
+        .map_err(|error| {
+            format!(
+                "process_integrity: invocation {owner_invocation_uuid} cannot validate completion obligation {} before new admission: {error}",
+                obligation.admission_id,
+            )
+        })?;
+        if !present {
+            return Err(format!(
+                "process_integrity: invocation {owner_invocation_uuid} cannot admit new completion authority because obligation {} owned by {} expects event {} in mailbox sidecar generation {}, but the event listener is absent",
+                obligation.admission_id,
+                obligation.owner_invocation_uuid,
+                obligation.event_id,
+                obligation.expected_sidecar_generation,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Result<(), String> {
@@ -691,6 +728,7 @@ mod tests {
 
     const INVOCATION_UUID: &str = "11111111-1111-4111-8111-111111111111";
     const SECOND_INVOCATION_UUID: &str = "22222222-2222-4222-8222-222222222222";
+    const THIRD_INVOCATION_UUID: &str = "33333333-3333-4333-8333-333333333333";
     const EVENT_ID: &str = "age299-s2-barrier-event";
     const SESSION_ID: &str = "age299-s2-barrier-session";
 
@@ -769,18 +807,14 @@ mod tests {
                 .unwrap();
         });
         assert!(
-            finalize_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
+            finalize_rx.recv_timeout(Duration::from_millis(25)).is_err(),
             "finalization must wait behind the completion-admission state writer"
         );
 
         admission_release_tx.send(()).unwrap();
         state_committed_rx.recv().unwrap();
         assert!(
-            finalize_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
+            finalize_rx.recv_timeout(Duration::from_millis(25)).is_err(),
             "finalization must wait behind sidecar materialization"
         );
 
@@ -953,7 +987,7 @@ mod tests {
                 second_registration,
             )
             .unwrap();
-        let obligations = active_completion_obligations_on(state.connection()).unwrap();
+        let obligations = all_completion_obligations_on(state.raw_connection()).unwrap();
         assert_eq!(obligations.len(), 2);
         assert!(
             obligations.iter().all(|obligation| {
@@ -962,12 +996,288 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_invocations_do_not_implicitly_retire_completion_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let held_sidecar_path = directory.path().join("pid-identity.held");
+        let mut state = StateDb::open(&state_path).unwrap();
+        let mut invocation_ids = Vec::new();
+        for invocation_uuid in [
+            INVOCATION_UUID,
+            SECOND_INVOCATION_UUID,
+            THIRD_INVOCATION_UUID,
+        ] {
+            invocation_ids.push(
+                state
+                    .start_invocation(&InvocationStart {
+                        invocation_uuid: invocation_uuid.to_string(),
+                        model_name: "age299-s2".to_string(),
+                        provider_name: "test-provider".to_string(),
+                        provider_index: 0,
+                        parent_invocation_id: None,
+                    })
+                    .unwrap(),
+            );
+        }
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-terminal-success-admission",
+                registration_for(
+                    "age299-s2-terminal-success-event",
+                    "age299-s2-terminal-success-session",
+                    INVOCATION_UUID,
+                ),
+            )
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-terminal-failure-admission",
+                registration_for(
+                    "age299-s2-terminal-failure-event",
+                    "age299-s2-terminal-failure-session",
+                    SECOND_INVOCATION_UUID,
+                ),
+            )
+            .unwrap();
+        let retained_generation = MailboxDb::open(&sidecar_path)
+            .unwrap()
+            .sidecar_generation()
+            .unwrap();
+        state
+            .finalize_invocation(invocation_ids[0], true, 0, None, None)
+            .unwrap();
+        state
+            .finalize_invocation(
+                invocation_ids[1],
+                false,
+                1,
+                Some("test_failure"),
+                Some("test_failure"),
+            )
+            .unwrap();
+        std::fs::rename(&sidecar_path, &held_sidecar_path).unwrap();
+        let third_registration = registration_for(
+            "age299-s2-post-terminal-event",
+            "age299-s2-post-terminal-session",
+            THIRD_INVOCATION_UUID,
+        );
+
+        let missing_error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-post-terminal-admission",
+                third_registration,
+            )
+            .unwrap_err();
+        assert!(
+            missing_error.contains("process_integrity"),
+            "{missing_error}"
+        );
+        assert!(!sidecar_path.exists());
+
+        let replacement_generation = MailboxDb::open(&sidecar_path)
+            .unwrap()
+            .sidecar_generation()
+            .unwrap();
+        assert_ne!(replacement_generation, retained_generation);
+        let replacement_error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-post-terminal-admission",
+                third_registration,
+            )
+            .unwrap_err();
+        assert!(
+            replacement_error.contains(&retained_generation),
+            "{replacement_error}"
+        );
+        assert!(
+            state
+                .completion_obligations_for_invocation(THIRD_INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_file(&sidecar_path).unwrap();
+        std::fs::rename(&held_sidecar_path, &sidecar_path).unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-post-terminal-admission",
+                third_registration,
+            )
+            .unwrap();
+        let obligations = all_completion_obligations_on(state.raw_connection()).unwrap();
+        assert_eq!(obligations.len(), 3);
+        assert!(
+            obligations.iter().all(|obligation| {
+                obligation.expected_sidecar_generation == retained_generation
+            })
+        );
+    }
+
+    #[test]
+    fn completion_registration_rejects_a_stale_same_generation_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let stale_sidecar_path = directory.path().join("pid-identity.stale");
+        let retained_sidecar_path = directory.path().join("pid-identity.retained");
+        let mut state = StateDb::open(&state_path).unwrap();
+        for invocation_uuid in [INVOCATION_UUID, SECOND_INVOCATION_UUID] {
+            state
+                .start_invocation(&InvocationStart {
+                    invocation_uuid: invocation_uuid.to_string(),
+                    model_name: "age299-s2".to_string(),
+                    provider_name: "test-provider".to_string(),
+                    provider_index: 0,
+                    parent_invocation_id: None,
+                })
+                .unwrap();
+        }
+        let retained_generation = MailboxDb::open(&sidecar_path)
+            .unwrap()
+            .sidecar_generation()
+            .unwrap();
+        std::fs::copy(&sidecar_path, &stale_sidecar_path).unwrap();
+        state
+            .register_completion_event_with_obligation("age299-s2-first-admission", registration())
+            .unwrap();
+        std::fs::rename(&sidecar_path, &retained_sidecar_path).unwrap();
+        std::fs::copy(&stale_sidecar_path, &sidecar_path).unwrap();
+        let second_registration = registration_for(
+            "age299-s2-stale-snapshot-event",
+            "age299-s2-stale-snapshot-session",
+            SECOND_INVOCATION_UUID,
+        );
+
+        let error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-stale-snapshot-admission",
+                second_registration,
+            )
+            .unwrap_err();
+        assert!(error.contains("event listener is absent"), "{error}");
+        assert!(
+            state
+                .completion_obligations_for_invocation(SECOND_INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
+        );
+        let stale_sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        assert_eq!(
+            stale_sidecar.sidecar_generation().unwrap(),
+            retained_generation
+        );
+        assert!(
+            stale_sidecar
+                .completion_event(second_registration.event_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(stale_sidecar);
+
+        std::fs::remove_file(&sidecar_path).unwrap();
+        std::fs::rename(&retained_sidecar_path, &sidecar_path).unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-stale-snapshot-admission",
+                second_registration,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn exact_replay_repairs_its_own_missing_listener_before_new_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let fault_connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+        fault_connection
+            .execute_batch(
+                "CREATE TRIGGER reject_completion_registration
+                 BEFORE INSERT ON completion_event
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced completion registration failure');
+                 END;",
+            )
+            .unwrap();
+        drop(fault_connection);
+
+        let first_error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-partial-admission",
+                registration(),
+            )
+            .unwrap_err();
+        assert!(
+            first_error.contains("forced completion registration failure"),
+            "{first_error}"
+        );
+        assert_eq!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .len(),
+            1
+        );
+        let distinct_error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-distinct-admission",
+                registration_for(
+                    "age299-s2-distinct-event",
+                    "age299-s2-distinct-session",
+                    INVOCATION_UUID,
+                ),
+            )
+            .unwrap_err();
+        assert!(
+            distinct_error.contains("event listener is absent"),
+            "{distinct_error}"
+        );
+
+        rusqlite::Connection::open(&sidecar_path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_completion_registration;")
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-partial-admission",
+                registration(),
+            )
+            .unwrap();
+        assert!(
+            MailboxDb::open(&sidecar_path)
+                .unwrap()
+                .contains_completion_obligation(EVENT_ID, INVOCATION_UUID, SESSION_ID)
+                .unwrap()
+        );
+    }
+
     fn registration() -> CompletionEventRegistrationInput<'static> {
+        registration_for(EVENT_ID, SESSION_ID, INVOCATION_UUID)
+    }
+
+    fn registration_for(
+        event_id: &'static str,
+        session_id: &'static str,
+        invocation_uuid: &'static str,
+    ) -> CompletionEventRegistrationInput<'static> {
         CompletionEventRegistrationInput {
-            event_id: EVENT_ID,
+            event_id,
             delivery_mode: "async",
-            owner_session_id: Some(SESSION_ID),
-            owner_invocation_uuid: Some(INVOCATION_UUID),
+            owner_session_id: Some(session_id),
+            owner_invocation_uuid: Some(invocation_uuid),
             state_dir: "/tmp/age299-s2-barrier-state",
             meta_path: "/tmp/age299-s2-barrier-meta",
             log_path: "/tmp/age299-s2-barrier-log",

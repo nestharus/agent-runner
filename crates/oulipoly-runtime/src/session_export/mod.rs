@@ -142,8 +142,8 @@ fn read_canonical_transcript_from_state_db(
     metadata: &ExportSessionMetadata,
 ) -> Result<Vec<CanonicalRecord>, ExportError> {
     let db = StateDb::open_default().map_err(|message| ExportError::Operational { message })?;
-    let mut stmt = db
-        .connection()
+    let connection = db.connection();
+    let mut stmt = connection
         .prepare(
             "SELECT id, turn_id, timestamp, role, body
              FROM session_turns
@@ -602,7 +602,8 @@ mod tests {
     fn seed_db_body(data_home: &Path, turn_id: &str, text: &str) {
         let db_path = data_home.join("oulipoly-agent-runner").join("state.db");
         let db = StateDb::open(&db_path).unwrap();
-        db.connection()
+        rusqlite::Connection::open(db.path())
+            .unwrap()
             .execute(
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role,
@@ -706,6 +707,7 @@ mod tests {
         let records = with_data_home(&data_home, || {
             let db_path = data_home.join("oulipoly-agent-runner").join("state.db");
             let db = StateDb::open(&db_path).unwrap();
+            let connection = rusqlite::Connection::open(db.path()).unwrap();
             for (turn_id, role, timestamp, body) in [
                 (
                     "db-user",
@@ -720,7 +722,7 @@ mod tests {
                     r#"[{"type":"text","text":"db fallback assistant"}]"#,
                 ),
             ] {
-                db.connection()
+                connection
                     .execute(
                         "INSERT INTO session_turns
                             (provider_name, session_id, turn_id, timestamp, role,

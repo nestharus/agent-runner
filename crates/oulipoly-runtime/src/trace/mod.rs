@@ -295,8 +295,8 @@ fn read_inline_transcript(
     let (Some(provider_name), Some(session_id)) = (provider_name, session_id) else {
         return Ok(Vec::new());
     };
-    let mut stmt = db
-        .connection()
+    let connection = db.connection();
+    let mut stmt = connection
         .prepare(
             "SELECT turn_id, timestamp, role, body
              FROM session_turns

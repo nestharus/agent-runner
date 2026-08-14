@@ -742,8 +742,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.db");
         let state = StateDb::open(&state_path).unwrap();
-        let baseline_version = user_version(state.connection());
-        let baseline_columns = invocation_columns(state.connection());
+        let baseline_version = user_version(state.raw_connection());
+        let baseline_columns = invocation_columns(state.raw_connection());
         drop(state);
 
         let sidecar_path = dir.path().join("pid-identity.db");
@@ -754,8 +754,8 @@ mod tests {
         drop(sidecar);
 
         let state = StateDb::open(&state_path).unwrap();
-        assert_eq!(user_version(state.connection()), baseline_version);
-        assert_eq!(invocation_columns(state.connection()), baseline_columns);
+        assert_eq!(user_version(state.raw_connection()), baseline_version);
+        assert_eq!(invocation_columns(state.raw_connection()), baseline_columns);
     }
 
     fn user_version(conn: &Connection) -> i64 {

@@ -754,7 +754,8 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
 fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
-    assert_eq!(user_version(fresh.connection()), 14);
+    let fresh_connection = rusqlite::Connection::open(fresh.path()).unwrap();
+    assert_eq!(user_version(&fresh_connection), 14);
     let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
@@ -767,14 +768,14 @@ fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
         "session_delivery_evidence",
     ];
     for table in lifecycle_tables {
-        assert!(table_exists(fresh.connection(), table), "missing {table}");
+        assert!(table_exists(&fresh_connection, table), "missing {table}");
     }
     assert!(
-        table_exists(fresh.connection(), "fresh_continuations"),
+        table_exists(&fresh_connection, "fresh_continuations"),
         "missing fresh_continuations"
     );
     assert!(
-        table_exists(fresh.connection(), "invocation_completion_obligations"),
+        table_exists(&fresh_connection, "invocation_completion_obligations"),
         "missing invocation_completion_obligations"
     );
 

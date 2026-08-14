@@ -57,6 +57,7 @@ pub use db::ReadOnlyOpenError;
 pub use db::SessionTurnCounts;
 pub use db::SessionTurnIngest;
 pub use db::StateDb;
+pub use db::StateReadConnection;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 pub use db::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
@@ -89,6 +90,9 @@ pub use db::{
 };
 pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
+pub use db::{
+    SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
+};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 pub use mailbox::{
@@ -139,6 +143,28 @@ pub mod age_32_connection_boundary_doctest {
     /// let mut state = StateDb::open_default().unwrap();
     /// let escaped: &mut rusqlite::Connection = state.connection_mut();
     /// escaped.execute_batch("CREATE TABLE bypass (id INTEGER)").unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use oulipoly_state::StateDb;
+    ///
+    /// let state = StateDb::open_default().unwrap();
+    /// state.connection().execute_batch(
+    ///     "DROP TRIGGER trg_invocation_completion_obligations_append_only_delete;
+    ///      DELETE FROM invocation_completion_obligations;",
+    /// ).unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use oulipoly_state::StateDb;
+    ///
+    /// let mut state = StateDb::open_default().unwrap();
+    /// state.with_write_txn(|tx| {
+    ///     tx.execute_batch(
+    ///         "DROP TRIGGER trg_invocation_completion_obligations_append_only_delete;
+    ///          DELETE FROM invocation_completion_obligations;",
+    ///     ).map_err(|error| error.to_string())
+    /// }).unwrap();
     /// ```
     pub struct StateDbRawConnectionEscapeMustNotCompile;
 }

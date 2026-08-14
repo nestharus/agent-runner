@@ -77,8 +77,8 @@ fn running_invocation_rows(state: &StateDb) -> Result<Vec<RunningInvocationRow>,
 fn running_invocation_row_values(
     state: &StateDb,
 ) -> Result<Vec<RunningInvocationRowValues>, String> {
-    let mut stmt = state
-        .connection()
+    let connection = state.connection();
+    let mut stmt = connection
         .prepare(
             "SELECT id, invocation_uuid, created_at
              FROM invocations

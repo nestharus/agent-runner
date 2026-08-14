@@ -61,10 +61,9 @@ type RawCompletionObligationRow = (
 
 #[test]
 fn state_db_rejects_completion_obligations_for_unknown_invocations() {
-    let state = StateDb::open(Path::new(":memory:")).unwrap();
+    let state = StateDb::open(&file_backed_test_state_path()).unwrap();
 
-    let error = state
-        .connection()
+    let error = raw_state_connection(&state)
         .execute(
             COMPLETION_OBLIGATION_INSERT,
             rusqlite::params![
@@ -98,10 +97,11 @@ fn schema_13_migrates_through_ordered_v14_and_preserves_invocation_data() {
     );
 
     let state = StateDb::open(&path).unwrap();
-    assert_eq!(user_version(state.connection()), CURRENT_SCHEMA_VERSION);
-    assert_eq!(invocation_projection(state.connection()), before);
+    let connection = raw_state_connection(&state);
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
+    assert_eq!(invocation_projection(&connection), before);
     assert!(table_exists(
-        state.connection(),
+        &connection,
         "invocation_completion_obligations"
     ));
     assert_invalid_utf8_insert_is_rejected(
@@ -920,8 +920,7 @@ fn replace_cannot_bypass_append_only_identity() {
         .unwrap();
     let before = raw_completion_obligation_rows(&state);
 
-    let error = state
-        .connection()
+    let error = raw_state_connection(&state)
         .execute(
             "INSERT OR REPLACE INTO invocation_completion_obligations (
                 admission_id, invocation_uuid, event_id, owner_invocation_uuid,
@@ -1229,7 +1228,7 @@ fn build_schema_13_database(path: &Path) {
 }
 
 fn state_with_root() -> StateDb {
-    let state = StateDb::open(Path::new(":memory:")).unwrap();
+    let state = StateDb::open(&file_backed_test_state_path()).unwrap();
     state
         .start_invocation(&invocation(ROOT_UUID, None))
         .unwrap();
@@ -1237,7 +1236,23 @@ fn state_with_root() -> StateDb {
 }
 
 fn state_with_lineage() -> StateDb {
-    state_with_lineage_at(Path::new(":memory:"))
+    state_with_lineage_at(&file_backed_test_state_path())
+}
+
+fn file_backed_test_state_path() -> std::path::PathBuf {
+    tempfile::tempdir()
+        .unwrap()
+        .keep()
+        .join(format!("{}.db", uuid::Uuid::new_v4()))
+}
+
+fn raw_state_connection(state: &StateDb) -> Connection {
+    let mut connection = Connection::open(state.path()).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    migrations::run_with_db_path(&mut connection, &[], state.path().to_path_buf()).unwrap();
+    connection
 }
 
 fn state_with_lineage_at(path: &Path) -> StateDb {
@@ -1322,8 +1337,7 @@ fn assert_every_direct_update_is_rejected(state: &StateDb, admission_id: &str) {
         ("admitted_at", "2026-08-13T00:05:00Z"),
     ] {
         let before = raw_completion_obligation_rows(state);
-        let error = state
-            .connection()
+        let error = raw_state_connection(state)
             .execute(
                 &format!(
                     "UPDATE invocation_completion_obligations
@@ -1346,8 +1360,7 @@ fn assert_every_direct_update_is_rejected(state: &StateDb, admission_id: &str) {
 
 fn assert_direct_delete_is_rejected(state: &StateDb, admission_id: &str) {
     let before = raw_completion_obligation_rows(state);
-    let error = state
-        .connection()
+    let error = raw_state_connection(state)
         .execute(
             "DELETE FROM invocation_completion_obligations WHERE admission_id = ?1",
             [admission_id],
@@ -1395,8 +1408,7 @@ fn assert_null_admission_insert_forms_are_rejected(
         ),
     ] {
         let before = raw_completion_obligation_rows(state);
-        let error = state
-            .connection()
+        let error = raw_state_connection(state)
             .execute(
                 statement,
                 rusqlite::params![
@@ -1446,8 +1458,7 @@ fn assert_null_admission_conflict_actions_are_rejected(
         ),
     ] {
         let before = raw_completion_obligation_rows(state);
-        let error = state
-            .connection()
+        let error = raw_state_connection(state)
             .execute(
                 statement,
                 rusqlite::params![
@@ -1634,8 +1645,7 @@ fn assert_equivalent_blob_admission_is_rejected(state: &StateDb, text_admission_
         Value::Text("2026-08-13T00:10:00Z".to_string()),
     ];
 
-    let error = state
-        .connection()
+    let error = raw_state_connection(state)
         .execute(
             COMPLETION_OBLIGATION_INSERT,
             params_from_iter(values.iter()),
@@ -1684,8 +1694,7 @@ fn assert_malformed_statement_is_rejected(
         .completion_obligation_authority(NUMERIC_ADMISSION_ID)
         .unwrap();
 
-    let error = state
-        .connection()
+    let error = raw_state_connection(state)
         .execute(statement, params_from_iter(values.iter()))
         .unwrap_err();
     assert!(
@@ -1840,7 +1849,7 @@ fn direct_insert_completion_obligation(
     input: CompletionObligationAdmission<'_>,
     admitted_at: &str,
 ) -> rusqlite::Result<usize> {
-    state.connection().execute(
+    raw_state_connection(state).execute(
         "INSERT INTO invocation_completion_obligations (
             admission_id, invocation_uuid, event_id, owner_invocation_uuid,
             owner_session_id, expected_sidecar_generation, admitted_at
@@ -1858,7 +1867,7 @@ fn direct_insert_completion_obligation(
 }
 
 fn raw_completion_obligation_rows(state: &StateDb) -> Vec<RawCompletionObligationRow> {
-    raw_completion_obligation_rows_for_connection(state.connection())
+    raw_completion_obligation_rows_for_connection(&raw_state_connection(state))
 }
 
 fn raw_completion_obligation_rows_for_connection(
@@ -1893,8 +1902,8 @@ fn raw_completion_obligation_rows_for_connection(
 }
 
 fn ownership_schema(state: &StateDb) -> Vec<String> {
-    let mut statement = state
-        .connection()
+    let connection = raw_state_connection(state);
+    let mut statement = connection
         .prepare(
             "SELECT sql FROM sqlite_schema
              WHERE name IN (

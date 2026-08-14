@@ -708,8 +708,8 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
     let state = fixture.open_state();
-    state
-        .connection()
+    rusqlite::Connection::open(state.path())
+        .unwrap()
         .execute_batch("PRAGMA wal_autocheckpoint=0;")
         .unwrap();
     let root_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;

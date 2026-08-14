@@ -22,7 +22,7 @@ impl StateDb {
         &self,
         chain_id: &str,
     ) -> Result<Vec<ChainSegmentRow>, DbError> {
-        read_chain_segments_desc(self.connection(), chain_id)
+        read_chain_segments_desc(self.raw_connection(), chain_id)
     }
 }
 
