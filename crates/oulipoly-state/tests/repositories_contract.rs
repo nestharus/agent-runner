@@ -16,10 +16,32 @@ use oulipoly_state::{
 };
 use std::path::PathBuf;
 
+struct TestDb {
+    db: StateDb,
+    _directory: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TestDb {
+    type Target = StateDb;
+
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
+
 // Declared role: accessor
-fn memory_db() -> StateDb {
-    let directory = tempfile::tempdir().unwrap().keep();
-    StateDb::open(&directory.join(format!("{}.db", uuid::Uuid::new_v4()))).unwrap()
+fn memory_db() -> TestDb {
+    let directory = tempfile::tempdir().unwrap();
+    let db = StateDb::open(
+        &directory
+            .path()
+            .join(format!("{}.db", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    TestDb {
+        db,
+        _directory: directory,
+    }
 }
 
 // Declared role: mapper
