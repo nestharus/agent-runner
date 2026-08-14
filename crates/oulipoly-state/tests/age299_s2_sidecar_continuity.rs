@@ -1,7 +1,5 @@
 use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
 use oulipoly_state::{CompletionObligationAdmission, InvocationStart, StateDb};
-use std::path::Path;
-
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const EVENT_ID: &str = "ab_age299_s2_event";
 const ADMISSION_ID: &str = "admission-age299-s2";
@@ -12,19 +10,17 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
-    let state = StateDb::open(&state_path).unwrap();
+    let mut state = StateDb::open(&state_path).unwrap();
     let invocation_row_id = start_invocation(&state, ROOT_UUID);
-    let matching_generation =
-        register_sidecar_completion(&sidecar_path, EVENT_ID, ROOT_UUID, OWNER_SESSION_ID);
     state
-        .record_completion_obligation(obligation(
+        .register_completion_event_with_obligation(
             ADMISSION_ID,
-            ROOT_UUID,
-            EVENT_ID,
-            ROOT_UUID,
-            OWNER_SESSION_ID,
-            &matching_generation,
-        ))
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap();
+    let matching_generation = MailboxDb::open(&sidecar_path)
+        .unwrap()
+        .sidecar_generation()
         .unwrap();
     state
         .finalize_invocation(invocation_row_id, true, 0, None, None)
@@ -88,19 +84,13 @@ fn admitted_completion_authority_refuses_a_renamed_sidecar_until_exact_authority
     let state_path = directory.path().join("state.db");
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let renamed_sidecar_path = directory.path().join("pid-identity.held");
-    let state = StateDb::open(&state_path).unwrap();
+    let mut state = StateDb::open(&state_path).unwrap();
     let invocation_row_id = start_invocation(&state, ROOT_UUID);
-    let generation =
-        register_sidecar_completion(&sidecar_path, EVENT_ID, ROOT_UUID, OWNER_SESSION_ID);
     state
-        .record_completion_obligation(obligation(
+        .register_completion_event_with_obligation(
             ADMISSION_ID,
-            ROOT_UUID,
-            EVENT_ID,
-            ROOT_UUID,
-            OWNER_SESSION_ID,
-            &generation,
-        ))
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
         .unwrap();
     std::fs::rename(&sidecar_path, &renamed_sidecar_path).unwrap();
 
@@ -223,41 +213,21 @@ fn obligation<'a>(
     }
 }
 
-fn register_sidecar_completion(
-    sidecar_path: &Path,
-    event_id: &str,
-    owner_invocation_uuid: &str,
-    owner_session_id: &str,
-) -> String {
-    let mut mailbox = MailboxDb::open(sidecar_path).unwrap();
-    let generation = mailbox.sidecar_generation().unwrap();
-    register_completion_event(
-        &mut mailbox,
+fn completion_registration<'a>(
+    event_id: &'a str,
+    owner_invocation_uuid: &'a str,
+    owner_session_id: &'a str,
+) -> CompletionEventRegistrationInput<'a> {
+    CompletionEventRegistrationInput {
         event_id,
-        owner_invocation_uuid,
-        owner_session_id,
-    );
-    generation
-}
-
-fn register_completion_event(
-    mailbox: &mut MailboxDb,
-    event_id: &str,
-    owner_invocation_uuid: &str,
-    owner_session_id: &str,
-) {
-    mailbox
-        .register_completion_event(CompletionEventRegistrationInput {
-            event_id,
-            delivery_mode: "async",
-            owner_session_id: Some(owner_session_id),
-            owner_invocation_uuid: Some(owner_invocation_uuid),
-            state_dir: "/tmp/age299-s2-state",
-            meta_path: "/tmp/age299-s2-meta",
-            log_path: "/tmp/age299-s2-log",
-            rc_path: "/tmp/age299-s2-rc",
-        })
-        .unwrap();
+        delivery_mode: "async",
+        owner_session_id: Some(owner_session_id),
+        owner_invocation_uuid: Some(owner_invocation_uuid),
+        state_dir: "/tmp/age299-s2-state",
+        meta_path: "/tmp/age299-s2-meta",
+        log_path: "/tmp/age299-s2-log",
+        rc_path: "/tmp/age299-s2-rc",
+    }
 }
 
 fn assert_running(state: &StateDb, invocation_uuid: &str) {

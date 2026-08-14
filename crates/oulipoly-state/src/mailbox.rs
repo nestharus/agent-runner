@@ -1822,7 +1822,7 @@ impl MailboxDb {
         Ok(map_finished_drain(row))
     }
 
-    pub fn register_completion_event(
+    pub(crate) fn register_completion_event(
         &mut self,
         input: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {

@@ -4,7 +4,7 @@ use oulipoly_runtime::services::{
     ProductionInvocationLifecycleService, error::ServiceError,
 };
 use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
-use oulipoly_state::{CompletionObligationAdmission, InvocationStart, StateDb};
+use oulipoly_state::{InvocationStart, StateDb};
 use rusqlite::{OptionalExtension, params};
 use std::path::Path;
 
@@ -258,35 +258,25 @@ fn age_299_s2_service_projects_missing_expected_sidecar_as_dependency_failure() 
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
-    let state = StateDb::open(&state_path).unwrap();
+    let mut state = StateDb::open(&state_path).unwrap();
     let invocation_uuid = "55555555-5555-4555-8555-555555555555";
     let invocation_row_id = state
         .start_invocation(&start_fixture(invocation_uuid, 0, None))
         .unwrap();
-    let mut sidecar = MailboxDb::open(&sidecar_path).unwrap();
-    let sidecar_generation = sidecar.sidecar_generation().unwrap();
-    sidecar
-        .register_completion_event(CompletionEventRegistrationInput {
-            event_id: "age299-s2-service-event",
-            delivery_mode: "async",
-            owner_session_id: Some("age299-s2-service-session"),
-            owner_invocation_uuid: Some(invocation_uuid),
-            state_dir: "/tmp/age299-s2-service-state",
-            meta_path: "/tmp/age299-s2-service-meta",
-            log_path: "/tmp/age299-s2-service-log",
-            rc_path: "/tmp/age299-s2-service-rc",
-        })
-        .unwrap();
-    drop(sidecar);
     state
-        .record_completion_obligation(CompletionObligationAdmission {
-            admission_id: "age299-s2-service-admission",
-            invocation_uuid,
-            event_id: "age299-s2-service-event",
-            owner_invocation_uuid: invocation_uuid,
-            owner_session_id: "age299-s2-service-session",
-            expected_sidecar_generation: &sidecar_generation,
-        })
+        .register_completion_event_with_obligation(
+            "age299-s2-service-admission",
+            CompletionEventRegistrationInput {
+                event_id: "age299-s2-service-event",
+                delivery_mode: "async",
+                owner_session_id: Some("age299-s2-service-session"),
+                owner_invocation_uuid: Some(invocation_uuid),
+                state_dir: "/tmp/age299-s2-service-state",
+                meta_path: "/tmp/age299-s2-service-meta",
+                log_path: "/tmp/age299-s2-service-log",
+                rc_path: "/tmp/age299-s2-service-rc",
+            },
+        )
         .unwrap();
     std::fs::remove_file(sidecar_path).unwrap();
 
