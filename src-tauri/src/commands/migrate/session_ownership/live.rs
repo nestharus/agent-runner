@@ -10,7 +10,7 @@ use super::target_resolution;
 use oulipoly_state::{StateDb, StateDbWriterAuthority};
 use rusqlite::Connection;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -29,7 +29,7 @@ pub(crate) struct ApplyOutcome {
 
 pub(crate) struct LiveMigrationConnection {
     connection: Connection,
-    _authority: StateDbWriterAuthority,
+    authority: StateDbWriterAuthority,
 }
 
 impl Deref for LiveMigrationConnection {
@@ -40,10 +40,16 @@ impl Deref for LiveMigrationConnection {
     }
 }
 
+impl LiveMigrationConnection {
+    pub(crate) fn state_path(&self) -> &Path {
+        self.authority.path()
+    }
+}
+
 pub(crate) fn run_session_ownership_apply(opts: ApplyOptions) -> Result<ApplyOutcome, DryRunError> {
     let conn = open_live_migration_connection(&opts.live_state_db_path)?;
-    let backup_path =
-        db_copy::create_verified_live_backup(&opts.live_state_db_path, &opts.backup_dir)?;
+    let source_path = conn.state_path().to_path_buf();
+    let backup_path = db_copy::create_verified_live_backup(&source_path, &opts.backup_dir)?;
     let before = preflight::preflight(&conn)?;
     let target = target_resolution::resolve_target(opts.models_dir.as_deref())?;
     let provider_proof = prove_or_skip_provider(&target, opts.skip_provider_proof)?;
@@ -63,7 +69,7 @@ pub(crate) fn run_session_ownership_apply(opts: ApplyOptions) -> Result<ApplyOut
     };
     let report_path = report::write_apply_report(&report::ApplyReportInput {
         report_dir: opts.backup_dir,
-        source_path: absolute_path(&opts.live_state_db_path)?,
+        source_path,
         backup_path: backup_path.clone(),
         before,
         verification,
@@ -81,8 +87,8 @@ pub(crate) fn run_session_ownership_corrective_apply(
     opts: ApplyOptions,
 ) -> Result<ApplyOutcome, DryRunError> {
     let conn = open_live_migration_connection(&opts.live_state_db_path)?;
-    let backup_path =
-        db_copy::create_verified_live_backup(&opts.live_state_db_path, &opts.backup_dir)?;
+    let source_path = conn.state_path().to_path_buf();
+    let backup_path = db_copy::create_verified_live_backup(&source_path, &opts.backup_dir)?;
     let before = preflight::preflight(&conn)?;
     let target = target_resolution::resolve_target(opts.models_dir.as_deref())?;
     let provider_proof = prove_or_skip_provider(&target, opts.skip_provider_proof)?;
@@ -107,7 +113,7 @@ pub(crate) fn run_session_ownership_corrective_apply(
     };
     let report_path = report::write_corrective_apply_report(&report::CorrectiveApplyReportInput {
         report_dir: opts.backup_dir,
-        source_path: absolute_path(&opts.live_state_db_path)?,
+        source_path,
         backup_path: backup_path.clone(),
         before,
         verification,
@@ -128,7 +134,7 @@ pub(crate) fn open_live_migration_connection(
     conn.busy_timeout(Duration::from_millis(1000))?;
     Ok(LiveMigrationConnection {
         connection: conn,
-        _authority: authority,
+        authority,
     })
 }
 
@@ -172,10 +178,6 @@ fn corrective_rollback_after_failed_verify<T>(
         "post-apply verification failed: {err}; {rollback_result}; backup={}",
         backup_path.display()
     )))
-}
-
-fn absolute_path(path: &std::path::Path) -> Result<PathBuf, DryRunError> {
-    path.canonicalize().map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -238,5 +240,21 @@ mod tests {
             error.to_string().contains("exactly one hard link"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_migration_retains_the_normalized_authority_path() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_path = directory.path().join("target.db");
+        let alias_path = directory.path().join("state.db");
+        drop(StateDb::open(&target_path).unwrap());
+        symlink(&target_path, &alias_path).unwrap();
+
+        let migration = open_live_migration_connection(&alias_path).unwrap();
+
+        assert_eq!(migration.state_path(), target_path.canonicalize().unwrap());
     }
 }

@@ -21,6 +21,7 @@ pub(crate) fn run_session_ownership_rollback(
     opts: RollbackOptions,
 ) -> Result<RollbackOutcome, DryRunError> {
     let conn = open_live_migration_connection(&opts.live_state_db_path)?;
+    let source_path = conn.state_path().to_path_buf();
     let before = preflight::preflight(&conn)?;
     let preimage_rows = sql::require_preimage_rows(&conn)?;
     let rollback = sql::apply_rollback_live(&conn)?;
@@ -32,7 +33,6 @@ pub(crate) fn run_session_ownership_rollback(
             after.quick_check
         )));
     }
-    let source_path = opts.live_state_db_path.canonicalize()?;
     let report_path = report::write_rollback_report(&report::RollbackReportInput {
         report_dir: report::default_rollback_report_dir(&source_path),
         source_path,
@@ -50,6 +50,7 @@ pub(crate) fn run_session_ownership_corrective_rollback(
     opts: RollbackOptions,
 ) -> Result<RollbackOutcome, DryRunError> {
     let conn = open_live_migration_connection(&opts.live_state_db_path)?;
+    let source_path = conn.state_path().to_path_buf();
     let before = preflight::preflight(&conn)?;
     let preimage_rows = sql::require_corrective_preimage_rows(&conn)?;
     let rollback = sql::apply_corrective_rollback_live(&conn)?;
@@ -61,7 +62,6 @@ pub(crate) fn run_session_ownership_corrective_rollback(
             after.quick_check
         )));
     }
-    let source_path = opts.live_state_db_path.canonicalize()?;
     let report_path =
         report::write_corrective_rollback_report(&report::CorrectiveRollbackReportInput {
             report_dir: report::default_rollback_report_dir(&source_path),

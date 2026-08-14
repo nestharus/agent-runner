@@ -300,8 +300,7 @@ impl StateDb {
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
         let guard = StateNamespaceGuard::acquire(&db_path, true)?;
-        Self::reject_rebuild_leaf_symlink(path)?;
-        Self::validate_state_namespace_file(&db_path)?;
+        Self::validate_rebuild_source(path, &db_path)?;
         Ok(StateDbRebuildAuthority {
             _guard: guard,
             db_path,
@@ -435,6 +434,17 @@ impl StateDb {
                 path.display()
             )),
         }
+    }
+
+    fn validate_rebuild_source(path: &Path, authority_path: &Path) -> Result<(), String> {
+        Self::reject_rebuild_leaf_symlink(path)?;
+        if Self::normalized_state_open_path(path) != authority_path {
+            return Err(format!(
+                "State DB rebuild source changed during authority acquisition: {}",
+                path.display()
+            ));
+        }
+        Self::validate_state_namespace_file(authority_path)
     }
 
     #[cfg(any(unix, windows))]
@@ -608,6 +618,12 @@ impl StateDbWriterAuthority {
     }
 }
 
+impl StateDbRebuildAuthority {
+    pub fn path(&self) -> &Path {
+        &self.db_path
+    }
+}
+
 #[cfg(test)]
 mod state_namespace_tests {
     use super::*;
@@ -713,5 +729,48 @@ mod state_namespace_tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&target_path).unwrap(), target_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_source_rejoin_rejects_a_replaced_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target_path = directory.path().join("target.db");
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&target_path).unwrap());
+        symlink(&target_path, &state_path).unwrap();
+        let authority_path = StateDb::normalized_state_open_path(&state_path);
+        std::fs::remove_file(&state_path).unwrap();
+        drop(StateDb::open(&state_path).unwrap());
+
+        let error = StateDb::validate_rebuild_source(&state_path, &authority_path).unwrap_err();
+
+        assert!(error.contains("source changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rebuild_source_rejoin_rejects_a_retargeted_parent_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_parent = directory.path().join("first");
+        let second_parent = directory.path().join("second");
+        let alias_parent = directory.path().join("current");
+        std::fs::create_dir_all(&first_parent).unwrap();
+        std::fs::create_dir_all(&second_parent).unwrap();
+        drop(StateDb::open(&first_parent.join("state.db")).unwrap());
+        drop(StateDb::open(&second_parent.join("state.db")).unwrap());
+        symlink(&first_parent, &alias_parent).unwrap();
+        let state_path = alias_parent.join("state.db");
+        let authority_path = StateDb::normalized_state_open_path(&state_path);
+        std::fs::remove_file(&alias_parent).unwrap();
+        symlink(&second_parent, &alias_parent).unwrap();
+
+        let error = StateDb::validate_rebuild_source(&state_path, &authority_path).unwrap_err();
+
+        assert!(error.contains("source changed"), "{error}");
     }
 }

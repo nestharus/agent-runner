@@ -15,6 +15,13 @@ pub(super) struct MigrateRebuildPlan {
     sidecars: Vec<PathBuf>,
 }
 
+impl MigrateRebuildPlan {
+    pub(super) fn bind_to_authority_path(&mut self, db_path: &Path) {
+        self.db_path = db_path.to_path_buf();
+        self.sidecars = db_sidecar_paths(db_path);
+    }
+}
+
 pub(super) fn migrate_rebuild_plan() -> Result<Option<MigrateRebuildPlan>, String> {
     let db_path = default_state_db_path()?;
     if missing_state_db(&db_path) {
@@ -65,4 +72,23 @@ pub(super) fn execute_migrate_rebuild(plan: &MigrateRebuildPlan) -> Result<(), S
     create_backup_dir(&plan.backup_dir)?;
     backup_rebuild_sidecars(&plan.sidecars, &plan.backup_dir)?;
     remove_live_sidecars(&plan.sidecars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_to_authority_path_replaces_every_destructive_source() {
+        let mut plan = migrate_rebuild_plan_value(
+            PathBuf::from("stale/state.db"),
+            PathBuf::from("backups/run"),
+        );
+        let authority_path = Path::new("locked/state.db");
+
+        plan.bind_to_authority_path(authority_path);
+
+        assert_eq!(plan.db_path, authority_path);
+        assert_eq!(plan.sidecars, db_sidecar_paths(authority_path));
+    }
 }

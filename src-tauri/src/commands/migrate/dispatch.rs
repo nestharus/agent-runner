@@ -164,10 +164,11 @@ fn validate_skip_provider_proof_ack(skip: bool, confirm: bool) -> Result<(), Str
 }
 
 fn run_migrate_rebuild() -> Result<i32, String> {
-    let Some(plan) = migrate_rebuild_plan()? else {
+    let Some(mut plan) = migrate_rebuild_plan()? else {
         return Ok(0);
     };
     let authority = super::accessor::acquire_rebuild_authority(&plan.db_path)?;
+    plan.bind_to_authority_path(authority.path());
     execute_migrate_rebuild(&plan)?;
     super::accessor::initialize_after_rebuild(&plan.db_path, &authority)?;
     render_migrate_rebuild_report(&plan);
