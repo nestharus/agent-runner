@@ -7,6 +7,7 @@
 use super::{RusqliteOptionalExtension, StateDb, sqlite};
 use crate::mailbox::{
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
+    validate_completion_event_registration,
 };
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -260,6 +261,7 @@ impl StateDb {
                 "Completion event registration requires a durable state database".to_string(),
             );
         }
+        validate_completion_event_registration(&registration)?;
         let owner_invocation_uuid = registration.owner_invocation_uuid.ok_or_else(|| {
             "Completion event owner session and invocation are both required".to_string()
         })?;
@@ -787,6 +789,78 @@ mod tests {
         assert_eq!(
             error,
             format!("Completion listener invocation {INVOCATION_UUID} does not exist")
+        );
+    }
+
+    #[test]
+    fn invalid_registration_never_commits_an_unreplayable_obligation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        let valid = registration();
+
+        for invalid in [
+            CompletionEventRegistrationInput {
+                delivery_mode: "invalid",
+                ..valid
+            },
+            CompletionEventRegistrationInput {
+                state_dir: "",
+                ..valid
+            },
+            CompletionEventRegistrationInput {
+                meta_path: "",
+                ..valid
+            },
+            CompletionEventRegistrationInput {
+                log_path: "",
+                ..valid
+            },
+            CompletionEventRegistrationInput {
+                rc_path: "",
+                ..valid
+            },
+        ] {
+            state
+                .register_completion_event_with_obligation(
+                    "age299-s2-invalid-registration",
+                    invalid,
+                )
+                .unwrap_err();
+            assert!(
+                state
+                    .completion_obligations_for_invocation(INVOCATION_UUID)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(!sidecar_path.exists());
+        }
+
+        state
+            .register_completion_event_with_obligation("age299-s2-invalid-registration", valid)
+            .unwrap();
+        assert_eq!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            MailboxDb::open(&sidecar_path)
+                .unwrap()
+                .contains_completion_obligation(EVENT_ID, INVOCATION_UUID, SESSION_ID)
+                .unwrap()
         );
     }
 

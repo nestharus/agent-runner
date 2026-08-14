@@ -5917,7 +5917,7 @@ fn wake_claim_is_valid_for_child(claim: Option<&WakeClaimRow>, claim_token: &str
     claim.is_some_and(|claim| wake_claim_matches_child(claim, claim_token))
 }
 
-fn validate_completion_event_registration(
+pub(crate) fn validate_completion_event_registration(
     input: &CompletionEventRegistrationInput<'_>,
 ) -> Result<(), String> {
     if input.event_id.is_empty() {
