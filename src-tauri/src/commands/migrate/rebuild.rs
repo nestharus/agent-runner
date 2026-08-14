@@ -63,8 +63,13 @@ fn migrate_rebuild_plan_value(db_path: PathBuf, backup_dir: PathBuf) -> MigrateR
 }
 
 fn db_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![db_path.to_path_buf()];
+    paths.extend(db_recovery_artifact_paths(db_path));
+    paths
+}
+
+fn db_recovery_artifact_paths(db_path: &Path) -> Vec<PathBuf> {
     vec![
-        db_path.to_path_buf(),
         format_db_sidecar_path(db_path, "-journal"),
         format_db_sidecar_path(db_path, "-wal"),
         format_db_sidecar_path(db_path, "-shm"),
@@ -72,7 +77,7 @@ fn db_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
 }
 
 fn reject_orphaned_rebuild_artifacts(db_path: &Path) -> Result<(), String> {
-    for artifact in db_sidecar_paths(db_path).into_iter().skip(1) {
+    for artifact in db_recovery_artifact_paths(db_path) {
         match std::fs::symlink_metadata(&artifact) {
             Ok(_) => {
                 return Err(format!(
