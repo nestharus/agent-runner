@@ -238,7 +238,11 @@ fn register_completion_event(
 }
 
 fn completion_obligation_admission_id(event_id: &str, owner_invocation_uuid: &str) -> String {
-    format!("completion:{event_id}:owner:{owner_invocation_uuid}")
+    format!(
+        "completion:{}:{event_id}:owner:{}:{owner_invocation_uuid}",
+        event_id.len(),
+        owner_invocation_uuid.len()
+    )
 }
 
 fn activate_completion_event(
@@ -560,4 +564,17 @@ fn render_error(handle: &str, json: bool, message: String) -> Result<i32, String
         json,
     )?;
     Ok(74)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completion_obligation_admission_id;
+
+    #[test]
+    fn completion_obligation_admission_id_disambiguates_delimiters_in_components() {
+        assert_ne!(
+            completion_obligation_admission_id("a", "b:owner:c"),
+            completion_obligation_admission_id("a:owner:b", "c")
+        );
+    }
 }
