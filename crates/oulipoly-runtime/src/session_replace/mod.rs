@@ -1382,8 +1382,8 @@ fn restoration_for_target(
                 timestamp: value_str(values, 3)?.to_string(),
                 role: value_str(values, 4)?.to_string(),
                 parent_turn_id: values.get(5).and_then(Value::as_str).map(str::to_string),
-                is_sidechain: values.get(6).and_then(Value::as_i64).unwrap_or(0),
-                is_compaction_boundary: values.get(7).and_then(Value::as_i64).unwrap_or(0),
+                is_sidechain: value_i64(values, 6)?,
+                is_compaction_boundary: value_i64(values, 7)?,
                 source_file: value_str(values, 8)?.to_string(),
                 body: values.get(9).and_then(Value::as_str).map(str::to_string),
             })
@@ -1460,6 +1460,15 @@ fn value_str(values: &[Value], index: usize) -> Result<&str, ReplaceError> {
     values
         .get(index)
         .and_then(Value::as_str)
+        .ok_or_else(|| ReplaceError::OperationalError {
+            message: "invalid_provider_owned_db_preimage".to_string(),
+        })
+}
+
+fn value_i64(values: &[Value], index: usize) -> Result<i64, ReplaceError> {
+    values
+        .get(index)
+        .and_then(Value::as_i64)
         .ok_or_else(|| ReplaceError::OperationalError {
             message: "invalid_provider_owned_db_preimage".to_string(),
         })
@@ -1845,6 +1854,57 @@ mod tests {
                 unsupported_record: false,
             },
         ]
+    }
+
+    #[test]
+    fn restoration_rejects_missing_or_non_integer_lineage_flags() {
+        let target = ProviderReplaceDbTarget {
+            provider_name: PROVIDER.to_string(),
+            session_id: SESSION_ID.to_string(),
+            chain_id: CHAIN_ID.to_string(),
+            active_segment_id: 1,
+            source_file: "<session-transcript>".to_string(),
+        };
+        let row = json!([
+            PROVIDER,
+            SESSION_ID,
+            "turn-1",
+            "2026-04-17T08:00:00Z",
+            "assistant",
+            null,
+            1,
+            1,
+            "<session-transcript>",
+            null
+        ]);
+
+        let mut invalid_sidechain = row.clone();
+        invalid_sidechain.as_array_mut().unwrap()[6] = Value::String("invalid".to_string());
+        let mut invalid_boundary = row.clone();
+        invalid_boundary.as_array_mut().unwrap()[7] = Value::String("invalid".to_string());
+        let mut missing_sidechain = row.clone();
+        missing_sidechain.as_array_mut().unwrap().truncate(6);
+        let mut missing_boundary = row;
+        missing_boundary.as_array_mut().unwrap().truncate(7);
+
+        for invalid_row in [
+            invalid_sidechain,
+            invalid_boundary,
+            missing_sidechain,
+            missing_boundary,
+        ] {
+            let preimage = ProviderReplaceDbPreimage {
+                session_turns: Value::Array(vec![invalid_row]),
+                last_turn_id: Some("turn-1".to_string()),
+                last_used_at: "2026-04-17T08:00:00Z".to_string(),
+            };
+
+            assert!(matches!(
+                restoration_for_target(&target, &preimage),
+                Err(ReplaceError::OperationalError { message })
+                    if message == "invalid_provider_owned_db_preimage"
+            ));
+        }
     }
 
     #[test]
