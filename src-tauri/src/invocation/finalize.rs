@@ -221,4 +221,34 @@ mod tests {
         assert_eq!(row.success, None);
         assert_eq!(row.exit_code, None);
     }
+
+    #[test]
+    fn finalizer_guard_still_finalizes_after_an_unrelated_dependency_failure() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            guard.preserve_running_after_process_integrity(&ServiceError::Dependency {
+                message: "completion sidecar is temporarily unavailable".to_string(),
+            });
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.success, Some(false));
+        assert_eq!(row.exit_code, Some(-1));
+        assert_eq!(row.error_category.as_deref(), Some("guard_drop"));
+        assert_eq!(row.terminal_reason.as_deref(), Some("guard_drop"));
+    }
 }
