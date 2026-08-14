@@ -171,6 +171,7 @@ impl StateDb {
         }
         let nonlocal = Self::is_nonlocal_sqlite_path(path);
         if !nonlocal {
+            Self::validate_local_state_path(path)?;
             Self::ensure_state_parent_dir(path)?;
         }
         let db_path = Self::normalized_state_open_path(path);
@@ -297,6 +298,7 @@ impl StateDb {
         if Self::is_nonlocal_sqlite_path(path) {
             return Err("State DB rebuild authority requires a local file path".to_string());
         }
+        Self::validate_local_state_path(path)?;
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
         let guard = StateNamespaceGuard::acquire(&db_path, true)?;
@@ -311,6 +313,7 @@ impl StateDb {
         if Self::is_nonlocal_sqlite_path(path) {
             return Err("State DB writer authority requires a local file path".to_string());
         }
+        Self::validate_local_state_path(path)?;
         Self::ensure_state_parent_dir(path)?;
         let db_path = Self::normalized_state_open_path(path);
         let guard = StateNamespaceGuard::acquire(&db_path, false)?;
@@ -419,6 +422,14 @@ impl StateDb {
 
     fn is_sqlite_uri_path(path: &Path) -> bool {
         path.as_os_str().as_encoded_bytes().starts_with(b"file:")
+    }
+
+    fn validate_local_state_path(path: &Path) -> Result<(), String> {
+        if path.to_str().is_some() {
+            Ok(())
+        } else {
+            Err("State DB local file paths must be valid UTF-8".to_string())
+        }
     }
 
     fn reject_rebuild_leaf_symlink(path: &Path) -> Result<(), String> {
@@ -772,5 +783,34 @@ mod state_namespace_tests {
         let error = StateDb::validate_rebuild_source(&state_path, &authority_path).unwrap_err();
 
         assert!(error.contains("source changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_state_authorities_reject_non_utf8_paths_without_creating_artifacts() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"state-\xff.db".to_vec()));
+
+        for error in [
+            StateDb::open(&state_path).err().unwrap(),
+            StateDb::acquire_writer_authority(&state_path)
+                .err()
+                .unwrap(),
+            StateDb::acquire_rebuild_authority(&state_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(error.contains("valid UTF-8"), "{error}");
+        }
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 }
