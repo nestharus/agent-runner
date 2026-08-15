@@ -5,7 +5,7 @@
 -- `mapper`, `validator`
 
 CREATE TABLE invocation_completion_authority_summary (
-    invocation_uuid ANY NOT NULL PRIMARY KEY REFERENCES invocations(invocation_uuid)
+    invocation_uuid ANY NOT NULL PRIMARY KEY
         CONSTRAINT completion_authority_summary_invocation_uuid_text
         CHECK (
             typeof(invocation_uuid) = 'text'
