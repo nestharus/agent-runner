@@ -55,6 +55,8 @@ const ACCEPT_POLL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(unix)]
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
@@ -499,7 +501,7 @@ fn report_live_session_binding(
 #[cfg(unix)]
 fn configure_live_session_stream(stream: &UnixStream) -> Result<(), String> {
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_read_timeout(Some(RESPONSE_TIMEOUT))
         .map_err(|err| format!("Failed to configure live-session response timeout: {err}"))?;
     stream
         .set_write_timeout(Some(IO_TIMEOUT))
