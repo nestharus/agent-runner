@@ -108,6 +108,7 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
             "0013_fresh_continuations.sql",
             "0014_invocation_completion_obligations.sql",
             "0015_invocation_completion_continuity.sql",
+            "0016_invocation_completion_authority_summary.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );
