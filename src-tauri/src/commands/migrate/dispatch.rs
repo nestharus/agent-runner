@@ -1,7 +1,7 @@
 //! Declared role: orchestration
 
 use super::formatter::{render_migrate_rebuild_report, render_session_chain_backfill_report};
-use super::rebuild::{execute_migrate_rebuild, migrate_rebuild_plan};
+use super::rebuild::{complete_migrate_rebuild, execute_migrate_rebuild, migrate_rebuild_plan};
 use super::validator::validate_migrate_rebuild_flag;
 use crate::commands::compaction_backfill::run_compaction_backfill;
 use std::path::Path;
@@ -169,8 +169,11 @@ fn run_migrate_rebuild() -> Result<i32, String> {
     };
     let authority = super::accessor::acquire_rebuild_authority(&plan.db_path)?;
     plan.bind_to_authority_path(authority.path());
-    execute_migrate_rebuild(&plan)?;
+    let mut sidecar_authority = super::accessor::acquire_sidecar_rebuild_authority(&authority)?;
+    execute_migrate_rebuild(&plan, &mut sidecar_authority)?;
     super::accessor::initialize_after_rebuild(&plan.db_path, &authority)?;
+    super::accessor::initialize_sidecar_after_rebuild(&mut sidecar_authority)?;
+    complete_migrate_rebuild(&plan)?;
     render_migrate_rebuild_report(&plan);
     Ok(0)
 }

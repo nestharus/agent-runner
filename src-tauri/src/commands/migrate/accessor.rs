@@ -20,6 +20,7 @@
 //!       - Intrinsic carrier subordinate to this domain: oulipoly_state::StateDb
 //! ```
 
+use oulipoly_state::mailbox::{MailboxDb, MailboxDbRebuildAuthority};
 use oulipoly_state::{StateDb, StateDbRebuildAuthority};
 use std::path::{Path, PathBuf};
 
@@ -59,4 +60,16 @@ pub(super) fn initialize_after_rebuild(
     authority: &StateDbRebuildAuthority,
 ) -> Result<(), String> {
     StateDb::initialize_after_rebuild(path, authority)
+}
+
+pub(super) fn acquire_sidecar_rebuild_authority(
+    authority: &StateDbRebuildAuthority,
+) -> Result<MailboxDbRebuildAuthority, String> {
+    MailboxDb::acquire_rebuild_authority(authority)
+}
+
+pub(super) fn initialize_sidecar_after_rebuild(
+    authority: &mut MailboxDbRebuildAuthority,
+) -> Result<(), String> {
+    authority.initialize_after_rebuild()
 }

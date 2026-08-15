@@ -4,8 +4,9 @@
 mod state_fixtures;
 
 use oulipoly_setup::memory::MemoryGraph;
+use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
 use oulipoly_state::schema::CURRENT_SCHEMA_VERSION;
-use oulipoly_state::{StateDb, schema_probe};
+use oulipoly_state::{InvocationStart, StateDb, schema_probe};
 use rusqlite::Connection;
 use serde_json::Value;
 use state_fixtures::future_db::build_future_db;
@@ -351,6 +352,148 @@ fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_d
         old_rows, 0,
         "destructive rebuild should create a fresh live DB"
     );
+}
+
+#[test]
+fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
+    let fixture = CliFixture::new();
+    let state_path = fixture.db_path();
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let first_uuid = "a1111111-1111-4111-8111-111111111111";
+    let mut state = StateDb::open(&state_path).unwrap();
+    state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: first_uuid.to_string(),
+            model_name: "age299-s2-rebuild".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .register_completion_event_with_obligation(
+            "age299-s2-rebuild-first-admission",
+            completion_registration(
+                "age299-s2-rebuild-first-event",
+                first_uuid,
+                "age299-s2-rebuild-first-session",
+            ),
+        )
+        .unwrap();
+    let old_generation = MailboxDb::open(&sidecar_path)
+        .unwrap()
+        .sidecar_generation()
+        .unwrap();
+    drop(state);
+
+    let output = fixture.run_rebuild();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let backup_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner")
+        .join("state-backups");
+    let backups = backup_dirs(&backup_root);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert!(backups[0].join("state.db").is_file());
+    assert!(backups[0].join("pid-identity.db").is_file());
+    let fresh_generation = MailboxDb::open(&sidecar_path)
+        .unwrap()
+        .sidecar_generation()
+        .unwrap();
+    assert_ne!(fresh_generation, old_generation);
+    let second_uuid = "a2222222-2222-4222-8222-222222222222";
+    let mut fresh_state = StateDb::open(&state_path).unwrap();
+    assert!(
+        fresh_state
+            .get_invocation_by_uuid(first_uuid)
+            .unwrap()
+            .is_none()
+    );
+    fresh_state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: second_uuid.to_string(),
+            model_name: "age299-s2-rebuild".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    fresh_state
+        .register_completion_event_with_obligation(
+            "age299-s2-rebuild-second-admission",
+            completion_registration(
+                "age299-s2-rebuild-second-event",
+                second_uuid,
+                "age299-s2-rebuild-second-session",
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        fresh_state
+            .completion_obligations_for_invocation(second_uuid)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn age_299_s2_rebuild_sidecar_writer_contention_is_nondestructive_and_retryable() {
+    let fixture = CliFixture::new();
+    let state_path = fixture.db_path();
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let invocation_uuid = "a3333333-3333-4333-8333-333333333333";
+    let mut state = StateDb::open(&state_path).unwrap();
+    state
+        .start_invocation(&InvocationStart {
+            invocation_uuid: invocation_uuid.to_string(),
+            model_name: "age299-s2-rebuild".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .register_completion_event_with_obligation(
+            "age299-s2-rebuild-contention-admission",
+            completion_registration(
+                "age299-s2-rebuild-contention-event",
+                invocation_uuid,
+                "age299-s2-rebuild-contention-session",
+            ),
+        )
+        .unwrap();
+    drop(state);
+    let writer = Connection::open(&sidecar_path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let blocked = fixture.run_rebuild();
+
+    assert_ne!(blocked.status.code(), Some(0), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("completion_authority_contention"),
+        "{blocked:?}"
+    );
+    assert!(state_path.is_file());
+    assert!(sidecar_path.is_file());
+    assert!(
+        backup_dirs(
+            &fixture
+                .data_home
+                .join("oulipoly-agent-runner")
+                .join("state-backups")
+        )
+        .is_empty()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+
+    let retry = fixture.run_rebuild();
+
+    assert_eq!(retry.status.code(), Some(0), "{retry:?}");
+    assert!(StateDb::open(&state_path).is_ok());
+    assert!(MailboxDb::open(&sidecar_path).is_ok());
 }
 
 #[test]
@@ -769,6 +912,23 @@ fn ti_38_cli_and_read_only_probe_fail_closed_for_unrecognized_versionless_defaul
     assert!(!report.compatible);
     assert_eq!(report.user_version, 0);
     assert_eq!(fs::read(fixture.db_path()).unwrap(), before);
+}
+
+fn completion_registration<'a>(
+    event_id: &'a str,
+    owner_invocation_uuid: &'a str,
+    owner_session_id: &'a str,
+) -> CompletionEventRegistrationInput<'a> {
+    CompletionEventRegistrationInput {
+        event_id,
+        delivery_mode: "async",
+        owner_session_id: Some(owner_session_id),
+        owner_invocation_uuid: Some(owner_invocation_uuid),
+        state_dir: "/tmp/age299-s2-rebuild-state",
+        meta_path: "/tmp/age299-s2-rebuild-meta",
+        log_path: "/tmp/age299-s2-rebuild-log",
+        rc_path: "/tmp/age299-s2-rebuild-rc",
+    }
 }
 
 fn backup_dirs(root: &Path) -> Vec<PathBuf> {
