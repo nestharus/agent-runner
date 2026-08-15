@@ -257,9 +257,10 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             13,
             14,
             15,
+            16,
             CURRENT_SCHEMA_VERSION
         ],
-        "schema-4 DBs must take every ordered migration through bounded completion authority schema 16"
+        "schema-4 DBs must take every ordered migration through caller-bound completion authority schema 17"
     );
     assert_eq!(
         plan_ids(&plan),
@@ -276,6 +277,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0014_invocation_completion_obligations",
             "0015_invocation_completion_continuity",
             "0016_invocation_completion_authority_summary",
+            "0017_completion_registration_authority",
         ]
     );
 }

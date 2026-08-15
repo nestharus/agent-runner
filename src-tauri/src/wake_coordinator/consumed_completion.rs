@@ -231,11 +231,11 @@ fn format_consumed_completion_fixture_owner() -> String {
 #[cfg(test)]
 fn seed_consumed_completion_fixture_mailbox(paths: &ConsumedCompletionFixturePaths) {
     use oulipoly_state::mailbox::{CompletionEventRegistrationInput, CompletionEventTriggerInput};
-    use oulipoly_state::{InvocationStart, StateDb};
+    use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 
     let mut state = StateDb::open(&paths.state_path).unwrap();
-    state
-        .start_invocation(&InvocationStart {
+    let invocation_start = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
             invocation_uuid: ConsumedCompletionFixture::INVOCATION_UUID.to_string(),
             model_name: "consumed-completion-fixture".to_string(),
             provider_name: "fixture-provider".to_string(),
@@ -244,7 +244,19 @@ fn seed_consumed_completion_fixture_mailbox(paths: &ConsumedCompletionFixturePat
         })
         .unwrap();
     state
-        .register_completion_event_with_obligation(
+        .bind_invocation_provider_session_start(
+            invocation_start.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: ConsumedCompletionFixture::SESSION_ID.to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    state
+        .register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
             "late-consumed-fixture-admission",
             CompletionEventRegistrationInput {
                 event_id: ConsumedCompletionFixture::EVENT_ID,

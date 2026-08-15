@@ -3184,6 +3184,7 @@ dependencies = [
  "chrono",
  "dirs",
  "fs4",
+ "getrandom 0.2.17",
  "libc",
  "oulipoly-agent-messenger",
  "oulipoly-config",

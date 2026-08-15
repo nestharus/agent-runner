@@ -219,10 +219,12 @@ fn register_completion_event(
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
+    let authority = oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
     validate_owner_binding(&owner, &metadata)?;
     let mut state = StateDb::open_default()?;
     let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
-    state.register_completion_event_with_obligation(
+    state.register_completion_event_with_authority(
+        &authority,
         &admission_id,
         CompletionEventRegistrationInput {
             event_id: args.handle,
@@ -403,10 +405,27 @@ fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), 
             return Err(owner_binding_error(owner));
         }
         if running_owner_binding_is_live(owner, metadata)? {
+            bind_verified_live_owner_session(&record, owner)?;
             return Ok(());
         }
     }
     Err(owner_binding_error(owner))
+}
+
+fn bind_verified_live_owner_session(
+    record: &InvocationRecord,
+    owner: &OwnerBinding,
+) -> Result<(), String> {
+    let state = StateDb::open_default()?;
+    state.bind_invocation_provider_session_start(
+        record.id,
+        &oulipoly_state::ProviderSessionBinding {
+            provider_session_id: owner.session_id.clone(),
+            capture_method: "completion_registration_live_pid",
+            resume_input_id: None,
+            provider_session_resolved_account: record.provider_name.clone(),
+        },
+    )
 }
 
 fn completion_owner_invocation(

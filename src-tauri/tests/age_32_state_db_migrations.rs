@@ -6,7 +6,10 @@ mod state_fixtures;
 use oulipoly_setup::memory::MemoryGraph;
 use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
 use oulipoly_state::schema::CURRENT_SCHEMA_VERSION;
-use oulipoly_state::{InvocationStart, StateDb, schema_probe};
+use oulipoly_state::{
+    InvocationStart, InvocationStartWithCompletionAuthority, ProviderSessionBinding, StateDb,
+    schema_probe,
+};
 use rusqlite::Connection;
 use serde_json::Value;
 use state_fixtures::future_db::build_future_db;
@@ -361,17 +364,11 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let first_uuid = "a1111111-1111-4111-8111-111111111111";
     let mut state = StateDb::open(&state_path).unwrap();
+    let first_start =
+        start_authorized_invocation(&state, first_uuid, "age299-s2-rebuild-first-session");
     state
-        .start_invocation(&InvocationStart {
-            invocation_uuid: first_uuid.to_string(),
-            model_name: "age299-s2-rebuild".to_string(),
-            provider_name: "fixture-provider".to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
-        .unwrap();
-    state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &first_start.completion_registration_authority,
             "age299-s2-rebuild-first-admission",
             completion_registration(
                 "age299-s2-rebuild-first-event",
@@ -436,17 +433,14 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
             .unwrap()
             .is_none()
     );
+    let second_start = start_authorized_invocation(
+        &fresh_state,
+        second_uuid,
+        "age299-s2-rebuild-second-session",
+    );
     fresh_state
-        .start_invocation(&InvocationStart {
-            invocation_uuid: second_uuid.to_string(),
-            model_name: "age299-s2-rebuild".to_string(),
-            provider_name: "fixture-provider".to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
-        .unwrap();
-    fresh_state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &second_start.completion_registration_authority,
             "age299-s2-rebuild-second-admission",
             completion_registration(
                 "age299-s2-rebuild-second-event",
@@ -471,17 +465,14 @@ fn age_299_s2_rebuild_sidecar_writer_contention_is_nondestructive_and_retryable(
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let invocation_uuid = "a3333333-3333-4333-8333-333333333333";
     let mut state = StateDb::open(&state_path).unwrap();
+    let invocation_start = start_authorized_invocation(
+        &state,
+        invocation_uuid,
+        "age299-s2-rebuild-contention-session",
+    );
     state
-        .start_invocation(&InvocationStart {
-            invocation_uuid: invocation_uuid.to_string(),
-            model_name: "age299-s2-rebuild".to_string(),
-            provider_name: "fixture-provider".to_string(),
-            provider_index: 0,
-            parent_invocation_id: None,
-        })
-        .unwrap();
-    state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
             "age299-s2-rebuild-contention-admission",
             completion_registration(
                 "age299-s2-rebuild-contention-event",
@@ -955,6 +946,34 @@ fn completion_registration<'a>(
         log_path: "/tmp/age299-s2-rebuild-log",
         rc_path: "/tmp/age299-s2-rebuild-rc",
     }
+}
+
+fn start_authorized_invocation(
+    state: &StateDb,
+    invocation_uuid: &str,
+    session_id: &str,
+) -> InvocationStartWithCompletionAuthority {
+    let start = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: invocation_uuid.to_string(),
+            model_name: "age299-s2-rebuild".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            start.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: session_id.to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    start
 }
 
 fn backup_dirs(root: &Path) -> Vec<PathBuf> {

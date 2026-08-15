@@ -25,6 +25,99 @@
 //! Invocation start persistence and lifecycle-log context.
 
 use super::*;
+use sha2::{Digest, Sha256};
+use std::fmt;
+
+pub const COMPLETION_REGISTRATION_AUTHORITY_ENV: &str =
+    "OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY";
+pub const COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD: &str =
+    "_oulipoly_completion_registration_authority";
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CompletionRegistrationAuthority {
+    secret: Box<str>,
+}
+
+impl fmt::Debug for CompletionRegistrationAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompletionRegistrationAuthority([REDACTED])")
+    }
+}
+
+impl CompletionRegistrationAuthority {
+    pub fn from_process_environment() -> Result<Self, String> {
+        let secret = std::env::var(COMPLETION_REGISTRATION_AUTHORITY_ENV).map_err(|_| {
+            "process_integrity: completion registration requires caller-bound invocation authority"
+                .to_string()
+        })?;
+        Self::from_process_environment_value(secret)
+    }
+
+    pub fn from_process_environment_value(secret: impl Into<String>) -> Result<Self, String> {
+        let secret = secret.into();
+        if secret.len() != 64
+            || !secret
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(
+                "process_integrity: completion registration authority has invalid shape"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            secret: secret.into_boxed_str(),
+        })
+    }
+
+    pub fn process_environment_value(&self) -> &str {
+        &self.secret
+    }
+
+    pub fn invocation_launch_environment(
+        &self,
+        invocation: &crate::invocation_marker::CompositeInvocationId,
+    ) -> Result<String, String> {
+        serde_json::to_string(&serde_json::json!({
+            "id": invocation.id,
+            "source": invocation.source,
+            COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD: self.secret.as_ref(),
+        }))
+        .map_err(|error| format!("Failed to serialize invocation launch authority: {error}"))
+    }
+
+    pub(super) fn digest(&self) -> String {
+        completion_registration_authority_digest(&self.secret)
+    }
+
+    fn generate() -> Result<Self, String> {
+        let mut bytes = [0_u8; 32];
+        getrandom::getrandom(&mut bytes).map_err(|error| {
+            format!("Failed to generate completion registration authority: {error}")
+        })?;
+        let secret = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Self::from_process_environment_value(secret)
+    }
+}
+
+pub struct InvocationStartWithCompletionAuthority {
+    pub invocation_row_id: i64,
+    pub completion_registration_authority: CompletionRegistrationAuthority,
+}
+
+pub(super) fn completion_registration_authority_digest(secret: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"oulipoly-completion-registration-authority-v1");
+    digest.update(secret.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 pub(super) struct FinalizeInvocationRow {
     pub(super) invocation_uuid: String,
@@ -100,10 +193,35 @@ impl StateDb {
     }
 
     pub fn start_invocation(&self, start: &InvocationStart) -> Result<i64, String> {
+        self.start_invocation_on(start, None)
+    }
+
+    pub fn start_invocation_with_completion_registration_authority(
+        &self,
+        start: &InvocationStart,
+    ) -> Result<InvocationStartWithCompletionAuthority, String> {
+        let authority = CompletionRegistrationAuthority::generate()?;
+        let digest = authority.digest();
+        let invocation_row_id = self.start_invocation_on(start, Some(&digest))?;
+        Ok(InvocationStartWithCompletionAuthority {
+            invocation_row_id,
+            completion_registration_authority: authority,
+        })
+    }
+
+    fn start_invocation_on(
+        &self,
+        start: &InvocationStart,
+        completion_registration_capability_digest: Option<&str>,
+    ) -> Result<i64, String> {
         let timer = lc_log_adapter::start_timer();
         let context = self.lifecycle_context(start);
         let started_at = Self::current_rfc3339_timestamp();
-        let sql_result = self.execute_start_invocation_sql(start, &started_at);
+        let sql_result = self.execute_start_invocation_sql(
+            start,
+            &started_at,
+            completion_registration_capability_digest,
+        );
         self.warn_invocation_artifact_for_start_result(start, &started_at, &sql_result);
         lc_log_adapter::emit_start(&self.lifecycle_sink, timer, context, &sql_result);
         Self::translate_start_invocation_result(sql_result)
@@ -113,9 +231,14 @@ impl StateDb {
         &self,
         start: &InvocationStart,
         started_at: &str,
+        completion_registration_capability_digest: Option<&str>,
     ) -> Result<i64, std::io::Error> {
-        self.insert_invocation_start_row_raw(start, started_at)
-            .map_err(Self::start_invocation_io_error)
+        self.insert_invocation_start_row_raw(
+            start,
+            started_at,
+            completion_registration_capability_digest,
+        )
+        .map_err(Self::start_invocation_io_error)
     }
 
     pub(super) fn translate_start_invocation_result(
@@ -132,6 +255,7 @@ impl StateDb {
         &self,
         start: &InvocationStart,
         started_at: &str,
+        completion_registration_capability_digest: Option<&str>,
     ) -> Result<i64, sqlite::Error> {
         self.conn.execute(
             "INSERT INTO invocations (
@@ -146,8 +270,9 @@ impl StateDb {
                     error_category,
                     terminal_reason,
                     created_at,
-                    finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
+                    finished_at,
+                    completion_registration_capability_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL, ?8)",
             sqlite::params![
                 &start.invocation_uuid,
                 &start.model_name,
@@ -156,6 +281,7 @@ impl StateDb {
                 start.parent_invocation_id,
                 InvocationStatus::Running.as_str(),
                 started_at,
+                completion_registration_capability_digest,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())

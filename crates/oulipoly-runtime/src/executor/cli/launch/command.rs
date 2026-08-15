@@ -33,7 +33,7 @@ pub(in crate::executor::cli) fn build_command(
 ) -> Result<Command, String> {
     let parts = parse_command_parts(&provider.command);
     validate_command_parts(&parts)?;
-    Ok(command_from_parts(
+    command_from_parts(
         &parts,
         provider_args,
         &provider.environment,
@@ -41,5 +41,5 @@ pub(in crate::executor::cli) fn build_command(
         working_dir,
         parent_invocation_env,
         return_channel,
-    ))
+    )
 }

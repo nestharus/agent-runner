@@ -4,7 +4,7 @@ use oulipoly_runtime::services::{
     ProductionInvocationLifecycleService, error::ServiceError,
 };
 use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
-use oulipoly_state::{InvocationStart, StateDb};
+use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 use rusqlite::{OptionalExtension, params};
 use std::path::Path;
 
@@ -139,28 +139,51 @@ fn state_with_completion_obligation(
     event_id: &str,
     session_id: &str,
 ) -> (tempfile::TempDir, StateDb, i64, std::path::PathBuf) {
+    state_with_completion_obligations(uuid, &[event_id], session_id)
+}
+
+fn state_with_completion_obligations(
+    uuid: &str,
+    event_ids: &[&str],
+    session_id: &str,
+) -> (tempfile::TempDir, StateDb, i64, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let mut state = StateDb::open(&state_path).unwrap();
-    let invocation_row_id = state
-        .start_invocation(&start_fixture(uuid, 0, None))
+    let invocation_start = state
+        .start_invocation_with_completion_registration_authority(&start_fixture(uuid, 0, None))
         .unwrap();
+    let invocation_row_id = invocation_start.invocation_row_id;
     state
-        .register_completion_event_with_obligation(
-            &format!("{event_id}-admission"),
-            CompletionEventRegistrationInput {
-                event_id,
-                delivery_mode: "async",
-                owner_session_id: Some(session_id),
-                owner_invocation_uuid: Some(uuid),
-                state_dir: "/tmp/age299-s2-service-state",
-                meta_path: "/tmp/age299-s2-service-meta",
-                log_path: "/tmp/age299-s2-service-log",
-                rc_path: "/tmp/age299-s2-service-rc",
+        .bind_invocation_provider_session_start(
+            invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: session_id.to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
             },
         )
         .unwrap();
+    for event_id in event_ids {
+        state
+            .register_completion_event_with_authority(
+                &invocation_start.completion_registration_authority,
+                &format!("{event_id}-admission"),
+                CompletionEventRegistrationInput {
+                    event_id,
+                    delivery_mode: "async",
+                    owner_session_id: Some(session_id),
+                    owner_invocation_uuid: Some(uuid),
+                    state_dir: "/tmp/age299-s2-service-state",
+                    meta_path: "/tmp/age299-s2-service-meta",
+                    log_path: "/tmp/age299-s2-service-log",
+                    rc_path: "/tmp/age299-s2-service-rc",
+                },
+            )
+            .unwrap();
+    }
     (directory, state, invocation_row_id, sidecar_path)
 }
 
@@ -300,11 +323,28 @@ fn age_299_s2_service_projects_missing_expected_sidecar_as_dependency_failure() 
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let mut state = StateDb::open(&state_path).unwrap();
     let invocation_uuid = "55555555-5555-4555-8555-555555555555";
-    let invocation_row_id = state
-        .start_invocation(&start_fixture(invocation_uuid, 0, None))
+    let invocation_start = state
+        .start_invocation_with_completion_registration_authority(&start_fixture(
+            invocation_uuid,
+            0,
+            None,
+        ))
+        .unwrap();
+    let invocation_row_id = invocation_start.invocation_row_id;
+    state
+        .bind_invocation_provider_session_start(
+            invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: "age299-s2-service-session".to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
         .unwrap();
     state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
             "age299-s2-service-admission",
             CompletionEventRegistrationInput {
                 event_id: "age299-s2-service-event",
@@ -477,4 +517,186 @@ fn age_299_s2_corrupt_admitted_sidecar_fails_closed_without_recreation_or_result
             .join(format!("{invocation_uuid}.result"))
             .exists()
     );
+}
+
+#[test]
+fn age_299_s2_exact_listener_damage_is_a_typed_nonterminal_integrity_refusal() {
+    for damage in [
+        ListenerDamage::AbsentEvent,
+        ListenerDamage::AbsentListener,
+        ListenerDamage::WrongOwner,
+        ListenerDamage::WrongSession,
+    ] {
+        let invocation_uuid = "99999999-9999-4999-8999-999999999999";
+        let event_id = "age299-s2-exact-listener-event";
+        let session_id = "age299-s2-exact-listener-session";
+        let (directory, state, invocation_row_id, sidecar_path) =
+            state_with_completion_obligation(invocation_uuid, event_id, session_id);
+        damage.apply(&sidecar_path, event_id);
+
+        let result = ProductionInvocationLifecycleService.finalize_invocation(
+            InvocationLifecycleFinalizeRequest {
+                state: &state,
+                invocation_row_id,
+                success: true,
+                exit_code: 0,
+                error_category: None,
+                terminal_reason: None,
+            },
+        );
+
+        let Err(ServiceError::Dependency { message }) = result else {
+            panic!("expected typed process-integrity refusal for {damage:?}, got {result:?}");
+        };
+        assert!(
+            message.contains("process_integrity"),
+            "{damage:?}: {message}"
+        );
+        assert!(
+            message.contains("exact agent_bash_complete event/listener"),
+            "{damage:?}: {message}"
+        );
+        assert_complete_nonterminal(&state, invocation_uuid);
+        assert!(
+            !directory
+                .path()
+                .join("invocations")
+                .join(format!("{invocation_uuid}.result"))
+                .exists(),
+            "{damage:?} emitted a result artifact"
+        );
+    }
+}
+
+#[test]
+fn age_299_s2_later_missing_listener_blocks_success_for_every_admitted_obligation() {
+    let invocation_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let event_ids = [
+        "age299-s2-first-listener-event",
+        "age299-s2-second-listener-event",
+    ];
+    let (directory, state, invocation_row_id, sidecar_path) = state_with_completion_obligations(
+        invocation_uuid,
+        &event_ids,
+        "age299-s2-multiple-listener-session",
+    );
+    let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER trg_completion_event_listener_continuity_delete;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "DELETE FROM completion_event_listener WHERE event_id = ?1",
+            [event_ids[1]],
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM completion_authority_continuity",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        2
+    );
+
+    let result = ProductionInvocationLifecycleService.finalize_invocation(
+        InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        },
+    );
+
+    let Err(ServiceError::Dependency { message }) = result else {
+        panic!("expected process-integrity refusal, got {result:?}");
+    };
+    assert!(message.contains("requires 2"), "{message}");
+    assert!(message.contains("only 1 remain"), "{message}");
+    assert_complete_nonterminal(&state, invocation_uuid);
+    assert!(
+        !directory
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"))
+            .exists()
+    );
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ListenerDamage {
+    AbsentEvent,
+    AbsentListener,
+    WrongOwner,
+    WrongSession,
+}
+
+impl ListenerDamage {
+    fn apply(self, sidecar_path: &Path, event_id: &str) {
+        let connection = rusqlite::Connection::open(sidecar_path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys=OFF;")
+            .unwrap();
+        match self {
+            Self::AbsentEvent => {
+                connection
+                    .execute_batch(
+                        "DROP TRIGGER trg_completion_event_listener_continuity_delete;
+                         DELETE FROM completion_event_listener;
+                         DELETE FROM completion_event;",
+                    )
+                    .unwrap();
+            }
+            Self::AbsentListener => {
+                connection
+                    .execute_batch(
+                        "DROP TRIGGER trg_completion_event_listener_continuity_delete;
+                         DELETE FROM completion_event_listener;",
+                    )
+                    .unwrap();
+            }
+            Self::WrongOwner => {
+                connection
+                    .execute_batch("DROP TRIGGER trg_completion_event_listener_identity_update;")
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE completion_event_listener
+                         SET listener_id = 'foreign-owner',
+                             owner_invocation_uuid = 'foreign-owner'
+                         WHERE event_id = ?1",
+                        [event_id],
+                    )
+                    .unwrap();
+            }
+            Self::WrongSession => {
+                connection
+                    .execute_batch("DROP TRIGGER trg_completion_event_listener_identity_update;")
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE completion_event_listener
+                         SET session_id = 'foreign-session'
+                         WHERE event_id = ?1",
+                        [event_id],
+                    )
+                    .unwrap();
+            }
+        }
+        let continuity_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM completion_authority_continuity",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(continuity_count, 1, "{self:?} changed continuity proof");
+    }
 }

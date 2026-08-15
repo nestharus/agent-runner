@@ -84,6 +84,7 @@ pub struct PidIdentityDb {
     conn: Connection,
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+    _namespace_authority: Option<crate::mailbox::MailboxAuthorityFence>,
 }
 
 impl PidIdentityDb {
@@ -99,7 +100,10 @@ impl PidIdentityDb {
     pub fn open(path: &Path) -> Result<Self, String> {
         let authority = crate::mailbox::MailboxAuthorityFence::acquire(path)
             .map_err(|error| error.to_string())?;
-        Self::open_with_authority(&authority)
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        let mut db = Self::open_with_authority(&authority)?;
+        db._namespace_authority = Some(authority);
+        Ok(db)
     }
 
     pub(crate) fn open_with_authority(
@@ -116,6 +120,7 @@ impl PidIdentityDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: None,
+            _namespace_authority: None,
         })
     }
 
@@ -134,6 +139,7 @@ impl PidIdentityDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
+            _namespace_authority: None,
         })
     }
 
@@ -630,7 +636,7 @@ mod tests {
     fn sidecar_creation_waits_for_canonical_namespace_authority() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
-        let authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&path).unwrap();
         let (opened_tx, opened_rx) = mpsc::channel();
         let opener_path = path.clone();
         let opener = std::thread::spawn(move || {
@@ -664,20 +670,13 @@ mod tests {
     }
 
     #[test]
-    fn nested_authority_acquisition_returns_timeout() {
+    fn nested_shared_authority_acquisition_avoids_same_process_deadlock() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
 
-        let error = match crate::mailbox::MailboxAuthorityFence::acquire(&path) {
-            Ok(_) => panic!("nested acquisition unexpectedly succeeded"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }
-        ));
+        let nested = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+        drop(nested);
     }
 
     #[cfg(unix)]
@@ -690,15 +689,8 @@ mod tests {
         std::os::unix::fs::symlink(&path, &alias).unwrap();
         let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
 
-        let error = match crate::mailbox::MailboxAuthorityFence::acquire(&alias) {
-            Ok(_) => panic!("symlinked sidecar acquired a separate authority fence"),
-            Err(error) => error,
-        };
-
-        assert!(matches!(
-            error,
-            crate::mailbox::MailboxAuthorityFenceError::Timeout { .. }
-        ));
+        let alias_authority = crate::mailbox::MailboxAuthorityFence::acquire(&alias).unwrap();
+        assert_eq!(alias_authority.path(), path.canonicalize().unwrap());
     }
 
     #[test]

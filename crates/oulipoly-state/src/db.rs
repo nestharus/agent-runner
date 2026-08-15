@@ -163,6 +163,10 @@ pub use self::imported_session_display_metadata::{
 };
 pub use self::imported_session_list::ImportedSessionListRow;
 pub use self::invocation_lifecycle_finalize::InvocationFinalizeError;
+pub use self::invocation_lifecycle_start::{
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
+    CompletionRegistrationAuthority, InvocationStartWithCompletionAuthority,
+};
 use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
     active_lifecycle_session_id, lifecycle_terminal_status,

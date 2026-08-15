@@ -41,6 +41,7 @@ pub mod migrations;
 pub mod paths;
 pub mod pid_identity;
 mod read_only_snapshot;
+pub mod rebuild_recovery;
 pub mod repositories;
 pub mod result_envelope;
 pub mod schema;
@@ -77,6 +78,10 @@ pub use db::{
     BackfillReport, ChainPreview, ModelStore, ProviderSessionBinding, RESUME_INPUT_MAX_LEN,
     ResolvedResume, ResumeError, ResumeInputMatch, ResumeNativeCandidate, SessionMarkerPayload,
     TurnPreview, WrongIdKindInput,
+};
+pub use db::{
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
+    CompletionRegistrationAuthority, InvocationStartWithCompletionAuthority,
 };
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};

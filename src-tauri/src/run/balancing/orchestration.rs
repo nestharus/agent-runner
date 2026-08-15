@@ -382,7 +382,7 @@ fn start_balanced_attempt<'state>(
 ) -> Result<BalancedInvocationAttempt<'state>, String> {
     let provider_name = provider.name.as_str();
     let invocation = super::composite_invocation_id(provider_name, reservation);
-    let invocation_row_id = start_balanced_invocation_row(
+    let invocation_start = start_balanced_invocation_row(
         agent_runtime_services,
         env,
         model,
@@ -391,6 +391,7 @@ fn start_balanced_attempt<'state>(
         parent_invocation_id,
         &invocation,
     )?;
+    let invocation_row_id = invocation_start.invocation_row_id;
     let guard = FinalizerGuard::new(&env.state, invocation_row_id);
     let start_known_provider_session =
         start_known_provider_session_for_attempt(provider, pending_verification)?;
@@ -405,8 +406,9 @@ fn start_balanced_attempt<'state>(
         provider_name,
         start_known_provider_session.id.as_deref(),
     );
-    let invocation_env = formatter::invocation_env(&invocation)
-        .map_err(formatter::invocation_env_serialization_error)?;
+    let invocation_env = invocation_start
+        .completion_registration_authority
+        .invocation_launch_environment(&invocation)?;
     formatter::emit_invocation_stderr_line(&invocation);
     Ok(balanced_invocation_attempt(
         invocation,
@@ -445,7 +447,7 @@ fn start_balanced_invocation_row(
     provider_index: usize,
     parent_invocation_id: Option<i64>,
     invocation: &CompositeInvocationId,
-) -> Result<i64, String> {
+) -> Result<oulipoly_runtime::services::InvocationLifecycleStartOutput, String> {
     let invocation_start = balanced_invocation_start(
         invocation,
         model,
@@ -460,7 +462,6 @@ fn start_balanced_invocation_row(
             &env.state,
             &invocation_start,
         ))
-        .map(|start| start.invocation_row_id)
         .map_err(|err| err.to_string())
 }
 

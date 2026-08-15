@@ -209,7 +209,8 @@ impl StateDb {
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT,
-                row_version INTEGER NOT NULL DEFAULT 0
+                row_version INTEGER NOT NULL DEFAULT 0,
+                completion_registration_capability_digest TEXT
             );",
         )
         .map_err(Self::format_migrated_invocations_table_create_error)

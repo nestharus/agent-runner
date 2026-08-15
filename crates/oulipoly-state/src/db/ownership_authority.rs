@@ -239,16 +239,39 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
+    pub fn register_completion_event_with_authority(
+        &mut self,
+        authority: &super::CompletionRegistrationAuthority,
+        admission_id: &str,
+        registration: CompletionEventRegistrationInput<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_with_obligation_on(
+            Some(authority),
+            admission_id,
+            registration,
+            || {},
+            || {},
+        )
+    }
+
+    #[cfg(test)]
     pub fn register_completion_event_with_obligation(
         &mut self,
         admission_id: &str,
         registration: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
-        self.register_completion_event_with_obligation_on(admission_id, registration, || {}, || {})
+        self.register_completion_event_with_obligation_on(
+            None,
+            admission_id,
+            registration,
+            || {},
+            || {},
+        )
     }
 
     fn register_completion_event_with_obligation_on<BeforeCommit, AfterCommit>(
         &mut self,
+        authority: Option<&super::CompletionRegistrationAuthority>,
         admission_id: &str,
         registration: CompletionEventRegistrationInput<'_>,
         before_state_commit: BeforeCommit,
@@ -279,6 +302,14 @@ impl StateDb {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
         require_completion_continuity_registration_ready(&tx)?;
+        if let Some(authority) = authority {
+            validate_completion_registration_actor(
+                &tx,
+                authority,
+                owner_invocation_uuid,
+                owner_session_id,
+            )?;
+        }
         let owner_authorization = completion_owner_authorization(
             &tx,
             owner_invocation_uuid,
@@ -905,6 +936,62 @@ fn completion_owner_authorization(
         .filter(|continuity| completion_continuity_matches_expectation(continuity, &existing))
         .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
     Ok(CompletionOwnerAuthorization::TerminalExactReplay(existing))
+}
+
+fn validate_completion_registration_actor(
+    conn: &sqlite::Connection,
+    authority: &super::CompletionRegistrationAuthority,
+    invocation_uuid: &str,
+    owner_session_id: &str,
+) -> Result<(), String> {
+    let binding: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT completion_registration_capability_digest,
+                    provider_session_id,
+                    session_id
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            sqlite::params![invocation_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            format!("Failed to resolve completion registration actor authority: {error}")
+        })?;
+    let Some((Some(expected_digest), provider_session_id, session_id)) = binding else {
+        return Err(format!(
+            "process_integrity: invocation {invocation_uuid} has no caller-bound completion registration authority"
+        ));
+    };
+    let observed_digest = authority.digest();
+    if !constant_time_text_eq(&expected_digest, &observed_digest) {
+        return Err(format!(
+            "process_integrity: completion registration actor is not authorized for invocation {invocation_uuid}"
+        ));
+    }
+    let authoritative_session = provider_session_id.or(session_id).ok_or_else(|| {
+        format!(
+            "process_integrity: invocation {invocation_uuid} has no authoritative session binding for completion registration"
+        )
+    })?;
+    if authoritative_session != owner_session_id {
+        return Err(format!(
+            "process_integrity: completion registration session {owner_session_id} is not the authoritative session for invocation {invocation_uuid}"
+        ));
+    }
+    Ok(())
+}
+
+fn constant_time_text_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn completion_owner_status(
@@ -1708,6 +1795,7 @@ mod tests {
             let mut state = StateDb::open(&writer_state_path).unwrap();
             state
                 .register_completion_event_with_obligation_on(
+                    None,
                     "age299-s2-barrier-admission",
                     registration(),
                     || {

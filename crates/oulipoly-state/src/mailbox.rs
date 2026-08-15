@@ -777,6 +777,7 @@ pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+    _namespace_authority: Option<MailboxAuthorityFence>,
 }
 
 /// Serializes cooperating canonical-path creation and replacement independently
@@ -870,6 +871,13 @@ impl CompletionAuthorityFence<'_> {
         completion_continuity_head_on(&self.tx)
     }
 
+    pub(crate) fn materialized_completion_obligation_count(
+        &self,
+        invocation_uuid: &str,
+    ) -> Result<i64, String> {
+        materialized_completion_obligation_count_on(&self.tx, invocation_uuid)
+    }
+
     pub(crate) fn preflight_completion_event_registration(
         &self,
         input: &CompletionEventRegistrationInput<'_>,
@@ -894,6 +902,14 @@ impl CompletionAuthorityFence<'_> {
 
 impl MailboxAuthorityFence {
     pub(crate) fn acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        Self::acquire_with_mode(path, false)
+    }
+
+    pub(crate) fn acquire_exclusive(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        Self::acquire_with_mode(path, true)
+    }
+
+    fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self, MailboxAuthorityFenceError> {
         const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
         #[cfg(not(test))]
         const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
@@ -962,7 +978,12 @@ impl MailboxAuthorityFence {
         }
         let deadline = Instant::now() + ACQUISITION_TIMEOUT;
         loop {
-            match <std::fs::File as fs4::FileExt>::try_lock(&file) {
+            let lock_result = if exclusive {
+                <std::fs::File as fs4::FileExt>::try_lock(&file)
+            } else {
+                <std::fs::File as fs4::FileExt>::try_lock_shared(&file)
+            };
+            match lock_result {
                 Ok(()) => {
                     let retained_authority_identity = inspect_mailbox_storage_file(&authority_path)
                         .map_err(|source| MailboxAuthorityFenceError::Open {
@@ -1060,8 +1081,19 @@ impl MailboxDb {
         state_authority: &crate::StateDbRebuildAuthority,
     ) -> Result<MailboxDbRebuildAuthority, String> {
         let sidecar_path = Self::path_for_state_db(state_authority.path());
-        let namespace = MailboxAuthorityFence::acquire(&sidecar_path)
-            .map_err(|error| format!("Failed to acquire PID mailbox rebuild authority: {error}"))?;
+        let namespace = match MailboxAuthorityFence::acquire_exclusive(&sidecar_path) {
+            Ok(namespace) => namespace,
+            Err(error @ MailboxAuthorityFenceError::Timeout { .. }) => {
+                return Err(format!(
+                    "process_integrity: completion_authority_contention: failed to acquire PID mailbox rebuild authority: {error}"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Failed to acquire PID mailbox rebuild authority: {error}"
+                ));
+            }
+        };
         let writer = acquire_mailbox_rebuild_writer(&namespace)?;
         Ok(MailboxDbRebuildAuthority { namespace, writer })
     }
@@ -1077,6 +1109,7 @@ impl MailboxDb {
 
     pub fn open_default_if_exists() -> Result<Option<Self>, String> {
         let path = Self::default_path()?;
+        crate::rebuild_recovery::ensure_writable_open_allowed(&path)?;
         if !path.exists() {
             return Ok(None);
         }
@@ -1084,12 +1117,20 @@ impl MailboxDb {
         if !path.exists() {
             return Ok(None);
         }
-        Self::open_with_authority(&authority).map(Some)
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        Self::open_with_owned_authority(authority).map(Some)
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
         let authority = MailboxAuthorityFence::acquire(path).map_err(|error| error.to_string())?;
-        Self::open_with_authority(&authority)
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        Self::open_with_owned_authority(authority)
+    }
+
+    fn open_with_owned_authority(authority: MailboxAuthorityFence) -> Result<Self, String> {
+        let mut mailbox = Self::open_with_authority(&authority)?;
+        mailbox._namespace_authority = Some(authority);
+        Ok(mailbox)
     }
 
     pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
@@ -1105,6 +1146,7 @@ impl MailboxDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: None,
+            _namespace_authority: None,
         })
     }
 
@@ -1117,6 +1159,7 @@ impl MailboxDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
+            _namespace_authority: None,
         })
     }
 
@@ -1134,6 +1177,7 @@ impl MailboxDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: None,
+            _namespace_authority: None,
         })
     }
 
@@ -3700,10 +3744,13 @@ fn acquire_mailbox_rebuild_writer(
         return Ok(None);
     }
     let connection =
-        match Connection::open_with_flags(namespace.path(), OpenFlags::SQLITE_OPEN_READ_WRITE) {
-            Ok(connection) => connection,
-            Err(_) => return Ok(None),
-        };
+        Connection::open_with_flags(namespace.path(), OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
+            |error| {
+                format!(
+                    "process_integrity: completion_authority_rebuild_writer_unavailable: failed to open existing PID mailbox rebuild writer; retry after reconciling sidecar access: {error}"
+                )
+            },
+        )?;
     connection
         .busy_timeout(completion_authority_sqlite_timeout())
         .map_err(|error| format!("Failed to configure PID mailbox rebuild writer: {error}"))?;
@@ -3720,8 +3767,19 @@ fn acquire_mailbox_rebuild_writer(
                 "process_integrity: completion_authority_contention: timed out acquiring PID mailbox rebuild writer: {error}"
             ))
         }
-        Err(_) => Ok(None),
+        Err(error) if sqlite_error_is_corrupt(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "process_integrity: completion_authority_rebuild_writer_unavailable: failed to prove the existing PID mailbox writer cut; retry after reconciling sidecar access: {error}"
+        )),
     }
+}
+
+fn sqlite_error_is_corrupt(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ffi::ErrorCode::DatabaseCorrupt)
+            | Some(rusqlite::ffi::ErrorCode::NotADatabase)
+    )
 }
 
 fn sqlite_error_is_contention(error: &rusqlite::Error) -> bool {
@@ -6321,6 +6379,30 @@ fn contains_completion_obligation_on(
     })
 }
 
+fn materialized_completion_obligation_count_on(
+    conn: &Connection,
+    invocation_uuid: &str,
+) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM completion_authority_continuity AS continuity
+         JOIN completion_event AS event
+           ON event.event_id = continuity.event_id
+          AND event.kind = ?2
+         JOIN completion_event_listener AS listener
+           ON listener.event_id = continuity.event_id
+          AND listener.listener_id = continuity.owner_invocation_uuid
+          AND listener.owner_invocation_uuid = continuity.owner_invocation_uuid
+          AND listener.session_id = continuity.owner_session_id
+         WHERE continuity.invocation_uuid = ?1",
+        params![invocation_uuid, AGENT_BASH_COMPLETE_KIND],
+        |row| row.get(0),
+    )
+    .map_err(|error| {
+        format!("Failed to count exact completion event/listener obligations: {error}")
+    })
+}
+
 fn preflight_completion_event_registration_on(
     conn: &Connection,
     input: &CompletionEventRegistrationInput<'_>,
@@ -7088,6 +7170,9 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_completion_authority_continuity_head
             ON completion_authority_continuity(authority_ordinal DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_completion_authority_continuity_invocation
+            ON completion_authority_continuity(invocation_uuid, authority_ordinal);
 
         CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_insert
         BEFORE INSERT ON completion_authority_continuity
@@ -7865,6 +7950,113 @@ mod tests {
             recorded_at: "2026-08-14T00:00:00Z",
         })
         .unwrap();
+    }
+
+    #[test]
+    fn idle_writable_handles_exclude_rebuild_until_release_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let generation = mailbox.sidecar_generation().unwrap();
+        let state_authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+
+        let error = MailboxDb::acquire_rebuild_authority(&state_authority)
+            .err()
+            .expect("idle writable sidecar handle must exclude rebuild");
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        assert_eq!(mailbox.sidecar_generation().unwrap(), generation);
+        mailbox
+            .upsert_session_runtime(SessionRuntimeUpsert {
+                session_id: "idle-handle-session",
+                mode: "headless",
+                invocation_uuid: Some("idle-handle-invocation"),
+                provider_name: None,
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
+        drop(mailbox);
+
+        let mut rebuild = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+        rebuild.reset().unwrap();
+        rebuild.initialize_after_rebuild().unwrap();
+        drop(rebuild);
+        drop(state_authority);
+
+        let reopened = MailboxDb::open(&sidecar_path).unwrap();
+        assert_ne!(reopened.sidecar_generation().unwrap(), generation);
+        assert!(
+            reopened
+                .session_runtime("idle-handle-session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn idle_pid_identity_handle_excludes_rebuild_until_release_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let pid = crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap();
+        let identity = crate::pid_identity::ProcessIdentity {
+            os_pid: 301,
+            os_boot_id: "idle-pid-handle-boot".to_string(),
+            os_pid_starttime_ticks: 401,
+        };
+        let state_authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+
+        let error = MailboxDb::acquire_rebuild_authority(&state_authority)
+            .err()
+            .expect("idle PID identity handle must exclude rebuild");
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        pid.record_identity(crate::pid_identity::PidIdentityRecord {
+            identity: &identity,
+            os_pgid: Some(301),
+            invocation_uuid: "idle-pid-handle-invocation",
+            session_id: Some("idle-pid-handle-session"),
+            provider_name: Some("fixture-provider"),
+            model_name: Some("fixture-model"),
+            recorded_at: "2026-08-15T00:00:00Z",
+        })
+        .unwrap();
+        drop(pid);
+
+        let mut rebuild = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+        rebuild.reset().unwrap();
+        rebuild.initialize_after_rebuild().unwrap();
+        drop(rebuild);
+        drop(state_authority);
+
+        let reopened = crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap();
+        assert!(reopened.lookup_by_identity(&identity).unwrap().is_none());
+    }
+
+    #[test]
+    fn rebuild_writer_error_classification_allows_only_explicit_corruption() {
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::NotADatabase,
+                extended_code: 0,
+            },
+            Some("not a database".to_string()),
+        );
+        let unavailable = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::SystemIoFailure,
+                extended_code: 0,
+            },
+            Some("I/O unavailable".to_string()),
+        );
+
+        assert!(sqlite_error_is_corrupt(&corrupt));
+        assert!(!sqlite_error_is_corrupt(&unavailable));
     }
 
     fn assert_writable_sidecar_rejects_orphan(conn: &Connection, listener_id: &str) {

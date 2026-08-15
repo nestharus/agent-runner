@@ -688,7 +688,13 @@ printf 'ok\n'"#,
         .unwrap();
 
         assert_eq!(result.exit_code, 0);
-        assert_eq!(std::fs::read_to_string(env_dump_path).unwrap(), parent_env);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(env_dump_path).unwrap()
+            )
+            .unwrap(),
+            serde_json::from_str::<serde_json::Value>(parent_env).unwrap()
+        );
     }
 
     // Characterization test for AGE-8 — pins current behavior of executor/mod.rs execute_effective_with_inputs_and_env facade wrapper.
@@ -720,6 +726,33 @@ printf 'ok\n'"#,
             String::from_utf8_lossy(&result.stdout),
             "effective=chosen\n"
         );
+    }
+
+    #[test]
+    fn executor_request_debug_redacts_parent_invocation_authority() {
+        let secret = "ab".repeat(32);
+        let request = ExecutorServiceRequest::Facade {
+            model: ModelConfig {
+                name: "debug-redaction-fixture".to_string(),
+                prompt_mode: PromptMode::Arg,
+                providers: vec![],
+                inputs: vec![],
+                provider: None,
+            },
+            provider_index: 0,
+            prompt: "fixture".to_string(),
+            working_dir: None,
+            models_dir: None,
+            extra_inputs: HashMap::new(),
+            parent_invocation_env: Some(format!(
+                "{{\"_oulipoly_completion_registration_authority\":\"{secret}\"}}"
+            )),
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        assert!(!debug.contains(&secret), "{debug}");
     }
 
     // T46

@@ -92,7 +92,7 @@ fn emit_finalizer_guard_warning(err: &str) {
 mod tests {
     use super::*;
     use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
-    use oulipoly_state::{InvocationStart, InvocationStatus};
+    use oulipoly_state::{InvocationStart, InvocationStatus, ProviderSessionBinding};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
     use uuid::Uuid;
@@ -243,8 +243,22 @@ mod tests {
             provider_index: 0,
             parent_invocation_id: None,
         };
-        let invocation_id = db.start_invocation(&start).unwrap();
-        db.register_completion_event_with_obligation(
+        let invocation_start = db
+            .start_invocation_with_completion_registration_authority(&start)
+            .unwrap();
+        let invocation_id = invocation_start.invocation_row_id;
+        db.bind_invocation_provider_session_start(
+            invocation_id,
+            &ProviderSessionBinding {
+                provider_session_id: "finalizer-guard-contention-session".to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+        db.register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
             "finalizer-guard-contention-admission",
             CompletionEventRegistrationInput {
                 event_id: "finalizer-guard-contention-event",

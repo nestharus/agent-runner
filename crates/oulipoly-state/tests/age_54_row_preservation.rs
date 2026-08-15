@@ -350,10 +350,12 @@ fn migrate_legacy_invocations_row_count_guards_abort_before_drop_in_source_shape
 // Declared role: mapper
 fn acceptable_unknown_shape_columns(before_columns: &[String]) -> Vec<Vec<String>> {
     let with_row_version = columns_with_row_version(before_columns);
+    let with_resolved_account = columns_with_resolved_account(&with_row_version);
     vec![
         before_columns.to_vec(),
         with_row_version.clone(),
-        columns_with_resolved_account(&with_row_version),
+        with_resolved_account.clone(),
+        columns_with_completion_authority(&with_resolved_account),
     ]
 }
 
@@ -368,6 +370,13 @@ fn columns_with_row_version(columns: &[String]) -> Vec<String> {
 fn columns_with_resolved_account(columns: &[String]) -> Vec<String> {
     let mut updated = columns.to_vec();
     updated.push("provider_session_resolved_account".to_string());
+    updated
+}
+
+// Declared role: mapper
+fn columns_with_completion_authority(columns: &[String]) -> Vec<String> {
+    let mut updated = columns.to_vec();
+    updated.push("completion_registration_capability_digest".to_string());
     updated
 }
 

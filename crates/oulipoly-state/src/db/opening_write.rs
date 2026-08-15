@@ -185,6 +185,7 @@ impl StateDb {
             Some(StateNamespaceGuard::acquire(&db_path, false)?)
         };
         if !nonlocal {
+            crate::rebuild_recovery::ensure_writable_open_allowed(&db_path)?;
             Self::validate_state_namespace_file(&db_path)?;
         }
         Self::open_with_prepared_namespace(
@@ -319,6 +320,7 @@ impl StateDb {
         let db_path = Self::normalized_state_open_path(path);
         Self::validate_local_state_path(&db_path)?;
         let guard = StateNamespaceGuard::acquire(&db_path, false)?;
+        crate::rebuild_recovery::ensure_writable_open_allowed(&db_path)?;
         Self::validate_state_namespace_file(&db_path)?;
         Ok(StateDbWriterAuthority {
             _guard: guard,

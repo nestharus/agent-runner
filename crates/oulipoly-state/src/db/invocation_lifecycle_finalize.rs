@@ -403,15 +403,22 @@ impl StateDb {
                     )
                 }
             })?;
-        if let (Some(sidecar_fence), Some(obligation), Some(state_continuity_head)) = (
+        if let (
+            Some(sidecar_fence),
+            Some(obligation),
+            Some(authority_summary),
+            Some(state_continuity_head),
+        ) = (
             sidecar_fence.as_ref(),
             obligation.as_ref(),
+            authority_summary.as_ref(),
             state_continuity_head.as_ref(),
         ) {
             self.validate_completion_sidecar_authority(
                 sidecar_fence,
                 &invocation.invocation_uuid,
                 obligation,
+                authority_summary.obligation_count,
                 state_continuity_head,
             )?;
         }
@@ -492,6 +499,7 @@ impl StateDb {
         sidecar: &crate::mailbox::CompletionAuthorityFence<'_>,
         invocation_uuid: &str,
         obligation: &CompletionObligationExpectation,
+        expected_obligation_count: i64,
         state_continuity_head: &crate::mailbox::CompletionContinuityHead,
     ) -> Result<(), String> {
         let observed_generation = sidecar.sidecar_generation().map_err(|error| {
@@ -513,6 +521,19 @@ impl StateDb {
             return Err(format!(
                 "process_integrity: invocation {invocation_uuid} cannot succeed because completion obligation {} owned by {} has no exact matching State/sidecar continuity proof",
                 obligation.admission_id, obligation.owner_invocation_uuid,
+            ));
+        }
+        let materialized_obligation_count = sidecar
+            .materialized_completion_obligation_count(invocation_uuid)
+            .map_err(|error| {
+                Self::format_unreadable_completion_sidecar(invocation_uuid, obligation, error)
+            })?;
+        if materialized_obligation_count != expected_obligation_count {
+            return Err(format!(
+                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion authority requires {expected_obligation_count} exact agent_bash_complete event/listener obligations but only {materialized_obligation_count} remain; first obligation {} is owned by invocation {} and session {}",
+                obligation.admission_id,
+                obligation.owner_invocation_uuid,
+                obligation.owner_session_id,
             ));
         }
         Ok(())
@@ -696,7 +717,8 @@ mod tests {
     fn finalization_waits_within_one_sidecar_authority_budget() {
         let (_directory, state, invocation_row_id, sidecar_path) =
             state_with_completion_obligation();
-        let authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let authority =
+            crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar_path).unwrap();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
             drop(authority);
@@ -720,7 +742,8 @@ mod tests {
     fn exhausted_sidecar_authority_contention_is_distinct_from_identity_failure() {
         let (_directory, state, invocation_row_id, sidecar_path) =
             state_with_completion_obligation();
-        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let _authority =
+            crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&sidecar_path).unwrap();
 
         let error = state
             .finalize_invocation(invocation_row_id, true, 0, None, None)
@@ -785,7 +808,8 @@ mod tests {
             start_mutation_rx.recv().unwrap();
             mutation_started_tx.send(()).unwrap();
             let authority =
-                crate::mailbox::MailboxAuthorityFence::acquire(&mutator_sidecar_path).unwrap();
+                crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&mutator_sidecar_path)
+                    .unwrap();
             authority_acquired_tx.send(()).unwrap();
             std::fs::rename(&mutator_sidecar_path, &mutator_renamed_path).unwrap();
             drop(authority);

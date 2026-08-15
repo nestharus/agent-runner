@@ -2,7 +2,7 @@ use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
 use oulipoly_state::migrations;
 use oulipoly_state::{
     CURRENT_SCHEMA_VERSION, CompletionContinuityRecoveryState, CompletionObligationAdmission,
-    InvocationStart, StateDb,
+    CompletionRegistrationAuthority, InvocationStart, ProviderSessionBinding, StateDb,
 };
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const EVENT_ID: &str = "ab_age299_s2_event";
@@ -10,7 +10,7 @@ const ADMISSION_ID: &str = "admission-age299-s2";
 const OWNER_SESSION_ID: &str = "session-age299-s2-owner";
 
 #[test]
-fn base_s1_schema_14_without_obligations_upgrades_and_registers_normally() {
+fn base_s1_schema_14_without_capability_upgrades_but_cannot_admit_new_authority() {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
@@ -23,22 +23,20 @@ fn base_s1_schema_14_without_obligations_upgrades_and_registers_normally() {
         state.completion_continuity_recovery_state().unwrap(),
         CompletionContinuityRecoveryState::Ready
     );
-    state
-        .register_completion_event_with_obligation(
+    let authority = fixture_authority();
+    let error = state
+        .register_completion_event_with_authority(
+            &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
         )
-        .unwrap();
+        .unwrap_err();
+    assert!(error.contains("no caller-bound"), "{error}");
     assert_eq!(
         count_state_rows(&state, "invocation_completion_continuity"),
-        1
+        0
     );
-    assert!(
-        MailboxDb::open(&sidecar_path)
-            .unwrap()
-            .contains_completion_obligation(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID)
-            .unwrap()
-    );
+    assert!(!sidecar_path.exists());
 }
 
 #[test]
@@ -59,7 +57,8 @@ fn base_s1_schema_14_obligations_require_typed_operator_recovery_before_registra
     );
     assert!(state.get_invocation_by_uuid(ROOT_UUID).unwrap().is_some());
     let error = state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &fixture_authority(),
             "post-upgrade-admission",
             completion_registration("post-upgrade-event", ROOT_UUID, OWNER_SESSION_ID),
         )
@@ -108,10 +107,13 @@ fn sibling_state_databases_cannot_register_into_one_sidecar_authority() {
     let canonical = StateDb::open(&canonical_path).unwrap();
     let mut alternate = StateDb::open(&alternate_path).unwrap();
     let canonical_row_id = start_invocation(&canonical, ROOT_UUID);
-    start_invocation(&alternate, ROOT_UUID);
+    let (alternate_row_id, alternate_authority) =
+        start_authorized_invocation(&alternate, ROOT_UUID, OWNER_SESSION_ID);
+    assert!(alternate_row_id > 0);
 
     alternate
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &alternate_authority,
             "alternate-state-admission",
             completion_registration("alternate-state-event", ROOT_UUID, OWNER_SESSION_ID),
         )
@@ -141,14 +143,93 @@ fn sibling_state_databases_cannot_register_into_one_sidecar_authority() {
 }
 
 #[test]
+fn completion_admission_rejects_foreign_capability_and_fabricated_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let mut state = StateDb::open(&state_path).unwrap();
+    let (_, owner_authority) = start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
+    let foreign_uuid = "33333333-3333-4333-8333-333333333333";
+    let (_, foreign_authority) =
+        start_authorized_invocation(&state, foreign_uuid, "foreign-session");
+
+    let foreign_error = state
+        .register_completion_event_with_authority(
+            &foreign_authority,
+            "foreign-capability-admission",
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap_err();
+    assert!(foreign_error.contains("not authorized"), "{foreign_error}");
+
+    let session_error = state
+        .register_completion_event_with_authority(
+            &owner_authority,
+            "fabricated-session-admission",
+            completion_registration(EVENT_ID, ROOT_UUID, "fabricated-session"),
+        )
+        .unwrap_err();
+    assert!(
+        session_error.contains("not the authoritative session"),
+        "{session_error}"
+    );
+    assert!(
+        state
+            .completion_obligations_for_invocation(ROOT_UUID)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!MailboxDb::path_for_state_db(&state_path).exists());
+}
+
+#[test]
+fn caller_bound_capability_preserves_only_exact_immutable_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let mut state = StateDb::open(&state_path).unwrap();
+    let (_, authority) = start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
+    let registration = completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID);
+
+    state
+        .register_completion_event_with_authority(&authority, ADMISSION_ID, registration)
+        .unwrap();
+    state
+        .register_completion_event_with_authority(&authority, ADMISSION_ID, registration)
+        .unwrap();
+
+    assert_eq!(
+        count_state_rows(&state, "invocation_completion_obligations"),
+        1
+    );
+    assert_eq!(
+        count_state_rows(&state, "invocation_completion_continuity"),
+        1
+    );
+    let stored_digest: String = state
+        .connection()
+        .query_row(
+            "SELECT completion_registration_capability_digest
+             FROM invocations
+             WHERE invocation_uuid = ?1",
+            [ROOT_UUID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_digest.len(), 64);
+    assert_ne!(stored_digest, authority.process_environment_value());
+    assert!(!format!("{authority:?}").contains(authority.process_environment_value()));
+}
+
+#[test]
 fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_sidecars() {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let mut state = StateDb::open(&state_path).unwrap();
-    let invocation_row_id = start_invocation(&state, ROOT_UUID);
+    let (invocation_row_id, authority) =
+        start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
     state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
         )
@@ -162,9 +243,11 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
         .unwrap();
 
     let missing_uuid = "55555555-5555-4555-8555-555555555555";
-    let missing_row_id = start_invocation(&state, missing_uuid);
+    let (missing_row_id, missing_authority) =
+        start_authorized_invocation(&state, missing_uuid, "session-missing-sidecar");
     state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &missing_authority,
             "admission-missing-sidecar",
             completion_registration(
                 "event-missing-sidecar",
@@ -221,9 +304,11 @@ fn admitted_completion_authority_refuses_a_renamed_sidecar_until_exact_authority
     let sidecar_path = MailboxDb::path_for_state_db(&state_path);
     let renamed_sidecar_path = directory.path().join("pid-identity.held");
     let mut state = StateDb::open(&state_path).unwrap();
-    let invocation_row_id = start_invocation(&state, ROOT_UUID);
+    let (invocation_row_id, authority) =
+        start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
     state
-        .register_completion_event_with_obligation(
+        .register_completion_event_with_authority(
+            &authority,
             ADMISSION_ID,
             completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
         )
@@ -281,9 +366,11 @@ fn admitted_completion_authority_refuses_present_event_with_wrong_owner_or_sessi
         let state_path = directory.path().join("state.db");
         let sidecar_path = MailboxDb::path_for_state_db(&state_path);
         let mut state = StateDb::open(&state_path).unwrap();
-        let invocation_row_id = start_invocation(&state, ROOT_UUID);
+        let (invocation_row_id, authority) =
+            start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
         state
-            .register_completion_event_with_obligation(
+            .register_completion_event_with_authority(
+                &authority,
                 ADMISSION_ID,
                 completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
             )
@@ -395,6 +482,41 @@ fn start_invocation(state: &StateDb, invocation_uuid: &str) -> i64 {
             parent_invocation_id: None,
         })
         .unwrap()
+}
+
+fn start_authorized_invocation(
+    state: &StateDb,
+    invocation_uuid: &str,
+    session_id: &str,
+) -> (i64, CompletionRegistrationAuthority) {
+    let start = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: invocation_uuid.to_string(),
+            model_name: "age299-s2".to_string(),
+            provider_name: "test-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            start.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: session_id.to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    (
+        start.invocation_row_id,
+        start.completion_registration_authority,
+    )
+}
+
+fn fixture_authority() -> CompletionRegistrationAuthority {
+    CompletionRegistrationAuthority::from_process_environment_value("11".repeat(32)).unwrap()
 }
 
 fn obligation<'a>(

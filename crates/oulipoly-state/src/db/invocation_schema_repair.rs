@@ -154,7 +154,9 @@ impl StateDb {
             .filter(|column| {
                 !matches!(
                     column.as_str(),
-                    "row_version" | "provider_session_resolved_account"
+                    "row_version"
+                        | "provider_session_resolved_account"
+                        | "completion_registration_capability_digest"
                 )
             })
             .cloned()

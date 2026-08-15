@@ -87,11 +87,13 @@ pub(super) fn legacy_resume_payload<'a>(
 pub(super) fn resume_invocation_attempt<'state>(
     invocation: CompositeInvocationId,
     invocation_row_id: i64,
+    completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
     guard: crate::invocation::finalize::FinalizerGuard<'state>,
 ) -> super::lifecycle::ResumeInvocationAttempt<'state> {
     super::lifecycle::ResumeInvocationAttempt {
         invocation,
         invocation_row_id,
+        completion_registration_authority,
         guard,
     }
 }

@@ -80,8 +80,8 @@ impl Fixture {
         event_id: &str,
     ) {
         let mut state = self.state();
-        let invocation_id = state
-            .start_invocation(&InvocationStart {
+        let invocation_start = state
+            .start_invocation_with_completion_registration_authority(&InvocationStart {
                 invocation_uuid: invocation_uuid.to_string(),
                 model_name: MODEL.to_string(),
                 provider_name: PROVIDER.to_string(),
@@ -89,6 +89,7 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
+        let invocation_id = invocation_start.invocation_row_id;
         state
             .bind_invocation_provider_session_start(
                 invocation_id,
@@ -148,7 +149,8 @@ impl Fixture {
         let artifacts = self.seed_mailbox_artifacts(event_id);
         write_seed_mailbox_artifacts(&artifacts, event_id);
         state
-            .register_completion_event_with_obligation(
+            .register_completion_event_with_authority(
+                &invocation_start.completion_registration_authority,
                 &format!("proactive-wake:{event_id}:owner:{invocation_uuid}"),
                 CompletionEventRegistrationInput {
                     event_id,

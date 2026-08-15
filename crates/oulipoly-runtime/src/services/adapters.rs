@@ -174,7 +174,11 @@ impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
         &self,
         request: InvocationLifecycleStartRequest<'_>,
     ) -> Result<InvocationLifecycleStartOutput, ServiceError> {
-        map_invocation_start_result(request.state.start_invocation(request.start))
+        map_invocation_start_result(
+            request
+                .state
+                .start_invocation_with_completion_registration_authority(request.start),
+        )
     }
 
     fn finalize_invocation(
@@ -312,10 +316,13 @@ fn map_routing_service_result(
 }
 
 fn map_invocation_start_result(
-    result: Result<i64, String>,
+    result: Result<oulipoly_state::InvocationStartWithCompletionAuthority, String>,
 ) -> Result<InvocationLifecycleStartOutput, ServiceError> {
     result
-        .map(|invocation_row_id| InvocationLifecycleStartOutput { invocation_row_id })
+        .map(|start| InvocationLifecycleStartOutput {
+            invocation_row_id: start.invocation_row_id,
+            completion_registration_authority: start.completion_registration_authority,
+        })
         .map_err(|message| ServiceError::Dependency { message })
 }
 
