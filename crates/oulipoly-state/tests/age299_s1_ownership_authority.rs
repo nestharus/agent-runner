@@ -167,6 +167,7 @@ fn schema_13_migrates_through_ordered_v17_and_preserves_invocation_data() {
             (15, "0015_invocation_completion_continuity"),
             (16, "0016_invocation_completion_authority_summary"),
             (17, "0017_completion_registration_authority"),
+            (18, "0018_invocation_completion_materialization_summary"),
         ]
     );
 

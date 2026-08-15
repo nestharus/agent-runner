@@ -341,10 +341,20 @@ impl StateDb {
                 Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
             })?
             .flatten();
+        let materialization_expectation = success
+            .then(|| {
+                Self::completion_materialization_expectation_on(&tx, &invocation.invocation_uuid)
+            })
+            .transpose()
+            .map_err(|error| {
+                Self::format_completion_authority_storage_error(&invocation.invocation_uuid, error)
+            })?
+            .flatten();
         Self::validate_completion_authority_summary(
             &invocation.invocation_uuid,
             obligation.as_ref(),
             authority_summary.as_ref(),
+            materialization_expectation.as_ref(),
         )?;
         let completion_authority_state_path = if obligation.is_none() {
             self.db_path.as_path()
@@ -406,19 +416,19 @@ impl StateDb {
         if let (
             Some(sidecar_fence),
             Some(obligation),
-            Some(authority_summary),
+            Some(materialization_expectation),
             Some(state_continuity_head),
         ) = (
             sidecar_fence.as_ref(),
             obligation.as_ref(),
-            authority_summary.as_ref(),
+            materialization_expectation.as_ref(),
             state_continuity_head.as_ref(),
         ) {
             self.validate_completion_sidecar_authority(
                 sidecar_fence,
                 &invocation.invocation_uuid,
                 obligation,
-                authority_summary.obligation_count,
+                materialization_expectation,
                 state_continuity_head,
             )?;
         }
@@ -499,7 +509,7 @@ impl StateDb {
         sidecar: &crate::mailbox::CompletionAuthorityFence<'_>,
         invocation_uuid: &str,
         obligation: &CompletionObligationExpectation,
-        expected_obligation_count: i64,
+        expected: &CompletionMaterializationExpectation,
         state_continuity_head: &crate::mailbox::CompletionContinuityHead,
     ) -> Result<(), String> {
         let observed_generation = sidecar.sidecar_generation().map_err(|error| {
@@ -523,14 +533,23 @@ impl StateDb {
                 obligation.admission_id, obligation.owner_invocation_uuid,
             ));
         }
-        let materialized_obligation_count = sidecar
-            .materialized_completion_obligation_count(invocation_uuid)
+        let observed = sidecar
+            .completion_materialization_summary(invocation_uuid)
             .map_err(|error| {
                 Self::format_unreadable_completion_sidecar(invocation_uuid, obligation, error)
             })?;
-        if materialized_obligation_count != expected_obligation_count {
+        let exact_match = observed.as_ref().is_some_and(|observed| {
+            observed.materialized_count == expected.materialized_count
+                && observed.authority_ordinal == expected.authority_ordinal
+                && observed.sidecar_generation == expected.sidecar_generation
+                && observed.continuity_digest == expected.continuity_digest
+        });
+        if !exact_match {
             return Err(format!(
-                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion authority requires {expected_obligation_count} exact agent_bash_complete event/listener obligations but only {materialized_obligation_count} remain; first obligation {} is owned by invocation {} and session {}",
+                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion authority requires {} exact agent_bash_complete event/listener obligations at ordinal {} and digest {}, but the sidecar materialization summary is absent or mismatched; first obligation {} is owned by invocation {} and session {}",
+                expected.materialized_count,
+                expected.authority_ordinal,
+                expected.continuity_digest,
                 obligation.admission_id,
                 obligation.owner_invocation_uuid,
                 obligation.owner_session_id,
@@ -543,19 +562,22 @@ impl StateDb {
         invocation_uuid: &str,
         obligation: Option<&CompletionObligationExpectation>,
         summary: Option<&CompletionAuthoritySummary>,
+        materialization: Option<&CompletionMaterializationExpectation>,
     ) -> Result<(), String> {
-        match (obligation, summary) {
-            (None, None) => Ok(()),
-            (Some(_), Some(summary))
+        match (obligation, summary, materialization) {
+            (None, None, None) => Ok(()),
+            (Some(_), Some(summary), Some(materialization))
                 if summary.obligation_count > 0
-                    && summary.obligation_count == summary.continuity_count =>
+                    && summary.obligation_count == summary.continuity_count
+                    && summary.obligation_count == materialization.materialized_count =>
             {
                 Ok(())
             }
             _ => Err(format!(
-                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion obligations lack exact State continuity proof: obligations={}, continuity={}",
+                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion obligations lack exact State continuity and materialization proof: obligations={}, continuity={}, materialized={}",
                 summary.map_or(0, |summary| summary.obligation_count),
                 summary.map_or(0, |summary| summary.continuity_count),
+                materialization.map_or(0, |summary| summary.materialized_count),
             )),
         }
     }
@@ -865,8 +887,8 @@ mod tests {
     }
 
     #[test]
-    fn mature_owner_finalization_uses_one_exact_head_lookup_per_store() {
-        fn query_counts(obligation_count: usize) -> (usize, usize) {
+    fn mature_owner_finalization_has_bounded_sqlite_vm_work_and_one_head_lookup_per_store() {
+        fn finalization_work(obligation_count: usize) -> (usize, usize, usize) {
             let directory = tempfile::tempdir().unwrap();
             let state_path = directory.path().join("state.db");
             let mut state = StateDb::open(&state_path).unwrap();
@@ -900,18 +922,35 @@ mod tests {
             }
             crate::db::ownership_authority::reset_completion_continuity_head_query_count();
             crate::mailbox::reset_completion_continuity_head_query_count();
+            crate::mailbox::install_completion_finalization_vm_counter(&state.conn);
+            crate::mailbox::begin_completion_finalization_vm_count();
 
             state
                 .finalize_invocation(invocation_row_id, true, 0, None, None)
                 .unwrap();
+            let vm_steps = crate::mailbox::end_completion_finalization_vm_count();
 
             (
                 crate::db::ownership_authority::completion_continuity_head_query_count(),
                 crate::mailbox::completion_continuity_head_query_count(),
+                vm_steps,
             )
         }
 
-        assert_eq!(query_counts(1), (1, 1));
-        assert_eq!(query_counts(256), (1, 1));
+        let small = finalization_work(1);
+        let mature = finalization_work(256);
+        assert_eq!((small.0, small.1), (1, 1));
+        assert_eq!((mature.0, mature.1), (1, 1));
+        assert!(
+            small.2 < 2_000,
+            "small-owner finalization used {} VM steps",
+            small.2
+        );
+        assert!(
+            mature.2 <= small.2 + 128,
+            "mature-owner finalization grew with retained obligations: small={}, mature={}",
+            small.2,
+            mature.2
+        );
     }
 }

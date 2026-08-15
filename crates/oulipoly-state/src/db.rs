@@ -178,8 +178,8 @@ use self::lifecycle_invocation_row::LifecycleInvocationRow;
 pub use self::opening_write::StateReadConnection;
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
 use self::ownership_authority::{
-    CompletionAuthoritySummary, completion_continuity_head_on,
-    require_completion_continuity_registration_ready,
+    CompletionAuthoritySummary, CompletionMaterializationExpectation,
+    completion_continuity_head_on, require_completion_continuity_registration_ready,
 };
 pub use self::ownership_authority::{
     CompletionContinuityRecoveryState, CompletionObligationAdmission,

@@ -355,7 +355,10 @@ fn admitted_completion_authority_refuses_an_absent_event_in_the_matching_sidecar
         .finalize_invocation(invocation_row_id, true, 0, None, None)
         .unwrap_err();
     assert!(error.contains("process_integrity"), "{error}");
-    assert!(error.contains("exact State continuity proof"), "{error}");
+    assert!(
+        error.contains("exact State continuity and materialization proof"),
+        "{error}"
+    );
     assert_running(&state, ROOT_UUID);
 }
 
@@ -400,6 +403,152 @@ fn admitted_completion_authority_refuses_present_event_with_wrong_owner_or_sessi
         );
         assert_running(&state, ROOT_UUID);
     }
+}
+
+#[test]
+fn finalization_refuses_missing_mismatched_or_drifted_materialization_summaries() {
+    for mutation in [
+        "sidecar_missing",
+        "sidecar_count_mismatch",
+        "sidecar_digest_mismatch",
+        "state_missing",
+        "state_count_mismatch",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        let (invocation_row_id, authority) =
+            start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
+        state
+            .register_completion_event_with_authority(
+                &authority,
+                ADMISSION_ID,
+                completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+            )
+            .unwrap();
+        let target = if mutation.starts_with("sidecar") {
+            &sidecar_path
+        } else {
+            &state_path
+        };
+        let connection = rusqlite::Connection::open(target).unwrap();
+        let statement = match mutation {
+            "sidecar_missing" => {
+                "DELETE FROM completion_authority_materialization_summary"
+            }
+            "sidecar_count_mismatch" => {
+                "UPDATE completion_authority_materialization_summary
+                 SET materialized_count = materialized_count + 1"
+            }
+            "sidecar_digest_mismatch" => {
+                "UPDATE completion_authority_materialization_summary
+                 SET continuity_digest = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+            }
+            "state_missing" => "DELETE FROM invocation_completion_materialization_summary",
+            "state_count_mismatch" => {
+                "UPDATE invocation_completion_materialization_summary
+                 SET materialized_count = materialized_count + 1"
+            }
+            _ => unreachable!(),
+        };
+        connection.execute(statement, []).unwrap();
+        drop(connection);
+
+        let error = state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap_err();
+
+        assert!(error.contains("process_integrity"), "{mutation}: {error}");
+        assert_running(&state, ROOT_UUID);
+    }
+}
+
+#[test]
+fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let mut state = StateDb::open(&state_path).unwrap();
+    let (invocation_row_id, authority) =
+        start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
+    state
+        .register_completion_event_with_authority(
+            &authority,
+            ADMISSION_ID,
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap();
+    drop(state);
+    let connection = rusqlite::Connection::open(&state_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER trg_invocation_completion_materialization_summary_continuity_insert;
+             DROP TABLE invocation_completion_materialization_summary;
+             PRAGMA user_version = 17;",
+        )
+        .unwrap();
+    drop(connection);
+
+    state = StateDb::open(&state_path).unwrap();
+    let summary: (i64, i64, String) = state
+        .connection()
+        .query_row(
+            "SELECT materialized_count, authority_ordinal, continuity_digest
+             FROM invocation_completion_materialization_summary
+             WHERE invocation_uuid = ?1",
+            [ROOT_UUID],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(summary.0, 1);
+    assert_eq!(summary.1, 1);
+    assert_eq!(summary.2.len(), 64);
+    state
+        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .unwrap();
+}
+
+#[test]
+fn sidecar_repair_does_not_synthesize_summary_from_malformed_listener_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let mut state = StateDb::open(&state_path).unwrap();
+    let (invocation_row_id, authority) =
+        start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
+    state
+        .register_completion_event_with_authority(
+            &authority,
+            ADMISSION_ID,
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap();
+    let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TRIGGER trg_completion_event_listener_identity_update;
+             DROP TRIGGER trg_completion_authority_materialization_summary_insert;
+             DELETE FROM completion_authority_materialization_summary;
+             UPDATE completion_event_listener SET session_id = 'malformed-session';",
+        )
+        .unwrap();
+    drop(connection);
+    drop(MailboxDb::open(&sidecar_path).unwrap());
+    let summary_count: i64 = rusqlite::Connection::open(&sidecar_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM completion_authority_materialization_summary",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(summary_count, 0);
+
+    let error = state
+        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .unwrap_err();
+    assert!(error.contains("process_integrity"), "{error}");
+    assert_running(&state, ROOT_UUID);
 }
 
 #[test]

@@ -860,6 +860,14 @@ pub(crate) struct CompletionContinuityHead {
     pub continuity_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionMaterializationSummary {
+    pub materialized_count: i64,
+    pub authority_ordinal: i64,
+    pub sidecar_generation: String,
+    pub continuity_digest: String,
+}
+
 impl CompletionAuthorityFence<'_> {
     pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
         sidecar_generation_on(&self.tx)
@@ -871,11 +879,11 @@ impl CompletionAuthorityFence<'_> {
         completion_continuity_head_on(&self.tx)
     }
 
-    pub(crate) fn materialized_completion_obligation_count(
+    pub(crate) fn completion_materialization_summary(
         &self,
         invocation_uuid: &str,
-    ) -> Result<i64, String> {
-        materialized_completion_obligation_count_on(&self.tx, invocation_uuid)
+    ) -> Result<Option<CompletionMaterializationSummary>, String> {
+        completion_materialization_summary_on(&self.tx, invocation_uuid)
     }
 
     pub(crate) fn preflight_completion_event_registration(
@@ -6347,6 +6355,36 @@ fn append_completion_continuity_on(
 #[cfg(test)]
 thread_local! {
     static COMPLETION_CONTINUITY_HEAD_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPLETION_FINALIZATION_VM_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_COMPLETION_FINALIZATION_VM_STEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn install_completion_finalization_vm_counter(conn: &Connection) {
+    conn.progress_handler(
+        1,
+        Some(|| {
+            COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| {
+                if enabled.get() {
+                    COMPLETION_FINALIZATION_VM_STEPS.with(|count| count.set(count.get() + 1));
+                }
+            });
+            false
+        }),
+    )
+    .expect("install completion finalization SQLite VM counter");
+}
+
+#[cfg(test)]
+pub(crate) fn begin_completion_finalization_vm_count() {
+    COMPLETION_FINALIZATION_VM_STEPS.with(|count| count.set(0));
+    COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| enabled.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn end_completion_finalization_vm_count() -> usize {
+    COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| enabled.set(false));
+    COMPLETION_FINALIZATION_VM_STEPS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -6379,28 +6417,26 @@ fn contains_completion_obligation_on(
     })
 }
 
-fn materialized_completion_obligation_count_on(
+fn completion_materialization_summary_on(
     conn: &Connection,
     invocation_uuid: &str,
-) -> Result<i64, String> {
+) -> Result<Option<CompletionMaterializationSummary>, String> {
     conn.query_row(
-        "SELECT COUNT(*)
-         FROM completion_authority_continuity AS continuity
-         JOIN completion_event AS event
-           ON event.event_id = continuity.event_id
-          AND event.kind = ?2
-         JOIN completion_event_listener AS listener
-           ON listener.event_id = continuity.event_id
-          AND listener.listener_id = continuity.owner_invocation_uuid
-          AND listener.owner_invocation_uuid = continuity.owner_invocation_uuid
-          AND listener.session_id = continuity.owner_session_id
-         WHERE continuity.invocation_uuid = ?1",
-        params![invocation_uuid, AGENT_BASH_COMPLETE_KIND],
-        |row| row.get(0),
+        "SELECT materialized_count, authority_ordinal, sidecar_generation, continuity_digest
+         FROM completion_authority_materialization_summary
+         WHERE invocation_uuid = ?1",
+        params![invocation_uuid],
+        |row| {
+            Ok(CompletionMaterializationSummary {
+                materialized_count: row.get(0)?,
+                authority_ordinal: row.get(1)?,
+                sidecar_generation: row.get(2)?,
+                continuity_digest: row.get(3)?,
+            })
+        },
     )
-    .map_err(|error| {
-        format!("Failed to count exact completion event/listener obligations: {error}")
-    })
+    .optional()
+    .map_err(|error| format!("Failed to read completion materialization summary: {error}"))
 }
 
 fn preflight_completion_event_registration_on(
@@ -6997,7 +7033,10 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
 
 pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result<(), String> {
     conn.pragma_update(None, "foreign_keys", true)
-        .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))
+        .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))?;
+    #[cfg(test)]
+    install_completion_finalization_vm_counter(conn);
+    Ok(())
 }
 
 fn mailbox_schema_definition() -> &'static str {
@@ -7136,6 +7175,21 @@ fn mailbox_schema_definition() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_completion_event_listener_pending
             ON completion_event_listener(session_id, active, acknowledged_at, event_id);
 
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_identity_update
+        BEFORE UPDATE OF event_id, kind, delivery_mode, state_dir, meta_path, log_path, rc_path, created_at
+        ON completion_event
+        WHEN OLD.event_id IS NOT NEW.event_id
+          OR OLD.kind IS NOT NEW.kind
+          OR OLD.delivery_mode IS NOT NEW.delivery_mode
+          OR OLD.state_dir IS NOT NEW.state_dir
+          OR OLD.meta_path IS NOT NEW.meta_path
+          OR OLD.log_path IS NOT NEW.log_path
+          OR OLD.rc_path IS NOT NEW.rc_path
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'completion event identity is immutable');
+        END;
+
         CREATE TRIGGER IF NOT EXISTS trg_completion_event_listener_identity_update
         BEFORE UPDATE OF event_id, listener_id, session_id, owner_invocation_uuid, created_at
         ON completion_event_listener
@@ -7174,6 +7228,59 @@ fn mailbox_schema_definition() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_completion_authority_continuity_invocation
             ON completion_authority_continuity(invocation_uuid, authority_ordinal);
 
+        CREATE TABLE IF NOT EXISTS completion_authority_materialization_summary (
+            invocation_uuid    TEXT PRIMARY KEY,
+            materialized_count INTEGER NOT NULL CHECK(materialized_count > 0),
+            authority_ordinal  INTEGER NOT NULL CHECK(authority_ordinal > 0),
+            sidecar_generation TEXT NOT NULL,
+            continuity_digest  TEXT NOT NULL
+                CHECK(length(continuity_digest) = 64
+                    AND continuity_digest NOT GLOB '*[^0-9a-f]*'),
+            FOREIGN KEY(sidecar_generation)
+                REFERENCES mailbox_sidecar_identity(generation_uuid)
+        ) STRICT;
+
+        INSERT OR IGNORE INTO completion_authority_materialization_summary (
+            invocation_uuid,
+            materialized_count,
+            authority_ordinal,
+            sidecar_generation,
+            continuity_digest
+        )
+        SELECT
+            head.invocation_uuid,
+            (
+                SELECT COUNT(*)
+                FROM completion_authority_continuity AS counted
+                WHERE counted.invocation_uuid = head.invocation_uuid
+            ),
+            head.authority_ordinal,
+            head.sidecar_generation,
+            head.continuity_digest
+        FROM completion_authority_continuity AS head
+        WHERE head.authority_ordinal = (
+            SELECT MAX(candidate.authority_ordinal)
+            FROM completion_authority_continuity AS candidate
+            WHERE candidate.invocation_uuid = head.invocation_uuid
+        )
+        AND (
+            SELECT COUNT(*)
+            FROM completion_authority_continuity AS counted
+            WHERE counted.invocation_uuid = head.invocation_uuid
+        ) = (
+            SELECT COUNT(*)
+            FROM completion_authority_continuity AS continuity
+            JOIN completion_event AS event
+              ON event.event_id = continuity.event_id
+             AND event.kind = 'agent_bash_complete'
+            JOIN completion_event_listener AS listener
+              ON listener.event_id = continuity.event_id
+             AND listener.listener_id = continuity.owner_invocation_uuid
+             AND listener.owner_invocation_uuid = continuity.owner_invocation_uuid
+             AND listener.session_id = continuity.owner_session_id
+            WHERE continuity.invocation_uuid = head.invocation_uuid
+        );
+
         CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_insert
         BEFORE INSERT ON completion_authority_continuity
         BEGIN
@@ -7201,7 +7308,41 @@ fn mailbox_schema_definition() -> &'static str {
                     FROM mailbox_sidecar_identity
                     WHERE singleton = 1
                 ) THEN RAISE(ABORT, 'completion continuity sidecar generation mismatch')
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM completion_event AS event
+                    JOIN completion_event_listener AS listener
+                      ON listener.event_id = event.event_id
+                    WHERE event.event_id = NEW.event_id
+                      AND event.kind = 'agent_bash_complete'
+                      AND listener.listener_id = NEW.owner_invocation_uuid
+                      AND listener.owner_invocation_uuid = NEW.owner_invocation_uuid
+                      AND listener.session_id = NEW.owner_session_id
+                ) THEN RAISE(ABORT, 'completion continuity event/listener identity mismatch')
             END;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_materialization_summary_insert
+        AFTER INSERT ON completion_authority_continuity
+        BEGIN
+            INSERT INTO completion_authority_materialization_summary (
+                invocation_uuid,
+                materialized_count,
+                authority_ordinal,
+                sidecar_generation,
+                continuity_digest
+            ) VALUES (
+                NEW.invocation_uuid,
+                1,
+                NEW.authority_ordinal,
+                NEW.sidecar_generation,
+                NEW.continuity_digest
+            )
+            ON CONFLICT(invocation_uuid) DO UPDATE SET
+                materialized_count = materialized_count + 1,
+                authority_ordinal = NEW.authority_ordinal,
+                sidecar_generation = NEW.sidecar_generation,
+                continuity_digest = NEW.continuity_digest;
         END;
 
         CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_update

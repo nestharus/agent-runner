@@ -67,6 +67,13 @@ pub(super) struct CompletionAuthoritySummary {
     pub(super) continuity_count: i64,
 }
 
+pub(super) struct CompletionMaterializationExpectation {
+    pub(super) materialized_count: i64,
+    pub(super) authority_ordinal: i64,
+    pub(super) sidecar_generation: String,
+    pub(super) continuity_digest: String,
+}
+
 impl CompletionObligationAuthority {
     pub fn sidecar_generation_state(
         &self,
@@ -441,6 +448,29 @@ impl StateDb {
         )
         .optional()
         .map_err(persistence("read completion authority summary"))
+    }
+
+    pub(super) fn completion_materialization_expectation_on(
+        conn: &rusqlite::Connection,
+        invocation_uuid: &str,
+    ) -> Result<Option<CompletionMaterializationExpectation>, OwnershipAuthorityError> {
+        validate_nonempty(invocation_uuid, "invocation_uuid")?;
+        conn.query_row(
+            "SELECT materialized_count, authority_ordinal, sidecar_generation, continuity_digest
+             FROM invocation_completion_materialization_summary
+             WHERE invocation_uuid = ?1",
+            sqlite::params![invocation_uuid],
+            |row| {
+                Ok(CompletionMaterializationExpectation {
+                    materialized_count: row.get(0)?,
+                    authority_ordinal: row.get(1)?,
+                    sidecar_generation: row.get(2)?,
+                    continuity_digest: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(persistence("read completion materialization expectation"))
     }
 
     pub fn completion_obligation_authority(
