@@ -4,7 +4,7 @@
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
-use super::{RusqliteOptionalExtension, StateDb, sqlite};
+use super::{InvocationStatus, RusqliteOptionalExtension, StateDb, sqlite};
 use crate::mailbox::{
     COMPLETION_CONTINUITY_GENESIS_DIGEST, CompletionContinuityHead,
     CompletionEventRegistrationInput, CompletionEventRegistrationResult, MailboxDb,
@@ -55,6 +55,11 @@ pub enum CompletionObligationAuthority {
 pub enum CompletionContinuityRecoveryState {
     Ready,
     OperatorRecoveryRequired { unproven_obligation_count: i64 },
+}
+
+enum CompletionOwnerAuthorization {
+    Running,
+    TerminalExactReplay(CompletionObligationExpectation),
 }
 
 impl CompletionObligationAuthority {
@@ -287,7 +292,13 @@ impl StateDb {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
         require_completion_continuity_registration_ready(&tx)?;
-        require_running_owner(&tx, owner_invocation_uuid)?;
+        let owner_authorization = completion_owner_authorization(
+            &tx,
+            owner_invocation_uuid,
+            owner_session_id,
+            registration.event_id,
+            &admission_id,
+        )?;
         let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
         let state_head = completion_continuity_head_on(&tx).map_err(|error| error.to_string())?;
@@ -333,6 +344,7 @@ impl StateDb {
             owner_session_id,
             expected_sidecar_generation: &sidecar_generation,
         };
+        owner_authorization.validate_observed_generation(&obligation)?;
         validate_completion_continuity_alignment(
             state_head.as_ref(),
             sidecar_head.as_ref(),
@@ -810,7 +822,57 @@ fn all_completion_obligations_on(
         .map_err(persistence("read completion obligation authority"))
 }
 
-fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Result<(), String> {
+impl CompletionOwnerAuthorization {
+    fn validate_observed_generation(
+        &self,
+        admission: &CompletionObligationAdmission<'_>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Running => Ok(()),
+            Self::TerminalExactReplay(existing)
+                if completion_obligation_matches(existing, admission) =>
+            {
+                Ok(())
+            }
+            Self::TerminalExactReplay(_) => Err(format!(
+                "process_integrity: terminal invocation {} cannot replay completion admission {} because the retained sidecar generation changed",
+                admission.owner_invocation_uuid, admission.admission_id
+            )),
+        }
+    }
+}
+
+fn completion_owner_authorization(
+    conn: &sqlite::Connection,
+    invocation_uuid: &str,
+    owner_session_id: &str,
+    event_id: &str,
+    admission_id: &str,
+) -> Result<CompletionOwnerAuthorization, String> {
+    let status = completion_owner_status(conn, invocation_uuid)?;
+    if status == InvocationStatus::Running {
+        return Ok(CompletionOwnerAuthorization::Running);
+    }
+    let existing = completion_obligation_by_admission_id(conn, admission_id)
+        .map_err(|error| error.to_string())?
+        .filter(|existing| {
+            existing.invocation_uuid == invocation_uuid
+                && existing.event_id == event_id
+                && existing.owner_invocation_uuid == invocation_uuid
+                && existing.owner_session_id == owner_session_id
+        })
+        .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
+    completion_continuity_by_admission_on(conn, admission_id)
+        .map_err(|error| error.to_string())?
+        .filter(|continuity| completion_continuity_matches_expectation(continuity, &existing))
+        .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
+    Ok(CompletionOwnerAuthorization::TerminalExactReplay(existing))
+}
+
+fn completion_owner_status(
+    conn: &sqlite::Connection,
+    invocation_uuid: &str,
+) -> Result<InvocationStatus, String> {
     let status: Option<String> = conn
         .query_row(
             "SELECT status FROM invocations WHERE invocation_uuid = ?1",
@@ -824,13 +886,15 @@ fn require_running_owner(conn: &sqlite::Connection, invocation_uuid: &str) -> Re
             "Completion listener invocation {invocation_uuid} does not exist"
         ));
     };
-    if status == "running" {
-        Ok(())
-    } else {
-        Err(format!(
-            "Completion listener invocation {invocation_uuid} is not running"
-        ))
-    }
+    InvocationStatus::from_str(&status).ok_or_else(|| {
+        format!("Completion listener invocation {invocation_uuid} has invalid status {status}")
+    })
+}
+
+fn terminal_owner_new_admission_error(invocation_uuid: &str) -> String {
+    format!(
+        "Completion listener invocation {invocation_uuid} is not running and registration is not an exact admitted replay"
+    )
 }
 
 fn validate_completion_obligation(
@@ -1293,11 +1357,53 @@ mod tests {
     fn completion_registration_reports_an_unknown_owner_invocation() {
         let state = StateDb::open(std::path::Path::new(":memory:")).unwrap();
 
-        let error = require_running_owner(&state.conn, INVOCATION_UUID).unwrap_err();
+        let error = completion_owner_status(&state.conn, INVOCATION_UUID).unwrap_err();
 
         assert_eq!(
             error,
             format!("Completion listener invocation {INVOCATION_UUID} does not exist")
+        );
+    }
+
+    #[test]
+    fn terminal_owner_cannot_create_a_new_completion_admission_or_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .finalize_invocation(
+                invocation_row_id,
+                false,
+                1,
+                Some("test_failure"),
+                Some("terminal before completion admission"),
+            )
+            .unwrap();
+
+        let error = state
+            .register_completion_event_with_obligation(
+                "age299-s2-terminal-new-admission",
+                registration(),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("not an exact admitted replay"), "{error}");
+        assert!(!sidecar_path.exists());
+        assert!(
+            state
+                .completion_obligations_for_invocation(INVOCATION_UUID)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2090,6 +2196,218 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_continuity, sidecar_continuity);
+    }
+
+    #[test]
+    fn terminal_owner_exact_replay_repairs_only_its_admitted_partial_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let fault_connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+        fault_connection
+            .execute_batch(
+                "CREATE TRIGGER reject_terminal_repair
+                 BEFORE INSERT ON completion_event
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced terminal repair interruption');
+                 END;",
+            )
+            .unwrap();
+        drop(fault_connection);
+
+        let first_error = state
+            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .unwrap_err();
+        assert!(
+            first_error.contains("forced terminal repair interruption"),
+            "{first_error}"
+        );
+        state
+            .finalize_invocation(
+                invocation_row_id,
+                false,
+                1,
+                Some("test_failure"),
+                Some("terminalized after state-first partial admission"),
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Failed
+        );
+
+        let interrupted_repair = state
+            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .unwrap_err();
+        assert!(
+            interrupted_repair.contains("forced terminal repair interruption"),
+            "{interrupted_repair}"
+        );
+        assert_eq!(
+            state
+                .raw_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM invocation_completion_continuity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let admitted_state_head: (i64, String, String) = state
+            .raw_connection()
+            .query_row(
+                "SELECT authority_ordinal, admission_id, continuity_digest
+                 FROM invocation_completion_continuity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        rusqlite::Connection::open(&sidecar_path)
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_terminal_repair;")
+            .unwrap();
+
+        let original = registration();
+        for (caller_admission_id, changed) in [
+            (
+                "age299-s2-terminal-partial",
+                CompletionEventRegistrationInput {
+                    delivery_mode: "sync",
+                    ..original
+                },
+            ),
+            (
+                "age299-s2-terminal-partial",
+                CompletionEventRegistrationInput {
+                    state_dir: "/tmp/age299-s2-terminal-changed-state",
+                    ..original
+                },
+            ),
+            ("age299-s2-terminal-distinct-admission", original),
+            (
+                "age299-s2-terminal-distinct-event-admission",
+                registration_for(
+                    "age299-s2-terminal-distinct-event",
+                    SESSION_ID,
+                    INVOCATION_UUID,
+                ),
+            ),
+        ] {
+            let error = state
+                .register_completion_event_with_obligation(caller_admission_id, changed)
+                .unwrap_err();
+            assert!(error.contains("not an exact admitted replay"), "{error}");
+            let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+            assert!(sidecar.completion_event(EVENT_ID).unwrap().is_none());
+            assert!(
+                sidecar
+                    .completion_event("age299-s2-terminal-distinct-event")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                sidecar
+                    .connection()
+                    .query_row(
+                        "SELECT COUNT(*) FROM completion_authority_continuity",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+
+        state
+            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .unwrap();
+        let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        let repaired_sidecar_head: (i64, String, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT authority_ordinal, admission_id, continuity_digest
+                 FROM completion_authority_continuity",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(repaired_sidecar_head, admitted_state_head);
+        drop(sidecar);
+
+        state
+            .register_completion_event_with_obligation("age299-s2-terminal-partial", registration())
+            .unwrap();
+        assert_eq!(
+            MailboxDb::open(&sidecar_path)
+                .unwrap()
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_authority_continuity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: SECOND_INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-after-terminal-repair",
+                registration_for(
+                    "age299-s2-after-terminal-repair-event",
+                    "age299-s2-after-terminal-repair-session",
+                    SECOND_INVOCATION_UUID,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .raw_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM invocation_completion_continuity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            MailboxDb::open(&sidecar_path)
+                .unwrap()
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_authority_continuity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
