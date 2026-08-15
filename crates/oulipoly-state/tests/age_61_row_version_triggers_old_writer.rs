@@ -149,6 +149,20 @@ fn repaired_missing_invocations_table_installs_row_version_triggers() {
          WHERE id = 6201",
         "SELECT row_version FROM invocations WHERE id = 6201",
     );
+    let error = connection
+        .execute(
+            "UPDATE invocations
+             SET completion_registration_capability_digest = ?1
+             WHERE id = 6201",
+            ["ab".repeat(32)],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completion registration capability is immutable"),
+        "{error}"
+    );
 }
 
 #[test]
