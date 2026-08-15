@@ -128,8 +128,13 @@ pub(crate) fn split_invocation_launch_environment(
                 })
         })
         .transpose()?;
-    let identity = serde_json::to_string(&parsed)
-        .map_err(|error| format!("Failed to serialize invocation identity environment: {error}"))?;
+    let identity = if authority.is_some() {
+        serde_json::to_string(&parsed).map_err(|error| {
+            format!("Failed to serialize invocation identity environment: {error}")
+        })?
+    } else {
+        value.to_string()
+    };
     Ok((identity, authority))
 }
 
