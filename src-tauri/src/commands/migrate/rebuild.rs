@@ -232,6 +232,7 @@ fn read_rebuild_recovery_marker(marker: &Path, backup_root: &Path) -> Result<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oulipoly_state::StateDb;
 
     #[test]
     fn binding_to_authority_path_replaces_every_destructive_source() {
@@ -291,5 +292,45 @@ mod tests {
             std::fs::read(backup_root.join("rebuild-attempt/pid-identity.db")).unwrap(),
             b"backed-up-sidecar"
         );
+    }
+
+    #[test]
+    fn post_reset_interruption_retries_from_the_published_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&db_path);
+        let backup_root = directory.path().join("state-backups");
+        let backup_dir = backup_root.join("rebuild-attempt");
+        std::fs::create_dir(&backup_root).unwrap();
+        drop(StateDb::open(&db_path).unwrap());
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir.clone(), false);
+
+        {
+            let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
+            let mut sidecar_authority =
+                MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+            execute_migrate_rebuild(&plan, &mut sidecar_authority).unwrap();
+        }
+
+        assert!(plan.recovery_marker.is_file());
+        assert!(backup_dir.join("state.db").is_file());
+        assert!(backup_dir.join("pid-identity.db").is_file());
+        assert!(!db_path.exists());
+        assert!(!sidecar_path.exists());
+
+        let retry_plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir, true);
+        let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
+        let mut sidecar_authority = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+        execute_migrate_rebuild(&retry_plan, &mut sidecar_authority).unwrap();
+        StateDb::initialize_after_rebuild(&db_path, &state_authority).unwrap();
+        sidecar_authority.initialize_after_rebuild().unwrap();
+        complete_migrate_rebuild(&retry_plan).unwrap();
+        drop(sidecar_authority);
+        drop(state_authority);
+
+        assert!(!retry_plan.recovery_marker.exists());
+        drop(StateDb::open(&db_path).unwrap());
+        drop(MailboxDb::open(&sidecar_path).unwrap());
     }
 }

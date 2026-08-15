@@ -527,14 +527,8 @@ impl StateDb {
     }
 }
 
-#[cfg(not(any(test, feature = "test-support")))]
 fn state_writer_busy_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(5)
-}
-
-#[cfg(any(test, feature = "test-support"))]
-fn state_writer_busy_timeout() -> std::time::Duration {
-    std::time::Duration::from_millis(500)
 }
 
 #[cfg(any(unix, windows))]

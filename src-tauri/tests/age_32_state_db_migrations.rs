@@ -397,11 +397,37 @@ fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert!(backups[0].join("state.db").is_file());
     assert!(backups[0].join("pid-identity.db").is_file());
-    let fresh_generation = MailboxDb::open(&sidecar_path)
-        .unwrap()
-        .sidecar_generation()
+    let backup_sidecar = Connection::open(backups[0].join("pid-identity.db")).unwrap();
+    let backup_generation: String = backup_sidecar
+        .query_row(
+            "SELECT generation_uuid FROM mailbox_sidecar_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
+    let backup_continuity_count: i64 = backup_sidecar
+        .query_row(
+            "SELECT COUNT(*) FROM completion_authority_continuity",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backup_generation, old_generation);
+    assert_eq!(backup_continuity_count, 1);
+    drop(backup_sidecar);
+    let fresh_sidecar = MailboxDb::open(&sidecar_path).unwrap();
+    let fresh_generation = fresh_sidecar.sidecar_generation().unwrap();
     assert_ne!(fresh_generation, old_generation);
+    assert!(
+        !fresh_sidecar
+            .contains_completion_obligation(
+                "age299-s2-rebuild-first-event",
+                first_uuid,
+                "age299-s2-rebuild-first-session",
+            )
+            .unwrap()
+    );
+    drop(fresh_sidecar);
     let second_uuid = "a2222222-2222-4222-8222-222222222222";
     let mut fresh_state = StateDb::open(&state_path).unwrap();
     assert!(

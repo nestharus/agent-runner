@@ -31,8 +31,14 @@ use crate::result_envelope::{ResultEnvelopeFailureIdentity, ResultEnvelopeInput}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvocationFinalizeError {
-    Contention { message: String },
-    Failure { message: String },
+    /// One independently bounded State, namespace, or sidecar writer wait expired.
+    /// This variant does not imply one aggregate end-to-end acquisition deadline.
+    Contention {
+        message: String,
+    },
+    Failure {
+        message: String,
+    },
 }
 
 impl InvocationFinalizeError {

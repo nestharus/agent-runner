@@ -2,9 +2,11 @@
 //!
 //! `orchestration`, `accessor`, `predicate`, `formatter`, `validator`
 
+use oulipoly_runtime::services::ServiceError;
+#[cfg(test)]
 use oulipoly_runtime::services::{
     InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
-    ProductionInvocationLifecycleService, ServiceError,
+    ProductionInvocationLifecycleService,
 };
 use oulipoly_state::StateDb;
 
