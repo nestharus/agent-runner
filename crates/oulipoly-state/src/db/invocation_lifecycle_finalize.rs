@@ -807,9 +807,19 @@ mod tests {
         let mutator = std::thread::spawn(move || {
             start_mutation_rx.recv().unwrap();
             mutation_started_tx.send(()).unwrap();
-            let authority =
-                crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&mutator_sidecar_path)
-                    .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            let authority = loop {
+                match crate::mailbox::MailboxAuthorityFence::acquire_exclusive(
+                    &mutator_sidecar_path,
+                ) {
+                    Ok(authority) => break authority,
+                    Err(crate::mailbox::MailboxAuthorityFenceError::Timeout { .. })
+                        if std::time::Instant::now() < deadline => {}
+                    Err(error) => {
+                        panic!("failed to acquire post-commit sidecar authority: {error}")
+                    }
+                }
+            };
             authority_acquired_tx.send(()).unwrap();
             std::fs::rename(&mutator_sidecar_path, &mutator_renamed_path).unwrap();
             drop(authority);
