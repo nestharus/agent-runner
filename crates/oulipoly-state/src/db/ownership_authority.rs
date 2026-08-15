@@ -1820,10 +1820,10 @@ mod tests {
         let (admission_release_tx, admission_release_rx) = mpsc::channel();
         let (state_committed_tx, state_committed_rx) = mpsc::channel();
         let (sidecar_release_tx, sidecar_release_rx) = mpsc::channel();
-        let writer_state_path = state_path.clone();
+        let mut writer_state = StateDb::open(&state_path).unwrap();
+        let finalizer_state = StateDb::open(&state_path).unwrap();
         let writer = std::thread::spawn(move || {
-            let mut state = StateDb::open(&writer_state_path).unwrap();
-            state
+            writer_state
                 .register_completion_event_with_obligation_on(
                     None,
                     "age299-s2-barrier-admission",
@@ -1842,11 +1842,9 @@ mod tests {
 
         admission_reached_rx.recv().unwrap();
         let (finalize_tx, finalize_rx) = mpsc::channel();
-        let finalizer_state_path = state_path.clone();
         let finalizer = std::thread::spawn(move || {
-            let state = StateDb::open(&finalizer_state_path).unwrap();
             finalize_tx
-                .send(state.finalize_invocation(invocation_row_id, true, 0, None, None))
+                .send(finalizer_state.finalize_invocation(invocation_row_id, true, 0, None, None))
                 .unwrap();
         });
         assert!(
