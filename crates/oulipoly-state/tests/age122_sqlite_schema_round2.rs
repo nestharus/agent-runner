@@ -51,14 +51,23 @@ const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS 
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
-            row_version INTEGER NOT NULL DEFAULT 0
+            row_version INTEGER NOT NULL DEFAULT 0,
+            completion_registration_capability_digest TEXT
+                CONSTRAINT invocation_completion_registration_capability_digest_shape
+                CHECK (
+                    completion_registration_capability_digest IS NULL
+                    OR (
+                        length(completion_registration_capability_digest) = 64
+                        AND completion_registration_capability_digest NOT GLOB '*[^0-9a-f]*'
+                    )
+                )
         );"#;
 
 #[test]
-fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface() {
+fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority() {
     assert!(
         invocation_schema_source().contains(EXPECTED_INVOCATIONS_SCHEMA_SNIPPET),
-        "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
+        "invocations repair SQL must remain sidecar-based and include completion authority"
     );
     assert!(
         schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 17;"),
