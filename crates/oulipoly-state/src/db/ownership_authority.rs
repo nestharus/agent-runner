@@ -62,6 +62,11 @@ enum CompletionOwnerAuthorization {
     TerminalExactReplay(CompletionObligationExpectation),
 }
 
+pub(super) struct CompletionAuthoritySummary {
+    pub(super) obligation_count: i64,
+    pub(super) continuity_count: i64,
+}
+
 impl CompletionObligationAuthority {
     pub fn sidecar_generation_state(
         &self,
@@ -234,24 +239,6 @@ impl fmt::Display for OwnershipAuthorityError {
 impl std::error::Error for OwnershipAuthorityError {}
 
 impl StateDb {
-    #[cfg(test)]
-    pub(crate) fn record_completion_obligation(
-        &self,
-        input: CompletionObligationAdmission<'_>,
-    ) -> Result<CompletionObligationAdmissionResult, OwnershipAuthorityError> {
-        validate_completion_obligation(&input)?;
-        let tx =
-            sqlite::Transaction::new_unchecked(&self.conn, sqlite::TransactionBehavior::Immediate)
-                .map_err(persistence("begin completion obligation admission"))?;
-
-        let state_head = completion_continuity_head_on(&tx)?;
-        let (result, _) =
-            record_completion_obligation_with_continuity_on(&tx, input, state_head.as_ref())?;
-        tx.commit()
-            .map_err(persistence("commit completion obligation admission"))?;
-        Ok(result)
-    }
-
     pub fn register_completion_event_with_obligation(
         &mut self,
         admission_id: &str,
@@ -273,7 +260,7 @@ impl StateDb {
     {
         let completion_authority_state_path =
             self.completion_authority_state_path().ok_or_else(|| {
-                "Completion event registration requires an absolute, non-symlink, single-link local state database".to_string()
+                "Completion event registration requires a stable, single-link local state database identity".to_string()
             })?;
         validate_completion_event_registration(&registration)?;
         let owner_invocation_uuid = registration.owner_invocation_uuid.ok_or_else(|| {
@@ -382,6 +369,47 @@ impl StateDb {
             .map_err(persistence("query completion obligations"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(persistence("read completion obligations"))
+    }
+
+    pub(super) fn first_completion_obligation_for_invocation_on(
+        conn: &rusqlite::Connection,
+        invocation_uuid: &str,
+    ) -> Result<Option<CompletionObligationExpectation>, OwnershipAuthorityError> {
+        validate_nonempty(invocation_uuid, "invocation_uuid")?;
+        conn.query_row(
+            &format!(
+                "SELECT {COMPLETION_OBLIGATION_COLUMNS}
+                 FROM invocation_completion_obligations
+                 WHERE invocation_uuid = ?1
+                 ORDER BY admitted_at, admission_id
+                 LIMIT 1"
+            ),
+            sqlite::params![invocation_uuid],
+            map_completion_obligation_row,
+        )
+        .optional()
+        .map_err(persistence("read first completion obligation"))
+    }
+
+    pub(super) fn completion_authority_summary_on(
+        conn: &rusqlite::Connection,
+        invocation_uuid: &str,
+    ) -> Result<Option<CompletionAuthoritySummary>, OwnershipAuthorityError> {
+        validate_nonempty(invocation_uuid, "invocation_uuid")?;
+        conn.query_row(
+            "SELECT obligation_count, continuity_count
+             FROM invocation_completion_authority_summary
+             WHERE invocation_uuid = ?1",
+            sqlite::params![invocation_uuid],
+            |row| {
+                Ok(CompletionAuthoritySummary {
+                    obligation_count: row.get(0)?,
+                    continuity_count: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(persistence("read completion authority summary"))
     }
 
     pub fn completion_obligation_authority(
@@ -621,7 +649,7 @@ fn append_completion_continuity_on(
     .map_err(persistence("append completion continuity"))
 }
 
-fn completion_continuity_head_on(
+pub(super) fn completion_continuity_head_on(
     conn: &sqlite::Connection,
 ) -> Result<Option<CompletionContinuityHead>, OwnershipAuthorityError> {
     #[cfg(test)]
@@ -753,7 +781,7 @@ fn format_completion_continuity_head(head: Option<&CompletionContinuityHead>) ->
     )
 }
 
-fn require_completion_continuity_registration_ready(
+pub(super) fn require_completion_continuity_registration_ready(
     conn: &sqlite::Connection,
 ) -> Result<(), String> {
     match completion_continuity_recovery_state_on(conn).map_err(|error| error.to_string())? {
@@ -799,6 +827,16 @@ fn completion_continuity_recovery_state_on(
 #[cfg(test)]
 thread_local! {
     static COMPLETION_CONTINUITY_HEAD_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_completion_continuity_head_query_count() {
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn completion_continuity_head_query_count() -> usize {
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1123,7 +1161,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "Completion event registration requires an absolute, non-symlink, single-link local state database"
+            "Completion event registration requires a stable, single-link local state database identity"
         );
     }
 
@@ -1151,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_registration_rejects_a_relative_state_path() {
+    fn completion_registration_accepts_a_stable_relative_state_path() {
         let current_directory = std::env::current_dir().unwrap();
         let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1171,30 +1209,36 @@ mod tests {
         relative_path.push("state.db");
 
         let mut state = StateDb::open(&relative_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
 
         assert_eq!(state.path(), std::fs::canonicalize(&relative_path).unwrap());
         assert!(state.path().is_absolute());
-        let error = state
+        state
             .register_completion_event_with_obligation(
                 "age299-s2-relative-path-admission",
                 registration(),
             )
-            .unwrap_err();
+            .unwrap();
         assert_eq!(
-            error,
-            "Completion event registration requires an absolute, non-symlink, single-link local state database"
-        );
-        assert!(
             state
                 .completion_obligations_for_invocation(INVOCATION_UUID)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
     }
 
     #[cfg(unix)]
     #[test]
-    fn completion_registration_rejects_a_state_file_symlink_alias() {
+    fn completion_registration_accepts_a_stable_state_file_symlink_alias() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1218,30 +1262,27 @@ mod tests {
             alias_state.path(),
             std::fs::canonicalize(&state_path).unwrap()
         );
-        let error = alias_state
+        alias_state
             .register_completion_event_with_obligation(
                 "age299-s2-symlink-admission",
                 registration(),
             )
-            .unwrap_err();
+            .unwrap();
 
         assert_eq!(
-            error,
-            "Completion event registration requires an absolute, non-symlink, single-link local state database"
-        );
-        assert!(
             alias_state
                 .completion_obligations_for_invocation(INVOCATION_UUID)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
-        assert!(!MailboxDb::path_for_state_db(&state_path).exists());
+        assert!(MailboxDb::path_for_state_db(&state_path).exists());
         assert!(!MailboxDb::path_for_state_db(&alias_path).exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn completion_registration_rejects_a_parent_directory_symlink_alias() {
+    fn completion_registration_accepts_a_stable_parent_directory_symlink_alias() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1251,25 +1292,85 @@ mod tests {
         symlink(&state_directory, &alias_directory).unwrap();
         let state_path = alias_directory.join("state.db");
         let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
 
-        let error = state
+        state
             .register_completion_event_with_obligation(
                 "age299-s2-parent-symlink-admission",
                 registration(),
             )
-            .unwrap_err();
+            .unwrap();
 
         assert_eq!(
-            error,
-            "Completion event registration requires an absolute, non-symlink, single-link local state database"
-        );
-        assert!(
             state
                 .completion_obligations_for_invocation(INVOCATION_UUID)
                 .unwrap()
-                .is_empty()
+                .len(),
+            1
         );
-        assert!(!MailboxDb::path_for_state_db(&state_path).exists());
+        assert!(MailboxDb::path_for_state_db(&state_directory.join("state.db")).exists());
+        assert_eq!(
+            std::fs::canonicalize(MailboxDb::path_for_state_db(&state_path)).unwrap(),
+            std::fs::canonicalize(MailboxDb::path_for_state_db(
+                &state_directory.join("state.db")
+            ))
+            .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_authority_rejects_a_retargeted_parent_directory_alias() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_directory = directory.path().join("first");
+        let second_directory = directory.path().join("second");
+        let alias_directory = directory.path().join("current");
+        std::fs::create_dir(&first_directory).unwrap();
+        std::fs::create_dir(&second_directory).unwrap();
+        symlink(&first_directory, &alias_directory).unwrap();
+        let mut state = StateDb::open(&alias_directory.join("state.db")).unwrap();
+        let invocation_row_id = state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        state
+            .register_completion_event_with_obligation(
+                "age299-s2-retarget-admission",
+                registration(),
+            )
+            .unwrap();
+        std::fs::remove_file(&alias_directory).unwrap();
+        symlink(&second_directory, &alias_directory).unwrap();
+
+        let error = state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap_err();
+
+        assert!(error.contains("process_integrity"), "{error}");
+        assert!(error.contains("retained canonical identity"), "{error}");
+        assert_eq!(
+            state
+                .get_invocation_by_uuid(INVOCATION_UUID)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Running
+        );
     }
 
     #[cfg(unix)]
@@ -1299,7 +1400,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "Completion event registration requires an absolute, non-symlink, single-link local state database"
+            "Completion event registration requires a stable, single-link local state database identity"
         );
         assert!(
             state
@@ -1342,7 +1443,7 @@ mod tests {
 
         assert!(error.contains("process_integrity"), "{error}");
         assert!(error.contains(INVOCATION_UUID), "{error}");
-        assert!(error.contains("no longer has"), "{error}");
+        assert!(error.contains("retained canonical identity"), "{error}");
         assert_eq!(
             state
                 .get_invocation_by_uuid(INVOCATION_UUID)

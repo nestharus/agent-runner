@@ -228,7 +228,7 @@ impl StateDb {
             .map_err(Self::format_state_db_foreign_keys_error)?;
         migrations::register_connection_primitives(&conn)
             .map_err(Self::format_state_db_primitive_error)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        conn.busy_timeout(state_writer_busy_timeout())
             .map_err(|err| format!("Failed to configure state DB busy timeout: {err}"))?;
         Ok(conn)
     }
@@ -375,13 +375,17 @@ impl StateDb {
         &self.conn
     }
 
+    /// Return the canonical State path.
+    ///
+    /// This is an identity/diagnostic projection, not an enforcement boundary
+    /// against callers that already hold arbitrary local filesystem write access.
     pub fn path(&self) -> &Path {
         &self.db_path
     }
 
     pub(super) fn completion_authority_state_path(&self) -> Option<&Path> {
         let authority = self.completion_authority_state.as_ref()?;
-        let canonical = std::fs::canonicalize(&authority.path).ok()?;
+        let canonical = std::fs::canonicalize(&authority.source_path).ok()?;
         let metadata = std::fs::metadata(&canonical).ok()?;
         if canonical != authority.path
             || !metadata.is_file()
@@ -416,21 +420,24 @@ impl StateDb {
         source_path: &Path,
         normalized_path: &Path,
     ) -> Option<CompletionAuthorityStateIdentity> {
-        if !source_path.is_absolute()
-            || Self::is_nonlocal_sqlite_path(source_path)
-            || !source_path.ancestors().all(|component| {
-                std::fs::symlink_metadata(component)
-                    .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-            })
-        {
+        if Self::is_nonlocal_sqlite_path(source_path) {
             return None;
         }
-        let canonical = std::fs::canonicalize(normalized_path).ok()?;
+        let source_path = if source_path.is_absolute() {
+            source_path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(source_path)
+        };
+        let canonical = std::fs::canonicalize(&source_path).ok()?;
+        if canonical != std::fs::canonicalize(normalized_path).ok()? {
+            return None;
+        }
         let metadata = std::fs::metadata(&canonical).ok()?;
         if !metadata.is_file() || !state_file_has_one_link(&metadata) {
             return None;
         }
         Some(CompletionAuthorityStateIdentity {
+            source_path,
             path: canonical,
             file: state_file_identity(&metadata)?,
         })
@@ -518,6 +525,16 @@ impl StateDb {
         }
         Ok(())
     }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn state_writer_busy_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(5)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn state_writer_busy_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
 }
 
 #[cfg(any(unix, windows))]
@@ -776,6 +793,11 @@ fn reserved_state_storage_name(file_name: &str) -> bool {
 }
 
 impl StateDbWriterAuthority {
+    /// Return the canonical path for the trusted migration connection.
+    ///
+    /// Possession of this carrier is terminal local-database authority. It may
+    /// execute arbitrary SQL and is intentionally outside typed append-only
+    /// enforcement claims.
     pub fn path(&self) -> &Path {
         &self.db_path
     }

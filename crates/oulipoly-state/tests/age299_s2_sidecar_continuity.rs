@@ -163,17 +163,16 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
 
     let missing_uuid = "55555555-5555-4555-8555-555555555555";
     let missing_row_id = start_invocation(&state, missing_uuid);
-    insert_completion_obligation(
-        &state,
-        obligation(
+    state
+        .register_completion_event_with_obligation(
             "admission-missing-sidecar",
-            missing_uuid,
-            "event-missing-sidecar",
-            missing_uuid,
-            "session-missing-sidecar",
-            &matching_generation,
-        ),
-    );
+            completion_registration(
+                "event-missing-sidecar",
+                missing_uuid,
+                "session-missing-sidecar",
+            ),
+        )
+        .unwrap();
     drop(state);
     std::fs::remove_file(&sidecar_path).unwrap();
 
@@ -212,6 +211,7 @@ fn admitted_completion_authority_refuses_missing_replaced_and_wrong_generation_s
         mismatch_error.contains(&replaced_generation),
         "{mismatch_error}"
     );
+    assert_running(&state, missing_uuid);
 }
 
 #[test]
@@ -270,9 +270,73 @@ fn admitted_completion_authority_refuses_an_absent_event_in_the_matching_sidecar
         .finalize_invocation(invocation_row_id, true, 0, None, None)
         .unwrap_err();
     assert!(error.contains("process_integrity"), "{error}");
-    assert!(error.contains(ADMISSION_ID), "{error}");
-    assert!(error.contains(EVENT_ID), "{error}");
-    assert!(error.contains("event listener is absent"), "{error}");
+    assert!(error.contains("exact State continuity proof"), "{error}");
+    assert_running(&state, ROOT_UUID);
+}
+
+#[test]
+fn admitted_completion_authority_refuses_present_event_with_wrong_owner_or_session() {
+    for (wrong_owner, wrong_session) in [(true, false), (false, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        let invocation_row_id = start_invocation(&state, ROOT_UUID);
+        state
+            .register_completion_event_with_obligation(
+                ADMISSION_ID,
+                completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+            )
+            .unwrap();
+        replace_admitted_listener(
+            &sidecar_path,
+            if wrong_owner {
+                "99999999-9999-4999-8999-999999999999"
+            } else {
+                ROOT_UUID
+            },
+            if wrong_session {
+                "wrong-session-age299-s2"
+            } else {
+                OWNER_SESSION_ID
+            },
+        );
+
+        let error = state
+            .finalize_invocation(invocation_row_id, true, 0, None, None)
+            .unwrap_err();
+
+        assert!(error.contains("process_integrity"), "{error}");
+        assert!(
+            error.contains("exact matching State/sidecar continuity proof"),
+            "{error}"
+        );
+        assert_running(&state, ROOT_UUID);
+    }
+}
+
+#[test]
+fn migrated_recovery_obligation_refuses_matching_listener_without_continuity_proof() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+    let generation = sidecar.sidecar_generation().unwrap();
+    drop(sidecar);
+    insert_sidecar_event_listener(&sidecar_path, "base-s1-event", ROOT_UUID, "base-s1-session");
+    build_base_s1_schema_14_with_obligation_generation(&state_path, &generation);
+    let state = StateDb::open(&state_path).unwrap();
+    let invocation_row_id = state.get_invocation_by_uuid(ROOT_UUID).unwrap().unwrap().id;
+
+    let error = state
+        .finalize_invocation(invocation_row_id, true, 0, None, None)
+        .unwrap_err();
+
+    assert!(
+        error.contains("completion_continuity_recovery=operator_recovery_required"),
+        "{error}"
+    );
+    assert_running(&state, ROOT_UUID);
 }
 
 #[test]
@@ -394,18 +458,45 @@ fn completion_registration<'a>(
 }
 
 fn assert_running(state: &StateDb, invocation_uuid: &str) {
-    assert_eq!(
-        state
-            .get_invocation_by_uuid(invocation_uuid)
+    let invocation = state
+        .get_invocation_by_uuid(invocation_uuid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(invocation.status.as_str(), "running");
+    assert_eq!(invocation.success, None);
+    assert_eq!(invocation.exit_code, None);
+    assert_eq!(invocation.error_category, None);
+    assert_eq!(invocation.terminal_reason, None);
+    assert_eq!(invocation.finished_at, None);
+    assert!(
+        !state
+            .path()
+            .parent()
             .unwrap()
-            .unwrap()
-            .status
-            .as_str(),
-        "running"
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"))
+            .exists()
     );
 }
 
 fn build_base_s1_schema_14(path: &std::path::Path, with_obligation: bool) {
+    build_base_s1_schema_14_with_optional_generation(
+        path,
+        with_obligation.then_some("44444444-4444-4444-8444-444444444444"),
+    );
+}
+
+fn build_base_s1_schema_14_with_obligation_generation(
+    path: &std::path::Path,
+    sidecar_generation: &str,
+) {
+    build_base_s1_schema_14_with_optional_generation(path, Some(sidecar_generation));
+}
+
+fn build_base_s1_schema_14_with_optional_generation(
+    path: &std::path::Path,
+    sidecar_generation: Option<&str>,
+) {
     let mut connection = rusqlite::Connection::open(path).unwrap();
     connection
         .pragma_update(None, "foreign_keys", true)
@@ -426,24 +517,95 @@ fn build_base_s1_schema_14(path: &std::path::Path, with_obligation: bool) {
             [ROOT_UUID],
         )
         .unwrap();
-    if with_obligation {
-        connection
-            .execute(
-                "INSERT INTO invocation_completion_obligations (
+    if let Some(sidecar_generation) = sidecar_generation {
+        insert_base_s1_obligation(&connection, sidecar_generation);
+    }
+}
+
+fn insert_base_s1_obligation(connection: &rusqlite::Connection, sidecar_generation: &str) {
+    connection
+        .execute(
+            "INSERT INTO invocation_completion_obligations (
                     admission_id, invocation_uuid, event_id, owner_invocation_uuid,
                     owner_session_id, expected_sidecar_generation, admitted_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2026-08-14T00:00:01Z')",
-                rusqlite::params![
-                    "base-s1-admission",
-                    ROOT_UUID,
-                    "base-s1-event",
-                    ROOT_UUID,
-                    "base-s1-session",
-                    "44444444-4444-4444-8444-444444444444",
-                ],
-            )
-            .unwrap();
-    }
+            rusqlite::params![
+                "base-s1-admission",
+                ROOT_UUID,
+                "base-s1-event",
+                ROOT_UUID,
+                "base-s1-session",
+                sidecar_generation,
+            ],
+        )
+        .unwrap();
+}
+
+fn replace_admitted_listener(
+    sidecar_path: &std::path::Path,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    let connection = rusqlite::Connection::open(sidecar_path).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TRIGGER trg_completion_authority_continuity_delete;
+             DROP TRIGGER trg_completion_event_listener_continuity_delete;
+             DELETE FROM completion_authority_continuity;
+             DELETE FROM completion_event_listener;
+             DELETE FROM completion_event;",
+        )
+        .unwrap();
+    drop(connection);
+    insert_sidecar_event_listener(
+        sidecar_path,
+        EVENT_ID,
+        owner_invocation_uuid,
+        owner_session_id,
+    );
+}
+
+fn insert_sidecar_event_listener(
+    sidecar_path: &std::path::Path,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) {
+    let connection = rusqlite::Connection::open(sidecar_path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO completion_event (
+                event_id, kind, state, delivery_mode, state_dir, meta_path,
+                log_path, rc_path, created_at
+             ) VALUES (?1, 'agent_bash_complete', 'pending', 'async', ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                event_id,
+                "/tmp/age299-s2-state",
+                "/tmp/age299-s2-meta",
+                "/tmp/age299-s2-log",
+                "/tmp/age299-s2-rc",
+                "2026-08-14T00:00:00Z",
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO completion_event_listener (
+                event_id, listener_id, session_id, owner_invocation_uuid,
+                active, created_at
+             ) VALUES (?1, ?2, ?3, ?2, 1, ?4)",
+            rusqlite::params![
+                event_id,
+                owner_invocation_uuid,
+                owner_session_id,
+                "2026-08-14T00:00:00Z",
+            ],
+        )
+        .unwrap();
 }
 
 fn user_version(connection: &rusqlite::Connection) -> i32 {

@@ -124,6 +124,46 @@ fn assert_dependency_error(result: Result<InvocationLifecycleFinalizeOutput, Ser
     }
 }
 
+fn assert_complete_nonterminal(db: &StateDb, uuid: &str) {
+    let snapshot = invocation_snapshot(db, uuid);
+    assert_eq!(snapshot.status, "running");
+    assert_eq!(snapshot.success, None);
+    assert_eq!(snapshot.exit_code, None);
+    assert_eq!(snapshot.error_category, None);
+    assert_eq!(snapshot.terminal_reason, None);
+    assert!(!snapshot.finished_at_present);
+}
+
+fn state_with_completion_obligation(
+    uuid: &str,
+    event_id: &str,
+    session_id: &str,
+) -> (tempfile::TempDir, StateDb, i64, std::path::PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let mut state = StateDb::open(&state_path).unwrap();
+    let invocation_row_id = state
+        .start_invocation(&start_fixture(uuid, 0, None))
+        .unwrap();
+    state
+        .register_completion_event_with_obligation(
+            &format!("{event_id}-admission"),
+            CompletionEventRegistrationInput {
+                event_id,
+                delivery_mode: "async",
+                owner_session_id: Some(session_id),
+                owner_invocation_uuid: Some(uuid),
+                state_dir: "/tmp/age299-s2-service-state",
+                meta_path: "/tmp/age299-s2-service-meta",
+                log_path: "/tmp/age299-s2-service-log",
+                rc_path: "/tmp/age299-s2-service-rc",
+            },
+        )
+        .unwrap();
+    (directory, state, invocation_row_id, sidecar_path)
+}
+
 #[test]
 fn age_35_production_lifecycle_service_start_matches_direct_state_db_start() {
     let direct_db = memory_db();
@@ -301,5 +341,140 @@ fn age_299_s2_service_projects_missing_expected_sidecar_as_dependency_failure() 
     assert_eq!(
         invocation_snapshot(&state, invocation_uuid).status,
         "running"
+    );
+}
+
+#[test]
+fn age_299_s2_state_writer_timeout_is_typed_contention_and_preserves_nonterminal_row() {
+    let (directory, state, invocation_row_id, _sidecar_path) = state_with_completion_obligation(
+        "66666666-6666-4666-8666-666666666666",
+        "age299-s2-state-writer-contention-event",
+        "age299-s2-state-writer-contention-session",
+    );
+    let invocation_uuid = "66666666-6666-4666-8666-666666666666";
+    let writer = rusqlite::Connection::open(directory.path().join("state.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let result = ProductionInvocationLifecycleService.finalize_invocation(
+        InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        },
+    );
+
+    let Err(ServiceError::Contention { message }) = result else {
+        panic!("expected typed contention, got {result:?}");
+    };
+    assert!(message.contains("State writer"), "{message}");
+    assert_complete_nonterminal(&state, invocation_uuid);
+    assert!(
+        !directory
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"))
+            .exists()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    ProductionInvocationLifecycleService
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn age_299_s2_sidecar_writer_timeout_is_typed_contention_and_preserves_nonterminal_row() {
+    let (directory, state, invocation_row_id, sidecar_path) = state_with_completion_obligation(
+        "77777777-7777-4777-8777-777777777777",
+        "age299-s2-sidecar-writer-contention-event",
+        "age299-s2-sidecar-writer-contention-session",
+    );
+    let invocation_uuid = "77777777-7777-4777-8777-777777777777";
+    let writer = rusqlite::Connection::open(&sidecar_path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let result = ProductionInvocationLifecycleService.finalize_invocation(
+        InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        },
+    );
+
+    let Err(ServiceError::Contention { message }) = result else {
+        panic!("expected typed contention, got {result:?}");
+    };
+    assert!(message.contains("PID mailbox SQLite writer"), "{message}");
+    assert_complete_nonterminal(&state, invocation_uuid);
+    assert!(
+        !directory
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"))
+            .exists()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    ProductionInvocationLifecycleService
+        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn age_299_s2_corrupt_admitted_sidecar_fails_closed_without_recreation_or_result() {
+    let (directory, state, invocation_row_id, sidecar_path) = state_with_completion_obligation(
+        "88888888-8888-4888-8888-888888888888",
+        "age299-s2-corrupt-sidecar-event",
+        "age299-s2-corrupt-sidecar-session",
+    );
+    let invocation_uuid = "88888888-8888-4888-8888-888888888888";
+    let corrupt_bytes = b"not a sqlite database: admitted authority must remain untouched";
+    std::fs::write(&sidecar_path, corrupt_bytes).unwrap();
+
+    let result = ProductionInvocationLifecycleService.finalize_invocation(
+        InvocationLifecycleFinalizeRequest {
+            state: &state,
+            invocation_row_id,
+            success: true,
+            exit_code: 0,
+            error_category: None,
+            terminal_reason: None,
+        },
+    );
+
+    let Err(ServiceError::Dependency { message }) = result else {
+        panic!("expected typed dependency failure, got {result:?}");
+    };
+    assert!(message.contains("process_integrity"), "{message}");
+    assert!(
+        message.contains("sidecar authority is unavailable"),
+        "{message}"
+    );
+    assert_complete_nonterminal(&state, invocation_uuid);
+    assert_eq!(std::fs::read(&sidecar_path).unwrap(), corrupt_bytes);
+    assert!(
+        !directory
+            .path()
+            .join("invocations")
+            .join(format!("{invocation_uuid}.result"))
+            .exists()
     );
 }

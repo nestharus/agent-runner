@@ -8,8 +8,17 @@ pub const DATA_DIR_ENV: &str = "OULIPOLY_DATA_DIR";
 pub fn data_dir() -> Result<PathBuf, String> {
     std::env::var_os(DATA_DIR_ENV)
         .map(PathBuf::from)
-        .map(Ok)
+        .map(absolutize_configured_data_dir)
         .unwrap_or_else(default_data_dir)
+}
+
+fn absolutize_configured_data_dir(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .map_err(|error| format!("Could not resolve relative {DATA_DIR_ENV}: {error}"))
 }
 
 fn default_data_dir() -> Result<PathBuf, String> {
@@ -124,6 +133,17 @@ mod tests {
         assert_eq!(data_dir().unwrap(), data_root);
         let _db = crate::StateDb::open_default().unwrap();
         assert!(data_root.join("state.db").exists());
+    }
+
+    #[test]
+    fn relative_data_dir_override_is_pinned_to_one_absolute_source_path() {
+        let relative = Path::new("target/age299-relative-data");
+        let _guard = EnvGuard::set(Some(relative), None);
+
+        assert_eq!(
+            data_dir().unwrap(),
+            std::env::current_dir().unwrap().join(relative)
+        );
     }
 
     #[test]

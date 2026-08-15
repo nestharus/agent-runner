@@ -760,8 +760,11 @@ struct WakeSweepSessionState {
     claim: Option<WakeClaimRow>,
 }
 
-/// Typed mailbox operations intentionally retain the writable connection.
-/// External callers cannot bypass those operations with raw SQL.
+/// Typed mailbox operations intentionally retain the writable connection and
+/// do not expose that connection through this API. This Rust capability
+/// boundary does not claim protection from a process with arbitrary local
+/// filesystem/SQLite write authority; such a process is trusted terminal
+/// storage authority.
 ///
 /// ```compile_fail
 /// use oulipoly_state::mailbox::MailboxDb;
@@ -782,6 +785,13 @@ pub(crate) struct MailboxAuthorityFence {
     file: std::fs::File,
     sidecar_path: PathBuf,
     target_identity: Option<MailboxFileIdentity>,
+}
+
+/// Exclusive sidecar namespace and SQLite-writer authority for the supported
+/// State-plus-sidecar destructive rebuild protocol.
+pub struct MailboxDbRebuildAuthority {
+    namespace: MailboxAuthorityFence,
+    writer: Option<Connection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -858,20 +868,6 @@ impl CompletionAuthorityFence<'_> {
         &self,
     ) -> Result<Option<CompletionContinuityHead>, String> {
         completion_continuity_head_on(&self.tx)
-    }
-
-    pub(crate) fn contains_completion_obligation(
-        &self,
-        event_id: &str,
-        owner_invocation_uuid: &str,
-        owner_session_id: &str,
-    ) -> Result<bool, String> {
-        contains_completion_obligation_on(
-            &self.tx,
-            event_id,
-            owner_invocation_uuid,
-            owner_session_id,
-        )
     }
 
     pub(crate) fn preflight_completion_event_registration(
@@ -1060,6 +1056,16 @@ impl MailboxDb {
         state_db_path.with_file_name(sidecar_name)
     }
 
+    pub fn acquire_rebuild_authority(
+        state_authority: &crate::StateDbRebuildAuthority,
+    ) -> Result<MailboxDbRebuildAuthority, String> {
+        let sidecar_path = Self::path_for_state_db(state_authority.path());
+        let namespace = MailboxAuthorityFence::acquire(&sidecar_path)
+            .map_err(|error| format!("Failed to acquire PID mailbox rebuild authority: {error}"))?;
+        let writer = acquire_mailbox_rebuild_writer(&namespace)?;
+        Ok(MailboxDbRebuildAuthority { namespace, writer })
+    }
+
     pub fn default_path() -> Result<PathBuf, String> {
         pid_identity::default_path()
     }
@@ -1122,7 +1128,7 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        conn.busy_timeout(completion_authority_sqlite_timeout())
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
             conn,
@@ -1139,7 +1145,15 @@ impl MailboxDb {
         self.conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map(|tx| CompletionAuthorityFence { tx })
-            .map_err(|err| format!("Failed to fence PID mailbox sidecar authority: {err}"))
+            .map_err(|err| {
+                if sqlite_error_is_contention(&err) {
+                    format!(
+                        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: {err}"
+                    )
+                } else {
+                    format!("Failed to fence PID mailbox sidecar authority: {err}")
+                }
+            })
     }
 
     pub fn path(&self) -> &Path {
@@ -3631,6 +3645,101 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
         Ok(())
     }
+}
+
+impl MailboxDbRebuildAuthority {
+    pub fn sqlite_member_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.namespace.path().to_path_buf()];
+        paths.extend(mailbox_sqlite_artifact_paths(self.namespace.path()));
+        paths
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        self.release_writer();
+
+        for path in self.sqlite_member_paths().into_iter().rev() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to reset PID mailbox rebuild member {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        self.release_writer();
+        self.namespace.target_identity = None;
+        Ok(())
+    }
+
+    pub fn initialize_after_rebuild(&mut self) -> Result<(), String> {
+        if self.writer.is_some() {
+            return Err(
+                "PID mailbox rebuild writer remains active during initialization".to_string(),
+            );
+        }
+        let mailbox = MailboxDb::open_with_authority(&self.namespace)?;
+        drop(mailbox);
+        self.namespace.target_identity = inspect_mailbox_storage_file(self.namespace.path())
+            .map_err(|error| format!("Failed to bind rebuilt PID mailbox identity: {error}"))?;
+        Ok(())
+    }
+
+    fn release_writer(&mut self) {
+        drop(self.writer.take());
+    }
+}
+
+fn acquire_mailbox_rebuild_writer(
+    namespace: &MailboxAuthorityFence,
+) -> Result<Option<Connection>, String> {
+    if !namespace.path().exists() {
+        return Ok(None);
+    }
+    let connection =
+        match Connection::open_with_flags(namespace.path(), OpenFlags::SQLITE_OPEN_READ_WRITE) {
+            Ok(connection) => connection,
+            Err(_) => return Ok(None),
+        };
+    connection
+        .busy_timeout(completion_authority_sqlite_timeout())
+        .map_err(|error| format!("Failed to configure PID mailbox rebuild writer: {error}"))?;
+    match connection.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => Ok(Some(connection)),
+        Err(error)
+            if matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+                    | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+            ) =>
+        {
+            Err(format!(
+                "process_integrity: completion_authority_contention: timed out acquiring PID mailbox rebuild writer: {error}"
+            ))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn sqlite_error_is_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+            | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+    )
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn completion_authority_sqlite_timeout() -> StdDuration {
+    StdDuration::from_secs(5)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn completion_authority_sqlite_timeout() -> StdDuration {
+    StdDuration::from_millis(500)
 }
 
 pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {

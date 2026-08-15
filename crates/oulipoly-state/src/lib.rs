@@ -91,7 +91,7 @@ pub use db::{
 pub use db::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,
 };
-pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
+pub use db::{InvocationFinalizeError, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
 pub use db::{
     SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
@@ -108,6 +108,11 @@ pub use result_envelope::{
 
 #[cfg(doctest)]
 pub mod age_32_connection_boundary_doctest {
+    //! These compile failures prove only that `StateDb` does not lend or return
+    //! its owned writable connection. Callers with direct local SQLite write
+    //! permission, including `StateDbWriterAuthority`, are trusted terminal
+    //! storage authorities and are outside trigger-enforced append-only claims.
+
     /// ```compile_fail
     /// use oulipoly_state::StateDb;
     ///

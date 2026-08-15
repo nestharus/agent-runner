@@ -12,13 +12,18 @@ pub enum ServiceError {
     Dependency {
         message: String,
     },
+    Contention {
+        message: String,
+    },
 }
 
 impl ServiceError {
     pub fn code(&self) -> Option<&str> {
         match self {
             ServiceError::Unavailable { code, .. } => code.as_deref(),
-            ServiceError::InvalidRequest { .. } | ServiceError::Dependency { .. } => None,
+            ServiceError::InvalidRequest { .. }
+            | ServiceError::Dependency { .. }
+            | ServiceError::Contention { .. } => None,
         }
     }
 }
@@ -28,7 +33,8 @@ impl fmt::Display for ServiceError {
         match self {
             ServiceError::Unavailable { message, .. }
             | ServiceError::InvalidRequest { message }
-            | ServiceError::Dependency { message } => f.write_str(message),
+            | ServiceError::Dependency { message }
+            | ServiceError::Contention { message } => f.write_str(message),
         }
     }
 }

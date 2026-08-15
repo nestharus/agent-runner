@@ -162,6 +162,7 @@ pub use self::imported_session_display_metadata::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert,
 };
 pub use self::imported_session_list::ImportedSessionListRow;
+pub use self::invocation_lifecycle_finalize::InvocationFinalizeError;
 use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
     active_lifecycle_session_id, lifecycle_terminal_status,
@@ -172,6 +173,10 @@ use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow}
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
 pub use self::opening_write::StateReadConnection;
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
+use self::ownership_authority::{
+    CompletionAuthoritySummary, completion_continuity_head_on,
+    require_completion_continuity_registration_ready,
+};
 pub use self::ownership_authority::{
     CompletionContinuityRecoveryState, CompletionObligationAdmission,
     CompletionObligationAdmissionResult, CompletionObligationAuthority,
@@ -244,7 +249,7 @@ use uuid::Uuid;
 pub struct StateDb {
     conn: sqlite::Connection,
     db_path: PathBuf,
-    // Completion authority accepts one absolute, non-symlink, single-link local file identity.
+    // Completion authority rejoins the accepted source path to one canonical local file identity.
     completion_authority_state: Option<CompletionAuthorityStateIdentity>,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
@@ -252,6 +257,7 @@ pub struct StateDb {
 }
 
 struct CompletionAuthorityStateIdentity {
+    source_path: PathBuf,
     path: PathBuf,
     file: StateFileIdentity,
 }
@@ -273,8 +279,13 @@ pub struct StateDbRebuildAuthority {
     _guard: StateNamespaceGuard,
 }
 
-/// Shared authority for a cooperating legacy writer that must retain its own
-/// SQLite connection. The carrier is path-bound and intentionally not cloneable.
+/// Shared authority for the trusted session-ownership migration writer.
+///
+/// This is terminal local-database authority, not a SQL sandbox: its holder has
+/// the same trust as any process with direct write permission to the State file.
+/// Trigger-enforced append-only claims cover typed State operations and do not
+/// claim protection from this authority or another arbitrary local SQLite writer.
+/// The carrier is path-bound and intentionally not cloneable.
 pub struct StateDbWriterAuthority {
     db_path: PathBuf,
     _guard: StateNamespaceGuard,

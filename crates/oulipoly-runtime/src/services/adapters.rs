@@ -181,7 +181,7 @@ impl InvocationLifecycleServicePort for ProductionInvocationLifecycleService {
         &self,
         request: InvocationLifecycleFinalizeRequest<'_>,
     ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
-        map_invocation_finalize_result(request.state.finalize_invocation(
+        map_invocation_finalize_result(request.state.finalize_invocation_typed(
             request.invocation_row_id,
             request.success,
             request.exit_code,
@@ -320,11 +320,18 @@ fn map_invocation_start_result(
 }
 
 fn map_invocation_finalize_result(
-    result: Result<(), String>,
+    result: Result<(), oulipoly_state::InvocationFinalizeError>,
 ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
     result
         .map(|_| InvocationLifecycleFinalizeOutput)
-        .map_err(|message| ServiceError::Dependency { message })
+        .map_err(|error| match error {
+            oulipoly_state::InvocationFinalizeError::Contention { message } => {
+                ServiceError::Contention { message }
+            }
+            oulipoly_state::InvocationFinalizeError::Failure { message } => {
+                ServiceError::Dependency { message }
+            }
+        })
 }
 
 fn map_resume_acceptance_result(

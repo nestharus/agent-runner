@@ -86,8 +86,16 @@ impl StateDb {
         }
         let updated_segments = tx
             .execute(
-                "UPDATE session_chain_segments SET last_turn_id = ?2 WHERE id = ?1",
-                params![input.active_segment_id, last.turn_id],
+                "UPDATE session_chain_segments
+                 SET last_turn_id = ?2
+                 WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5",
+                params![
+                    input.active_segment_id,
+                    last.turn_id,
+                    input.chain_id,
+                    input.provider_name,
+                    input.session_id,
+                ],
             )
             .map_err(|error| format!("failed to refresh active segment: {error}"))?;
         if updated_segments != 1 {
@@ -152,8 +160,16 @@ impl StateDb {
         }
         let updated_segments = tx
             .execute(
-                "UPDATE session_chain_segments SET last_turn_id = ?2 WHERE id = ?1",
-                params![input.active_segment_id, input.last_turn_id],
+                "UPDATE session_chain_segments
+                 SET last_turn_id = ?2
+                 WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5",
+                params![
+                    input.active_segment_id,
+                    input.last_turn_id,
+                    input.chain_id,
+                    input.provider_name,
+                    input.session_id,
+                ],
             )
             .map_err(|error| format!("failed to restore active segment: {error}"))?;
         if updated_segments != 1 {
@@ -181,13 +197,18 @@ impl StateDb {
 mod tests {
     use super::*;
 
-    fn insert_chain_and_segment(state: &StateDb) -> i64 {
+    fn insert_chain_and_segment(
+        state: &StateDb,
+        chain_id: &str,
+        provider_name: &str,
+        session_id: &str,
+    ) -> i64 {
         state
             .conn
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
-                 VALUES ('chain', '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 'model')",
-                [],
+                 VALUES (?1, '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 'model')",
+                params![chain_id],
             )
             .unwrap();
         state
@@ -195,8 +216,8 @@ mod tests {
             .execute(
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, last_turn_id, transition_reason)
-                 VALUES ('chain', 'provider', 'session', '2026-08-13T00:00:00Z', 'current', 'initial')",
-                [],
+                 VALUES (?1, ?2, ?3, '2026-08-13T00:00:00Z', 'current', 'initial')",
+                params![chain_id, provider_name, session_id],
             )
             .unwrap();
         state.conn.last_insert_rowid()
@@ -234,7 +255,7 @@ mod tests {
     fn replacement_rolls_back_when_active_segment_is_missing() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = StateDb::open(&directory.path().join("state.db")).unwrap();
-        insert_chain_and_segment(&state);
+        insert_chain_and_segment(&state, "chain", "provider", "session");
         insert_turn(&state, "old");
         let input = SessionTurnsReplacement {
             provider_name: "provider".to_string(),
@@ -261,7 +282,7 @@ mod tests {
     fn restoration_rolls_back_when_chain_is_missing() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = StateDb::open(&directory.path().join("state.db")).unwrap();
-        let segment_id = insert_chain_and_segment(&state);
+        let segment_id = insert_chain_and_segment(&state, "chain", "provider", "session");
         insert_turn(&state, "replacement");
         let input = SessionTurnsRestore {
             provider_name: "provider".to_string(),
@@ -286,7 +307,7 @@ mod tests {
 
         assert_eq!(
             state.restore_session_turns(&input).unwrap_err(),
-            "failed to restore chain: expected 1 updated row, got 0"
+            "failed to restore active segment: expected 1 updated row, got 0"
         );
         assert_eq!(turn_ids(&state), vec!["replacement"]);
     }
@@ -320,5 +341,90 @@ mod tests {
             state.restore_session_turns(&input).unwrap_err(),
             "session-turn restoration rows do not match the target identity"
         );
+    }
+
+    #[test]
+    fn replacement_rejects_cross_resource_segment_chain_and_session_targets() {
+        for (active_segment, chain_id, provider_name, session_id) in [
+            ("other", "chain", "provider", "session"),
+            ("target", "other-chain", "provider", "session"),
+            ("target", "chain", "other-provider", "session"),
+            ("target", "chain", "provider", "other-session"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = StateDb::open(&directory.path().join("state.db")).unwrap();
+            let target_segment = insert_chain_and_segment(&state, "chain", "provider", "session");
+            let other_segment =
+                insert_chain_and_segment(&state, "other-chain", "other-provider", "other-session");
+            insert_turn(&state, "old");
+            let input = SessionTurnsReplacement {
+                provider_name: provider_name.to_string(),
+                session_id: session_id.to_string(),
+                chain_id: chain_id.to_string(),
+                active_segment_id: if active_segment == "target" {
+                    target_segment
+                } else {
+                    other_segment
+                },
+                source_file: "/tmp/session.jsonl".to_string(),
+                turns: vec![SessionTurnReplacement {
+                    turn_id: "new".to_string(),
+                    timestamp: "2026-08-14T00:00:00Z".to_string(),
+                    role: "assistant".to_string(),
+                    body: "new".to_string(),
+                }],
+            };
+
+            let error = state.replace_session_turns(&input).unwrap_err();
+
+            assert!(error.contains("expected 1 updated row, got 0"), "{error}");
+            assert_eq!(turn_ids(&state), vec!["old"]);
+        }
+    }
+
+    #[test]
+    fn restoration_rejects_cross_resource_segment_chain_and_session_targets() {
+        for (active_segment, chain_id, provider_name, session_id) in [
+            ("other", "chain", "provider", "session"),
+            ("target", "other-chain", "provider", "session"),
+            ("target", "chain", "other-provider", "session"),
+            ("target", "chain", "provider", "other-session"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = StateDb::open(&directory.path().join("state.db")).unwrap();
+            let target_segment = insert_chain_and_segment(&state, "chain", "provider", "session");
+            let other_segment =
+                insert_chain_and_segment(&state, "other-chain", "other-provider", "other-session");
+            insert_turn(&state, "replacement");
+            let input = SessionTurnsRestore {
+                provider_name: provider_name.to_string(),
+                session_id: session_id.to_string(),
+                chain_id: chain_id.to_string(),
+                active_segment_id: if active_segment == "target" {
+                    target_segment
+                } else {
+                    other_segment
+                },
+                last_turn_id: Some("old".to_string()),
+                last_used_at: "2026-08-13T00:00:00Z".to_string(),
+                turns: vec![SessionTurnRestoreRow {
+                    provider_name: provider_name.to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: "old".to_string(),
+                    timestamp: "2026-08-13T00:00:00Z".to_string(),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: 0,
+                    is_compaction_boundary: 0,
+                    source_file: "/tmp/session.jsonl".to_string(),
+                    body: Some("old".to_string()),
+                }],
+            };
+
+            let error = state.restore_session_turns(&input).unwrap_err();
+
+            assert!(error.contains("expected 1 updated row, got 0"), "{error}");
+            assert_eq!(turn_ids(&state), vec!["replacement"]);
+        }
     }
 }

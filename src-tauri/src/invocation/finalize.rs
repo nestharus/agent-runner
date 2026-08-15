@@ -2,7 +2,10 @@
 //!
 //! `orchestration`, `accessor`, `predicate`, `formatter`, `validator`
 
-use oulipoly_runtime::services::ServiceError;
+use oulipoly_runtime::services::{
+    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    ProductionInvocationLifecycleService, ServiceError,
+};
 use oulipoly_state::StateDb;
 
 pub(crate) struct FinalizerGuard<'a> {
@@ -21,10 +24,12 @@ impl<'a> FinalizerGuard<'a> {
     }
 
     pub(crate) fn preserve_running_after_process_integrity(&mut self, error: &ServiceError) {
-        if matches!(
-            error,
-            ServiceError::Dependency { message } if message.starts_with("process_integrity:")
-        ) {
+        let preserves_running = match error {
+            ServiceError::Contention { .. } => true,
+            ServiceError::Dependency { message } => message.starts_with("process_integrity:"),
+            _ => false,
+        };
+        if preserves_running {
             self.finalized = true;
         }
     }
@@ -263,15 +268,27 @@ mod tests {
         let started = std::time::Instant::now();
         {
             let mut guard = FinalizerGuard::new(&db, invocation_id);
-            let message = db
-                .finalize_invocation(invocation_id, true, 0, None, None)
-                .unwrap_err();
+            let result = ProductionInvocationLifecycleService.finalize_invocation(
+                InvocationLifecycleFinalizeRequest {
+                    state: &db,
+                    invocation_row_id: invocation_id,
+                    success: true,
+                    exit_code: 0,
+                    error_category: None,
+                    terminal_reason: None,
+                },
+            );
+            let error = match result {
+                Err(error @ ServiceError::Contention { .. }) => error,
+                other => panic!("expected typed contention, got {other:?}"),
+            };
+            let message = error.to_string();
             assert!(started.elapsed() < std::time::Duration::from_secs(7));
             assert!(
                 message.starts_with("process_integrity: completion_authority_contention:"),
                 "{message}"
             );
-            guard.preserve_running_after_process_integrity(&ServiceError::Dependency { message });
+            guard.preserve_running_after_process_integrity(&error);
         }
 
         let row = db
