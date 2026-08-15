@@ -275,9 +275,11 @@ fn rotation_model(fixture: &Fixture, accounts: &[&str]) -> ModelConfig {
     }
 }
 
-fn registry_with_handshake_timeout(model: &ModelConfig) -> ProviderRegistry {
-    let options = ProviderRegistryOptions::default()
-        .with_client_options(ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT));
+fn registry_with_client_options(
+    model: &ModelConfig,
+    client_options: ProviderClientOptions,
+) -> ProviderRegistry {
+    let options = ProviderRegistryOptions::default().with_client_options(client_options);
     ProviderRegistry::from_model_configs(std::slice::from_ref(model), options)
         .expect("registry should construct from rotation model")
 }
@@ -286,7 +288,19 @@ fn execute(
     model: ModelConfig,
     provider_index: usize,
 ) -> Result<executor::ExecutionResult, ServiceError> {
-    let registry = registry_with_handshake_timeout(&model);
+    execute_with_client_options(
+        model,
+        provider_index,
+        ProviderClientOptions::default().with_timeout(HANDSHAKE_TIMEOUT),
+    )
+}
+
+fn execute_with_client_options(
+    model: ModelConfig,
+    provider_index: usize,
+    client_options: ProviderClientOptions,
+) -> Result<executor::ExecutionResult, ServiceError> {
+    let registry = registry_with_client_options(&model, client_options);
     let service = executor::RuntimeExecutorService::new(Arc::new(registry));
     service
         .execute(ExecutorServiceRequest::Facade {
@@ -353,8 +367,12 @@ fn external_launch_heartbeat_gap_timeout_rotates_to_next_account_and_succeeds() 
     let fixture = make_fixture_with_launch_stalls(&[], &[], &["stall-1"]);
     let model = rotation_model(&fixture, &["stall-1", "fast-2"]);
 
-    let result =
-        execute(model, 0).expect("a launch heartbeat-gap timeout on the first account must rotate");
+    let result = execute_with_client_options(
+        model,
+        0,
+        ProviderClientOptions::default().with_launch_heartbeat_gap(HANDSHAKE_TIMEOUT),
+    )
+    .expect("a launch heartbeat-gap timeout on the first account must rotate");
 
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.stdout, vec![0, 1, 255]);
