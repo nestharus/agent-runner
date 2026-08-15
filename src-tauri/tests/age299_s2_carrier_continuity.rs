@@ -9,9 +9,10 @@ use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const MODEL: &str = "age299-s2-carrier";
@@ -38,6 +39,7 @@ struct Fixture {
     child_env: PathBuf,
     registration_stdout: PathBuf,
     registration_stderr: PathBuf,
+    provider_exited: PathBuf,
 }
 
 struct MaterializationSummary {
@@ -55,6 +57,81 @@ struct ProviderScriptPaths<'a> {
     child_env: &'a Path,
     registration_stdout: &'a Path,
     registration_stderr: &'a Path,
+    provider_exited: &'a Path,
+}
+
+struct CarrierChild {
+    child: Option<Child>,
+    bind: PathBuf,
+    release: PathBuf,
+}
+
+impl CarrierChild {
+    fn new(child: Child, bind: PathBuf, release: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            bind,
+            release,
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .expect("carrier child present")
+            .try_wait()
+    }
+
+    fn wait_with_output(mut self) -> io::Result<Output> {
+        self.child
+            .take()
+            .expect("carrier child present")
+            .wait_with_output()
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.try_wait() {
+                Ok(Some(_)) => {
+                    self.child.take();
+                    return true;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+}
+
+impl Drop for CarrierChild {
+    fn drop(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+
+        let _ = fs::write(&self.bind, b"bind\n");
+        let _ = fs::write(&self.release, b"release\n");
+        if self.wait_for_exit(Duration::from_secs(30)) {
+            return;
+        }
+
+        if let Some(child) = self.child.as_mut() {
+            // SIGTERM lets the runner clean up its provider process group.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        if self.wait_for_exit(Duration::from_secs(5)) {
+            return;
+        }
+
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Fixture {
@@ -72,6 +149,7 @@ impl Fixture {
         let child_env = root.path().join("child-env");
         let registration_stdout = root.path().join("registration-stdout");
         let registration_stderr = root.path().join("registration-stderr");
+        let provider_exited = root.path().join("provider-exited");
         let script = root.path().join("provider.sh");
         write_executable(
             &script,
@@ -85,6 +163,7 @@ impl Fixture {
                     child_env: &child_env,
                     registration_stdout: &registration_stdout,
                     registration_stderr: &registration_stderr,
+                    provider_exited: &provider_exited,
                 },
             ),
         );
@@ -113,6 +192,7 @@ impl Fixture {
             child_env,
             registration_stdout,
             registration_stderr,
+            provider_exited,
         };
         if matches!(carrier, Carrier::Resume) {
             fixture.seed_resume_identity();
@@ -154,7 +234,7 @@ impl Fixture {
             .unwrap();
     }
 
-    fn spawn(&self, carrier: Carrier) -> Child {
+    fn spawn(&self, carrier: Carrier) -> CarrierChild {
         let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         match carrier {
             Carrier::Balancing => {
@@ -183,7 +263,7 @@ impl Fixture {
                     .arg(&self.models_dir);
             }
         }
-        command
+        let child = command
             .current_dir(self.root.path())
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_DATA_HOME", &self.data_home)
@@ -196,8 +276,23 @@ impl Fixture {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap()
+            .unwrap();
+        CarrierChild::new(child, self.bind.clone(), self.release.clone())
     }
+}
+
+#[test]
+fn dropping_a_carrier_before_registration_releases_its_provider() {
+    let fixture = Fixture::new(Carrier::Balancing);
+    let mut child = fixture.spawn(Carrier::Balancing);
+    assert!(wait_for_path_or_exit(&fixture.prepared, &mut child));
+
+    drop(child);
+
+    assert!(
+        fixture.provider_exited.exists(),
+        "carrier drop must release and reap the blocked provider"
+    );
 }
 
 #[test]
@@ -329,7 +424,7 @@ fn all_success_carriers_exhaust_contention_without_a_terminal_result() {
     }
 }
 
-fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, Child, String) {
+fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, String) {
     let fixture = Fixture::new(carrier);
     let mut child = fixture.spawn(carrier);
     if !wait_for_path_or_exit(&fixture.prepared, &mut child) {
@@ -394,7 +489,7 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, Child, String) {
     (fixture, child, invocation_uuid)
 }
 
-fn stage_finalization_only_contention(fixture: &Fixture, child: &mut Child) -> fs::File {
+fn stage_finalization_only_contention(fixture: &Fixture, child: &mut CarrierChild) -> fs::File {
     let state_writer = Connection::open(fixture.state_path()).unwrap();
     state_writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     fs::write(&fixture.release, b"release\n").unwrap();
@@ -413,7 +508,7 @@ fn stage_finalization_only_contention(fixture: &Fixture, child: &mut Child) -> f
     sidecar_authority
 }
 
-fn wait_for_runtime_exit(fixture: &Fixture, child: &mut Child) {
+fn wait_for_runtime_exit(fixture: &Fixture, child: &mut CarrierChild) {
     let sidecar = MailboxDb::path_for_state_db(&fixture.state_path());
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -482,6 +577,7 @@ fn provider_script(root: &Path, paths: ProviderScriptPaths<'_>) -> String {
         child_env,
         registration_stdout,
         registration_stderr,
+        provider_exited,
     } = paths;
     let runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
     let state_dir = root.join("agent-bash-artifacts");
@@ -491,6 +587,7 @@ fn provider_script(root: &Path, paths: ProviderScriptPaths<'_>) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
+trap 'touch {provider_exited:?}' EXIT
 mkdir -p {state_dir:?}
 invocation_uuid="$(python3 -c 'import json,os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
 authority_len="${{#OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY}}"
@@ -521,7 +618,7 @@ fn write_executable(path: &Path, content: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
-fn wait_for_path_or_exit(path: &Path, child: &mut Child) -> bool {
+fn wait_for_path_or_exit(path: &Path, child: &mut CarrierChild) -> bool {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if path.exists() {
