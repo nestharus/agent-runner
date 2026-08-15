@@ -61,8 +61,8 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
         "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
     );
     assert!(
-        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 14;"),
-        "schema version must include invocation completion obligations"
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 15;"),
+        "schema version must include invocation completion continuity"
     );
     assert!(
         !lib_source().contains("pub mod lifecycle_log"),
@@ -107,6 +107,7 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
             "0012_session_ingress_evidence.sql",
             "0013_fresh_continuations.sql",
             "0014_invocation_completion_obligations.sql",
+            "0015_invocation_completion_continuity.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

@@ -87,6 +87,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0014_invocation_completion_obligations.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 15,
+        id: "0015_invocation_completion_continuity",
+        sql: include_str!("../migrations/0015_invocation_completion_continuity.sql"),
+        post_sql_hook: None,
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {

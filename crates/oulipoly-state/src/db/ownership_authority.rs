@@ -51,6 +51,12 @@ pub enum CompletionObligationAuthority {
     Admitted(CompletionObligationExpectation),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionContinuityRecoveryState {
+    Ready,
+    OperatorRecoveryRequired { unproven_obligation_count: i64 },
+}
+
 impl CompletionObligationAuthority {
     pub fn sidecar_generation_state(
         &self,
@@ -280,6 +286,7 @@ impl StateDb {
             .map_err(|error| {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
+        require_completion_continuity_registration_ready(&tx)?;
         require_running_owner(&tx, owner_invocation_uuid)?;
         let sidecar_authority = crate::mailbox::MailboxAuthorityFence::acquire(&sidecar_path)
             .map_err(|error| error.to_string())?;
@@ -374,6 +381,12 @@ impl StateDb {
             Some(expectation) => CompletionObligationAuthority::Admitted(expectation),
             None => CompletionObligationAuthority::NoAdmittedObligation,
         })
+    }
+
+    pub fn completion_continuity_recovery_state(
+        &self,
+    ) -> Result<CompletionContinuityRecoveryState, OwnershipAuthorityError> {
+        completion_continuity_recovery_state_on(&self.conn)
     }
 
     pub fn completion_obligations_for_invocation(
@@ -726,6 +739,49 @@ fn format_completion_continuity_head(head: Option<&CompletionContinuityHead>) ->
             )
         },
     )
+}
+
+fn require_completion_continuity_registration_ready(
+    conn: &sqlite::Connection,
+) -> Result<(), String> {
+    match completion_continuity_recovery_state_on(conn).map_err(|error| error.to_string())? {
+        CompletionContinuityRecoveryState::Ready => Ok(()),
+        CompletionContinuityRecoveryState::OperatorRecoveryRequired {
+            unproven_obligation_count,
+        } => Err(format!(
+            "process_integrity: completion_continuity_recovery=operator_recovery_required; {unproven_obligation_count} schema-14 completion obligation(s) lack exact continuity proof; run `agents migrate --rebuild`"
+        )),
+    }
+}
+
+fn completion_continuity_recovery_state_on(
+    conn: &sqlite::Connection,
+) -> Result<CompletionContinuityRecoveryState, OwnershipAuthorityError> {
+    let recovery: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT recovery_state, unproven_obligation_count
+             FROM invocation_completion_continuity_recovery
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(persistence("read completion continuity recovery state"))?;
+    match recovery {
+        None => Ok(CompletionContinuityRecoveryState::Ready),
+        Some((state, unproven_obligation_count))
+            if state == "operator_recovery_required" && unproven_obligation_count > 0 =>
+        {
+            Ok(
+                CompletionContinuityRecoveryState::OperatorRecoveryRequired {
+                    unproven_obligation_count,
+                },
+            )
+        }
+        Some((state, unproven_obligation_count)) => Err(persistence_message(format!(
+            "invalid completion continuity recovery state: state={state}, unproven_obligation_count={unproven_obligation_count}"
+        ))),
+    }
 }
 
 #[cfg(test)]

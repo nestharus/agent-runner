@@ -1,10 +1,84 @@
 use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
 use oulipoly_state::migrations;
-use oulipoly_state::{CompletionObligationAdmission, InvocationStart, StateDb};
+use oulipoly_state::{
+    CURRENT_SCHEMA_VERSION, CompletionContinuityRecoveryState, CompletionObligationAdmission,
+    InvocationStart, StateDb,
+};
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const EVENT_ID: &str = "ab_age299_s2_event";
 const ADMISSION_ID: &str = "admission-age299-s2";
 const OWNER_SESSION_ID: &str = "session-age299-s2-owner";
+
+#[test]
+fn base_s1_schema_14_without_obligations_upgrades_and_registers_normally() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    build_base_s1_schema_14(&state_path, false);
+
+    let mut state = StateDb::open(&state_path).unwrap();
+
+    assert_eq!(state_user_version(&state), CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        state.completion_continuity_recovery_state().unwrap(),
+        CompletionContinuityRecoveryState::Ready
+    );
+    state
+        .register_completion_event_with_obligation(
+            ADMISSION_ID,
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap();
+    assert_eq!(
+        count_state_rows(&state, "invocation_completion_continuity"),
+        1
+    );
+    assert!(
+        MailboxDb::open(&sidecar_path)
+            .unwrap()
+            .contains_completion_obligation(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID)
+            .unwrap()
+    );
+}
+
+#[test]
+fn base_s1_schema_14_obligations_require_typed_operator_recovery_before_registration() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    build_base_s1_schema_14(&state_path, true);
+
+    let mut state = StateDb::open(&state_path).unwrap();
+
+    assert_eq!(state_user_version(&state), CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        state.completion_continuity_recovery_state().unwrap(),
+        CompletionContinuityRecoveryState::OperatorRecoveryRequired {
+            unproven_obligation_count: 1,
+        }
+    );
+    assert!(state.get_invocation_by_uuid(ROOT_UUID).unwrap().is_some());
+    let error = state
+        .register_completion_event_with_obligation(
+            "post-upgrade-admission",
+            completion_registration("post-upgrade-event", ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap_err();
+    assert!(
+        error.contains("completion_continuity_recovery=operator_recovery_required"),
+        "{error}"
+    );
+    assert!(error.contains("agents migrate --rebuild"), "{error}");
+    assert!(!sidecar_path.exists());
+    assert_eq!(
+        count_state_rows(&state, "invocation_completion_obligations"),
+        1
+    );
+    assert_eq!(
+        count_state_rows(&state, "invocation_completion_continuity"),
+        0
+    );
+}
 
 #[test]
 fn each_state_database_path_derives_a_distinct_sidecar_path() {
@@ -329,4 +403,79 @@ fn assert_running(state: &StateDb, invocation_uuid: &str) {
             .as_str(),
         "running"
     );
+}
+
+fn build_base_s1_schema_14(path: &std::path::Path, with_obligation: bool) {
+    let mut connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    let plan = migrations::plan(0, 14).unwrap();
+    migrations::run_with_db_path(&mut connection, &plan, path.to_path_buf()).unwrap();
+    assert_eq!(user_version(&connection), 14);
+    assert!(!table_exists(
+        &connection,
+        "invocation_completion_continuity"
+    ));
+    connection
+        .execute(
+            "INSERT INTO invocations (
+                invocation_uuid, model_name, provider_name, provider_index,
+                status, created_at
+             ) VALUES (?1, 'age299-s2', 'test-provider', 0, 'running', '2026-08-14T00:00:00Z')",
+            [ROOT_UUID],
+        )
+        .unwrap();
+    if with_obligation {
+        connection
+            .execute(
+                "INSERT INTO invocation_completion_obligations (
+                    admission_id, invocation_uuid, event_id, owner_invocation_uuid,
+                    owner_session_id, expected_sidecar_generation, admitted_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2026-08-14T00:00:01Z')",
+                rusqlite::params![
+                    "base-s1-admission",
+                    ROOT_UUID,
+                    "base-s1-event",
+                    ROOT_UUID,
+                    "base-s1-session",
+                    "44444444-4444-4444-8444-444444444444",
+                ],
+            )
+            .unwrap();
+    }
+}
+
+fn user_version(connection: &rusqlite::Connection) -> i32 {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn table_exists(connection: &rusqlite::Connection, table: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+             )",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn state_user_version(state: &StateDb) -> i32 {
+    state
+        .connection()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap()
+}
+
+fn count_state_rows(state: &StateDb, table: &str) -> i64 {
+    state
+        .connection()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
 }
