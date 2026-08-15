@@ -306,6 +306,7 @@ fn assert_schema5_current_plan(plan: &[&migrations::Migration]) {
             "0013_fresh_continuations",
             "0014_invocation_completion_obligations",
             "0015_invocation_completion_continuity",
+            "0016_invocation_completion_authority_summary",
         ]
     );
 }

@@ -151,7 +151,7 @@ fn state_db_rejects_completion_obligations_for_unknown_invocations() {
 }
 
 #[test]
-fn schema_13_migrates_through_ordered_v15_and_preserves_invocation_data() {
+fn schema_13_migrates_through_ordered_v16_and_preserves_invocation_data() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.db");
     build_schema_13_database(&path);
@@ -165,6 +165,7 @@ fn schema_13_migrates_through_ordered_v15_and_preserves_invocation_data() {
         vec![
             (14, "0014_invocation_completion_obligations"),
             (15, "0015_invocation_completion_continuity"),
+            (16, "0016_invocation_completion_authority_summary"),
         ]
     );
 

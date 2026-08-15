@@ -751,11 +751,14 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
 }
 
 #[test]
-fn schema_v15_is_created_fresh_and_upgrades_from_schema_v10() {
+fn current_schema_is_created_fresh_and_schema_v10_upgrades_through_v15() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
     let fresh_connection = rusqlite::Connection::open(fresh.path()).unwrap();
-    assert_eq!(user_version(&fresh_connection), 15);
+    assert_eq!(
+        user_version(&fresh_connection),
+        i64::from(oulipoly_state::CURRENT_SCHEMA_VERSION)
+    );
     let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
@@ -777,6 +780,10 @@ fn schema_v15_is_created_fresh_and_upgrades_from_schema_v10() {
     assert!(
         table_exists(&fresh_connection, "invocation_completion_obligations"),
         "missing invocation_completion_obligations"
+    );
+    assert!(
+        table_exists(&fresh_connection, "invocation_completion_authority_summary"),
+        "missing invocation_completion_authority_summary"
     );
 
     let upgrade_path = dir.path().join("upgrade.db");

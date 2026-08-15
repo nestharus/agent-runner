@@ -60,6 +60,7 @@ fn ti_04_loader_level_idempotence_preserves_representative_rows() {
             "0013_fresh_continuations",
             "0014_invocation_completion_obligations",
             "0015_invocation_completion_continuity",
+            "0016_invocation_completion_authority_summary",
         ]
     );
 
