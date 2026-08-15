@@ -21,7 +21,10 @@ use super::predicate::{
 use super::state_update::{bump_quota_tick, emit_session_capture_failure, update_session_capture};
 use super::validator;
 use crate::captured_child::supervise_captured_child_invocations;
-use crate::invocation::finalize::FinalizerGuard;
+use crate::invocation::finalize::{
+    FinalizerGuard, finalize_retained_outcome_with_contention_retry,
+    is_completion_authority_contention,
+};
 use crate::quota_zero_turn::balanced_result_error_category;
 use crate::session_ingest_cli::{emit_known_session_id, ingest_and_emit_session_id_resume_aware};
 use crate::terminal_outcome_adapter::{TerminalSignalContext, apply_terminal_signal_outcome};
@@ -174,20 +177,28 @@ fn finalize_completed_attempt_lifecycle(
     input: &mut CompletedAttemptInput<'_, '_, '_>,
     classification: &CompletedAttemptClassification,
 ) -> Option<BalancedLoopControl> {
-    let finalize_result = input
-        .agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(mapper::completed_finalize_request(
+    let finalize_result = finalize_retained_outcome_with_contention_retry(
+        input
+            .agent_runtime_services
+            .invocation_lifecycle_service
+            .as_ref(),
+        mapper::completed_finalize_request(
             &input.env.state,
             input.invocation_row_id,
             classification.success,
             input.result.exit_code,
             classification.error_category.as_deref(),
             input.result.terminal_reason.as_deref(),
-        ));
+        ),
+    );
     if let Err(err) = finalize_result {
         if classification.success {
             input.guard.preserve_running_after_process_integrity(&err);
+        }
+        if is_completion_authority_contention(&err) {
+            formatter::emit_finalize_invocation_warning(err);
+            mark_balanced_attempt_idle(input, Some(input.result.exit_code));
+            return Some(BalancedLoopControl::Return(Ok(1)));
         }
         emit_completed_attempt_finalize_failure(input, err);
         return Some(BalancedLoopControl::Return(Ok(1)));

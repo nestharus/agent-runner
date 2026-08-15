@@ -2,13 +2,59 @@
 //!
 //! `orchestration`, `accessor`, `predicate`, `formatter`, `validator`
 
-use oulipoly_runtime::services::ServiceError;
+use oulipoly_runtime::services::{
+    InvocationLifecycleFinalizeOutput, InvocationLifecycleFinalizeRequest,
+    InvocationLifecycleServicePort, ServiceError,
+};
 #[cfg(test)]
 use oulipoly_runtime::services::{
-    InvocationLifecycleFinalizeRequest, InvocationLifecycleServicePort,
+    InvocationLifecycleStartOutput, InvocationLifecycleStartRequest,
     ProductionInvocationLifecycleService,
 };
 use oulipoly_state::StateDb;
+
+const SUCCESS_FINALIZE_MAX_ATTEMPTS: usize = 3;
+const SUCCESS_FINALIZE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
+pub(crate) fn finalize_retained_outcome_with_contention_retry(
+    service: &dyn InvocationLifecycleServicePort,
+    request: InvocationLifecycleFinalizeRequest<'_>,
+) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
+    let InvocationLifecycleFinalizeRequest {
+        state,
+        invocation_row_id,
+        success,
+        exit_code,
+        error_category,
+        terminal_reason,
+    } = request;
+    let attempts = if success {
+        SUCCESS_FINALIZE_MAX_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 1..=attempts {
+        let result = service.finalize_invocation(InvocationLifecycleFinalizeRequest {
+            state,
+            invocation_row_id,
+            success,
+            exit_code,
+            error_category,
+            terminal_reason,
+        });
+        match result {
+            Err(ServiceError::Contention { .. }) if attempt < attempts => {
+                std::thread::sleep(SUCCESS_FINALIZE_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the bounded finalization retry loop always returns")
+}
+
+pub(crate) fn is_completion_authority_contention(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::Contention { .. })
+}
 
 pub(crate) struct FinalizerGuard<'a> {
     db: &'a StateDb,
@@ -95,7 +141,53 @@ mod tests {
     use oulipoly_state::{InvocationStart, InvocationStatus, ProviderSessionBinding};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ObservedFinalizeRequest {
+        invocation_row_id: i64,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<String>,
+        terminal_reason: Option<String>,
+    }
+
+    struct ContendingLifecycleService {
+        succeed_on_attempt: Option<usize>,
+        observed: Mutex<Vec<ObservedFinalizeRequest>>,
+    }
+
+    impl InvocationLifecycleServicePort for ContendingLifecycleService {
+        fn start_invocation(
+            &self,
+            _request: InvocationLifecycleStartRequest<'_>,
+        ) -> Result<InvocationLifecycleStartOutput, ServiceError> {
+            unreachable!("the finalization retry test never starts an invocation through the fake")
+        }
+
+        fn finalize_invocation(
+            &self,
+            request: InvocationLifecycleFinalizeRequest<'_>,
+        ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
+            let mut observed = self.observed.lock().unwrap();
+            observed.push(ObservedFinalizeRequest {
+                invocation_row_id: request.invocation_row_id,
+                success: request.success,
+                exit_code: request.exit_code,
+                error_category: request.error_category.map(str::to_string),
+                terminal_reason: request.terminal_reason.map(str::to_string),
+            });
+            if self.succeed_on_attempt == Some(observed.len()) {
+                Ok(InvocationLifecycleFinalizeOutput)
+            } else {
+                Err(ServiceError::Contention {
+                    message: "process_integrity: completion_authority_contention: fixture"
+                        .to_string(),
+                })
+            }
+        }
+    }
 
     fn test_db() -> StateDb {
         open_test_db(Path::new(":memory:"))
@@ -103,6 +195,89 @@ mod tests {
 
     fn open_test_db(path: &Path) -> StateDb {
         StateDb::open(path).unwrap()
+    }
+
+    #[test]
+    fn success_finalization_retries_the_exact_retained_outcome_until_it_succeeds() {
+        let db = test_db();
+        let service = ContendingLifecycleService {
+            succeed_on_attempt: Some(3),
+            observed: Mutex::new(Vec::new()),
+        };
+
+        finalize_retained_outcome_with_contention_retry(
+            &service,
+            InvocationLifecycleFinalizeRequest {
+                state: &db,
+                invocation_row_id: 71,
+                success: true,
+                exit_code: 0,
+                error_category: Some("retained-category"),
+                terminal_reason: Some("retained-reason"),
+            },
+        )
+        .unwrap();
+
+        let observed = service.observed.lock().unwrap();
+        assert_eq!(observed.len(), SUCCESS_FINALIZE_MAX_ATTEMPTS);
+        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            observed[0],
+            ObservedFinalizeRequest {
+                invocation_row_id: 71,
+                success: true,
+                exit_code: 0,
+                error_category: Some("retained-category".to_string()),
+                terminal_reason: Some("retained-reason".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn exhausted_success_contention_preserves_the_running_invocation() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+        let service = ContendingLifecycleService {
+            succeed_on_attempt: None,
+            observed: Mutex::new(Vec::new()),
+        };
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            let error = finalize_retained_outcome_with_contention_retry(
+                &service,
+                InvocationLifecycleFinalizeRequest {
+                    state: &db,
+                    invocation_row_id: invocation_id,
+                    success: true,
+                    exit_code: 0,
+                    error_category: None,
+                    terminal_reason: None,
+                },
+            )
+            .unwrap_err();
+            assert!(is_completion_authority_contention(&error));
+            guard.preserve_running_after_process_integrity(&error);
+        }
+
+        assert_eq!(
+            service.observed.lock().unwrap().len(),
+            SUCCESS_FINALIZE_MAX_ATTEMPTS
+        );
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
     }
 
     #[test]

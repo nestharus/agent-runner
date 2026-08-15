@@ -9,7 +9,9 @@ use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_state::CompositeInvocationId;
 
 use super::mapper;
-use crate::invocation::finalize::FinalizerGuard;
+use crate::invocation::finalize::{
+    FinalizerGuard, finalize_retained_outcome_with_contention_retry,
+};
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::session_ingest_cli::{SessionIngestRequest, ingest_and_emit_session_id_resume_aware};
 use crate::wiring;
@@ -32,17 +34,20 @@ pub(super) struct CompletedReplAttemptInput<'a, 'state> {
 pub(super) fn finalize_completed_repl_attempt(
     input: CompletedReplAttemptInput<'_, '_>,
 ) -> Result<i32, String> {
-    let finalize_result = input
-        .agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(mapper::finalize_request(
+    let finalize_result = finalize_retained_outcome_with_contention_retry(
+        input
+            .agent_runtime_services
+            .invocation_lifecycle_service
+            .as_ref(),
+        mapper::finalize_request(
             &input.env.state,
             input.invocation_row_id,
             input.result.exit_code == 0,
             input.result.exit_code,
             None,
             input.result.terminal_reason.as_deref(),
-        ));
+        ),
+    );
     if let Err(error) = &finalize_result
         && input.result.exit_code == 0
     {
