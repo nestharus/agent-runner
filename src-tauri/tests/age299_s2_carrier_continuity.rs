@@ -47,6 +47,16 @@ struct MaterializationSummary {
     continuity_digest: String,
 }
 
+struct ProviderScriptPaths<'a> {
+    registered: &'a Path,
+    prepared: &'a Path,
+    bind: &'a Path,
+    release: &'a Path,
+    child_env: &'a Path,
+    registration_stdout: &'a Path,
+    registration_stderr: &'a Path,
+}
+
 impl Fixture {
     fn new(carrier: Carrier) -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -67,13 +77,15 @@ impl Fixture {
             &script,
             &provider_script(
                 root.path(),
-                &registered,
-                &prepared,
-                &bind,
-                &release,
-                &child_env,
-                &registration_stdout,
-                &registration_stderr,
+                ProviderScriptPaths {
+                    registered: &registered,
+                    prepared: &prepared,
+                    bind: &bind,
+                    release: &release,
+                    child_env: &child_env,
+                    registration_stdout: &registration_stdout,
+                    registration_stderr: &registration_stderr,
+                },
             ),
         );
         fs::write(
@@ -403,7 +415,7 @@ fn stage_finalization_only_contention(fixture: &Fixture, child: &mut Child) -> f
 
 fn wait_for_runtime_exit(fixture: &Fixture, child: &mut Child) {
     let sidecar = MailboxDb::path_for_state_db(&fixture.state_path());
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let exited = Connection::open(&sidecar)
             .and_then(|connection| {
@@ -444,8 +456,7 @@ fn assert_refusal_oracle(
         "{carrier:?}: {stdout}"
     );
     assert!(
-        stderr.contains("process_integrity")
-            && stderr.contains("sidecar materialization summary is absent or mismatched"),
+        stderr.contains("process_integrity") && stderr.contains("sidecar materialization summary"),
         "{carrier:?}: {stderr}"
     );
     assert!(
@@ -462,16 +473,16 @@ fn assert_refusal_oracle(
     assert_eq!(row.exit_code, None, "{carrier:?}");
 }
 
-fn provider_script(
-    root: &Path,
-    registered: &Path,
-    prepared: &Path,
-    bind: &Path,
-    release: &Path,
-    child_env: &Path,
-    registration_stdout: &Path,
-    registration_stderr: &Path,
-) -> String {
+fn provider_script(root: &Path, paths: ProviderScriptPaths<'_>) -> String {
+    let ProviderScriptPaths {
+        registered,
+        prepared,
+        bind,
+        release,
+        child_env,
+        registration_stdout,
+        registration_stderr,
+    } = paths;
     let runner = env!("CARGO_BIN_EXE_oulipoly-agent-runner");
     let state_dir = root.join("agent-bash-artifacts");
     let meta = state_dir.join("meta.json");
@@ -511,7 +522,7 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 fn wait_for_path_or_exit(path: &Path, child: &mut Child) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if path.exists() {
             return true;

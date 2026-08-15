@@ -7369,6 +7369,92 @@ fn mailbox_schema_definition() -> &'static str {
             SELECT RAISE(ABORT, 'completion listener continuity identity is immutable');
         END;
 
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_materialization_delete
+        AFTER DELETE ON completion_event
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_materialization_update
+        AFTER UPDATE OF event_id, kind ON completion_event
+        WHEN OLD.event_id IS NOT NEW.event_id OR OLD.kind IS NOT NEW.kind
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_listener_materialization_delete
+        AFTER DELETE ON completion_event_listener
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+                    AND owner_invocation_uuid = OLD.listener_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+                  AND owner_invocation_uuid = OLD.listener_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_listener_materialization_update
+        AFTER UPDATE OF event_id, listener_id, session_id, owner_invocation_uuid
+        ON completion_event_listener
+        WHEN OLD.event_id IS NOT NEW.event_id
+          OR OLD.listener_id IS NOT NEW.listener_id
+          OR OLD.session_id IS NOT NEW.session_id
+          OR OLD.owner_invocation_uuid IS NOT NEW.owner_invocation_uuid
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+                    AND owner_invocation_uuid = OLD.listener_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+                  AND owner_invocation_uuid = OLD.listener_id
+            );
+        END;
+
         CREATE TABLE IF NOT EXISTS mailbox_notification_control (
             session_id                    TEXT PRIMARY KEY,
             paused                       INTEGER NOT NULL DEFAULT 0,

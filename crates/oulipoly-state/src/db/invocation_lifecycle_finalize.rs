@@ -545,8 +545,17 @@ impl StateDb {
                 && observed.continuity_digest == expected.continuity_digest
         });
         if !exact_match {
+            let observed_shape = observed.as_ref().map_or_else(
+                || "the sidecar materialization summary is absent".to_string(),
+                |observed| {
+                    format!(
+                        "only {} remain in the sidecar materialization summary",
+                        observed.materialized_count
+                    )
+                },
+            );
             return Err(format!(
-                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion authority requires {} exact agent_bash_complete event/listener obligations at ordinal {} and digest {}, but the sidecar materialization summary is absent or mismatched; first obligation {} is owned by invocation {} and session {}",
+                "process_integrity: invocation {invocation_uuid} cannot succeed because its completion authority requires {} exact agent_bash_complete event/listener obligations at ordinal {} and digest {}, but {observed_shape}; first obligation {} is owned by invocation {} and session {}",
                 expected.materialized_count,
                 expected.authority_ordinal,
                 expected.continuity_digest,
