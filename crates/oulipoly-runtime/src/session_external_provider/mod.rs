@@ -48,7 +48,6 @@ use crate::session_replace::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -187,8 +186,12 @@ pub fn replace_session(
         }
     };
     validate_accepted_host_state_consistency(&accepted)?;
-    let receipt =
-        replace_host_apply::apply_provider_owned_replace(&identity, session_id, &accepted)?;
+    let receipt = replace_host_apply::apply_provider_owned_replace_to_target(
+        &identity,
+        session_id,
+        &accepted,
+        &pending_journal.db_target,
+    )?;
     pending_journal.mark_db_applied()?;
     maybe_provider_owned_test_hook(TEST_STOP_AFTER_DB_APPLY_MARKER)?;
     if accepted.operation_state == "prepared" {
@@ -285,10 +288,11 @@ fn recover_provider_owned_journal(
                 &query_result,
             )
             .map_err(service_error_mapper::replace_adapter_error)?;
-            replace_host_apply::apply_provider_owned_replace(
+            replace_host_apply::apply_provider_owned_replace_to_target(
                 &identity,
                 &journal.session_id,
                 &accepted,
+                &map_provider_owned_journal_db_target(&journal),
             )?;
             mark_provider_owned_journal_path(path, "applied", journal.recovery_id.as_deref())?;
             send_provider_owned_recovery_action(
@@ -309,10 +313,11 @@ fn recover_provider_owned_journal(
                     &query_result,
                 )
                 .map_err(service_error_mapper::replace_adapter_error)?;
-                replace_host_apply::apply_provider_owned_replace(
+                replace_host_apply::apply_provider_owned_replace_to_target(
                     &identity,
                     &journal.session_id,
                     &accepted,
+                    &map_provider_owned_journal_db_target(&journal),
                 )?;
                 send_provider_owned_recovery_action(
                     &client,
@@ -340,10 +345,11 @@ fn recover_provider_owned_journal(
                     &query_result,
                 )
                 .map_err(service_error_mapper::replace_adapter_error)?;
-                replace_host_apply::apply_provider_owned_replace(
+                replace_host_apply::apply_provider_owned_replace_to_target(
                     &identity,
                     &journal.session_id,
                     &accepted,
+                    &map_provider_owned_journal_db_target(&journal),
                 )?;
             }
             cleanup_provider_owned_journal(path)?;
@@ -508,7 +514,7 @@ fn parse_provider_owned_journal_header(bytes: &[u8]) -> Option<ProviderOwnedJour
 }
 
 fn is_provider_owned_pending_journal_header(header: &ProviderOwnedJournalHeader) -> bool {
-    header.schema_version == 2 && header.operation == PROVIDER_OWNED_JOURNAL_OPERATION
+    header.schema_version == 3 && header.operation == PROVIDER_OWNED_JOURNAL_OPERATION
 }
 
 fn parse_provider_owned_pending_journal(
@@ -583,6 +589,7 @@ fn map_provider_owned_journal_db_target(
         session_id: journal.session_id.clone(),
         chain_id: journal.chain_id.clone(),
         active_segment_id: journal.active_segment_id,
+        active_segment_started_at: journal.active_segment_started_at.clone(),
         source_file: String::new(),
     }
 }
@@ -621,6 +628,7 @@ struct ProviderOwnedReplaceJournal {
     session_id: String,
     chain_id: String,
     active_segment_id: i64,
+    active_segment_started_at: String,
     db_apply_marker: String,
     db_preimage: ProviderReplaceDbPreimage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -629,6 +637,7 @@ struct ProviderOwnedReplaceJournal {
 
 struct ProviderOwnedJournalPublication {
     pending_path: PathBuf,
+    db_target: ProviderReplaceDbTarget,
 }
 
 impl ProviderOwnedJournalPublication {
@@ -638,28 +647,14 @@ impl ProviderOwnedJournalPublication {
         session_id: &str,
         operation_id: &str,
     ) -> Result<Self, ReplaceError> {
-        let identity_result = crate::session_replace::strict_provider_replace_db_identity(
+        let db_target = crate::session_replace::strict_provider_replace_db_identity(
             &identity.provider_name,
             session_id,
             String::new(),
-        );
-        let (chain_id, active_segment_id, db_preimage) = match identity_result {
-            Ok(target) => {
-                let preimage = crate::session_replace::provider_replace_db_preimage(&target)?;
-                (target.chain_id, target.active_segment_id, preimage)
-            }
-            Err(_) => (
-                String::new(),
-                0,
-                ProviderReplaceDbPreimage {
-                    session_turns: Value::Array(Vec::new()),
-                    last_turn_id: None,
-                    last_used_at: String::new(),
-                },
-            ),
-        };
+        )?;
+        let db_preimage = crate::session_replace::provider_replace_db_preimage(&db_target)?;
         let journal = ProviderOwnedReplaceJournal {
-            schema_version: 2,
+            schema_version: 3,
             operation: PROVIDER_OWNED_JOURNAL_OPERATION.to_string(),
             operation_id: operation_id.to_string(),
             started_at: Utc::now().to_rfc3339(),
@@ -668,8 +663,9 @@ impl ProviderOwnedJournalPublication {
             provider_name: identity.provider_name.clone(),
             provider_instance_id: identity::provider_instance_id(identity),
             session_id: session_id.to_string(),
-            chain_id,
-            active_segment_id,
+            chain_id: db_target.chain_id.clone(),
+            active_segment_id: db_target.active_segment_id,
+            active_segment_started_at: db_target.active_segment_started_at.clone(),
             db_apply_marker: "not_applied".to_string(),
             db_preimage,
             recovery_id: None,
@@ -680,7 +676,10 @@ impl ProviderOwnedJournalPublication {
         })?;
         let pending_path = journal_root.join(format!("session-{session_id}.pending"));
         write_provider_owned_journal(&pending_path, &journal)?;
-        Ok(Self { pending_path })
+        Ok(Self {
+            pending_path,
+            db_target,
+        })
     }
 
     fn update_recovery_id(&self, recovery_id: &str) -> Result<(), ReplaceError> {

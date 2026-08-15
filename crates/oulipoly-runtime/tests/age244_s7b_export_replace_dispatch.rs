@@ -513,13 +513,14 @@ storage_type = "{storage_type}"
         .expect("pending canonical records");
         let pending_path = journal_root.join(format!("session-{SESSION_ID}.pending"));
         let journal = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operation": "import-replace",
             "operation_uuid": "33333333-3333-4333-8333-333333333333",
             "started_at": "2026-05-01T02:00:00Z",
             "session_id": SESSION_ID,
             "chain_id": CHAIN_ID,
             "active_segment_id": self.active_segment_id(),
+            "active_segment_started_at": "2026-05-01T00:00:00Z",
             "provider_name": PROVIDER_NAME,
             "storage_type": builtin_storage_type(),
             "jsonl_path": self.transcript_path.display().to_string(),
@@ -559,13 +560,14 @@ storage_type = "{storage_type}"
         fs::write(&preimage_snapshot_path, preimage_bytes).expect("preimage snapshot");
         let pending_path = journal_root.join(format!("session-{SESSION_ID}.pending"));
         let mut journal = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "operation": "import-replace",
             "operation_uuid": "44444444-4444-4444-8444-444444444444",
             "started_at": "2026-05-01T02:00:00Z",
             "session_id": SESSION_ID,
             "chain_id": CHAIN_ID,
             "active_segment_id": self.active_segment_id(),
+            "active_segment_started_at": "2026-05-01T00:00:00Z",
             "provider_name": PROVIDER_NAME,
             "storage_type": builtin_storage_type(),
             "jsonl_path": self.transcript_path.display().to_string(),
@@ -585,19 +587,19 @@ storage_type = "{storage_type}"
         .expect("pending journal");
     }
 
-    fn seed_provider_owned_v2_pending_replace_journal(
+    fn seed_provider_owned_v3_pending_replace_journal(
         &self,
         db_apply_marker: &str,
         recovery_id: Option<&str>,
     ) {
-        self.seed_provider_owned_v2_pending_replace_journal_with_preimage(
+        self.seed_provider_owned_v3_pending_replace_journal_with_preimage(
             db_apply_marker,
             recovery_id,
             self.sqlite_snapshot(),
         );
     }
 
-    fn seed_provider_owned_v2_pending_replace_journal_with_preimage(
+    fn seed_provider_owned_v3_pending_replace_journal_with_preimage(
         &self,
         db_apply_marker: &str,
         recovery_id: Option<&str>,
@@ -606,7 +608,7 @@ storage_type = "{storage_type}"
         let journal_root = self.data_root.join("replace_journal");
         fs::create_dir_all(&journal_root).expect("journal root");
         let mut journal = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "operation": "provider-owned-import-replace",
             "operation_id": provider_owned_operation_id(),
             "started_at": "2026-05-01T02:00:00Z",
@@ -617,6 +619,7 @@ storage_type = "{storage_type}"
             "session_id": SESSION_ID,
             "chain_id": CHAIN_ID,
             "active_segment_id": self.active_segment_id(),
+            "active_segment_started_at": "2026-05-01T00:00:00Z",
             "db_apply_marker": db_apply_marker,
             "db_preimage": {
                 "session_turns": db_preimage.session_turns,
@@ -629,9 +632,9 @@ storage_type = "{storage_type}"
         }
         fs::write(
             journal_root.join(format!("session-{SESSION_ID}.pending")),
-            serde_json::to_vec_pretty(&journal).expect("v2 journal json"),
+            serde_json::to_vec_pretty(&journal).expect("v3 journal json"),
         )
-        .expect("v2 pending journal");
+        .expect("v3 pending journal");
     }
 
     fn delete_active_segment_for_provider_session(&self) {
@@ -1275,7 +1278,7 @@ fn external_replace_success_uses_provider_transform_and_host_owned_apply_lifecyc
 }
 
 #[test]
-fn provider_owned_success_publishes_updates_and_cleans_v2_journal_lifecycle() {
+fn provider_owned_success_publishes_updates_and_cleans_v3_journal_lifecycle() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
 
     let observed = DispatchFixture::new();
@@ -1295,7 +1298,7 @@ fn provider_owned_success_publishes_updates_and_cleans_v2_journal_lifecycle() {
         .result
         .expect("replace receipt");
 
-    assert_pending_v2_journal_observed_before_provider_mutation(&observed);
+    assert_pending_v3_journal_observed_before_provider_mutation(&observed);
     assert_eq!(observed.journal_snapshot(), Vec::<(String, Vec<u8>)>::new());
     assert_provider_owned_prepare_commit_flow(&observed);
     assert_forbidden_helper_counts_zero();
@@ -1649,7 +1652,7 @@ fn external_replace_provider_ref_db_identity_missing_or_ambiguous_fails_before_d
 
         assert_error_token(format!("{err:?}"), expected_token);
         assert_eq!(fixture.sqlite_snapshot(), before_db, "{label}");
-        assert_provider_call_counts(&fixture, 1, 0, 1);
+        assert_provider_call_counts(&fixture, 1, 0, 0);
         assert_provider_requests_do_not_expose_sqlite_mutation_authority(&fixture);
         assert_forbidden_helper_counts_zero();
     }
@@ -1863,7 +1866,7 @@ fn provider_owned_recovery_rolls_forward_with_db_preimage_only_and_no_local_snap
         b"local transcript is not recovery authority\n",
     )
     .expect("non-authoritative local transcript");
-    fixture.seed_provider_owned_v2_pending_replace_journal(
+    fixture.seed_provider_owned_v3_pending_replace_journal(
         "not_applied",
         Some(provider_owned_recovery_id().as_str()),
     );
@@ -1897,7 +1900,7 @@ fn provider_owned_recovery_rolls_back_db_apply_from_durable_db_preimage_without_
         b"provider storage is not host rollback authority\n",
     )
     .expect("provider storage marker");
-    fixture.seed_provider_owned_v2_pending_replace_journal_with_preimage(
+    fixture.seed_provider_owned_v3_pending_replace_journal_with_preimage(
         "applied",
         Some(provider_owned_recovery_id().as_str()),
         db_preimage.clone(),
@@ -1916,7 +1919,7 @@ fn provider_owned_recovery_rolls_back_db_apply_from_durable_db_preimage_without_
 }
 
 #[test]
-fn provider_owned_v2_recovery_is_idempotent_across_prepare_commit_atomic_and_rollback() {
+fn provider_owned_v3_recovery_is_idempotent_across_prepare_commit_atomic_and_rollback() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     for (mode, marker, expected_actions) in [
         (
@@ -1939,7 +1942,7 @@ fn provider_owned_v2_recovery_is_idempotent_across_prepare_commit_atomic_and_rol
         let fixture = DispatchFixture::new();
         fixture.write_model_file(true);
         fixture.set_mode(mode);
-        fixture.seed_provider_owned_v2_pending_replace_journal(
+        fixture.seed_provider_owned_v3_pending_replace_journal(
             marker,
             Some(provider_owned_recovery_id().as_str()),
         );
@@ -1987,11 +1990,11 @@ fn provider_owned_v2_recovery_is_idempotent_across_prepare_commit_atomic_and_rol
 }
 
 #[test]
-fn provider_owned_v2_recovery_provider_unavailable_keeps_journal_without_local_restore() {
+fn provider_owned_v3_recovery_provider_unavailable_keeps_journal_without_local_restore() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let fixture = DispatchFixture::new();
     fixture.write_model_file(true);
-    fixture.seed_provider_owned_v2_pending_replace_journal(
+    fixture.seed_provider_owned_v3_pending_replace_journal(
         "not_applied",
         Some(provider_owned_recovery_id().as_str()),
     );
@@ -2007,6 +2010,56 @@ fn provider_owned_v2_recovery_provider_unavailable_keeps_journal_without_local_r
     assert_eq!(host_mutation_snapshot(&fixture), before);
     assert_provider_owned_pending_journal(&fixture, "not_applied", true);
     assert_forbidden_helper_counts_zero();
+}
+
+#[test]
+fn legacy_or_incomplete_provider_owned_journals_remain_pending_without_host_mutation() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (schema_version, include_generation) in [(2, false), (3, false)] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        let journal_root = fixture.data_root.join("replace_journal");
+        fs::create_dir_all(&journal_root).unwrap();
+        let pending = journal_root.join(format!("session-{SESSION_ID}.pending"));
+        let mut journal = json!({
+            "schema_version": schema_version,
+            "operation": "provider-owned-import-replace",
+            "operation_id": provider_owned_operation_id(),
+            "started_at": "2026-05-01T02:00:00Z",
+            "settings_id": SETTINGS_ID,
+            "model_name": MODEL,
+            "provider_name": PROVIDER_NAME,
+            "provider_instance_id": PROVIDER_INSTANCE_ID,
+            "session_id": SESSION_ID,
+            "chain_id": CHAIN_ID,
+            "active_segment_id": fixture.active_segment_id(),
+            "db_apply_marker": "not_applied",
+            "db_preimage": expected_provider_owned_journal_db_preimage(),
+        });
+        if include_generation {
+            journal["active_segment_started_at"] =
+                Value::String("2026-05-01T00:00:00Z".to_string());
+        }
+        fs::write(&pending, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let before = host_mutation_snapshot(&fixture);
+
+        let result =
+            oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+                fixture.registry_handle(),
+            );
+
+        if schema_version == 2 {
+            result.expect("legacy journal remains delegated and pending");
+        } else {
+            assert_error_token(
+                format!("{:?}", result.unwrap_err()),
+                "invalid provider-owned replace journal",
+            );
+        }
+        assert!(pending.exists());
+        assert_eq!(host_mutation_snapshot(&fixture), before);
+        assert_provider_call_counts(&fixture, 0, 0, 0);
+    }
 }
 
 #[test]
@@ -2404,7 +2457,7 @@ fn assert_provider_owned_pending_journal(
         .find(|(name, _)| name.ends_with(".pending"))
         .unwrap_or_else(|| panic!("expected pending provider-owned journal: {journals:#?}"));
     let json: Value = serde_json::from_slice(&pending.1).expect("pending journal json");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["operation"], "provider-owned-import-replace");
     assert_eq!(json["operation_id"], provider_owned_operation_id());
     assert_provider_owned_journal_db_preimage_and_identity(&json, fixture, expected_marker);
@@ -2418,7 +2471,7 @@ fn assert_provider_owned_pending_journal(
     }
 }
 
-fn assert_pending_v2_journal_observed_before_provider_mutation(fixture: &DispatchFixture) {
+fn assert_pending_v3_journal_observed_before_provider_mutation(fixture: &DispatchFixture) {
     let observations = fixture.request_records_for("session.replace.journal_observed");
     assert_eq!(
         observations.len(),
@@ -2435,9 +2488,9 @@ fn assert_pending_v2_journal_observed_before_provider_mutation(fixture: &Dispatc
                 .as_str()
                 .is_some_and(|name| name.ends_with(".pending"))
         })
-        .unwrap_or_else(|| panic!("provider did not observe pending v2 journal: {entries:#?}"));
+        .unwrap_or_else(|| panic!("provider did not observe pending v3 journal: {entries:#?}"));
     let json = &pending["json"];
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["operation"], "provider-owned-import-replace");
     assert_eq!(json["operation_id"], provider_owned_operation_id());
     assert_provider_owned_journal_db_preimage_and_identity(json, fixture, "not_applied");
@@ -2462,6 +2515,7 @@ fn assert_provider_owned_journal_db_preimage_and_identity(
         json["active_segment_id"].as_i64(),
         Some(fixture.active_segment_id())
     );
+    assert_eq!(json["active_segment_started_at"], "2026-05-01T00:00:00Z");
     assert_eq!(json["db_apply_marker"].as_str(), Some(expected_marker));
     assert_eq!(
         json["db_preimage"],
@@ -2483,7 +2537,7 @@ fn assert_provider_owned_journal_db_preimage_and_identity(
     ] {
         assert!(
             !journal_text.contains(forbidden),
-            "provider-owned v2 journal must not carry local canonical/input/postimage bytes or local-file recovery authority {forbidden:?}: {json}"
+            "provider-owned v3 journal must not carry local canonical/input/postimage bytes or local-file recovery authority {forbidden:?}: {json}"
         );
     }
 }

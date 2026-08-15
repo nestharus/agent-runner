@@ -20,6 +20,7 @@ pub struct SessionTurnsReplacement {
     pub session_id: String,
     pub chain_id: String,
     pub active_segment_id: i64,
+    pub active_segment_started_at: String,
     pub source_file: String,
     pub turns: Vec<SessionTurnReplacement>,
 }
@@ -44,6 +45,7 @@ pub struct SessionTurnsRestore {
     pub session_id: String,
     pub chain_id: String,
     pub active_segment_id: i64,
+    pub active_segment_started_at: String,
     pub last_turn_id: Option<String>,
     pub last_used_at: String,
     pub turns: Vec<SessionTurnRestoreRow>,
@@ -88,13 +90,15 @@ impl StateDb {
             .execute(
                 "UPDATE session_chain_segments
                  SET last_turn_id = ?2
-                 WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5",
+                 WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5
+                   AND started_at = ?6 AND ended_at IS NULL",
                 params![
                     input.active_segment_id,
                     last.turn_id,
                     input.chain_id,
                     input.provider_name,
                     input.session_id,
+                    input.active_segment_started_at,
                 ],
             )
             .map_err(|error| format!("failed to refresh active segment: {error}"))?;
@@ -105,8 +109,22 @@ impl StateDb {
         }
         let updated_chains = tx
             .execute(
-                "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-                params![input.chain_id, last.timestamp],
+                "UPDATE session_chains
+                 SET last_used_at = ?2
+                 WHERE chain_id = ?1
+                   AND EXISTS (
+                       SELECT 1 FROM session_chain_segments
+                       WHERE id = ?3 AND chain_id = ?1 AND provider_name = ?4 AND session_id = ?5
+                         AND started_at = ?6 AND ended_at IS NULL
+                   )",
+                params![
+                    input.chain_id,
+                    last.timestamp,
+                    input.active_segment_id,
+                    input.provider_name,
+                    input.session_id,
+                    input.active_segment_started_at,
+                ],
             )
             .map_err(|error| format!("failed to refresh chain: {error}"))?;
         if updated_chains != 1 {
@@ -162,13 +180,15 @@ impl StateDb {
             .execute(
                 "UPDATE session_chain_segments
                  SET last_turn_id = ?2
-                 WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5",
+                 WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5
+                   AND started_at = ?6 AND ended_at IS NULL",
                 params![
                     input.active_segment_id,
                     input.last_turn_id,
                     input.chain_id,
                     input.provider_name,
                     input.session_id,
+                    input.active_segment_started_at,
                 ],
             )
             .map_err(|error| format!("failed to restore active segment: {error}"))?;
@@ -179,8 +199,22 @@ impl StateDb {
         }
         let updated_chains = tx
             .execute(
-                "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-                params![input.chain_id, input.last_used_at],
+                "UPDATE session_chains
+                 SET last_used_at = ?2
+                 WHERE chain_id = ?1
+                   AND EXISTS (
+                       SELECT 1 FROM session_chain_segments
+                       WHERE id = ?3 AND chain_id = ?1 AND provider_name = ?4 AND session_id = ?5
+                         AND started_at = ?6 AND ended_at IS NULL
+                   )",
+                params![
+                    input.chain_id,
+                    input.last_used_at,
+                    input.active_segment_id,
+                    input.provider_name,
+                    input.session_id,
+                    input.active_segment_started_at,
+                ],
             )
             .map_err(|error| format!("failed to restore chain: {error}"))?;
         if updated_chains != 1 {
@@ -262,6 +296,7 @@ mod tests {
             session_id: "session".to_string(),
             chain_id: "chain".to_string(),
             active_segment_id: i64::MAX,
+            active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
             source_file: "/tmp/session.jsonl".to_string(),
             turns: vec![SessionTurnReplacement {
                 turn_id: "new".to_string(),
@@ -289,6 +324,7 @@ mod tests {
             session_id: "session".to_string(),
             chain_id: "missing-chain".to_string(),
             active_segment_id: segment_id,
+            active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
             last_turn_id: Some("old".to_string()),
             last_used_at: "2026-08-13T00:00:00Z".to_string(),
             turns: vec![SessionTurnRestoreRow {
@@ -321,6 +357,7 @@ mod tests {
             session_id: "target-session".to_string(),
             chain_id: "target-chain".to_string(),
             active_segment_id: 1,
+            active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
             last_turn_id: Some("turn-1".to_string()),
             last_used_at: "2026-08-13T00:00:00Z".to_string(),
             turns: vec![SessionTurnRestoreRow {
@@ -366,6 +403,7 @@ mod tests {
                 } else {
                     other_segment
                 },
+                active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
                 source_file: "/tmp/session.jsonl".to_string(),
                 turns: vec![SessionTurnReplacement {
                     turn_id: "new".to_string(),
@@ -405,11 +443,89 @@ mod tests {
                 } else {
                     other_segment
                 },
+                active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
                 last_turn_id: Some("old".to_string()),
                 last_used_at: "2026-08-13T00:00:00Z".to_string(),
                 turns: vec![SessionTurnRestoreRow {
                     provider_name: provider_name.to_string(),
                     session_id: session_id.to_string(),
+                    turn_id: "old".to_string(),
+                    timestamp: "2026-08-13T00:00:00Z".to_string(),
+                    role: "user".to_string(),
+                    parent_turn_id: None,
+                    is_sidechain: 0,
+                    is_compaction_boundary: 0,
+                    source_file: "/tmp/session.jsonl".to_string(),
+                    body: Some("old".to_string()),
+                }],
+            };
+
+            let error = state.restore_session_turns(&input).unwrap_err();
+
+            assert!(error.contains("expected 1 updated row, got 0"), "{error}");
+            assert_eq!(turn_ids(&state), vec!["replacement"]);
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_a_reused_or_ended_active_segment_generation() {
+        for mutation in [
+            "UPDATE session_chain_segments
+             SET started_at = '2026-08-14T00:00:00Z' WHERE id = ?1",
+            "UPDATE session_chain_segments
+             SET ended_at = '2026-08-14T00:00:00Z' WHERE id = ?1",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = StateDb::open(&directory.path().join("state.db")).unwrap();
+            let segment_id = insert_chain_and_segment(&state, "chain", "provider", "session");
+            insert_turn(&state, "old");
+            state.conn.execute(mutation, params![segment_id]).unwrap();
+            let input = SessionTurnsReplacement {
+                provider_name: "provider".to_string(),
+                session_id: "session".to_string(),
+                chain_id: "chain".to_string(),
+                active_segment_id: segment_id,
+                active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
+                source_file: "/tmp/session.jsonl".to_string(),
+                turns: vec![SessionTurnReplacement {
+                    turn_id: "new".to_string(),
+                    timestamp: "2026-08-14T00:00:00Z".to_string(),
+                    role: "assistant".to_string(),
+                    body: "new".to_string(),
+                }],
+            };
+
+            let error = state.replace_session_turns(&input).unwrap_err();
+
+            assert!(error.contains("expected 1 updated row, got 0"), "{error}");
+            assert_eq!(turn_ids(&state), vec!["old"]);
+        }
+    }
+
+    #[test]
+    fn restoration_rejects_a_reused_or_ended_active_segment_generation() {
+        for mutation in [
+            "UPDATE session_chain_segments
+             SET started_at = '2026-08-14T00:00:00Z' WHERE id = ?1",
+            "UPDATE session_chain_segments
+             SET ended_at = '2026-08-14T00:00:00Z' WHERE id = ?1",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut state = StateDb::open(&directory.path().join("state.db")).unwrap();
+            let segment_id = insert_chain_and_segment(&state, "chain", "provider", "session");
+            insert_turn(&state, "replacement");
+            state.conn.execute(mutation, params![segment_id]).unwrap();
+            let input = SessionTurnsRestore {
+                provider_name: "provider".to_string(),
+                session_id: "session".to_string(),
+                chain_id: "chain".to_string(),
+                active_segment_id: segment_id,
+                active_segment_started_at: "2026-08-13T00:00:00Z".to_string(),
+                last_turn_id: Some("old".to_string()),
+                last_used_at: "2026-08-13T00:00:00Z".to_string(),
+                turns: vec![SessionTurnRestoreRow {
+                    provider_name: "provider".to_string(),
+                    session_id: "session".to_string(),
                     turn_id: "old".to_string(),
                     timestamp: "2026-08-13T00:00:00Z".to_string(),
                     role: "user".to_string(),

@@ -5,26 +5,30 @@ use super::replace_result_mapper::AcceptedProviderOwnedReplaceEvidence;
 use crate::session_replace::{ProviderReplaceDbTarget, ReplaceError, ReplaceReceipt};
 use std::path::PathBuf;
 
-pub(crate) fn apply_provider_owned_replace(
+pub(crate) fn apply_provider_owned_replace_to_target(
     identity: &ExternalSessionIdentity,
     session_id: &str,
     accepted: &AcceptedProviderOwnedReplaceEvidence,
+    target: &ProviderReplaceDbTarget,
 ) -> Result<ReplaceReceipt, ReplaceError> {
-    let target = provider_owned_db_target(identity, session_id, accepted)?;
-    crate::session_replace::apply_provider_owned_replace_sqlite(&target, &accepted.records)?;
+    validate_provider_owned_db_target(identity, session_id, accepted, target)?;
+    let mut apply_target = target.clone();
+    apply_target.source_file = accepted.source_id.clone();
+    crate::session_replace::apply_provider_owned_replace_sqlite(&apply_target, &accepted.records)?;
     Ok(provider_owned_receipt(identity, session_id, accepted))
 }
 
-pub(crate) fn provider_owned_db_target(
+fn validate_provider_owned_db_target(
     identity: &ExternalSessionIdentity,
     session_id: &str,
     accepted: &AcceptedProviderOwnedReplaceEvidence,
-) -> Result<ProviderReplaceDbTarget, ReplaceError> {
-    let target = crate::session_replace::strict_provider_replace_db_identity(
-        &identity.provider_name,
-        session_id,
-        accepted.source_id.clone(),
-    )?;
+    target: &ProviderReplaceDbTarget,
+) -> Result<(), ReplaceError> {
+    if target.provider_name != identity.provider_name || target.session_id != session_id {
+        return Err(ReplaceError::OperationalError {
+            message: "provider_db_identity_mismatch".to_string(),
+        });
+    }
     if accepted
         .plan
         .get("chain_id")
@@ -45,7 +49,17 @@ pub(crate) fn provider_owned_db_target(
             message: "provider_db_identity_mismatch".to_string(),
         });
     }
-    Ok(target)
+    if accepted
+        .plan
+        .get("active_segment_started_at")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|started_at| started_at != target.active_segment_started_at)
+    {
+        return Err(ReplaceError::OperationalError {
+            message: "provider_db_identity_mismatch".to_string(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn provider_owned_receipt(
