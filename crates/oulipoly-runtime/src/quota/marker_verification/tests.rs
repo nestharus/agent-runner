@@ -592,12 +592,12 @@ fn spawn_refresh_workers(
     let in_flight = Arc::new(InFlight::new());
     let providers = Arc::new(providers);
     let sessions = Arc::new(SessionsConfig::default());
-    let db_path = Arc::new(db_path);
     let barrier = Arc::new(Barrier::new(50));
     let mut handles = Vec::with_capacity(50);
     for _ in 0..50 {
+        let db = StateDb::open(&db_path).unwrap();
         handles.push(spawn_refresh_worker(
-            db_path.clone(),
+            db,
             providers.clone(),
             sessions.clone(),
             in_flight.clone(),
@@ -609,7 +609,7 @@ fn spawn_refresh_workers(
 }
 
 fn spawn_refresh_worker(
-    db_path: Arc<PathBuf>,
+    db: StateDb,
     providers: Arc<ProvidersConfig>,
     sessions: Arc<SessionsConfig>,
     in_flight: Arc<InFlight>,
@@ -617,7 +617,6 @@ fn spawn_refresh_worker(
     barrier: Arc<Barrier>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let db = StateDb::open(&db_path).unwrap();
         let now = Utc::now();
         barrier.wait();
         verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);
