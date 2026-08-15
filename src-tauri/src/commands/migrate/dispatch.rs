@@ -170,7 +170,7 @@ fn run_migrate_rebuild() -> Result<i32, String> {
     let authority = super::accessor::acquire_rebuild_authority(&plan.db_path)?;
     plan.bind_to_authority_path(authority.path())?;
     let mut sidecar_authority = super::accessor::acquire_sidecar_rebuild_authority(&authority)?;
-    execute_migrate_rebuild(&plan, &mut sidecar_authority)?;
+    execute_migrate_rebuild(&mut plan, &mut sidecar_authority)?;
     super::accessor::initialize_after_rebuild(&plan.db_path, &authority)?;
     super::accessor::initialize_sidecar_after_rebuild(&mut sidecar_authority)?;
     complete_migrate_rebuild(&plan)?;

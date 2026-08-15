@@ -43,6 +43,39 @@ impl MigrateRebuildPlan {
             .cloned()
             .collect()
     }
+
+    fn rebind_recovery_identity_under_complete_authority(&mut self) -> Result<(), String> {
+        let backup_root = prepare_migrate_backup_root(&self.db_path)?;
+        match std::fs::symlink_metadata(&self.recovery_marker) {
+            Ok(_) => {
+                self.backup_dir =
+                    read_rebuild_recovery_marker(&self.recovery_marker, &backup_root)?;
+                self.resume_from_backup = true;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.resume_from_backup {
+                    return Err(format!(
+                        "process_integrity: State-plus-sidecar rebuild recovery marker {} disappeared before complete rebuild authority was acquired",
+                        self.recovery_marker.display()
+                    ));
+                }
+                if self.backup_dir.parent() != Some(backup_root.as_path())
+                    || self.backup_dir.exists()
+                {
+                    return Err(format!(
+                        "process_integrity: State-plus-sidecar rebuild backup identity {} is no longer available after complete rebuild authority was acquired",
+                        self.backup_dir.display()
+                    ));
+                }
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "Failed to inspect State-plus-sidecar rebuild recovery marker {} after authority acquisition: {error}",
+                self.recovery_marker.display()
+            )),
+        }
+    }
 }
 
 pub(super) fn migrate_rebuild_plan() -> Result<Option<MigrateRebuildPlan>, String> {
@@ -210,12 +243,13 @@ fn reject_orphaned_rebuild_artifacts(db_path: &Path) -> Result<(), String> {
 }
 
 pub(super) fn execute_migrate_rebuild(
-    plan: &MigrateRebuildPlan,
+    plan: &mut MigrateRebuildPlan,
     sidecar_authority: &mut MailboxDbRebuildAuthority,
 ) -> Result<(), String> {
     if sidecar_authority.sqlite_member_paths() != plan.sidecar_members {
         return Err("PID mailbox rebuild authority does not match the rebuild plan".to_string());
     }
+    plan.rebind_recovery_identity_under_complete_authority()?;
     if !plan.resume_from_backup {
         create_backup_dir(&plan.backup_dir)?;
         backup_rebuild_sidecars(&plan.all_members(), &plan.backup_dir)?;
@@ -254,12 +288,36 @@ fn write_rebuild_recovery_marker(marker: &Path, backup_dir: &Path) -> Result<(),
         .create_new(true)
         .open(&temporary)
         .map_err(|error| format!("Failed to create rebuild recovery marker: {error}"))?;
-    file.write_all(backup_dir.as_bytes())
+    if let Err(error) = file
+        .write_all(backup_dir.as_bytes())
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
-        .map_err(|error| format!("Failed to persist rebuild recovery marker: {error}"))?;
-    std::fs::rename(&temporary, marker)
-        .map_err(|error| format!("Failed to publish rebuild recovery marker: {error}"))
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "Failed to persist rebuild recovery marker: {error}"
+        ));
+    }
+    drop(file);
+    if let Err(error) = std::fs::hard_link(&temporary, marker) {
+        let cleanup = match std::fs::remove_file(&temporary) {
+            Ok(()) => String::new(),
+            Err(cleanup_error) => format!("; staging cleanup also failed: {cleanup_error}"),
+        };
+        return Err(format!(
+            "Failed to publish rebuild recovery marker without replacing existing authority: {error}{cleanup}"
+        ));
+    }
+    std::fs::remove_file(&temporary).map_err(|error| {
+        format!("Failed to clear published rebuild marker staging file: {error}")
+    })?;
+    let marker_parent = marker
+        .parent()
+        .ok_or_else(|| "State-plus-sidecar rebuild marker has no parent directory".to_string())?;
+    std::fs::File::open(marker_parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("Failed to sync rebuild recovery marker directory: {error}"))
 }
 
 fn read_rebuild_recovery_marker(marker: &Path, backup_root: &Path) -> Result<PathBuf, String> {
@@ -350,6 +408,113 @@ mod tests {
     }
 
     #[test]
+    fn recovery_marker_publication_never_replaces_existing_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_root = directory.path().join("state-backups");
+        let incumbent_backup = backup_root.join("incumbent");
+        let competing_backup = backup_root.join("competing");
+        let marker = directory
+            .path()
+            .join(oulipoly_state::rebuild_recovery::STATE_SIDECAR_REBUILD_RECOVERY_MARKER);
+        std::fs::create_dir_all(&incumbent_backup).unwrap();
+        std::fs::create_dir(&competing_backup).unwrap();
+        write_rebuild_recovery_marker(&marker, &incumbent_backup).unwrap();
+
+        let error = write_rebuild_recovery_marker(&marker, &competing_backup).unwrap_err();
+
+        assert!(
+            error.contains("without replacing existing authority"),
+            "{error}"
+        );
+        assert_eq!(
+            read_rebuild_recovery_marker(&marker, &backup_root).unwrap(),
+            incumbent_backup
+        );
+        assert!(!marker.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn complete_authority_rebinds_a_fresh_plan_to_a_new_recovery_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&db_path);
+        let backup_root = directory.path().join("state-backups");
+        let planned_backup = backup_root.join("planned");
+        let incumbent_backup = backup_root.join("incumbent");
+        std::fs::create_dir(&backup_root).unwrap();
+        std::fs::create_dir(&incumbent_backup).unwrap();
+        drop(StateDb::open(&db_path).unwrap());
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let mut plan = migrate_rebuild_plan_value(db_path.clone(), planned_backup.clone(), false);
+        let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
+        let mut sidecar_authority = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+        write_rebuild_recovery_marker(&plan.recovery_marker, &incumbent_backup).unwrap();
+
+        execute_migrate_rebuild(&mut plan, &mut sidecar_authority).unwrap();
+
+        assert!(plan.resume_from_backup);
+        assert_eq!(plan.backup_dir, incumbent_backup);
+        assert!(!planned_backup.exists());
+        assert_eq!(
+            read_rebuild_recovery_marker(&plan.recovery_marker, &backup_root).unwrap(),
+            plan.backup_dir
+        );
+    }
+
+    #[test]
+    fn waiting_second_owner_reuses_the_first_owners_published_recovery_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&db_path);
+        let backup_root = directory.path().join("state-backups");
+        let backup_a = backup_root.join("owner-a");
+        let backup_b = backup_root.join("owner-b");
+        std::fs::create_dir(&backup_root).unwrap();
+        drop(StateDb::open(&db_path).unwrap());
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let mut plan_a = migrate_rebuild_plan_value(db_path.clone(), backup_a.clone(), false);
+        let plan_b = migrate_rebuild_plan_value(db_path.clone(), backup_b.clone(), false);
+        let state_authority_a = StateDb::acquire_rebuild_authority(&db_path).unwrap();
+        let mut sidecar_authority_a =
+            MailboxDb::acquire_rebuild_authority(&state_authority_a).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        let owner_b = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
+            let mut sidecar_authority =
+                MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+            let mut plan = plan_b;
+            let result = execute_migrate_rebuild(&mut plan, &mut sidecar_authority);
+            result_tx.send((result, plan)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(matches!(
+            result_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        execute_migrate_rebuild(&mut plan_a, &mut sidecar_authority_a).unwrap();
+        drop(sidecar_authority_a);
+        drop(state_authority_a);
+        let (result_b, rebound_plan_b) = result_rx.recv().unwrap();
+        result_b.unwrap();
+        owner_b.join().unwrap();
+
+        assert!(rebound_plan_b.resume_from_backup);
+        assert_eq!(rebound_plan_b.backup_dir, backup_a);
+        assert!(!backup_b.exists());
+        assert_eq!(
+            read_rebuild_recovery_marker(&rebound_plan_b.recovery_marker, &backup_root).unwrap(),
+            backup_a
+        );
+        assert!(backup_a.join("state.db").is_file());
+        assert!(backup_a.join("pid-identity.db").is_file());
+    }
+
+    #[test]
     fn post_reset_interruption_retries_from_the_published_backup() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("state.db");
@@ -359,13 +524,13 @@ mod tests {
         std::fs::create_dir(&backup_root).unwrap();
         drop(StateDb::open(&db_path).unwrap());
         drop(MailboxDb::open(&sidecar_path).unwrap());
-        let plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir.clone(), false);
+        let mut plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir.clone(), false);
 
         {
             let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
             let mut sidecar_authority =
                 MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
-            execute_migrate_rebuild(&plan, &mut sidecar_authority).unwrap();
+            execute_migrate_rebuild(&mut plan, &mut sidecar_authority).unwrap();
         }
 
         assert!(plan.recovery_marker.is_file());
@@ -374,10 +539,10 @@ mod tests {
         assert!(!db_path.exists());
         assert!(!sidecar_path.exists());
 
-        let retry_plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir, true);
+        let mut retry_plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir, true);
         let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
         let mut sidecar_authority = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
-        execute_migrate_rebuild(&retry_plan, &mut sidecar_authority).unwrap();
+        execute_migrate_rebuild(&mut retry_plan, &mut sidecar_authority).unwrap();
         StateDb::initialize_after_rebuild(&db_path, &state_authority).unwrap();
         sidecar_authority.initialize_after_rebuild().unwrap();
         complete_migrate_rebuild(&retry_plan).unwrap();
@@ -398,13 +563,13 @@ mod tests {
         std::fs::create_dir(directory.path().join("state-backups")).unwrap();
         drop(StateDb::open(&db_path).unwrap());
         drop(MailboxDb::open(&sidecar_path).unwrap());
-        let plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir.clone(), false);
+        let mut plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir.clone(), false);
 
         {
             let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
             let mut sidecar_authority =
                 MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
-            execute_migrate_rebuild(&plan, &mut sidecar_authority).unwrap();
+            execute_migrate_rebuild(&mut plan, &mut sidecar_authority).unwrap();
             StateDb::initialize_after_rebuild(&db_path, &state_authority).unwrap();
             sidecar_authority.initialize_after_rebuild().unwrap();
         }
@@ -420,10 +585,10 @@ mod tests {
             );
         }
 
-        let retry_plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir, true);
+        let mut retry_plan = migrate_rebuild_plan_value(db_path.clone(), backup_dir, true);
         let state_authority = StateDb::acquire_rebuild_authority(&db_path).unwrap();
         let mut sidecar_authority = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
-        execute_migrate_rebuild(&retry_plan, &mut sidecar_authority).unwrap();
+        execute_migrate_rebuild(&mut retry_plan, &mut sidecar_authority).unwrap();
         StateDb::initialize_after_rebuild(&db_path, &state_authority).unwrap();
         sidecar_authority.initialize_after_rebuild().unwrap();
         complete_migrate_rebuild(&retry_plan).unwrap();
