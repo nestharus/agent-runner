@@ -8,6 +8,7 @@
 mod adapters;
 mod dtos;
 pub mod error;
+mod invocation_lifecycle_finalize;
 mod lock;
 mod marker;
 mod migration;
@@ -27,6 +28,9 @@ pub use adapters::{
 };
 pub use dtos::*;
 pub use error::ServiceError;
+pub use invocation_lifecycle_finalize::{
+    SUCCESS_FINALIZE_MAX_ATTEMPTS, finalize_retained_outcome_with_contention_retry,
+};
 pub use ports::*;
 
 pub(crate) fn emit_live_session_marker(

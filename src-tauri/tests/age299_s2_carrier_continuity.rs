@@ -24,6 +24,7 @@ const CHAIN_ID: &str = "29929929-2992-4992-8992-299299299299";
 enum Carrier {
     Balancing,
     Repl,
+    DefaultProviderRepl,
     Resume,
 }
 
@@ -180,6 +181,11 @@ impl Fixture {
             ),
         )
         .unwrap();
+        fs::write(
+            app_config.join("config.toml"),
+            format!("default_provider = {PROVIDER:?}\n"),
+        )
+        .unwrap();
         let fixture = Self {
             root,
             config_home,
@@ -251,6 +257,9 @@ impl Fixture {
                     .arg("--models-dir")
                     .arg(&self.models_dir)
                     .arg(MODEL);
+            }
+            Carrier::DefaultProviderRepl => {
+                command.arg("repl");
             }
             Carrier::Resume => {
                 command
@@ -368,7 +377,12 @@ fn all_success_carriers_refuse_damaged_sidecar_then_finalize_retained_outcome_af
 
 #[test]
 fn all_success_carriers_retry_the_same_outcome_when_contention_releases() {
-    for carrier in [Carrier::Balancing, Carrier::Repl, Carrier::Resume] {
+    for carrier in [
+        Carrier::Balancing,
+        Carrier::Repl,
+        Carrier::DefaultProviderRepl,
+        Carrier::Resume,
+    ] {
         let (fixture, mut child, invocation_uuid) = prepare_registered_carrier(carrier);
         let sidecar_authority = stage_finalization_only_contention(&fixture, &mut child);
         std::thread::sleep(Duration::from_millis(5_250));
@@ -390,7 +404,12 @@ fn all_success_carriers_retry_the_same_outcome_when_contention_releases() {
 
 #[test]
 fn all_success_carriers_exhaust_contention_without_a_terminal_result() {
-    for carrier in [Carrier::Balancing, Carrier::Repl, Carrier::Resume] {
+    for carrier in [
+        Carrier::Balancing,
+        Carrier::Repl,
+        Carrier::DefaultProviderRepl,
+        Carrier::Resume,
+    ] {
         let (fixture, mut child, invocation_uuid) = prepare_registered_carrier(carrier);
         let sidecar_authority = stage_finalization_only_contention(&fixture, &mut child);
         std::thread::sleep(Duration::from_secs(17));
@@ -448,7 +467,9 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
         .unwrap()
         .unwrap();
     assert_eq!(running.status, InvocationStatus::Running, "{carrier:?}");
-    if running.provider_session_id.as_deref() != Some(SESSION_ID) {
+    if !matches!(carrier, Carrier::DefaultProviderRepl)
+        && running.provider_session_id.as_deref() != Some(SESSION_ID)
+    {
         state
             .bind_invocation_provider_session_start(
                 running.id,
@@ -524,9 +545,9 @@ fn wait_for_runtime_exit(fixture: &Fixture, child: &mut CarrierChild) {
                 connection.query_row(
                     "SELECT EXISTS(
                          SELECT 1 FROM runtime_generation
-                         WHERE provider_name = ?1 AND lifecycle_state = 'exited'
+                         WHERE lifecycle_state = 'exited'
                      )",
-                    [PROVIDER],
+                    [],
                     |row| row.get::<_, bool>(0),
                 )
             })
@@ -594,6 +615,18 @@ fn provider_script(root: &Path, paths: ProviderScriptPaths<'_>) -> String {
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
+request=$(cat || true)
+request_id=$(printf '%s' "$request" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+case "${{1-}}" in
+  describe)
+    printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":{{"provider_id":"age299-s2-provider-instance","display_name":"AGE-299 S2 Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{{"launch":false,"policy":false,"quota":false,"session":true,"session_enumerate":false,"terminal":false,"rotation":false,"discovery":false,"settings":false,"setup_brain":false,"setup":false,"migration":false}}}}}}\n' "$request_id"
+    exit 0
+    ;;
+  session.capture)
+    printf '{{"contract":"oulipoly.provider/v1","request_id":"%s","ok":true,"result":{{"provider_session_id":"age299-s2-live-session","state":null,"artifacts":[]}}}}\n' "$request_id"
+    exit 0
+    ;;
+esac
 trap 'touch {provider_exited:?}' EXIT
 mkdir -p {state_dir:?}
 invocation_uuid="$(python3 -c 'import json,os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"

@@ -31,6 +31,7 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
+const MAILBOX_SIDECAR_SCHEMA_VERSION: i64 = 1;
 const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, enqueued_at,
     delivered_at, delivered_by_invocation_uuid, delivery_attempts,
     delivery_error, owner_invocation_uuid, matched_os_pid,
@@ -7752,24 +7753,48 @@ fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFile
 }
 
 fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {
-    conn.execute_batch(mailbox_schema_definition())
-        .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
-    ensure_mailbox_sidecar_identity(conn)?;
-    ensure_mailbox_columns(conn)?;
-    ensure_mailbox_target_index(conn)?;
-    ensure_mailbox_compaction_index(conn)?;
-    ensure_mailbox_delivery_owner_index(conn)?;
-    ensure_session_runtime_columns(conn)?;
-    ensure_runtime_generation_columns(conn)
-}
+    let stored_version = mailbox_sidecar_schema_version(conn)?;
+    if stored_version == MAILBOX_SIDECAR_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if stored_version != 0 {
+        return Err(format!(
+            "Unsupported PID mailbox sidecar schema version {stored_version}; expected {MAILBOX_SIDECAR_SCHEMA_VERSION}"
+        ));
+    }
 
-fn ensure_mailbox_sidecar_identity(conn: &mut Connection) -> Result<(), String> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| format!("Failed to lock PID mailbox sidecar identity: {err}"))?;
+        .map_err(|err| format!("Failed to lock PID mailbox sidecar schema upgrade: {err}"))?;
+    let locked_version = mailbox_sidecar_schema_version(&tx)?;
+    if locked_version == MAILBOX_SIDECAR_SCHEMA_VERSION {
+        return tx
+            .commit()
+            .map_err(|err| format!("Failed to finish PID mailbox sidecar schema check: {err}"));
+    }
+    if locked_version != 0 {
+        return Err(format!(
+            "Unsupported PID mailbox sidecar schema version {locked_version}; expected {MAILBOX_SIDECAR_SCHEMA_VERSION}"
+        ));
+    }
+    tx.execute_batch(mailbox_schema_definition())
+        .map_err(|err| format!("Failed to upgrade PID mailbox sidecar schema: {err}"))?;
     ensure_mailbox_sidecar_identity_locked(&tx)?;
+    ensure_mailbox_columns(&tx)?;
+    ensure_mailbox_target_index(&tx)?;
+    ensure_mailbox_compaction_index(&tx)?;
+    ensure_mailbox_delivery_owner_index(&tx)?;
+    ensure_session_runtime_columns(&tx)?;
+    ensure_runtime_generation_columns(&tx)?;
+    tx.pragma_update(None, "user_version", MAILBOX_SIDECAR_SCHEMA_VERSION)
+        .map_err(|err| format!("Failed to record PID mailbox sidecar schema version: {err}"))?;
     tx.commit()
-        .map_err(|err| format!("Failed to commit PID mailbox sidecar identity: {err}"))
+        .map_err(|err| format!("Failed to commit PID mailbox sidecar schema upgrade: {err}"))
+}
+
+fn mailbox_sidecar_schema_version(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
 }
 
 fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), String> {
@@ -8177,6 +8202,140 @@ mod tests {
             recorded_at: "2026-08-14T00:00:00Z",
         })
         .unwrap();
+    }
+
+    #[test]
+    fn current_sidecar_open_is_bounded_and_upgrade_backfills_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        append_test_completion_history(&mut mailbox, 32);
+        drop(mailbox);
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM completion_authority_materialization_summary",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        drop(connection);
+
+        drop(crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap());
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let current_open_steps = end_completion_finalization_vm_count();
+        eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+        assert!(
+            current_open_steps < 512,
+            "current-schema open performed unexpected SQLite work: {current_open_steps}"
+        );
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
+        drop(connection);
+        drop(crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap());
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        let (version, count): (i64, i64) = (
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT materialized_count
+                     FROM completion_authority_materialization_summary
+                     WHERE invocation_uuid = 'mature-open-invocation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(version, 1);
+        assert_eq!(count, 32);
+    }
+
+    #[test]
+    fn mature_history_does_not_increase_ordinary_mailbox_open_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        append_test_completion_history(&mut mailbox, 1);
+        drop(mailbox);
+
+        begin_completion_finalization_vm_count();
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let small_open_steps = end_completion_finalization_vm_count();
+        append_test_completion_history(&mut mailbox, 255);
+        drop(mailbox);
+
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let mature_open_steps = end_completion_finalization_vm_count();
+        eprintln!("ordinary open VM steps: small={small_open_steps}, mature={mature_open_steps}");
+
+        assert!(
+            mature_open_steps <= small_open_steps + 64,
+            "ordinary sidecar open grew with retained history: small={small_open_steps}, mature={mature_open_steps}"
+        );
+    }
+
+    fn append_test_completion_history(mailbox: &mut MailboxDb, additional: usize) {
+        let generation = mailbox.sidecar_generation().unwrap();
+        let retained_head = completion_continuity_head_on(mailbox.connection()).unwrap();
+        let mut ordinal = retained_head
+            .as_ref()
+            .map_or(1, |head| head.authority_ordinal + 1);
+        let mut previous_digest = retained_head.map_or_else(
+            || COMPLETION_CONTINUITY_GENESIS_DIGEST.to_string(),
+            |head| head.continuity_digest,
+        );
+        for _ in 0..additional {
+            let event_id = format!("mature-open-event-{ordinal}");
+            mailbox
+                .register_completion_event(completion_registration(
+                    &event_id,
+                    "async",
+                    "mature-open-session",
+                    "mature-open-owner",
+                ))
+                .unwrap();
+            let digest = sha256_hex(format!("mature-open-digest-{ordinal}").as_bytes());
+            append_completion_continuity_on(
+                mailbox.connection(),
+                &CompletionContinuityHead {
+                    authority_ordinal: ordinal,
+                    admission_id: format!("mature-open-admission-{ordinal}"),
+                    sidecar_generation: generation.clone(),
+                    invocation_uuid: "mature-open-invocation".to_string(),
+                    event_id,
+                    owner_invocation_uuid: "mature-open-owner".to_string(),
+                    owner_session_id: "mature-open-session".to_string(),
+                    previous_continuity_digest: previous_digest,
+                    continuity_digest: digest.clone(),
+                },
+            )
+            .unwrap();
+            previous_digest = digest;
+            ordinal += 1;
+        }
+    }
+
+    fn materialization_summary_count(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM completion_authority_materialization_summary",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]

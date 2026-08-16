@@ -139,6 +139,10 @@ pub enum ReplaceError {
         expected: String,
         actual: String,
     },
+    OperatorRecoveryRequired {
+        journal_path: PathBuf,
+        reason: String,
+    },
     OperationalError {
         message: String,
     },
@@ -156,6 +160,7 @@ impl ReplaceError {
             ReplaceError::InvalidInputTranscript { .. } | ReplaceError::PreimageMismatch { .. } => {
                 15
             }
+            ReplaceError::OperatorRecoveryRequired { .. } => 16,
             ReplaceError::OperationalError { .. } => 1,
         }
     }
@@ -171,6 +176,7 @@ impl ReplaceError {
             ReplaceError::SchemaIncompatible { .. } => "schema-incompatible",
             ReplaceError::InvalidInputTranscript { .. } => "invalid-input-transcript",
             ReplaceError::PreimageMismatch { .. } => "preimage-mismatch",
+            ReplaceError::OperatorRecoveryRequired { .. } => "operator-recovery-required",
             ReplaceError::OperationalError { .. } => "operational-error",
         }
     }
@@ -202,6 +208,16 @@ impl ReplaceError {
             }
             ReplaceError::SchemaIncompatible { reason } => {
                 json!({"error": {"code": self.code(), "message": reason}})
+            }
+            ReplaceError::OperatorRecoveryRequired {
+                journal_path,
+                reason,
+            } => {
+                json!({"error": {
+                    "code": self.code(),
+                    "journal_path": journal_path,
+                    "message": reason,
+                }})
             }
             ReplaceError::OperationalError { message } => {
                 json!({"error": {"code": self.code(), "message": message}})
@@ -1615,24 +1631,39 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Replace
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+    atomic_write_bytes_before_replace(path, bytes, || Ok(()))
+}
+
+pub(crate) fn atomic_write_bytes_before_replace(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: impl FnOnce() -> Result<(), ReplaceError>,
+) -> Result<(), ReplaceError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to create parent dir: {e}"),
         })?;
     }
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    write_new_file_synced(&tmp, bytes)?;
-    fs::rename(&tmp, path).map_err(|e| ReplaceError::OperationalError {
-        message: format!(
-            "failed to rename {} to {}: {e}",
-            tmp.display(),
-            path.display()
-        ),
-    })?;
-    if let Some(parent) = path.parent() {
-        fsync_dir(parent)?;
+    let result = (|| {
+        write_new_file_synced(&tmp, bytes)?;
+        before_replace()?;
+        fs::rename(&tmp, path).map_err(|e| ReplaceError::OperationalError {
+            message: format!(
+                "failed to rename {} to {}: {e}",
+                tmp.display(),
+                path.display()
+            ),
+        })?;
+        if let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 fn write_new_file_synced(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {

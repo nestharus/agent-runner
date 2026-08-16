@@ -1301,6 +1301,7 @@ fn provider_owned_success_publishes_updates_and_cleans_v3_journal_lifecycle() {
     assert_pending_v3_journal_observed_before_provider_mutation(&observed);
     assert_eq!(observed.journal_snapshot(), Vec::<(String, Vec<u8>)>::new());
     assert_provider_owned_prepare_commit_flow(&observed);
+    assert_provider_owned_lease_is_available(&observed);
     assert_forbidden_helper_counts_zero();
 
     let recovery_id_updated = DispatchFixture::new();
@@ -1354,6 +1355,97 @@ fn provider_owned_success_publishes_updates_and_cleans_v3_journal_lifecycle() {
         expected_provider_owned_replacement_turn_rows()
     );
     assert_provider_owned_pending_journal(&durable_marked, "applied", true);
+}
+
+#[test]
+fn provider_owned_atomic_journal_failures_retain_the_last_valid_generation() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (hook, expected_marker, expect_recovery_id, expect_db_apply) in [
+        (
+            "fail-recovery-id-journal-replace",
+            "not_applied",
+            false,
+            false,
+        ),
+        ("fail-db-apply-journal-replace", "not_applied", true, true),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode("replace_provider_owned_prepared_success");
+        let before_db = fixture.sqlite_snapshot();
+        let _hook = EnvVarGuard::set("OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK", hook);
+        let service =
+            ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+
+        let err = service
+            .replace_session(SessionReplaceServiceRequest {
+                session_id: SESSION_ID.to_string(),
+                source: ReplaceSource::File(fixture.input_path.clone()),
+                preimage_sha256: Some(provider_owned_preimage_sha256()),
+                external_provider: Some(provider_identity()),
+            })
+            .expect("service output")
+            .result
+            .expect_err(hook);
+
+        assert_error_token(format!("{err:?}"), hook);
+        assert_provider_owned_pending_journal(&fixture, expected_marker, expect_recovery_id);
+        assert_eq!(
+            fixture.sqlite_snapshot() != before_db,
+            expect_db_apply,
+            "{hook}"
+        );
+        assert!(
+            fixture
+                .journal_snapshot()
+                .iter()
+                .all(|(name, _)| !name.contains(".tmp-")),
+            "failed replacement must clean its unpublished temporary file"
+        );
+        let lock = SessionLock::new(&fixture.data_root.join("locks")).unwrap();
+        let lease = lock
+            .acquire(SESSION_ID, PROVIDER_NAME, Duration::from_secs(300))
+            .expect("failed journal transition must release the session lease immediately");
+        lock.release(SESSION_ID, &lease.token).unwrap();
+    }
+}
+
+#[test]
+fn failed_initial_journal_publication_releases_lease_for_immediate_retry() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("replace_provider_owned_success");
+    let service = ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+    let hook = EnvVarGuard::set(
+        "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+        "fail-initial-journal-replace",
+    );
+
+    let err = service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            source: ReplaceSource::File(fixture.input_path.clone()),
+            preimage_sha256: Some(provider_owned_preimage_sha256()),
+            external_provider: Some(provider_identity()),
+        })
+        .expect("service output")
+        .result
+        .expect_err("initial publication interruption");
+
+    assert_error_token(format!("{err:?}"), "fail-initial-journal-replace");
+    assert!(fixture.journal_snapshot().is_empty());
+    drop(hook);
+    service
+        .replace_session(SessionReplaceServiceRequest {
+            session_id: SESSION_ID.to_string(),
+            source: ReplaceSource::File(fixture.input_path.clone()),
+            preimage_sha256: Some(provider_owned_preimage_sha256()),
+            external_provider: Some(provider_identity()),
+        })
+        .expect("retry service output")
+        .result
+        .expect("retry must not wait for lease expiry");
 }
 
 #[test]
@@ -1651,11 +1743,53 @@ fn external_replace_provider_ref_db_identity_missing_or_ambiguous_fails_before_d
             .expect_err(label);
 
         assert_error_token(format!("{err:?}"), expected_token);
+        let retry = service
+            .replace_session(SessionReplaceServiceRequest {
+                session_id: SESSION_ID.to_string(),
+                source: ReplaceSource::File(fixture.input_path.clone()),
+                preimage_sha256: Some(provider_owned_preimage_sha256()),
+                external_provider: Some(provider_identity()),
+            })
+            .expect("retry service output")
+            .result
+            .expect_err("identity repair retry must reach the same pre-publication check");
+        assert_error_token(format!("{retry:?}"), expected_token);
         assert_eq!(fixture.sqlite_snapshot(), before_db, "{label}");
         assert_provider_call_counts(&fixture, 1, 0, 0);
         assert_provider_requests_do_not_expose_sqlite_mutation_authority(&fixture);
         assert_forbidden_helper_counts_zero();
     }
+}
+
+#[test]
+fn external_replace_db_preimage_failure_releases_lease_for_immediate_retry() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("replace_provider_owned_success");
+    fixture
+        .conn()
+        .execute_batch("DROP TABLE session_turns")
+        .unwrap();
+    let service = ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+
+    for attempt in 1..=2 {
+        let error = service
+            .replace_session(SessionReplaceServiceRequest {
+                session_id: SESSION_ID.to_string(),
+                source: ReplaceSource::File(fixture.input_path.clone()),
+                preimage_sha256: Some(provider_owned_preimage_sha256()),
+                external_provider: Some(provider_identity()),
+            })
+            .expect("service output")
+            .result
+            .expect_err("missing preimage table must fail before publication");
+        assert!(
+            matches!(error, ReplaceError::OperationalError { .. }),
+            "attempt {attempt} must reach preimage lookup instead of a retained lease: {error:?}"
+        );
+    }
+    assert!(fixture.request_records_for("session.replace").is_empty());
 }
 
 #[test]
@@ -2040,7 +2174,8 @@ fn legacy_or_incomplete_provider_owned_journals_remain_pending_without_host_muta
             journal["active_segment_started_at"] =
                 Value::String("2026-05-01T00:00:00Z".to_string());
         }
-        fs::write(&pending, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+        let retained_bytes = serde_json::to_vec_pretty(&journal).unwrap();
+        fs::write(&pending, &retained_bytes).unwrap();
         let before = host_mutation_snapshot(&fixture);
 
         let result =
@@ -2048,18 +2183,78 @@ fn legacy_or_incomplete_provider_owned_journals_remain_pending_without_host_muta
                 fixture.registry_handle(),
             );
 
-        if schema_version == 2 {
-            result.expect("legacy journal remains delegated and pending");
-        } else {
-            assert_error_token(
-                format!("{:?}", result.unwrap_err()),
-                "invalid provider-owned replace journal",
-            );
-        }
+        let error = result.expect_err("unreplayable provider journal must block startup");
+        assert_eq!(error.code(), "operator-recovery-required");
         assert!(pending.exists());
+        assert_eq!(fs::read(&pending).unwrap(), retained_bytes);
         assert_eq!(host_mutation_snapshot(&fixture), before);
         assert_provider_call_counts(&fixture, 0, 0, 0);
+
+        if schema_version == 2 {
+            fixture.set_mode("replace_provider_owned_success");
+            let service =
+                ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+            let error = service
+                .replace_session(SessionReplaceServiceRequest {
+                    session_id: SESSION_ID.to_string(),
+                    source: ReplaceSource::File(fixture.input_path.clone()),
+                    preimage_sha256: Some(provider_owned_preimage_sha256()),
+                    external_provider: Some(provider_identity()),
+                })
+                .expect("service output")
+                .result
+                .expect_err("retained schema-2 recovery authority must block replacement");
+            assert_eq!(error.code(), "operator-recovery-required");
+            assert_eq!(fs::read(&pending).unwrap(), retained_bytes);
+            assert!(fixture.request_records_for("session.replace").is_empty());
+        }
     }
+}
+
+#[test]
+fn malformed_unreadable_and_unknown_pending_journals_require_operator_recovery() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (label, bytes) in [
+        ("partial", b"{\"schema_version\":".as_slice()),
+        ("empty", b"".as_slice()),
+        (
+            "unknown",
+            br#"{"schema_version":99,"operation":"unknown"}"#.as_slice(),
+        ),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        let journal_root = fixture.data_root.join("replace_journal");
+        fs::create_dir_all(&journal_root).unwrap();
+        let pending = journal_root.join(format!("session-{SESSION_ID}.pending"));
+        fs::write(&pending, bytes).unwrap();
+
+        let error =
+            oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+                fixture.registry_handle(),
+            )
+            .expect_err(label);
+
+        assert_eq!(error.code(), "operator-recovery-required", "{label}");
+        assert_eq!(fs::read(&pending).unwrap(), bytes, "{label}");
+        assert_provider_call_counts(&fixture, 0, 0, 0);
+    }
+
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    let pending = fixture
+        .data_root
+        .join("replace_journal")
+        .join(format!("session-{SESSION_ID}.pending"));
+    fs::create_dir_all(&pending).unwrap();
+    let error =
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        )
+        .expect_err("unreadable matching journal");
+    assert_eq!(error.code(), "operator-recovery-required");
+    assert!(pending.is_dir());
+    assert_provider_call_counts(&fixture, 0, 0, 0);
 }
 
 #[test]
@@ -2469,6 +2664,14 @@ fn assert_provider_owned_pending_journal(
             "recovery id must not be present before provider response: {json}"
         );
     }
+}
+
+fn assert_provider_owned_lease_is_available(fixture: &DispatchFixture) {
+    let lock = SessionLock::new(&fixture.data_root.join("locks")).unwrap();
+    let lease = lock
+        .acquire(SESSION_ID, PROVIDER_NAME, Duration::from_secs(300))
+        .expect("completed provider-owned publication must release its lease");
+    lock.release(SESSION_ID, &lease.token).unwrap();
 }
 
 fn assert_pending_v3_journal_observed_before_provider_mutation(fixture: &DispatchFixture) {

@@ -2,6 +2,8 @@
 //!
 //! `orchestration`, `accessor`, `predicate`, `formatter`, `validator`
 
+#[cfg(test)]
+use oulipoly_runtime::services::SUCCESS_FINALIZE_MAX_ATTEMPTS;
 use oulipoly_runtime::services::{
     InvocationLifecycleFinalizeOutput, InvocationLifecycleFinalizeRequest,
     InvocationLifecycleServicePort, ServiceError,
@@ -13,43 +15,11 @@ use oulipoly_runtime::services::{
 };
 use oulipoly_state::StateDb;
 
-const SUCCESS_FINALIZE_MAX_ATTEMPTS: usize = 3;
-const SUCCESS_FINALIZE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
-
 pub(crate) fn finalize_retained_outcome_with_contention_retry(
     service: &dyn InvocationLifecycleServicePort,
     request: InvocationLifecycleFinalizeRequest<'_>,
 ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
-    let InvocationLifecycleFinalizeRequest {
-        state,
-        invocation_row_id,
-        success,
-        exit_code,
-        error_category,
-        terminal_reason,
-    } = request;
-    let attempts = if success {
-        SUCCESS_FINALIZE_MAX_ATTEMPTS
-    } else {
-        1
-    };
-    for attempt in 1..=attempts {
-        let result = service.finalize_invocation(InvocationLifecycleFinalizeRequest {
-            state,
-            invocation_row_id,
-            success,
-            exit_code,
-            error_category,
-            terminal_reason,
-        });
-        match result {
-            Err(ServiceError::Contention { .. }) if attempt < attempts => {
-                std::thread::sleep(SUCCESS_FINALIZE_RETRY_DELAY);
-            }
-            result => return result,
-        }
-    }
-    unreachable!("the bounded finalization retry loop always returns")
+    oulipoly_runtime::services::finalize_retained_outcome_with_contention_retry(service, request)
 }
 
 pub(crate) fn is_completion_authority_contention(error: &ServiceError) -> bool {

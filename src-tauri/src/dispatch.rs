@@ -186,8 +186,13 @@ fn pending_session_replace_exit_code(err: &session_replace::ReplaceError) -> i32
 }
 
 fn run_default_provider_repl(cli: &Cli) -> Result<i32, String> {
-    let services =
-        oulipoly_runtime::repl_default_provider::RuntimeServices::production(cli.project.clone())?;
+    run_default_provider_repl_for_project(cli.project.clone())
+}
+
+fn run_default_provider_repl_for_project(
+    project: Option<std::path::PathBuf>,
+) -> Result<i32, String> {
+    let services = oulipoly_runtime::repl_default_provider::RuntimeServices::production(project)?;
     oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services)
 }
 
@@ -230,14 +235,20 @@ fn dispatch_subcommand(
             rotate_provider,
             project,
             models_dir,
-        } => run::run_repl(
-            agent_runtime_services,
-            model.as_deref(),
-            resume.as_deref(),
-            rotate_provider.as_deref(),
-            project.as_deref(),
-            models_dir.as_deref(),
-        ),
+        } => {
+            if model.is_none() && resume.is_none() && rotate_provider.is_none() {
+                run_default_provider_repl_for_project(project)
+            } else {
+                run::run_repl(
+                    agent_runtime_services,
+                    model.as_deref(),
+                    resume.as_deref(),
+                    rotate_provider.as_deref(),
+                    project.as_deref(),
+                    models_dir.as_deref(),
+                )
+            }
+        }
         Subcommands::Resume {
             model,
             session_id,

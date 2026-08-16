@@ -114,7 +114,7 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
     let app = oulipoly_config::app::AppConfig::load(&app_config_path)?;
     let family = app.default_provider.ok_or_else(|| {
         format!(
-            "'default_provider' must be set in {} for '--new'",
+            "'default_provider' must be set in {} for a default-provider REPL",
             app_config_path.display()
         )
     })?;
@@ -348,17 +348,19 @@ fn finalize_default_provider_repl_result(
     invocation_row_id: i64,
     result: &crate::executor::cli::InteractiveExecutionResult,
 ) -> Result<(), String> {
-    lifecycle
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+    crate::services::finalize_retained_outcome_with_contention_retry(
+        lifecycle,
+        InvocationLifecycleFinalizeRequest {
             state,
             invocation_row_id,
             success: result.exit_code == 0,
             exit_code: result.exit_code,
             error_category: None,
             terminal_reason: result.terminal_reason.as_deref(),
-        })
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        },
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
 }
 
 fn finalize_default_provider_spawn_error(
@@ -880,7 +882,7 @@ exit 17"#,
         assert_eq!(
             error,
             format!(
-                "'default_provider' must be set in {} for '--new'",
+                "'default_provider' must be set in {} for a default-provider REPL",
                 temp.path().join("config.toml").display()
             )
         );

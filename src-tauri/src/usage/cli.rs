@@ -154,7 +154,7 @@ pub(crate) enum Subcommands {
     /// Launch a model interactively without a prompt payload.
     Repl {
         /// Model id to launch interactively. Optional when --resume can infer
-        /// a model or fall through to the provider CLI's default model.
+        /// a model or when default_provider selects a fresh provider-family REPL.
         model: Option<String>,
 
         /// Resume an existing session by full UUID
