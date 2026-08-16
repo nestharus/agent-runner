@@ -301,6 +301,7 @@ fn all_success_carriers_refuse_damaged_sidecar_then_finalize_retained_outcome_af
         let (fixture, child, invocation_uuid) = prepare_registered_carrier(carrier);
 
         let sidecar = MailboxDb::path_for_state_db(&fixture.state_path());
+        let sidecar_authority = lock_sidecar_authority(&sidecar);
         let sidecar_connection = Connection::open(&sidecar).unwrap();
         let retained_summary = sidecar_connection
             .query_row(
@@ -327,6 +328,7 @@ fn all_success_carriers_refuse_damaged_sidecar_then_finalize_retained_outcome_af
             )
             .unwrap();
         drop(sidecar_connection);
+        <fs::File as fs4::FileExt>::unlock(&sidecar_authority).unwrap();
         fs::write(&fixture.release, b"release\n").unwrap();
         let output = child.wait_with_output().unwrap();
 
@@ -496,6 +498,12 @@ fn stage_finalization_only_contention(fixture: &Fixture, child: &mut CarrierChil
     wait_for_runtime_exit(fixture, child);
 
     let sidecar = MailboxDb::path_for_state_db(&fixture.state_path());
+    let sidecar_authority = lock_sidecar_authority(&sidecar);
+    state_writer.execute_batch("COMMIT").unwrap();
+    sidecar_authority
+}
+
+fn lock_sidecar_authority(sidecar: &Path) -> fs::File {
     let mut authority_path = sidecar.as_os_str().to_os_string();
     authority_path.push(".authority.lock");
     let sidecar_authority = fs::OpenOptions::new()
@@ -504,7 +512,6 @@ fn stage_finalization_only_contention(fixture: &Fixture, child: &mut CarrierChil
         .open(PathBuf::from(authority_path))
         .unwrap();
     <fs::File as fs4::FileExt>::lock(&sidecar_authority).unwrap();
-    state_writer.execute_batch("COMMIT").unwrap();
     sidecar_authority
 }
 
