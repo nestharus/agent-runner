@@ -64,12 +64,12 @@ pub(super) fn initialize_after_rebuild(
 
 pub(super) fn acquire_sidecar_rebuild_authority(
     authority: &StateDbRebuildAuthority,
-) -> Result<MailboxDbRebuildAuthority, String> {
+) -> Result<MailboxDbRebuildAuthority<'_>, String> {
     MailboxDb::acquire_rebuild_authority(authority)
 }
 
 pub(super) fn initialize_sidecar_after_rebuild(
-    authority: &mut MailboxDbRebuildAuthority,
+    authority: &mut MailboxDbRebuildAuthority<'_>,
 ) -> Result<(), String> {
     authority.initialize_after_rebuild()
 }

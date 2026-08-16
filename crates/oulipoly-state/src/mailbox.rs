@@ -791,9 +791,27 @@ pub(crate) struct MailboxAuthorityFence {
 
 /// Exclusive sidecar namespace and SQLite-writer authority for the supported
 /// State-plus-sidecar destructive rebuild protocol.
-pub struct MailboxDbRebuildAuthority {
+///
+/// The sidecar capability cannot outlive the exact State rebuild authority
+/// from which it was derived.
+///
+/// ```compile_fail
+/// use oulipoly_state::StateDb;
+/// use oulipoly_state::mailbox::MailboxDb;
+///
+/// let directory = tempfile::tempdir().unwrap();
+/// let state_path = directory.path().join("state.db");
+/// drop(StateDb::open(&state_path).unwrap());
+/// let state_authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+/// let mut sidecar_authority = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+/// drop(state_authority);
+/// let _writable_state = StateDb::open(&state_path).unwrap();
+/// sidecar_authority.reset().unwrap();
+/// ```
+pub struct MailboxDbRebuildAuthority<'state> {
     namespace: MailboxAuthorityFence,
     writer: Option<Connection>,
+    _state_authority: &'state crate::StateDbRebuildAuthority,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1086,9 +1104,9 @@ impl MailboxDb {
         state_db_path.with_file_name(sidecar_name)
     }
 
-    pub fn acquire_rebuild_authority(
-        state_authority: &crate::StateDbRebuildAuthority,
-    ) -> Result<MailboxDbRebuildAuthority, String> {
+    pub fn acquire_rebuild_authority<'state>(
+        state_authority: &'state crate::StateDbRebuildAuthority,
+    ) -> Result<MailboxDbRebuildAuthority<'state>, String> {
         let sidecar_path = Self::path_for_state_db(state_authority.path());
         let namespace = match MailboxAuthorityFence::acquire_exclusive(&sidecar_path) {
             Ok(namespace) => namespace,
@@ -1104,7 +1122,11 @@ impl MailboxDb {
             }
         };
         let writer = acquire_mailbox_rebuild_writer(&namespace)?;
-        Ok(MailboxDbRebuildAuthority { namespace, writer })
+        Ok(MailboxDbRebuildAuthority {
+            namespace,
+            writer,
+            _state_authority: state_authority,
+        })
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -3700,7 +3722,7 @@ impl MailboxDb {
     }
 }
 
-impl MailboxDbRebuildAuthority {
+impl MailboxDbRebuildAuthority<'_> {
     pub fn sqlite_member_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.namespace.path().to_path_buf()];
         paths.extend(mailbox_sqlite_artifact_paths(self.namespace.path()));

@@ -2,7 +2,9 @@
 
 use super::identity::ExternalSessionIdentity;
 use super::replace_result_mapper::AcceptedProviderOwnedReplaceEvidence;
-use crate::session_replace::{ProviderReplaceDbTarget, ReplaceError, ReplaceReceipt};
+use crate::session_replace::{
+    ProviderReplaceDbPreimage, ProviderReplaceDbTarget, ReplaceError, ReplaceReceipt,
+};
 use std::path::PathBuf;
 
 pub(crate) fn apply_provider_owned_replace_to_target(
@@ -10,11 +12,16 @@ pub(crate) fn apply_provider_owned_replace_to_target(
     session_id: &str,
     accepted: &AcceptedProviderOwnedReplaceEvidence,
     target: &ProviderReplaceDbTarget,
+    admissible_current: &[ProviderReplaceDbPreimage],
 ) -> Result<ReplaceReceipt, ReplaceError> {
     validate_provider_owned_db_target(identity, session_id, accepted, target)?;
     let mut apply_target = target.clone();
     apply_target.source_file = accepted.source_id.clone();
-    crate::session_replace::apply_provider_owned_replace_sqlite(&apply_target, &accepted.records)?;
+    crate::session_replace::apply_provider_owned_replace_sqlite_if_current(
+        &apply_target,
+        &accepted.records,
+        admissible_current,
+    )?;
     Ok(provider_owned_receipt(identity, session_id, accepted))
 }
 

@@ -244,7 +244,7 @@ fn reject_orphaned_rebuild_artifacts(db_path: &Path) -> Result<(), String> {
 
 pub(super) fn execute_migrate_rebuild(
     plan: &mut MigrateRebuildPlan,
-    sidecar_authority: &mut MailboxDbRebuildAuthority,
+    sidecar_authority: &mut MailboxDbRebuildAuthority<'_>,
 ) -> Result<(), String> {
     if sidecar_authority.sqlite_member_paths() != plan.sidecar_members {
         return Err("PID mailbox rebuild authority does not match the rebuild plan".to_string());

@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Post-WU5a characterization baseline. The guard still catches any genuinely
 // new concrete provider-name reference introduced after the manager-approved
@@ -607,6 +607,12 @@ storage_type = "{storage_type}"
     ) {
         let journal_root = self.data_root.join("replace_journal");
         fs::create_dir_all(&journal_root).expect("journal root");
+        let mut session_turns = db_preimage.session_turns;
+        for turn in &mut session_turns {
+            if turn.8 == "<session-transcript>" {
+                turn.8 = self.transcript_path.display().to_string();
+            }
+        }
         let mut journal = json!({
             "schema_version": 3,
             "operation": "provider-owned-import-replace",
@@ -622,7 +628,7 @@ storage_type = "{storage_type}"
             "active_segment_started_at": "2026-05-01T00:00:00Z",
             "db_apply_marker": db_apply_marker,
             "db_preimage": {
-                "session_turns": db_preimage.session_turns,
+                "session_turns": session_turns,
                 "last_turn_id": db_preimage.session_chain_segments[0].6,
                 "last_used_at": db_preimage.session_chains[0].2,
             }
@@ -696,6 +702,50 @@ storage_type = "{storage_type}"
             params![CHAIN_ID],
         )
         .expect("update chain last used");
+    }
+
+    fn append_later_same_generation_turn(&self) {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO session_turns
+                (provider_name, session_id, turn_id, timestamp, role,
+                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, body, ingested_at)
+             VALUES (?1, ?2, 'later-turn', '2026-05-01T02:00:00Z', 'assistant',
+                     NULL, 0, 0, '<later-writer>', '[{\"type\":\"text\",\"text\":\"later\"}]',
+                     '2026-05-01T02:00:00Z')",
+            params![PROVIDER_NAME, SESSION_ID],
+        )
+        .expect("insert later same-generation turn");
+        conn.execute(
+            "UPDATE session_chain_segments
+             SET last_turn_id = 'later-turn'
+             WHERE id = ?1 AND chain_id = ?2 AND provider_name = ?3
+               AND session_id = ?4 AND started_at = '2026-05-01T00:00:00Z'
+               AND ended_at IS NULL",
+            params![
+                self.active_segment_id(),
+                CHAIN_ID,
+                PROVIDER_NAME,
+                SESSION_ID
+            ],
+        )
+        .expect("advance active segment without changing its generation");
+        conn.execute(
+            "UPDATE session_chains SET last_used_at = '2026-05-01T02:00:00Z'
+             WHERE chain_id = ?1",
+            params![CHAIN_ID],
+        )
+        .expect("advance chain timestamp");
+    }
+
+    fn replace_same_generation_source_file(&self) {
+        self.conn()
+            .execute(
+                "UPDATE session_turns SET source_file = '<later-source>'
+                 WHERE provider_name = ?1 AND session_id = ?2",
+                params![PROVIDER_NAME, SESSION_ID],
+            )
+            .expect("replace same-generation source file");
     }
 }
 
@@ -2124,6 +2174,201 @@ fn provider_owned_v3_recovery_is_idempotent_across_prepare_commit_atomic_and_rol
 }
 
 #[test]
+fn provider_owned_recovery_defers_to_a_live_publisher_then_recovers_uncontended() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_prepared_before_db_apply");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    let lock = SessionLock::new(&fixture.data_root.join("locks")).unwrap();
+    let live_lease = lock
+        .acquire(SESSION_ID, PROVIDER_NAME, Duration::from_secs(300))
+        .expect("live publisher lease");
+    let before = fixture.sqlite_snapshot();
+
+    let blocked =
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        );
+    lock.release(SESSION_ID, &live_lease.token)
+        .expect("release live publisher lease");
+
+    assert!(
+        matches!(blocked, Err(ReplaceError::SessionBusy { .. })),
+        "startup recovery must defer to the live journal publisher: {blocked:?}"
+    );
+    assert_eq!(fixture.sqlite_snapshot(), before);
+    assert_provider_owned_pending_journal(&fixture, "not_applied", true);
+    assert!(fixture.request_records_for("session.replace").is_empty());
+
+    oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+        fixture.registry_handle(),
+    )
+    .expect("uncontended recovery after live publisher release");
+    assert_eq!(
+        fixture.sqlite_snapshot().session_turns,
+        expected_provider_owned_replacement_turn_rows()
+    );
+    assert!(fixture.journal_snapshot().is_empty());
+    assert_recorded_recovery_actions(&fixture, &["query", "commit"]);
+}
+
+#[test]
+fn two_provider_owned_recovery_workers_cannot_reconcile_one_journal_concurrently() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_prepared_before_db_apply");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    let _hook = EnvVarGuard::set(
+        "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+        "sleep-recovery-after-lease-ms:250",
+    );
+    let first_registry = fixture.registry_handle();
+    let first = std::thread::spawn(move || {
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            first_registry,
+        )
+    });
+    let lock_path = fixture
+        .data_root
+        .join("locks")
+        .join(format!("session-{SESSION_ID}.lock"));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !lock_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let lease_was_observed = lock_path.exists();
+    let second = lease_was_observed.then(|| {
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        )
+    });
+    let first_result = first.join().expect("first recovery worker must not panic");
+
+    assert!(
+        lease_was_observed,
+        "first recovery worker did not acquire the provider session lease"
+    );
+    assert!(
+        matches!(second, Some(Err(ReplaceError::SessionBusy { .. }))),
+        "second recovery worker must receive typed transient busy: {second:?}"
+    );
+    first_result.expect("first recovery worker");
+    assert!(fixture.journal_snapshot().is_empty());
+    assert_recorded_recovery_actions(&fixture, &["query", "commit"]);
+}
+
+#[test]
+fn stale_provider_owned_recovery_cannot_overwrite_a_later_same_generation_host_change() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_prepared_before_db_apply");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    fixture.append_later_same_generation_turn();
+    let later_state = fixture.sqlite_snapshot();
+
+    let error =
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        )
+        .expect_err("stale recovery must not replace a later same-generation host state");
+
+    assert_eq!(error.code(), "operator-recovery-required");
+    assert_error_token(format!("{error:?}"), "reconciliation_precondition_mismatch");
+    assert_eq!(fixture.sqlite_snapshot(), later_state);
+    assert_provider_owned_pending_journal(&fixture, "not_applied", true);
+    assert_recorded_recovery_actions(&fixture, &["query"]);
+}
+
+#[test]
+fn stale_provider_owned_recovery_cannot_overwrite_a_source_only_host_change() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_prepared_before_db_apply");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    fixture.replace_same_generation_source_file();
+    let later_state = fixture.sqlite_snapshot();
+
+    let error =
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        )
+        .expect_err("stale recovery must not replace a source-only host change");
+
+    assert_eq!(error.code(), "operator-recovery-required");
+    assert_error_token(format!("{error:?}"), "reconciliation_precondition_mismatch");
+    assert_eq!(fixture.sqlite_snapshot(), later_state);
+    assert_provider_owned_pending_journal(&fixture, "not_applied", true);
+    assert_recorded_recovery_actions(&fixture, &["query"]);
+}
+
+#[test]
+fn provider_owned_retirement_failure_is_cleanup_only_after_no_change_and_changed_completion() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (mode, expect_changed) in [
+        ("replace_no_change", false),
+        ("replace_provider_owned_success", true),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode(mode);
+        let before = fixture.sqlite_snapshot();
+        let hook = EnvVarGuard::set(
+            "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+            "fail-provider-owned-journal-remove",
+        );
+        let service =
+            ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+
+        let error = service
+            .replace_session(SessionReplaceServiceRequest {
+                session_id: SESSION_ID.to_string(),
+                source: ReplaceSource::File(fixture.input_path.clone()),
+                preimage_sha256: Some(provider_owned_preimage_sha256()),
+                external_provider: Some(provider_identity()),
+            })
+            .expect("service output")
+            .result
+            .expect_err("journal retirement failure must not be ordinary success");
+
+        assert_eq!(error.code(), "operator-recovery-required", "{mode}");
+        assert_provider_owned_cleanup_only_journal(&fixture);
+        let completed_state = fixture.sqlite_snapshot();
+        assert_eq!(completed_state != before, expect_changed, "{mode}");
+        let provider_calls = fixture.records().len();
+        drop(hook);
+
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        )
+        .expect("startup must finish cleanup-only retirement");
+
+        assert!(fixture.journal_snapshot().is_empty(), "{mode}");
+        assert_eq!(fixture.sqlite_snapshot(), completed_state, "{mode}");
+        assert_eq!(
+            fixture.records().len(),
+            provider_calls,
+            "cleanup-only startup must not query or correct the provider: {mode}"
+        );
+    }
+}
+
+#[test]
 fn provider_owned_v3_recovery_provider_unavailable_keeps_journal_without_local_restore() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let fixture = DispatchFixture::new();
@@ -2168,7 +2413,7 @@ fn legacy_or_incomplete_provider_owned_journals_remain_pending_without_host_muta
             "chain_id": CHAIN_ID,
             "active_segment_id": fixture.active_segment_id(),
             "db_apply_marker": "not_applied",
-            "db_preimage": expected_provider_owned_journal_db_preimage(),
+            "db_preimage": expected_provider_owned_journal_db_preimage(&fixture),
         });
         if include_generation {
             journal["active_segment_started_at"] =
@@ -2666,6 +2911,19 @@ fn assert_provider_owned_pending_journal(
     }
 }
 
+fn assert_provider_owned_cleanup_only_journal(fixture: &DispatchFixture) {
+    let journals = fixture.journal_snapshot();
+    let pending = journals
+        .iter()
+        .find(|(name, _)| name.ends_with(".pending"))
+        .unwrap_or_else(|| panic!("expected cleanup-only provider-owned journal: {journals:#?}"));
+    let json: Value = serde_json::from_slice(&pending.1).expect("cleanup-only journal json");
+    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["operation"], "provider-owned-import-replace");
+    assert_eq!(json["operation_id"], provider_owned_operation_id());
+    assert_eq!(json["reconciliation_state"], "cleanup_only");
+}
+
 fn assert_provider_owned_lease_is_available(fixture: &DispatchFixture) {
     let lock = SessionLock::new(&fixture.data_root.join("locks")).unwrap();
     let lease = lock
@@ -2722,7 +2980,7 @@ fn assert_provider_owned_journal_db_preimage_and_identity(
     assert_eq!(json["db_apply_marker"].as_str(), Some(expected_marker));
     assert_eq!(
         json["db_preimage"],
-        expected_provider_owned_journal_db_preimage()
+        expected_provider_owned_journal_db_preimage(fixture)
     );
 
     let journal_text = json.to_string();
@@ -2745,7 +3003,8 @@ fn assert_provider_owned_journal_db_preimage_and_identity(
     }
 }
 
-fn expected_provider_owned_journal_db_preimage() -> Value {
+fn expected_provider_owned_journal_db_preimage(fixture: &DispatchFixture) -> Value {
+    let source_file = fixture.transcript_path.display().to_string();
     json!({
         "session_turns": [
             [
@@ -2757,7 +3016,7 @@ fn expected_provider_owned_journal_db_preimage() -> Value {
                 null,
                 0,
                 0,
-                "<session-transcript>",
+                source_file.clone(),
                 null
             ],
             [
@@ -2769,7 +3028,7 @@ fn expected_provider_owned_journal_db_preimage() -> Value {
                 null,
                 0,
                 0,
-                "<session-transcript>",
+                source_file,
                 null
             ]
         ],

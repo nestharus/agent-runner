@@ -329,6 +329,86 @@ fn admitted_completion_authority_refuses_a_renamed_sidecar_until_exact_authority
 }
 
 #[test]
+fn finalization_rejects_a_post_a_same_generation_snapshot_after_b_is_admitted() {
+    const B_UUID: &str = "22222222-2222-4222-8222-222222222222";
+    const B_SESSION_ID: &str = "session-age299-s2-b";
+    const B_EVENT_ID: &str = "ab_age299_s2_event_b";
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.db");
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let post_a_snapshot = directory.path().join("pid-identity.post-a");
+    let post_b_snapshot = directory.path().join("pid-identity.post-b");
+    let mut state = StateDb::open(&state_path).unwrap();
+    let (a_row_id, a_authority) = start_authorized_invocation(&state, ROOT_UUID, OWNER_SESSION_ID);
+    let (_, b_authority) = start_authorized_invocation(&state, B_UUID, B_SESSION_ID);
+
+    state
+        .register_completion_event_with_authority(
+            &a_authority,
+            ADMISSION_ID,
+            completion_registration(EVENT_ID, ROOT_UUID, OWNER_SESSION_ID),
+        )
+        .unwrap();
+    let post_a_bytes = std::fs::read(&sidecar_path).unwrap();
+    std::fs::write(&post_a_snapshot, &post_a_bytes).unwrap();
+    let post_a_facts = sidecar_invocation_facts(&sidecar_path, ROOT_UUID);
+    assert_eq!(post_a_facts.1, 1);
+    assert_eq!(post_a_facts.2, 1);
+    assert_eq!(post_a_facts.3, 1);
+
+    state
+        .register_completion_event_with_authority(
+            &b_authority,
+            "admission-age299-s2-b",
+            completion_registration(B_EVENT_ID, B_UUID, B_SESSION_ID),
+        )
+        .unwrap();
+    let post_b_bytes = std::fs::read(&sidecar_path).unwrap();
+    std::fs::write(&post_b_snapshot, &post_b_bytes).unwrap();
+    let post_b_facts = sidecar_invocation_facts(&sidecar_path, ROOT_UUID);
+    assert_eq!(post_b_facts.0, post_a_facts.0);
+    assert_eq!(post_b_facts.1, 2);
+    assert_eq!(&post_b_facts.2.., &post_a_facts.2..);
+    assert_eq!(
+        count_state_rows(&state, "invocation_completion_continuity"),
+        2
+    );
+
+    std::fs::remove_file(&sidecar_path).unwrap();
+    std::fs::write(&sidecar_path, &post_a_bytes).unwrap();
+    assert_eq!(std::fs::read(&sidecar_path).unwrap(), post_a_bytes);
+    assert_eq!(
+        sidecar_invocation_facts(&sidecar_path, ROOT_UUID),
+        post_a_facts
+    );
+
+    let error = state
+        .finalize_invocation(a_row_id, true, 0, None, None)
+        .unwrap_err();
+
+    assert!(error.contains("process_integrity"), "{error}");
+    assert!(
+        error.contains("no exact matching State/sidecar continuity proof"),
+        "{error}"
+    );
+    assert_running(&state, ROOT_UUID);
+    assert_eq!(
+        state
+            .completion_obligations_for_invocation(B_UUID)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    std::fs::remove_file(&sidecar_path).unwrap();
+    std::fs::rename(&post_b_snapshot, &sidecar_path).unwrap();
+    assert_eq!(std::fs::read(&sidecar_path).unwrap(), post_b_bytes);
+    state
+        .finalize_invocation(a_row_id, true, 0, None, None)
+        .unwrap();
+}
+
+#[test]
 fn admitted_completion_authority_refuses_an_absent_event_in_the_matching_sidecar() {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.db");
@@ -911,4 +991,50 @@ fn count_state_rows(state: &StateDb, table: &str) -> i64 {
             row.get(0)
         })
         .unwrap()
+}
+
+fn sidecar_invocation_facts(
+    path: &std::path::Path,
+    invocation_uuid: &str,
+) -> (String, i64, i64, i64) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let generation = connection
+        .query_row(
+            "SELECT generation_uuid FROM mailbox_sidecar_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let continuity_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM completion_authority_continuity",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_listener_count = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM completion_event e
+             JOIN completion_event_listener l ON l.event_id = e.event_id
+             WHERE l.owner_invocation_uuid = ?1",
+            [invocation_uuid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let summary_count = connection
+        .query_row(
+            "SELECT materialized_count
+             FROM completion_authority_materialization_summary
+             WHERE invocation_uuid = ?1",
+            [invocation_uuid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (
+        generation,
+        continuity_count,
+        event_listener_count,
+        summary_count,
+    )
 }

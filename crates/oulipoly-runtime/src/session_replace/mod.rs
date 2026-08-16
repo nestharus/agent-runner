@@ -99,7 +99,7 @@ pub(crate) struct ProviderReplaceDbTarget {
     pub(crate) source_file: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProviderReplaceDbPreimage {
     pub(crate) session_turns: Value,
     pub(crate) last_turn_id: Option<String>,
@@ -802,33 +802,43 @@ fn apply_replace_sqlite(
         })
 }
 
-pub(crate) fn apply_provider_owned_replace_sqlite(
+pub(crate) fn apply_provider_owned_replace_sqlite_if_current(
     target: &ProviderReplaceDbTarget,
     records: &[CanonicalRecord],
+    admissible_current: &[ProviderReplaceDbPreimage],
 ) -> Result<(), ReplaceError> {
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
     let input = replacement_for_target(target, records)?;
+    let admissible_current = admissible_current
+        .iter()
+        .map(|preimage| restoration_for_target(target, preimage))
+        .collect::<Result<Vec<_>, _>>()?;
     state
-        .replace_session_turns(&input)
+        .replace_session_turns_if_current(&input, &admissible_current)
         .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to update state db: {e}"),
+            message: format!("failed to reconcile provider-owned state db: {e}"),
         })
 }
 
-pub(crate) fn restore_provider_owned_db_preimage(
+pub(crate) fn restore_provider_owned_db_preimage_if_current(
     target: &ProviderReplaceDbTarget,
     preimage: &ProviderReplaceDbPreimage,
+    admissible_current: &[ProviderReplaceDbPreimage],
 ) -> Result<(), ReplaceError> {
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
     let input = restoration_for_target(target, preimage)?;
+    let admissible_current = admissible_current
+        .iter()
+        .map(|candidate| restoration_for_target(target, candidate))
+        .collect::<Result<Vec<_>, _>>()?;
     state
-        .restore_session_turns(&input)
+        .restore_session_turns_if_current(&input, &admissible_current)
         .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to restore state db: {e}"),
+            message: format!("failed to reconcile provider-owned state db: {e}"),
         })
 }
 
@@ -896,6 +906,43 @@ pub(crate) fn provider_replace_db_preimage(
     })?;
     let conn = state.connection();
     db_preimage_from_conn(&conn, target)
+}
+
+pub(crate) fn provider_replace_db_postimage(
+    target: &ProviderReplaceDbTarget,
+    records: &[CanonicalRecord],
+    source_file: &str,
+) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
+    let replacement = replacement_for_target(target, records)?;
+    let last = replacement
+        .turns
+        .last()
+        .ok_or_else(|| ReplaceError::OperationalError {
+            message: "cannot model an empty provider-owned DB postimage".to_string(),
+        })?;
+    let session_turns = replacement
+        .turns
+        .iter()
+        .map(|turn| {
+            json!([
+                &replacement.provider_name,
+                &replacement.session_id,
+                &turn.turn_id,
+                &turn.timestamp,
+                &turn.role,
+                null,
+                0,
+                0,
+                source_file,
+                &turn.body,
+            ])
+        })
+        .collect();
+    Ok(ProviderReplaceDbPreimage {
+        session_turns: Value::Array(session_turns),
+        last_turn_id: Some(last.turn_id.clone()),
+        last_used_at: last.timestamp.clone(),
+    })
 }
 
 fn cleanup_replace_journal_publication(
@@ -1460,7 +1507,7 @@ fn db_preimage_from_conn(
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
-                "<session-transcript>",
+                row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
             ]))
         })

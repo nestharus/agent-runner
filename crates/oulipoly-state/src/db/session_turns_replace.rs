@@ -53,22 +53,90 @@ pub struct SessionTurnsRestore {
 
 impl StateDb {
     pub fn replace_session_turns(&mut self, input: &SessionTurnsReplacement) -> Result<(), String> {
-        let last = input
-            .turns
-            .last()
-            .ok_or_else(|| "cannot replace db with empty records".to_string())?;
         let tx = self
             .conn
             .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to start session-turn replacement: {error}"))?;
+        replace_session_turns_on(&tx, input)?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit session-turn replacement: {error}"))
+    }
+
+    pub fn replace_session_turns_if_current(
+        &mut self,
+        input: &SessionTurnsReplacement,
+        admissible_current: &[SessionTurnsRestore],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start session-turn replacement: {error}"))?;
+        require_admissible_session_turns_on(
+            &tx,
+            &input.provider_name,
+            &input.session_id,
+            &input.chain_id,
+            input.active_segment_id,
+            &input.active_segment_started_at,
+            admissible_current,
+        )?;
+        replace_session_turns_on(&tx, input)?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit session-turn replacement: {error}"))
+    }
+
+    pub fn restore_session_turns(&mut self, input: &SessionTurnsRestore) -> Result<(), String> {
+        validate_restoration_rows(input)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start session-turn restoration: {error}"))?;
+        restore_session_turns_on(&tx, input)?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit session-turn restoration: {error}"))
+    }
+
+    pub fn restore_session_turns_if_current(
+        &mut self,
+        input: &SessionTurnsRestore,
+        admissible_current: &[SessionTurnsRestore],
+    ) -> Result<(), String> {
+        validate_restoration_rows(input)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start session-turn restoration: {error}"))?;
+        require_admissible_session_turns_on(
+            &tx,
+            &input.provider_name,
+            &input.session_id,
+            &input.chain_id,
+            input.active_segment_id,
+            &input.active_segment_started_at,
+            admissible_current,
+        )?;
+        restore_session_turns_on(&tx, input)?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit session-turn restoration: {error}"))
+    }
+}
+
+fn replace_session_turns_on(
+    tx: &Transaction<'_>,
+    input: &SessionTurnsReplacement,
+) -> Result<(), String> {
+    let last = input
+        .turns
+        .last()
+        .ok_or_else(|| "cannot replace db with empty records".to_string())?;
+    tx.execute(
+        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+        params![input.provider_name, input.session_id],
+    )
+    .map_err(|error| format!("failed to delete old turns: {error}"))?;
+    let now = StateDb::current_rfc3339_timestamp();
+    for turn in &input.turns {
         tx.execute(
-            "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-            params![input.provider_name, input.session_id],
-        )
-        .map_err(|error| format!("failed to delete old turns: {error}"))?;
-        let now = StateDb::current_rfc3339_timestamp();
-        for turn in &input.turns {
-            tx.execute(
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role,
                      parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
@@ -85,31 +153,31 @@ impl StateDb {
                 ],
             )
             .map_err(|error| format!("failed to insert replacement turn: {error}"))?;
-        }
-        let updated_segments = tx
-            .execute(
-                "UPDATE session_chain_segments
+    }
+    let updated_segments = tx
+        .execute(
+            "UPDATE session_chain_segments
                  SET last_turn_id = ?2
                  WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5
                    AND started_at = ?6 AND ended_at IS NULL",
-                params![
-                    input.active_segment_id,
-                    last.turn_id,
-                    input.chain_id,
-                    input.provider_name,
-                    input.session_id,
-                    input.active_segment_started_at,
-                ],
-            )
-            .map_err(|error| format!("failed to refresh active segment: {error}"))?;
-        if updated_segments != 1 {
-            return Err(format!(
-                "failed to refresh active segment: expected 1 updated row, got {updated_segments}"
-            ));
-        }
-        let updated_chains = tx
-            .execute(
-                "UPDATE session_chains
+            params![
+                input.active_segment_id,
+                last.turn_id,
+                input.chain_id,
+                input.provider_name,
+                input.session_id,
+                input.active_segment_started_at,
+            ],
+        )
+        .map_err(|error| format!("failed to refresh active segment: {error}"))?;
+    if updated_segments != 1 {
+        return Err(format!(
+            "failed to refresh active segment: expected 1 updated row, got {updated_segments}"
+        ));
+    }
+    let updated_chains = tx
+        .execute(
+            "UPDATE session_chains
                  SET last_used_at = ?2
                  WHERE chain_id = ?1
                    AND EXISTS (
@@ -117,45 +185,45 @@ impl StateDb {
                        WHERE id = ?3 AND chain_id = ?1 AND provider_name = ?4 AND session_id = ?5
                          AND started_at = ?6 AND ended_at IS NULL
                    )",
-                params![
-                    input.chain_id,
-                    last.timestamp,
-                    input.active_segment_id,
-                    input.provider_name,
-                    input.session_id,
-                    input.active_segment_started_at,
-                ],
-            )
-            .map_err(|error| format!("failed to refresh chain: {error}"))?;
-        if updated_chains != 1 {
-            return Err(format!(
-                "failed to refresh chain: expected 1 updated row, got {updated_chains}"
-            ));
-        }
-        tx.commit()
-            .map_err(|error| format!("failed to commit session-turn replacement: {error}"))
-    }
-
-    pub fn restore_session_turns(&mut self, input: &SessionTurnsRestore) -> Result<(), String> {
-        if input.turns.iter().any(|turn| {
-            turn.provider_name != input.provider_name || turn.session_id != input.session_id
-        }) {
-            return Err(
-                "session-turn restoration rows do not match the target identity".to_string(),
-            );
-        }
-        let tx = self
-            .conn
-            .transaction_with_behavior(sqlite::TransactionBehavior::Immediate)
-            .map_err(|error| format!("failed to start session-turn restoration: {error}"))?;
-        tx.execute(
-            "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-            params![input.provider_name, input.session_id],
+            params![
+                input.chain_id,
+                last.timestamp,
+                input.active_segment_id,
+                input.provider_name,
+                input.session_id,
+                input.active_segment_started_at,
+            ],
         )
-        .map_err(|error| format!("failed to delete replacement turns: {error}"))?;
-        let now = StateDb::current_rfc3339_timestamp();
-        for turn in &input.turns {
-            tx.execute(
+        .map_err(|error| format!("failed to refresh chain: {error}"))?;
+    if updated_chains != 1 {
+        return Err(format!(
+            "failed to refresh chain: expected 1 updated row, got {updated_chains}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_restoration_rows(input: &SessionTurnsRestore) -> Result<(), String> {
+    if input.turns.iter().any(|turn| {
+        turn.provider_name != input.provider_name || turn.session_id != input.session_id
+    }) {
+        return Err("session-turn restoration rows do not match the target identity".to_string());
+    }
+    Ok(())
+}
+
+fn restore_session_turns_on(
+    tx: &Transaction<'_>,
+    input: &SessionTurnsRestore,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
+        params![input.provider_name, input.session_id],
+    )
+    .map_err(|error| format!("failed to delete replacement turns: {error}"))?;
+    let now = StateDb::current_rfc3339_timestamp();
+    for turn in &input.turns {
+        tx.execute(
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role,
                      parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
@@ -175,31 +243,31 @@ impl StateDb {
                 ],
             )
             .map_err(|error| format!("failed to restore preimage turn: {error}"))?;
-        }
-        let updated_segments = tx
-            .execute(
-                "UPDATE session_chain_segments
+    }
+    let updated_segments = tx
+        .execute(
+            "UPDATE session_chain_segments
                  SET last_turn_id = ?2
                  WHERE id = ?1 AND chain_id = ?3 AND provider_name = ?4 AND session_id = ?5
                    AND started_at = ?6 AND ended_at IS NULL",
-                params![
-                    input.active_segment_id,
-                    input.last_turn_id,
-                    input.chain_id,
-                    input.provider_name,
-                    input.session_id,
-                    input.active_segment_started_at,
-                ],
-            )
-            .map_err(|error| format!("failed to restore active segment: {error}"))?;
-        if updated_segments != 1 {
-            return Err(format!(
-                "failed to restore active segment: expected 1 updated row, got {updated_segments}"
-            ));
-        }
-        let updated_chains = tx
-            .execute(
-                "UPDATE session_chains
+            params![
+                input.active_segment_id,
+                input.last_turn_id,
+                input.chain_id,
+                input.provider_name,
+                input.session_id,
+                input.active_segment_started_at,
+            ],
+        )
+        .map_err(|error| format!("failed to restore active segment: {error}"))?;
+    if updated_segments != 1 {
+        return Err(format!(
+            "failed to restore active segment: expected 1 updated row, got {updated_segments}"
+        ));
+    }
+    let updated_chains = tx
+        .execute(
+            "UPDATE session_chains
                  SET last_used_at = ?2
                  WHERE chain_id = ?1
                    AND EXISTS (
@@ -207,24 +275,123 @@ impl StateDb {
                        WHERE id = ?3 AND chain_id = ?1 AND provider_name = ?4 AND session_id = ?5
                          AND started_at = ?6 AND ended_at IS NULL
                    )",
-                params![
-                    input.chain_id,
-                    input.last_used_at,
-                    input.active_segment_id,
-                    input.provider_name,
-                    input.session_id,
-                    input.active_segment_started_at,
-                ],
-            )
-            .map_err(|error| format!("failed to restore chain: {error}"))?;
-        if updated_chains != 1 {
-            return Err(format!(
-                "failed to restore chain: expected 1 updated row, got {updated_chains}"
-            ));
-        }
-        tx.commit()
-            .map_err(|error| format!("failed to commit session-turn restoration: {error}"))
+            params![
+                input.chain_id,
+                input.last_used_at,
+                input.active_segment_id,
+                input.provider_name,
+                input.session_id,
+                input.active_segment_started_at,
+            ],
+        )
+        .map_err(|error| format!("failed to restore chain: {error}"))?;
+    if updated_chains != 1 {
+        return Err(format!(
+            "failed to restore chain: expected 1 updated row, got {updated_chains}"
+        ));
     }
+    Ok(())
+}
+
+type SessionTurnReconciliationRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    String,
+    Option<String>,
+);
+
+fn require_admissible_session_turns_on(
+    tx: &Transaction<'_>,
+    provider_name: &str,
+    session_id: &str,
+    chain_id: &str,
+    active_segment_id: i64,
+    active_segment_started_at: &str,
+    admissible_current: &[SessionTurnsRestore],
+) -> Result<(), String> {
+    let mut statement = tx
+        .prepare(
+            "SELECT provider_name, session_id, turn_id, timestamp, role,
+                    parent_turn_id, is_sidechain, is_compaction_boundary, source_file, body
+             FROM session_turns
+             WHERE provider_name = ?1 AND session_id = ?2
+             ORDER BY timestamp, turn_id",
+        )
+        .map_err(|error| format!("failed to prepare session-turn reconciliation check: {error}"))?;
+    let observed_turns = statement
+        .query_map(params![provider_name, session_id], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })
+        .map_err(|error| format!("failed to query session-turn reconciliation check: {error}"))?
+        .collect::<Result<Vec<SessionTurnReconciliationRow>, _>>()
+        .map_err(|error| format!("failed to read session-turn reconciliation check: {error}"))?;
+    let observed_chain = tx
+        .query_row(
+            "SELECT s.last_turn_id, c.last_used_at
+             FROM session_chain_segments s
+             JOIN session_chains c ON c.chain_id = s.chain_id
+             WHERE s.id = ?1 AND s.chain_id = ?2 AND s.provider_name = ?3
+               AND s.session_id = ?4 AND s.started_at = ?5 AND s.ended_at IS NULL",
+            params![
+                active_segment_id,
+                chain_id,
+                provider_name,
+                session_id,
+                active_segment_started_at,
+            ],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read session-turn reconciliation chain: {error}"))?;
+    let matches = admissible_current.iter().any(|expected| {
+        expected.provider_name == provider_name
+            && expected.session_id == session_id
+            && expected.chain_id == chain_id
+            && expected.active_segment_id == active_segment_id
+            && expected.active_segment_started_at == active_segment_started_at
+            && observed_chain.as_ref()
+                == Some(&(expected.last_turn_id.clone(), expected.last_used_at.clone()))
+            && observed_turns
+                == expected
+                    .turns
+                    .iter()
+                    .map(|turn| {
+                        (
+                            turn.provider_name.clone(),
+                            turn.session_id.clone(),
+                            turn.turn_id.clone(),
+                            turn.timestamp.clone(),
+                            turn.role.clone(),
+                            turn.parent_turn_id.clone(),
+                            turn.is_sidechain,
+                            turn.is_compaction_boundary,
+                            turn.source_file.clone(),
+                            turn.body.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+    });
+    if !matches {
+        return Err("session_turn_reconciliation_precondition_mismatch".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
