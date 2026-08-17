@@ -747,6 +747,68 @@ storage_type = "{storage_type}"
             )
             .expect("replace same-generation source file");
     }
+
+    fn mutate_same_generation_turn_field(&self, field: &str) {
+        let (column, value) = match field {
+            "body" => ("body", "[{\"type\":\"text\",\"text\":\"later body\"}]"),
+            "parent_turn_id" => ("parent_turn_id", "later-parent-turn"),
+            "is_sidechain" => ("is_sidechain", "1"),
+            "is_compaction_boundary" => ("is_compaction_boundary", "1"),
+            other => panic!("unsupported turn mutation {other}"),
+        };
+        self.conn()
+            .execute(
+                &format!(
+                    "UPDATE session_turns SET {column} = ?1
+                     WHERE provider_name = ?2 AND session_id = ?3 AND turn_id = 'old-turn-1'"
+                ),
+                params![value, PROVIDER_NAME, SESSION_ID],
+            )
+            .expect("mutate same-generation turn field");
+    }
+
+    fn pending_provider_owned_journal(&self) -> Value {
+        let journals = self.journal_snapshot();
+        let (_, bytes) = journals
+            .iter()
+            .find(|(name, _)| name.ends_with(".pending"))
+            .unwrap_or_else(|| panic!("expected pending provider-owned journal: {journals:#?}"));
+        serde_json::from_slice(bytes).expect("pending provider-owned journal json")
+    }
+
+    fn pending_provider_owned_journal_path(&self) -> PathBuf {
+        self.data_root
+            .join("replace_journal")
+            .join(format!("session-{SESSION_ID}.pending"))
+    }
+
+    fn rewrite_pending_operation_id(&self, operation_id: &str) {
+        let path = self.pending_provider_owned_journal_path();
+        let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        journal["operation_id"] = Value::String(operation_id.to_string());
+        fs::write(path, serde_json::to_vec_pretty(&journal).unwrap()).unwrap();
+    }
+
+    fn append_mature_preimage_turns(&self, count: usize) {
+        let conn = self.conn();
+        for index in 0..count {
+            conn.execute(
+                "INSERT INTO session_turns
+                    (provider_name, session_id, turn_id, timestamp, role,
+                     parent_turn_id, is_sidechain, is_compaction_boundary, source_file, body, ingested_at)
+                 VALUES (?1, ?2, ?3, ?4, 'assistant', NULL, 0, 0, ?5, ?6, ?4)",
+                params![
+                    PROVIDER_NAME,
+                    SESSION_ID,
+                    format!("mature-turn-{index:04}"),
+                    format!("2026-04-30T23:{:02}:{:02}Z", (index / 60) % 60, index % 60),
+                    self.transcript_path.to_string_lossy(),
+                    format!("[{{\"type\":\"text\",\"text\":\"mature {index}\"}}]"),
+                ],
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn write_shell_script(path: &Path, body: &str) {
@@ -756,6 +818,15 @@ fn write_shell_script(path: &Path, body: &str) {
         .permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("fixture script chmod");
+}
+
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(path.exists(), "timed out waiting for {}", path.display());
+    std::thread::sleep(Duration::from_millis(10));
 }
 
 fn shell_double_quoted(value: &str) -> String {
@@ -1438,8 +1509,15 @@ fn provider_owned_atomic_journal_failures_retain_the_last_valid_generation() {
             .result
             .expect_err(hook);
 
+        assert_eq!(err.code(), "operator-recovery-required", "{hook}: {err:?}");
         assert_error_token(format!("{err:?}"), hook);
         assert_provider_owned_pending_journal(&fixture, expected_marker, expect_recovery_id);
+        assert!(
+            fixture.pending_provider_owned_journal()["failure_context"]
+                .as_str()
+                .is_some_and(|context| context.contains(hook)),
+            "changed provider work must retain the journal transition failure: {hook}"
+        );
         assert_eq!(
             fixture.sqlite_snapshot() != before_db,
             expect_db_apply,
@@ -1588,6 +1666,246 @@ fn external_replace_provider_protocol_hash_plan_and_source_failures_do_not_mutat
         );
         assert_forbidden_helper_counts_zero();
         assert_provider_requests_do_not_expose_sqlite_mutation_authority(&fixture);
+    }
+}
+
+#[test]
+fn indeterminate_provider_dispatch_and_changed_identity_failures_retain_restart_authority() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (mode, expected_token, expect_recovery_id) in [
+        (
+            "replace_provider_owned_mutate_then_malformed_json",
+            "invalid_json",
+            false,
+        ),
+        ("replace_missing_operation_id", "missing_operation_id", true),
+        (
+            "replace_operation_id_echo_mismatch",
+            "operation_id_mismatch",
+            true,
+        ),
+        ("replace_missing_recovery_id", "missing_recovery_id", false),
+        (
+            "replace_recovery_evidence_mismatch",
+            "recovery_id_mismatch",
+            true,
+        ),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode(mode);
+        let before_db = fixture.sqlite_snapshot();
+        let before_provider_bytes = fixture.transcript_bytes();
+        let service =
+            ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+
+        let error = service
+            .replace_session(SessionReplaceServiceRequest {
+                session_id: SESSION_ID.to_string(),
+                source: ReplaceSource::File(fixture.input_path.clone()),
+                preimage_sha256: Some(provider_owned_preimage_sha256()),
+                external_provider: Some(provider_identity()),
+            })
+            .expect("service output")
+            .result
+            .expect_err(mode);
+
+        assert_eq!(
+            error.code(),
+            "operator-recovery-required",
+            "{mode}: {error:?}"
+        );
+        assert_error_token(format!("{error:?}"), expected_token);
+        assert_eq!(fixture.sqlite_snapshot(), before_db, "{mode}");
+        if mode == "replace_provider_owned_mutate_then_malformed_json" {
+            assert_ne!(
+                fixture.transcript_bytes(),
+                before_provider_bytes,
+                "the provider mutation must precede response loss"
+            );
+        }
+        let journal = fixture.pending_provider_owned_journal();
+        assert_eq!(
+            journal["operation_id"],
+            provider_owned_operation_id(),
+            "{mode}"
+        );
+        assert_eq!(
+            journal["db_preimage"],
+            expected_provider_owned_journal_db_preimage(&fixture),
+            "{mode}"
+        );
+        assert_eq!(
+            journal.get("recovery_id").is_some(),
+            expect_recovery_id,
+            "{mode}: {journal}"
+        );
+        assert!(
+            journal["failure_context"]
+                .as_str()
+                .is_some_and(|context| context.contains(expected_token)),
+            "{mode}: {journal}"
+        );
+
+        fixture.set_mode("recovery_atomic_before_cleanup");
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        )
+        .expect("retained indeterminate work must remain recoverable after restart");
+        assert_eq!(
+            fixture.sqlite_snapshot().session_turns,
+            expected_provider_owned_replacement_turn_rows(),
+            "restart recovery must converge State to the committed provider postimage: {mode}"
+        );
+        assert!(fixture.journal_snapshot().is_empty(), "{mode}");
+    }
+}
+
+#[test]
+fn corrective_commit_and_rollback_require_exact_terminal_evidence() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (mode, expected_token) in [
+        (
+            "replace_provider_owned_commit_nonterminal",
+            "corrective_state_mismatch",
+        ),
+        (
+            "replace_provider_owned_commit_operation_mismatch",
+            "corrective_operation_id_mismatch",
+        ),
+        (
+            "replace_provider_owned_commit_recovery_mismatch",
+            "corrective_recovery_id_mismatch",
+        ),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode(mode);
+        let service =
+            ProductionSessionReplaceService::with_registry_handle(fixture.registry_handle());
+
+        let error = service
+            .replace_session(SessionReplaceServiceRequest {
+                session_id: SESSION_ID.to_string(),
+                source: ReplaceSource::File(fixture.input_path.clone()),
+                preimage_sha256: Some(provider_owned_preimage_sha256()),
+                external_provider: Some(provider_identity()),
+            })
+            .expect("service output")
+            .result
+            .expect_err(mode);
+
+        assert_eq!(
+            error.code(),
+            "operator-recovery-required",
+            "{mode}: {error:?}"
+        );
+        assert_error_token(format!("{error:?}"), expected_token);
+        assert_provider_owned_pending_journal(&fixture, "applied", true);
+        assert_eq!(
+            fixture.request_records_for("session.replace").len(),
+            2,
+            "{mode}"
+        );
+    }
+
+    for (mode, marker, expected_token) in [
+        (
+            "recovery_commit_nonterminal",
+            "applied",
+            "corrective_state_mismatch",
+        ),
+        (
+            "recovery_commit_operation_mismatch",
+            "applied",
+            "corrective_operation_id_mismatch",
+        ),
+        (
+            "recovery_commit_recovery_mismatch",
+            "applied",
+            "corrective_recovery_id_mismatch",
+        ),
+        (
+            "recovery_rollback_nonterminal",
+            "applied",
+            "corrective_state_mismatch",
+        ),
+        (
+            "recovery_rollback_operation_mismatch",
+            "applied",
+            "corrective_operation_id_mismatch",
+        ),
+        (
+            "recovery_rollback_recovery_mismatch",
+            "applied",
+            "corrective_recovery_id_mismatch",
+        ),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode(mode);
+        if mode.starts_with("recovery_rollback_") {
+            let db_preimage = fixture.sqlite_snapshot();
+            fixture.replace_db_rows_with_provider_owned_postimage();
+            fixture.seed_provider_owned_v3_pending_replace_journal_with_preimage(
+                "applied",
+                Some(provider_owned_recovery_id().as_str()),
+                db_preimage,
+            );
+        } else {
+            fixture.seed_provider_owned_v3_pending_replace_journal(
+                "not_applied",
+                Some(provider_owned_recovery_id().as_str()),
+            );
+        }
+
+        let error =
+            oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+                fixture.registry_handle(),
+            )
+            .expect_err(mode);
+
+        assert_eq!(
+            error.code(),
+            "operator-recovery-required",
+            "{mode}: {error:?}"
+        );
+        assert_error_token(format!("{error:?}"), expected_token);
+        assert_provider_owned_pending_journal(&fixture, marker, true);
+    }
+}
+
+#[test]
+fn absent_and_unknown_provider_query_states_retain_authority_without_effects() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for (mode, expected_state) in [
+        ("recovery_query_missing_state", "missing_operation_state"),
+        ("recovery_query_unknown_state", "schema_invalid_response"),
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode(mode);
+        fixture.seed_provider_owned_v3_pending_replace_journal(
+            "not_applied",
+            Some(provider_owned_recovery_id().as_str()),
+        );
+        let before_db = fixture.sqlite_snapshot();
+
+        let error =
+            oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+                fixture.registry_handle(),
+            )
+            .expect_err(mode);
+
+        assert_eq!(
+            error.code(),
+            "operator-recovery-required",
+            "{mode}: {error:?}"
+        );
+        assert_error_token(format!("{error:?}"), expected_state);
+        assert_eq!(fixture.sqlite_snapshot(), before_db, "{mode}");
+        assert_provider_owned_pending_journal(&fixture, "not_applied", true);
+        assert_recorded_recovery_actions(&fixture, &["query"]);
     }
 }
 
@@ -2266,6 +2584,209 @@ fn two_provider_owned_recovery_workers_cannot_reconcile_one_journal_concurrently
 }
 
 #[test]
+fn provider_owned_recovery_rereads_journal_after_acquiring_process_authority() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_atomic_before_cleanup");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    let hook = EnvVarGuard::set(
+        "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+        "sleep-recovery-after-lease-ms:250",
+    );
+    let registry = fixture.registry_handle();
+    let worker = std::thread::spawn(move || {
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            registry,
+        )
+    });
+    wait_for_path(
+        &fixture
+            .data_root
+            .join("locks")
+            .join(format!("session-{SESSION_ID}.lock")),
+    );
+    let later_operation_id = "66666666-6666-4666-8666-666666666666";
+    fixture.rewrite_pending_operation_id(later_operation_id);
+
+    worker.join().unwrap().unwrap();
+    drop(hook);
+
+    let requests = fixture.request_records_for("session.replace");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["request"]["params"]["operation_id"],
+        later_operation_id
+    );
+    assert!(fixture.journal_snapshot().is_empty());
+}
+
+#[test]
+fn provider_owned_process_authority_excludes_workers_after_timestamp_lease_expiry() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_atomic_before_cleanup");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    let hook = EnvVarGuard::set(
+        "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+        "sleep-recovery-after-lease-ms:250",
+    );
+    let ttl = EnvVarGuard::set("OULIPOLY_PROVIDER_OWNED_REPLACE_LEASE_TTL_MS", "40");
+    let registry = fixture.registry_handle();
+    let worker = std::thread::spawn(move || {
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            registry,
+        )
+    });
+    wait_for_path(
+        &fixture
+            .data_root
+            .join("locks")
+            .join(format!("session-{SESSION_ID}.lock")),
+    );
+    std::thread::sleep(Duration::from_millis(80));
+
+    let lock = SessionLock::new(&fixture.data_root.join("locks")).unwrap();
+    let timestamp_takeover = lock.acquire(SESSION_ID, PROVIDER_NAME, Duration::from_secs(300));
+    let competing =
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        );
+
+    if let Ok(lease) = &timestamp_takeover {
+        lock.release(SESSION_ID, &lease.token).unwrap();
+    }
+    assert!(
+        matches!(timestamp_takeover, Err(oulipoly_runtime::session_lock::LockError::Busy { ref expires_at, .. }) if expires_at == "process-lifetime"),
+        "every session-lock acquirer must honor live process authority after timestamp expiry: {timestamp_takeover:?}"
+    );
+    assert!(matches!(competing, Err(ReplaceError::SessionBusy { .. })));
+    worker.join().unwrap().unwrap();
+    drop(ttl);
+    drop(hook);
+    assert!(fixture.journal_snapshot().is_empty());
+}
+
+#[test]
+fn provider_owned_process_authority_remains_held_at_terminal_retirement() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_prepared_before_db_apply");
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+    let hook = EnvVarGuard::set(
+        "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+        "sleep-before-retire-ms:250",
+    );
+    let registry = fixture.registry_handle();
+    let worker = std::thread::spawn(move || {
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            registry,
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.request_records_for("session.replace").len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        fixture.request_records_for("session.replace").len(),
+        2,
+        "recovery must reach corrective commit before the retirement barrier"
+    );
+
+    let competing =
+        oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+            fixture.registry_handle(),
+        );
+
+    assert!(matches!(competing, Err(ReplaceError::SessionBusy { .. })));
+    worker.join().unwrap().unwrap();
+    drop(hook);
+    assert!(fixture.journal_snapshot().is_empty());
+}
+
+#[test]
+fn stale_publisher_cannot_replace_a_later_operation_at_the_reused_journal_path() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("replace_provider_owned_prepared_success");
+    let before_db = fixture.sqlite_snapshot();
+    let hook = EnvVarGuard::set(
+        "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK",
+        "sleep-before-db-postimage-ms:1000",
+    );
+    let registry = fixture.registry_handle();
+    let input_path = fixture.input_path.clone();
+    let worker = std::thread::spawn(move || {
+        oulipoly_runtime::session_external_provider::replace_session(
+            Some(&registry),
+            provider_identity(),
+            SESSION_ID,
+            &ReplaceSource::File(input_path),
+            Some(&provider_owned_preimage_sha256()),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.request_records_for("session.replace").is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wait_for_path(&fixture.pending_provider_owned_journal_path());
+    let later_operation_id = "66666666-6666-4666-8666-666666666666";
+    fixture.rewrite_pending_operation_id(later_operation_id);
+
+    let error = worker
+        .join()
+        .unwrap()
+        .expect_err("stale publisher must be fenced");
+    drop(hook);
+
+    assert_eq!(error.code(), "operator-recovery-required");
+    assert_error_token(format!("{error:?}"), "operation changed");
+    assert_eq!(fixture.sqlite_snapshot(), before_db);
+    assert_eq!(
+        fixture.pending_provider_owned_journal()["operation_id"],
+        later_operation_id
+    );
+    assert_eq!(fixture.request_records_for("session.replace").len(), 1);
+}
+
+#[test]
+fn mature_provider_owned_recovery_stays_within_process_authority() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let fixture = DispatchFixture::new();
+    fixture.write_model_file(true);
+    fixture.set_mode("recovery_prepared_before_db_apply");
+    fixture.append_mature_preimage_turns(256);
+    fixture.seed_provider_owned_v3_pending_replace_journal(
+        "not_applied",
+        Some(provider_owned_recovery_id().as_str()),
+    );
+
+    oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+        fixture.registry_handle(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        fixture.sqlite_snapshot().session_turns,
+        expected_provider_owned_replacement_turn_rows()
+    );
+    assert!(fixture.journal_snapshot().is_empty());
+    assert_recorded_recovery_actions(&fixture, &["query", "commit"]);
+}
+
+#[test]
 fn stale_provider_owned_recovery_cannot_overwrite_a_later_same_generation_host_change() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let fixture = DispatchFixture::new();
@@ -2315,6 +2836,45 @@ fn stale_provider_owned_recovery_cannot_overwrite_a_source_only_host_change() {
     assert_eq!(fixture.sqlite_snapshot(), later_state);
     assert_provider_owned_pending_journal(&fixture, "not_applied", true);
     assert_recorded_recovery_actions(&fixture, &["query"]);
+}
+
+#[test]
+fn stale_provider_owned_recovery_compares_in_place_content_and_lineage_fields() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    for field in [
+        "body",
+        "parent_turn_id",
+        "is_sidechain",
+        "is_compaction_boundary",
+    ] {
+        let fixture = DispatchFixture::new();
+        fixture.write_model_file(true);
+        fixture.set_mode("recovery_prepared_before_db_apply");
+        fixture.seed_provider_owned_v3_pending_replace_journal(
+            "not_applied",
+            Some(provider_owned_recovery_id().as_str()),
+        );
+        fixture.mutate_same_generation_turn_field(field);
+        let later_state = fixture.sqlite_snapshot();
+        let later_state_bytes = fs::read(fixture.data_root.join("state.db")).unwrap();
+
+        let error =
+            oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
+                fixture.registry_handle(),
+            )
+            .expect_err(field);
+
+        assert_eq!(error.code(), "operator-recovery-required", "{field}");
+        assert_error_token(format!("{error:?}"), "reconciliation_precondition_mismatch");
+        assert_eq!(fixture.sqlite_snapshot(), later_state, "{field}");
+        assert_eq!(
+            fs::read(fixture.data_root.join("state.db")).unwrap(),
+            later_state_bytes,
+            "recovery must preserve the later State image byte-for-byte: {field}"
+        );
+        assert_provider_owned_pending_journal(&fixture, "not_applied", true);
+        assert_recorded_recovery_actions(&fixture, &["query"]);
+    }
 }
 
 #[test]
@@ -2377,7 +2937,7 @@ fn provider_owned_v3_recovery_provider_unavailable_keeps_journal_without_local_r
         "not_applied",
         Some(provider_owned_recovery_id().as_str()),
     );
-    let before = host_mutation_snapshot(&fixture);
+    let before = (fixture.transcript_bytes(), fixture.sqlite_snapshot());
     session_replace::reset_forbidden_helper_recorder();
 
     let err = oulipoly_runtime::session_external_provider::recover_pending_provider_owned_replaces(
@@ -2386,8 +2946,16 @@ fn provider_owned_v3_recovery_provider_unavailable_keeps_journal_without_local_r
     .expect_err("provider-owned recovery must fail closed when provider is unavailable");
 
     assert_error_token(format!("{err:?}"), "provider_owned_recovery_unavailable");
-    assert_eq!(host_mutation_snapshot(&fixture), before);
+    assert_eq!(
+        (fixture.transcript_bytes(), fixture.sqlite_snapshot()),
+        before
+    );
     assert_provider_owned_pending_journal(&fixture, "not_applied", true);
+    assert!(
+        fixture.pending_provider_owned_journal()["failure_context"]
+            .as_str()
+            .is_some_and(|context| context.contains("provider_owned_recovery_unavailable"))
+    );
     assert_forbidden_helper_counts_zero();
 }
 
@@ -3917,17 +4485,49 @@ def replace_result():
     if params.get("operation_mode") == "recover":
         action = params.get("recovery_action")
         recovery_result = dict(provider_owned_prepared_result)
-        recovery_result["operation_state"] = "prepared"
-        if mode == "recovery_atomic_before_cleanup":
-            recovery_result["operation_state"] = "atomic_committed"
-        if mode == "recovery_rollback_retry":
+        if action == "query":
+            recovery_result["operation_state"] = "prepared"
+            if mode == "recovery_atomic_before_cleanup":
+                recovery_result["operation_state"] = "atomic_committed"
+            if mode in (
+                "recovery_rollback_retry",
+                "recovery_rollback_nonterminal",
+                "recovery_rollback_operation_mismatch",
+                "recovery_rollback_recovery_mismatch",
+            ):
+                recovery_result["operation_state"] = "rolled_back"
+            if mode == "recovery_query_missing_state":
+                recovery_result.pop("operation_state", None)
+            if mode == "recovery_query_unknown_state":
+                recovery_result["operation_state"] = "future_indeterminate"
+        elif action == "commit":
+            recovery_result["operation_state"] = "committed"
+            if mode in ("replace_provider_owned_commit_nonterminal", "recovery_commit_nonterminal"):
+                recovery_result["operation_state"] = "prepared"
+            if mode in ("replace_provider_owned_commit_operation_mismatch", "recovery_commit_operation_mismatch"):
+                recovery_result["operation_id"] = "77777777-7777-4777-8777-777777777777"
+            if mode in ("replace_provider_owned_commit_recovery_mismatch", "recovery_commit_recovery_mismatch"):
+                recovery_result["recovery_id"] = "88888888-8888-4888-8888-888888888888"
+        elif action == "rollback":
             recovery_result["operation_state"] = "rolled_back"
+            if mode == "recovery_rollback_nonterminal":
+                recovery_result["operation_state"] = "prepared"
+            if mode == "recovery_rollback_operation_mismatch":
+                recovery_result["operation_id"] = "77777777-7777-4777-8777-777777777777"
+            if mode == "recovery_rollback_recovery_mismatch":
+                recovery_result["recovery_id"] = "88888888-8888-4888-8888-888888888888"
         if mode == "recovery_provider_unavailable":
             return error("provider_owned_recovery_unavailable", "unavailable")
         return envelope(recovery_result)
     if mode == "replace_provider_owned_success":
         return envelope(provider_owned_result)
     if mode == "replace_provider_owned_prepared_success":
+        return envelope(provider_owned_prepared_result)
+    if mode in (
+        "replace_provider_owned_commit_nonterminal",
+        "replace_provider_owned_commit_operation_mismatch",
+        "replace_provider_owned_commit_recovery_mismatch",
+    ):
         return envelope(provider_owned_prepared_result)
     if mode == "replace_provider_owned_observe_pending_journal":
         observe_pending_journal()
@@ -3957,6 +4557,10 @@ def replace_result():
         broken = dict(provider_owned_result)
         broken.pop("recovery_id", None)
         return envelope(broken)
+    if mode == "replace_provider_owned_mutate_then_malformed_json":
+        pathlib.Path({transcript_path}).write_bytes(native_data)
+        print("{{")
+        raise SystemExit(0)
     if mode == "replace_missing_observed_preimage":
         broken = dict(provider_owned_result)
         broken.pop("preimage_sha256_observed", None)

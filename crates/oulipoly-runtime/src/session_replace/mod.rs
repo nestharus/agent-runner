@@ -12,7 +12,7 @@
 //! ```
 
 use crate::session_export::{self as export, ContentChunk, ExportError, ExportSessionMetadata};
-use crate::session_lock::{Lease, LockError, SessionLock};
+use crate::session_lock::{Lease, LockError, ProcessAuthority, SessionLock};
 use crate::session_metadata::{
     MetadataError, SessionMetadata, SessionStorageType, TranscriptState, locate_session_metadata,
 };
@@ -128,6 +128,9 @@ pub enum ReplaceError {
         token: String,
         expires_at: String,
     },
+    SessionLockSentinelBusy {
+        timeout_ms: u64,
+    },
     SchemaIncompatible {
         reason: String,
     },
@@ -155,7 +158,7 @@ impl ReplaceError {
             ReplaceError::SessionNotFound { .. } => 10,
             ReplaceError::AmbiguousSession { .. } => 11,
             ReplaceError::UnsupportedStorage { .. } => 12,
-            ReplaceError::SessionBusy { .. } => 13,
+            ReplaceError::SessionBusy { .. } | ReplaceError::SessionLockSentinelBusy { .. } => 13,
             ReplaceError::SchemaIncompatible { .. } => 14,
             ReplaceError::InvalidInputTranscript { .. } | ReplaceError::PreimageMismatch { .. } => {
                 15
@@ -173,6 +176,7 @@ impl ReplaceError {
             ReplaceError::AmbiguousSession { .. } => "ambiguous-session",
             ReplaceError::UnsupportedStorage { .. } => "unsupported-storage",
             ReplaceError::SessionBusy { .. } => "session-busy",
+            ReplaceError::SessionLockSentinelBusy { .. } => "session-lock-sentinel-busy",
             ReplaceError::SchemaIncompatible { .. } => "schema-incompatible",
             ReplaceError::InvalidInputTranscript { .. } => "invalid-input-transcript",
             ReplaceError::PreimageMismatch { .. } => "preimage-mismatch",
@@ -200,6 +204,9 @@ impl ReplaceError {
             }
             ReplaceError::SessionBusy { token, expires_at } => {
                 json!({"error": {"code": self.code(), "token": token, "expires_at": expires_at}})
+            }
+            ReplaceError::SessionLockSentinelBusy { timeout_ms } => {
+                json!({"error": {"code": self.code(), "timeout_ms": timeout_ms, "retryable": true}})
             }
             ReplaceError::InvalidSessionId { input }
             | ReplaceError::SessionNotFound { input }
@@ -246,6 +253,9 @@ fn map_lock_error(err: LockError) -> ReplaceError {
         LockError::LockExpired => ReplaceError::OperationalError {
             message: "lock expired during import-replace".to_string(),
         },
+        LockError::SentinelBusy { timeout_ms } => {
+            ReplaceError::SessionLockSentinelBusy { timeout_ms }
+        }
         LockError::Operational { message } => ReplaceError::OperationalError { message },
     }
 }
@@ -274,6 +284,7 @@ struct ImportReplaceLease<'a> {
     lock: &'a SessionLock,
     session_id: String,
     lease: Option<Lease>,
+    process_authority: Option<ProcessAuthority>,
 }
 
 impl<'a> ImportReplaceLease<'a> {
@@ -283,6 +294,7 @@ impl<'a> ImportReplaceLease<'a> {
                 .release(&self.session_id, &lease.token)
                 .map_err(map_lock_error)?;
         }
+        self.process_authority = None;
         Ok(())
     }
 }
@@ -292,6 +304,7 @@ impl Drop for ImportReplaceLease<'_> {
         if let Some(lease) = self.lease.take() {
             let _ = self.lock.release(&self.session_id, &lease.token);
         }
+        self.process_authority = None;
     }
 }
 
@@ -642,7 +655,7 @@ fn acquire_import_replace_lease<'a>(
     metadata: &SessionMetadata,
     workspace: &ReplaceJournalWorkspace,
 ) -> Result<ImportReplaceLease<'a>, ReplaceError> {
-    let lease = match lock.acquire(
+    let (process_authority, lease) = match lock.acquire_with_process_authority(
         &metadata.session_id,
         &metadata.provider_name,
         Duration::from_secs(300),
@@ -657,6 +670,7 @@ fn acquire_import_replace_lease<'a>(
         lock,
         session_id: metadata.session_id.clone(),
         lease: Some(lease),
+        process_authority: Some(process_authority),
     })
 }
 

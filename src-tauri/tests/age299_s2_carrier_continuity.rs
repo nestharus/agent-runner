@@ -8,6 +8,8 @@
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::{InvocationStatus, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -306,7 +308,12 @@ fn dropping_a_carrier_before_registration_releases_its_provider() {
 
 #[test]
 fn all_success_carriers_refuse_damaged_sidecar_then_finalize_retained_outcome_after_restoration() {
-    for carrier in [Carrier::Balancing, Carrier::Repl, Carrier::Resume] {
+    for carrier in [
+        Carrier::Balancing,
+        Carrier::Repl,
+        Carrier::DefaultProviderRepl,
+        Carrier::Resume,
+    ] {
         let (fixture, child, invocation_uuid) = prepare_registered_carrier(carrier);
 
         let sidecar = MailboxDb::path_for_state_db(&fixture.state_path());
@@ -455,11 +462,30 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
             fs::read_to_string(&fixture.child_env),
         );
     }
-    let child_env = fs::read_to_string(&fixture.child_env).unwrap();
-    let mut env_lines = child_env.lines();
-    let invocation_uuid = env_lines.next().unwrap().to_string();
-    assert_eq!(env_lines.next(), Some("64"), "{carrier:?}: {child_env}");
-    assert_eq!(env_lines.next(), Some("false"), "{carrier:?}: {child_env}");
+    let child_env: Value = serde_json::from_slice(&fs::read(&fixture.child_env).unwrap()).unwrap();
+    let parent_identity = &child_env["parent_identity"];
+    let invocation_uuid = parent_identity["id"].as_str().unwrap().to_string();
+    let completion_authority = child_env["completion_registration_authority"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        parent_identity,
+        &json!({"source": PROVIDER, "id": invocation_uuid}),
+        "{carrier:?}: {child_env}"
+    );
+    assert!(
+        parent_identity
+            .get(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
+            .is_none(),
+        "{carrier:?}: {child_env}"
+    );
+    assert!(
+        !serde_json::to_string(parent_identity)
+            .unwrap()
+            .contains(completion_authority),
+        "{carrier:?}: {child_env}"
+    );
+    assert_eq!(completion_authority.len(), 64, "{carrier:?}: {child_env}");
 
     let state = StateDb::open(&fixture.state_path()).unwrap();
     let running = state
@@ -467,6 +493,24 @@ fn prepare_registered_carrier(carrier: Carrier) -> (Fixture, CarrierChild, Strin
         .unwrap()
         .unwrap();
     assert_eq!(running.status, InvocationStatus::Running, "{carrier:?}");
+    let expected_authority_digest = {
+        let mut digest = Sha256::new();
+        digest.update(b"oulipoly-completion-registration-authority-v1");
+        digest.update(completion_authority.as_bytes());
+        format!("{:x}", digest.finalize())
+    };
+    let stored_authority_digest: String = state
+        .connection()
+        .query_row(
+            "SELECT completion_registration_capability_digest FROM invocations WHERE invocation_uuid = ?1",
+            [&invocation_uuid],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_authority_digest, expected_authority_digest,
+        "the dedicated authority environment must carry the exact generated capability"
+    );
     if !matches!(carrier, Carrier::DefaultProviderRepl)
         && running.provider_session_id.as_deref() != Some(SESSION_ID)
     {
@@ -629,10 +673,15 @@ case "${{1-}}" in
 esac
 trap 'touch {provider_exited:?}' EXIT
 mkdir -p {state_dir:?}
+python3 - {child_env:?} <<'PY'
+import json, os, sys
+with open(sys.argv[1], "w") as target:
+    json.dump({{
+        "parent_identity": json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"]),
+        "completion_registration_authority": os.environ["OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY"],
+    }}, target)
+PY
 invocation_uuid="$(python3 -c 'import json,os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
-authority_len="${{#OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY}}"
-identity_has_authority="$(python3 -c 'import json,os; print(str("completion_registration_authority" in json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])).lower())')"
-printf '%s\n%s\n%s\n' "$invocation_uuid" "$authority_len" "$identity_has_authority" > {child_env:?}
 python3 - "$invocation_uuid" {meta:?} <<'PY'
 import json, sys
 with open(sys.argv[2], "w") as target:

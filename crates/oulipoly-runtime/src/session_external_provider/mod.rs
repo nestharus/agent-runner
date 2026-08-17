@@ -42,7 +42,7 @@ mod service_error_mapper;
 use crate::provider_registry::ProviderRegistryHandle;
 use crate::services::SessionServiceExternalProviderIdentity;
 use crate::session_export::ExportError;
-use crate::session_lock::{Lease, LockError, SessionLock};
+use crate::session_lock::{Lease, LockError, ProcessAuthority, SessionLock};
 use crate::session_replace::{
     ProviderReplaceDbPreimage, ProviderReplaceDbTarget, ReplaceError, ReplaceReceipt, ReplaceSource,
 };
@@ -55,10 +55,13 @@ use uuid::Uuid;
 
 const PROVIDER_OWNED_JOURNAL_OPERATION: &str = "provider-owned-import-replace";
 const PROVIDER_OWNED_TEST_HOOK_ENV: &str = "OULIPOLY_PROVIDER_OWNED_REPLACE_TEST_HOOK";
+const PROVIDER_OWNED_LEASE_TTL_ENV: &str = "OULIPOLY_PROVIDER_OWNED_REPLACE_LEASE_TTL_MS";
 const TEST_STOP_AFTER_RECOVERY_ID: &str = "stop-after-recovery-id-journal-update";
 const TEST_STOP_AFTER_DB_APPLY_MARKER: &str = "stop-after-db-apply-marker";
 const TEST_FAIL_JOURNAL_REMOVE: &str = "fail-provider-owned-journal-remove";
 const TEST_SLEEP_RECOVERY_AFTER_LEASE_PREFIX: &str = "sleep-recovery-after-lease-ms:";
+const TEST_SLEEP_BEFORE_DB_POSTIMAGE_PREFIX: &str = "sleep-before-db-postimage-ms:";
+const TEST_SLEEP_BEFORE_RETIRE_PREFIX: &str = "sleep-before-retire-ms:";
 const PROVIDER_OWNED_RECONCILIATION_PENDING: &str = "pending";
 const PROVIDER_OWNED_RECONCILIATION_CLEANUP_ONLY: &str = "cleanup_only";
 
@@ -151,11 +154,17 @@ pub fn replace_session(
                 return Err(pending_journal.retire_after_error(mapped));
             }
         };
+    pending_journal.require_current()?;
     let result = match client_invoker::invoke_replace(&client, request) {
         Ok(result) => result,
         Err(error) => {
+            let indeterminate = error.is_host_transport_or_protocol();
             let mapped = service_error_mapper::replace_client_error(error);
-            return Err(pending_journal.retire_after_error(mapped));
+            return Err(if indeterminate {
+                pending_journal.retain_after_error(mapped)
+            } else {
+                pending_journal.retire_after_error(mapped)
+            });
         }
     };
     if !result.changed {
@@ -166,7 +175,13 @@ pub fn replace_session(
         ));
     }
     if let Some(recovery_id) = result.recovery_id.as_deref() {
-        pending_journal.update_recovery_id(recovery_id)?;
+        if let Err(error) = pending_journal.update_recovery_id(recovery_id) {
+            return Err(pending_journal.retain_after_error(ReplaceError::OperationalError {
+                message: format!(
+                    "failed to persist observed provider recovery identity {recovery_id:?}: {error:?}"
+                ),
+            }));
+        }
         maybe_provider_owned_test_hook(TEST_STOP_AFTER_RECOVERY_ID)?;
     }
     let accepted = match replace_result_mapper::validate_changed_replace_result(
@@ -174,44 +189,46 @@ pub fn replace_session(
     ) {
         Ok(accepted) => accepted,
         Err(error) => {
-            let lacks_recovery_identity = matches!(
-                error.token,
-                "missing_operation_id" | "operation_id_mismatch" | "missing_recovery_id"
-            );
             let mapped = service_error_mapper::replace_adapter_error(error);
-            if lacks_recovery_identity || result.recovery_id.is_none() {
-                return Err(pending_journal.retire_after_error(mapped));
-            }
-            return Err(mapped);
+            return Err(pending_journal.retain_after_error(mapped));
         }
     };
-    validate_accepted_host_state_consistency(&accepted)?;
-    let journal = pending_journal.record_db_postimage(&accepted.records, &accepted.source_id)?;
-    let receipt = replace_host_apply::apply_provider_owned_replace_to_target(
+    if let Err(error) = validate_accepted_host_state_consistency(&accepted) {
+        return Err(pending_journal.retain_after_error(error));
+    }
+    maybe_sleep_provider_owned_test_hook(TEST_SLEEP_BEFORE_DB_POSTIMAGE_PREFIX)?;
+    let journal = match pending_journal.record_db_postimage(&accepted.records, &accepted.source_id)
+    {
+        Ok(journal) => journal,
+        Err(error) => return Err(pending_journal.retain_after_error(error)),
+    };
+    pending_journal.require_current()?;
+    let receipt = match replace_host_apply::apply_provider_owned_replace_to_target(
         &identity,
         session_id,
         &accepted,
         &pending_journal.db_target,
         &provider_owned_admissible_db_states(&journal),
     )
-    .map_err(|error| {
-        map_provider_owned_reconciliation_error(&pending_journal.pending_path, error)
-    })?;
-    pending_journal.mark_db_applied()?;
+    .map_err(|error| map_provider_owned_reconciliation_error(&pending_journal.pending_path, error))
+    {
+        Ok(receipt) => receipt,
+        Err(error) => return Err(pending_journal.retain_after_error(error)),
+    };
+    if let Err(error) = pending_journal.mark_db_applied() {
+        return Err(pending_journal.retain_after_error(error));
+    }
     maybe_provider_owned_test_hook(TEST_STOP_AFTER_DB_APPLY_MARKER)?;
     if accepted.operation_state == "prepared" {
-        let request = request_builder::build_recovery_replace_request_with_input(
+        send_provider_owned_recovery_action(
+            &client,
             &identity,
-            session_id,
-            &accepted.operation_id,
-            Some(&accepted.recovery_id),
+            &journal,
+            &pending_journal.pending_path,
+            pending_journal.authority()?,
             "commit",
             Some(&input),
-            request_id_formatter::session_request_id("replace"),
-        )
-        .map_err(service_error_mapper::replace_adapter_error)?;
-        client_invoker::invoke_replace(&client, request)
-            .map_err(service_error_mapper::replace_client_error)?;
+        )?;
     }
     pending_journal.retire()?;
     pending_journal.release_lease()?;
@@ -239,7 +256,7 @@ pub fn recover_pending_provider_owned_replaces(
             PROVIDER_OWNED_JOURNAL_OPERATION,
         )?;
         maybe_sleep_provider_owned_recovery_after_lease()?;
-        recover_provider_owned_journal_candidate(registry.as_ref(), &path, &session_id)?;
+        recover_provider_owned_journal_candidate(registry.as_ref(), &path, &session_id, &lease)?;
         lease.release()?;
     }
     Ok(())
@@ -249,7 +266,9 @@ fn recover_provider_owned_journal_candidate(
     registry: &crate::provider_registry::ProviderRegistry,
     path: &Path,
     leased_session_id: &str,
+    lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<(), ReplaceError> {
+    lease.require_active()?;
     let bytes = read_provider_owned_pending_bytes(path)?;
     let header = parse_provider_owned_journal_header(path, &bytes)?;
     if header.operation != PROVIDER_OWNED_JOURNAL_OPERATION {
@@ -284,7 +303,7 @@ fn recover_provider_owned_journal_candidate(
         ));
     }
     if journal.reconciliation_state == PROVIDER_OWNED_RECONCILIATION_CLEANUP_ONLY {
-        return retire_provider_owned_journal(path, &journal);
+        return retire_provider_owned_journal(path, &journal, lease);
     }
     if journal.reconciliation_state != PROVIDER_OWNED_RECONCILIATION_PENDING {
         return Err(operator_recovery_required(
@@ -295,21 +314,32 @@ fn recover_provider_owned_journal_candidate(
             ),
         ));
     }
-    recover_provider_owned_journal(registry, path, journal)
+    recover_provider_owned_journal(registry, path, journal, lease)
 }
 
 fn recover_provider_owned_journal(
     registry: &crate::provider_registry::ProviderRegistry,
     path: &Path,
     mut journal: ProviderOwnedReplaceJournal,
+    lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<(), ReplaceError> {
     let identity = map_provider_owned_journal_identity(&journal);
-    let client = provider_registry_accessor::provider_client_for_model(registry, &identity)
+    let client = match provider_registry_accessor::provider_client_for_model(registry, &identity)
         .map_err(|error| ReplaceError::OperationalError {
             message: format!("provider_owned_recovery_unavailable: {error}"),
-        })?;
+        }) {
+        Ok(client) => client,
+        Err(error) => {
+            return Err(retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                format!("{error:?}"),
+            ));
+        }
+    };
     let recovery_input = debug_recovery_canonical_input(&journal.session_id)?;
-    let query = request_builder::build_recovery_replace_request_with_input(
+    let query = match request_builder::build_recovery_replace_request_with_input(
         &identity,
         &journal.session_id,
         &journal.operation_id,
@@ -318,38 +348,133 @@ fn recover_provider_owned_journal(
         recovery_input.as_ref(),
         request_id_formatter::session_request_id("replace"),
     )
-    .map_err(service_error_mapper::replace_adapter_error)?;
-    let query_result = client_invoker::invoke_replace(&client, query).map_err(|error| {
-        ReplaceError::OperationalError {
-            message: format!("provider_owned_recovery_unavailable: {error}"),
+    .map_err(service_error_mapper::replace_adapter_error)
+    {
+        Ok(query) => query,
+        Err(error) => {
+            return Err(retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                format!("failed to build provider recovery query: {error:?}"),
+            ));
         }
-    })?;
-    let state = query_result
-        .operation_state
-        .as_deref()
-        .unwrap_or("prepared");
-    let accepted = validate_provider_owned_recovery_evidence(
+    };
+    lease.require_current_journal(path, &journal.operation_id)?;
+    let query_result = match client_invoker::invoke_replace(&client, query) {
+        Ok(result) => result,
+        Err(error) => {
+            let context = format!("provider_owned_recovery_unavailable: {error}");
+            return Err(retain_provider_owned_failure(
+                path, &journal, lease, context,
+            ));
+        }
+    };
+    let state = match query_result.operation_state.as_deref() {
+        Some(state @ ("prepared" | "committed" | "atomic_committed" | "rolled_back")) => {
+            state.to_string()
+        }
+        Some(state) => {
+            return Err(retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                format!("unsupported provider query operation_state {state:?}"),
+            ));
+        }
+        None => {
+            return Err(retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                "missing_operation_state in provider query response".to_string(),
+            ));
+        }
+    };
+    let accepted = match validate_provider_owned_recovery_evidence(
         &identity,
         &journal,
         &query_result,
         recovery_input.as_ref(),
-    )?;
-    validate_accepted_host_state_consistency(&accepted)?;
+    ) {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            return Err(retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                format!("invalid provider query evidence: {error:?}"),
+            ));
+        }
+    };
+    if let Some(expected_recovery_id) = journal.recovery_id.as_deref()
+        && accepted.recovery_id != expected_recovery_id
+    {
+        return Err(retain_provider_owned_failure(
+            path,
+            &journal,
+            lease,
+            format!(
+                "provider query recovery_id_mismatch: expected {expected_recovery_id:?}, observed {:?}",
+                accepted.recovery_id
+            ),
+        ));
+    }
+    if journal.recovery_id.is_none() {
+        journal.recovery_id = Some(accepted.recovery_id.clone());
+        write_provider_owned_journal(
+            path,
+            &journal,
+            "fail-recovery-id-journal-replace",
+            Some(&journal.operation_id),
+            lease,
+        )
+        .map_err(|error| {
+            retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                format!(
+                    "failed to persist observed provider recovery identity {:?}: {error:?}",
+                    journal.recovery_id
+                ),
+            )
+        })?;
+    }
+    if let Err(error) = validate_accepted_host_state_consistency(&accepted) {
+        return Err(retain_provider_owned_failure(
+            path,
+            &journal,
+            lease,
+            format!("invalid provider host state evidence: {error:?}"),
+        ));
+    }
     let postimage = crate::session_replace::provider_replace_db_postimage(
         &map_provider_owned_journal_db_target(&journal),
         &accepted.records,
         &accepted.source_id,
-    )?;
-    journal = publish_provider_owned_db_postimage(path, &journal, postimage)?;
+    )
+    .map_err(|error| retain_provider_owned_failure(path, &journal, lease, format!("{error:?}")))?;
+    journal =
+        publish_provider_owned_db_postimage(path, &journal, postimage, lease).map_err(|error| {
+            retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
+        })?;
     let admissible = provider_owned_admissible_db_states(&journal);
-    match state {
+    match state.as_str() {
         "rolled_back" => {
+            lease.require_current_journal(path, &journal.operation_id)?;
             restore_provider_owned_db_from_journal(&journal, &admissible)
-                .map_err(|error| map_provider_owned_reconciliation_error(path, error))?;
-            send_provider_owned_recovery_action(&client, &identity, &journal, "rollback", None)?;
-            retire_provider_owned_journal(path, &journal)?;
+                .map_err(|error| map_provider_owned_reconciliation_error(path, error))
+                .map_err(|error| {
+                    retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
+                })?;
+            send_provider_owned_recovery_action(
+                &client, &identity, &journal, path, lease, "rollback", None,
+            )?;
+            retire_provider_owned_journal(path, &journal, lease)?;
         }
         "prepared" => {
+            lease.require_current_journal(path, &journal.operation_id)?;
             replace_host_apply::apply_provider_owned_replace_to_target(
                 &identity,
                 &journal.session_id,
@@ -357,19 +482,34 @@ fn recover_provider_owned_journal(
                 &map_provider_owned_journal_db_target(&journal),
                 &admissible,
             )
-            .map_err(|error| map_provider_owned_reconciliation_error(path, error))?;
-            mark_provider_owned_journal_path(path, "applied", journal.recovery_id.as_deref())?;
+            .map_err(|error| map_provider_owned_reconciliation_error(path, error))
+            .map_err(|error| {
+                retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
+            })?;
+            mark_provider_owned_journal_path(
+                path,
+                "applied",
+                journal.recovery_id.as_deref(),
+                &journal.operation_id,
+                lease,
+            )
+            .map_err(|error| {
+                retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
+            })?;
             send_provider_owned_recovery_action(
                 &client,
                 &identity,
                 &journal,
+                path,
+                lease,
                 "commit",
                 recovery_input.as_ref(),
             )?;
             journal.db_apply_marker = "applied".to_string();
-            retire_provider_owned_journal(path, &journal)?;
+            retire_provider_owned_journal(path, &journal, lease)?;
         }
         "atomic_committed" | "committed" => {
+            lease.require_current_journal(path, &journal.operation_id)?;
             replace_host_apply::apply_provider_owned_replace_to_target(
                 &identity,
                 &journal.session_id,
@@ -377,23 +517,24 @@ fn recover_provider_owned_journal(
                 &map_provider_owned_journal_db_target(&journal),
                 &admissible,
             )
-            .map_err(|error| map_provider_owned_reconciliation_error(path, error))?;
-            mark_provider_owned_journal_path(path, "applied", journal.recovery_id.as_deref())?;
+            .map_err(|error| map_provider_owned_reconciliation_error(path, error))
+            .map_err(|error| {
+                retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
+            })?;
+            mark_provider_owned_journal_path(
+                path,
+                "applied",
+                journal.recovery_id.as_deref(),
+                &journal.operation_id,
+                lease,
+            )
+            .map_err(|error| {
+                retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
+            })?;
             journal.db_apply_marker = "applied".to_string();
-            retire_provider_owned_journal(path, &journal)?;
+            retire_provider_owned_journal(path, &journal, lease)?;
         }
-        _ => {
-            restore_provider_owned_db_from_journal(&journal, &admissible)
-                .map_err(|error| map_provider_owned_reconciliation_error(path, error))?;
-            send_provider_owned_recovery_action(
-                &client,
-                &identity,
-                &journal,
-                "rollback",
-                recovery_input.as_ref(),
-            )?;
-            retire_provider_owned_journal(path, &journal)?;
-        }
+        _ => unreachable!("query state was recognized before reconciliation"),
     }
     Ok(())
 }
@@ -402,15 +543,26 @@ fn send_provider_owned_recovery_action(
     client: &oulipoly_provider::client::ProviderClient,
     identity: &identity::ExternalSessionIdentity,
     journal: &ProviderOwnedReplaceJournal,
+    path: &Path,
+    lease: &ProviderOwnedReplaceLease<'_>,
     action: &str,
     input: Option<&replace_input_mapper::PreparedReplaceInput>,
 ) -> Result<(), ReplaceError> {
+    let recovery_id = journal.recovery_id.as_deref().ok_or_else(|| {
+        operator_recovery_required(
+            path,
+            format!(
+                "provider-owned operation {:?} has no recovery identity for corrective {action}",
+                journal.operation_id
+            ),
+        )
+    })?;
     let request = if let Some(input) = input {
         request_builder::build_recovery_replace_request_with_input(
             identity,
             &journal.session_id,
             &journal.operation_id,
-            journal.recovery_id.as_deref(),
+            Some(recovery_id),
             action,
             Some(input),
             request_id_formatter::session_request_id("replace"),
@@ -420,15 +572,81 @@ fn send_provider_owned_recovery_action(
             identity,
             &journal.session_id,
             &journal.operation_id,
-            journal.recovery_id.as_deref(),
+            Some(recovery_id),
             action,
             request_id_formatter::session_request_id("replace"),
         )
     }
-    .map_err(service_error_mapper::replace_adapter_error)?;
-    client_invoker::invoke_replace(client, request)
-        .map(|_| ())
-        .map_err(service_error_mapper::replace_client_error)
+    .map_err(service_error_mapper::replace_adapter_error);
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            return Err(retain_provider_owned_failure(
+                path,
+                journal,
+                lease,
+                format!("failed to build provider corrective {action}: {error:?}"),
+            ));
+        }
+    };
+    lease.require_current_journal(path, &journal.operation_id)?;
+    let result = match client_invoker::invoke_replace(client, request) {
+        Ok(result) => result,
+        Err(error) => {
+            let journal = lease.require_current_journal(path, &journal.operation_id)?;
+            return Err(retain_provider_owned_failure(
+                path,
+                &journal,
+                lease,
+                format!("provider corrective {action} failed: {error}"),
+            ));
+        }
+    };
+    if result.operation_id.as_deref() != Some(journal.operation_id.as_str()) {
+        let current_journal = lease.require_current_journal(path, &journal.operation_id)?;
+        return Err(retain_provider_owned_failure(
+            path,
+            &current_journal,
+            lease,
+            format!(
+                "corrective_operation_id_mismatch: expected {:?}, observed {:?}",
+                journal.operation_id, result.operation_id
+            ),
+        ));
+    }
+    if result.recovery_id.as_deref() != Some(recovery_id) {
+        let current_journal = lease.require_current_journal(path, &journal.operation_id)?;
+        return Err(retain_provider_owned_failure(
+            path,
+            &current_journal,
+            lease,
+            format!(
+                "corrective_recovery_id_mismatch: expected {recovery_id:?}, observed {:?}",
+                result.recovery_id
+            ),
+        ));
+    }
+    let terminal = match action {
+        "commit" => matches!(
+            result.operation_state.as_deref(),
+            Some("committed" | "atomic_committed")
+        ),
+        "rollback" => result.operation_state.as_deref() == Some("rolled_back"),
+        _ => false,
+    };
+    if !terminal {
+        let current_journal = lease.require_current_journal(path, &journal.operation_id)?;
+        return Err(retain_provider_owned_failure(
+            path,
+            &current_journal,
+            lease,
+            format!(
+                "corrective_state_mismatch: action {action:?} observed nonterminal state {:?}",
+                result.operation_state
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn debug_recovery_canonical_input(
@@ -473,16 +691,15 @@ fn validate_provider_owned_recovery_evidence(
     result: &oulipoly_provider::generated::SessionReplaceResult,
     recovery_input: Option<&replace_input_mapper::PreparedReplaceInput>,
 ) -> Result<replace_result_mapper::AcceptedProviderOwnedReplaceEvidence, ReplaceError> {
-    let input = recovery_input
+    let mut input = recovery_input
         .cloned()
         .unwrap_or_else(|| recovery_input_from_result(journal, result));
-    let mut evidence = result.clone();
-    evidence.operation_state = Some("prepared".to_string());
-    replace_result_mapper::validate_changed_replace_result(
+    input.operation_id = journal.operation_id.clone();
+    replace_result_mapper::validate_recovery_replace_result(
         identity,
         &journal.session_id,
         &input,
-        &evidence,
+        result,
     )
     .map_err(service_error_mapper::replace_adapter_error)
 }
@@ -747,6 +964,8 @@ struct ProviderOwnedReplaceJournal {
     db_postimage: Option<ProviderReplaceDbPreimage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_context: Option<String>,
 }
 
 fn provider_owned_pending_reconciliation_state() -> String {
@@ -756,6 +975,7 @@ fn provider_owned_pending_reconciliation_state() -> String {
 struct ProviderOwnedReplaceLease<'a> {
     lock: &'a SessionLock,
     lease: Option<Lease>,
+    process_authority: Option<ProcessAuthority>,
 }
 
 impl<'a> ProviderOwnedReplaceLease<'a> {
@@ -764,13 +984,39 @@ impl<'a> ProviderOwnedReplaceLease<'a> {
         session_id: &str,
         provider_name: &str,
     ) -> Result<Self, ReplaceError> {
-        let lease = lock
-            .acquire(session_id, provider_name, Duration::from_secs(300))
+        let (process_authority, lease) = lock
+            .acquire_with_process_authority(session_id, provider_name, provider_owned_lease_ttl()?)
             .map_err(map_provider_lock_error)?;
         Ok(Self {
             lock,
             lease: Some(lease),
+            process_authority: Some(process_authority),
         })
+    }
+
+    fn require_active(&self) -> Result<(), ReplaceError> {
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or_else(|| ReplaceError::OperationalError {
+                message: "provider-owned process authority was already released".to_string(),
+            })?;
+        self.process_authority
+            .as_ref()
+            .ok_or_else(|| ReplaceError::OperationalError {
+                message: "provider-owned process authority is absent".to_string(),
+            })?
+            .require_session(&lease.session_id)
+            .map_err(map_provider_lock_error)
+    }
+
+    fn require_current_journal(
+        &self,
+        path: &Path,
+        operation_id: &str,
+    ) -> Result<ProviderOwnedReplaceJournal, ReplaceError> {
+        self.require_active()?;
+        read_matching_provider_owned_journal(path, operation_id)
     }
 
     fn release(mut self) -> Result<(), ReplaceError> {
@@ -780,6 +1026,7 @@ impl<'a> ProviderOwnedReplaceLease<'a> {
                 .map_err(map_provider_lock_error)?;
             self.lease = None;
         }
+        self.process_authority = None;
         Ok(())
     }
 }
@@ -789,12 +1036,14 @@ impl Drop for ProviderOwnedReplaceLease<'_> {
         if let Some(lease) = self.lease.take() {
             let _ = self.lock.release(&lease.session_id, &lease.token);
         }
+        self.process_authority = None;
     }
 }
 
 struct ProviderOwnedJournalPublication<'a> {
     pending_path: PathBuf,
     db_target: ProviderReplaceDbTarget,
+    operation_id: String,
     lease: Option<ProviderOwnedReplaceLease<'a>>,
 }
 
@@ -836,27 +1085,41 @@ impl<'a> ProviderOwnedJournalPublication<'a> {
             db_preimage,
             db_postimage: None,
             recovery_id: None,
+            failure_context: None,
         };
-        write_provider_owned_journal(&pending_path, &journal, "fail-initial-journal-replace")?;
+        write_provider_owned_journal(
+            &pending_path,
+            &journal,
+            "fail-initial-journal-replace",
+            None,
+            &lease,
+        )?;
         Ok(Self {
             pending_path,
             db_target,
+            operation_id: operation_id.to_string(),
             lease: Some(lease),
         })
     }
 
     fn update_recovery_id(&self, recovery_id: &str) -> Result<(), ReplaceError> {
-        let mut journal = read_provider_owned_journal(&self.pending_path)?;
+        let lease = self.authority()?;
+        let mut journal =
+            lease.require_current_journal(&self.pending_path, &self.operation_id()?)?;
         journal.recovery_id = Some(recovery_id.to_string());
         write_provider_owned_journal(
             &self.pending_path,
             &journal,
             "fail-recovery-id-journal-replace",
+            Some(&journal.operation_id),
+            lease,
         )
     }
 
     fn mark_db_applied(&self) -> Result<(), ReplaceError> {
-        mark_provider_owned_journal_path(&self.pending_path, "applied", None)
+        let lease = self.authority()?;
+        let operation_id = self.operation_id()?;
+        mark_provider_owned_journal_path(&self.pending_path, "applied", None, &operation_id, lease)
     }
 
     fn record_db_postimage(
@@ -869,13 +1132,15 @@ impl<'a> ProviderOwnedJournalPublication<'a> {
             records,
             source_file,
         )?;
-        let journal = read_provider_owned_journal(&self.pending_path)?;
-        publish_provider_owned_db_postimage(&self.pending_path, &journal, postimage)
+        let lease = self.authority()?;
+        let journal = lease.require_current_journal(&self.pending_path, &self.operation_id()?)?;
+        publish_provider_owned_db_postimage(&self.pending_path, &journal, postimage, lease)
     }
 
     fn retire(&self) -> Result<(), ReplaceError> {
-        let journal = read_provider_owned_journal(&self.pending_path)?;
-        retire_provider_owned_journal(&self.pending_path, &journal)
+        let lease = self.authority()?;
+        let journal = lease.require_current_journal(&self.pending_path, &self.operation_id()?)?;
+        retire_provider_owned_journal(&self.pending_path, &journal, lease)
     }
 
     fn retire_after_error(&self, original: ReplaceError) -> ReplaceError {
@@ -888,6 +1153,39 @@ impl<'a> ProviderOwnedJournalPublication<'a> {
                 ),
             ),
         }
+    }
+
+    fn retain_after_error(&self, original: ReplaceError) -> ReplaceError {
+        let lease = match self.authority() {
+            Ok(lease) => lease,
+            Err(error) => return error,
+        };
+        let journal = match lease.require_current_journal(&self.pending_path, &self.operation_id) {
+            Ok(journal) => journal,
+            Err(error) => return error,
+        };
+        retain_provider_owned_failure(&self.pending_path, &journal, lease, format!("{original:?}"))
+    }
+
+    fn require_current(&self) -> Result<ProviderOwnedReplaceJournal, ReplaceError> {
+        let operation_id = self.operation_id()?;
+        self.authority()?
+            .require_current_journal(&self.pending_path, &operation_id)
+    }
+
+    fn operation_id(&self) -> Result<String, ReplaceError> {
+        Ok(self.operation_id.clone())
+    }
+
+    fn authority(&self) -> Result<&ProviderOwnedReplaceLease<'a>, ReplaceError> {
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or_else(|| ReplaceError::OperationalError {
+                message: "provider-owned journal authority was already released".to_string(),
+            })?;
+        lease.require_active()?;
+        Ok(lease)
     }
 
     fn release_lease(mut self) -> Result<(), ReplaceError> {
@@ -916,23 +1214,38 @@ fn mark_provider_owned_journal_path(
     path: &Path,
     marker: &str,
     recovery_id: Option<&str>,
+    operation_id: &str,
+    lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<(), ReplaceError> {
-    let mut journal = read_provider_owned_journal(path)?;
+    let mut journal = lease.require_current_journal(path, operation_id)?;
     journal.db_apply_marker = marker.to_string();
     if let Some(recovery_id) = recovery_id {
         journal.recovery_id = Some(recovery_id.to_string());
     }
-    write_provider_owned_journal(path, &journal, "fail-db-apply-journal-replace")
+    write_provider_owned_journal(
+        path,
+        &journal,
+        "fail-db-apply-journal-replace",
+        Some(operation_id),
+        lease,
+    )
 }
 
 fn publish_provider_owned_db_postimage(
     path: &Path,
     journal: &ProviderOwnedReplaceJournal,
     postimage: ProviderReplaceDbPreimage,
+    lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<ProviderOwnedReplaceJournal, ReplaceError> {
     let mut next = journal.clone();
     next.db_postimage = Some(postimage);
-    write_provider_owned_journal(path, &next, "fail-db-postimage-journal-replace")?;
+    write_provider_owned_journal(
+        path,
+        &next,
+        "fail-db-postimage-journal-replace",
+        Some(&journal.operation_id),
+        lease,
+    )?;
     Ok(next)
 }
 
@@ -941,27 +1254,100 @@ fn read_provider_owned_journal(path: &Path) -> Result<ProviderOwnedReplaceJourna
     parse_provider_owned_pending_journal(path, &bytes)
 }
 
+fn read_matching_provider_owned_journal(
+    path: &Path,
+    operation_id: &str,
+) -> Result<ProviderOwnedReplaceJournal, ReplaceError> {
+    let journal = read_provider_owned_journal(path)?;
+    if journal.operation_id != operation_id {
+        return Err(operator_recovery_required(
+            path,
+            format!(
+                "provider-owned journal operation changed: expected {operation_id:?}, observed {:?}",
+                journal.operation_id
+            ),
+        ));
+    }
+    Ok(journal)
+}
+
+fn retain_provider_owned_failure(
+    path: &Path,
+    journal: &ProviderOwnedReplaceJournal,
+    lease: &ProviderOwnedReplaceLease<'_>,
+    context: String,
+) -> ReplaceError {
+    let mut retained = match lease.require_current_journal(path, &journal.operation_id) {
+        Ok(retained) => retained,
+        Err(error) => {
+            return operator_recovery_required(
+                path,
+                format!(
+                    "provider-owned operation {:?} failed with {context}; current journal could not be joined: {error:?}",
+                    journal.operation_id
+                ),
+            );
+        }
+    };
+    if retained.failure_context.is_none() {
+        retained.failure_context = Some(context.clone());
+    }
+    let persistence = write_provider_owned_journal(
+        path,
+        &retained,
+        "fail-failure-context-journal-replace",
+        Some(&journal.operation_id),
+        lease,
+    );
+    operator_recovery_required(
+        path,
+        format!(
+            "provider-owned operation {:?} remains pending after {context}; failure-context persistence: {persistence:?}",
+            journal.operation_id
+        ),
+    )
+}
+
 fn write_provider_owned_journal(
     path: &Path,
     journal: &ProviderOwnedReplaceJournal,
     failure_hook: &str,
+    expected_operation_id: Option<&str>,
+    lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<(), ReplaceError> {
+    lease.require_active()?;
     let bytes = serde_json::to_vec_pretty(journal).map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to serialize provider-owned journal: {e}"),
     })?;
     crate::session_replace::atomic_write_bytes_before_replace(path, &bytes, || {
-        maybe_provider_owned_test_hook(failure_hook)
+        maybe_provider_owned_test_hook(failure_hook)?;
+        match expected_operation_id {
+            Some(operation_id) => {
+                lease.require_current_journal(path, operation_id)?;
+            }
+            None => require_provider_owned_pending_path_absent(path)?,
+        }
+        Ok(())
     })
 }
 
 fn retire_provider_owned_journal(
     path: &Path,
     journal: &ProviderOwnedReplaceJournal,
+    lease: &ProviderOwnedReplaceLease<'_>,
 ) -> Result<(), ReplaceError> {
+    maybe_sleep_provider_owned_test_hook(TEST_SLEEP_BEFORE_RETIRE_PREFIX)?;
+    lease.require_current_journal(path, &journal.operation_id)?;
     let mut terminal = journal.clone();
     terminal.reconciliation_state = PROVIDER_OWNED_RECONCILIATION_CLEANUP_ONLY.to_string();
-    write_provider_owned_journal(path, &terminal, "fail-terminal-journal-replace")
-        .map_err(|error| provider_owned_retirement_required(path, error))?;
+    write_provider_owned_journal(
+        path,
+        &terminal,
+        "fail-terminal-journal-replace",
+        Some(&journal.operation_id),
+        lease,
+    )
+    .map_err(|error| provider_owned_retirement_required(path, error))?;
     let observed = read_provider_owned_journal(path)
         .map_err(|error| provider_owned_retirement_required(path, error))?;
     if observed != terminal {
@@ -972,6 +1358,7 @@ fn retire_provider_owned_journal(
     }
     maybe_provider_owned_test_hook(TEST_FAIL_JOURNAL_REMOVE)
         .map_err(|error| provider_owned_retirement_required(path, error))?;
+    lease.require_current_journal(path, &journal.operation_id)?;
     fs::remove_file(path).map_err(|error| {
         operator_recovery_required(
             path,
@@ -985,7 +1372,7 @@ fn retire_provider_owned_journal(
         )
     })?;
     if let Err(error) = sync_provider_owned_journal_directory(parent) {
-        let republish = write_provider_owned_journal(path, &terminal, "");
+        let republish = write_provider_owned_journal(path, &terminal, "", None, lease);
         return Err(operator_recovery_required(
             path,
             format!(
@@ -1044,8 +1431,28 @@ fn map_provider_lock_error(error: LockError) -> ReplaceError {
         LockError::TokenInvalid | LockError::LockExpired => ReplaceError::OperationalError {
             message: "session lock token invalid".to_string(),
         },
+        LockError::SentinelBusy { timeout_ms } => {
+            ReplaceError::SessionLockSentinelBusy { timeout_ms }
+        }
         LockError::Operational { message } => ReplaceError::OperationalError { message },
     }
+}
+
+fn provider_owned_lease_ttl() -> Result<Duration, ReplaceError> {
+    if !cfg!(debug_assertions) {
+        return Ok(Duration::from_secs(300));
+    }
+    let Some(value) = std::env::var_os(PROVIDER_OWNED_LEASE_TTL_ENV) else {
+        return Ok(Duration::from_secs(300));
+    };
+    let milliseconds =
+        value
+            .to_string_lossy()
+            .parse::<u64>()
+            .map_err(|error| ReplaceError::OperationalError {
+                message: format!("invalid provider-owned lease test TTL: {error}"),
+            })?;
+    Ok(Duration::from_millis(milliseconds))
 }
 
 fn generate_provider_owned_operation_id() -> String {
@@ -1067,13 +1474,17 @@ fn maybe_provider_owned_test_hook(token: &str) -> Result<(), ReplaceError> {
 }
 
 fn maybe_sleep_provider_owned_recovery_after_lease() -> Result<(), ReplaceError> {
+    maybe_sleep_provider_owned_test_hook(TEST_SLEEP_RECOVERY_AFTER_LEASE_PREFIX)
+}
+
+fn maybe_sleep_provider_owned_test_hook(prefix: &str) -> Result<(), ReplaceError> {
     if !cfg!(debug_assertions) {
         return Ok(());
     }
     let Ok(value) = std::env::var(PROVIDER_OWNED_TEST_HOOK_ENV) else {
         return Ok(());
     };
-    let Some(milliseconds) = value.strip_prefix(TEST_SLEEP_RECOVERY_AFTER_LEASE_PREFIX) else {
+    let Some(milliseconds) = value.strip_prefix(prefix) else {
         return Ok(());
     };
     let milliseconds =
