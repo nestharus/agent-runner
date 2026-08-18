@@ -507,6 +507,7 @@ state_dir = {state_dir:?}
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_continuation_fixture(
     dir: tempfile::TempDir,
     config_home: PathBuf,
@@ -658,6 +659,7 @@ flag = "--resume"
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_legacy_resume_fixture(
     dir: tempfile::TempDir,
     config_home: PathBuf,
@@ -1354,6 +1356,7 @@ fn map_artifact_identity(artifact: &EvidenceIdentity) -> Value {
     json!({"path": artifact.1, "sha256": artifact.2})
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_continuation_request(
     planning_root: &Path,
     worktree: &Path,

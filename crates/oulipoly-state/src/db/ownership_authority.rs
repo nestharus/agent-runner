@@ -254,6 +254,23 @@ impl StateDb {
     ) -> Result<CompletionEventRegistrationResult, String> {
         self.register_completion_event_with_obligation_on(
             Some(authority),
+            false,
+            admission_id,
+            registration,
+            || {},
+            || {},
+        )
+    }
+
+    /// Materialize a hash-identical State admission without creating new authority.
+    pub fn repair_admitted_completion_event(
+        &mut self,
+        admission_id: &str,
+        registration: CompletionEventRegistrationInput<'_>,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        self.register_completion_event_with_obligation_on(
+            None,
+            true,
             admission_id,
             registration,
             || {},
@@ -269,6 +286,7 @@ impl StateDb {
     ) -> Result<CompletionEventRegistrationResult, String> {
         self.register_completion_event_with_obligation_on(
             None,
+            false,
             admission_id,
             registration,
             || {},
@@ -279,6 +297,7 @@ impl StateDb {
     fn register_completion_event_with_obligation_on<BeforeCommit, AfterCommit>(
         &mut self,
         authority: Option<&super::CompletionRegistrationAuthority>,
+        admitted_replay_only: bool,
         admission_id: &str,
         registration: CompletionEventRegistrationInput<'_>,
         before_state_commit: BeforeCommit,
@@ -309,7 +328,15 @@ impl StateDb {
                 format!("Failed to begin completion admission transaction: {error}")
             })?;
         require_completion_continuity_registration_ready(&tx)?;
-        if let Some(authority) = authority {
+        if admitted_replay_only {
+            require_exact_admitted_completion_replay(
+                &tx,
+                &admission_id,
+                owner_invocation_uuid,
+                owner_session_id,
+                registration.event_id,
+            )?;
+        } else if let Some(authority) = authority {
             validate_completion_registration_actor(
                 &tx,
                 authority,
@@ -370,9 +397,16 @@ impl StateDb {
             expected_sidecar_generation: &sidecar_generation,
         };
         owner_authorization.validate_observed_generation(&obligation)?;
+        let replay_continuity = if state_head != sidecar_head {
+            completion_continuity_by_admission_on(&tx, &admission_id)
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         validate_completion_continuity_alignment(
             state_head.as_ref(),
             sidecar_head.as_ref(),
+            replay_continuity.as_ref(),
             &obligation,
         )?;
         sidecar_fence.preflight_completion_event_registration(&registration)?;
@@ -765,17 +799,19 @@ fn map_completion_continuity_head(
 fn validate_completion_continuity_alignment(
     state_head: Option<&CompletionContinuityHead>,
     sidecar_head: Option<&CompletionContinuityHead>,
+    replay_continuity: Option<&CompletionContinuityHead>,
     admission: &CompletionObligationAdmission<'_>,
 ) -> Result<(), String> {
     let generation_matches = state_head
         .into_iter()
         .chain(sidecar_head)
+        .chain(replay_continuity)
         .all(|head| head.sidecar_generation == admission.expected_sidecar_generation);
     if generation_matches && state_head == sidecar_head {
         return Ok(());
     }
     if generation_matches
-        && state_head.is_some_and(|head| {
+        && replay_continuity.is_some_and(|head| {
             completion_continuity_is_one_ahead(head, sidecar_head)
                 && completion_continuity_matches_admission(head, admission)
         })
@@ -952,20 +988,78 @@ fn completion_owner_authorization(
     if status == InvocationStatus::Running {
         return Ok(CompletionOwnerAuthorization::Running);
     }
-    let existing = completion_obligation_by_admission_id(conn, admission_id)
-        .map_err(|error| error.to_string())?
-        .filter(|existing| {
-            existing.invocation_uuid == invocation_uuid
-                && existing.event_id == event_id
-                && existing.owner_invocation_uuid == invocation_uuid
-                && existing.owner_session_id == owner_session_id
-        })
-        .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
-    completion_continuity_by_admission_on(conn, admission_id)
-        .map_err(|error| error.to_string())?
-        .filter(|continuity| completion_continuity_matches_expectation(continuity, &existing))
-        .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
+    let existing = exact_admitted_completion_expectation(
+        conn,
+        admission_id,
+        invocation_uuid,
+        owner_session_id,
+        event_id,
+    )?
+    .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
+    if !exact_completion_continuity_exists(conn, admission_id, &existing)? {
+        return Err(terminal_owner_new_admission_error(invocation_uuid));
+    }
     Ok(CompletionOwnerAuthorization::TerminalExactReplay(existing))
+}
+
+fn require_exact_admitted_completion_replay(
+    conn: &sqlite::Connection,
+    admission_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+    event_id: &str,
+) -> Result<(), String> {
+    let expectation = exact_admitted_completion_expectation(
+        conn,
+        admission_id,
+        owner_invocation_uuid,
+        owner_session_id,
+        event_id,
+    )?
+        .ok_or_else(|| {
+            format!(
+                "process_integrity: completion repair requires an exact admitted replay for event {event_id}"
+            )
+        })?;
+    if exact_completion_continuity_exists(conn, admission_id, &expectation)? {
+        return Ok(());
+    }
+    Err(format!(
+        "process_integrity: completion repair requires exact State continuity for event {event_id}"
+    ))
+}
+
+fn exact_admitted_completion_expectation(
+    conn: &sqlite::Connection,
+    admission_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+    event_id: &str,
+) -> Result<Option<CompletionObligationExpectation>, String> {
+    completion_obligation_by_admission_id(conn, admission_id)
+        .map_err(|error| error.to_string())
+        .map(|expectation| {
+            expectation.filter(|expectation| {
+                expectation.invocation_uuid == owner_invocation_uuid
+                    && expectation.event_id == event_id
+                    && expectation.owner_invocation_uuid == owner_invocation_uuid
+                    && expectation.owner_session_id == owner_session_id
+            })
+        })
+}
+
+fn exact_completion_continuity_exists(
+    conn: &sqlite::Connection,
+    admission_id: &str,
+    expectation: &CompletionObligationExpectation,
+) -> Result<bool, String> {
+    completion_continuity_by_admission_on(conn, admission_id)
+        .map_err(|error| error.to_string())
+        .map(|continuity| {
+            continuity
+                .as_ref()
+                .is_some_and(|row| completion_continuity_matches_expectation(row, expectation))
+        })
 }
 
 fn validate_completion_registration_actor(
@@ -1826,6 +1920,7 @@ mod tests {
             writer_state
                 .register_completion_event_with_obligation_on(
                     None,
+                    false,
                     "age299-s2-barrier-admission",
                     registration(),
                     || {
@@ -2413,6 +2508,122 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state_continuity, sidecar_continuity);
+    }
+
+    #[test]
+    fn exact_ordered_replays_repair_a_multi_row_same_generation_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut state = StateDb::open(&state_path).unwrap();
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: INVOCATION_UUID.to_string(),
+                model_name: "age299-s2".to_string(),
+                provider_name: "test-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id: None,
+            })
+            .unwrap();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let pre_admission_sidecar = std::fs::read(&sidecar_path).unwrap();
+        let first = registration_for("age299-s2-rollback-first", SESSION_ID, INVOCATION_UUID);
+        let second = registration_for("age299-s2-rollback-second", SESSION_ID, INVOCATION_UUID);
+
+        state
+            .register_completion_event_with_obligation("age299-s2-rollback-first", first)
+            .unwrap();
+        state
+            .register_completion_event_with_obligation("age299-s2-rollback-second", second)
+            .unwrap();
+        assert_eq!(
+            state
+                .raw_connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM invocation_completion_continuity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+
+        std::fs::remove_file(&sidecar_path).unwrap();
+        std::fs::write(&sidecar_path, pre_admission_sidecar).unwrap();
+        let rolled_back = MailboxDb::open(&sidecar_path).unwrap();
+        assert_eq!(
+            rolled_back
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM completion_authority_continuity",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(rolled_back);
+
+        let out_of_order_error = state
+            .register_completion_event_with_obligation("age299-s2-rollback-second", second)
+            .unwrap_err();
+        assert!(
+            out_of_order_error.contains("continuity heads do not match"),
+            "{out_of_order_error}"
+        );
+        let new_admission_error = state
+            .repair_admitted_completion_event(
+                "age299-s2-rollback-third",
+                registration_for("age299-s2-rollback-third", SESSION_ID, INVOCATION_UUID),
+            )
+            .unwrap_err();
+        assert!(
+            new_admission_error.contains("requires an exact admitted replay"),
+            "{new_admission_error}"
+        );
+
+        state
+            .repair_admitted_completion_event("age299-s2-rollback-first", first)
+            .unwrap();
+        state
+            .repair_admitted_completion_event("age299-s2-rollback-second", second)
+            .unwrap();
+
+        let sidecar = MailboxDb::open(&sidecar_path).unwrap();
+        let state_head: (i64, String) = state
+            .raw_connection()
+            .query_row(
+                "SELECT authority_ordinal, continuity_digest
+                 FROM invocation_completion_continuity
+                 ORDER BY authority_ordinal DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let sidecar_head: (i64, String) = sidecar
+            .connection()
+            .query_row(
+                "SELECT authority_ordinal, continuity_digest
+                 FROM completion_authority_continuity
+                 ORDER BY authority_ordinal DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state_head, sidecar_head);
+        assert_eq!(sidecar_head.0, 2);
+        assert!(
+            sidecar
+                .contains_completion_obligation(first.event_id, INVOCATION_UUID, SESSION_ID)
+                .unwrap()
+        );
+        assert!(
+            sidecar
+                .contains_completion_obligation(second.event_id, INVOCATION_UUID, SESSION_ID)
+                .unwrap()
+        );
     }
 
     #[test]

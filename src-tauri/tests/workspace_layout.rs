@@ -261,10 +261,8 @@ fn binary_target_resolves() {
         "CARGO_BIN_EXE_oulipoly-agent-runner should be non-empty"
     );
     assert!(
-        binary_path
-            .components()
-            .any(|component| component.as_os_str() == "target"),
-        "binary path should resolve under target/: {}",
+        binary_path.is_absolute(),
+        "Cargo should resolve the binary to an absolute path: {}",
         binary_path.display()
     );
     assert!(

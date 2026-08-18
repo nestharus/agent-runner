@@ -337,6 +337,10 @@ pub(crate) enum NotifySubcommands {
         #[arg(long)]
         rc: PathBuf,
 
+        /// Materialize only an exact completion admission already retained in State.
+        #[arg(long)]
+        repair_admitted: bool,
+
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,

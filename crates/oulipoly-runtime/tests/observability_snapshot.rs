@@ -964,7 +964,13 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
     let running_dir = write_agent_bash_meta(
         &root,
         "yy-running",
-        &agent_bash_meta("yy-running", "RUNNING", &owner, Some(777), None),
+        &agent_bash_meta(
+            "yy-running",
+            "RUNNING",
+            &owner,
+            Some(dead_identity().os_pid),
+            None,
+        ),
         "running tail",
     );
     set_dir_mtime(&running_dir, 50);
