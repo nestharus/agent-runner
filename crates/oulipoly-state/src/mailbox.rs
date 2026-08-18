@@ -1733,6 +1733,8 @@ impl MailboxDb {
         &mut self,
         request: FailRuntimeGenerationDelivery<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        reject_unauthorized_terminal_wake_abandonment(request.delivery_error)
+            .map_err(GenerationStorageError::new)?;
         validate_delivery_claim_seqs(request.seqs)?;
         let tx = self
             .conn
@@ -3044,6 +3046,7 @@ impl MailboxDb {
         attempt_id: &str,
         delivery_error: &str,
     ) -> Result<bool, String> {
+        reject_unauthorized_terminal_wake_abandonment(delivery_error)?;
         let now = now_rfc3339();
         let tx = self.conn.transaction().map_err(|err| {
             format!("Failed to start unobserved mailbox delivery transaction: {err}")
@@ -3095,12 +3098,7 @@ impl MailboxDb {
         seqs: &[i64],
         delivery_error: &str,
     ) -> Result<(), String> {
-        if delivery_error == WAKE_SWEEP_ABANDONED_ERROR {
-            return Err(
-                "Terminal wake abandonment requires a dedicated authority-bearing disposition"
-                    .to_string(),
-            );
-        }
+        reject_unauthorized_terminal_wake_abandonment(delivery_error)?;
         if seqs.is_empty() {
             return Ok(());
         }
@@ -5606,6 +5604,16 @@ fn validate_delivery_claim_seqs(seqs: &[i64]) -> Result<(), GenerationStorageErr
         return Err(GenerationStorageError::new(
             "Delivery claim mailbox sequence numbers must be strictly increasing".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn reject_unauthorized_terminal_wake_abandonment(delivery_error: &str) -> Result<(), String> {
+    if delivery_error == WAKE_SWEEP_ABANDONED_ERROR {
+        return Err(
+            "Terminal wake abandonment requires a dedicated authority-bearing disposition"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -10070,6 +10078,35 @@ mod tests {
     }
 
     #[test]
+    fn unobserved_delivery_failure_rejects_terminal_wake_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &[row.seq], 0)
+            .unwrap();
+        db.record_delivery_attempt_transport_ack("attempt-1")
+            .unwrap();
+
+        let error = db
+            .fail_unobserved_delivery_attempt("attempt-1", WAKE_SWEEP_ABANDONED_ERROR)
+            .unwrap_err();
+
+        assert!(error.contains("dedicated authority-bearing disposition"));
+        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+        let resolved_at: Option<String> = db
+            .connection()
+            .query_row(
+                "SELECT resolved_at FROM mailbox_delivery_attempts WHERE attempt_id = 'attempt-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(resolved_at.is_none());
+    }
+
+    #[test]
     fn accepted_attempt_owner_requires_transport_ack_and_oldest_pending_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -11413,6 +11450,49 @@ mod tests {
             DrainAdvanceResult::Advanced(_)
         ));
         assert!(db.list_pending("session-a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_generation_delivery_failure_rejects_terminal_wake_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("abababab-abab-4bab-8bab-abababababab").unwrap();
+        let claim_id = DeliveryClaimId::parse("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd").unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("claimed", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+        db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+            fence,
+            claim_id: &claim_id,
+            seqs: &[row.seq],
+            stale_after_seconds: 30,
+        })
+        .unwrap();
+
+        let error = db
+            .fail_runtime_generation_delivery(FailRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[row.seq],
+                delivery_error: WAKE_SWEEP_ABANDONED_ERROR,
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("dedicated authority-bearing disposition")
+        );
+        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+        let generation = db.runtime_generation(&generation_id).unwrap().unwrap();
+        assert_eq!(generation.active_delivery_claim_id, Some(claim_id));
+        assert_eq!(generation.active_delivery_seqs, vec![row.seq]);
     }
 
     #[test]
