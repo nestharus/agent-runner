@@ -117,9 +117,32 @@ impl StateDb {
     fn backfill_provider_quotas_topology_peak_counts(
         conn: &sqlite::Connection,
     ) -> Result<(), String> {
+        if !Self::provider_quotas_topology_backfill_is_needed(conn)? {
+            return Ok(());
+        }
         conn.execute(Self::provider_quotas_topology_backfill_sql(), [])
             .map_err(Self::format_provider_quotas_topology_backfill_error)?;
         Ok(())
+    }
+
+    fn provider_quotas_topology_backfill_is_needed(
+        conn: &sqlite::Connection,
+    ) -> Result<bool, String> {
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM provider_quotas
+                 WHERE topology_peak_live_window_count < (
+                     SELECT COUNT(*)
+                     FROM provider_quota_windows
+                     WHERE provider_quota_windows.provider_name = provider_quotas.provider_name
+                 )
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|needed| needed != 0)
+        .map_err(|e| format!("Failed to inspect provider_quotas topology peak counts: {e}"))
     }
 
     fn format_provider_quotas_topology_backfill_error(e: sqlite::Error) -> String {
@@ -135,6 +158,11 @@ impl StateDb {
                 FROM provider_quota_windows
                 WHERE provider_quota_windows.provider_name = provider_quotas.provider_name
             )
+         )
+         WHERE topology_peak_live_window_count < (
+             SELECT COUNT(*)
+             FROM provider_quota_windows
+             WHERE provider_quota_windows.provider_name = provider_quotas.provider_name
          )"
     }
 

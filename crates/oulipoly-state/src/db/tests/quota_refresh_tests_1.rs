@@ -179,6 +179,46 @@ fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
 }
 
 #[test]
+fn provider_quotas_topology_backfill_does_not_request_writer_when_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let setup = sqlite::Connection::open(&path).unwrap();
+    setup
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE provider_quotas (
+                 provider_name TEXT PRIMARY KEY,
+                 topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0,
+                 last_topology_probe_at TEXT
+             );
+             CREATE TABLE provider_quota_windows (
+                 provider_name TEXT NOT NULL,
+                 window_id INTEGER NOT NULL,
+                 PRIMARY KEY (provider_name, window_id)
+             );
+             INSERT INTO provider_quotas
+                 (provider_name, topology_peak_live_window_count)
+             VALUES ('p', 1);
+             INSERT INTO provider_quota_windows (provider_name, window_id)
+             VALUES ('p', 0);",
+        )
+        .unwrap();
+    drop(setup);
+
+    let blocker = sqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let candidate = sqlite::Connection::open(&path).unwrap();
+    candidate
+        .busy_timeout(std::time::Duration::from_millis(50))
+        .unwrap();
+
+    let result = StateDb::ensure_provider_quotas_topology_schema(&candidate);
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    result.expect("current topology repair must not acquire the SQLite writer");
+}
+
+#[test]
 fn upsert_quota_refresh_updates_topology_peak_without_lowering_on_shrink() {
     let db = test_db();
     let provider = "p";

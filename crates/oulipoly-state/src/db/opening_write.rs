@@ -810,6 +810,48 @@ mod state_namespace_tests {
     use super::*;
 
     #[test]
+    fn concurrent_current_schema_opens_do_not_request_state_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        state
+            .conn
+            .execute(
+                "INSERT INTO session_chains
+                    (chain_id, created_at, last_used_at, model_name)
+                 VALUES ('current-open', '2026-08-18T00:00:00Z', '2026-08-18T00:00:00Z', 'test')",
+                [],
+            )
+            .unwrap();
+        drop(state);
+
+        let blocker = sqlite::Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let openers = (0..8)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let state_path = state_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    StateDb::open(&state_path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let opened = openers
+            .into_iter()
+            .map(|opener| opener.join().unwrap())
+            .collect::<Vec<_>>();
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        for result in opened {
+            drop(result.expect("current-schema open must not acquire the SQLite writer"));
+        }
+    }
+
+    #[test]
     fn writable_state_holds_shared_namespace_authority_for_its_lifetime() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.db");
