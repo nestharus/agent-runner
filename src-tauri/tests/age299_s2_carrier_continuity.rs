@@ -21,6 +21,7 @@ const MODEL: &str = "age299-s2-carrier";
 const PROVIDER: &str = "age299-s2-provider";
 const SESSION_ID: &str = "age299-s2-live-session";
 const CHAIN_ID: &str = "29929929-2992-4992-8992-299299299299";
+const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug)]
 enum Carrier {
@@ -96,10 +97,7 @@ impl CarrierChild {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             match self.try_wait() {
-                Ok(Some(_)) => {
-                    self.child.take();
-                    return true;
-                }
+                Ok(Some(_)) => return true,
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 Err(_) => return false,
             }
@@ -419,8 +417,12 @@ fn all_success_carriers_exhaust_contention_without_a_terminal_result() {
     ] {
         let (fixture, mut child, invocation_uuid) = prepare_registered_carrier(carrier);
         let sidecar_authority = stage_finalization_only_contention(&fixture, &mut child);
-        std::thread::sleep(Duration::from_secs(17));
+        let exhausted = child.wait_for_exit(PROCESS_WAIT_TIMEOUT);
         <fs::File as fs4::FileExt>::unlock(&sidecar_authority).unwrap();
+        assert!(
+            exhausted,
+            "{carrier:?}: production carrier did not exhaust contention within the test timeout"
+        );
 
         let output = child.wait_with_output().unwrap();
 
@@ -708,7 +710,7 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 fn wait_for_path_or_exit(path: &Path, child: &mut CarrierChild) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + PROCESS_WAIT_TIMEOUT;
     while Instant::now() < deadline {
         if path.exists() {
             return true;
