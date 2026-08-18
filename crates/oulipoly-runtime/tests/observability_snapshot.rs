@@ -20,6 +20,7 @@ use oulipoly_state::mailbox::{
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
+use rusqlite::params;
 #[cfg(unix)]
 use serde_json::Value;
 use std::ffi::OsString;
@@ -956,32 +957,42 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
 }
 
 #[test]
-fn abandoned_mailbox_is_failed_and_does_not_require_wake() {
+fn historical_abandoned_mailbox_is_failed_and_does_not_require_wake() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
     let mut mailbox = fixture.open_mailbox();
-    mailbox
+    let mailbox_row = match mailbox
         .enqueue_agent_bash_complete(&mailbox_input("handle-abandoned", SESSION_ID))
-        .unwrap();
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        other => panic!("unexpected enqueue result: {other:?}"),
+    };
+    drop(mailbox);
+    let connection = rusqlite::Connection::open(fixture.sidecar_path()).unwrap();
     assert_eq!(
-        mailbox
-            .mark_pending_abandoned(SESSION_ID, WAKE_SWEEP_ABANDONED_ERROR, 1)
+        connection
+            .execute(
+                "UPDATE mailbox SET delivery_error = ?3 WHERE session_id = ?1 AND seq = ?2",
+                params![SESSION_ID, mailbox_row.seq, WAKE_SWEEP_ABANDONED_ERROR],
+            )
             .unwrap(),
         1
     );
-    drop(mailbox);
+    drop(connection);
 
     let live = fixture
         .service()
         .snapshot(&fixture.root(), SnapshotLimits::default());
     assert_eq!(live.summary.pending_mailbox_count, 0);
     assert!(!has_diagnostic(&live, "wake-needed:no-runtime"));
-    assert!(find_node(&live, "mailbox:session-observe:1").is_none());
+    let node_id = format!("mailbox:{SESSION_ID}:{}", mailbox_row.seq);
+    assert!(find_node(&live, &node_id).is_none());
 
     let full = fixture
         .service()
         .snapshot(&fixture.root(), full_snapshot_limits());
-    let row = node(&full, "mailbox:session-observe:1");
+    let row = node(&full, &node_id);
     assert_eq!(row.status, MonitorStatus::Failed);
     assert_eq!(
         row.mailbox.as_ref().unwrap().delivery_error.as_deref(),

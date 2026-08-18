@@ -3091,10 +3091,16 @@ impl MailboxDb {
 
     pub fn mark_delivery_failed(
         &mut self,
-        _session_id: &str,
+        session_id: &str,
         seqs: &[i64],
         delivery_error: &str,
     ) -> Result<(), String> {
+        if delivery_error == WAKE_SWEEP_ABANDONED_ERROR {
+            return Err(
+                "Terminal wake abandonment requires a dedicated authority-bearing disposition"
+                    .to_string(),
+            );
+        }
         if seqs.is_empty() {
             return Ok(());
         }
@@ -3106,9 +3112,10 @@ impl MailboxDb {
                 "UPDATE mailbox
                  SET delivery_attempts = delivery_attempts + 1,
                      delivery_error = ?3
-                 WHERE seq = ?2
+                 WHERE session_id = ?1
+                   AND seq = ?2
                    AND delivered_at IS NULL",
-                params![rusqlite::types::Null, seq, delivery_error],
+                params![session_id, seq, delivery_error],
             )
             .map_err(|err| format!("Failed to mark mailbox row delivery failed: {err}"))?;
         }
@@ -3116,10 +3123,10 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to commit mailbox delivery failure transaction: {err}"))
     }
 
-    pub fn mark_pending_abandoned(
+    #[cfg(test)]
+    fn force_pending_abandoned_for_test(
         &mut self,
         session_id: &str,
-        delivery_error: &str,
         limit: usize,
     ) -> Result<usize, String> {
         if limit == 0 {
@@ -3136,13 +3143,13 @@ impl MailboxDb {
                  WHERE seq IN (
                     SELECT seq
                     FROM mailbox
-                    WHERE session_id = ?1
-                      AND delivered_at IS NULL
-                      AND (delivery_error IS NULL OR delivery_error != ?2)
+                     WHERE session_id = ?1
+                       AND delivered_at IS NULL
+                       AND (delivery_error IS NULL OR delivery_error != ?2)
                     ORDER BY seq ASC
                     LIMIT ?3
                  )",
-                params![session_id, delivery_error, limit as i64],
+                params![session_id, WAKE_SWEEP_ABANDONED_ERROR, limit as i64],
             )
             .map_err(|err| format!("Failed to mark mailbox rows abandoned: {err}"))?;
         if changed > 0 {
@@ -10111,8 +10118,7 @@ mod tests {
             inserted_row(db.enqueue_agent_bash_complete(&input("exhausted", "session-a")));
         let deliverable =
             inserted_row(db.enqueue_agent_bash_complete(&input("deliverable", "session-a")));
-        db.mark_pending_abandoned("session-a", WAKE_SWEEP_ABANDONED_ERROR, 1)
-            .unwrap();
+        db.force_pending_abandoned_for_test("session-a", 1).unwrap();
         for _ in 0..MAX_UNCONFIRMED_DELIVERY_ATTEMPTS {
             db.mark_delivery_failed(
                 "session-a",
@@ -10447,6 +10453,36 @@ mod tests {
             failed.delivery_error.as_deref(),
             Some("mailbox_delivery_unconfirmed")
         );
+    }
+
+    #[test]
+    fn mark_delivery_failed_cannot_mutate_a_row_from_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-b", "session-b")));
+
+        db.mark_delivery_failed("session-a", &[row.seq], "mailbox_delivery_unconfirmed")
+            .unwrap();
+
+        let unchanged = db.list_mailbox("session-b", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+    }
+
+    #[test]
+    fn generic_delivery_failure_rejects_terminal_wake_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+
+        let error = db
+            .mark_delivery_failed("session-a", &[row.seq], WAKE_SWEEP_ABANDONED_ERROR)
+            .unwrap_err();
+
+        assert!(error.contains("dedicated authority-bearing disposition"));
+        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
     }
 
     #[test]
