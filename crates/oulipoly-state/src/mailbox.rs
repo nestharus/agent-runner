@@ -2659,6 +2659,7 @@ impl MailboxDb {
     pub fn mark_delivered(
         &mut self,
         session_id: &str,
+        chain_id: Option<&str>,
         seqs: &[i64],
         delivered_by_invocation_uuid: &str,
     ) -> Result<(), String> {
@@ -2668,19 +2669,31 @@ impl MailboxDb {
         let now = now_rfc3339();
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start mailbox delivery transaction: {err}"))?;
+        let delivery_states = mailbox_delivery_target_states_on(&tx, session_id, chain_id, seqs)
+            .map_err(|err| format!("Failed to validate mailbox delivery batch: {err}"))?;
+        if !all_mailbox_seqs_owned(&delivery_states) {
+            return Err(
+                "Mailbox delivery batch contains a missing or foreign-session row".to_string(),
+            );
+        }
+        let update_sql = format!(
+            "UPDATE mailbox
+             SET delivered_at = ?4,
+                 delivered_by_invocation_uuid = ?5,
+                 delivery_attempts = delivery_attempts + 1,
+                 delivery_error = NULL
+             WHERE seq = ?3
+               AND delivered_at IS NULL
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+        );
         for seq in seqs {
             tx.execute(
-                "UPDATE mailbox
-                 SET delivered_at = ?3,
-                     delivered_by_invocation_uuid = ?4,
-                     delivery_attempts = delivery_attempts + 1,
-                     delivery_error = NULL
-                 WHERE seq = ?2
-                   AND delivered_at IS NULL",
+                &update_sql,
                 params![
-                    rusqlite::types::Null,
+                    session_id,
+                    chain_id,
                     seq,
                     &now,
                     delivered_by_invocation_uuid
@@ -2688,7 +2701,7 @@ impl MailboxDb {
             )
             .map_err(|err| format!("Failed to mark mailbox row delivered: {err}"))?;
         }
-        acknowledge_completion_event_listeners_for_seqs(&tx, seqs, &now)?;
+        acknowledge_completion_event_listeners_for_seqs(&tx, session_id, chain_id, seqs, &now)?;
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))
@@ -5718,6 +5731,31 @@ fn mailbox_delivery_states_on(
     Ok(states)
 }
 
+fn mailbox_delivery_target_states_on(
+    conn: &Connection,
+    session_id: &str,
+    chain_id: Option<&str>,
+    seqs: &[i64],
+) -> Result<Vec<Option<Option<String>>>, GenerationStorageError> {
+    let sql = format!(
+        "SELECT delivered_at FROM mailbox
+         WHERE seq = ?3 AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+    );
+    let mut states = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        let state = conn
+            .query_row(&sql, params![session_id, chain_id, seq], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map_err(generation_storage_error(
+                "verify mailbox delivery target authority",
+            ))?;
+        states.push(state);
+    }
+    Ok(states)
+}
+
 fn all_mailbox_seqs_owned(states: &[Option<Option<String>>]) -> bool {
     states.iter().all(Option::is_some)
 }
@@ -7078,18 +7116,24 @@ fn completion_event_mailbox_rows_on(
 
 fn acknowledge_completion_event_listeners_for_seqs(
     tx: &Transaction<'_>,
+    session_id: &str,
+    chain_id: Option<&str>,
     seqs: &[i64],
     now: &str,
 ) -> Result<(), String> {
+    let sql = format!(
+        "UPDATE completion_event_listener
+         SET acknowledged_at = COALESCE(acknowledged_at, ?4),
+             acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
+         WHERE mailbox_seq = ?3
+           AND EXISTS (
+               SELECT 1 FROM mailbox
+               WHERE mailbox.seq = ?3 AND {PENDING_MAILBOX_TARGET_PREDICATE}
+           )"
+    );
     for seq in seqs {
-        tx.execute(
-            "UPDATE completion_event_listener
-             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
-                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
-             WHERE mailbox_seq = ?1",
-            params![seq, now],
-        )
-        .map_err(|err| format!("Failed to acknowledge completion event listener: {err}"))?;
+        tx.execute(&sql, params![session_id, chain_id, seq, now])
+            .map_err(|err| format!("Failed to acknowledge completion event listener: {err}"))?;
     }
     Ok(())
 }
@@ -8965,7 +9009,7 @@ mod tests {
             .find(|row| row.session_id == "session-a")
             .unwrap()
             .seq;
-        db.mark_delivered("session-a", &[session_a_seq], "delivery-a")
+        db.mark_delivered("session-a", None, &[session_a_seq], "delivery-a")
             .unwrap();
         let listeners = db.completion_event_listeners(event_id).unwrap();
         let first = listeners
@@ -9745,10 +9789,10 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
 
-        db.mark_delivered("session-a", &[row.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
         let first = db.list_mailbox("session-a", true).unwrap().remove(0);
-        db.mark_delivered("session-a", &[row.seq], "resume-2")
+        db.mark_delivered("session-a", None, &[row.seq], "resume-2")
             .unwrap();
         let second = db.list_mailbox("session-a", true).unwrap().remove(0);
 
@@ -9758,6 +9802,26 @@ mod tests {
             Some("resume-1")
         );
         assert_eq!(second.delivery_attempts, 1);
+    }
+
+    #[test]
+    fn mark_delivered_rejects_a_mixed_session_batch_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let owned = inserted_row(db.enqueue_agent_bash_complete(&input("owned", "session-a")));
+        let foreign = inserted_row(db.enqueue_agent_bash_complete(&input("foreign", "session-b")));
+
+        let error = db
+            .mark_delivered("session-a", None, &[owned.seq, foreign.seq], "invocation-a")
+            .unwrap_err();
+
+        assert!(error.contains("missing or foreign-session row"));
+        for session_id in ["session-a", "session-b"] {
+            let unchanged = db.list_mailbox(session_id, true).unwrap().remove(0);
+            assert!(unchanged.delivered_at.is_none());
+            assert!(unchanged.delivered_by_invocation_uuid.is_none());
+            assert_eq!(unchanged.delivery_attempts, 0);
+        }
     }
 
     #[test]
@@ -10056,7 +10120,7 @@ mod tests {
         db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
             .unwrap();
         assert!(!db.confirm_delivery_attempt("attempt-1").unwrap());
-        db.mark_delivered("session-a", &[rows[0].seq], "sibling-invocation")
+        db.mark_delivered("session-a", None, &[rows[0].seq], "sibling-invocation")
             .unwrap();
         db.record_delivery_attempt_transport_ack("attempt-1")
             .unwrap();
@@ -10400,7 +10464,7 @@ mod tests {
                 params![delivered.seq, &delivered_payload],
             )
             .unwrap();
-        db.mark_delivered("session-a", &[delivered.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[delivered.seq], "resume-1")
             .unwrap();
 
         let before = db.delivered_payload_compaction_stats().unwrap();
@@ -10474,7 +10538,7 @@ mod tests {
                 params![row.seq, &payload],
             )
             .unwrap();
-        db.mark_delivered("session-a", &[row.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
 
         let report = db.compact_delivered_payloads(1).unwrap();
@@ -10586,7 +10650,7 @@ mod tests {
             inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
         let pending = inserted_row(db.enqueue_agent_bash_complete(&input("handle-b", "session-a")));
 
-        db.mark_delivered("session-a", &[delivered.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[delivered.seq], "resume-1")
             .unwrap();
 
         let pending_rows = db.list_pending("session-a").unwrap();
@@ -11826,7 +11890,7 @@ mod tests {
         let row =
             inserted_row(mailbox.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
         mailbox
-            .mark_delivered("session-a", &[row.seq], "resume-1")
+            .mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
         let identity = current_identity();
         mailbox

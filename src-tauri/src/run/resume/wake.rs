@@ -343,6 +343,7 @@ pub(super) fn complete_successful_mailbox_delivery(
 ) -> Result<(), String> {
     crate::mailbox_delivery::mark_headless_resume_delivered(
         input.mailbox_session_id,
+        Some(&input.resolved.chain_id),
         input.mailbox_delivery_seqs,
         invocation_uuid,
     )?;

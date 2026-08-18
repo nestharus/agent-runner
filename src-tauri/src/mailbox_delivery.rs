@@ -984,6 +984,7 @@ fn prepared_delivery(
 
 pub(crate) fn mark_headless_resume_delivered(
     session_id: &str,
+    chain_id: Option<&str>,
     seqs: &[i64],
     delivered_by_invocation_uuid: &str,
 ) -> Result<(), String> {
@@ -993,7 +994,7 @@ pub(crate) fn mark_headless_resume_delivered(
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("mailbox sidecar missing while marking delivered rows".to_string());
     };
-    db.mark_delivered(session_id, seqs, delivered_by_invocation_uuid)
+    db.mark_delivered(session_id, chain_id, seqs, delivered_by_invocation_uuid)
 }
 
 pub(crate) fn mark_headless_resume_delivery_failed(

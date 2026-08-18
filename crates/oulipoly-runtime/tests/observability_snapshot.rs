@@ -469,7 +469,7 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
         result => panic!("unexpected enqueue result: {result:?}"),
     };
     mailbox
-        .mark_delivered(SESSION_ID, &[row.seq], LIVE_CHILD_UUID)
+        .mark_delivered(SESSION_ID, None, &[row.seq], LIVE_CHILD_UUID)
         .unwrap();
     drop(mailbox);
 

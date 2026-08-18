@@ -57,7 +57,7 @@ fn abandoned_transient_disposition(
         trace_abandoned_transient_wake_skip(&candidate.session_id);
         return Ok(WakeSweepDisposition::Skip);
     }
-    trace_abandoned_transient_wake_reap(&candidate.session_id);
+    trace_abandoned_transient_wake_retained(&candidate.session_id);
     Ok(WakeSweepDisposition::Abandoned)
 }
 
@@ -320,9 +320,9 @@ fn trace_abandoned_transient_wake_skip(session_id: &str) {
     );
 }
 
-fn trace_abandoned_transient_wake_reap(session_id: &str) {
+fn trace_abandoned_transient_wake_retained(session_id: &str) {
     tracing::warn!(
         session_id,
-        "Reaping abandoned transient session with dead owner lineage and no resume evidence"
+        "Retaining abandoned transient session with dead owner lineage and no resume evidence"
     );
 }

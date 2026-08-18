@@ -1177,7 +1177,7 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
             params![row.seq, &original_payload],
         )
         .unwrap();
-    db.mark_delivered(SESSION_A, &[row.seq], INVOCATION_A)
+    db.mark_delivered(SESSION_A, None, &[row.seq], INVOCATION_A)
         .unwrap();
     drop(db);
 

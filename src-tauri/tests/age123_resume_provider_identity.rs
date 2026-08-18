@@ -344,7 +344,7 @@ prompt_mode = "stdin"
     fn seed_auto_wake_claim(&self, session_id: &str, claim_token: &str) {
         let seq = self.seed_pending_auto_wake_claim(session_id, claim_token);
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
-        db.mark_delivered(session_id, &[seq], "notification-boundary-test")
+        db.mark_delivered(session_id, None, &[seq], "notification-boundary-test")
             .unwrap();
     }
 
