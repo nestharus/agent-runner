@@ -6,9 +6,7 @@
 //! predicates for proactive wake integration cases.
 
 use crate::fixtures::Fixture;
-use oulipoly_state::mailbox::{
-    MailboxRow, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
-};
+use oulipoly_state::mailbox::{MailboxRow, SessionRuntimeRow, WakeClaimRow};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -103,7 +101,7 @@ pub(crate) fn newer_mailbox_delivered_with_exhausted_old_pending(fixture: &Fixtu
         && mailbox_row_is_delivered(row_with_handle(&rows, "h-newer"))
 }
 
-pub(crate) fn backlog_recovered_and_debris_reaped(
+pub(crate) fn backlog_recovered_and_debris_retained(
     fixture: &Fixture,
     idle_session: &str,
     recent_session: &str,
@@ -112,9 +110,11 @@ pub(crate) fn backlog_recovered_and_debris_reaped(
     recovered_backlog_is_delivered(
         &mailbox_rows(fixture, idle_session),
         &mailbox_rows(fixture, recent_session),
-    ) && dead_sessions
-        .iter()
-        .all(|session_id| dead_session_debris_is_reaped(fixture, session_id))
+    ) && wake_claim_is_absent(&wake_claim(fixture, idle_session))
+        && wake_claim_is_absent(&wake_claim(fixture, recent_session))
+        && dead_sessions
+            .iter()
+            .all(|session_id| dead_session_debris_is_retained(fixture, session_id))
 }
 
 fn mailbox_rows(fixture: &Fixture, session_id: &str) -> Vec<MailboxRow> {
@@ -177,20 +177,17 @@ fn single_mailbox_row_is_delivered(rows: &[MailboxRow]) -> bool {
     rows.len() == 1 && mailbox_row_has_delivery(&rows[0])
 }
 
-pub(crate) fn assert_dead_owner_debris_reaped(fixture: &Fixture, session_id: &str) {
+pub(crate) fn assert_dead_owner_debris_retained(fixture: &Fixture, session_id: &str) {
     assert!(
-        dead_session_debris_is_reaped(fixture, session_id),
-        "expected non-resumable dead-owner session {session_id} to be reaped with {WAKE_SWEEP_ABANDONED_ERROR}"
+        dead_session_debris_is_retained(fixture, session_id),
+        "expected non-resumable dead-owner session {session_id} to remain pending for explicit authority"
     );
 }
 
-fn dead_session_debris_is_reaped(fixture: &Fixture, session_id: &str) -> bool {
-    dead_session_rows_are_reaped(&mailbox_rows(fixture, session_id))
-        && wake_claim_is_absent(&wake_claim(fixture, session_id))
+fn dead_session_debris_is_retained(fixture: &Fixture, session_id: &str) -> bool {
+    dead_session_rows_are_retained(&mailbox_rows(fixture, session_id))
 }
 
-fn dead_session_rows_are_reaped(rows: &[MailboxRow]) -> bool {
-    rows.len() == 1
-        && rows[0].delivered_at.is_none()
-        && rows[0].delivery_error.as_deref() == Some(WAKE_SWEEP_ABANDONED_ERROR)
+fn dead_session_rows_are_retained(rows: &[MailboxRow]) -> bool {
+    rows.len() == 1 && rows[0].delivered_at.is_none() && rows[0].delivery_error.is_none()
 }

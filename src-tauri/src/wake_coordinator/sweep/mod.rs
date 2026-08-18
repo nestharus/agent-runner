@@ -6,9 +6,7 @@ mod candidate;
 mod consumed;
 mod state;
 
-use oulipoly_state::mailbox::{
-    MailboxDb, SessionLiveness, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeSweepCandidate,
-};
+use oulipoly_state::mailbox::{MailboxDb, SessionLiveness, SessionRuntimeRow, WakeSweepCandidate};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -16,8 +14,7 @@ use std::time::Duration;
 
 use super::auto_wake_env::is_auto_wake_invocation;
 use super::constants::{
-    LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_REAP_ROWS_PER_SESSION,
-    WAKE_RECLAIM_REAP_SESSION_LIMIT, WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
+    LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
     WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
 };
 use super::diagnostics::WakeDiagnostic;
@@ -166,7 +163,7 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     if candidates.is_empty() {
         return Ok(());
     }
-    let start = plan_and_reap_wake_sweep(
+    let start = plan_wake_sweep(
         &mut db,
         candidates,
         state::open_default_state_read_only_with_timeout(Duration::from_secs(
@@ -282,7 +279,6 @@ fn wake_sweep_start_input<'a>(
 
 struct WakeSweepPlan {
     start: Vec<WakeSweepCandidate>,
-    reap: Vec<WakeSweepCandidate>,
 }
 
 fn wake_sweep_plan(
@@ -290,50 +286,43 @@ fn wake_sweep_plan(
     candidates: Vec<WakeSweepCandidate>,
     state: Option<&oulipoly_state::StateDb>,
 ) -> Result<WakeSweepPlan, String> {
-    let (recoverable, reap) = partition_wake_sweep_candidates(db, candidates, state)?;
+    let recoverable = partition_wake_sweep_candidates(db, candidates, state)?;
     let start = select_recoverable_sweep_candidates(recoverable);
-    Ok(wake_sweep_plan_from_selected(start, reap))
+    Ok(wake_sweep_plan_from_selected(start))
 }
 
 fn partition_wake_sweep_candidates(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
     state: Option<&oulipoly_state::StateDb>,
-) -> Result<(Vec<WakeSweepCandidate>, Vec<WakeSweepCandidate>), String> {
+) -> Result<Vec<WakeSweepCandidate>, String> {
     let mut recoverable = Vec::new();
-    let mut reap = Vec::new();
     for candidate in candidates {
         match candidate::wake_sweep_candidate_disposition(db, state, &candidate)? {
             WakeSweepDisposition::Recoverable => {
                 recoverable.push(candidate);
             }
             WakeSweepDisposition::Abandoned => {
-                if reap.len() < WAKE_RECLAIM_REAP_SESSION_LIMIT {
-                    reap.push(candidate);
-                }
+                trace_abandoned_candidate_retained(&candidate.session_id);
             }
             WakeSweepDisposition::Skip => {}
         }
     }
-    Ok((recoverable, reap))
+    Ok(recoverable)
 }
 
-fn plan_and_reap_wake_sweep(
+fn plan_wake_sweep(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
     state: Result<Option<oulipoly_state::StateDb>, String>,
 ) -> Result<Vec<WakeSweepCandidate>, String> {
     let state = state?;
     let plan = wake_sweep_plan(db, candidates, state.as_ref())?;
-    reap_abandoned_sweep_candidates(db, &plan.reap)?;
     Ok(plan.start)
 }
 
-fn wake_sweep_plan_from_selected(
-    start: Vec<WakeSweepCandidate>,
-    reap: Vec<WakeSweepCandidate>,
-) -> WakeSweepPlan {
-    WakeSweepPlan { start, reap }
+fn wake_sweep_plan_from_selected(start: Vec<WakeSweepCandidate>) -> WakeSweepPlan {
+    WakeSweepPlan { start }
 }
 
 fn select_recoverable_sweep_candidates(
@@ -368,18 +357,11 @@ enum WakeSweepDisposition {
     Skip,
 }
 
-fn reap_abandoned_sweep_candidates(
-    db: &mut MailboxDb,
-    candidates: &[WakeSweepCandidate],
-) -> Result<(), String> {
-    for candidate in candidates {
-        db.mark_pending_abandoned(
-            &candidate.session_id,
-            WAKE_SWEEP_ABANDONED_ERROR,
-            WAKE_RECLAIM_REAP_ROWS_PER_SESSION,
-        )?;
-    }
-    Ok(())
+fn trace_abandoned_candidate_retained(session_id: &str) {
+    tracing::warn!(
+        session_id,
+        "Wake reclaim sweep retained abandoned candidate because terminal reap lacks cross-store authority"
+    );
 }
 
 fn trace_wake_sweep_candidate(session_id: &str, diagnostic: &WakeDiagnostic) {
@@ -565,9 +547,9 @@ mod tests {
 
         let invalid_state = directory.path().join("invalid-state.db");
         std::fs::write(&invalid_state, "not sqlite").unwrap();
-        let result = plan_and_reap_wake_sweep(
+        let result = plan_wake_sweep(
             &mut db,
-            vec![candidate],
+            vec![candidate.clone()],
             state::open_state_read_only_at(&invalid_state),
         );
 
@@ -584,5 +566,37 @@ mod tests {
         let claim_after = db.wake_claim(&row.session_id).unwrap().unwrap();
         assert_eq!(claim_after.claim_token, claim_before.claim_token);
         assert_eq!(claim_after.auto_wake_count, claim_before.auto_wake_count);
+
+        let second = db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "state-unavailable-session",
+                handle: "newer-state-unavailable-handle",
+                payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+                owner_invocation_uuid: None,
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: &state_dir,
+                meta_path: &meta,
+                log_path: &log,
+                rc_path: &rc,
+                rc: 0,
+            })
+            .unwrap();
+        assert!(matches!(second, EnqueueResult::Inserted(_)));
+
+        let start = plan_wake_sweep(&mut db, vec![candidate], Ok(None)).unwrap();
+        assert!(start.is_empty());
+        let rows = db.list_mailbox("state-unavailable-session", true).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.delivery_error.is_none()));
+        assert_eq!(
+            db.wake_claim("state-unavailable-session")
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            claim_token
+        );
     }
 }

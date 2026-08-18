@@ -8,7 +8,7 @@ use crate::SESSION;
 use crate::fake_cli::provider_script;
 use crate::fixtures::Fixture;
 use crate::liveness::{
-    backlog_recovered_and_debris_reaped, newer_mailbox_delivered_with_exhausted_old_pending,
+    backlog_recovered_and_debris_retained, newer_mailbox_delivered_with_exhausted_old_pending,
     wait_for_file, wait_until,
 };
 use crate::test_guard::integration_test_guard;
@@ -64,7 +64,7 @@ pub(crate) fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris() {
+pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script(
@@ -105,9 +105,9 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debri
     assert_prompt_contains_handle(&recent_prompt, "h-recent-leak-backlog");
 
     wait_until(
-        "backlog recoverable sessions delivered and debris reaped",
+        "backlog recoverable sessions delivered and debris retained",
         || {
-            backlog_recovered_and_debris_reaped(
+            backlog_recovered_and_debris_retained(
                 &fixture,
                 idle_session,
                 recent_session,
@@ -133,11 +133,8 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debri
         assert_eq!(rows.len(), 1);
         assert!(rows[0].delivered_at.is_none());
         assert_eq!(rows[0].delivery_attempts, 0);
-        assert_eq!(
-            rows[0].delivery_error.as_deref(),
-            Some(oulipoly_state::mailbox::WAKE_SWEEP_ABANDONED_ERROR)
-        );
-        assert!(fixture.mailbox().wake_claim(session_id).unwrap().is_none());
+        assert!(rows[0].delivery_error.is_none());
+        assert!(fixture.mailbox().wake_claim(session_id).unwrap().is_some());
     }
     assert_xdg_isolated(&fixture);
 }
