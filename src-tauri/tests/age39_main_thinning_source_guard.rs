@@ -625,6 +625,12 @@ fn age_39_startup_recovery_runs_before_cli_service_graph_and_dispatch() {
 
     assert_order(
         &run,
+        "dispatch_inspection_only_session(command)",
+        "recover_pending_session_replaces()",
+        "read-only session inspection must not wait for startup recovery",
+    );
+    assert_order(
+        &run,
         "recover_pending_session_replaces()",
         "ifcli.new",
         "startup recovery must precede --new dispatch",

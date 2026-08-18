@@ -89,12 +89,11 @@ pub(crate) use predicate::{
 };
 
 pub(crate) fn run(cli: Cli) -> Result<i32, String> {
-    // Keep inspection-only listing ahead of startup recovery and provider dispatch.
-    if let Some(Subcommands::Session {
-        command: SessionSubcommands::List { json },
-    }) = &cli.command
+    // Keep read-only session inspection ahead of startup recovery and provider dispatch.
+    if let Some(Subcommands::Session { command }) = &cli.command
+        && let Some(result) = dispatch_inspection_only_session(command)
     {
-        return crate::commands::session_list::run_session_list(*json);
+        return result;
     }
 
     // Maintenance must not trigger wake recovery before it inspects or compacts storage.
@@ -143,6 +142,28 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     }
 
     crate::commands::direct_model::run_agent_cli(&cli, &agent_runtime_services)
+}
+
+fn dispatch_inspection_only_session(command: &SessionSubcommands) -> Option<Result<i32, String>> {
+    match command {
+        SessionSubcommands::List { json } => {
+            Some(crate::commands::session_list::run_session_list(*json))
+        }
+        SessionSubcommands::OfPid { pid, json } => {
+            Some(crate::commands::pid_session::run_of_pid(*pid, *json))
+        }
+        SessionSubcommands::Alive { pid, json } => {
+            Some(crate::commands::pid_session::run_alive(*pid, *json))
+        }
+        SessionSubcommands::Subtree {
+            pid,
+            json,
+            max_depth,
+        } => Some(crate::commands::pid_session::run_subtree(
+            *pid, *json, *max_depth,
+        )),
+        _ => None,
+    }
 }
 
 fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
