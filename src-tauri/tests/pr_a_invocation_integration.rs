@@ -1,6 +1,8 @@
 #![cfg(unix)]
 
-use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
+use oulipoly_state::{
+    CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding, StateDb,
+};
 use rusqlite::params;
 use serde_json::Value;
 use std::fs;
@@ -121,6 +123,7 @@ fn run_agent_bash_nested_child(
     parent_env: &str,
     owner_session_id: &str,
     owner_invocation_uuid: &str,
+    registration_authority: &str,
     agent_bash_bin: &Path,
 ) -> String {
     let command = nested_child_command(fixture);
@@ -132,6 +135,7 @@ fn run_agent_bash_nested_child(
         parent_env,
         owner_session_id,
         owner_invocation_uuid,
+        registration_authority,
     );
     let output = run.output().unwrap();
     assert!(output.status.success(), "{output:?}");
@@ -158,6 +162,7 @@ fn configure_agent_bash_env(
     parent_env: &str,
     owner_session_id: &str,
     owner_invocation_uuid: &str,
+    registration_authority: &str,
 ) {
     command.env("XDG_CONFIG_HOME", &fixture.config_home);
     command.env("XDG_DATA_HOME", &fixture.data_home);
@@ -165,6 +170,11 @@ fn configure_agent_bash_env(
     command.env("OULIPOLY_PARENT_INVOCATION", parent_env);
     command.env("AGENT_BASH_OWNER_SESSION_ID", owner_session_id);
     command.env("AGENT_BASH_OWNER_INVOCATION_UUID", owner_invocation_uuid);
+    assert_eq!(registration_authority.len(), 64, "registration authority");
+    command.env(
+        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        registration_authority,
+    );
     command.env(
         "AGENT_BASH_AGENT_RUNNER_BIN",
         env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
@@ -368,17 +378,38 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
 fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
     let agent_bash_bin = agent_bash_bin_from_env();
     let fixture = Fixture::new();
-
-    let parent_output = fixture.run(None);
-    assert!(parent_output.status.success());
-    let parent = parse_invocation(&String::from_utf8_lossy(&parent_output.stderr));
-    let parent_row = fixture
-        .open_db()
-        .get_invocation_by_uuid(&parent.id)
-        .unwrap()
+    let parent = CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "aaaaaaaa-0000-4000-8000-000000000010".to_string(),
+    };
+    let owner_session_id = "fixture-parent-session";
+    let state = fixture.open_db();
+    let started = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: parent.id.clone(),
+            model_name: "fixture".to_string(),
+            provider_name: parent.source.clone(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
         .unwrap();
-    assert_eq!(parent_row.status, InvocationStatus::Succeeded);
-    let owner_session_id = parent_row.provider_session_id.as_deref().unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            started.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: owner_session_id.to_string(),
+                capture_method: "fixture_running_parent",
+                resume_input_id: None,
+                provider_session_resolved_account: Some(parent.source.clone()),
+            },
+        )
+        .unwrap();
+    let registration_authority = started
+        .completion_registration_authority
+        .process_environment_value()
+        .to_string();
+    let parent_row_id = started.invocation_row_id;
+    drop(state);
     let parent_env = serde_json::to_string(&parent).unwrap();
 
     let status = run_agent_bash_nested_child(
@@ -386,6 +417,7 @@ fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
         &parent_env,
         owner_session_id,
         &parent.id,
+        &registration_authority,
         &agent_bash_bin,
     );
 
@@ -399,7 +431,7 @@ fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
         .get_invocation_by_uuid(&child.id)
         .unwrap()
         .unwrap();
-    assert_eq!(child_row.parent_invocation_id, Some(parent_row.id));
+    assert_eq!(child_row.parent_invocation_id, Some(parent_row_id));
 }
 
 #[test]

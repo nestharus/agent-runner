@@ -332,8 +332,8 @@ fn new_flag_with_missing_default_provider_returns_runtime_error() {
         "stderr should name the missing default_provider: {stderr}"
     );
     assert!(
-        stderr.contains("for '--new'"),
-        "stderr should name the surviving --new surface: {stderr}"
+        stderr.contains("for a default-provider REPL"),
+        "stderr should name the default-provider REPL surface: {stderr}"
     );
     assert!(
         !stderr.contains("'agent'"),

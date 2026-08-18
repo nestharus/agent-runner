@@ -244,13 +244,17 @@ fn assert_parent_env_source_contains_parent(source: &str) {
 }
 
 fn parent_env_json_producer_count(source: &str) -> usize {
-    source.matches("serde_json::to_string(invocation)").count()
-        + source.matches("serde_json::to_string(&invocation)").count()
+    source
+        .matches(".invocation_launch_environment(invocation)")
+        .count()
+        + source
+            .matches(".invocation_launch_environment(&invocation)")
+            .count()
 }
 
 fn assert_parent_env_json_producer_count(count: usize) {
     assert!(
         count >= 3,
-        "run/repl/resume/balanced parent env propagation must use raw compact JSON without the stderr prefix"
+        "run/repl/resume/balanced parent env propagation must use the typed launch-environment formatter without the stderr prefix"
     );
 }

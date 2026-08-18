@@ -148,13 +148,23 @@ fn import_replace_cli_provider_owned_protocol_failure_does_not_use_builtin_apply
     assert!(output.stdout.is_empty(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("missing_operation_id"), "{stderr}");
-    assert_eq!(
-        prepared.fixture.mutation_snapshot(
-            &prepared.jsonl_path,
-            EXTERNAL_PROVIDER,
-            &prepared.session_id
-        ),
-        before
+    let after = prepared.fixture.mutation_snapshot(
+        &prepared.jsonl_path,
+        EXTERNAL_PROVIDER,
+        &prepared.session_id,
+    );
+    assert_eq!(after.transcript_bytes, before.transcript_bytes);
+    assert_eq!(after.turn_rows, before.turn_rows);
+    assert_eq!(after.journal_files.len(), 1, "{after:?}");
+    let journal: Value =
+        serde_json::from_slice(&fs::read(&after.journal_files[0]).unwrap()).unwrap();
+    assert_eq!(journal["operation_id"], provider_owned_operation_id());
+    assert_eq!(journal["recovery_id"], provider_owned_recovery_id());
+    assert!(
+        journal["failure_context"]
+            .as_str()
+            .is_some_and(|context| context.contains("missing_operation_id")),
+        "{journal}"
     );
     let records = provider_records(&prepared.record_path);
     assert_subcommand_count(&records, "session.replace", 1);

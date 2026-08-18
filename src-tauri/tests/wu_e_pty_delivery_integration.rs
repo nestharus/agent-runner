@@ -89,6 +89,10 @@ impl Fixture {
             .join("state.db")
     }
 
+    fn registration_authority_path(&self) -> PathBuf {
+        self.dir.path().join("completion-registration-authority")
+    }
+
     fn conn(&self) -> Connection {
         let _ = StateDb::open(&self.state_path()).unwrap();
         Connection::open(self.state_path()).unwrap()
@@ -107,7 +111,12 @@ impl Fixture {
 
     fn run_notify(&self, handle: &str, metadata: Value) -> Output {
         let artifacts = self.write_notify_artifacts(handle, metadata, 0);
-        let registration = self.run(self.register_command(handle, &artifacts));
+        let mut command = self.register_command(handle, &artifacts);
+        command.env(
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            fs::read_to_string(self.registration_authority_path()).unwrap(),
+        );
+        let registration = self.run(command);
         assert!(registration.status.success(), "{registration:?}");
         self.run(self.notify_command(handle, &artifacts))
     }
@@ -194,8 +203,8 @@ impl Fixture {
 
     fn record_owner_identity(&self, identity: &ProcessIdentity) {
         let state = StateDb::open(&self.state_path()).unwrap();
-        let invocation_id = state
-            .start_invocation(&InvocationStart {
+        let started = state
+            .start_invocation_with_completion_registration_authority(&InvocationStart {
                 invocation_uuid: INVOCATION_A.to_string(),
                 model_name: "fixture-model".to_string(),
                 provider_name: "fixture-provider".to_string(),
@@ -203,9 +212,16 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
+        fs::write(
+            self.registration_authority_path(),
+            started
+                .completion_registration_authority
+                .process_environment_value(),
+        )
+        .unwrap();
         state
             .bind_invocation_provider_session_start(
-                invocation_id,
+                started.invocation_row_id,
                 &ProviderSessionBinding {
                     provider_session_id: SESSION_A.to_string(),
                     capture_method: "fixture",
@@ -1235,6 +1251,7 @@ fn fixture_provider_waiting_for_notification(dir: &Path, received_log: &Path) ->
             r#"#!/usr/bin/env bash
 set -euo pipefail
 : > {received}
+printf '%s' "${{OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-}}" > {authority}
 test -t 0
 test -t 1
 test -t 2
@@ -1250,7 +1267,9 @@ while IFS= read -r line; do
   fi
 done
 "#,
-            received = shell_single_quote(&path_string(received_log))
+            received = shell_single_quote(&path_string(received_log)),
+            authority =
+                shell_single_quote(&path_string(&dir.join("completion-registration-authority"))),
         ),
     )
     .unwrap();
@@ -1268,6 +1287,7 @@ fn fixture_provider_with_continuous_redraw(dir: &Path, received_log: &Path) -> P
             r#"#!/usr/bin/env bash
 set -euo pipefail
 : > {received}
+printf '%s' "${{OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-}}" > {authority}
 test -t 0
 test -t 1
 test -t 2
@@ -1287,7 +1307,9 @@ while true; do
   fi
 done
 "#,
-            received = shell_single_quote(&path_string(received_log))
+            received = shell_single_quote(&path_string(received_log)),
+            authority =
+                shell_single_quote(&path_string(&dir.join("completion-registration-authority"))),
         ),
     )
     .unwrap();

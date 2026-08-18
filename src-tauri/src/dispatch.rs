@@ -323,6 +323,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
             meta,
             log,
             rc,
+            repair_admitted,
             json,
         } => crate::commands::notify::run_agent_bash_register(
             crate::commands::notify::AgentBashRegisterArgs {
@@ -332,6 +333,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
                 meta: &meta,
                 log: &log,
                 rc: &rc,
+                repair_admitted,
                 json,
             },
         ),

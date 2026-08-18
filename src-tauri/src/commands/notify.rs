@@ -27,6 +27,7 @@ pub(crate) struct AgentBashRegisterArgs<'a> {
     pub meta: &'a Path,
     pub log: &'a Path,
     pub rc: &'a Path,
+    pub repair_admitted: bool,
     pub json: bool,
 }
 
@@ -133,7 +134,9 @@ pub(crate) fn run_agent_bash_register(args: AgentBashRegisterArgs<'_>) -> Result
             let owner = result.listeners.first();
             render(
                 &RegistrationResponse {
-                    status: if result.inserted {
+                    status: if args.repair_admitted {
+                        "repaired".to_string()
+                    } else if result.inserted {
                         "registered".to_string()
                     } else {
                         "already_registered".to_string()
@@ -219,24 +222,26 @@ fn register_completion_event(
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
-    let authority = oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
     validate_owner_binding(&owner, &metadata)?;
     let mut state = StateDb::open_default()?;
     let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
-    state.register_completion_event_with_authority(
-        &authority,
-        &admission_id,
-        CompletionEventRegistrationInput {
-            event_id: args.handle,
-            delivery_mode: args.delivery_mode,
-            owner_session_id: Some(owner.session_id.as_str()),
-            owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
-            state_dir: &paths.state_dir,
-            meta_path: &paths.meta_path,
-            log_path: &paths.log_path,
-            rc_path: &paths.rc_path,
-        },
-    )
+    let registration = CompletionEventRegistrationInput {
+        event_id: args.handle,
+        delivery_mode: args.delivery_mode,
+        owner_session_id: Some(owner.session_id.as_str()),
+        owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
+        state_dir: &paths.state_dir,
+        meta_path: &paths.meta_path,
+        log_path: &paths.log_path,
+        rc_path: &paths.rc_path,
+    };
+    if args.repair_admitted {
+        state.repair_admitted_completion_event(&admission_id, registration)
+    } else {
+        let authority =
+            oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
+        state.register_completion_event_with_authority(&authority, &admission_id, registration)
+    }
 }
 
 fn completion_obligation_admission_id(event_id: &str, owner_invocation_uuid: &str) -> String {

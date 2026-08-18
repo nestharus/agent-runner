@@ -129,7 +129,9 @@ pub(crate) fn split_invocation_launch_environment(
         })
         .transpose()?;
     let identity = if authority.is_some() {
-        serde_json::to_string(&parsed).map_err(|error| {
+        let invocation = serde_json::from_value::<CompositeInvocationId>(parsed)
+            .map_err(|error| format!("Invalid invocation identity environment: {error}"))?;
+        serde_json::to_string(&invocation).map_err(|error| {
             format!("Failed to serialize invocation identity environment: {error}")
         })?
     } else {
