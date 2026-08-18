@@ -44,7 +44,6 @@ jobs:
     needs: prepare-matrix
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 1
       matrix:
         crate: ${{ fromJSON(needs.prepare-matrix.outputs.libs) }}
     steps:
@@ -55,32 +54,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: lib-${{ matrix.crate }}
-      - name: Install test tools (Linux)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep
-      - if: matrix.crate != 'oulipoly-runtime'
-        run: cargo test -p ${{ matrix.crate }} -- --test-threads=1
-      - if: matrix.crate == 'oulipoly-runtime'
-        name: Run runtime tests with PTY cases isolated
-        run: |
-          cargo test -p oulipoly-runtime -- --test-threads=1 --skip observed_relay_forwards_input_while_snapshot_provider_is_slow --skip observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor --skip render_thread_keeps_drawing_while_processing_side_is_busy
-          cargo test -p oulipoly-runtime --lib executor::cli::pty_broker::tui::tests::observed_relay_forwards_input_while_snapshot_provider_is_slow -- --exact --test-threads=1
-          cargo test -p oulipoly-runtime --lib executor::cli::pty_broker::tui::tests::observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor -- --exact --test-threads=1
-          cargo test -p oulipoly-runtime --lib executor::cli::pty_broker::tui::tests::render_thread_keeps_drawing_while_processing_side_is_busy -- --exact --test-threads=1
+      - run: cargo test -p ${{ matrix.crate }}
       - run: cargo clippy -p ${{ matrix.crate }} -- -D warnings
 
   rust-client-check:
-    needs: [prepare-matrix, rust-lib-check]
+    needs: prepare-matrix
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 1
       matrix:
         client: ${{ fromJSON(needs.prepare-matrix.outputs.clients) }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -91,11 +75,11 @@ jobs:
         name: Install system deps (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev ripgrep
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
       - if: matrix.client.name == 'oulipoly-agent-runner'
         name: Install pinned agent-bash
         uses: ./.github/actions/install-agent-bash
-      - run: cargo test -p ${{ matrix.client.name }} -- --test-threads=1
+      - run: cargo test -p ${{ matrix.client.name }}
       - run: cargo clippy -p ${{ matrix.client.name }} -- -D warnings
 
   rust-state-windows:
@@ -106,7 +90,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: state-windows
-      - run: cargo test -p oulipoly-state read_only_snapshot -- --test-threads=1
+      - run: cargo test -p oulipoly-state read_only_snapshot
 
   rust-integration:
     needs: [rust-lib-check, rust-client-check, rust-state-windows]
@@ -123,9 +107,9 @@ jobs:
         name: Install system deps (Linux)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev ripgrep
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
       - name: Install pinned agent-bash
         uses: ./.github/actions/install-agent-bash
-      - run: cargo test --workspace -- --test-threads=1
+      - run: cargo test --workspace
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace -- -D warnings

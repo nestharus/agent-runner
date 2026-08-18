@@ -1223,9 +1223,11 @@ fn external_provider_launch_env_inherits_parent_environment_with_runner_override
 #[test]
 fn external_provider_launch_env_separates_completion_authority_from_parent_identity() {
     let _lock = env_lock();
+    let data_dir = tempdir_path("completion authority data tempdir");
     let _env = EnvScope::set_optional(&[
         ("OULIPOLY_AUTO_WAKE", None),
         ("OULIPOLY_PARENT_INVOCATION", None),
+        ("OULIPOLY_DATA_DIR", Some(data_dir.path.as_str())),
         (oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV, None),
     ]);
     let fixture = make_external_fixture(
