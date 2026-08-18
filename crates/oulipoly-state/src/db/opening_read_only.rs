@@ -131,7 +131,7 @@ fn classify_file_open_unreadable(result: std::io::Result<std::fs::File>) -> bool
 }
 
 impl StateDb {
-    pub(super) fn validate_read_only_paths(path: &Path) -> Result<(), ReadOnlyOpenError> {
+    pub(super) fn validate_read_only_paths(path: &Path) -> Result<PathBuf, ReadOnlyOpenError> {
         if !path.exists() {
             return Err(ReadOnlyOpenError::Missing {
                 path: path.to_path_buf(),
@@ -142,7 +142,12 @@ impl StateDb {
                 path: path.to_path_buf(),
             });
         }
-        Self::validate_read_only_sidecars(path)
+        let canonical =
+            std::fs::canonicalize(path).map_err(|error| ReadOnlyOpenError::Operational {
+                message: format!("Failed to resolve read-only SQLite database identity: {error}"),
+            })?;
+        Self::validate_read_only_sidecars(&canonical)?;
+        Ok(canonical)
     }
 
     pub(super) fn validate_read_only_sidecars(path: &Path) -> Result<(), ReadOnlyOpenError> {

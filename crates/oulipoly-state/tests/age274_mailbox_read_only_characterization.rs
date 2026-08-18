@@ -341,6 +341,53 @@ fn state_open_read_only_recovers_committed_wal_invocation_and_turn_without_mutat
     drop(writer);
 }
 
+#[cfg(unix)]
+#[test]
+fn state_open_read_only_leaf_symlink_uses_only_canonical_sidecars() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let state_path = data_dir.join("state.db");
+    let alias_path = data_dir.join("state-alias.db");
+    let initial = StateDb::open(&state_path).unwrap();
+    initial
+        .start_invocation(&InvocationStart {
+            invocation_uuid: INVOCATION.to_string(),
+            model_name: "model-before-wal".to_string(),
+            provider_name: "provider-read-only".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    drop(initial);
+
+    let writer = Connection::open(&state_path).unwrap();
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    writer
+        .execute(
+            "UPDATE invocations SET model_name = 'model-in-canonical-wal' WHERE invocation_uuid = ?1",
+            [INVOCATION],
+        )
+        .unwrap();
+    assert!(path_with_suffix(&state_path, "-wal").exists());
+    symlink(&state_path, &alias_path).unwrap();
+    let alias_wal = path_with_suffix(&alias_path, "-wal");
+    std::fs::write(&alias_wal, "unrelated alias artifact").unwrap();
+    let mut permissions = std::fs::metadata(&alias_wal).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&alias_wal, permissions).unwrap();
+
+    let state = StateDb::open_read_only(&alias_path).unwrap();
+    let invocation = state.get_invocation_by_uuid(INVOCATION).unwrap().unwrap();
+
+    assert_eq!(invocation.model_name, "model-in-canonical-wal");
+    drop(state);
+    drop(writer);
+}
+
 #[test]
 fn read_only_missing_paths_for_all_facades_create_nothing() {
     let dir = tempfile::tempdir().unwrap();

@@ -282,8 +282,8 @@ impl StateDb {
         path: &Path,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, ReadOnlyOpenError> {
-        Self::validate_read_only_paths(path)?;
-        let (conn, snapshot) = Self::open_read_only_connection(path, is_cancelled)?;
+        let source = Self::validate_read_only_paths(path)?;
+        let (conn, snapshot) = Self::open_read_only_connection(&source, is_cancelled)?;
         Self::probe_read_only_schema(path, &conn)?;
 
         Ok(Self {
