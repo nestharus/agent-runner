@@ -44,6 +44,7 @@ jobs:
     needs: prepare-matrix
     runs-on: ubuntu-latest
     strategy:
+      max-parallel: 1
       matrix:
         crate: ${{ fromJSON(needs.prepare-matrix.outputs.libs) }}
     steps:
@@ -58,17 +59,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep
-      - run: cargo test -p ${{ matrix.crate }} -- --test-threads=1
+      - if: matrix.crate != 'oulipoly-runtime'
+        run: cargo test -p ${{ matrix.crate }} -- --test-threads=1
+      - if: matrix.crate == 'oulipoly-runtime'
+        name: Run runtime tests with PTY cases isolated
+        run: |
+          cargo test -p oulipoly-runtime -- --test-threads=1 --skip observed_relay_forwards_input_while_snapshot_provider_is_slow --skip observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor --skip render_thread_keeps_drawing_while_processing_side_is_busy
+          cargo test -p oulipoly-runtime --lib executor::cli::pty_broker::tui::tests::observed_relay_forwards_input_while_snapshot_provider_is_slow -- --exact --test-threads=1
+          cargo test -p oulipoly-runtime --lib executor::cli::pty_broker::tui::tests::observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor -- --exact --test-threads=1
+          cargo test -p oulipoly-runtime --lib executor::cli::pty_broker::tui::tests::render_thread_keeps_drawing_while_processing_side_is_busy -- --exact --test-threads=1
       - run: cargo clippy -p ${{ matrix.crate }} -- -D warnings
 
   rust-client-check:
-    needs: prepare-matrix
+    needs: [prepare-matrix, rust-lib-check]
     runs-on: ubuntu-latest
     strategy:
+      max-parallel: 1
       matrix:
         client: ${{ fromJSON(needs.prepare-matrix.outputs.clients) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
