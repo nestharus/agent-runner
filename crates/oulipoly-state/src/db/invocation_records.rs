@@ -276,6 +276,88 @@ impl StateDb {
             .map_err(Self::format_invocation_children_map_error)
     }
 
+    pub fn list_invocation_children_with_running_descendants_bounded(
+        &self,
+        parent_id: i64,
+        limit: usize,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let live_child_ids = self.list_live_subtree_child_ids(parent_id, limit)?;
+        let mut children = Vec::with_capacity(limit);
+        for id in &live_child_ids {
+            if let Some(record) = self.get_invocation_by_id(*id)? {
+                children.push(record);
+            }
+        }
+        if children.len() >= limit {
+            return Ok(children);
+        }
+
+        let live_child_ids = live_child_ids
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let candidates = self.list_invocation_children_bounded(
+            parent_id,
+            limit.saturating_add(live_child_ids.len()),
+            true,
+        )?;
+        children.extend(
+            candidates
+                .into_iter()
+                .filter(|record| !live_child_ids.contains(&record.id))
+                .take(limit - children.len()),
+        );
+        Ok(children)
+    }
+
+    fn list_live_subtree_child_ids(
+        &self,
+        parent_id: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE live_ancestors(id, parent_invocation_id) AS (
+                     SELECT id, parent_invocation_id
+                     FROM invocations INDEXED BY idx_invocations_running_parent
+                     WHERE status = 'running'
+                     UNION
+                     SELECT parent.id, parent.parent_invocation_id
+                     FROM invocations AS parent
+                     JOIN live_ancestors AS child ON parent.id = child.parent_invocation_id
+                 )
+                 SELECT direct.id
+                 FROM live_ancestors AS live
+                 JOIN invocations AS direct ON direct.id = live.id
+                 WHERE live.parent_invocation_id = ?1
+                 ORDER BY direct.created_at, direct.id
+                 LIMIT ?2",
+            )
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let ids = statement
+            .query_map(sqlite::params![parent_id, limit], |row| row.get(0))
+            .map_err(Self::format_invocation_children_query_error)?;
+        ids.collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocation_children_map_error)
+    }
+
+    fn get_invocation_by_id(&self, id: i64) -> Result<Option<InvocationRecord>, String> {
+        let sql = Self::invocation_record_select_sql(&self.conn, "WHERE id = ?1")?;
+        let mut statement = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_lookup_prepare_error)?;
+        match statement.query_row(sqlite::params![id], Self::map_invocation_row) {
+            Ok(record) => Ok(Some(record)),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(Self::format_invocation_lookup_query_error(error)),
+        }
+    }
+
     fn format_invocation_child_lookup_prepare_error(err: sqlite::Error) -> String {
         format!("Failed to prepare invocation child lookup: {err}")
     }

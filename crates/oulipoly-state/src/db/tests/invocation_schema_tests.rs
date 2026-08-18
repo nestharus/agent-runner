@@ -50,6 +50,7 @@ fn schema_creation() {
             "idx_invocations_provider_created".to_string(),
             "idx_invocations_provider_provider_session".to_string(),
             "idx_invocations_provider_session".to_string(),
+            "idx_invocations_running_parent".to_string(),
             "idx_invocations_uuid".to_string(),
             "sqlite_autoindex_invocations_1".to_string(),
         ]

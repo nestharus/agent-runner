@@ -108,6 +108,7 @@ fn schema_18_migration_installs_the_running_projection_index() {
     connection
         .execute_batch(
             "DROP INDEX idx_invocations_parent_running_created;
+             DROP INDEX idx_invocations_running_parent;
              PRAGMA user_version = 18;",
         )
         .unwrap();
@@ -118,12 +119,16 @@ fn schema_18_migration_installs_the_running_projection_index() {
     let installed = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
-             WHERE type = 'index' AND name = 'idx_invocations_parent_running_created'",
+             WHERE type = 'index'
+               AND name IN (
+                   'idx_invocations_parent_running_created',
+                   'idx_invocations_running_parent'
+               )",
             [],
             |row| row.get::<_, i64>(0),
         )
         .unwrap();
-    assert_eq!(installed, 1);
+    assert_eq!(installed, 2);
     assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
 }
 

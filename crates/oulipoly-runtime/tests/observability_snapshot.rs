@@ -6,7 +6,6 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, SessionStorage,
     provider_implementation_ref::ProviderImplementationRef,
 };
-#[cfg(unix)]
 use oulipoly_provider::client::CancellationToken;
 use oulipoly_runtime::observability::{
     InspectRef, LivenessStatus, MonitorNodeKind, MonitorStatus, ObservabilityRoot,
@@ -40,6 +39,8 @@ const CHILD_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_ID: &str = "session-observe";
 #[cfg(target_os = "linux")]
 const LIVE_CHILD_UUID: &str = "33333333-3333-4333-8333-333333333333";
+#[cfg(target_os = "linux")]
+const TERMINAL_ANCESTOR_UUID: &str = "33333333-3333-4333-8333-333333333334";
 #[cfg(target_os = "linux")]
 const DEAD_CHILD_UUID: &str = "44444444-4444-4444-8444-444444444444";
 #[cfg(target_os = "linux")]
@@ -366,6 +367,51 @@ fn overlay_counts_live_logical_child_after_terminal_history_and_fails_closed() {
     assert_invocation_absent(&snapshot, MISSING_CHILD_UUID);
     assert_invocation_absent(&snapshot, MISMATCHED_CHILD_UUID);
     assert_invocation_absent(&snapshot, UNRELATED_UUID);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn overlay_retains_terminal_ancestor_of_live_grandchild_after_terminal_history() {
+    let fixture = Fixture::new();
+    let root_process = TestProcess::spawn();
+    let grandchild_process = TestProcess::spawn();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    for index in 0..TERMINAL_DESCENDANT_COUNT {
+        let uuid = format!("81000000-0000-4000-8000-{index:012}");
+        let row_id = seed_invocation(&state, &uuid, Some(root_id));
+        state
+            .finalize_invocation(row_id, true, 0, None, Some("completed"))
+            .unwrap();
+    }
+    let ancestor_id = seed_invocation(&state, TERMINAL_ANCESTOR_UUID, Some(root_id));
+    state
+        .finalize_invocation(ancestor_id, true, 0, None, Some("completed"))
+        .unwrap();
+    seed_invocation(&state, LIVE_CHILD_UUID, Some(ancestor_id));
+    drop(state);
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), root_process.identity());
+    record_identity(
+        &pid,
+        LIVE_CHILD_UUID,
+        Some(SESSION_ID),
+        grandchild_process.identity(),
+    );
+    drop(pid);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert_eq!(
+        node(&snapshot, &format!("invocation:{TERMINAL_ANCESTOR_UUID}")).status,
+        MonitorStatus::Succeeded
+    );
+    assert_verified_running_process(&snapshot, LIVE_CHILD_UUID, grandchild_process.identity());
 }
 
 #[cfg(target_os = "linux")]
@@ -719,6 +765,27 @@ fn provider_inspect_snapshot_cancellation_stops_blocked_provider_lookup() {
             .iter()
             .all(|node| !matches!(node.inspect_ref, Some(InspectRef::SessionTranscript { .. }))),
         "cancelled snapshot must not publish a provider transcript"
+    );
+}
+
+#[test]
+fn public_cancelled_snapshot_is_distinct_from_a_completed_idle_observation() {
+    let fixture = Fixture::new();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let snapshot = fixture.service().snapshot_with_cancel(
+        &fixture.root(),
+        SnapshotLimits::default(),
+        &cancellation,
+    );
+
+    assert_eq!(snapshot.summary.status, MonitorStatus::Cancelled);
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "snapshot:cancelled")
     );
 }
 

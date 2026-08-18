@@ -163,6 +163,16 @@ fn artifact_sets_match(
     copied: &mut OpenedSqliteArtifactSet,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<bool> {
+    artifact_sets_match_with_hook(source, destination, copied, is_cancelled, |_| Ok(()))
+}
+
+fn artifact_sets_match_with_hook(
+    source: &Path,
+    destination: &Path,
+    copied: &mut OpenedSqliteArtifactSet,
+    is_cancelled: &dyn Fn() -> bool,
+    mut after_artifact: impl FnMut(usize) -> io::Result<()>,
+) -> io::Result<bool> {
     for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
         ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
@@ -179,6 +189,25 @@ fn artifact_sets_match(
                 }
             }
             _ => return Ok(false),
+        }
+        after_artifact(index)?;
+    }
+    artifact_identity_set_matches(source, copied, is_cancelled)
+}
+
+fn artifact_identity_set_matches(
+    source: &Path,
+    copied: &OpenedSqliteArtifactSet,
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<bool> {
+    for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
+        ensure_snapshot_not_cancelled(is_cancelled)?;
+        let source_artifact = path_with_suffix(source, suffix);
+        let expected = copied.artifacts[index]
+            .as_ref()
+            .map(|artifact| artifact.identity);
+        if validated_artifact_identity(&source_artifact)? != expected {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -622,6 +651,32 @@ mod tests {
             std::fs::read(path_with_suffix(snapshot.path(), "-wal")).unwrap(),
             b"stable wal"
         );
+    }
+
+    #[test]
+    fn main_replacement_after_its_check_is_rejected_by_final_artifact_set_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let wal = path_with_suffix(&source, "-wal");
+        let destination = directory.path().join("snapshot.db");
+        let replaced = directory.path().join("state-replaced.db");
+        std::fs::write(&source, "stable main").unwrap();
+        std::fs::write(&wal, "stable wal").unwrap();
+        let mut copied = copy_artifact_set(&source, &destination, &|| false)
+            .unwrap()
+            .unwrap();
+
+        let matches =
+            artifact_sets_match_with_hook(&source, &destination, &mut copied, &|| false, |index| {
+                if index == 0 {
+                    std::fs::rename(&source, &replaced)?;
+                    std::fs::write(&source, "replacement main")?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(!matches);
     }
 
     #[cfg(unix)]

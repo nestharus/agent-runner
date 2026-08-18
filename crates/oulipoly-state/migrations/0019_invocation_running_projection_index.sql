@@ -1,4 +1,5 @@
--- Bound running-first invocation projection without sorting all terminal history.
+-- Bound running-first invocation projection, including ancestors of running descendants,
+-- without sorting all terminal history.
 -- ## Declared roles
 -- `mapper`
 

@@ -10,7 +10,6 @@ use oulipoly_state::mailbox::{
     MailboxDb, SessionLiveness, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeSweepCandidate,
 };
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -18,8 +17,8 @@ use std::time::Duration;
 use super::auto_wake_env::is_auto_wake_invocation;
 use super::constants::{
     LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_REAP_ROWS_PER_SESSION,
-    WAKE_RECLAIM_REAP_SESSION_LIMIT, WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT,
-    WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+    WAKE_RECLAIM_REAP_SESSION_LIMIT, WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
+    WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
 };
 use super::diagnostics::WakeDiagnostic;
 use super::wake_start::{StartWakeInput, start_wake_chain};
@@ -47,8 +46,12 @@ pub(crate) fn start_wake_reclaim_maintenance_driver() {
 }
 
 fn start_wake_reclaim_driver(initial_trigger: &'static str) {
-    static DRIVER: OnceLock<()> = OnceLock::new();
-    DRIVER.get_or_init(|| spawn_wake_reclaim_maintenance_driver(initial_trigger));
+    static DRIVER_STARTED: AtomicBool = AtomicBool::new(false);
+    if let Err(err) = try_start_wake_reclaim_driver(&DRIVER_STARTED, || {
+        spawn_wake_reclaim_thread(move || wake_reclaim_maintenance_loop(initial_trigger)).map(drop)
+    }) {
+        warn_wake_reclaim_driver_start_failed(err);
+    }
 }
 
 pub(crate) struct LivePtyRetryDriverGuard {
@@ -104,11 +107,21 @@ fn live_pty_retry_loop(stop: Arc<AtomicBool>) {
     }
 }
 
-fn spawn_wake_reclaim_maintenance_driver(initial_trigger: &'static str) {
-    let result = spawn_wake_reclaim_thread(move || wake_reclaim_maintenance_loop(initial_trigger));
-    if let Err(err) = result {
-        warn_wake_reclaim_driver_start_failed(err);
+fn try_start_wake_reclaim_driver(
+    started: &AtomicBool,
+    spawn: impl FnOnce() -> Result<(), std::io::Error>,
+) -> Result<bool, std::io::Error> {
+    if started
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
     }
+    if let Err(error) = spawn() {
+        started.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
+    Ok(true)
 }
 
 fn spawn_wake_reclaim_thread(
@@ -153,8 +166,13 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     if candidates.is_empty() {
         return Ok(());
     }
-    let start =
-        plan_and_reap_wake_sweep(&mut db, candidates, state::open_default_state_read_only())?;
+    let start = plan_and_reap_wake_sweep(
+        &mut db,
+        candidates,
+        state::open_default_state_read_only_with_timeout(Duration::from_secs(
+            WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
+        )),
+    )?;
     drop(db);
     for candidate in start {
         let diagnostic = start_wake_chain(wake_sweep_start_input(&candidate, trigger));
@@ -459,6 +477,33 @@ mod tests {
         *lock.lock().unwrap() = true;
         condition.notify_one();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn failed_wake_reclaim_driver_spawn_leaves_admission_retryable() {
+        let started = AtomicBool::new(false);
+        let attempts = std::cell::Cell::new(0);
+
+        let first = try_start_wake_reclaim_driver(&started, || {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::other("synthetic spawn failure"))
+        });
+        assert!(first.is_err());
+        assert!(!started.load(Ordering::SeqCst));
+
+        let second = try_start_wake_reclaim_driver(&started, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(second.unwrap(), true);
+        assert!(started.load(Ordering::SeqCst));
+
+        let third = try_start_wake_reclaim_driver(&started, || {
+            attempts.set(attempts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(third.unwrap(), false);
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]

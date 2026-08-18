@@ -421,12 +421,25 @@ fn monitor_snapshot(
 
 fn cancelled_snapshot(generated_at: SystemTime) -> MonitorSnapshot {
     let nodes = Vec::new();
-    let diagnostics = Vec::new();
+    let diagnostics = vec![MonitorDiagnostic {
+        code: "snapshot:cancelled".to_string(),
+        severity: MonitorDiagnosticSeverity::Info,
+        message: "Observability snapshot cancelled before completion".to_string(),
+        node_id: None,
+    }];
     monitor_snapshot(
         generated_at,
         None,
         None,
-        summary(&nodes, &diagnostics, 0, 0),
+        MonitorSummary {
+            status: MonitorStatus::Cancelled,
+            total_nodes: 0,
+            invocation_nodes: 0,
+            running_nodes: 0,
+            pending_mailbox_count: 0,
+            running_agent_bash_count: 0,
+            diagnostics_count: diagnostics.len(),
+        },
         nodes,
         diagnostics,
     )

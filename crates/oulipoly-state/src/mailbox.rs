@@ -1210,7 +1210,7 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
-        conn.busy_timeout(completion_authority_sqlite_timeout())
+        conn.busy_timeout(mailbox_writer_sqlite_timeout())
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
             conn,
@@ -3791,7 +3791,7 @@ fn acquire_mailbox_rebuild_writer(
             },
         )?;
     connection
-        .busy_timeout(completion_authority_sqlite_timeout())
+        .busy_timeout(mailbox_writer_sqlite_timeout())
         .map_err(|error| format!("Failed to configure PID mailbox rebuild writer: {error}"))?;
     match connection.execute_batch("BEGIN IMMEDIATE") {
         Ok(()) => Ok(Some(connection)),
@@ -3830,12 +3830,12 @@ fn sqlite_error_is_contention(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
-fn completion_authority_sqlite_timeout() -> StdDuration {
+fn mailbox_writer_sqlite_timeout() -> StdDuration {
     StdDuration::from_secs(5)
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn completion_authority_sqlite_timeout() -> StdDuration {
+fn mailbox_writer_sqlite_timeout() -> StdDuration {
     StdDuration::from_millis(500)
 }
 
@@ -7065,6 +7065,8 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
 pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result<(), String> {
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))?;
+    conn.busy_timeout(mailbox_writer_sqlite_timeout())
+        .map_err(|err| format!("Failed to configure PID mailbox writer wait: {err}"))?;
     #[cfg(test)]
     install_completion_finalization_vm_counter(conn);
     Ok(())
@@ -8168,6 +8170,94 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::StateDb;
+
+    #[test]
+    fn ordinary_mailbox_connections_wait_for_bounded_writer_contention() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let blocker = MailboxDb::open(&sidecar_path).unwrap();
+        let mut launch = MailboxDb::open(&sidecar_path).unwrap();
+        let timeout_ms = launch
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(
+            timeout_ms >= 500,
+            "configured busy timeout was {timeout_ms}ms"
+        );
+        blocker
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let generation_id =
+                RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+            let result = launch
+                .create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "launch-contention-invocation",
+                    session_id: Some("launch-contention-session"),
+                    runtime_mode: "headless",
+                    provider_name: "provider-a",
+                    model_name: Some("model-a"),
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                })
+                .map(|mutation| matches!(mutation, GenerationMutation::Applied(_)))
+                .map_err(|error| error.to_string());
+            created_tx.send((launch, result)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            created_rx
+                .recv_timeout(StdDuration::from_millis(25))
+                .is_err(),
+            "runtime generation creation must wait while the sweep-side writer is held"
+        );
+        blocker.connection().execute_batch("ROLLBACK").unwrap();
+        let (mut launch, created) = created_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+        assert_eq!(created, Ok(true));
+
+        blocker
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let generation_id =
+                RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+            let result = launch
+                .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                    fence: RuntimeGenerationFence {
+                        generation_id: &generation_id,
+                        spawn_invocation_uuid: "launch-contention-invocation",
+                    },
+                    spawned_os_pid: 901,
+                    exact_process_identity: None,
+                    os_pgid: None,
+                })
+                .map(|mutation| matches!(mutation, GenerationMutation::Applied(_)))
+                .map_err(|error| error.to_string());
+            bound_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            bound_rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+            "runtime generation binding must wait while the sweep-side writer is held"
+        );
+        blocker.connection().execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            bound_rx.recv_timeout(StdDuration::from_secs(1)).unwrap(),
+            Ok(true)
+        );
+    }
 
     #[test]
     fn every_writable_sidecar_constructor_enforces_foreign_keys() {

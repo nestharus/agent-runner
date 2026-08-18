@@ -284,6 +284,58 @@ fn bounded_invocation_children_prioritize_running_over_terminal_history() {
 }
 
 #[test]
+fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendant() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "21000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    for index in 0..128 {
+        let child_id = insert_invocation_fixture(
+            &db,
+            &format!("22000000-0000-0000-0000-{index:012}"),
+            Some(root_id),
+            "2026-04-17T08:01:00Z",
+        );
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                sqlite::params![child_id],
+            )
+            .unwrap();
+    }
+    let ancestor_id = insert_invocation_fixture(
+        &db,
+        "23000000-0000-0000-0000-000000000000",
+        Some(root_id),
+        "2026-04-17T08:02:00Z",
+    );
+    db.conn
+        .execute(
+            "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+            sqlite::params![ancestor_id],
+        )
+        .unwrap();
+    insert_invocation_fixture(
+        &db,
+        "24000000-0000-0000-0000-000000000000",
+        Some(ancestor_id),
+        "2026-04-17T08:03:00Z",
+    );
+
+    let children = db
+        .list_invocation_children_with_running_descendants_bounded(root_id, 1)
+        .unwrap();
+
+    assert_eq!(
+        invocation_record_uuids(&children),
+        vec!["23000000-0000-0000-0000-000000000000"]
+    );
+}
+
+#[test]
 fn running_first_bounded_query_uses_the_projection_index_without_a_temp_sort() {
     let db = test_db();
     let sql = StateDb::invocation_record_select_sql(

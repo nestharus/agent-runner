@@ -218,7 +218,10 @@ fn invocation_running_projection_index_sql() -> &'static str {
          (status = 'running') DESC,
          created_at,
          id
-     );"
+     );
+     CREATE INDEX IF NOT EXISTS idx_invocations_running_parent
+     ON invocations (parent_invocation_id, id)
+     WHERE status = 'running';"
 }
 
 fn map_primitive_registration_error(db_path: PathBuf, source: rusqlite::Error) -> MigrationError {

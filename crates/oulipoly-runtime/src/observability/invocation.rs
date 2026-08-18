@@ -370,7 +370,11 @@ fn read_invocation_children(
     limit: usize,
     prioritize_running: bool,
 ) -> Result<Vec<InvocationRecord>, String> {
-    state.list_invocation_children_bounded(record_id, limit, prioritize_running)
+    if prioritize_running {
+        state.list_invocation_children_with_running_descendants_bounded(record_id, limit)
+    } else {
+        state.list_invocation_children_bounded(record_id, limit, false)
+    }
 }
 
 fn order_invocation_children(children: &mut [InvocationRecord], include_terminal: bool) {
