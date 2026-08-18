@@ -589,6 +589,9 @@ fn render<T: Serialize>(response: &T, json: bool) -> Result<(), String> {
 }
 
 fn render_error(handle: &str, json: bool, message: String) -> Result<i32, String> {
+    if !json {
+        eprintln!("{message}");
+    }
     render(
         &ErrorResponse {
             status: "notification_event_error".to_string(),

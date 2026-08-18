@@ -117,6 +117,16 @@ impl Fixture {
         delivery_mode: &str,
         artifacts: &NotifyArtifacts,
     ) -> Output {
+        self.run_register_artifacts_with_output(handle, delivery_mode, artifacts, true)
+    }
+
+    fn run_register_artifacts_with_output(
+        &self,
+        handle: &str,
+        delivery_mode: &str,
+        artifacts: &NotifyArtifacts,
+        json: bool,
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("notify")
             .arg("agent-bash-register")
@@ -131,8 +141,10 @@ impl Fixture {
             .arg("--log")
             .arg(&artifacts.log)
             .arg("--rc")
-            .arg(&artifacts.rc)
-            .arg("--json");
+            .arg(&artifacts.rc);
+        if json {
+            cmd.arg("--json");
+        }
         let metadata: Value = serde_json::from_slice(&fs::read(&artifacts.meta).unwrap()).unwrap();
         if let Some(invocation_uuid) = metadata
             .get("owner_invocation_uuid")
@@ -903,6 +915,31 @@ fn completion_registration_rejects_an_unbound_session() {
     assert_eq!(json["status"], "notification_event_error");
     assert!(json["message"].as_str().unwrap().contains("is not bound"));
     assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_human_error_preserves_structured_output_and_stderr_detail() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-wrong-session-human",
+        owner_metadata(SESSION_B, INVOCATION_A),
+        0,
+    );
+
+    let output = fixture.run_register_artifacts_with_output(
+        "h-wrong-session-human",
+        "async",
+        &artifacts,
+        false,
+    );
+
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    let json = stdout_json(&output);
+    let message = json["message"].as_str().expect("error message");
+    assert!(message.contains("is not bound"), "{message}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(message));
     fixture.assert_default_user_paths_untouched();
 }
 
