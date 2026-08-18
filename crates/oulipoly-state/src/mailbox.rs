@@ -1544,6 +1544,15 @@ impl MailboxDb {
             ))?;
             return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
         }
+        let generation_session_id = match runtime_generation_session_id(&before) {
+            Ok(session_id) => session_id.to_string(),
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit sessionless delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
+        };
         let has_existing_claim = before.active_delivery_claim_id.is_some();
         if has_existing_claim && validate_existing_delivery_claim(&before).is_err() {
             tx.commit().map_err(generation_storage_error(
@@ -1552,6 +1561,21 @@ impl MailboxDb {
             return Ok(DeliveryClaimAcquireResult::Rejected(
                 GenerationRejection::InvariantViolation,
             ));
+        }
+        if has_existing_claim {
+            let claimed_states = mailbox_delivery_states_on(
+                &tx,
+                &generation_session_id,
+                &before.active_delivery_seqs,
+            )?;
+            if !all_mailbox_seqs_owned(&claimed_states) {
+                tx.commit().map_err(generation_storage_error(
+                    "commit cross-session delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(
+                    GenerationRejection::SessionConflict,
+                ));
+            }
         }
         let existing_claim_stale =
             runtime_delivery_claim_is_stale(&before, request.stale_after_seconds);
@@ -1614,7 +1638,16 @@ impl MailboxDb {
                 return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
             }
         }
-        let delivery_states = mailbox_delivery_states_on(&tx, request.seqs)?;
+        let delivery_states =
+            mailbox_delivery_states_on(&tx, &generation_session_id, request.seqs)?;
+        if !all_mailbox_seqs_owned(&delivery_states) {
+            tx.commit().map_err(generation_storage_error(
+                "commit cross-session delivery claim batch transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::SessionConflict,
+            ));
+        }
         let rows_pending = all_mailbox_seqs_pending(&delivery_states);
         let claim_encodings = active_delivery_claim_encodings_on(&tx, request.fence.generation_id)?;
         let claim_batches = parse_active_delivery_claim_batches(claim_encodings)?;
@@ -1693,6 +1726,10 @@ impl MailboxDb {
             return Ok(GenerationMutation::Rejected(rejection));
         }
         let before = before.expect("validated active claim requires a generation row");
+        let session_id = before
+            .session_id
+            .as_deref()
+            .expect("validated active claim requires a session");
         if let Err(rejection) = validate_running_delivery_confirmation(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit non-running delivery confirmation transaction",
@@ -1703,18 +1740,19 @@ impl MailboxDb {
             let changed = tx
                 .execute(
                     "UPDATE mailbox
-                     SET delivered_at = ?2,
-                         delivered_by_invocation_uuid = ?3,
+                     SET delivered_at = ?3,
+                         delivered_by_invocation_uuid = ?4,
                          delivery_attempts = delivery_attempts + 1,
                          delivery_error = NULL
                      WHERE seq = ?1
+                       AND session_id = ?2
                        AND delivered_at IS NULL",
-                    params![seq, &now, request.delivered_by_invocation_uuid],
+                    params![seq, session_id, &now, request.delivered_by_invocation_uuid],
                 )
                 .map_err(generation_storage_error(
                     "confirm claimed mailbox row delivery",
                 ))?;
-            validate_confirmed_mailbox_row_change(*seq, changed)?;
+            validate_claimed_mailbox_row_change(*seq, changed, "confirmation")?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -1754,18 +1792,26 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(rejection));
         }
+        let before = before.expect("validated active claim requires a generation row");
+        let session_id = before
+            .session_id
+            .as_deref()
+            .expect("validated active claim requires a session");
         for seq in request.seqs {
-            tx.execute(
-                "UPDATE mailbox
-                 SET delivery_attempts = delivery_attempts + 1,
-                     delivery_error = ?2
-                 WHERE seq = ?1
-                   AND delivered_at IS NULL",
-                params![seq, request.delivery_error],
-            )
-            .map_err(generation_storage_error(
-                "record claimed mailbox row delivery failure",
-            ))?;
+            let changed = tx
+                .execute(
+                    "UPDATE mailbox
+                     SET delivery_attempts = delivery_attempts + 1,
+                         delivery_error = ?3
+                     WHERE seq = ?1
+                       AND session_id = ?2
+                       AND delivered_at IS NULL",
+                    params![seq, session_id, request.delivery_error],
+                )
+                .map_err(generation_storage_error(
+                    "record claimed mailbox row delivery failure",
+                ))?;
+            validate_claimed_mailbox_row_change(*seq, changed, "failure")?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -3303,19 +3349,15 @@ impl MailboxDb {
     pub fn release_wake_claim(
         &mut self,
         session_id: &str,
-        claim_token: Option<&str>,
+        claim_token: &str,
     ) -> Result<bool, String> {
-        let changed = match claim_token {
-            Some(token) => self.conn.execute(
+        let changed = self
+            .conn
+            .execute(
                 "DELETE FROM session_wake_claim WHERE session_id = ?1 AND claim_token = ?2",
-                params![session_id, token],
-            ),
-            None => self.conn.execute(
-                "DELETE FROM session_wake_claim WHERE session_id = ?1",
-                params![session_id],
-            ),
-        }
-        .map_err(|err| format!("Failed to release wake claim: {err}"))?;
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release wake claim: {err}"))?;
         Ok(changed > 0)
     }
 
@@ -3689,7 +3731,7 @@ impl MailboxDb {
         session_id: &str,
         claim_token: &str,
     ) -> Result<(), String> {
-        self.release_wake_claim(session_id, Some(claim_token))?;
+        self.release_wake_claim(session_id, claim_token)?;
         Ok(())
     }
 
@@ -5142,6 +5184,7 @@ fn validate_active_delivery_claim(
         return Err(GenerationRejection::NotFound);
     };
     validate_generation_fence(row, fence)?;
+    runtime_generation_session_id(row)?;
     if row.active_delivery_claim_id.as_ref() != Some(claim_id)
         || row.active_delivery_seqs != seqs
         || row.active_delivery_claimed_at.is_none()
@@ -5163,15 +5206,23 @@ fn validate_running_delivery_confirmation(
     })
 }
 
-fn validate_confirmed_mailbox_row_change(
+fn runtime_generation_session_id(row: &RuntimeGenerationRow) -> Result<&str, GenerationRejection> {
+    row.session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or(GenerationRejection::SessionConflict)
+}
+
+fn validate_claimed_mailbox_row_change(
     seq: i64,
     changed: usize,
+    operation: &str,
 ) -> Result<(), GenerationStorageError> {
     if changed == 1 {
         return Ok(());
     }
     Err(GenerationStorageError::new(format!(
-        "Claimed mailbox row {seq} was not pending at confirmation"
+        "Claimed mailbox row {seq} was not owned and pending at {operation}"
     )))
 }
 
@@ -5647,14 +5698,15 @@ fn runtime_delivery_claim_is_stale(row: &RuntimeGenerationRow, stale_after_secon
 
 fn mailbox_delivery_states_on(
     conn: &Connection,
+    session_id: &str,
     seqs: &[i64],
 ) -> Result<Vec<Option<Option<String>>>, GenerationStorageError> {
     let mut states = Vec::with_capacity(seqs.len());
     for seq in seqs {
         let state = conn
             .query_row(
-                "SELECT delivered_at FROM mailbox WHERE seq = ?1",
-                params![seq],
+                "SELECT delivered_at FROM mailbox WHERE session_id = ?1 AND seq = ?2",
+                params![session_id, seq],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()
@@ -5664,6 +5716,10 @@ fn mailbox_delivery_states_on(
         states.push(state);
     }
     Ok(states)
+}
+
+fn all_mailbox_seqs_owned(states: &[Option<Option<String>>]) -> bool {
+    states.iter().all(Option::is_some)
 }
 
 fn all_mailbox_seqs_pending(states: &[Option<Option<String>>]) -> bool {
@@ -11034,10 +11090,35 @@ mod tests {
                 .auto_wake_count,
             5
         );
-        db.release_wake_claim("session-a", Some("token-a")).unwrap();
+        db.release_wake_claim("session-a", "token-a").unwrap();
         let candidates = db.wake_sweep_candidates(600, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].auto_wake_count, 6);
+    }
+
+    #[test]
+    fn wake_claim_release_requires_the_exact_current_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.try_acquire_wake_claim(WakeClaimRequest {
+            session_id: "session-a",
+            claim_token: "token-a",
+            reason: "notify_idle",
+            auto_wake_count: 1,
+            wake_invocation_uuid: Some("wake-a"),
+            stale_after_seconds: 600,
+        })
+        .unwrap();
+
+        assert!(!db.release_wake_claim("session-a", "token-b").unwrap());
+        assert_eq!(
+            db.wake_claim("session-a").unwrap().unwrap().claim_token,
+            "token-a"
+        );
+        assert!(db.release_wake_claim("session-a", "token-a").unwrap());
+        assert!(db.wake_claim("session-a").unwrap().is_none());
     }
 
     #[test]
@@ -11453,6 +11534,53 @@ mod tests {
     }
 
     #[test]
+    fn runtime_generation_delivery_failure_is_session_bound_and_releases_its_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("56565656-5656-4656-8656-565656565656").unwrap();
+        let claim_id = DeliveryClaimId::parse("78787878-7878-4878-8878-787878787878").unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("claimed", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+        db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+            fence,
+            claim_id: &claim_id,
+            seqs: &[row.seq],
+            stale_after_seconds: 30,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            db.fail_runtime_generation_delivery(FailRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[row.seq],
+                delivery_error: MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+            })
+            .unwrap(),
+            GenerationMutation::Applied(_)
+        ));
+
+        let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(failed.delivery_attempts, 1);
+        assert_eq!(
+            failed.delivery_error.as_deref(),
+            Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
+        );
+        assert!(
+            db.runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .active_delivery_claim_id
+                .is_none()
+        );
+    }
+
+    #[test]
     fn runtime_generation_delivery_failure_rejects_terminal_wake_abandonment() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -11493,6 +11621,84 @@ mod tests {
         let generation = db.runtime_generation(&generation_id).unwrap().unwrap();
         assert_eq!(generation.active_delivery_claim_id, Some(claim_id));
         assert_eq!(generation.active_delivery_seqs, vec![row.seq]);
+    }
+
+    #[test]
+    fn runtime_generation_delivery_authority_is_session_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("12121212-1212-4212-8212-121212121212").unwrap();
+        let claim_id = DeliveryClaimId::parse("34343434-3434-4434-8434-343434343434").unwrap();
+        let foreign = inserted_row(db.enqueue_agent_bash_complete(&input("foreign", "session-b")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+
+        assert_eq!(
+            db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[foreign.seq],
+                stale_after_seconds: 30,
+            })
+            .unwrap(),
+            DeliveryClaimAcquireResult::Rejected(GenerationRejection::SessionConflict)
+        );
+        assert!(
+            db.runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .active_delivery_claim_id
+                .is_none()
+        );
+
+        let seqs_json = serde_json::to_string(&[foreign.seq]).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE runtime_generation
+                 SET active_delivery_claim_uuid = ?2,
+                     active_delivery_claimed_at = '2026-08-18T00:00:00Z',
+                     active_delivery_seqs_json = ?3
+                 WHERE generation_uuid = ?1",
+                params![generation_id.to_string(), claim_id.to_string(), seqs_json],
+            )
+            .unwrap();
+
+        let confirmation_error = db
+            .confirm_runtime_generation_delivery(ConfirmRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[foreign.seq],
+                delivered_by_invocation_uuid: "invocation-a",
+            })
+            .unwrap_err();
+        assert!(
+            confirmation_error
+                .to_string()
+                .contains("not owned and pending")
+        );
+        for _ in 0..2 {
+            let failure_error = db
+                .fail_runtime_generation_delivery(FailRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[foreign.seq],
+                    delivery_error: MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+                })
+                .unwrap_err();
+            assert!(failure_error.to_string().contains("not owned and pending"));
+        }
+
+        let unchanged = db.list_mailbox("session-b", true).unwrap().remove(0);
+        assert!(unchanged.delivered_at.is_none());
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+        let generation = db.runtime_generation(&generation_id).unwrap().unwrap();
+        assert_eq!(generation.active_delivery_claim_id, Some(claim_id));
+        assert_eq!(generation.active_delivery_seqs, vec![foreign.seq]);
     }
 
     #[test]

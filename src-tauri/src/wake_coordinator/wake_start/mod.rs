@@ -261,7 +261,7 @@ fn failed_wake_spawn_diagnostic(
     claim: WakeClaimRow,
     err: String,
 ) -> WakeDiagnostic {
-    let _ = db.release_wake_claim(input.session_id, Some(&claim.claim_token));
+    let _ = db.release_wake_claim(input.session_id, &claim.claim_token);
     spawn_error_diagnostic(claim.claim_token, input.auto_wake_count, err)
 }
 

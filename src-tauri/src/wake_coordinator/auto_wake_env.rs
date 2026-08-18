@@ -40,7 +40,10 @@ pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), Str
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    db.release_wake_claim(session_id, None)?;
+    let Some(claim) = db.wake_claim(session_id)? else {
+        return Ok(());
+    };
+    db.release_wake_claim(session_id, &claim.claim_token)?;
     Ok(())
 }
 
@@ -232,7 +235,7 @@ pub(super) fn release_current_auto_wake_claim(session_id: &str, auto_wake: Optio
 }
 
 fn release_wake_claim_or_warn(db: &mut MailboxDb, session_id: &str, token: &str) {
-    if let Err(err) = db.release_wake_claim(session_id, Some(token)) {
+    if let Err(err) = db.release_wake_claim(session_id, token) {
         warn_release_wake_claim_failed(session_id, err);
     }
 }
