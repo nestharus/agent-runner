@@ -24,7 +24,7 @@ pub(super) fn wake_sweep_candidate_disposition(
     if db.notifications_paused(&candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
-    if consumed::pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
+    if consumed::pending_mailbox_consumed_marker_present(db, state, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {

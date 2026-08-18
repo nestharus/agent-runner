@@ -40,6 +40,15 @@ pub struct ObservabilityRoot {
 
 pub trait ObservabilitySnapshotPort {
     fn snapshot(&self, root: &ObservabilityRoot, limits: SnapshotLimits) -> MonitorSnapshot;
+
+    fn snapshot_with_cancel(
+        &self,
+        root: &ObservabilityRoot,
+        limits: SnapshotLimits,
+        _is_cancelled: &dyn Fn() -> bool,
+    ) -> MonitorSnapshot {
+        self.snapshot(root, limits)
+    }
 }
 
 pub struct ProductionObservabilitySnapshotService {
@@ -118,8 +127,31 @@ impl Default for ProductionObservabilitySnapshotService {
 
 impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
     fn snapshot(&self, root: &ObservabilityRoot, limits: SnapshotLimits) -> MonitorSnapshot {
+        self.snapshot_from_stores(root, limits, SnapshotStores::open_default_read_only())
+    }
+
+    fn snapshot_with_cancel(
+        &self,
+        root: &ObservabilityRoot,
+        limits: SnapshotLimits,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> MonitorSnapshot {
+        self.snapshot_from_stores(
+            root,
+            limits,
+            SnapshotStores::open_default_read_only_with_cancel(is_cancelled),
+        )
+    }
+}
+
+impl ProductionObservabilitySnapshotService {
+    fn snapshot_from_stores(
+        &self,
+        root: &ObservabilityRoot,
+        limits: SnapshotLimits,
+        stores: SnapshotStores,
+    ) -> MonitorSnapshot {
         let generated_at = SystemTime::now();
-        let stores = SnapshotStores::open_default_read_only();
         let invocation = project_invocations(
             stores.state.as_ref(),
             stores.pid.as_ref(),
@@ -180,9 +212,7 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
             diagnostics,
         )
     }
-}
 
-impl ProductionObservabilitySnapshotService {
     /// Build the agent-bash projection input from the open stores and the active
     /// session's invocation/mailbox context.
     fn agent_bash_input<'a>(

@@ -1182,8 +1182,16 @@ impl MailboxDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
-        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create(path)
-            .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        Self::open_read_only_with_cancel(path, &|| false)
+    }
+
+    pub fn open_read_only_with_cancel(
+        path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        let snapshot =
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_cancel(path, is_cancelled)
+                .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         let conn = Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         Ok(Self {

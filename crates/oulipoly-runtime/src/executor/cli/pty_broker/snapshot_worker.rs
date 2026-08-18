@@ -145,7 +145,11 @@ fn run_snapshot_worker(
         if shared.shutdown_requested() {
             return;
         }
-        shared.publish(read_monitor_snapshot(provider.as_ref(), &root));
+        let snapshot = read_monitor_snapshot(provider.as_ref(), &root, &shared);
+        if shared.shutdown_requested() {
+            return;
+        }
+        shared.publish(snapshot);
         next_scan = Instant::now() + shared.interval();
     }
 }
@@ -174,8 +178,11 @@ fn wait_for_scan(shared: &SnapshotWorkerShared, deadline: Instant) -> bool {
 fn read_monitor_snapshot(
     provider: &dyn ObservabilitySnapshotPort,
     root: &ObservabilityRoot,
+    shared: &SnapshotWorkerShared,
 ) -> MonitorSnapshot {
-    provider.snapshot(root, SnapshotLimits::default())
+    provider.snapshot_with_cancel(root, SnapshotLimits::default(), &|| {
+        shared.shutdown_requested()
+    })
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -260,7 +260,7 @@ fn partition_wake_sweep_candidates(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
 ) -> Result<(Vec<WakeSweepCandidate>, Vec<WakeSweepCandidate>), String> {
-    let state = state::open_default_state_read_only();
+    let state = state::open_default_state_read_only()?;
     let mut recoverable = Vec::new();
     let mut reap = Vec::new();
     for candidate in candidates {

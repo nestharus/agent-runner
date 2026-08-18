@@ -218,6 +218,64 @@ fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source()
     drop(writer);
 }
 
+#[cfg(unix)]
+#[test]
+fn mailbox_open_read_only_through_leaf_symlink_recovers_canonical_wal_state() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::seeded();
+    let alias_path = fixture.sidecar_path.with_file_name("pid-identity-alias.db");
+    let mut writer = MailboxDb::open(&fixture.sidecar_path).unwrap();
+    writer
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: SESSION,
+            handle: "h-canonical-wal",
+            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete","wal":true}"#,
+            owner_invocation_uuid: Some(INVOCATION),
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "/wal/state",
+            meta_path: "/wal/meta.json",
+            log_path: "/wal/log",
+            rc_path: "/wal/rc",
+            rc: 0,
+        })
+        .unwrap();
+    assert!(path_with_suffix(&fixture.sidecar_path, "-wal").exists());
+    symlink(&fixture.sidecar_path, &alias_path).unwrap();
+    let before = physical_snapshot(fixture.sidecar_path.parent().unwrap());
+
+    let mailbox = MailboxDb::open_read_only(&alias_path).unwrap();
+    let rows = mailbox.list_mailbox(SESSION, true).unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].handle, "h-canonical-wal");
+    drop(mailbox);
+    assert_physical_snapshot_unchanged(
+        &before,
+        &physical_snapshot(fixture.sidecar_path.parent().unwrap()),
+    );
+    drop(writer);
+}
+
+#[test]
+fn mailbox_open_read_only_rejects_multi_link_database_identity() {
+    let fixture = Fixture::seeded();
+    let alias_path = fixture
+        .sidecar_path
+        .with_file_name("pid-identity-hard-link.db");
+    std::fs::hard_link(&fixture.sidecar_path, &alias_path).unwrap();
+
+    let result = MailboxDb::open_read_only(&alias_path);
+
+    assert!(
+        result.is_err(),
+        "multi-link SQLite identity must be rejected"
+    );
+}
+
 #[test]
 fn state_open_read_only_recovers_committed_wal_invocation_and_turn_without_mutating_source() {
     let dir = tempfile::tempdir().unwrap();

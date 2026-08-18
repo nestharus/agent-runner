@@ -8006,9 +8006,10 @@ mod tests {
             Arc::clone(&snapshot_release),
         ));
         let root = ObservabilityRoot::default();
+        let (relay_done_tx, relay_done_rx) = mpsc::sync_channel(1);
         let relay = thread::spawn(move || {
             let mut child = child;
-            relay_until_exit_observed(
+            let result = relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
@@ -8017,7 +8018,8 @@ mod tests {
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
-            )
+            );
+            let _ = relay_done_tx.send(result);
         });
 
         set_nonblocking(outer.master.as_raw_fd());
@@ -8033,17 +8035,27 @@ mod tests {
         }
         let input_observed_while_snapshot_blocked = observation_path.exists();
 
+        let relay_result = relay_done_rx.recv_timeout(Duration::from_millis(500));
+        let settled_before_snapshot_release = relay_result.is_ok();
+
         let (released, wake) = &*snapshot_release;
         *released.lock().expect("snapshot release lock") = true;
         wake.notify_all();
 
-        let status = relay
-            .join()
-            .expect("relay thread panicked")
-            .expect("relay error");
+        let result = relay_result.unwrap_or_else(|_| {
+            relay_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("relay should settle after snapshot release")
+        });
+        relay.join().expect("relay thread panicked");
+        let status = result.expect("relay error");
         assert!(
             input_observed_while_snapshot_blocked,
             "relay must forward input without waiting for the blocked snapshot provider"
+        );
+        assert!(
+            settled_before_snapshot_release,
+            "child settlement must not wait for best-effort snapshot observation"
         );
         assert_eq!(
             status.code(),
@@ -8256,18 +8268,33 @@ mod tests {
                 release,
             }
         }
+
+        fn wait_for_release(&self, is_cancelled: &dyn Fn() -> bool) -> MonitorSnapshot {
+            let _ = self.entered.try_send(());
+            let (released, wake) = &*self.release;
+            let mut guard = released.lock().expect("snapshot release lock");
+            while !*guard && !is_cancelled() {
+                guard = wake
+                    .wait_timeout(guard, Duration::from_millis(5))
+                    .expect("snapshot release wait")
+                    .0;
+            }
+            self.snapshot.clone()
+        }
     }
 
     impl ObservabilitySnapshotPort for BlockingMonitor {
         fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
-            let _ = self.entered.try_send(());
-            let (released, wake) = &*self.release;
-            let guard = released.lock().expect("snapshot release lock");
-            drop(
-                wake.wait_while(guard, |released| !*released)
-                    .expect("snapshot release wait"),
-            );
-            self.snapshot.clone()
+            self.wait_for_release(&|| false)
+        }
+
+        fn snapshot_with_cancel(
+            &self,
+            _root: &ObservabilityRoot,
+            _limits: SnapshotLimits,
+            is_cancelled: &dyn Fn() -> bool,
+        ) -> MonitorSnapshot {
+            self.wait_for_release(is_cancelled)
         }
     }
 
