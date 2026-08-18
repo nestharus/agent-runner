@@ -28,6 +28,7 @@ use crate::quota_zero_turn::zero_turn_record_baseline;
 pub(super) struct ResumeInvocationAttempt<'state> {
     pub(super) invocation: oulipoly_state::CompositeInvocationId,
     pub(super) invocation_row_id: i64,
+    pub(super) completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
     pub(super) guard: FinalizerGuard<'state>,
 }
 
@@ -57,7 +58,10 @@ pub(super) fn setup_bound_resume_attempt<'state>(
         &provider.name,
         Some(&provider_session_id),
     );
-    let invocation_env = resume_invocation_env(&attempt.invocation)?;
+    let invocation_env = resume_invocation_env(
+        &attempt.invocation,
+        &attempt.completion_registration_authority,
+    )?;
     formatter::emit_stderr(&attempt.invocation.stderr_line());
     Ok(mapper::bound_resume_attempt(
         attempt,
@@ -69,8 +73,9 @@ pub(super) fn setup_bound_resume_attempt<'state>(
 
 fn resume_invocation_env(
     invocation: &oulipoly_state::CompositeInvocationId,
+    authority: &oulipoly_state::CompletionRegistrationAuthority,
 ) -> Result<String, String> {
-    serde_json::to_string(invocation).map_err(|e| format!("Failed to serialize invocation id: {e}"))
+    authority.invocation_launch_environment(invocation)
 }
 
 fn start_resume_invocation<'state>(
@@ -86,19 +91,20 @@ fn start_resume_invocation<'state>(
         provider_index,
         input.parent_invocation_id,
     );
-    let invocation_row_id = input
+    let invocation_start = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .start_invocation(mapper::invocation_lifecycle_start_request(
             &input.env.state,
             &invocation_start,
         ))
-        .map_err(|err| err.to_string())?
-        .invocation_row_id;
+        .map_err(|err| err.to_string())?;
+    let invocation_row_id = invocation_start.invocation_row_id;
     let guard = FinalizerGuard::new(&input.env.state, invocation_row_id);
     Ok(mapper::resume_invocation_attempt(
         invocation,
         invocation_row_id,
+        invocation_start.completion_registration_authority,
         guard,
     ))
 }

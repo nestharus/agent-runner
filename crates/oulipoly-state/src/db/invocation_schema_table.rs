@@ -72,7 +72,16 @@ impl StateDb {
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
-            row_version INTEGER NOT NULL DEFAULT 0
+            row_version INTEGER NOT NULL DEFAULT 0,
+            completion_registration_capability_digest TEXT
+                CONSTRAINT invocation_completion_registration_capability_digest_shape
+                CHECK (
+                    completion_registration_capability_digest IS NULL
+                    OR (
+                        length(completion_registration_capability_digest) = 64
+                        AND completion_registration_capability_digest NOT GLOB '*[^0-9a-f]*'
+                    )
+                )
         );
 
         CREATE INDEX IF NOT EXISTS idx_invocations_uuid

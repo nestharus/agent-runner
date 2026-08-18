@@ -150,7 +150,10 @@ fn initialize_repl_invocation(
     manual_migrate: Option<&str>,
     resume_session_id: Option<&str>,
 ) -> Result<String, String> {
-    let invocation_env = execution::serialize_repl_invocation_env(&attempt.invocation)?;
+    let invocation_env = execution::serialize_repl_invocation_env(
+        &attempt.invocation,
+        &attempt.completion_registration_authority,
+    )?;
     execution::bind_repl_resume_session(
         env,
         attempt.invocation_row_id,

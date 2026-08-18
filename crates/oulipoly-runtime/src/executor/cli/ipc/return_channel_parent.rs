@@ -17,11 +17,14 @@
 //! ```
 
 use super::return_channel_warnings::return_channel_parent_invocation_parse_error;
+use crate::executor::cli::spawn_identity::split_invocation_launch_environment;
 use oulipoly_state::CompositeInvocationId;
 
 pub(super) fn parse_return_channel_parent_invocation(
     parent_invocation_env: &str,
 ) -> Result<CompositeInvocationId, String> {
-    CompositeInvocationId::parse_env_value(parent_invocation_env)
+    let (identity, _) = split_invocation_launch_environment(parent_invocation_env)
+        .map_err(|error| return_channel_parent_invocation_parse_error(&error))?;
+    CompositeInvocationId::parse_env_value(&identity)
         .map_err(|err| return_channel_parent_invocation_parse_error(&err))
 }

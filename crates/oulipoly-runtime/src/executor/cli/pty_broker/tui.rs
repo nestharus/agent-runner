@@ -5825,8 +5825,8 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::FromRawFd;
     use std::process::Command;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -7983,11 +7983,14 @@ mod tests {
         };
         let termios = tty_termios(outer.slave.as_raw_fd());
         let pty = PtyPair::open(&top_pane_winsize(&full), &termios).expect("inner pty");
+        let observation_dir = tempfile::tempdir().expect("observation tempdir");
+        let observation_path = observation_dir.path().join("input-observed");
 
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(
-            r#"[ -t 0 ] || exit 7; IFS= read -r -t 1 line || exit 6; [ "$line" = "ping" ] && exit 42 || exit 8"#,
+            r#"[ -t 0 ] || exit 7; IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] || exit 8; printf observed > "$OBSERVED_INPUT_PATH"; exit 42"#,
         );
+        cmd.env("OBSERVED_INPUT_PATH", &observation_path);
         configure_child_pty(&mut cmd, &pty).expect("configure child pty");
         let child = cmd.spawn().expect("spawn child");
         drop(pty.slave);
@@ -7995,16 +7998,17 @@ mod tests {
         let writer = outer.slave.try_clone().expect("clone writer");
         let input_fd = outer.slave.as_raw_fd();
         let master = pty.master;
-        let done = Arc::new(AtomicBool::new(false));
-        let done_relay = Arc::clone(&done);
-        let monitor = Box::new(SlowMonitor::new(
+        let (snapshot_entered_tx, snapshot_entered_rx) = mpsc::sync_channel(1);
+        let snapshot_release = Arc::new((Mutex::new(false), Condvar::new()));
+        let monitor = Box::new(BlockingMonitor::new(
             empty_snapshot(),
-            Duration::from_millis(1500),
+            snapshot_entered_tx,
+            Arc::clone(&snapshot_release),
         ));
         let root = ObservabilityRoot::default();
         let relay = thread::spawn(move || {
             let mut child = child;
-            let result = relay_until_exit_observed(
+            relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
@@ -8013,35 +8017,34 @@ mod tests {
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
-            );
-            done_relay.store(true, Ordering::SeqCst);
-            result
+            )
         });
 
         set_nonblocking(outer.master.as_raw_fd());
         let mut buf = [0_u8; 8192];
+        snapshot_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("snapshot worker should enter the blocking provider");
+        (&outer.master).write_all(b"ping\n").expect("write input");
         let start = Instant::now();
-        let mut injected = false;
-        loop {
+        while !observation_path.exists() && start.elapsed() < Duration::from_secs(2) {
             let _ = (&outer.master).read(&mut buf);
-            if !injected && start.elapsed() >= Duration::from_millis(200) {
-                (&outer.master).write_all(b"ping\n").expect("write input");
-                injected = true;
-            }
-            if done.load(Ordering::SeqCst) {
-                break;
-            }
-            assert!(
-                start.elapsed() <= Duration::from_secs(6),
-                "relay should finish even while the snapshot worker is sleeping"
-            );
             thread::sleep(Duration::from_millis(5));
         }
+        let input_observed_while_snapshot_blocked = observation_path.exists();
+
+        let (released, wake) = &*snapshot_release;
+        *released.lock().expect("snapshot release lock") = true;
+        wake.notify_all();
 
         let status = relay
             .join()
             .expect("relay thread panicked")
             .expect("relay error");
+        assert!(
+            input_observed_while_snapshot_blocked,
+            "relay must forward input without waiting for the blocked snapshot provider"
+        );
         assert_eq!(
             status.code(),
             Some(42),
@@ -8235,20 +8238,35 @@ mod tests {
         }
     }
 
-    struct SlowMonitor {
+    struct BlockingMonitor {
         snapshot: MonitorSnapshot,
-        delay: Duration,
+        entered: mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
     }
 
-    impl SlowMonitor {
-        fn new(snapshot: MonitorSnapshot, delay: Duration) -> Self {
-            Self { snapshot, delay }
+    impl BlockingMonitor {
+        fn new(
+            snapshot: MonitorSnapshot,
+            entered: mpsc::SyncSender<()>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        ) -> Self {
+            Self {
+                snapshot,
+                entered,
+                release,
+            }
         }
     }
 
-    impl ObservabilitySnapshotPort for SlowMonitor {
+    impl ObservabilitySnapshotPort for BlockingMonitor {
         fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
-            thread::sleep(self.delay);
+            let _ = self.entered.try_send(());
+            let (released, wake) = &*self.release;
+            let guard = released.lock().expect("snapshot release lock");
+            drop(
+                wake.wait_while(guard, |released| !*released)
+                    .expect("snapshot release wait"),
+            );
             self.snapshot.clone()
         }
     }

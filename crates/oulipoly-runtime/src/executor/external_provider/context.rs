@@ -20,7 +20,7 @@ use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) model: ModelConfig,
     pub(crate) provider: ProviderConfig,
@@ -36,7 +36,7 @@ pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) settings_id: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ExternalProviderDispatchInput {
     pub(crate) model: ModelConfig,
     pub(crate) provider: ProviderConfig,

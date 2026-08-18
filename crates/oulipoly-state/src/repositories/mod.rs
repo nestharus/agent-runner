@@ -682,7 +682,7 @@ pub trait SchemaProbeRepository {
 
 impl SchemaProbeRepository for StateDb {
     fn inspect_open_db(&self, path: PathBuf) -> Result<SchemaProbeReport, String> {
-        let state_db = schema_probe::inspect_schema(self.connection(), path)?;
+        let state_db = schema_probe::inspect_schema(self.raw_connection(), path)?;
         Ok(schema_probe::report_from_state_db(state_db))
     }
 }

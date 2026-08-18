@@ -94,7 +94,8 @@ impl Fixture {
             selected_auto_wake_max: Some(wake_max),
         })
         .unwrap();
-        db.connection()
+        rusqlite::Connection::open(MailboxDb::default_path().unwrap())
+            .unwrap()
             .execute(
                 "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",
                 rusqlite::params![SESSION, wake_count],

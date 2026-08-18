@@ -61,7 +61,7 @@
 //!       - ownership_authority, provider_schema_migration, provider_schema_validation, provider_session_binding, providers
 //!       - resume_active_segment, resume_lookup, resume_preview, resume_resolution, resume_types
 //!       - returned_artifacts_codec, returned_artifacts_read, returned_artifacts_write
-//!       - schema_types, session_capture, session_markers, session_turns_ingest, session_turns_query, sqlite_adapter, timestamps
+//!       - schema_types, session_capture, session_markers, session_turns_ingest, session_turns_query, session_turns_replace, sqlite_adapter, timestamps
 //! ```
 
 macro_rules! invocation_returned_artifacts_schema_sql {
@@ -146,6 +146,7 @@ mod session_lifecycle;
 mod session_markers;
 mod session_turns_ingest;
 mod session_turns_query;
+mod session_turns_replace;
 mod sqlite_adapter;
 mod timestamps;
 
@@ -161,6 +162,11 @@ pub use self::imported_session_display_metadata::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert,
 };
 pub use self::imported_session_list::ImportedSessionListRow;
+pub use self::invocation_lifecycle_finalize::InvocationFinalizeError;
+pub use self::invocation_lifecycle_start::{
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
+    CompletionRegistrationAuthority, InvocationStartWithCompletionAuthority,
+};
 use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
     active_lifecycle_session_id, lifecycle_terminal_status,
@@ -169,13 +175,19 @@ pub use self::invocation_records::{InvocationRecord, InvocationStart, Invocation
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;
+pub use self::opening_write::StateReadConnection;
 pub use self::owned_turn_event_write::{OwnedTurnEvent, OwnedTurnEventRow};
+use self::ownership_authority::{
+    CompletionAuthoritySummary, CompletionMaterializationExpectation,
+    completion_continuity_head_on, require_completion_continuity_registration_ready,
+};
 pub use self::ownership_authority::{
-    CompletionObligationAdmission, CompletionObligationAdmissionResult,
-    CompletionObligationAuthority, CompletionObligationExpectation, EffectiveTerminalDisposition,
-    ListenerSettlementClass, OwnedCompletionEventState, OwnerLineageRelationship,
-    OwnershipAuthorityError, OwnershipAuthoritySnapshot, RecoveryDisposition,
-    SettlementVerifierIdentity, SidecarGenerationState,
+    CompletionContinuityRecoveryState, CompletionObligationAdmission,
+    CompletionObligationAdmissionResult, CompletionObligationAuthority,
+    CompletionObligationExpectation, EffectiveTerminalDisposition, ListenerSettlementClass,
+    OwnedCompletionEventState, OwnerLineageRelationship, OwnershipAuthorityError,
+    OwnershipAuthoritySnapshot, RecoveryDisposition, SettlementVerifierIdentity,
+    SidecarGenerationState,
 };
 use self::provider_quotas::{
     MAX_LEARNABLE_BURN_RATE, MIN_LEARN_SAMPLE_CALLS, NEAR_EXHAUSTED_USED_PERCENT,
@@ -217,6 +229,9 @@ pub use self::session_markers::SessionMarkerPayload;
 #[allow(unused_imports)]
 pub use self::session_turns_ingest::SessionTurnRecord;
 pub use self::session_turns_ingest::{SessionTurnCounts, SessionTurnIngest};
+pub use self::session_turns_replace::{
+    SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
+};
 
 use self::lifecycle_log_adapter as lc_log_adapter;
 use self::sqlite_adapter as sqlite;
@@ -238,8 +253,46 @@ use uuid::Uuid;
 pub struct StateDb {
     conn: sqlite::Connection,
     db_path: PathBuf,
+    // Completion authority rejoins the accepted source path to one canonical local file identity.
+    completion_authority_state: Option<CompletionAuthorityStateIdentity>,
     lifecycle_sink: Mutex<Box<dyn LifecycleEventSink + Send>>,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+    _state_namespace_guard: Option<StateNamespaceGuard>,
+}
+
+struct CompletionAuthorityStateIdentity {
+    source_path: PathBuf,
+    path: PathBuf,
+    file: StateFileIdentity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StateFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+struct StateNamespaceGuard {
+    file: std::fs::File,
+}
+
+/// Exclusive authority for the supported destructive state rebuild operation.
+/// Writable StateDb handles hold the shared form for their complete lifetime.
+pub struct StateDbRebuildAuthority {
+    db_path: PathBuf,
+    _guard: StateNamespaceGuard,
+}
+
+/// Shared authority for the trusted session-ownership migration writer.
+///
+/// This is terminal local-database authority, not a SQL sandbox: its holder has
+/// the same trust as any process with direct write permission to the State file.
+/// Trigger-enforced append-only claims cover typed State operations and do not
+/// claim protection from this authority or another arbitrary local SQLite writer.
+/// The carrier is path-bound and intentionally not cloneable.
+pub struct StateDbWriterAuthority {
+    db_path: PathBuf,
+    _guard: StateNamespaceGuard,
 }
 
 #[derive(Debug, Clone)]

@@ -66,6 +66,7 @@ impl StateDb {
     pub(super) fn initialize_invocations_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_schema_sql())
             .map_err(Self::format_initialize_invocations_schema_error)?;
+        Self::ensure_completion_registration_authority_trigger(conn)?;
         Self::ensure_invocations_row_version_support(conn)
     }
 
@@ -84,7 +85,25 @@ impl StateDb {
             Self::invocations_drop_column_repairs().as_slice(),
         )?;
         Self::ensure_invocation_indexes(conn)?;
+        Self::ensure_completion_registration_authority_trigger(conn)?;
         Self::ensure_invocations_row_version_support(conn)
+    }
+
+    pub(super) fn ensure_completion_registration_authority_trigger(
+        conn: &sqlite::Connection,
+    ) -> Result<(), String> {
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS trg_invocation_completion_registration_capability_immutable
+             BEFORE UPDATE OF completion_registration_capability_digest ON invocations
+             WHEN OLD.completion_registration_capability_digest
+                  IS NOT NEW.completion_registration_capability_digest
+             BEGIN
+                 SELECT RAISE(ABORT, 'completion registration capability is immutable');
+             END;",
+        )
+        .map_err(|error| {
+            format!("Failed to ensure completion registration authority trigger: {error}")
+        })
     }
 
     fn invocations_drop_column_repairs() -> [DropColumnRepair; 1] {
@@ -154,7 +173,9 @@ impl StateDb {
             .filter(|column| {
                 !matches!(
                     column.as_str(),
-                    "row_version" | "provider_session_resolved_account"
+                    "row_version"
+                        | "provider_session_resolved_account"
+                        | "completion_registration_capability_digest"
                 )
             })
             .cloned()

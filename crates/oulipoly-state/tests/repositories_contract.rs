@@ -14,11 +14,34 @@ use oulipoly_state::{
     InvocationStart, InvocationStatus, ModelParameter, ParamType, QuotaWindowInput,
     SessionTurnIngest, StateDb,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+struct TestDb {
+    db: StateDb,
+    _directory: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TestDb {
+    type Target = StateDb;
+
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
 
 // Declared role: accessor
-fn memory_db() -> StateDb {
-    StateDb::open(Path::new(":memory:")).unwrap()
+fn memory_db() -> TestDb {
+    let directory = tempfile::tempdir().unwrap();
+    let db = StateDb::open(
+        &directory
+            .path()
+            .join(format!("{}.db", uuid::Uuid::new_v4())),
+    )
+    .unwrap();
+    TestDb {
+        db,
+        _directory: directory,
+    }
 }
 
 // Declared role: mapper
@@ -50,7 +73,8 @@ fn fixed_time(offset_secs: i64) -> chrono::DateTime<Utc> {
 
 // Declared role: accessor
 fn seed_chain(db: &StateDb, chain_id: &str, model_name: &str, ts: chrono::DateTime<Utc>) {
-    db.connection()
+    rusqlite::Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)",
@@ -577,10 +601,10 @@ fn schema_probe_repository_delegates_open_db_inspection() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let db = StateDb::open(&db_path).unwrap();
+    let connection = rusqlite::Connection::open(&db_path).unwrap();
 
     let direct_state =
-        oulipoly_state::schema_probe::inspect_schema(db.connection(), PathBuf::from(&db_path))
-            .unwrap();
+        oulipoly_state::schema_probe::inspect_schema(&connection, PathBuf::from(&db_path)).unwrap();
     let direct_report = oulipoly_state::schema_probe::report_from_state_db(direct_state);
     let trait_report =
         <StateDb as SchemaProbeRepository>::inspect_open_db(&db, PathBuf::from(&db_path)).unwrap();

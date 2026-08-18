@@ -436,7 +436,8 @@ fn invocation_status(db: &StateDb, row_id: i64) -> String {
 
 fn install_session_failure_trigger(db: &StateDb) {
     // Contract § 6a permits test-time triggers on tempdir-backed StateDb files.
-    db.connection()
+    rusqlite::Connection::open(db.path())
+        .unwrap()
         .execute_batch(
             "CREATE TRIGGER age129_fail_session_capture
              BEFORE UPDATE OF session_capture_method ON invocations
@@ -449,7 +450,8 @@ fn install_session_failure_trigger(db: &StateDb) {
 
 fn install_finalize_failure_trigger(db: &StateDb) {
     // Contract § 6a permits test-time triggers on tempdir-backed StateDb files.
-    db.connection()
+    rusqlite::Connection::open(db.path())
+        .unwrap()
         .execute_batch(
             "CREATE TRIGGER age129_fail_finalize
              BEFORE UPDATE OF status ON invocations
@@ -589,7 +591,8 @@ fn error_variants_emit_full_schema_for_start_session_finalize() {
         install_session_failure_trigger(&db);
         db.update_session_capture(session_row_id, Some("session-err"), "fresh")
             .unwrap_err();
-        db.connection()
+        rusqlite::Connection::open(db.path())
+            .unwrap()
             .execute_batch("DROP TRIGGER age129_fail_session_capture")
             .unwrap();
 
@@ -784,7 +787,8 @@ fn lifecycle_method_sink_forward_invoked_with_same_record() {
         install_session_failure_trigger(&db);
         db.update_session_capture(session_err_row_id, Some("session-err"), "fresh")
             .unwrap_err();
-        db.connection()
+        rusqlite::Connection::open(db.path())
+            .unwrap()
             .execute_batch("DROP TRIGGER age129_fail_session_capture")
             .unwrap();
 
@@ -958,7 +962,8 @@ fn lifecycle_method_errors_emit_sqlite_error_records_without_changing_return_err
                 "Failed to update session capture for invocation {session_row_id}: age129 session capture failure"
             )
         );
-        db.connection()
+        rusqlite::Connection::open(db.path())
+            .unwrap()
             .execute_batch("DROP TRIGGER age129_fail_session_capture")
             .unwrap();
 

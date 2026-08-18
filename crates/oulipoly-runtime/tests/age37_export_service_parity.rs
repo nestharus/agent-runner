@@ -162,15 +162,16 @@ flag = "--resume"
 
     fn seed_active_chain(&self, chain_id: &str, provider_name: &str, session_id: &str) {
         let db = self.db();
+        let connection = rusqlite::Connection::open(db.path()).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        db.connection()
+        connection
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                  VALUES (?1, ?2, ?2, ?3)",
                 params![chain_id, now, MODEL],
             )
             .unwrap();
-        db.connection()
+        connection
             .execute(
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, transition_reason)
@@ -182,7 +183,8 @@ flag = "--resume"
 
     fn seed_db_turn(&self, provider_name: &str, session_id: &str, turn_id: &str, text: &str) {
         let db = self.db();
-        db.connection()
+        rusqlite::Connection::open(db.path())
+            .unwrap()
             .execute(
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role,

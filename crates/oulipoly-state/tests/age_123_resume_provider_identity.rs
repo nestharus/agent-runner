@@ -43,9 +43,10 @@ fn fresh_schema_has_provider_session_resolved_account_on_invocations() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let db = StateDb::open(&db_path).unwrap();
+    let connection = Connection::open(db.path()).unwrap();
 
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
-    let columns = invocation_columns(db.connection());
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
+    let columns = invocation_columns(&connection);
     let column = columns
         .iter()
         .find(|column| column.name == "provider_session_resolved_account")
@@ -67,11 +68,12 @@ fn migration_0007_adds_identity_column_and_preserves_rows() {
     drop(before_conn);
 
     let db = StateDb::open(&db_path).unwrap();
-    assert_eq!(user_version(db.connection()), CURRENT_SCHEMA_VERSION);
-    let after_rows = invocation_payload_snapshot(db.connection());
+    let connection = Connection::open(db.path()).unwrap();
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
+    let after_rows = invocation_payload_snapshot(&connection);
     assert_eq!(after_rows, before_rows);
 
-    let historical_identities = historical_identity_values(db.connection());
+    let historical_identities = historical_identity_values(&connection);
     assert!(!historical_identities.is_empty());
     assert!(
         historical_identities.iter().all(Option::is_none),

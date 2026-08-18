@@ -36,7 +36,7 @@ pub(super) fn create_backup_dir(backup_dir: &Path) -> Result<(), String> {
 }
 
 pub(super) fn remove_live_sidecars(sidecars: &[PathBuf]) -> Result<(), String> {
-    for source in sidecars {
+    for source in sidecars.iter().rev() {
         if source.exists() {
             fs::remove_file(source).map_err(|e| format_live_sidecar_remove_error(source, e))?;
         }

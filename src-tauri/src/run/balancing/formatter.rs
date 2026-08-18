@@ -23,16 +23,6 @@ pub(super) fn emit_pool_exhausted_pre_invocation_failure(model: &ModelConfig, re
     );
 }
 
-pub(super) fn invocation_env_serialization_error(error: serde_json::Error) -> String {
-    format!("Failed to serialize invocation id: {error}")
-}
-
-pub(super) fn invocation_env(
-    invocation: &CompositeInvocationId,
-) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&invocation)
-}
-
 pub(super) fn emit_invocation_stderr_line(invocation: &CompositeInvocationId) {
     emit_stderr(&invocation.stderr_line());
 }

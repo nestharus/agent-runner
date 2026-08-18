@@ -154,17 +154,16 @@ fn malformed_recorded_outcome_blocks_during_accept() {
     drop(store);
 
     let state = StateDb::open(&fixture.state_path).expect("open state for corruption check");
-    let constrained = state.connection().execute(
+    let connection = rusqlite::Connection::open(state.path()).unwrap();
+    let constrained = connection.execute(
         "UPDATE fresh_continuations SET resume_outcome_json = '{' WHERE continuation_id = ?1",
         [&continuation.continuation_id],
     );
     assert!(constrained.is_err(), "schema must reject malformed JSON");
-    state
-        .connection()
+    connection
         .execute_batch("PRAGMA ignore_check_constraints = ON")
         .expect("enable corruption injection");
-    state
-        .connection()
+    connection
         .execute(
             "UPDATE fresh_continuations SET resume_outcome_json = '{' WHERE continuation_id = ?1",
             [&continuation.continuation_id],
@@ -189,8 +188,8 @@ fn invalid_persisted_reservation_identity_blocks_during_accept() {
     drop(store);
 
     let state = StateDb::open(&fixture.state_path).expect("open state for corruption check");
-    state
-        .connection()
+    rusqlite::Connection::open(state.path())
+        .unwrap()
         .execute(
             "UPDATE fresh_continuations
                 SET resume_invocation_id = 'not-a-uuid',
@@ -218,7 +217,8 @@ fn fresh_stage_before_resume_completion_blocks_during_accept() {
     drop(store);
 
     let state = StateDb::open(&fixture.state_path).expect("open state for corruption check");
-    let constrained = state.connection().execute(
+    let connection = rusqlite::Connection::open(state.path()).unwrap();
+    let constrained = connection.execute(
         "UPDATE fresh_continuations SET fresh_stage = 'running' WHERE continuation_id = ?1",
         [&continuation.continuation_id],
     );
@@ -226,12 +226,10 @@ fn fresh_stage_before_resume_completion_blocks_during_accept() {
         constrained.is_err(),
         "schema must reject fresh progress before durable resume completion"
     );
-    state
-        .connection()
+    connection
         .execute_batch("PRAGMA ignore_check_constraints = ON")
         .expect("enable corruption injection");
-    state
-        .connection()
+    connection
         .execute(
             "UPDATE fresh_continuations SET fresh_stage = 'running' WHERE continuation_id = ?1",
             [&continuation.continuation_id],
@@ -641,10 +639,10 @@ fn durable_continuation_id_rewrite_cannot_replace_validated_store_provenance() {
     let original_id = continuation.continuation_id.clone();
     let replacement_id = "replacement-continuation-id";
     let writer = StateDb::open(&fixture.state_path).expect("open separate public writer");
+    let connection = rusqlite::Connection::open(writer.path()).unwrap();
     let before = durable_continuation_non_id_fields(&writer, &original_id);
 
-    let updated = writer
-        .connection()
+    let updated = connection
         .execute(
             "UPDATE fresh_continuations SET continuation_id = ?1 WHERE continuation_id = ?2",
             [replacement_id, &original_id],
@@ -681,8 +679,7 @@ fn durable_continuation_id_rewrite_cannot_replace_validated_store_provenance() {
         None
     );
 
-    let restored = writer
-        .connection()
+    let restored = connection
         .execute(
             "UPDATE fresh_continuations SET continuation_id = ?1 WHERE continuation_id = ?2",
             [&original_id, replacement_id],

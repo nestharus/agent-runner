@@ -1221,6 +1221,67 @@ fn external_provider_launch_env_inherits_parent_environment_with_runner_override
 }
 
 #[test]
+fn external_provider_launch_env_separates_completion_authority_from_parent_identity() {
+    let _lock = env_lock();
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_AUTO_WAKE", None),
+        ("OULIPOLY_PARENT_INVOCATION", None),
+        (oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV, None),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let invocation = oulipoly_state::CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "11111111-1111-4111-8111-111111111111".to_string(),
+    };
+    let authority =
+        oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+            "ab".repeat(32),
+        )
+        .expect("valid completion registration authority");
+    let launch_environment = authority
+        .invocation_launch_environment(&invocation)
+        .expect("launch environment");
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(launch_environment))
+        .expect("external dispatch should separate completion authority from parent identity");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    let policy_env = json_object(&policy["params"]["launch"]["env"]);
+    assert!(
+        policy_env
+            .get(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV)
+            .is_none(),
+        "provider policy diagnostics must not receive reusable completion authority"
+    );
+    let launch_env = json_object(&launch["params"]["env"]);
+    for env in [policy_env, launch_env] {
+        let parent_identity = env["OULIPOLY_PARENT_INVOCATION"]
+            .as_str()
+            .expect("parent invocation text");
+        assert_eq!(
+            serde_json::from_str::<Value>(parent_identity).expect("parent identity"),
+            serde_json::to_value(&invocation).expect("expected parent identity")
+        );
+        assert!(
+            !parent_identity
+                .contains(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
+        );
+    }
+    assert_eq!(
+        launch_env[oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV],
+        authority.process_environment_value()
+    );
+}
+
+#[test]
 fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
     const JIRA_ENV: &str = "JIRA_API_KEY_REALLY";
     const JIRA_VALUE: &str = "synthetic-jira-api-key-really";

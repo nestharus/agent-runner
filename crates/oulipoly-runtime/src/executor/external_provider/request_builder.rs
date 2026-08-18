@@ -16,7 +16,9 @@
 //! ```
 
 use super::context::ExternalProviderDispatchContext;
-use crate::executor::cli::spawn_identity::provider_parent_invocation_env;
+use crate::executor::cli::spawn_identity::{
+    provider_parent_invocation_env, split_invocation_launch_environment,
+};
 use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
 use oulipoly_config::PromptMode;
 use oulipoly_provider::generated::{
@@ -33,7 +35,7 @@ const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 // universal provider or operating-system argv limit.
 const OPENCODE_EXTERNAL_PROVIDER_POSITIONAL_PROMPT_LIMIT_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct LaunchCandidate {
     pub(crate) argv: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
@@ -41,32 +43,60 @@ pub(crate) struct LaunchCandidate {
     pub(crate) prompt: String,
     pub(crate) prompt_mode: PromptMode,
     pub(crate) working_directory: String,
+    completion_registration_authority: Option<String>,
 }
 
 pub(crate) fn build_launch_candidate(
     context: &ExternalProviderDispatchContext,
 ) -> Result<LaunchCandidate, String> {
     let input_args = resolve_input_flags(&context.model, &context.extra_inputs)?;
+    let (env, completion_registration_authority) = declared_launch_env(context)?;
 
     Ok(LaunchCandidate {
         argv: provider_argv(context, &input_args),
-        env: declared_launch_env(context),
+        env,
         stdin: launch_stdin(context),
         prompt: context.prompt.clone(),
         prompt_mode: context.prompt_mode,
         working_directory: working_directory(context),
+        completion_registration_authority,
     })
 }
 
-fn declared_launch_env(context: &ExternalProviderDispatchContext) -> BTreeMap<String, String> {
+fn declared_launch_env(
+    context: &ExternalProviderDispatchContext,
+) -> Result<(BTreeMap<String, String>, Option<String>), String> {
     let mut env = inherited_launch_env();
+    let inherited_authority = env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
+    env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     insert_pinned_agent_data_dir(&mut env);
+    let mut completion_registration_authority = None;
     if let Some(parent) = provider_parent_invocation_env(context.parent_invocation_env.as_deref()) {
-        env.insert(PARENT_INVOCATION_ENV.to_string(), parent);
+        let selected_is_current = context.parent_invocation_env.as_deref() == Some(parent.as_str());
+        let carries_authority = serde_json::from_str::<Value>(&parent)
+            .ok()
+            .and_then(|value| {
+                value
+                    .as_object()?
+                    .get(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
+                    .cloned()
+            })
+            .is_some();
+        let (identity, authority) = if carries_authority {
+            split_invocation_launch_environment(&parent)?
+        } else {
+            (parent, None)
+        };
+        env.insert(PARENT_INVOCATION_ENV.to_string(), identity);
+        if let Some(authority) = authority {
+            completion_registration_authority = Some(authority);
+        } else if !selected_is_current {
+            completion_registration_authority = inherited_authority;
+        }
     }
-    env
+    Ok((env, completion_registration_authority))
 }
 
 fn remove_configured_launch_env(env: &mut BTreeMap<String, String>, names: &[String]) {
@@ -121,10 +151,17 @@ pub(crate) fn build_launch_request(
     candidate: &LaunchCandidate,
 ) -> Result<Value, serde_json::Error> {
     let (argv, launch_stdin) = project_launch_carrier(context, candidate);
-    let env = if candidate.env.is_empty() {
+    let mut launch_env = candidate.env.clone();
+    if let Some(authority) = &candidate.completion_registration_authority {
+        launch_env.insert(
+            oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV.to_string(),
+            authority.clone(),
+        );
+    }
+    let env = if launch_env.is_empty() {
         None
     } else {
-        Some(candidate.env.clone())
+        Some(launch_env)
     };
     let stdin = launch_stdin.map(|stdin| BytePayload {
         encoding: "utf8".to_string(),

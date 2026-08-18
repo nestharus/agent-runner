@@ -216,21 +216,35 @@ pub(crate) fn run_agent_bash_complete(args: AgentBashCompleteArgs<'_>) -> Result
 fn register_completion_event(
     args: &AgentBashRegisterArgs<'_>,
 ) -> Result<CompletionEventRegistrationResult, String> {
+    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
+    let authority = oulipoly_state::CompletionRegistrationAuthority::from_process_environment()?;
     validate_owner_binding(&owner, &metadata)?;
-    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
-    let mut mailbox = MailboxDb::open_default()?;
-    mailbox.register_completion_event(CompletionEventRegistrationInput {
-        event_id: args.handle,
-        delivery_mode: args.delivery_mode,
-        owner_session_id: Some(owner.session_id.as_str()),
-        owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
-        state_dir: &paths.state_dir,
-        meta_path: &paths.meta_path,
-        log_path: &paths.log_path,
-        rc_path: &paths.rc_path,
-    })
+    let mut state = StateDb::open_default()?;
+    let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
+    state.register_completion_event_with_authority(
+        &authority,
+        &admission_id,
+        CompletionEventRegistrationInput {
+            event_id: args.handle,
+            delivery_mode: args.delivery_mode,
+            owner_session_id: Some(owner.session_id.as_str()),
+            owner_invocation_uuid: Some(owner.invocation_uuid.as_str()),
+            state_dir: &paths.state_dir,
+            meta_path: &paths.meta_path,
+            log_path: &paths.log_path,
+            rc_path: &paths.rc_path,
+        },
+    )
+}
+
+fn completion_obligation_admission_id(event_id: &str, owner_invocation_uuid: &str) -> String {
+    format!(
+        "completion:{}:{event_id}:owner:{}:{owner_invocation_uuid}",
+        event_id.len(),
+        owner_invocation_uuid.len()
+    )
 }
 
 fn activate_completion_event(
@@ -258,9 +272,9 @@ fn trigger_completion_event(
     ),
     String,
 > {
+    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let rc = read_rc(args.rc)?;
-    let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc);
     let mut mailbox = MailboxDb::open_default()?;
     let event = mailbox
         .completion_event(args.handle)?
@@ -391,10 +405,27 @@ fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), 
             return Err(owner_binding_error(owner));
         }
         if running_owner_binding_is_live(owner, metadata)? {
+            bind_verified_live_owner_session(&record, owner)?;
             return Ok(());
         }
     }
     Err(owner_binding_error(owner))
+}
+
+fn bind_verified_live_owner_session(
+    record: &InvocationRecord,
+    owner: &OwnerBinding,
+) -> Result<(), String> {
+    let state = StateDb::open_default()?;
+    state.bind_invocation_provider_session_start(
+        record.id,
+        &oulipoly_state::ProviderSessionBinding {
+            provider_session_id: owner.session_id.clone(),
+            capture_method: "completion_registration_live_pid",
+            resume_input_id: None,
+            provider_session_resolved_account: record.provider_name.clone(),
+        },
+    )
 }
 
 fn completion_owner_invocation(
@@ -512,17 +543,24 @@ fn render_payload_json(payload: &Value) -> Result<String, String> {
         .map_err(|err| format!("failed to serialize completion event payload: {err}"))
 }
 
-fn notify_path_strings(state_dir: &Path, meta: &Path, log: &Path, rc: &Path) -> NotifyPathStrings {
-    NotifyPathStrings {
-        state_dir: path_string(state_dir),
-        meta_path: path_string(meta),
-        log_path: path_string(log),
-        rc_path: path_string(rc),
-    }
+fn notify_path_strings(
+    state_dir: &Path,
+    meta: &Path,
+    log: &Path,
+    rc: &Path,
+) -> Result<NotifyPathStrings, String> {
+    Ok(NotifyPathStrings {
+        state_dir: notify_path_string("state directory", state_dir)?,
+        meta_path: notify_path_string("metadata", meta)?,
+        log_path: notify_path_string("log", log)?,
+        rc_path: notify_path_string("return-code", rc)?,
+    })
 }
 
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+fn notify_path_string(kind: &str, path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("agent-bash {kind} path must be valid UTF-8"))
 }
 
 fn render<T: Serialize>(response: &T, json: bool) -> Result<(), String> {
@@ -552,4 +590,38 @@ fn render_error(handle: &str, json: bool, message: String) -> Result<i32, String
         json,
     )?;
     Ok(74)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{completion_obligation_admission_id, notify_path_strings};
+    use std::path::Path;
+
+    #[test]
+    fn completion_obligation_admission_id_disambiguates_delimiters_in_components() {
+        assert_ne!(
+            completion_obligation_admission_id("a", "b:owner:c"),
+            completion_obligation_admission_id("a:owner:b", "c")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notify_paths_reject_non_utf8_before_lossy_identity_projection() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid =
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(b"artifact-\xff".to_vec()));
+        let valid = Path::new("artifact");
+
+        for paths in [
+            [&invalid as &Path, valid, valid, valid],
+            [valid, &invalid, valid, valid],
+            [valid, valid, &invalid, valid],
+            [valid, valid, valid, &invalid],
+        ] {
+            let error = notify_path_strings(paths[0], paths[1], paths[2], paths[3]).unwrap_err();
+            assert!(error.contains("valid UTF-8"), "{error}");
+        }
+    }
 }

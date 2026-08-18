@@ -114,7 +114,7 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
     let app = oulipoly_config::app::AppConfig::load(&app_config_path)?;
     let family = app.default_provider.ok_or_else(|| {
         format!(
-            "'default_provider' must be set in {} for '--new'",
+            "'default_provider' must be set in {} for a default-provider REPL",
             app_config_path.display()
         )
     })?;
@@ -219,16 +219,17 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
     let invocation = default_provider_invocation(input.provider_name);
     let invocation_start =
         default_provider_invocation_start(&invocation, input.provider_name, input.provider_index);
-    let invocation_row_id = lifecycle
+    let invocation_start = lifecycle
         .start_invocation(InvocationLifecycleStartRequest {
             state: input.state,
             start: &invocation_start,
         })
-        .map_err(|err| err.to_string())?
-        .invocation_row_id;
+        .map_err(|err| err.to_string())?;
+    let invocation_row_id = invocation_start.invocation_row_id;
     eprintln!("{}", invocation.stderr_line());
-    let parent_invocation_env = serde_json::to_string(&invocation)
-        .map_err(|err| format!("Failed to serialize invocation id: {err}"))?;
+    let parent_invocation_env = invocation_start
+        .completion_registration_authority
+        .invocation_launch_environment(&invocation)?;
 
     let result = match input.launcher.launch(
         input.launch_provider,
@@ -347,17 +348,19 @@ fn finalize_default_provider_repl_result(
     invocation_row_id: i64,
     result: &crate::executor::cli::InteractiveExecutionResult,
 ) -> Result<(), String> {
-    lifecycle
-        .finalize_invocation(InvocationLifecycleFinalizeRequest {
+    crate::services::finalize_retained_outcome_with_contention_retry(
+        lifecycle,
+        InvocationLifecycleFinalizeRequest {
             state,
             invocation_row_id,
             success: result.exit_code == 0,
             exit_code: result.exit_code,
             error_category: None,
             terminal_reason: result.terminal_reason.as_deref(),
-        })
-        .map(|_| ())
-        .map_err(|err| err.to_string())
+        },
+    )
+    .map(|_| ())
+    .map_err(|err| err.to_string())
 }
 
 fn finalize_default_provider_spawn_error(
@@ -879,7 +882,7 @@ exit 17"#,
         assert_eq!(
             error,
             format!(
-                "'default_provider' must be set in {} for '--new'",
+                "'default_provider' must be set in {} for a default-provider REPL",
                 temp.path().join("config.toml").display()
             )
         );
@@ -1163,10 +1166,14 @@ unset_environment = ["OPENAI_API_KEY"]
             .2
             .clone()
             .expect("parent invocation env");
-        let parsed = CompositeInvocationId::parse_env_value(&parent_env).unwrap();
+        let (parent_identity, completion_authority) =
+            crate::executor::cli::spawn_identity::split_invocation_launch_environment(&parent_env)
+                .unwrap();
+        let parsed = CompositeInvocationId::parse_env_value(&parent_identity).unwrap();
         let (_model_name, provider_name, _status, _provider_session_id, _capture_method) =
             invocation_row(&state_path);
         assert_eq!(parsed.source, provider_name);
+        assert!(completion_authority.is_some());
     }
 
     #[cfg(unix)]

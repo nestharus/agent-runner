@@ -87,8 +87,8 @@ pub fn run_schema_probe_with_routing_port(
         Err(error) => return Err(ProbeError::Open { error }),
     };
 
-    let state_db =
-        inspect_schema(db.connection(), path).map_err(|message| ProbeError::Inspect { message })?;
+    let state_db = inspect_schema(db.raw_connection(), path)
+        .map_err(|message| ProbeError::Inspect { message })?;
     Ok(report_from_state_db(state_db))
 }
 
@@ -232,7 +232,7 @@ fn safe_for_import_replace(
         && supported_storage_types == self::supported_storage_types()
 }
 
-fn required_tables() -> [(&'static str, i32); 6] {
+fn required_tables() -> [(&'static str, i32); 10] {
     [
         ("invocations", MINIMUM_SUPPORTED_SCHEMA_VERSION),
         ("session_turns", MINIMUM_SUPPORTED_SCHEMA_VERSION),
@@ -240,6 +240,10 @@ fn required_tables() -> [(&'static str, i32); 6] {
         ("session_chain_segments", MINIMUM_SUPPORTED_SCHEMA_VERSION),
         ("fresh_continuations", 13),
         ("invocation_completion_obligations", 14),
+        ("invocation_completion_continuity", 15),
+        ("invocation_completion_continuity_recovery", 15),
+        ("invocation_completion_authority_summary", 16),
+        ("invocation_completion_materialization_summary", 18),
     ]
 }
 

@@ -71,10 +71,20 @@ pub struct LiveProcessIdentityRecord<'a> {
     pub model_name: Option<&'a str>,
 }
 
+/// External callers use typed identity operations rather than raw writable SQL.
+///
+/// ```compile_fail
+/// use oulipoly_state::pid_identity::PidIdentityDb;
+///
+/// fn raw_write_capability(identity: &PidIdentityDb) {
+///     let _ = identity.connection();
+/// }
+/// ```
 pub struct PidIdentityDb {
     conn: Connection,
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+    _namespace_authority: Option<crate::mailbox::MailboxAuthorityFence>,
 }
 
 impl PidIdentityDb {
@@ -88,15 +98,29 @@ impl PidIdentityDb {
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
-        ensure_parent_dir(path)?;
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire(path)
+            .map_err(|error| error.to_string())?;
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        let mut db = Self::open_with_authority(&authority)?;
+        db._namespace_authority = Some(authority);
+        Ok(db)
+    }
+
+    pub(crate) fn open_with_authority(
+        authority: &crate::mailbox::MailboxAuthorityFence,
+    ) -> Result<Self, String> {
+        let path = authority.path();
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
+        authority.validate_opened_target()?;
+        crate::mailbox::configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
         ensure_identity_schema(&conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: None,
+            _namespace_authority: None,
         })
     }
 
@@ -115,6 +139,7 @@ impl PidIdentityDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
+            _namespace_authority: None,
         })
     }
 
@@ -122,7 +147,8 @@ impl PidIdentityDb {
         &self.path
     }
 
-    pub fn connection(&self) -> &Connection {
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
 
@@ -246,14 +272,6 @@ fn observe_live_process_identity_impl(os_pid: i64) -> ProcessIdentityObservation
 #[cfg(not(target_os = "linux"))]
 fn observe_live_process_identity_impl(_os_pid: i64) -> ProcessIdentityObservation {
     ProcessIdentityObservation::Unsupported
-}
-
-fn ensure_parent_dir(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create PID identity sidecar directory: {err}"))?;
-    }
-    Ok(())
 }
 
 fn set_wal_mode(conn: &Connection) -> Result<(), String> {
@@ -560,6 +578,8 @@ fn process_group_id(_os_pid: i64) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::StateDb;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     const INVOCATION_UUID: &str = "11111111-1111-1111-1111-111111111111";
 
@@ -613,6 +633,67 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_creation_waits_for_canonical_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire_exclusive(&path).unwrap();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener_path = path.clone();
+        let opener = std::thread::spawn(move || {
+            opened_tx.send(PidIdentityDb::open(&opener_path)).unwrap();
+        });
+
+        assert!(
+            opened_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "sidecar creation must wait behind canonical namespace authority"
+        );
+        assert!(!path.exists());
+
+        drop(authority);
+        opened_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        opener.join().unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn sidecar_open_reuses_canonical_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+
+        let db = PidIdentityDb::open_with_authority(&authority).unwrap();
+
+        assert_eq!(db.path(), path);
+    }
+
+    #[test]
+    fn nested_shared_authority_acquisition_avoids_same_process_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+
+        let nested = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+        drop(nested);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_sidecar_reuses_canonical_namespace_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        PidIdentityDb::open(&path).unwrap();
+        let alias = dir.path().join("pid-identity-alias.db");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let _authority = crate::mailbox::MailboxAuthorityFence::acquire(&path).unwrap();
+
+        let alias_authority = crate::mailbox::MailboxAuthorityFence::acquire(&alias).unwrap();
+        assert_eq!(alias_authority.path(), path.canonicalize().unwrap());
+    }
+
+    #[test]
     fn set_session_id_fills_existing_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
@@ -646,8 +727,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.db");
         let state = StateDb::open(&state_path).unwrap();
-        let baseline_version = user_version(state.connection());
-        let baseline_columns = invocation_columns(state.connection());
+        let baseline_version = user_version(state.raw_connection());
+        let baseline_columns = invocation_columns(state.raw_connection());
         drop(state);
 
         let sidecar_path = dir.path().join("pid-identity.db");
@@ -658,8 +739,8 @@ mod tests {
         drop(sidecar);
 
         let state = StateDb::open(&state_path).unwrap();
-        assert_eq!(user_version(state.connection()), baseline_version);
-        assert_eq!(invocation_columns(state.connection()), baseline_columns);
+        assert_eq!(user_version(state.raw_connection()), baseline_version);
+        assert_eq!(invocation_columns(state.raw_connection()), baseline_columns);
     }
 
     fn user_version(conn: &Connection) -> i64 {

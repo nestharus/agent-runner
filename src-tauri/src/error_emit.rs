@@ -164,6 +164,7 @@ fn lock_error_disposition_from_parts(
 fn lock_error_exit_code(err: &LockError) -> i32 {
     match err {
         LockError::Busy { .. } => 13,
+        LockError::SentinelBusy { .. } => 13,
         LockError::TokenInvalid => 16,
         LockError::LockExpired => 17,
         LockError::Operational { .. } => 1,
@@ -180,6 +181,12 @@ fn lock_error_payload(err: LockError) -> LockErrorPayload {
         LockError::Busy { expires_at, .. } => LockErrorPayload {
             code: "session-busy",
             message: session_busy_message(&expires_at),
+        },
+        LockError::SentinelBusy { timeout_ms } => LockErrorPayload {
+            code: "session-lock-sentinel-busy",
+            message: format!(
+                "global session-lock metadata authority remained busy for {timeout_ms}ms; retry the operation"
+            ),
         },
         LockError::TokenInvalid => LockErrorPayload {
             code: "lock-token-invalid",

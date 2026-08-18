@@ -17,6 +17,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
@@ -30,6 +31,7 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
+const MAILBOX_SIDECAR_SCHEMA_VERSION: i64 = 1;
 const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, enqueued_at,
     delivered_at, delivered_by_invocation_uuid, delivery_attempts,
     delivery_error, owner_invocation_uuid, matched_os_pid,
@@ -759,10 +761,328 @@ struct WakeSweepSessionState {
     claim: Option<WakeClaimRow>,
 }
 
+/// Typed mailbox operations intentionally retain the writable connection and
+/// do not expose that connection through this API. This Rust capability
+/// boundary does not claim protection from a process with arbitrary local
+/// filesystem/SQLite write authority; such a process is trusted terminal
+/// storage authority.
+///
+/// ```compile_fail
+/// use oulipoly_state::mailbox::MailboxDb;
+///
+/// fn raw_write_capability(mailbox: &MailboxDb) {
+///     let _ = mailbox.connection();
+/// }
+/// ```
 pub struct MailboxDb {
     conn: Connection,
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
+    _namespace_authority: Option<MailboxAuthorityFence>,
+}
+
+/// Serializes cooperating canonical-path creation and replacement independently
+/// of SQLite's inode-scoped writer locks.
+pub(crate) struct MailboxAuthorityFence {
+    file: std::fs::File,
+    sidecar_path: PathBuf,
+    target_identity: Option<MailboxFileIdentity>,
+}
+
+/// Exclusive sidecar namespace and SQLite-writer authority for the supported
+/// State-plus-sidecar destructive rebuild protocol.
+///
+/// The sidecar capability cannot outlive the exact State rebuild authority
+/// from which it was derived.
+///
+/// ```compile_fail
+/// use oulipoly_state::StateDb;
+/// use oulipoly_state::mailbox::MailboxDb;
+///
+/// let directory = tempfile::tempdir().unwrap();
+/// let state_path = directory.path().join("state.db");
+/// drop(StateDb::open(&state_path).unwrap());
+/// let state_authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+/// let mut sidecar_authority = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+/// drop(state_authority);
+/// let _writable_state = StateDb::open(&state_path).unwrap();
+/// sidecar_authority.reset().unwrap();
+/// ```
+pub struct MailboxDbRebuildAuthority<'state> {
+    namespace: MailboxAuthorityFence,
+    writer: Option<Connection>,
+    _state_authority: &'state crate::StateDbRebuildAuthority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MailboxFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum MailboxAuthorityFenceError {
+    Open {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Lock(fs4::TryLockError),
+    Timeout {
+        path: PathBuf,
+        timeout: StdDuration,
+    },
+}
+
+impl fmt::Display for MailboxAuthorityFenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open { path, source } => write!(
+                formatter,
+                "Failed to open PID mailbox sidecar authority fence {}: {source}",
+                path.display()
+            ),
+            Self::Lock(error) => {
+                write!(
+                    formatter,
+                    "Failed to lock PID mailbox sidecar authority: {error}"
+                )
+            }
+            Self::Timeout { path, timeout } => write!(
+                formatter,
+                "Timed out after {}ms acquiring PID mailbox sidecar authority fence {}",
+                timeout.as_millis(),
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MailboxAuthorityFenceError {}
+
+pub(crate) struct CompletionAuthorityFence<'a> {
+    tx: Transaction<'a>,
+}
+
+pub(crate) const COMPLETION_CONTINUITY_GENESIS_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionContinuityHead {
+    pub authority_ordinal: i64,
+    pub admission_id: String,
+    pub sidecar_generation: String,
+    pub invocation_uuid: String,
+    pub event_id: String,
+    pub owner_invocation_uuid: String,
+    pub owner_session_id: String,
+    pub previous_continuity_digest: String,
+    pub continuity_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompletionMaterializationSummary {
+    pub materialized_count: i64,
+    pub authority_ordinal: i64,
+    pub sidecar_generation: String,
+    pub continuity_digest: String,
+}
+
+impl CompletionAuthorityFence<'_> {
+    pub(crate) fn sidecar_generation(&self) -> Result<String, String> {
+        sidecar_generation_on(&self.tx)
+    }
+
+    pub(crate) fn completion_continuity_head(
+        &self,
+    ) -> Result<Option<CompletionContinuityHead>, String> {
+        completion_continuity_head_on(&self.tx)
+    }
+
+    pub(crate) fn completion_materialization_summary(
+        &self,
+        invocation_uuid: &str,
+    ) -> Result<Option<CompletionMaterializationSummary>, String> {
+        completion_materialization_summary_on(&self.tx, invocation_uuid)
+    }
+
+    pub(crate) fn preflight_completion_event_registration(
+        &self,
+        input: &CompletionEventRegistrationInput<'_>,
+    ) -> Result<(), String> {
+        preflight_completion_event_registration_on(&self.tx, input)
+    }
+
+    pub(crate) fn register_completion_event(
+        self,
+        input: CompletionEventRegistrationInput<'_>,
+        continuity: &CompletionContinuityHead,
+    ) -> Result<CompletionEventRegistrationResult, String> {
+        let inserted = register_completion_event_on(&self.tx, &input, &now_rfc3339())?;
+        append_completion_continuity_on(&self.tx, continuity)?;
+        let result = completion_event_registration_on(&self.tx, input.event_id, inserted)?;
+        self.tx
+            .commit()
+            .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
+        Ok(result)
+    }
+}
+
+impl MailboxAuthorityFence {
+    pub(crate) fn acquire(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        Self::acquire_with_mode(path, false)
+    }
+
+    pub(crate) fn acquire_exclusive(path: &Path) -> Result<Self, MailboxAuthorityFenceError> {
+        Self::acquire_with_mode(path, true)
+    }
+
+    fn acquire_with_mode(path: &Path, exclusive: bool) -> Result<Self, MailboxAuthorityFenceError> {
+        const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
+        #[cfg(not(test))]
+        const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+        #[cfg(test)]
+        const ACQUISITION_TIMEOUT: StdDuration = StdDuration::from_millis(500);
+
+        ensure_parent_dir(path).map_err(|error| MailboxAuthorityFenceError::Open {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+        let sidecar_path =
+            normalized_mailbox_path(path).map_err(|source| MailboxAuthorityFenceError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        validate_mailbox_storage_path(&sidecar_path).map_err(|source| {
+            MailboxAuthorityFenceError::Open {
+                path: sidecar_path.clone(),
+                source,
+            }
+        })?;
+        let target_identity = inspect_mailbox_storage_file(&sidecar_path).map_err(|source| {
+            MailboxAuthorityFenceError::Open {
+                path: sidecar_path.clone(),
+                source,
+            }
+        })?;
+        validate_mailbox_sqlite_artifacts(&sidecar_path).map_err(|source| {
+            MailboxAuthorityFenceError::Open {
+                path: sidecar_path.clone(),
+                source,
+            }
+        })?;
+        let authority_path = mailbox_authority_path(&sidecar_path);
+        let initial_authority_identity =
+            inspect_mailbox_storage_file(&authority_path).map_err(|source| {
+                MailboxAuthorityFenceError::Open {
+                    path: authority_path.clone(),
+                    source,
+                }
+            })?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&authority_path)
+            .map_err(|source| MailboxAuthorityFenceError::Open {
+                path: authority_path.clone(),
+                source,
+            })?;
+        let opened_authority_identity = opened_mailbox_file_identity(&file, &authority_path)
+            .map_err(|source| MailboxAuthorityFenceError::Open {
+                path: authority_path.clone(),
+                source,
+            })?;
+        if initial_authority_identity.is_some_and(|identity| identity != opened_authority_identity)
+        {
+            return Err(MailboxAuthorityFenceError::Open {
+                path: authority_path,
+                source: std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "PID mailbox authority fence changed during open",
+                ),
+            });
+        }
+        let deadline = Instant::now() + ACQUISITION_TIMEOUT;
+        loop {
+            let lock_result = if exclusive {
+                <std::fs::File as fs4::FileExt>::try_lock(&file)
+            } else {
+                <std::fs::File as fs4::FileExt>::try_lock_shared(&file)
+            };
+            match lock_result {
+                Ok(()) => {
+                    let retained_authority_identity = inspect_mailbox_storage_file(&authority_path)
+                        .map_err(|source| MailboxAuthorityFenceError::Open {
+                            path: authority_path.clone(),
+                            source,
+                        })?
+                        .ok_or_else(|| MailboxAuthorityFenceError::Open {
+                            path: authority_path.clone(),
+                            source: std::io::Error::new(
+                                ErrorKind::NotFound,
+                                "PID mailbox authority fence is missing after lock",
+                            ),
+                        })?;
+                    if retained_authority_identity != opened_authority_identity {
+                        return Err(MailboxAuthorityFenceError::Open {
+                            path: authority_path,
+                            source: std::io::Error::new(
+                                ErrorKind::InvalidInput,
+                                "PID mailbox authority fence changed during lock acquisition",
+                            ),
+                        });
+                    }
+                    validate_mailbox_source(path, &sidecar_path, target_identity).map_err(
+                        |source| MailboxAuthorityFenceError::Open {
+                            path: sidecar_path.clone(),
+                            source,
+                        },
+                    )?;
+                    return Ok(Self {
+                        file,
+                        sidecar_path,
+                        target_identity,
+                    });
+                }
+                Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(fs4::TryLockError::WouldBlock) => {
+                    return Err(MailboxAuthorityFenceError::Timeout {
+                        path: authority_path,
+                        timeout: ACQUISITION_TIMEOUT,
+                    });
+                }
+                Err(error) => return Err(MailboxAuthorityFenceError::Lock(error)),
+            }
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.sidecar_path
+    }
+
+    pub(crate) fn validate_opened_target(&self) -> Result<(), String> {
+        let observed = inspect_mailbox_storage_file(&self.sidecar_path)
+            .map_err(|error| format!("Failed to validate PID mailbox sidecar target: {error}"))?
+            .ok_or_else(|| "PID mailbox sidecar target is missing after open".to_string())?;
+        if self
+            .target_identity
+            .is_some_and(|expected| expected != observed)
+        {
+            return Err("PID mailbox sidecar target changed during open".to_string());
+        }
+        validate_mailbox_sqlite_artifacts(&self.sidecar_path)
+            .map_err(|error| format!("Failed to validate PID mailbox SQLite artifacts: {error}"))?;
+        Ok(())
+    }
+}
+
+impl Drop for MailboxAuthorityFence {
+    fn drop(&mut self) {
+        let _ = <std::fs::File as fs4::FileExt>::unlock(&self.file);
+    }
 }
 
 enum BoundedMailboxRowsError {
@@ -773,7 +1093,40 @@ enum BoundedMailboxRowsError {
 
 impl MailboxDb {
     pub fn path_for_state_db(state_db_path: &Path) -> PathBuf {
-        state_db_path.with_file_name("pid-identity.db")
+        if state_db_path.file_name() == Some(std::ffi::OsStr::new("state.db")) {
+            return state_db_path.with_file_name("pid-identity.db");
+        }
+        let mut sidecar_name = state_db_path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("state"))
+            .to_os_string();
+        sidecar_name.push(".pid-identity.db");
+        state_db_path.with_file_name(sidecar_name)
+    }
+
+    pub fn acquire_rebuild_authority<'state>(
+        state_authority: &'state crate::StateDbRebuildAuthority,
+    ) -> Result<MailboxDbRebuildAuthority<'state>, String> {
+        let sidecar_path = Self::path_for_state_db(state_authority.path());
+        let namespace = match MailboxAuthorityFence::acquire_exclusive(&sidecar_path) {
+            Ok(namespace) => namespace,
+            Err(error @ MailboxAuthorityFenceError::Timeout { .. }) => {
+                return Err(format!(
+                    "process_integrity: completion_authority_contention: failed to acquire PID mailbox rebuild authority: {error}"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Failed to acquire PID mailbox rebuild authority: {error}"
+                ));
+            }
+        };
+        let writer = acquire_mailbox_rebuild_writer(&namespace)?;
+        Ok(MailboxDbRebuildAuthority {
+            namespace,
+            writer,
+            _state_authority: state_authority,
+        })
     }
 
     pub fn default_path() -> Result<PathBuf, String> {
@@ -787,23 +1140,44 @@ impl MailboxDb {
 
     pub fn open_default_if_exists() -> Result<Option<Self>, String> {
         let path = Self::default_path()?;
+        crate::rebuild_recovery::ensure_writable_open_allowed(&path)?;
         if !path.exists() {
             return Ok(None);
         }
-        Self::open(&path).map(Some)
+        let authority = MailboxAuthorityFence::acquire(&path).map_err(|error| error.to_string())?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        Self::open_with_owned_authority(authority).map(Some)
     }
 
     pub fn open(path: &Path) -> Result<Self, String> {
-        ensure_parent_dir(path)?;
-        let conn = Connection::open(path)
+        let authority = MailboxAuthorityFence::acquire(path).map_err(|error| error.to_string())?;
+        crate::rebuild_recovery::ensure_writable_open_allowed(authority.path())?;
+        Self::open_with_owned_authority(authority)
+    }
+
+    fn open_with_owned_authority(authority: MailboxAuthorityFence) -> Result<Self, String> {
+        let mut mailbox = Self::open_with_authority(&authority)?;
+        mailbox._namespace_authority = Some(authority);
+        Ok(mailbox)
+    }
+
+    pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
+        let path = authority.path();
+        let mut conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
+        authority.validate_opened_target()?;
+        configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
         pid_identity::ensure_identity_schema(&conn)?;
-        ensure_mailbox_schema(&conn)?;
+        ensure_mailbox_schema(&mut conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: None,
+            _namespace_authority: None,
         })
     }
 
@@ -816,15 +1190,72 @@ impl MailboxDb {
             conn,
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
+            _namespace_authority: None,
         })
+    }
+
+    pub(crate) fn open_existing_for_completion_authority(
+        authority: &MailboxAuthorityFence,
+    ) -> Result<Self, String> {
+        let path = authority.path();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
+        authority.validate_opened_target()?;
+        configure_writable_sidecar_connection(&conn)?;
+        conn.busy_timeout(completion_authority_sqlite_timeout())
+            .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            _read_only_snapshot: None,
+            _namespace_authority: None,
+        })
+    }
+
+    pub(crate) fn begin_completion_authority_fence(
+        &mut self,
+    ) -> Result<CompletionAuthorityFence<'_>, String> {
+        // A write transaction excludes sidecar writers between authority validation and the
+        // state commit. This deliberately accepts writer contention to close that TOCTOU window.
+        self.conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map(|tx| CompletionAuthorityFence { tx })
+            .map_err(|err| {
+                if sqlite_error_is_contention(&err) {
+                    format!(
+                        "completion_authority_contention: timed out acquiring PID mailbox SQLite writer: {err}"
+                    )
+                } else {
+                    format!("Failed to fence PID mailbox sidecar authority: {err}")
+                }
+            })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn connection(&self) -> &Connection {
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    pub fn sidecar_generation(&self) -> Result<String, String> {
+        sidecar_generation_on(&self.conn)
+    }
+
+    pub fn contains_completion_obligation(
+        &self,
+        event_id: &str,
+        owner_invocation_uuid: &str,
+        owner_session_id: &str,
+    ) -> Result<bool, String> {
+        contains_completion_obligation_on(
+            &self.conn,
+            event_id,
+            owner_invocation_uuid,
+            owner_session_id,
+        )
     }
 
     pub fn create_runtime_generation(
@@ -1647,7 +2078,8 @@ impl MailboxDb {
         Ok(map_finished_drain(row))
     }
 
-    pub fn register_completion_event(
+    #[cfg(test)]
+    pub(crate) fn register_completion_event(
         &mut self,
         input: CompletionEventRegistrationInput<'_>,
     ) -> Result<CompletionEventRegistrationResult, String> {
@@ -1659,23 +2091,11 @@ impl MailboxDb {
             .map_err(|err| {
                 format!("Failed to start completion event registration transaction: {err}")
             })?;
-        let existing = completion_event_by_id_on(&tx, input.event_id)?;
-        let inserted = if let Some(existing) = existing.as_ref() {
-            validate_completion_event_registration_replay(existing, &input)?;
-            false
-        } else {
-            insert_completion_event(&tx, &input, &now)?;
-            true
-        };
-        register_completion_event_listener(
-            &tx,
-            &input,
-            existing.is_some_and(|event| event.state == "triggered"),
-            &now,
-        )?;
+        let inserted = register_completion_event_on(&tx, &input, &now)?;
+        let result = completion_event_registration_on(&tx, input.event_id, inserted)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit completion event registration: {err}"))?;
-        self.completion_event_registration(input.event_id, inserted)
+        Ok(result)
     }
 
     pub fn activate_completion_event_listeners(
@@ -1780,22 +2200,6 @@ impl MailboxDb {
         resolve_completed_delivery_attempts_for_mailbox_seq(&tx, mailbox_seq, &now)?;
         commit_consumed_completion_acknowledgement(tx)?;
         Ok(Some(binding.event_id))
-    }
-
-    fn completion_event_registration(
-        &self,
-        event_id: &str,
-        inserted: bool,
-    ) -> Result<CompletionEventRegistrationResult, String> {
-        let event = self
-            .completion_event(event_id)?
-            .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
-        let listeners = self.completion_event_listeners(event_id)?;
-        Ok(CompletionEventRegistrationResult {
-            inserted,
-            event,
-            listeners,
-        })
     }
 
     fn completion_event_trigger_result(
@@ -3316,6 +3720,115 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
         Ok(())
     }
+}
+
+impl MailboxDbRebuildAuthority<'_> {
+    pub fn sqlite_member_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.namespace.path().to_path_buf()];
+        paths.extend(mailbox_sqlite_artifact_paths(self.namespace.path()));
+        paths
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        self.release_writer();
+
+        for path in self.sqlite_member_paths().into_iter().rev() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to reset PID mailbox rebuild member {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        self.release_writer();
+        self.namespace.target_identity = None;
+        Ok(())
+    }
+
+    pub fn initialize_after_rebuild(&mut self) -> Result<(), String> {
+        if self.writer.is_some() {
+            return Err(
+                "PID mailbox rebuild writer remains active during initialization".to_string(),
+            );
+        }
+        let mailbox = MailboxDb::open_with_authority(&self.namespace)?;
+        drop(mailbox);
+        self.namespace.target_identity = inspect_mailbox_storage_file(self.namespace.path())
+            .map_err(|error| format!("Failed to bind rebuilt PID mailbox identity: {error}"))?;
+        Ok(())
+    }
+
+    fn release_writer(&mut self) {
+        drop(self.writer.take());
+    }
+}
+
+fn acquire_mailbox_rebuild_writer(
+    namespace: &MailboxAuthorityFence,
+) -> Result<Option<Connection>, String> {
+    if !namespace.path().exists() {
+        return Ok(None);
+    }
+    let connection =
+        Connection::open_with_flags(namespace.path(), OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
+            |error| {
+                format!(
+                    "process_integrity: completion_authority_rebuild_writer_unavailable: failed to open existing PID mailbox rebuild writer; retry after reconciling sidecar access: {error}"
+                )
+            },
+        )?;
+    connection
+        .busy_timeout(completion_authority_sqlite_timeout())
+        .map_err(|error| format!("Failed to configure PID mailbox rebuild writer: {error}"))?;
+    match connection.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => Ok(Some(connection)),
+        Err(error)
+            if matches!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+                    | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+            ) =>
+        {
+            Err(format!(
+                "process_integrity: completion_authority_contention: timed out acquiring PID mailbox rebuild writer: {error}"
+            ))
+        }
+        Err(error) if sqlite_error_is_corrupt(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "process_integrity: completion_authority_rebuild_writer_unavailable: failed to prove the existing PID mailbox writer cut; retry after reconciling sidecar access: {error}"
+        )),
+    }
+}
+
+fn sqlite_error_is_corrupt(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ffi::ErrorCode::DatabaseCorrupt)
+            | Some(rusqlite::ffi::ErrorCode::NotADatabase)
+    )
+}
+
+fn sqlite_error_is_contention(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+            | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+    )
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn completion_authority_sqlite_timeout() -> StdDuration {
+    StdDuration::from_secs(5)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn completion_authority_sqlite_timeout() -> StdDuration {
+    StdDuration::from_millis(500)
 }
 
 pub fn mailbox_row_is_deliverable_pending(row: &MailboxRow) -> bool {
@@ -5723,7 +6236,7 @@ fn wake_claim_is_valid_for_child(claim: Option<&WakeClaimRow>, claim_token: &str
     claim.is_some_and(|claim| wake_claim_matches_child(claim, claim_token))
 }
 
-fn validate_completion_event_registration(
+pub(crate) fn validate_completion_event_registration(
     input: &CompletionEventRegistrationInput<'_>,
 ) -> Result<(), String> {
     if input.event_id.is_empty() {
@@ -5754,6 +6267,269 @@ fn validate_completion_event_registration(
         }
         _ => Err("Completion event owner session and invocation are both required".to_string()),
     }
+}
+
+fn sidecar_generation_on(conn: &Connection) -> Result<String, String> {
+    let generation = conn
+        .query_row(
+            "SELECT generation_uuid
+             FROM mailbox_sidecar_identity
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|err| format!("Failed to read PID mailbox sidecar generation: {err}"))?;
+    let parsed = Uuid::parse_str(&generation)
+        .map_err(|_| "PID mailbox sidecar generation is invalid".to_string())?;
+    if parsed.to_string() != generation {
+        return Err("PID mailbox sidecar generation is not canonical".to_string());
+    }
+    Ok(generation)
+}
+
+fn completion_continuity_head_on(
+    conn: &Connection,
+) -> Result<Option<CompletionContinuityHead>, String> {
+    #[cfg(test)]
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(count.get() + 1));
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM completion_authority_continuity
+         ORDER BY authority_ordinal DESC
+         LIMIT 1",
+        [],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read completion continuity head: {err}"))
+}
+
+fn completion_continuity_by_admission_on(
+    conn: &Connection,
+    admission_id: &str,
+) -> Result<Option<CompletionContinuityHead>, String> {
+    conn.query_row(
+        "SELECT authority_ordinal, admission_id, sidecar_generation,
+                invocation_uuid, event_id, owner_invocation_uuid, owner_session_id,
+                previous_continuity_digest, continuity_digest
+         FROM completion_authority_continuity
+         WHERE admission_id = ?1",
+        params![admission_id],
+        map_completion_continuity_head,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read completion continuity admission: {err}"))
+}
+
+fn map_completion_continuity_head(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CompletionContinuityHead> {
+    Ok(CompletionContinuityHead {
+        authority_ordinal: row.get(0)?,
+        admission_id: row.get(1)?,
+        sidecar_generation: row.get(2)?,
+        invocation_uuid: row.get(3)?,
+        event_id: row.get(4)?,
+        owner_invocation_uuid: row.get(5)?,
+        owner_session_id: row.get(6)?,
+        previous_continuity_digest: row.get(7)?,
+        continuity_digest: row.get(8)?,
+    })
+}
+
+fn append_completion_continuity_on(
+    conn: &Connection,
+    continuity: &CompletionContinuityHead,
+) -> Result<(), String> {
+    if let Some(existing) = completion_continuity_by_admission_on(conn, &continuity.admission_id)? {
+        return if existing == *continuity {
+            Ok(())
+        } else {
+            Err(format!(
+                "Completion continuity admission {} conflicts with its durable identity",
+                continuity.admission_id
+            ))
+        };
+    }
+    conn.execute(
+        "INSERT INTO completion_authority_continuity (
+            authority_ordinal, admission_id, sidecar_generation, invocation_uuid,
+            event_id, owner_invocation_uuid, owner_session_id,
+            previous_continuity_digest, continuity_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            continuity.authority_ordinal,
+            continuity.admission_id,
+            continuity.sidecar_generation,
+            continuity.invocation_uuid,
+            continuity.event_id,
+            continuity.owner_invocation_uuid,
+            continuity.owner_session_id,
+            continuity.previous_continuity_digest,
+            continuity.continuity_digest,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|err| format!("Failed to append completion continuity: {err}"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPLETION_CONTINUITY_HEAD_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPLETION_FINALIZATION_VM_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COUNT_COMPLETION_FINALIZATION_VM_STEPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn install_completion_finalization_vm_counter(conn: &Connection) {
+    conn.progress_handler(
+        1,
+        Some(|| {
+            COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| {
+                if enabled.get() {
+                    COMPLETION_FINALIZATION_VM_STEPS.with(|count| count.set(count.get() + 1));
+                }
+            });
+            false
+        }),
+    )
+    .expect("install completion finalization SQLite VM counter");
+}
+
+#[cfg(test)]
+pub(crate) fn begin_completion_finalization_vm_count() {
+    COMPLETION_FINALIZATION_VM_STEPS.with(|count| count.set(0));
+    COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| enabled.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn end_completion_finalization_vm_count() -> usize {
+    COUNT_COMPLETION_FINALIZATION_VM_STEPS.with(|enabled| enabled.set(false));
+    COMPLETION_FINALIZATION_VM_STEPS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_completion_continuity_head_query_count() {
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn completion_continuity_head_query_count() -> usize {
+    COMPLETION_CONTINUITY_HEAD_QUERIES.with(std::cell::Cell::get)
+}
+
+fn contains_completion_obligation_on(
+    conn: &Connection,
+    event_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+) -> Result<bool, String> {
+    let Some(event) = completion_event_by_id_on(conn, event_id)? else {
+        return Ok(false);
+    };
+    if event.kind != AGENT_BASH_COMPLETE_KIND {
+        return Ok(false);
+    }
+    completion_event_listener_on(conn, event_id, owner_invocation_uuid).map(|listener| {
+        listener.is_some_and(|listener| {
+            listener.owner_invocation_uuid == owner_invocation_uuid
+                && listener.session_id == owner_session_id
+        })
+    })
+}
+
+fn completion_materialization_summary_on(
+    conn: &Connection,
+    invocation_uuid: &str,
+) -> Result<Option<CompletionMaterializationSummary>, String> {
+    conn.query_row(
+        "SELECT materialized_count, authority_ordinal, sidecar_generation, continuity_digest
+         FROM completion_authority_materialization_summary
+         WHERE invocation_uuid = ?1",
+        params![invocation_uuid],
+        |row| {
+            Ok(CompletionMaterializationSummary {
+                materialized_count: row.get(0)?,
+                authority_ordinal: row.get(1)?,
+                sidecar_generation: row.get(2)?,
+                continuity_digest: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("Failed to read completion materialization summary: {error}"))
+}
+
+fn preflight_completion_event_registration_on(
+    conn: &Connection,
+    input: &CompletionEventRegistrationInput<'_>,
+) -> Result<(), String> {
+    validate_completion_event_registration(input)?;
+    let Some(event) = completion_event_by_id_on(conn, input.event_id)? else {
+        return Ok(());
+    };
+    validate_completion_event_registration_replay(&event, input)?;
+    let owner_invocation_uuid = input
+        .owner_invocation_uuid
+        .expect("validated completion registration has an owner");
+    let owner_session_id = input
+        .owner_session_id
+        .expect("validated completion registration has a session");
+    if let Some(listener) =
+        completion_event_listener_on(conn, input.event_id, owner_invocation_uuid)?
+    {
+        return validate_completion_event_listener_replay(
+            &listener,
+            owner_session_id,
+            owner_invocation_uuid,
+        );
+    }
+    if event.state == "triggered" {
+        return Err(format!(
+            "Completion event {} cannot register a listener after it was triggered",
+            input.event_id
+        ));
+    }
+    Ok(())
+}
+
+fn register_completion_event_on(
+    tx: &Transaction<'_>,
+    input: &CompletionEventRegistrationInput<'_>,
+    now: &str,
+) -> Result<bool, String> {
+    let existing = completion_event_by_id_on(tx, input.event_id)?;
+    let inserted = if let Some(existing) = existing.as_ref() {
+        validate_completion_event_registration_replay(existing, input)?;
+        false
+    } else {
+        insert_completion_event(tx, input, now)?;
+        true
+    };
+    register_completion_event_listener(
+        tx,
+        input,
+        existing.is_some_and(|event| event.state == "triggered"),
+        now,
+    )?;
+    Ok(inserted)
+}
+
+fn completion_event_registration_on(
+    conn: &Connection,
+    event_id: &str,
+    inserted: bool,
+) -> Result<CompletionEventRegistrationResult, String> {
+    let event = completion_event_by_id_on(conn, event_id)?
+        .ok_or_else(|| format!("Completion event {event_id} disappeared"))?;
+    let listeners = completion_event_listeners_on(conn, event_id)?;
+    Ok(CompletionEventRegistrationResult {
+        inserted,
+        event,
+        listeners,
+    })
 }
 
 fn validate_completion_event_trigger(
@@ -6278,8 +7054,41 @@ fn set_wal_mode(conn: &Connection) -> Result<(), String> {
         .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
 }
 
+pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result<(), String> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))?;
+    #[cfg(test)]
+    install_completion_finalization_vm_counter(conn);
+    Ok(())
+}
+
 fn mailbox_schema_definition() -> &'static str {
-    "CREATE TABLE IF NOT EXISTS mailbox (
+    "CREATE TABLE IF NOT EXISTS mailbox_sidecar_identity (
+            singleton       INTEGER PRIMARY KEY CHECK(singleton = 1),
+            generation_uuid TEXT NOT NULL UNIQUE,
+            created_at      TEXT NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_mailbox_sidecar_identity_update
+        BEFORE UPDATE ON mailbox_sidecar_identity
+        BEGIN
+            SELECT RAISE(ABORT, 'mailbox sidecar identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_mailbox_sidecar_identity_insert
+        BEFORE INSERT ON mailbox_sidecar_identity
+        WHEN EXISTS (SELECT 1 FROM mailbox_sidecar_identity)
+        BEGIN
+            SELECT RAISE(ABORT, 'mailbox sidecar identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_mailbox_sidecar_identity_delete
+        BEFORE DELETE ON mailbox_sidecar_identity
+        BEGIN
+            SELECT RAISE(ABORT, 'mailbox sidecar identity is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS mailbox (
             seq                          INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id                   TEXT    NOT NULL,
             kind                         TEXT    NOT NULL,
@@ -6388,6 +7197,286 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_completion_event_listener_pending
             ON completion_event_listener(session_id, active, acknowledged_at, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_identity_update
+        BEFORE UPDATE OF event_id, kind, delivery_mode, state_dir, meta_path, log_path, rc_path, created_at
+        ON completion_event
+        WHEN OLD.event_id IS NOT NEW.event_id
+          OR OLD.kind IS NOT NEW.kind
+          OR OLD.delivery_mode IS NOT NEW.delivery_mode
+          OR OLD.state_dir IS NOT NEW.state_dir
+          OR OLD.meta_path IS NOT NEW.meta_path
+          OR OLD.log_path IS NOT NEW.log_path
+          OR OLD.rc_path IS NOT NEW.rc_path
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'completion event identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_listener_identity_update
+        BEFORE UPDATE OF event_id, listener_id, session_id, owner_invocation_uuid, created_at
+        ON completion_event_listener
+        WHEN OLD.event_id IS NOT NEW.event_id
+          OR OLD.listener_id IS NOT NEW.listener_id
+          OR OLD.session_id IS NOT NEW.session_id
+          OR OLD.owner_invocation_uuid IS NOT NEW.owner_invocation_uuid
+          OR OLD.created_at IS NOT NEW.created_at
+        BEGIN
+            SELECT RAISE(ABORT, 'completion listener identity is immutable');
+        END;
+
+        CREATE TABLE IF NOT EXISTS completion_authority_continuity (
+            authority_ordinal          INTEGER PRIMARY KEY CHECK(authority_ordinal > 0),
+            admission_id              TEXT NOT NULL UNIQUE,
+            sidecar_generation        TEXT NOT NULL,
+            invocation_uuid           TEXT NOT NULL,
+            event_id                  TEXT NOT NULL,
+            owner_invocation_uuid     TEXT NOT NULL,
+            owner_session_id          TEXT NOT NULL,
+            previous_continuity_digest TEXT NOT NULL
+                CHECK(length(previous_continuity_digest) = 64
+                    AND previous_continuity_digest NOT GLOB '*[^0-9a-f]*'),
+            continuity_digest         TEXT NOT NULL UNIQUE
+                CHECK(length(continuity_digest) = 64
+                    AND continuity_digest NOT GLOB '*[^0-9a-f]*'),
+            FOREIGN KEY(sidecar_generation)
+                REFERENCES mailbox_sidecar_identity(generation_uuid),
+            FOREIGN KEY(event_id, owner_invocation_uuid)
+                REFERENCES completion_event_listener(event_id, listener_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_completion_authority_continuity_head
+            ON completion_authority_continuity(authority_ordinal DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_completion_authority_continuity_invocation
+            ON completion_authority_continuity(invocation_uuid, authority_ordinal);
+
+        CREATE TABLE IF NOT EXISTS completion_authority_materialization_summary (
+            invocation_uuid    TEXT PRIMARY KEY,
+            materialized_count INTEGER NOT NULL CHECK(materialized_count > 0),
+            authority_ordinal  INTEGER NOT NULL CHECK(authority_ordinal > 0),
+            sidecar_generation TEXT NOT NULL,
+            continuity_digest  TEXT NOT NULL
+                CHECK(length(continuity_digest) = 64
+                    AND continuity_digest NOT GLOB '*[^0-9a-f]*'),
+            FOREIGN KEY(sidecar_generation)
+                REFERENCES mailbox_sidecar_identity(generation_uuid)
+        ) STRICT;
+
+        INSERT OR IGNORE INTO completion_authority_materialization_summary (
+            invocation_uuid,
+            materialized_count,
+            authority_ordinal,
+            sidecar_generation,
+            continuity_digest
+        )
+        SELECT
+            head.invocation_uuid,
+            (
+                SELECT COUNT(*)
+                FROM completion_authority_continuity AS counted
+                WHERE counted.invocation_uuid = head.invocation_uuid
+            ),
+            head.authority_ordinal,
+            head.sidecar_generation,
+            head.continuity_digest
+        FROM completion_authority_continuity AS head
+        WHERE head.authority_ordinal = (
+            SELECT MAX(candidate.authority_ordinal)
+            FROM completion_authority_continuity AS candidate
+            WHERE candidate.invocation_uuid = head.invocation_uuid
+        )
+        AND (
+            SELECT COUNT(*)
+            FROM completion_authority_continuity AS counted
+            WHERE counted.invocation_uuid = head.invocation_uuid
+        ) = (
+            SELECT COUNT(*)
+            FROM completion_authority_continuity AS continuity
+            JOIN completion_event AS event
+              ON event.event_id = continuity.event_id
+             AND event.kind = 'agent_bash_complete'
+            JOIN completion_event_listener AS listener
+              ON listener.event_id = continuity.event_id
+             AND listener.listener_id = continuity.owner_invocation_uuid
+             AND listener.owner_invocation_uuid = continuity.owner_invocation_uuid
+             AND listener.session_id = continuity.owner_session_id
+            WHERE continuity.invocation_uuid = head.invocation_uuid
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_insert
+        BEFORE INSERT ON completion_authority_continuity
+        BEGIN
+            SELECT CASE
+                WHEN NEW.authority_ordinal <> COALESCE(
+                    (
+                        SELECT authority_ordinal + 1
+                        FROM completion_authority_continuity
+                        ORDER BY authority_ordinal DESC
+                        LIMIT 1
+                    ),
+                    1
+                ) THEN RAISE(ABORT, 'completion continuity ordinal is not append-only')
+                WHEN NEW.previous_continuity_digest <> COALESCE(
+                    (
+                        SELECT continuity_digest
+                        FROM completion_authority_continuity
+                        ORDER BY authority_ordinal DESC
+                        LIMIT 1
+                    ),
+                    '0000000000000000000000000000000000000000000000000000000000000000'
+                ) THEN RAISE(ABORT, 'completion continuity previous digest mismatch')
+                WHEN NEW.sidecar_generation <> (
+                    SELECT generation_uuid
+                    FROM mailbox_sidecar_identity
+                    WHERE singleton = 1
+                ) THEN RAISE(ABORT, 'completion continuity sidecar generation mismatch')
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM completion_event AS event
+                    JOIN completion_event_listener AS listener
+                      ON listener.event_id = event.event_id
+                    WHERE event.event_id = NEW.event_id
+                      AND event.kind = 'agent_bash_complete'
+                      AND listener.listener_id = NEW.owner_invocation_uuid
+                      AND listener.owner_invocation_uuid = NEW.owner_invocation_uuid
+                      AND listener.session_id = NEW.owner_session_id
+                ) THEN RAISE(ABORT, 'completion continuity event/listener identity mismatch')
+            END;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_materialization_summary_insert
+        AFTER INSERT ON completion_authority_continuity
+        BEGIN
+            INSERT INTO completion_authority_materialization_summary (
+                invocation_uuid,
+                materialized_count,
+                authority_ordinal,
+                sidecar_generation,
+                continuity_digest
+            ) VALUES (
+                NEW.invocation_uuid,
+                1,
+                NEW.authority_ordinal,
+                NEW.sidecar_generation,
+                NEW.continuity_digest
+            )
+            ON CONFLICT(invocation_uuid) DO UPDATE SET
+                materialized_count = materialized_count + 1,
+                authority_ordinal = NEW.authority_ordinal,
+                sidecar_generation = NEW.sidecar_generation,
+                continuity_digest = NEW.continuity_digest;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_update
+        BEFORE UPDATE ON completion_authority_continuity
+        BEGIN
+            SELECT RAISE(ABORT, 'completion continuity is append-only: update forbidden');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_authority_continuity_delete
+        BEFORE DELETE ON completion_authority_continuity
+        BEGIN
+            SELECT RAISE(ABORT, 'completion continuity is append-only: delete forbidden');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_listener_continuity_delete
+        BEFORE DELETE ON completion_event_listener
+        WHEN EXISTS (
+            SELECT 1
+            FROM completion_authority_continuity
+            WHERE event_id = OLD.event_id
+              AND owner_invocation_uuid = OLD.listener_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'completion listener continuity identity is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_materialization_delete
+        AFTER DELETE ON completion_event
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_event_materialization_update
+        AFTER UPDATE OF event_id, kind ON completion_event
+        WHEN OLD.event_id IS NOT NEW.event_id OR OLD.kind IS NOT NEW.kind
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_listener_materialization_delete
+        AFTER DELETE ON completion_event_listener
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+                    AND owner_invocation_uuid = OLD.listener_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+                  AND owner_invocation_uuid = OLD.listener_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_completion_listener_materialization_update
+        AFTER UPDATE OF event_id, listener_id, session_id, owner_invocation_uuid
+        ON completion_event_listener
+        WHEN OLD.event_id IS NOT NEW.event_id
+          OR OLD.listener_id IS NOT NEW.listener_id
+          OR OLD.session_id IS NOT NEW.session_id
+          OR OLD.owner_invocation_uuid IS NOT NEW.owner_invocation_uuid
+        BEGIN
+            DELETE FROM completion_authority_materialization_summary
+            WHERE materialized_count = 1
+              AND invocation_uuid IN (
+                  SELECT invocation_uuid
+                  FROM completion_authority_continuity
+                  WHERE event_id = OLD.event_id
+                    AND owner_invocation_uuid = OLD.listener_id
+              );
+            UPDATE completion_authority_materialization_summary
+            SET materialized_count = materialized_count - 1
+            WHERE invocation_uuid IN (
+                SELECT invocation_uuid
+                FROM completion_authority_continuity
+                WHERE event_id = OLD.event_id
+                  AND owner_invocation_uuid = OLD.listener_id
+            );
+        END;
 
         CREATE TABLE IF NOT EXISTS mailbox_notification_control (
             session_id                    TEXT PRIMARY KEY,
@@ -6518,15 +7607,240 @@ fn mailbox_schema_definition() -> &'static str {
             ON session_wake_claim(claimed_at);"
 }
 
-fn ensure_mailbox_schema(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(mailbox_schema_definition())
-        .map_err(|err| format!("Failed to ensure PID mailbox sidecar schema: {err}"))?;
-    ensure_mailbox_columns(conn)?;
-    ensure_mailbox_target_index(conn)?;
-    ensure_mailbox_compaction_index(conn)?;
-    ensure_mailbox_delivery_owner_index(conn)?;
-    ensure_session_runtime_columns(conn)?;
-    ensure_runtime_generation_columns(conn)
+fn normalized_mailbox_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(sidecar_path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let parent = sidecar_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let file_name = sidecar_path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "PID mailbox sidecar path must name a file",
+                )
+            })?;
+            Ok(fs::canonicalize(parent)?.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn mailbox_authority_path(sidecar_path: &Path) -> PathBuf {
+    let mut path = sidecar_path.as_os_str().to_owned();
+    path.push(".authority.lock");
+    PathBuf::from(path)
+}
+
+fn validate_mailbox_storage_path(path: &Path) -> std::io::Result<()> {
+    let valid_role = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|file_name| {
+            file_name == "pid-identity.db" || file_name.ends_with(".pid-identity.db")
+        });
+    if valid_role {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "PID mailbox sidecar path must use a reserved sidecar storage role",
+        ))
+    }
+}
+
+fn validate_mailbox_source(
+    source_path: &Path,
+    retained_path: &Path,
+    expected_identity: Option<MailboxFileIdentity>,
+) -> std::io::Result<()> {
+    if normalized_mailbox_path(source_path)? != retained_path {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "PID mailbox sidecar source changed during authority acquisition",
+        ));
+    }
+    if inspect_mailbox_storage_file(retained_path)? != expected_identity {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "PID mailbox sidecar target changed during authority acquisition",
+        ));
+    }
+    validate_mailbox_sqlite_artifacts(retained_path)?;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "PID mailbox storage requires a regular file with exactly one hard link: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(Some(mailbox_file_identity(&metadata)?))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFileIdentity>> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        format!(
+            "PID mailbox sidecar file identity is unsupported on this platform: {}",
+            path.display()
+        ),
+    ))
+}
+
+fn validate_mailbox_sqlite_artifacts(sidecar_path: &Path) -> std::io::Result<()> {
+    for artifact in mailbox_sqlite_artifact_paths(sidecar_path) {
+        inspect_mailbox_storage_file(&artifact)?;
+    }
+    Ok(())
+}
+
+fn mailbox_sqlite_artifact_paths(sidecar_path: &Path) -> [PathBuf; 3] {
+    [
+        path_with_storage_suffix(sidecar_path, "-journal"),
+        path_with_storage_suffix(sidecar_path, "-wal"),
+        path_with_storage_suffix(sidecar_path, "-shm"),
+    ]
+}
+
+fn path_with_storage_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn opened_mailbox_file_identity(
+    file: &std::fs::File,
+    path: &Path,
+) -> std::io::Result<MailboxFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "PID mailbox storage requires a regular file with exactly one hard link: {}",
+                path.display()
+            ),
+        ));
+    }
+    mailbox_file_identity(&metadata)
+}
+
+#[cfg(unix)]
+fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+
+#[cfg(unix)]
+fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(MailboxFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.number_of_links() == Some(1)
+}
+
+#[cfg(windows)]
+fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+    Ok(MailboxFileIdentity {
+        volume: u64::from(metadata.volume_serial_number().ok_or_else(|| {
+            std::io::Error::new(ErrorKind::Unsupported, "missing volume serial number")
+        })?),
+        file: metadata
+            .file_index()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::Unsupported, "missing file index"))?,
+    })
+}
+
+fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {
+    let stored_version = mailbox_sidecar_schema_version(conn)?;
+    if stored_version == MAILBOX_SIDECAR_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if stored_version != 0 {
+        return Err(format!(
+            "Unsupported PID mailbox sidecar schema version {stored_version}; expected {MAILBOX_SIDECAR_SCHEMA_VERSION}"
+        ));
+    }
+
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| format!("Failed to lock PID mailbox sidecar schema upgrade: {err}"))?;
+    let locked_version = mailbox_sidecar_schema_version(&tx)?;
+    if locked_version == MAILBOX_SIDECAR_SCHEMA_VERSION {
+        return tx
+            .commit()
+            .map_err(|err| format!("Failed to finish PID mailbox sidecar schema check: {err}"));
+    }
+    if locked_version != 0 {
+        return Err(format!(
+            "Unsupported PID mailbox sidecar schema version {locked_version}; expected {MAILBOX_SIDECAR_SCHEMA_VERSION}"
+        ));
+    }
+    tx.execute_batch(mailbox_schema_definition())
+        .map_err(|err| format!("Failed to upgrade PID mailbox sidecar schema: {err}"))?;
+    ensure_mailbox_sidecar_identity_locked(&tx)?;
+    ensure_mailbox_columns(&tx)?;
+    ensure_mailbox_target_index(&tx)?;
+    ensure_mailbox_compaction_index(&tx)?;
+    ensure_mailbox_delivery_owner_index(&tx)?;
+    ensure_session_runtime_columns(&tx)?;
+    ensure_runtime_generation_columns(&tx)?;
+    tx.pragma_update(None, "user_version", MAILBOX_SIDECAR_SCHEMA_VERSION)
+        .map_err(|err| format!("Failed to record PID mailbox sidecar schema version: {err}"))?;
+    tx.commit()
+        .map_err(|err| format!("Failed to commit PID mailbox sidecar schema upgrade: {err}"))
+}
+
+fn mailbox_sidecar_schema_version(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
+}
+
+fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), String> {
+    let count = conn
+        .query_row("SELECT COUNT(*) FROM mailbox_sidecar_identity", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|err| format!("Failed to validate PID mailbox sidecar identity: {err}"))?;
+    if count == 0 {
+        conn.execute(
+            "INSERT INTO mailbox_sidecar_identity (
+                singleton, generation_uuid, created_at
+             ) VALUES (1, ?1, ?2)",
+            params![Uuid::new_v4().to_string(), now_rfc3339()],
+        )
+        .map_err(|err| format!("Failed to initialize PID mailbox sidecar identity: {err}"))?;
+        return Ok(());
+    }
+    if count != 1 {
+        return Err(format!(
+            "PID mailbox sidecar identity is not a singleton: {count} rows"
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_mailbox_columns(conn: &Connection) -> Result<(), String> {
@@ -6867,6 +8181,454 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::StateDb;
+
+    #[test]
+    fn every_writable_sidecar_constructor_enforces_foreign_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let mut first_admission = MailboxDb::open_with_authority(&authority).unwrap();
+        assert_writable_sidecar_rejects_orphan(first_admission.connection(), "first-admission");
+        first_admission
+            .register_completion_event(completion_registration(
+                "foreign-key-normal-event",
+                "async",
+                "foreign-key-session",
+                "foreign-key-invocation",
+            ))
+            .unwrap();
+        drop(first_admission);
+        drop(authority);
+
+        let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let existing = MailboxDb::open_existing_for_completion_authority(&authority).unwrap();
+        assert_writable_sidecar_rejects_orphan(existing.connection(), "existing-authority");
+        drop(existing);
+        drop(authority);
+
+        let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
+        let pid = crate::pid_identity::PidIdentityDb::open_with_authority(&authority).unwrap();
+        assert_writable_sidecar_rejects_orphan(pid.connection(), "pid-identity");
+        let identity = crate::pid_identity::ProcessIdentity {
+            os_pid: 101,
+            os_boot_id: "foreign-key-boot".to_string(),
+            os_pid_starttime_ticks: 202,
+        };
+        pid.record_identity(crate::pid_identity::PidIdentityRecord {
+            identity: &identity,
+            os_pgid: Some(101),
+            invocation_uuid: "foreign-key-invocation",
+            session_id: Some("foreign-key-session"),
+            provider_name: Some("test-provider"),
+            model_name: Some("test-model"),
+            recorded_at: "2026-08-14T00:00:00Z",
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn current_sidecar_open_is_bounded_and_upgrade_backfills_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        append_test_completion_history(&mut mailbox, 32);
+        drop(mailbox);
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute(
+                "DELETE FROM completion_authority_materialization_summary",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        drop(connection);
+
+        drop(crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap());
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let current_open_steps = end_completion_finalization_vm_count();
+        eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+        assert!(
+            current_open_steps < 512,
+            "current-schema open performed unexpected SQLite work: {current_open_steps}"
+        );
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
+        drop(connection);
+        drop(crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap());
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        let (version, count): (i64, i64) = (
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap(),
+            connection
+                .query_row(
+                    "SELECT materialized_count
+                     FROM completion_authority_materialization_summary
+                     WHERE invocation_uuid = 'mature-open-invocation'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(version, 1);
+        assert_eq!(count, 32);
+    }
+
+    #[test]
+    fn mature_history_does_not_increase_ordinary_mailbox_open_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        append_test_completion_history(&mut mailbox, 1);
+        drop(mailbox);
+
+        begin_completion_finalization_vm_count();
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let small_open_steps = end_completion_finalization_vm_count();
+        append_test_completion_history(&mut mailbox, 255);
+        drop(mailbox);
+
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let mature_open_steps = end_completion_finalization_vm_count();
+        eprintln!("ordinary open VM steps: small={small_open_steps}, mature={mature_open_steps}");
+
+        assert!(
+            mature_open_steps <= small_open_steps + 64,
+            "ordinary sidecar open grew with retained history: small={small_open_steps}, mature={mature_open_steps}"
+        );
+    }
+
+    fn append_test_completion_history(mailbox: &mut MailboxDb, additional: usize) {
+        let generation = mailbox.sidecar_generation().unwrap();
+        let retained_head = completion_continuity_head_on(mailbox.connection()).unwrap();
+        let mut ordinal = retained_head
+            .as_ref()
+            .map_or(1, |head| head.authority_ordinal + 1);
+        let mut previous_digest = retained_head.map_or_else(
+            || COMPLETION_CONTINUITY_GENESIS_DIGEST.to_string(),
+            |head| head.continuity_digest,
+        );
+        for _ in 0..additional {
+            let event_id = format!("mature-open-event-{ordinal}");
+            mailbox
+                .register_completion_event(completion_registration(
+                    &event_id,
+                    "async",
+                    "mature-open-session",
+                    "mature-open-owner",
+                ))
+                .unwrap();
+            let digest = sha256_hex(format!("mature-open-digest-{ordinal}").as_bytes());
+            append_completion_continuity_on(
+                mailbox.connection(),
+                &CompletionContinuityHead {
+                    authority_ordinal: ordinal,
+                    admission_id: format!("mature-open-admission-{ordinal}"),
+                    sidecar_generation: generation.clone(),
+                    invocation_uuid: "mature-open-invocation".to_string(),
+                    event_id,
+                    owner_invocation_uuid: "mature-open-owner".to_string(),
+                    owner_session_id: "mature-open-session".to_string(),
+                    previous_continuity_digest: previous_digest,
+                    continuity_digest: digest.clone(),
+                },
+            )
+            .unwrap();
+            previous_digest = digest;
+            ordinal += 1;
+        }
+    }
+
+    fn materialization_summary_count(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM completion_authority_materialization_summary",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn idle_writable_handles_exclude_rebuild_until_release_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let generation = mailbox.sidecar_generation().unwrap();
+        let state_authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+
+        let error = MailboxDb::acquire_rebuild_authority(&state_authority)
+            .err()
+            .expect("idle writable sidecar handle must exclude rebuild");
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        assert_eq!(mailbox.sidecar_generation().unwrap(), generation);
+        mailbox
+            .upsert_session_runtime(SessionRuntimeUpsert {
+                session_id: "idle-handle-session",
+                mode: "headless",
+                invocation_uuid: Some("idle-handle-invocation"),
+                provider_name: None,
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
+        drop(mailbox);
+
+        let mut rebuild = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+        rebuild.reset().unwrap();
+        rebuild.initialize_after_rebuild().unwrap();
+        drop(rebuild);
+        drop(state_authority);
+
+        let reopened = MailboxDb::open(&sidecar_path).unwrap();
+        assert_ne!(reopened.sidecar_generation().unwrap(), generation);
+        assert!(
+            reopened
+                .session_runtime("idle-handle-session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn idle_pid_identity_handle_excludes_rebuild_until_release_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let pid = crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap();
+        let identity = crate::pid_identity::ProcessIdentity {
+            os_pid: 301,
+            os_boot_id: "idle-pid-handle-boot".to_string(),
+            os_pid_starttime_ticks: 401,
+        };
+        let state_authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+
+        let error = MailboxDb::acquire_rebuild_authority(&state_authority)
+            .err()
+            .expect("idle PID identity handle must exclude rebuild");
+        assert!(error.contains("completion_authority_contention"), "{error}");
+        pid.record_identity(crate::pid_identity::PidIdentityRecord {
+            identity: &identity,
+            os_pgid: Some(301),
+            invocation_uuid: "idle-pid-handle-invocation",
+            session_id: Some("idle-pid-handle-session"),
+            provider_name: Some("fixture-provider"),
+            model_name: Some("fixture-model"),
+            recorded_at: "2026-08-15T00:00:00Z",
+        })
+        .unwrap();
+        drop(pid);
+
+        let mut rebuild = MailboxDb::acquire_rebuild_authority(&state_authority).unwrap();
+        rebuild.reset().unwrap();
+        rebuild.initialize_after_rebuild().unwrap();
+        drop(rebuild);
+        drop(state_authority);
+
+        let reopened = crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap();
+        assert!(reopened.lookup_by_identity(&identity).unwrap().is_none());
+    }
+
+    #[test]
+    fn rebuild_writer_error_classification_allows_only_explicit_corruption() {
+        let corrupt = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::NotADatabase,
+                extended_code: 0,
+            },
+            Some("not a database".to_string()),
+        );
+        let unavailable = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::SystemIoFailure,
+                extended_code: 0,
+            },
+            Some("I/O unavailable".to_string()),
+        );
+
+        assert!(sqlite_error_is_corrupt(&corrupt));
+        assert!(!sqlite_error_is_corrupt(&unavailable));
+    }
+
+    fn assert_writable_sidecar_rejects_orphan(conn: &Connection, listener_id: &str) {
+        let foreign_keys = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        let error = conn
+            .execute(
+                "INSERT INTO completion_event_listener (
+                    event_id, listener_id, session_id, owner_invocation_uuid, active, created_at
+                 ) VALUES ('missing-event', ?1, 'session', 'invocation', 0, 'now')",
+                params![listener_id],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sidecar_writers_reject_a_state_database_storage_role() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+
+        for error in [
+            MailboxDb::open(&state_path).err().unwrap(),
+            crate::pid_identity::PidIdentityDb::open(&state_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(error.contains("reserved sidecar storage role"), "{error}");
+        }
+        assert!(!directory.path().join("state.db.authority.lock").exists());
+        assert_eq!(state.path(), state_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_writers_reject_hard_links_to_state_and_control_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let journal_path = path_with_suffix(&state_path, "-journal");
+        fs::write(&journal_path, b"journal-role").unwrap();
+
+        for (index, target) in [
+            state_path.clone(),
+            path_with_suffix(&state_path, ".namespace.lock"),
+            journal_path,
+            path_with_suffix(&state_path, "-wal"),
+            path_with_suffix(&state_path, "-shm"),
+            sidecar_path.clone(),
+            path_with_suffix(&sidecar_path, ".authority.lock"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(target.exists(), "missing storage role {}", target.display());
+            for kind in ["mailbox", "pid"] {
+                let alias = directory
+                    .path()
+                    .join(format!("hard-link-{index}-{kind}.pid-identity.db"));
+                fs::hard_link(&target, &alias).unwrap();
+                let error = if kind == "mailbox" {
+                    MailboxDb::open(&alias).err().unwrap()
+                } else {
+                    crate::pid_identity::PidIdentityDb::open(&alias)
+                        .err()
+                        .unwrap()
+                };
+                assert!(error.contains("exactly one hard link"), "{error}");
+                assert!(!path_with_suffix(&alias, ".authority.lock").exists());
+                fs::remove_file(alias).unwrap();
+            }
+        }
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_writers_reject_aliased_authority_fences_and_sqlite_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let state_before = fs::read(&state_path).unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let authority_path = path_with_suffix(&sidecar_path, ".authority.lock");
+
+        fs::remove_file(&authority_path).unwrap();
+        symlink(&state_path, &authority_path).unwrap();
+        for error in [
+            MailboxDb::open(&sidecar_path).err().unwrap(),
+            crate::pid_identity::PidIdentityDb::open(&sidecar_path)
+                .err()
+                .unwrap(),
+        ] {
+            assert!(error.contains("exactly one hard link"), "{error}");
+        }
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+
+        fs::remove_file(&authority_path).unwrap();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let artifact = path_with_suffix(&sidecar_path, suffix);
+            if artifact.exists() {
+                fs::remove_file(&artifact).unwrap();
+            }
+            fs::hard_link(&state_path, &artifact).unwrap();
+            for error in [
+                MailboxDb::open(&sidecar_path).err().unwrap(),
+                crate::pid_identity::PidIdentityDb::open(&sidecar_path)
+                    .err()
+                    .unwrap(),
+            ] {
+                assert!(error.contains("exactly one hard link"), "{error}");
+            }
+            fs::remove_file(artifact).unwrap();
+        }
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_authority_retains_its_target_across_parent_retargeting() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first_parent = directory.path().join("first");
+        let second_parent = directory.path().join("second");
+        let alias_parent = directory.path().join("current");
+        fs::create_dir(&first_parent).unwrap();
+        fs::create_dir(&second_parent).unwrap();
+        let first_path = first_parent.join("pid-identity.db");
+        let second_path = second_parent.join("pid-identity.db");
+        drop(MailboxDb::open(&first_path).unwrap());
+        drop(MailboxDb::open(&second_path).unwrap());
+        symlink(&first_parent, &alias_parent).unwrap();
+        let alias_path = alias_parent.join("pid-identity.db");
+
+        let first_authority = MailboxAuthorityFence::acquire(&alias_path).unwrap();
+        fs::remove_file(&alias_parent).unwrap();
+        symlink(&second_parent, &alias_parent).unwrap();
+        let first = MailboxDb::open_with_authority(&first_authority).unwrap();
+        let second_authority = MailboxAuthorityFence::acquire(&alias_path).unwrap();
+        let second =
+            crate::pid_identity::PidIdentityDb::open_with_authority(&second_authority).unwrap();
+
+        assert_eq!(first.path(), first_path.canonicalize().unwrap());
+        assert_eq!(second.path(), second_path.canonicalize().unwrap());
+    }
+
+    fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
 
     fn input<'a>(handle: &'a str, session_id: &'a str) -> AgentBashCompleteEnqueue<'a> {
         AgentBashCompleteEnqueue {
@@ -9657,8 +11419,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.db");
         let state = StateDb::open(&state_path).unwrap();
-        let baseline_version = user_version(state.connection());
-        let baseline_columns = invocation_columns(state.connection());
+        let baseline_version = user_version(state.raw_connection());
+        let baseline_columns = invocation_columns(state.raw_connection());
         drop(state);
 
         let mut mailbox = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -9705,8 +11467,8 @@ mod tests {
         drop(mailbox);
 
         let state = StateDb::open(&state_path).unwrap();
-        assert_eq!(user_version(state.connection()), baseline_version);
-        assert_eq!(invocation_columns(state.connection()), baseline_columns);
+        assert_eq!(user_version(state.raw_connection()), baseline_version);
+        assert_eq!(invocation_columns(state.raw_connection()), baseline_columns);
     }
 
     fn inserted_row(result: Result<EnqueueResult, String>) -> MailboxRow {

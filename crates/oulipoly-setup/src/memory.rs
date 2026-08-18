@@ -4,7 +4,9 @@ use serde::Serialize;
 use std::path::Path;
 
 pub struct MemoryGraph {
-    state_db: StateDb,
+    connection: rusqlite::Connection,
+    _state_authority: StateDb,
+    _temporary_directory: Option<tempfile::TempDir>,
 }
 
 #[derive(Clone, Serialize)]
@@ -34,8 +36,28 @@ pub struct MemorySnapshot {
 
 impl MemoryGraph {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let state_db = StateDb::open_for_memory(path)?;
-        Ok(MemoryGraph { state_db })
+        let temporary_directory = (path == Path::new(":memory:"))
+            .then(tempfile::tempdir)
+            .transpose()
+            .map_err(|error| format!("Failed to create temporary memory database: {error}"))?;
+        let database_path = temporary_directory
+            .as_ref()
+            .map(|directory| directory.path().join("state.db"))
+            .unwrap_or_else(|| path.to_path_buf());
+        let state_authority = StateDb::open_for_memory(&database_path)?;
+        let connection = rusqlite::Connection::open(state_authority.path())
+            .map_err(|error| format!("Failed to open setup memory database: {error}"))?;
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(|error| format!("Failed to configure setup memory database: {error}"))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("Failed to configure setup memory timeout: {error}"))?;
+        Ok(MemoryGraph {
+            connection,
+            _state_authority: state_authority,
+            _temporary_directory: temporary_directory,
+        })
     }
 
     pub fn upsert_node(
@@ -46,8 +68,7 @@ impl MemoryGraph {
         data: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.state_db
-            .connection()
+        self.connection
             .execute(
                 "INSERT INTO memory_nodes (id, node_type, label, data, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -66,8 +87,7 @@ impl MemoryGraph {
         edge_type: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.state_db
-            .connection()
+        self.connection
             .execute(
                 "INSERT OR IGNORE INTO memory_edges (source_id, target_id, edge_type, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -78,7 +98,7 @@ impl MemoryGraph {
     }
 
     pub fn get_node(&self, id: &str) -> Result<Option<MemoryNode>, String> {
-        let mut stmt = self.state_db.connection().prepare(
+        let mut stmt = self.connection.prepare(
             "SELECT id, node_type, label, data, created_at, updated_at FROM memory_nodes WHERE id = ?1"
         ).map_err(|e| format!("Query error: {e}"))?;
 
@@ -102,8 +122,7 @@ impl MemoryGraph {
 
     pub fn get_neighbors(&self, node_id: &str) -> Result<Vec<(MemoryEdge, MemoryNode)>, String> {
         let mut stmt = self
-            .state_db
-            .connection()
+            .connection
             .prepare(
                 "SELECT e.source_id, e.target_id, e.edge_type, e.data, e.created_at,
                     n.id, n.node_type, n.label, n.data, n.created_at, n.updated_at
@@ -153,8 +172,7 @@ impl MemoryGraph {
         );
 
         let mut stmt = self
-            .state_db
-            .connection()
+            .connection
             .prepare(&query)
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -211,8 +229,7 @@ impl MemoryGraph {
         );
 
         let mut stmt = self
-            .state_db
-            .connection()
+            .connection
             .prepare(&query)
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -241,8 +258,7 @@ impl MemoryGraph {
 
     pub fn snapshot(&self) -> Result<MemorySnapshot, String> {
         let mut stmt = self
-            .state_db
-            .connection()
+            .connection
             .prepare("SELECT id, node_type, label, data, created_at, updated_at FROM memory_nodes")
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -262,8 +278,7 @@ impl MemoryGraph {
             .map_err(|e| format!("Failed to collect: {e}"))?;
 
         let mut stmt = self
-            .state_db
-            .connection()
+            .connection
             .prepare("SELECT source_id, target_id, edge_type, data, created_at FROM memory_edges")
             .map_err(|e| format!("Query error: {e}"))?;
 
@@ -287,8 +302,7 @@ impl MemoryGraph {
     // Session tracking
     pub fn create_session(&self, session_id: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.state_db
-            .connection()
+        self.connection
             .execute(
                 "INSERT INTO setup_sessions (id, started_at) VALUES (?1, ?2)",
                 params![session_id, &now],
@@ -306,14 +320,13 @@ impl MemoryGraph {
         events: &str,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.state_db.connection().execute(
+        self.connection.execute(
             "INSERT INTO setup_turns (session_id, turn_number, agent_prompt, agent_response, events_emitted, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![session_id, turn_number, prompt, response, events, &now],
         ).map_err(|e| format!("Failed to record turn: {e}"))?;
 
-        self.state_db
-            .connection()
+        self.connection
             .execute(
                 "UPDATE setup_sessions SET turn_count = ?1 WHERE id = ?2",
                 params![turn_number, session_id],
@@ -325,8 +338,7 @@ impl MemoryGraph {
 
     pub fn end_session(&self, session_id: &str, outcome: &str) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.state_db
-            .connection()
+        self.connection
             .execute(
                 "UPDATE setup_sessions SET ended_at = ?1, outcome = ?2 WHERE id = ?3",
                 params![&now, outcome, session_id],
@@ -402,5 +414,56 @@ mod tests {
     fn missing_node_returns_none() {
         let g = test_graph();
         assert!(g.get_node("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn file_backed_graph_and_rebuild_authority_exclude_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let graph = MemoryGraph::open(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let rebuild_path = state_path.clone();
+        let rebuild = std::thread::spawn(move || {
+            sender
+                .send(StateDb::acquire_rebuild_authority(&rebuild_path))
+                .unwrap()
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "rebuild escaped a live file-backed memory graph"
+        );
+        drop(graph);
+        drop(receiver.recv().unwrap().unwrap());
+        rebuild.join().unwrap();
+
+        let authority = StateDb::acquire_rebuild_authority(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let graph_path = state_path.clone();
+        let opener =
+            std::thread::spawn(move || sender.send(MemoryGraph::open(&graph_path)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "file-backed memory graph escaped rebuild authority"
+        );
+        drop(authority);
+        drop(receiver.recv().unwrap().unwrap());
+        opener.join().unwrap();
+    }
+
+    #[test]
+    fn file_backed_graph_rejects_a_preexisting_hard_link_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let alias_path = directory.path().join("alternate.db");
+        drop(StateDb::open(&state_path).unwrap());
+        std::fs::hard_link(&state_path, &alias_path).unwrap();
+
+        let error = MemoryGraph::open(&alias_path).err().unwrap();
+
+        assert!(error.contains("exactly one hard link"), "{error}");
     }
 }

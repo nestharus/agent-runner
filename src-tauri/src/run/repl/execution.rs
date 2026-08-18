@@ -95,6 +95,7 @@ pub(super) struct StartSelectedReplInvocationInput<'a, 'state> {
 pub(super) struct ReplInvocationAttempt<'state> {
     pub(super) invocation: oulipoly_state::CompositeInvocationId,
     pub(super) invocation_row_id: i64,
+    pub(super) completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
     pub(super) guard: FinalizerGuard<'state>,
 }
 
@@ -109,27 +110,29 @@ pub(super) fn start_selected_repl_invocation<'state>(
         input.provider_index,
         input.parent_invocation_id,
     );
-    let invocation_row_id = input
+    let invocation_start = input
         .agent_runtime_services
         .invocation_lifecycle_service
         .start_invocation(mapper::invocation_lifecycle_start_request(
             &input.env.state,
             &invocation_start,
         ))
-        .map_err(|err| err.to_string())?
-        .invocation_row_id;
+        .map_err(|err| err.to_string())?;
+    let invocation_row_id = invocation_start.invocation_row_id;
     let guard = FinalizerGuard::new(&input.env.state, invocation_row_id);
     Ok(mapper::repl_invocation_attempt(
         invocation,
         invocation_row_id,
+        invocation_start.completion_registration_authority,
         guard,
     ))
 }
 
 pub(super) fn serialize_repl_invocation_env(
     invocation: &oulipoly_state::CompositeInvocationId,
+    authority: &oulipoly_state::CompletionRegistrationAuthority,
 ) -> Result<String, String> {
-    serde_json::to_string(invocation).map_err(|e| format!("Failed to serialize invocation id: {e}"))
+    authority.invocation_launch_environment(invocation)
 }
 
 pub(super) fn emit_repl_invocation_line_if_needed(

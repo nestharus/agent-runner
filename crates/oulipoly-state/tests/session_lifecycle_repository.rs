@@ -751,10 +751,14 @@ fn bounded_reconstruction_returns_only_one_sessions_authoritative_state() {
 }
 
 #[test]
-fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
+fn current_schema_is_created_fresh_and_schema_v10_upgrades_through_v15() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = StateDb::open(&dir.path().join("fresh.db")).unwrap();
-    assert_eq!(user_version(fresh.connection()), 14);
+    let fresh_connection = rusqlite::Connection::open(fresh.path()).unwrap();
+    assert_eq!(
+        user_version(&fresh_connection),
+        i64::from(oulipoly_state::CURRENT_SCHEMA_VERSION)
+    );
     let lifecycle_tables = [
         "session_supervisor_leases",
         "provider_turn_generations",
@@ -767,15 +771,19 @@ fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
         "session_delivery_evidence",
     ];
     for table in lifecycle_tables {
-        assert!(table_exists(fresh.connection(), table), "missing {table}");
+        assert!(table_exists(&fresh_connection, table), "missing {table}");
     }
     assert!(
-        table_exists(fresh.connection(), "fresh_continuations"),
+        table_exists(&fresh_connection, "fresh_continuations"),
         "missing fresh_continuations"
     );
     assert!(
-        table_exists(fresh.connection(), "invocation_completion_obligations"),
+        table_exists(&fresh_connection, "invocation_completion_obligations"),
         "missing invocation_completion_obligations"
+    );
+    assert!(
+        table_exists(&fresh_connection, "invocation_completion_authority_summary"),
+        "missing invocation_completion_authority_summary"
     );
 
     let upgrade_path = dir.path().join("upgrade.db");
@@ -786,7 +794,7 @@ fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
          PRAGMA user_version = 10;",
     )
     .unwrap();
-    let plan = oulipoly_state::migrations::plan(10, 14).unwrap();
+    let plan = oulipoly_state::migrations::plan(10, 15).unwrap();
     assert_eq!(
         plan.iter()
             .map(|migration| migration.id)
@@ -795,11 +803,12 @@ fn schema_v14_is_created_fresh_and_upgrades_from_schema_v10() {
             "0011_durable_session_lifecycle",
             "0012_session_ingress_evidence",
             "0013_fresh_continuations",
-            "0014_invocation_completion_obligations"
+            "0014_invocation_completion_obligations",
+            "0015_invocation_completion_continuity"
         ]
     );
     oulipoly_state::migrations::run_with_db_path(&mut conn, &plan, upgrade_path).unwrap();
-    assert_eq!(user_version(&conn), 14);
+    assert_eq!(user_version(&conn), 15);
     for table in lifecycle_tables {
         assert!(table_exists(&conn, table), "missing {table}");
     }

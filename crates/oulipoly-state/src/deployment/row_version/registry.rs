@@ -79,6 +79,7 @@ const INVOCATIONS_PAYLOAD: &[&str] = &[
     "resume_input_id",
     "provider_session_capture_method",
     "provider_session_resolved_account",
+    "completion_registration_capability_digest",
 ];
 /// Payload columns from PRAGMA order: data, created_at.
 const MEMORY_EDGES_PAYLOAD: &[&str] = &["data", "created_at"];

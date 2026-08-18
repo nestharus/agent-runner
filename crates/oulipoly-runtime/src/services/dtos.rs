@@ -315,7 +315,7 @@ pub enum SessionLockFailure {
     Lock(LockError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(
     clippy::large_enum_variant,
     reason = "AGE-34 DTO contract pins unboxed ModelConfig and ProviderConfig fields"
@@ -365,6 +365,42 @@ pub enum ExecutorServiceRequest {
         parent_invocation_env: Option<String>,
         start_known_provider_session_id: String,
     },
+}
+
+impl std::fmt::Debug for ExecutorServiceRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (variant, parent_invocation_env) = match self {
+            Self::Facade {
+                parent_invocation_env,
+                ..
+            } => ("Facade", parent_invocation_env),
+            Self::Effective {
+                parent_invocation_env,
+                ..
+            } => ("Effective", parent_invocation_env),
+            Self::EffectiveWithStartKnownProviderSessionId {
+                parent_invocation_env,
+                ..
+            } => (
+                "EffectiveWithStartKnownProviderSessionId",
+                parent_invocation_env,
+            ),
+            Self::EffectiveWithCreateKnownProviderSessionId {
+                parent_invocation_env,
+                ..
+            } => (
+                "EffectiveWithCreateKnownProviderSessionId",
+                parent_invocation_env,
+            ),
+        };
+        formatter
+            .debug_struct(variant)
+            .field(
+                "parent_invocation_env",
+                &parent_invocation_env.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,9 +514,10 @@ pub struct InvocationLifecycleStartRequest<'a> {
     pub start: &'a oulipoly_state::InvocationStart,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvocationLifecycleStartOutput {
     pub invocation_row_id: i64,
+    pub completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
 }
 
 pub struct InvocationLifecycleFinalizeRequest<'a> {

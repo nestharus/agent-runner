@@ -165,6 +165,7 @@ pub(super) struct ConsumedCompletionFixture {
 
 #[cfg(test)]
 struct ConsumedCompletionFixturePaths {
+    state_path: std::path::PathBuf,
     db_path: std::path::PathBuf,
     state_dir: std::path::PathBuf,
     state_dir_text: String,
@@ -198,9 +199,11 @@ impl ConsumedCompletionFixture {
 
 #[cfg(test)]
 fn consumed_completion_fixture_paths(dir: &tempfile::TempDir) -> ConsumedCompletionFixturePaths {
-    let db_path = dir.path().join("pid-identity.db");
+    let state_path = dir.path().join("state.db");
+    let db_path = MailboxDb::path_for_state_db(&state_path);
     let state_dir = dir.path().join("agent-bash-state");
     ConsumedCompletionFixturePaths {
+        state_path,
         db_path,
         state_dir_text: state_dir.to_string_lossy().to_string(),
         meta_path: state_dir.join("meta.json").to_string_lossy().to_string(),
@@ -228,19 +231,46 @@ fn format_consumed_completion_fixture_owner() -> String {
 #[cfg(test)]
 fn seed_consumed_completion_fixture_mailbox(paths: &ConsumedCompletionFixturePaths) {
     use oulipoly_state::mailbox::{CompletionEventRegistrationInput, CompletionEventTriggerInput};
+    use oulipoly_state::{InvocationStart, ProviderSessionBinding, StateDb};
 
+    let mut state = StateDb::open(&paths.state_path).unwrap();
+    let invocation_start = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: ConsumedCompletionFixture::INVOCATION_UUID.to_string(),
+            model_name: "consumed-completion-fixture".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            invocation_start.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: ConsumedCompletionFixture::SESSION_ID.to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    state
+        .register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
+            "late-consumed-fixture-admission",
+            CompletionEventRegistrationInput {
+                event_id: ConsumedCompletionFixture::EVENT_ID,
+                delivery_mode: "async",
+                owner_session_id: Some(ConsumedCompletionFixture::SESSION_ID),
+                owner_invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
+                state_dir: &paths.state_dir_text,
+                meta_path: &paths.meta_path,
+                log_path: &paths.log_path,
+                rc_path: &paths.rc_path,
+            },
+        )
+        .unwrap();
     let mut db = MailboxDb::open(&paths.db_path).unwrap();
-    db.register_completion_event(CompletionEventRegistrationInput {
-        event_id: ConsumedCompletionFixture::EVENT_ID,
-        delivery_mode: "async",
-        owner_session_id: Some(ConsumedCompletionFixture::SESSION_ID),
-        owner_invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
-        state_dir: &paths.state_dir_text,
-        meta_path: &paths.meta_path,
-        log_path: &paths.log_path,
-        rc_path: &paths.rc_path,
-    })
-    .unwrap();
     db.trigger_completion_event(CompletionEventTriggerInput {
         event_id: ConsumedCompletionFixture::EVENT_ID,
         payload_json: r#"{"schema_version":2,"handle":"ab_late_consumed_fixture"}"#,

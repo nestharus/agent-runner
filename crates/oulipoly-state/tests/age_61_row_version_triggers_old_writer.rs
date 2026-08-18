@@ -133,9 +133,10 @@ fn repaired_missing_invocations_table_installs_row_version_triggers() {
     }
 
     let db = StateDb::open(&db_path).unwrap();
+    let connection = Connection::open(db.path()).unwrap();
 
     assert_row_version_lifecycle(
-        db.connection(),
+        &connection,
         "invocations",
         "INSERT INTO invocations
             (id, invocation_uuid, model_name, provider_name, provider_index, status, created_at)
@@ -147,6 +148,20 @@ fn repaired_missing_invocations_table_installs_row_version_triggers() {
         "UPDATE invocations SET row_version = ?1, terminal_reason = 'explicit'
          WHERE id = 6201",
         "SELECT row_version FROM invocations WHERE id = 6201",
+    );
+    let error = connection
+        .execute(
+            "UPDATE invocations
+             SET completion_registration_capability_digest = ?1
+             WHERE id = 6201",
+            ["ab".repeat(32)],
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completion registration capability is immutable"),
+        "{error}"
     );
 }
 
@@ -165,9 +180,10 @@ fn repaired_uuid_invocations_table_installs_missing_row_version_triggers() {
     }
 
     let db = StateDb::open(&db_path).unwrap();
+    let connection = Connection::open(db.path()).unwrap();
 
     assert_row_version_lifecycle(
-        db.connection(),
+        &connection,
         "invocations",
         "INSERT INTO invocations
             (id, invocation_uuid, model_name, provider_name, provider_index, status, created_at)

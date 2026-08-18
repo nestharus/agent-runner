@@ -202,17 +202,16 @@ impl Fixture {
             .join("oulipoly-agent-runner")
             .join("state.db");
         let state = StateDb::open(&db_path).unwrap();
+        let connection = rusqlite::Connection::open(state.path()).unwrap();
         for chain in chains {
-            state
-                .connection()
+            connection
                 .execute(
                     "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                      VALUES (?1, ?2, ?3, ?4)",
                     params![chain.chain_id, BASE_TIMESTAMP, chain.last_used_at, MODEL],
                 )
                 .unwrap();
-            state
-                .connection()
+            connection
                 .execute(
                     "INSERT INTO session_chain_segments
                         (chain_id, provider_name, session_id, started_at, transition_reason)

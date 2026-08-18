@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use crate::executor::cli::spawn_identity::provider_parent_invocation_env;
+use crate::executor::cli::spawn_identity::{
+    provider_parent_invocation_env, split_invocation_launch_environment,
+};
 
 pub(super) fn command_from_parts(
     parts: &[String],
@@ -30,7 +32,7 @@ pub(super) fn command_from_parts(
     working_dir: Option<&Path>,
     parent_invocation_env: Option<&str>,
     return_channel: Option<&Path>,
-) -> Command {
+) -> Result<Command, String> {
     let mut cmd = Command::new(&parts[0]);
     for part in &parts[1..] {
         cmd.arg(part);
@@ -46,8 +48,21 @@ pub(super) fn command_from_parts(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    if let Some(parent_invocation_env) = provider_parent_invocation_env(parent_invocation_env) {
-        cmd.env("OULIPOLY_PARENT_INVOCATION", parent_invocation_env);
+    if let Some(selected_parent) = provider_parent_invocation_env(parent_invocation_env) {
+        let selected_is_current = parent_invocation_env == Some(selected_parent.as_str());
+        let (parent_identity, completion_authority) =
+            split_invocation_launch_environment(&selected_parent)?;
+        cmd.env("OULIPOLY_PARENT_INVOCATION", parent_identity);
+        if let Some(completion_authority) = completion_authority {
+            cmd.env(
+                oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+                completion_authority,
+            );
+        } else if selected_is_current {
+            cmd.env_remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
+        }
+    } else {
+        cmd.env_remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     }
     if let Some(return_channel) = return_channel {
         cmd.env("OULIPOLY_RETURN_CHANNEL", return_channel);
@@ -56,7 +71,7 @@ pub(super) fn command_from_parts(
     }
     pin_agent_data_dir(&mut cmd);
 
-    cmd
+    Ok(cmd)
 }
 
 fn pin_agent_data_dir(cmd: &mut Command) {
@@ -68,5 +83,40 @@ fn pin_agent_data_dir(cmd: &mut Command) {
 pub(in crate::executor::cli) fn append_command_args(cmd: &mut Command, args: &[String]) {
     for arg in args {
         cmd.arg(arg);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_authority_is_removed_from_observable_parent_identity() {
+        let invocation = oulipoly_state::CompositeInvocationId {
+            source: "fixture-provider".to_string(),
+            id: "11111111-1111-4111-8111-111111111111".to_string(),
+        };
+        let authority =
+            oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+                "ab".repeat(32),
+            )
+            .unwrap();
+        let launch = authority
+            .invocation_launch_environment(&invocation)
+            .unwrap();
+
+        let (identity, transported_authority) =
+            split_invocation_launch_environment(&launch).unwrap();
+
+        assert_eq!(
+            oulipoly_state::CompositeInvocationId::parse_env_value(&identity).unwrap(),
+            invocation
+        );
+        assert!(!identity.contains(authority.process_environment_value()));
+        assert_eq!(
+            transported_authority.as_deref(),
+            Some(authority.process_environment_value())
+        );
+        assert!(!format!("{authority:?}").contains(authority.process_environment_value()));
     }
 }

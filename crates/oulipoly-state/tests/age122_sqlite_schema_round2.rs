@@ -51,18 +51,27 @@ const EXPECTED_INVOCATIONS_SCHEMA_SNIPPET: &str = r#"CREATE TABLE IF NOT EXISTS 
             resume_acceptance_evidence TEXT,
             created_at TEXT NOT NULL,
             finished_at TEXT,
-            row_version INTEGER NOT NULL DEFAULT 0
+            row_version INTEGER NOT NULL DEFAULT 0,
+            completion_registration_capability_digest TEXT
+                CONSTRAINT invocation_completion_registration_capability_digest_shape
+                CHECK (
+                    completion_registration_capability_digest IS NULL
+                    OR (
+                        length(completion_registration_capability_digest) = 64
+                        AND completion_registration_capability_digest NOT GLOB '*[^0-9a-f]*'
+                    )
+                )
         );"#;
 
 #[test]
-fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface() {
+fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority() {
     assert!(
         invocation_schema_source().contains(EXPECTED_INVOCATIONS_SCHEMA_SNIPPET),
-        "AGE-129 must keep invocations_schema_sql unchanged and sidecar-based"
+        "invocations repair SQL must remain sidecar-based and include completion authority"
     );
     assert!(
-        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 14;"),
-        "schema version must include invocation completion obligations"
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 18;"),
+        "schema version must include caller-bound completion registration authority"
     );
     assert!(
         !lib_source().contains("pub mod lifecycle_log"),
@@ -107,6 +116,10 @@ fn invocations_schema_sql_unchanged_no_raw_io_columns_and_no_migration_surface()
             "0012_session_ingress_evidence.sql",
             "0013_fresh_continuations.sql",
             "0014_invocation_completion_obligations.sql",
+            "0015_invocation_completion_continuity.sql",
+            "0016_invocation_completion_authority_summary.sql",
+            "0017_completion_registration_authority.sql",
+            "0018_invocation_completion_materialization_summary.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

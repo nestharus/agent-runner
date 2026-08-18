@@ -4,8 +4,12 @@
 mod state_fixtures;
 
 use oulipoly_setup::memory::MemoryGraph;
+use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
 use oulipoly_state::schema::CURRENT_SCHEMA_VERSION;
-use oulipoly_state::{StateDb, schema_probe};
+use oulipoly_state::{
+    InvocationStart, InvocationStartWithCompletionAuthority, ProviderSessionBinding, StateDb,
+    schema_probe,
+};
 use rusqlite::Connection;
 use serde_json::Value;
 use state_fixtures::future_db::build_future_db;
@@ -15,9 +19,13 @@ use state_fixtures::versionless_drifted_setup::build_versionless_drifted_setup_d
 use state_fixtures::versionless_unrecognized::build_versionless_unrecognized_db;
 use state_fixtures::{ROOT_INVOCATION_UUID, default_state_path, user_version};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+const HOT_JOURNAL_HELPER_ENV: &str = "AGE_32_HOT_JOURNAL_HELPER";
+const HOT_JOURNAL_PATH_ENV: &str = "AGE_32_HOT_JOURNAL_PATH";
 
 struct CliFixture {
     _dir: tempfile::TempDir,
@@ -107,6 +115,13 @@ impl CliFixture {
 
     fn run_rebuild(&self) -> Output {
         let mut cmd = self.command();
+        cmd.arg("migrate").arg("--rebuild");
+        cmd.output().unwrap()
+    }
+
+    fn run_rebuild_in(&self, data_dir: &Path) -> Output {
+        let mut cmd = self.command();
+        cmd.env("OULIPOLY_DATA_DIR", data_dir);
         cmd.arg("migrate").arg("--rebuild");
         cmd.output().unwrap()
     }
@@ -306,6 +321,7 @@ fn ti_17_migrate_rebuild_command_is_accepted_by_cli() {
 fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_db() {
     let fixture = CliFixture::new();
     build_v3_full_state_db(&fixture.db_path());
+    fs::write(journal_path(&fixture.db_path()), "journal-sidecar").unwrap();
     fs::write(wal_path(&fixture.db_path()), "wal-sidecar").unwrap();
     fs::write(shm_path(&fixture.db_path()), "shm-sidecar").unwrap();
 
@@ -326,6 +342,7 @@ fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_d
     let backups = backup_dirs(&backup_root);
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert!(backups[0].join("state.db").is_file());
+    assert!(backups[0].join("state.db-journal").is_file());
     assert!(backups[0].join("state.db-wal").is_file());
     assert!(backups[0].join("state.db-shm").is_file());
 
@@ -338,6 +355,376 @@ fn ti_18_ti_19_ti_21_ti_26_rebuild_backs_up_sidecars_and_creates_fresh_current_d
         old_rows, 0,
         "destructive rebuild should create a fresh live DB"
     );
+}
+
+#[test]
+fn age_299_s2_rebuild_backs_up_resets_and_readmits_state_sidecar_continuity() {
+    let fixture = CliFixture::new();
+    let state_path = fixture.db_path();
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let first_uuid = "a1111111-1111-4111-8111-111111111111";
+    let mut state = StateDb::open(&state_path).unwrap();
+    let first_start =
+        start_authorized_invocation(&state, first_uuid, "age299-s2-rebuild-first-session");
+    state
+        .register_completion_event_with_authority(
+            &first_start.completion_registration_authority,
+            "age299-s2-rebuild-first-admission",
+            completion_registration(
+                "age299-s2-rebuild-first-event",
+                first_uuid,
+                "age299-s2-rebuild-first-session",
+            ),
+        )
+        .unwrap();
+    let old_generation = MailboxDb::open(&sidecar_path)
+        .unwrap()
+        .sidecar_generation()
+        .unwrap();
+    drop(state);
+
+    let output = fixture.run_rebuild();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let backup_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner")
+        .join("state-backups");
+    let backups = backup_dirs(&backup_root);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert!(backups[0].join("state.db").is_file());
+    assert!(backups[0].join("pid-identity.db").is_file());
+    let backup_sidecar = Connection::open(backups[0].join("pid-identity.db")).unwrap();
+    let backup_generation: String = backup_sidecar
+        .query_row(
+            "SELECT generation_uuid FROM mailbox_sidecar_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let backup_continuity_count: i64 = backup_sidecar
+        .query_row(
+            "SELECT COUNT(*) FROM completion_authority_continuity",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(backup_generation, old_generation);
+    assert_eq!(backup_continuity_count, 1);
+    drop(backup_sidecar);
+    let fresh_sidecar = MailboxDb::open(&sidecar_path).unwrap();
+    let fresh_generation = fresh_sidecar.sidecar_generation().unwrap();
+    assert_ne!(fresh_generation, old_generation);
+    assert!(
+        !fresh_sidecar
+            .contains_completion_obligation(
+                "age299-s2-rebuild-first-event",
+                first_uuid,
+                "age299-s2-rebuild-first-session",
+            )
+            .unwrap()
+    );
+    drop(fresh_sidecar);
+    let second_uuid = "a2222222-2222-4222-8222-222222222222";
+    let mut fresh_state = StateDb::open(&state_path).unwrap();
+    assert!(
+        fresh_state
+            .get_invocation_by_uuid(first_uuid)
+            .unwrap()
+            .is_none()
+    );
+    let second_start = start_authorized_invocation(
+        &fresh_state,
+        second_uuid,
+        "age299-s2-rebuild-second-session",
+    );
+    fresh_state
+        .register_completion_event_with_authority(
+            &second_start.completion_registration_authority,
+            "age299-s2-rebuild-second-admission",
+            completion_registration(
+                "age299-s2-rebuild-second-event",
+                second_uuid,
+                "age299-s2-rebuild-second-session",
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        fresh_state
+            .completion_obligations_for_invocation(second_uuid)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn age_299_s2_rebuild_sidecar_writer_contention_is_nondestructive_and_retryable() {
+    let fixture = CliFixture::new();
+    let state_path = fixture.db_path();
+    let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+    let invocation_uuid = "a3333333-3333-4333-8333-333333333333";
+    let mut state = StateDb::open(&state_path).unwrap();
+    let invocation_start = start_authorized_invocation(
+        &state,
+        invocation_uuid,
+        "age299-s2-rebuild-contention-session",
+    );
+    state
+        .register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
+            "age299-s2-rebuild-contention-admission",
+            completion_registration(
+                "age299-s2-rebuild-contention-event",
+                invocation_uuid,
+                "age299-s2-rebuild-contention-session",
+            ),
+        )
+        .unwrap();
+    drop(state);
+    let writer = Connection::open(&sidecar_path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let blocked = fixture.run_rebuild();
+
+    assert_ne!(blocked.status.code(), Some(0), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("completion_authority_contention"),
+        "{blocked:?}"
+    );
+    assert!(state_path.is_file());
+    assert!(sidecar_path.is_file());
+    assert!(
+        backup_dirs(
+            &fixture
+                .data_home
+                .join("oulipoly-agent-runner")
+                .join("state-backups")
+        )
+        .is_empty()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+
+    let retry = fixture.run_rebuild();
+
+    assert_eq!(retry.status.code(), Some(0), "{retry:?}");
+    assert!(StateDb::open(&state_path).is_ok());
+    assert!(MailboxDb::open(&sidecar_path).is_ok());
+}
+
+#[test]
+fn rebuild_backs_up_and_removes_a_hot_rollback_journal_before_fresh_initialization() {
+    let fixture = CliFixture::new();
+    drop(StateDb::open(&fixture.db_path()).unwrap());
+    leave_hot_rollback_journal(&fixture.db_path());
+    let journal = journal_path(&fixture.db_path());
+    let journal_before = fs::read(&journal).unwrap();
+    assert!(journal_before.len() > 512, "journal was not populated");
+
+    let output = fixture.run_rebuild();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let backup_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner")
+        .join("state-backups");
+    let backups = backup_dirs(&backup_root);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        fs::read(backups[0].join("state.db-journal")).unwrap(),
+        journal_before
+    );
+    assert!(!journal.exists());
+    let conn = Connection::open(fixture.db_path()).unwrap();
+    assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+    let probe_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'hot_journal_probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(probe_exists, 0, "hot journal restored pre-rebuild state");
+}
+
+#[test]
+fn rebuild_rejects_orphaned_recovery_artifacts_instead_of_reporting_no_work() {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let fixture = CliFixture::new();
+        fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
+        let artifact = sidecar_path(&fixture.db_path(), suffix);
+        fs::write(&artifact, b"orphaned recovery state").unwrap();
+
+        let output = fixture.run_rebuild();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "{output:?}");
+        assert!(stderr.contains("recovery artifact remains"), "{stderr}");
+        assert!(stderr.contains(suffix), "{stderr}");
+        assert!(!stdout.contains("no state.db"), "{stdout}");
+        assert_eq!(fs::read(&artifact).unwrap(), b"orphaned recovery state");
+        assert!(
+            !fixture
+                .data_home
+                .join("oulipoly-agent-runner")
+                .join("state-backups")
+                .exists()
+        );
+    }
+}
+
+#[test]
+#[ignore = "spawned by rebuild_backs_up_and_removes_a_hot_rollback_journal_before_fresh_initialization"]
+fn hot_rollback_journal_helper() {
+    if std::env::var_os(HOT_JOURNAL_HELPER_ENV).is_none() {
+        return;
+    }
+    let db_path = PathBuf::from(std::env::var_os(HOT_JOURNAL_PATH_ENV).unwrap());
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA journal_mode=DELETE;
+         PRAGMA synchronous=FULL;
+         PRAGMA cache_size=1;
+         BEGIN IMMEDIATE;
+         CREATE TABLE hot_journal_probe(value BLOB NOT NULL);
+         INSERT INTO hot_journal_probe(value) VALUES (zeroblob(1048576));",
+    )
+    .unwrap();
+    let journal = journal_path(&db_path);
+    let bytes = fs::read(&journal).unwrap();
+    assert!(bytes.len() > 512, "journal was not populated");
+    std::process::exit(86);
+}
+
+fn leave_hot_rollback_journal(db_path: &Path) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg("hot_rollback_journal_helper")
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(HOT_JOURNAL_HELPER_ENV, "1")
+        .env(HOT_JOURNAL_PATH_ENV, db_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "helper failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn rebuild_rejects_a_leaf_symlink_before_backup_or_removal() {
+    let fixture = CliFixture::new();
+    let target_path = fixture.db_path().with_file_name("target.db");
+    build_v3_full_state_db(&target_path);
+    symlink(&target_path, fixture.db_path()).unwrap();
+    let target_before = fs::read(&target_path).unwrap();
+
+    let output = fixture.run_rebuild();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("leaf symlink"), "{stderr}");
+    assert!(
+        fs::symlink_metadata(fixture.db_path())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "rebuild must preserve the canonical symlink on refusal"
+    );
+    assert_eq!(fs::read(&target_path).unwrap(), target_before);
+    let backup_root = fixture
+        .data_home
+        .join("oulipoly-agent-runner")
+        .join("state-backups");
+    assert!(!backup_root.exists());
+}
+
+#[test]
+fn rebuild_rejects_a_dangling_leaf_symlink_before_no_work_or_backup() {
+    let fixture = CliFixture::new();
+    fs::create_dir_all(fixture.db_path().parent().unwrap()).unwrap();
+    symlink(
+        fixture.db_path().with_file_name("missing.db"),
+        fixture.db_path(),
+    )
+    .unwrap();
+
+    let output = fixture.run_rebuild();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("leaf symlink"), "{stderr}");
+    assert!(!stdout.contains("no state.db"), "{stdout}");
+    assert!(
+        fs::symlink_metadata(fixture.db_path())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !fixture
+            .data_home
+            .join("oulipoly-agent-runner")
+            .join("state-backups")
+            .exists()
+    );
+}
+
+#[test]
+fn rebuild_rejects_a_dangling_ancestor_symlink_before_no_work_or_backup() {
+    let fixture = CliFixture::new();
+    let missing_data_dir = fixture._dir.path().join("missing-data");
+    let data_alias = fixture._dir.path().join("data-alias");
+    symlink(&missing_data_dir, &data_alias).unwrap();
+
+    let output = fixture.run_rebuild_in(&data_alias);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(stderr.contains("dangling ancestor symlink"), "{stderr}");
+    assert!(!stdout.contains("no state.db"), "{stdout}");
+    assert!(!missing_data_dir.exists());
+    assert!(
+        fs::symlink_metadata(&data_alias)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn rebuild_rejects_a_non_utf8_default_before_planning_or_reporting() {
+    let fixture = CliFixture::new();
+    let data_dir = fixture
+        ._dir
+        .path()
+        .join(std::ffi::OsString::from_vec(b"data-\xff".to_vec()));
+
+    let missing = fixture.run_rebuild_in(&data_dir);
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(missing_stderr.contains("valid UTF-8"), "{missing_stderr}");
+    assert!(!String::from_utf8_lossy(&missing.stdout).contains("no state.db"));
+    assert!(!data_dir.exists());
+
+    fs::create_dir(&data_dir).unwrap();
+    let state_path = data_dir.join("state.db");
+    fs::write(&state_path, b"unchanged").unwrap();
+    let existing = fixture.run_rebuild_in(&data_dir);
+    let existing_stderr = String::from_utf8_lossy(&existing.stderr);
+    assert!(!existing.status.success(), "{existing:?}");
+    assert!(existing_stderr.contains("valid UTF-8"), "{existing_stderr}");
+    assert_eq!(fs::read(&state_path).unwrap(), b"unchanged");
+    assert!(!data_dir.join("state-backups").exists());
+    assert!(!data_dir.join("state.db.namespace.lock").exists());
 }
 
 #[test]
@@ -544,6 +931,51 @@ fn ti_38_cli_and_read_only_probe_fail_closed_for_unrecognized_versionless_defaul
     assert_eq!(fs::read(fixture.db_path()).unwrap(), before);
 }
 
+fn completion_registration<'a>(
+    event_id: &'a str,
+    owner_invocation_uuid: &'a str,
+    owner_session_id: &'a str,
+) -> CompletionEventRegistrationInput<'a> {
+    CompletionEventRegistrationInput {
+        event_id,
+        delivery_mode: "async",
+        owner_session_id: Some(owner_session_id),
+        owner_invocation_uuid: Some(owner_invocation_uuid),
+        state_dir: "/tmp/age299-s2-rebuild-state",
+        meta_path: "/tmp/age299-s2-rebuild-meta",
+        log_path: "/tmp/age299-s2-rebuild-log",
+        rc_path: "/tmp/age299-s2-rebuild-rc",
+    }
+}
+
+fn start_authorized_invocation(
+    state: &StateDb,
+    invocation_uuid: &str,
+    session_id: &str,
+) -> InvocationStartWithCompletionAuthority {
+    let start = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: invocation_uuid.to_string(),
+            model_name: "age299-s2-rebuild".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            start.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: session_id.to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+    start
+}
+
 fn backup_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = fs::read_dir(root)
         .unwrap()
@@ -555,11 +987,21 @@ fn backup_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 fn wal_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-wal", path.display()))
+    sidecar_path(path, "-wal")
 }
 
 fn shm_path(path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-shm", path.display()))
+    sidecar_path(path, "-shm")
+}
+
+fn journal_path(path: &Path) -> PathBuf {
+    sidecar_path(path, "-journal")
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
 }
 
 fn memory_edges_has_foreign_keys(conn: &Connection) -> bool {

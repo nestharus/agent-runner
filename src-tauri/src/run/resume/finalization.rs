@@ -9,7 +9,9 @@ use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_state::CompositeInvocationId;
 
 use super::{formatter, mapper};
-use crate::invocation::finalize::FinalizerGuard;
+use crate::invocation::finalize::{
+    FinalizerGuard, finalize_retained_outcome_with_contention_retry,
+};
 use crate::migration_providers::ResumeExecutionEnvironment;
 use crate::quota_zero_turn::resume_result_error_category;
 use crate::session_ingest_cli::{
@@ -114,18 +116,26 @@ fn finalize_regular_completed_attempt(
     success: bool,
     error_category: Option<&str>,
 ) -> Result<(), String> {
-    input
-        .agent_runtime_services
-        .invocation_lifecycle_service
-        .finalize_invocation(mapper::finalize_request(
+    let finalize_result = finalize_retained_outcome_with_contention_retry(
+        input
+            .agent_runtime_services
+            .invocation_lifecycle_service
+            .as_ref(),
+        mapper::finalize_request(
             &input.env.state,
             input.invocation_row_id,
             success,
             input.result.exit_code,
             error_category,
             input.result.terminal_reason.as_deref(),
-        ))
-        .map_err(|err| err.to_string())?;
+        ),
+    );
+    if let Err(error) = &finalize_result
+        && success
+    {
+        input.guard.preserve_running_after_process_integrity(error);
+    }
+    finalize_result.map_err(|err| err.to_string())?;
     input.guard.mark_finalized();
     Ok(())
 }

@@ -22,7 +22,7 @@ use crate::session_supervisor::{SupervisorError, TurnRequest};
 
 const MAX_MAILBOX_BATCH_ROWS: usize = 20;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CliResumeRequest {
     pub provider: ProviderConfig,
     pub provider_index: usize,
@@ -34,6 +34,26 @@ pub struct CliResumeRequest {
     pub strategy: ResumeStrategy,
     pub model_name: String,
     pub models_dir: Option<PathBuf>,
+}
+
+impl fmt::Debug for CliResumeRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CliResumeRequest")
+            .field("provider", &self.provider)
+            .field("provider_index", &self.provider_index)
+            .field("prompt_mode", &self.prompt_mode)
+            .field("working_dir", &self.working_dir)
+            .field(
+                "parent_invocation_env",
+                &self.parent_invocation_env.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("session_id", &self.session_id)
+            .field("strategy", &self.strategy)
+            .field("model_name", &self.model_name)
+            .field("models_dir", &self.models_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]

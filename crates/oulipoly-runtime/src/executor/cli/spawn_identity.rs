@@ -104,6 +104,40 @@ pub(crate) fn provider_parent_invocation_env(current: Option<&str>) -> Option<St
     provider_parent_invocation_env_for(current, auto_wake, inherited.as_deref())
 }
 
+pub(crate) fn split_invocation_launch_environment(
+    value: &str,
+) -> Result<(String, Option<String>), String> {
+    let mut parsed: serde_json::Value = serde_json::from_str(value)
+        .map_err(|error| format!("Invalid invocation launch environment: {error}"))?;
+    let authority = parsed
+        .as_object_mut()
+        .and_then(|object| {
+            object.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD)
+        })
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    "Invocation completion registration authority must be text".to_string()
+                })
+                .and_then(|secret| {
+                    oulipoly_state::CompletionRegistrationAuthority::from_process_environment_value(
+                        secret,
+                    )
+                    .map(|authority| authority.process_environment_value().to_string())
+                })
+        })
+        .transpose()?;
+    let identity = if authority.is_some() {
+        serde_json::to_string(&parsed).map_err(|error| {
+            format!("Failed to serialize invocation identity environment: {error}")
+        })?
+    } else {
+        value.to_string()
+    };
+    Ok((identity, authority))
+}
+
 fn provider_parent_invocation_env_for(
     current: Option<&str>,
     auto_wake: bool,
@@ -121,7 +155,16 @@ fn provider_parent_invocation_env_for(
 fn parse_parent_invocation_env(
     parent_invocation_env: Option<&str>,
 ) -> Option<CompositeInvocationId> {
-    parent_invocation_env.and_then(parse_invocation_env_silent)
+    parent_invocation_env
+        .and_then(strip_completion_registration_launch_authority)
+        .as_deref()
+        .and_then(parse_invocation_env_silent)
+}
+
+fn strip_completion_registration_launch_authority(value: &str) -> Option<String> {
+    split_invocation_launch_environment(value)
+        .ok()
+        .map(|(identity, _)| identity)
 }
 
 fn spawn_identity_context_from_invocation(

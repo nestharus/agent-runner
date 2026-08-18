@@ -2,7 +2,29 @@
 //!
 //! `orchestration`, `accessor`, `predicate`, `formatter`, `validator`
 
+#[cfg(test)]
+use oulipoly_runtime::services::SUCCESS_FINALIZE_MAX_ATTEMPTS;
+use oulipoly_runtime::services::{
+    InvocationLifecycleFinalizeOutput, InvocationLifecycleFinalizeRequest,
+    InvocationLifecycleServicePort, ServiceError,
+};
+#[cfg(test)]
+use oulipoly_runtime::services::{
+    InvocationLifecycleStartOutput, InvocationLifecycleStartRequest,
+    ProductionInvocationLifecycleService,
+};
 use oulipoly_state::StateDb;
+
+pub(crate) fn finalize_retained_outcome_with_contention_retry(
+    service: &dyn InvocationLifecycleServicePort,
+    request: InvocationLifecycleFinalizeRequest<'_>,
+) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
+    oulipoly_runtime::services::finalize_retained_outcome_with_contention_retry(service, request)
+}
+
+pub(crate) fn is_completion_authority_contention(error: &ServiceError) -> bool {
+    matches!(error, ServiceError::Contention { .. })
+}
 
 pub(crate) struct FinalizerGuard<'a> {
     db: &'a StateDb,
@@ -17,6 +39,17 @@ impl<'a> FinalizerGuard<'a> {
 
     pub(crate) fn mark_finalized(&mut self) {
         self.finalized = true;
+    }
+
+    pub(crate) fn preserve_running_after_process_integrity(&mut self, error: &ServiceError) {
+        let preserves_running = match error {
+            ServiceError::Contention { .. } => true,
+            ServiceError::Dependency { message } => message.starts_with("process_integrity:"),
+            _ => false,
+        };
+        if preserves_running {
+            self.finalized = true;
+        }
     }
 }
 
@@ -74,10 +107,57 @@ fn emit_finalizer_guard_warning(err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oulipoly_state::{InvocationStart, InvocationStatus};
+    use oulipoly_state::mailbox::{CompletionEventRegistrationInput, MailboxDb};
+    use oulipoly_state::{InvocationStart, InvocationStatus, ProviderSessionBinding};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::path::Path;
+    use std::sync::Mutex;
     use uuid::Uuid;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ObservedFinalizeRequest {
+        invocation_row_id: i64,
+        success: bool,
+        exit_code: i32,
+        error_category: Option<String>,
+        terminal_reason: Option<String>,
+    }
+
+    struct ContendingLifecycleService {
+        succeed_on_attempt: Option<usize>,
+        observed: Mutex<Vec<ObservedFinalizeRequest>>,
+    }
+
+    impl InvocationLifecycleServicePort for ContendingLifecycleService {
+        fn start_invocation(
+            &self,
+            _request: InvocationLifecycleStartRequest<'_>,
+        ) -> Result<InvocationLifecycleStartOutput, ServiceError> {
+            unreachable!("the finalization retry test never starts an invocation through the fake")
+        }
+
+        fn finalize_invocation(
+            &self,
+            request: InvocationLifecycleFinalizeRequest<'_>,
+        ) -> Result<InvocationLifecycleFinalizeOutput, ServiceError> {
+            let mut observed = self.observed.lock().unwrap();
+            observed.push(ObservedFinalizeRequest {
+                invocation_row_id: request.invocation_row_id,
+                success: request.success,
+                exit_code: request.exit_code,
+                error_category: request.error_category.map(str::to_string),
+                terminal_reason: request.terminal_reason.map(str::to_string),
+            });
+            if self.succeed_on_attempt == Some(observed.len()) {
+                Ok(InvocationLifecycleFinalizeOutput)
+            } else {
+                Err(ServiceError::Contention {
+                    message: "process_integrity: completion_authority_contention: fixture"
+                        .to_string(),
+                })
+            }
+        }
+    }
 
     fn test_db() -> StateDb {
         open_test_db(Path::new(":memory:"))
@@ -85,6 +165,89 @@ mod tests {
 
     fn open_test_db(path: &Path) -> StateDb {
         StateDb::open(path).unwrap()
+    }
+
+    #[test]
+    fn success_finalization_retries_the_exact_retained_outcome_until_it_succeeds() {
+        let db = test_db();
+        let service = ContendingLifecycleService {
+            succeed_on_attempt: Some(3),
+            observed: Mutex::new(Vec::new()),
+        };
+
+        finalize_retained_outcome_with_contention_retry(
+            &service,
+            InvocationLifecycleFinalizeRequest {
+                state: &db,
+                invocation_row_id: 71,
+                success: true,
+                exit_code: 0,
+                error_category: Some("retained-category"),
+                terminal_reason: Some("retained-reason"),
+            },
+        )
+        .unwrap();
+
+        let observed = service.observed.lock().unwrap();
+        assert_eq!(observed.len(), SUCCESS_FINALIZE_MAX_ATTEMPTS);
+        assert!(observed.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            observed[0],
+            ObservedFinalizeRequest {
+                invocation_row_id: 71,
+                success: true,
+                exit_code: 0,
+                error_category: Some("retained-category".to_string()),
+                terminal_reason: Some("retained-reason".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn exhausted_success_contention_preserves_the_running_invocation() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+        let service = ContendingLifecycleService {
+            succeed_on_attempt: None,
+            observed: Mutex::new(Vec::new()),
+        };
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            let error = finalize_retained_outcome_with_contention_retry(
+                &service,
+                InvocationLifecycleFinalizeRequest {
+                    state: &db,
+                    invocation_row_id: invocation_id,
+                    success: true,
+                    exit_code: 0,
+                    error_category: None,
+                    terminal_reason: None,
+                },
+            )
+            .unwrap_err();
+            assert!(is_completion_authority_contention(&error));
+            guard.preserve_running_after_process_integrity(&error);
+        }
+
+        assert_eq!(
+            service.observed.lock().unwrap().len(),
+            SUCCESS_FINALIZE_MAX_ATTEMPTS
+        );
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
     }
 
     #[test]
@@ -181,5 +344,164 @@ mod tests {
         assert_eq!(row.success, Some(false));
         assert_eq!(row.exit_code, Some(1));
         assert_eq!(row.error_category.as_deref(), Some("spawn_error"));
+    }
+
+    #[test]
+    fn finalizer_guard_preserves_running_row_after_process_integrity_failure() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            guard.preserve_running_after_process_integrity(&ServiceError::Dependency {
+                message: "process_integrity: completion sidecar authority is unavailable"
+                    .to_string(),
+            });
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
+    }
+
+    #[test]
+    fn finalizer_guard_preserves_running_after_completion_authority_contention() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let sidecar_path = MailboxDb::path_for_state_db(&state_path);
+        let mut db = open_test_db(&state_path);
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_start = db
+            .start_invocation_with_completion_registration_authority(&start)
+            .unwrap();
+        let invocation_id = invocation_start.invocation_row_id;
+        db.bind_invocation_provider_session_start(
+            invocation_id,
+            &ProviderSessionBinding {
+                provider_session_id: "finalizer-guard-contention-session".to_string(),
+                capture_method: "fixture",
+                resume_input_id: None,
+                provider_session_resolved_account: None,
+            },
+        )
+        .unwrap();
+        db.register_completion_event_with_authority(
+            &invocation_start.completion_registration_authority,
+            "finalizer-guard-contention-admission",
+            CompletionEventRegistrationInput {
+                event_id: "finalizer-guard-contention-event",
+                delivery_mode: "async",
+                owner_session_id: Some("finalizer-guard-contention-session"),
+                owner_invocation_uuid: Some(&start.invocation_uuid),
+                state_dir: "/tmp/finalizer-guard-contention-state",
+                meta_path: "/tmp/finalizer-guard-contention-meta",
+                log_path: "/tmp/finalizer-guard-contention-log",
+                rc_path: "/tmp/finalizer-guard-contention-rc",
+            },
+        )
+        .unwrap();
+        let mut authority_path = sidecar_path.as_os_str().to_os_string();
+        authority_path.push(".authority.lock");
+        let authority_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(std::path::PathBuf::from(authority_path))
+            .unwrap();
+        <std::fs::File as fs4::FileExt>::lock(&authority_file).unwrap();
+
+        let started = std::time::Instant::now();
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            let result = ProductionInvocationLifecycleService.finalize_invocation(
+                InvocationLifecycleFinalizeRequest {
+                    state: &db,
+                    invocation_row_id: invocation_id,
+                    success: true,
+                    exit_code: 0,
+                    error_category: None,
+                    terminal_reason: None,
+                },
+            );
+            let error = match result {
+                Err(error @ ServiceError::Contention { .. }) => error,
+                other => panic!("expected typed contention, got {other:?}"),
+            };
+            let message = error.to_string();
+            assert!(started.elapsed() < std::time::Duration::from_secs(7));
+            assert!(
+                message.starts_with("process_integrity: completion_authority_contention:"),
+                "{message}"
+            );
+            guard.preserve_running_after_process_integrity(&error);
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Running);
+        assert_eq!(row.success, None);
+        assert_eq!(row.exit_code, None);
+        assert_eq!(row.error_category, None);
+        assert_eq!(row.terminal_reason, None);
+
+        <std::fs::File as fs4::FileExt>::unlock(&authority_file).unwrap();
+        drop(authority_file);
+        db.finalize_invocation(invocation_id, true, 0, None, None)
+            .unwrap();
+        assert_eq!(
+            db.get_invocation_by_uuid(&start.invocation_uuid)
+                .unwrap()
+                .unwrap()
+                .status,
+            InvocationStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn finalizer_guard_still_finalizes_after_an_unrelated_dependency_failure() {
+        let db = test_db();
+        let start = InvocationStart {
+            invocation_uuid: Uuid::new_v4().to_string(),
+            model_name: "fixture-model".to_string(),
+            provider_name: "fixture-provider".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        };
+        let invocation_id = db.start_invocation(&start).unwrap();
+
+        {
+            let mut guard = FinalizerGuard::new(&db, invocation_id);
+            guard.preserve_running_after_process_integrity(&ServiceError::Dependency {
+                message: "completion sidecar is temporarily unavailable".to_string(),
+            });
+        }
+
+        let row = db
+            .get_invocation_by_uuid(&start.invocation_uuid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, InvocationStatus::Failed);
+        assert_eq!(row.success, Some(false));
+        assert_eq!(row.exit_code, Some(-1));
+        assert_eq!(row.error_category.as_deref(), Some("guard_drop"));
+        assert_eq!(row.terminal_reason.as_deref(), Some("guard_drop"));
     }
 }

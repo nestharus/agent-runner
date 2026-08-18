@@ -417,13 +417,21 @@ fn marker_with_fresh_cache_and_healthy_windows_is_cleared() {
 #[test]
 fn clear_marker_failure_does_not_panic_and_leaves_marker_intact() {
     let (_lock_dir, _env_guard) = isolated_lock_dir();
-    let db = open_db();
+    let state_directory = tempdir().unwrap();
+    let db = StateDb::open(&state_directory.path().join("state.db")).unwrap();
     let now = Utc::now();
     let marker_at = now + Duration::hours(1);
     seed_window(&db, "p", 0.10, 5);
     seed_marker(&db, "p", marker_at);
-    db.connection()
-        .execute("PRAGMA query_only = ON", [])
+    rusqlite::Connection::open(db.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_quota_marker_clear
+             BEFORE UPDATE ON provider_quotas
+             BEGIN
+               SELECT RAISE(ABORT, 'forced marker clear failure');
+             END;",
+        )
         .unwrap();
 
     let providers = providers_with_script("p", "exit 1");
@@ -584,12 +592,12 @@ fn spawn_refresh_workers(
     let in_flight = Arc::new(InFlight::new());
     let providers = Arc::new(providers);
     let sessions = Arc::new(SessionsConfig::default());
-    let db_path = Arc::new(db_path);
     let barrier = Arc::new(Barrier::new(50));
     let mut handles = Vec::with_capacity(50);
     for _ in 0..50 {
+        let db = StateDb::open(&db_path).unwrap();
         handles.push(spawn_refresh_worker(
-            db_path.clone(),
+            db,
             providers.clone(),
             sessions.clone(),
             in_flight.clone(),
@@ -601,7 +609,7 @@ fn spawn_refresh_workers(
 }
 
 fn spawn_refresh_worker(
-    db_path: Arc<PathBuf>,
+    db: StateDb,
     providers: Arc<ProvidersConfig>,
     sessions: Arc<SessionsConfig>,
     in_flight: Arc<InFlight>,
@@ -609,7 +617,6 @@ fn spawn_refresh_worker(
     barrier: Arc<Barrier>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let db = StateDb::open(&db_path).unwrap();
         let now = Utc::now();
         barrier.wait();
         verify_or_clear_marker(&db, &providers, &sessions, &in_flight, "p", now);

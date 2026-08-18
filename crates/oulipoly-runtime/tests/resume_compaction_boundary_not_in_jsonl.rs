@@ -380,8 +380,8 @@ fn target_jsonl_path(projects_dir: &Path, workspace: &Path, session_id: &str) ->
 }
 
 fn segment_snapshot(state: &StateDb) -> Vec<(String, String, String, Option<String>)> {
-    let mut stmt = state
-        .connection()
+    let connection = state.connection();
+    let mut stmt = connection
         .prepare(
             "SELECT chain_id, provider_name, session_id, ended_at
              FROM session_chain_segments
@@ -440,8 +440,8 @@ fn seed_conflicting_active_segment(
     session_id: &str,
 ) -> String {
     let chain_id = "99999999-9999-4999-8999-999999999999".to_string();
-    state
-        .connection()
+    rusqlite::Connection::open(state.path())
+        .unwrap()
         .execute(
             "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
              VALUES (?1, ?2, ?2, ?3)",

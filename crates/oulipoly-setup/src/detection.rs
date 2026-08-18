@@ -1,3 +1,4 @@
+use oulipoly_state::StateDb;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -66,6 +67,7 @@ pub struct WrapperInfo {
 /// path.
 pub struct VersionTracker {
     conn: Connection,
+    _state_authority: Option<StateDb>,
 }
 
 /// A single row from the `cli_versions` table.
@@ -81,12 +83,19 @@ impl VersionTracker {
     /// Open (or create) the version-tracking table inside the given SQLite
     /// database file.
     pub fn open(db_path: &Path) -> Result<Self, String> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create directory for version DB: {e}"))?;
-        }
-        let conn =
-            Connection::open(db_path).map_err(|e| format!("Failed to open version DB: {e}"))?;
+        let state_authority = if db_path == Path::new(":memory:") {
+            None
+        } else {
+            Some(StateDb::open(db_path)?)
+        };
+        let connection_path = state_authority
+            .as_ref()
+            .map(StateDb::path)
+            .unwrap_or(db_path);
+        let conn = Connection::open(connection_path)
+            .map_err(|e| format!("Failed to open version DB: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("Failed to configure version DB busy timeout: {e}"))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(|e| format!("Failed to set WAL mode: {e}"))?;
@@ -112,33 +121,15 @@ impl VersionTracker {
         )
         .map_err(|e| format!("Failed to create cli_versions tables: {e}"))?;
 
-        Ok(VersionTracker { conn })
+        Ok(VersionTracker {
+            conn,
+            _state_authority: state_authority,
+        })
     }
 
     /// Return the most-recently stored version for `cli_name`, if any.
     pub fn get_current(&self, cli_name: &str) -> Result<Option<VersionRecord>, String> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT cli_name, version, path, detected_at
-                 FROM cli_versions WHERE cli_name = ?1",
-            )
-            .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-        let result = stmt.query_row(params![cli_name], |row| {
-            Ok(VersionRecord {
-                cli_name: row.get(0)?,
-                version: row.get(1)?,
-                path: row.get(2)?,
-                detected_at: row.get(3)?,
-            })
-        });
-
-        match result {
-            Ok(rec) => Ok(Some(rec)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to query cli_versions: {e}")),
-        }
+        get_current_on(&self.conn, cli_name)
     }
 
     /// Upsert the current version.  If the version changed, a row is also
@@ -152,28 +143,32 @@ impl VersionTracker {
         path: Option<&str>,
     ) -> Result<bool, String> {
         let now = chrono::Utc::now().to_rfc3339();
-        let prev = self.get_current(cli_name)?;
-
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|e| format!("Failed to begin version record transaction: {e}"))?;
+        let prev = get_current_on(&tx, cli_name)?;
         let changed = prev.as_ref().map(|r| r.version != version).unwrap_or(false);
 
-        self.conn
-            .execute(
-                "INSERT INTO cli_versions (cli_name, version, path, detected_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (cli_name) DO UPDATE SET
-                    version = ?2, path = ?3, detected_at = ?4",
-                params![cli_name, version, path, &now],
-            )
-            .map_err(|e| format!("Failed to upsert cli_versions: {e}"))?;
+        tx.execute(
+            "INSERT INTO cli_versions (cli_name, version, path, detected_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (cli_name) DO UPDATE SET
+                version = ?2, path = ?3, detected_at = ?4",
+            params![cli_name, version, path, &now],
+        )
+        .map_err(|e| format!("Failed to upsert cli_versions: {e}"))?;
 
         // Always append to history so we have a timeline.
-        self.conn
-            .execute(
-                "INSERT INTO cli_version_history (cli_name, version, path, detected_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![cli_name, version, path, &now],
-            )
-            .map_err(|e| format!("Failed to insert cli_version_history: {e}"))?;
+        tx.execute(
+            "INSERT INTO cli_version_history (cli_name, version, path, detected_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![cli_name, version, path, &now],
+        )
+        .map_err(|e| format!("Failed to insert cli_version_history: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit version record transaction: {e}"))?;
 
         Ok(changed)
     }
@@ -204,6 +199,30 @@ impl VersionTracker {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect history rows: {e}"))
+    }
+}
+
+fn get_current_on(conn: &Connection, cli_name: &str) -> Result<Option<VersionRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT cli_name, version, path, detected_at
+             FROM cli_versions WHERE cli_name = ?1",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let result = stmt.query_row(params![cli_name], |row| {
+        Ok(VersionRecord {
+            cli_name: row.get(0)?,
+            version: row.get(1)?,
+            path: row.get(2)?,
+            detected_at: row.get(3)?,
+        })
+    });
+
+    match result {
+        Ok(record) => Ok(Some(record)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to query cli_versions: {e}")),
     }
 }
 
@@ -817,6 +836,8 @@ pub fn summarize(report: &DetectionReport) -> Vec<super::actions::CliSummaryItem
 mod tests {
     use super::*;
 
+    const FIXTURE_CLI: &str = "fixture-cli";
+
     #[test]
     fn detect_os_info() {
         let info = detect_os();
@@ -877,9 +898,123 @@ mod tests {
     }
 
     #[test]
+    fn version_tracker_record_waits_for_bounded_contention_and_commits_both_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let tracker = VersionTracker::open(&state_path).unwrap();
+        let blocker = Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        assert!(!tracker.record(FIXTURE_CLI, "0.200.0", None).unwrap());
+        release.join().unwrap();
+
+        assert_eq!(
+            tracker.get_current(FIXTURE_CLI).unwrap().unwrap().version,
+            "0.200.0"
+        );
+        let history = tracker.history(FIXTURE_CLI, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "0.200.0");
+    }
+
+    #[test]
+    fn version_tracker_record_contention_timeout_commits_neither_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let tracker = VersionTracker::open(&state_path).unwrap();
+        tracker
+            .conn
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let blocker = Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+
+        let error = tracker.record(FIXTURE_CLI, "0.200.0", None).unwrap_err();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.contains("database is locked"), "{error}");
+        assert!(tracker.get_current(FIXTURE_CLI).unwrap().is_none());
+        assert!(tracker.history(FIXTURE_CLI, 10).unwrap().is_empty());
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn version_tracker_record_rolls_back_upsert_when_history_insert_fails() {
+        let tracker = VersionTracker::open(Path::new(":memory:")).unwrap();
+        tracker
+            .record(FIXTURE_CLI, "0.100.0", Some("/old/fixture-cli"))
+            .unwrap();
+        tracker
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_version_history
+                 BEFORE INSERT ON cli_version_history
+                 WHEN NEW.version = '0.200.0'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced history failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = tracker
+            .record(FIXTURE_CLI, "0.200.0", Some("/new/fixture-cli"))
+            .unwrap_err();
+
+        assert!(error.contains("forced history failure"), "{error}");
+        let current = tracker.get_current(FIXTURE_CLI).unwrap().unwrap();
+        assert_eq!(current.version, "0.100.0");
+        assert_eq!(current.path.as_deref(), Some("/old/fixture-cli"));
+        let history = tracker.history(FIXTURE_CLI, 10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].version, "0.100.0");
+    }
+
+    #[test]
     fn version_tracker_missing_cli_returns_none() {
         let tracker = VersionTracker::open(Path::new(":memory:")).unwrap();
         assert!(tracker.get_current("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn file_backed_version_tracker_excludes_rebuild() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let tracker = VersionTracker::open(&state_path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let rebuild_path = state_path.clone();
+        let rebuild = std::thread::spawn(move || {
+            sender
+                .send(StateDb::acquire_rebuild_authority(&rebuild_path))
+                .unwrap()
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "rebuild escaped a live file-backed version tracker"
+        );
+        drop(tracker);
+        drop(receiver.recv().unwrap().unwrap());
+        rebuild.join().unwrap();
+    }
+
+    #[test]
+    fn file_backed_version_tracker_rejects_a_preexisting_hard_link_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let alias_path = directory.path().join("alternate.db");
+        drop(StateDb::open(&state_path).unwrap());
+        std::fs::hard_link(&state_path, &alias_path).unwrap();
+
+        let error = VersionTracker::open(&alias_path).err().unwrap();
+
+        assert!(error.contains("exactly one hard link"), "{error}");
     }
 
     #[test]

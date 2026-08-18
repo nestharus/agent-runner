@@ -20,7 +20,8 @@
 //!       - Intrinsic carrier subordinate to this domain: oulipoly_state::StateDb
 //! ```
 
-use oulipoly_state::StateDb;
+use oulipoly_state::mailbox::{MailboxDb, MailboxDbRebuildAuthority};
+use oulipoly_state::{StateDb, StateDbRebuildAuthority};
 use std::path::{Path, PathBuf};
 
 pub(super) fn default_state_db_path() -> Result<PathBuf, String> {
@@ -46,6 +47,29 @@ pub(super) fn open_default_state_db() -> Result<StateDb, String> {
     )
 }
 
-pub(super) fn open_state_db(path: &Path) -> Result<StateDb, String> {
-    StateDb::open(path)
+pub(super) fn acquire_rebuild_authority(path: &Path) -> Result<StateDbRebuildAuthority, String> {
+    StateDb::acquire_rebuild_authority(path)
+}
+
+pub(super) fn validate_rebuild_path(path: &Path) -> Result<(), String> {
+    StateDb::validate_rebuild_path(path)
+}
+
+pub(super) fn initialize_after_rebuild(
+    path: &Path,
+    authority: &StateDbRebuildAuthority,
+) -> Result<(), String> {
+    StateDb::initialize_after_rebuild(path, authority)
+}
+
+pub(super) fn acquire_sidecar_rebuild_authority(
+    authority: &StateDbRebuildAuthority,
+) -> Result<MailboxDbRebuildAuthority<'_>, String> {
+    MailboxDb::acquire_rebuild_authority(authority)
+}
+
+pub(super) fn initialize_sidecar_after_rebuild(
+    authority: &mut MailboxDbRebuildAuthority<'_>,
+) -> Result<(), String> {
+    authority.initialize_after_rebuild()
 }

@@ -12,14 +12,17 @@
 //! ```
 
 use crate::session_export::{self as export, ContentChunk, ExportError, ExportSessionMetadata};
-use crate::session_lock::{Lease, LockError, SessionLock};
+use crate::session_lock::{Lease, LockError, ProcessAuthority, SessionLock};
 use crate::session_metadata::{
     MetadataError, SessionMetadata, SessionStorageType, TranscriptState, locate_session_metadata,
 };
 use chrono::{DateTime, Utc};
 use oulipoly_config::{ProvidersConfig, SessionsConfig, load_models};
-use oulipoly_state::StateDb;
-use rusqlite::{Connection, Transaction, params};
+use oulipoly_state::{
+    SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
+    StateDb, StateReadConnection,
+};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -92,10 +95,11 @@ pub(crate) struct ProviderReplaceDbTarget {
     pub(crate) session_id: String,
     pub(crate) chain_id: String,
     pub(crate) active_segment_id: i64,
+    pub(crate) active_segment_started_at: String,
     pub(crate) source_file: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProviderReplaceDbPreimage {
     pub(crate) session_turns: Value,
     pub(crate) last_turn_id: Option<String>,
@@ -124,6 +128,9 @@ pub enum ReplaceError {
         token: String,
         expires_at: String,
     },
+    SessionLockSentinelBusy {
+        timeout_ms: u64,
+    },
     SchemaIncompatible {
         reason: String,
     },
@@ -134,6 +141,10 @@ pub enum ReplaceError {
     PreimageMismatch {
         expected: String,
         actual: String,
+    },
+    OperatorRecoveryRequired {
+        journal_path: PathBuf,
+        reason: String,
     },
     OperationalError {
         message: String,
@@ -147,11 +158,12 @@ impl ReplaceError {
             ReplaceError::SessionNotFound { .. } => 10,
             ReplaceError::AmbiguousSession { .. } => 11,
             ReplaceError::UnsupportedStorage { .. } => 12,
-            ReplaceError::SessionBusy { .. } => 13,
+            ReplaceError::SessionBusy { .. } | ReplaceError::SessionLockSentinelBusy { .. } => 13,
             ReplaceError::SchemaIncompatible { .. } => 14,
             ReplaceError::InvalidInputTranscript { .. } | ReplaceError::PreimageMismatch { .. } => {
                 15
             }
+            ReplaceError::OperatorRecoveryRequired { .. } => 16,
             ReplaceError::OperationalError { .. } => 1,
         }
     }
@@ -164,9 +176,11 @@ impl ReplaceError {
             ReplaceError::AmbiguousSession { .. } => "ambiguous-session",
             ReplaceError::UnsupportedStorage { .. } => "unsupported-storage",
             ReplaceError::SessionBusy { .. } => "session-busy",
+            ReplaceError::SessionLockSentinelBusy { .. } => "session-lock-sentinel-busy",
             ReplaceError::SchemaIncompatible { .. } => "schema-incompatible",
             ReplaceError::InvalidInputTranscript { .. } => "invalid-input-transcript",
             ReplaceError::PreimageMismatch { .. } => "preimage-mismatch",
+            ReplaceError::OperatorRecoveryRequired { .. } => "operator-recovery-required",
             ReplaceError::OperationalError { .. } => "operational-error",
         }
     }
@@ -191,6 +205,9 @@ impl ReplaceError {
             ReplaceError::SessionBusy { token, expires_at } => {
                 json!({"error": {"code": self.code(), "token": token, "expires_at": expires_at}})
             }
+            ReplaceError::SessionLockSentinelBusy { timeout_ms } => {
+                json!({"error": {"code": self.code(), "timeout_ms": timeout_ms, "retryable": true}})
+            }
             ReplaceError::InvalidSessionId { input }
             | ReplaceError::SessionNotFound { input }
             | ReplaceError::AmbiguousSession { input } => {
@@ -198,6 +215,16 @@ impl ReplaceError {
             }
             ReplaceError::SchemaIncompatible { reason } => {
                 json!({"error": {"code": self.code(), "message": reason}})
+            }
+            ReplaceError::OperatorRecoveryRequired {
+                journal_path,
+                reason,
+            } => {
+                json!({"error": {
+                    "code": self.code(),
+                    "journal_path": journal_path,
+                    "message": reason,
+                }})
             }
             ReplaceError::OperationalError { message } => {
                 json!({"error": {"code": self.code(), "message": message}})
@@ -226,6 +253,9 @@ fn map_lock_error(err: LockError) -> ReplaceError {
         LockError::LockExpired => ReplaceError::OperationalError {
             message: "lock expired during import-replace".to_string(),
         },
+        LockError::SentinelBusy { timeout_ms } => {
+            ReplaceError::SessionLockSentinelBusy { timeout_ms }
+        }
         LockError::Operational { message } => ReplaceError::OperationalError { message },
     }
 }
@@ -254,6 +284,7 @@ struct ImportReplaceLease<'a> {
     lock: &'a SessionLock,
     session_id: String,
     lease: Option<Lease>,
+    process_authority: Option<ProcessAuthority>,
 }
 
 impl<'a> ImportReplaceLease<'a> {
@@ -263,6 +294,7 @@ impl<'a> ImportReplaceLease<'a> {
                 .release(&self.session_id, &lease.token)
                 .map_err(map_lock_error)?;
         }
+        self.process_authority = None;
         Ok(())
     }
 }
@@ -272,6 +304,7 @@ impl Drop for ImportReplaceLease<'_> {
         if let Some(lease) = self.lease.take() {
             let _ = self.lock.release(&self.session_id, &lease.token);
         }
+        self.process_authority = None;
     }
 }
 
@@ -357,6 +390,7 @@ struct ReplaceJournal {
     session_id: String,
     chain_id: String,
     active_segment_id: i64,
+    active_segment_started_at: String,
     provider_name: String,
     storage_type: String,
     jsonl_path: PathBuf,
@@ -476,11 +510,24 @@ fn run_import_replace_with_postimage(
     let lock = initialize_replace_session_lock(&data_root)?;
     let lease = acquire_import_replace_lease(&lock, &metadata, &workspace)?;
     maybe_test_hook(TEST_SLEEP_AFTER_LOCK_MS);
+    let db_target = strict_provider_replace_db_identity(
+        &metadata.provider_name,
+        &metadata.session_id,
+        metadata.jsonl_path.to_string_lossy().to_string(),
+    )?;
+    if db_target.chain_id != metadata.chain_id
+        || db_target.active_segment_id != metadata.active_segment_id
+    {
+        return Err(ReplaceError::OperationalError {
+            message: "provider_db_identity_mismatch".to_string(),
+        });
+    }
 
     let preimage = resolve_replace_preimage(&postimage_authority, &metadata, &workspace)?;
     let published = publish_replace_journal(
         &workspace,
         &metadata,
+        &db_target,
         replace_input.records.len(),
         &preimage,
         &postimage_plan.expected_sha256,
@@ -494,7 +541,7 @@ fn run_import_replace_with_postimage(
         &replace_input.records,
         &postimage_plan.expected_sha256,
     )?;
-    apply_replace_sqlite(&metadata, &replace_input.records)?;
+    apply_replace_sqlite(&db_target, &replace_input.records)?;
     cleanup_replace_journal_publication(&workspace, &published)?;
     lease.commit()?;
 
@@ -608,7 +655,7 @@ fn acquire_import_replace_lease<'a>(
     metadata: &SessionMetadata,
     workspace: &ReplaceJournalWorkspace,
 ) -> Result<ImportReplaceLease<'a>, ReplaceError> {
-    let lease = match lock.acquire(
+    let (process_authority, lease) = match lock.acquire_with_process_authority(
         &metadata.session_id,
         &metadata.provider_name,
         Duration::from_secs(300),
@@ -623,6 +670,7 @@ fn acquire_import_replace_lease<'a>(
         lock,
         session_id: metadata.session_id.clone(),
         lease: Some(lease),
+        process_authority: Some(process_authority),
     })
 }
 
@@ -642,6 +690,7 @@ fn resolve_replace_preimage(
 fn publish_replace_journal(
     workspace: &ReplaceJournalWorkspace,
     metadata: &SessionMetadata,
+    db_target: &ProviderReplaceDbTarget,
     expected_turn_count: usize,
     preimage_sha256: &str,
     postimage_sha256: &str,
@@ -661,13 +710,14 @@ fn publish_replace_journal(
         .journal_root
         .join(format!("session-{}.pending", metadata.session_id));
     let journal = ReplaceJournal {
-        schema_version: 1,
+        schema_version: 2,
         operation: "import-replace".to_string(),
         operation_uuid: workspace.operation_uuid.clone(),
         started_at: Utc::now().to_rfc3339(),
         session_id: metadata.session_id.clone(),
-        chain_id: metadata.chain_id.clone(),
-        active_segment_id: metadata.active_segment_id,
+        chain_id: db_target.chain_id.clone(),
+        active_segment_id: db_target.active_segment_id,
+        active_segment_started_at: db_target.active_segment_started_at.clone(),
         provider_name: metadata.provider_name.clone(),
         storage_type: storage_type_as_str(metadata.storage_type).to_string(),
         jsonl_path: metadata.jsonl_path.clone(),
@@ -752,48 +802,57 @@ fn verify_replace_postimage(
 }
 
 fn apply_replace_sqlite(
-    metadata: &SessionMetadata,
-    records: &[CanonicalRecord],
-) -> Result<(), ReplaceError> {
-    let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to open state db: {e}"),
-    })?;
-    state
-        .with_write_txn(|tx| replace_db_turns(tx, metadata, records).map_err(|e| format!("{e:?}")))
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to update state db: {e}"),
-        })
-}
-
-pub(crate) fn apply_provider_owned_replace_sqlite(
     target: &ProviderReplaceDbTarget,
     records: &[CanonicalRecord],
 ) -> Result<(), ReplaceError> {
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
+    let input = replacement_for_target(target, records)?;
     state
-        .with_write_txn(|tx| {
-            replace_db_turns_for_target(tx, target, records).map_err(|e| format!("{e:?}"))
-        })
+        .replace_session_turns(&input)
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to update state db: {e}"),
         })
 }
 
-pub(crate) fn restore_provider_owned_db_preimage(
+pub(crate) fn apply_provider_owned_replace_sqlite_if_current(
+    target: &ProviderReplaceDbTarget,
+    records: &[CanonicalRecord],
+    admissible_current: &[ProviderReplaceDbPreimage],
+) -> Result<(), ReplaceError> {
+    let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
+        message: format!("failed to open state db: {e}"),
+    })?;
+    let input = replacement_for_target(target, records)?;
+    let admissible_current = admissible_current
+        .iter()
+        .map(|preimage| restoration_for_target(target, preimage))
+        .collect::<Result<Vec<_>, _>>()?;
+    state
+        .replace_session_turns_if_current(&input, &admissible_current)
+        .map_err(|e| ReplaceError::OperationalError {
+            message: format!("failed to reconcile provider-owned state db: {e}"),
+        })
+}
+
+pub(crate) fn restore_provider_owned_db_preimage_if_current(
     target: &ProviderReplaceDbTarget,
     preimage: &ProviderReplaceDbPreimage,
+    admissible_current: &[ProviderReplaceDbPreimage],
 ) -> Result<(), ReplaceError> {
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db: {e}"),
     })?;
+    let input = restoration_for_target(target, preimage)?;
+    let admissible_current = admissible_current
+        .iter()
+        .map(|candidate| restoration_for_target(target, candidate))
+        .collect::<Result<Vec<_>, _>>()?;
     state
-        .with_write_txn(|tx| {
-            restore_db_preimage_for_target(tx, target, preimage).map_err(|e| format!("{e:?}"))
-        })
+        .restore_session_turns_if_current(&input, &admissible_current)
         .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to restore state db: {e}"),
+            message: format!("failed to reconcile provider-owned state db: {e}"),
         })
 }
 
@@ -810,7 +869,7 @@ pub(crate) fn strict_provider_replace_db_identity(
     let conn = state.connection();
     let mut stmt = conn
         .prepare(
-            "SELECT chain_id, id
+            "SELECT chain_id, id, started_at
              FROM session_chain_segments
              WHERE provider_name = ?1 AND session_id = ?2 AND ended_at IS NULL
              ORDER BY id",
@@ -820,7 +879,11 @@ pub(crate) fn strict_provider_replace_db_identity(
         })?;
     let rows = stmt
         .query_map(params![provider_name, session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to query provider DB identity: {e}"),
@@ -833,11 +896,12 @@ pub(crate) fn strict_provider_replace_db_identity(
         [] => Err(ReplaceError::OperationalError {
             message: "provider_db_identity_missing".to_string(),
         }),
-        [(chain_id, active_segment_id)] => Ok(ProviderReplaceDbTarget {
+        [(chain_id, active_segment_id, active_segment_started_at)] => Ok(ProviderReplaceDbTarget {
             provider_name: provider_name.to_string(),
             session_id: session_id.to_string(),
             chain_id: chain_id.clone(),
             active_segment_id: *active_segment_id,
+            active_segment_started_at: active_segment_started_at.clone(),
             source_file,
         }),
         _ => Err(ReplaceError::OperationalError {
@@ -855,7 +919,44 @@ pub(crate) fn provider_replace_db_preimage(
         message: format!("failed to open state db: {e}"),
     })?;
     let conn = state.connection();
-    db_preimage_from_conn(conn, target)
+    db_preimage_from_conn(&conn, target)
+}
+
+pub(crate) fn provider_replace_db_postimage(
+    target: &ProviderReplaceDbTarget,
+    records: &[CanonicalRecord],
+    source_file: &str,
+) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
+    let replacement = replacement_for_target(target, records)?;
+    let last = replacement
+        .turns
+        .last()
+        .ok_or_else(|| ReplaceError::OperationalError {
+            message: "cannot model an empty provider-owned DB postimage".to_string(),
+        })?;
+    let session_turns = replacement
+        .turns
+        .iter()
+        .map(|turn| {
+            json!([
+                &replacement.provider_name,
+                &replacement.session_id,
+                &turn.turn_id,
+                &turn.timestamp,
+                &turn.role,
+                null,
+                0,
+                0,
+                source_file,
+                &turn.body,
+            ])
+        })
+        .collect();
+    Ok(ProviderReplaceDbPreimage {
+        session_turns: Value::Array(session_turns),
+        last_turn_id: Some(last.turn_id.clone()),
+        last_used_at: last.timestamp.clone(),
+    })
 }
 
 fn cleanup_replace_journal_publication(
@@ -954,10 +1055,15 @@ pub fn recover_pending_replaces() -> Result<(), ReplaceError> {
             move_to_quarantine(&path, &quarantine_dir);
             continue;
         };
-        if header.schema_version == 2 && header.operation == "provider-owned-import-replace" {
+        if matches!(header.schema_version, 2 | 3)
+            && header.operation == "provider-owned-import-replace"
+        {
             continue;
         }
-        if header.schema_version != 1 || header.operation != "import-replace" {
+        if header.schema_version == 1 && header.operation == "import-replace" {
+            continue;
+        }
+        if header.schema_version != 2 || header.operation != "import-replace" {
             move_to_quarantine(&path, &quarantine_dir);
             continue;
         }
@@ -996,13 +1102,9 @@ fn recover_replace_journal_entry(
         journal.postimage_sha256.as_deref(),
         current_hash,
     ) {
-        (_, Some(postimage), Ok(hash)) if hash == postimage => roll_forward_replace_journal(
-            journal_root,
-            quarantine_dir,
-            pending_path,
-            journal,
-            metadata,
-        ),
+        (_, Some(postimage), Ok(hash)) if hash == postimage => {
+            roll_forward_replace_journal(journal_root, quarantine_dir, pending_path, journal)
+        }
         (Some(preimage), _, Ok(hash)) if hash == preimage => {
             cleanup_recovered_replace_journal(journal_root, pending_path, journal)
         }
@@ -1022,7 +1124,6 @@ fn roll_forward_replace_journal(
     quarantine_dir: &Path,
     pending_path: &Path,
     journal: &ReplaceJournal,
-    metadata: &SessionMetadata,
 ) -> Result<(), ReplaceError> {
     let Ok(canonical) = fs::read_to_string(&journal.canonical_records_path) else {
         move_to_quarantine(pending_path, quarantine_dir);
@@ -1035,8 +1136,17 @@ fn roll_forward_replace_journal(
     let mut state = StateDb::open_default().map_err(|e| ReplaceError::OperationalError {
         message: format!("failed to open state db during recovery: {e}"),
     })?;
+    let target = ProviderReplaceDbTarget {
+        provider_name: journal.provider_name.clone(),
+        session_id: journal.session_id.clone(),
+        chain_id: journal.chain_id.clone(),
+        active_segment_id: journal.active_segment_id,
+        active_segment_started_at: journal.active_segment_started_at.clone(),
+        source_file: journal.jsonl_path.to_string_lossy().to_string(),
+    };
+    let input = replacement_for_target(&target, &records)?;
     state
-        .with_write_txn(|tx| replace_db_turns(tx, metadata, &records).map_err(|e| format!("{e:?}")))
+        .replace_session_turns(&input)
         .map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to update state db during recovery: {e}"),
         })?;
@@ -1295,80 +1405,30 @@ fn resolve_replace_metadata(session_id: &str) -> Result<SessionMetadata, Replace
         .map_err(map_metadata_error)
 }
 
-fn replace_db_turns(
-    tx: &mut Transaction<'_>,
-    metadata: &SessionMetadata,
-    records: &[CanonicalRecord],
-) -> Result<(), ReplaceError> {
-    let target = ProviderReplaceDbTarget {
-        provider_name: metadata.provider_name.clone(),
-        session_id: metadata.session_id.clone(),
-        chain_id: metadata.chain_id.clone(),
-        active_segment_id: metadata.active_segment_id,
-        source_file: metadata.jsonl_path.to_string_lossy().to_string(),
-    };
-    replace_db_turns_for_target(tx, &target, records)
-}
-
-fn replace_db_turns_for_target(
-    tx: &mut Transaction<'_>,
+fn replacement_for_target(
     target: &ProviderReplaceDbTarget,
     records: &[CanonicalRecord],
-) -> Result<(), ReplaceError> {
-    tx.execute(
-        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-        params![target.provider_name, target.session_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to delete old turns: {e}"),
-    })?;
-    let now = Utc::now().to_rfc3339();
-    // Canonical v1 records intentionally do not carry parentage, sidechain, or
-    // compaction metadata, so imported rows reset those lineage fields.
-    for record in records {
-        let body = replacement_body_json(&record.content)?;
-        tx.execute(
-            "INSERT INTO session_turns
-                (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, 0, ?6, ?7, ?8)",
-            params![
-                target.provider_name,
-                target.session_id,
-                record.turn_id,
-                record.timestamp,
-                record.role,
-                target.source_file,
-                now,
-                body,
-            ],
-        )
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to insert replacement turn: {e}"),
-        })?;
-    }
-    let last = records
-        .last()
-        .ok_or_else(|| ReplaceError::OperationalError {
-            message: "cannot replace db with empty records".to_string(),
-        })?;
-    tx.execute(
-        "UPDATE session_chain_segments
-         SET last_turn_id = ?2
-         WHERE id = ?1",
-        params![target.active_segment_id, last.turn_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to refresh active segment: {e}"),
-    })?;
-    tx.execute(
-        "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-        params![target.chain_id, last.timestamp],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to refresh chain: {e}"),
-    })?;
-    Ok(())
+) -> Result<SessionTurnsReplacement, ReplaceError> {
+    let turns = records
+        .iter()
+        .map(|record| {
+            Ok(SessionTurnReplacement {
+                turn_id: record.turn_id.clone(),
+                timestamp: record.timestamp.clone(),
+                role: record.role.clone(),
+                body: replacement_body_json(&record.content)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ReplaceError>>()?;
+    Ok(SessionTurnsReplacement {
+        provider_name: target.provider_name.clone(),
+        session_id: target.session_id.clone(),
+        chain_id: target.chain_id.clone(),
+        active_segment_id: target.active_segment_id,
+        active_segment_started_at: target.active_segment_started_at.clone(),
+        source_file: target.source_file.clone(),
+        turns,
+    })
 }
 
 fn replacement_body_json(content: &[ContentChunk]) -> Result<String, ReplaceError> {
@@ -1392,82 +1452,51 @@ fn replacement_body_json(content: &[ContentChunk]) -> Result<String, ReplaceErro
     Ok(format!("[{}]", chunks.join(",")))
 }
 
-fn restore_db_preimage_for_target(
-    tx: &mut Transaction<'_>,
+fn restoration_for_target(
     target: &ProviderReplaceDbTarget,
     preimage: &ProviderReplaceDbPreimage,
-) -> Result<(), ReplaceError> {
-    tx.execute(
-        "DELETE FROM session_turns WHERE provider_name = ?1 AND session_id = ?2",
-        params![target.provider_name, target.session_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to delete replacement turns: {e}"),
-    })?;
+) -> Result<SessionTurnsRestore, ReplaceError> {
     let Some(rows) = preimage.session_turns.as_array() else {
         return Err(ReplaceError::OperationalError {
             message: "invalid_provider_owned_db_preimage".to_string(),
         });
     };
-    let now = Utc::now().to_rfc3339();
-    for row in rows {
-        let Some(values) = row.as_array() else {
-            return Err(ReplaceError::OperationalError {
-                message: "invalid_provider_owned_db_preimage".to_string(),
-            });
-        };
-        let provider_name = value_str(values, 0)?;
-        let session_id = value_str(values, 1)?;
-        let turn_id = value_str(values, 2)?;
-        let timestamp = value_str(values, 3)?;
-        let role = value_str(values, 4)?;
-        let parent_turn_id = values.get(5).and_then(Value::as_str);
-        let is_sidechain = values.get(6).and_then(Value::as_i64).unwrap_or(0);
-        let is_compaction_boundary = values.get(7).and_then(Value::as_i64).unwrap_or(0);
-        let source_file = value_str(values, 8)?;
-        let body = values.get(9).and_then(Value::as_str);
-        tx.execute(
-            "INSERT INTO session_turns
-                (provider_name, session_id, turn_id, timestamp, role,
-                 parent_turn_id, is_sidechain, is_compaction_boundary, source_file, ingested_at, body)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                provider_name,
-                session_id,
-                turn_id,
-                timestamp,
-                role,
-                parent_turn_id,
-                is_sidechain,
-                is_compaction_boundary,
-                source_file,
-                now,
-                body,
-            ],
-        )
-        .map_err(|e| ReplaceError::OperationalError {
-            message: format!("failed to restore preimage turn: {e}"),
-        })?;
-    }
-    tx.execute(
-        "UPDATE session_chain_segments SET last_turn_id = ?2 WHERE id = ?1",
-        params![target.active_segment_id, preimage.last_turn_id],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to restore active segment: {e}"),
-    })?;
-    tx.execute(
-        "UPDATE session_chains SET last_used_at = ?2 WHERE chain_id = ?1",
-        params![target.chain_id, preimage.last_used_at],
-    )
-    .map_err(|e| ReplaceError::OperationalError {
-        message: format!("failed to restore chain: {e}"),
-    })?;
-    Ok(())
+    let turns = rows
+        .iter()
+        .map(|row| {
+            let Some(values) = row.as_array() else {
+                return Err(ReplaceError::OperationalError {
+                    message: "invalid_provider_owned_db_preimage".to_string(),
+                });
+            };
+            Ok(SessionTurnRestoreRow {
+                provider_name: value_str(values, 0)?.to_string(),
+                session_id: value_str(values, 1)?.to_string(),
+                turn_id: value_str(values, 2)?.to_string(),
+                timestamp: value_str(values, 3)?.to_string(),
+                role: value_str(values, 4)?.to_string(),
+                parent_turn_id: values.get(5).and_then(Value::as_str).map(str::to_string),
+                is_sidechain: value_i64(values, 6)?,
+                is_compaction_boundary: value_i64(values, 7)?,
+                source_file: value_str(values, 8)?.to_string(),
+                body: values.get(9).and_then(Value::as_str).map(str::to_string),
+            })
+        })
+        .collect::<Result<Vec<_>, ReplaceError>>()?;
+    Ok(SessionTurnsRestore {
+        provider_name: target.provider_name.clone(),
+        session_id: target.session_id.clone(),
+        chain_id: target.chain_id.clone(),
+        active_segment_id: target.active_segment_id,
+        active_segment_started_at: target.active_segment_started_at.clone(),
+        last_turn_id: preimage.last_turn_id.clone(),
+        last_used_at: preimage.last_used_at.clone(),
+        turns,
+    })
 }
 
 fn db_preimage_from_conn(
-    conn: &Connection,
+    conn: &StateReadConnection<'_>,
     target: &ProviderReplaceDbTarget,
 ) -> Result<ProviderReplaceDbPreimage, ReplaceError> {
     let mut turns = conn
@@ -1492,7 +1521,7 @@ fn db_preimage_from_conn(
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
-                "<session-transcript>",
+                row.get::<_, String>(8)?,
                 row.get::<_, Option<String>>(9)?,
             ]))
         })
@@ -1508,8 +1537,15 @@ fn db_preimage_from_conn(
             "SELECT s.last_turn_id, c.last_used_at
              FROM session_chain_segments s
              JOIN session_chains c ON c.chain_id = s.chain_id
-             WHERE s.id = ?1",
-            params![target.active_segment_id],
+             WHERE s.id = ?1 AND s.chain_id = ?2 AND s.provider_name = ?3
+               AND s.session_id = ?4 AND s.started_at = ?5 AND s.ended_at IS NULL",
+            params![
+                target.active_segment_id,
+                target.chain_id,
+                target.provider_name,
+                target.session_id,
+                target.active_segment_started_at,
+            ],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|e| ReplaceError::OperationalError {
@@ -1526,6 +1562,15 @@ fn value_str(values: &[Value], index: usize) -> Result<&str, ReplaceError> {
     values
         .get(index)
         .and_then(Value::as_str)
+        .ok_or_else(|| ReplaceError::OperationalError {
+            message: "invalid_provider_owned_db_preimage".to_string(),
+        })
+}
+
+fn value_i64(values: &[Value], index: usize) -> Result<i64, ReplaceError> {
+    values
+        .get(index)
+        .and_then(Value::as_i64)
         .ok_or_else(|| ReplaceError::OperationalError {
             message: "invalid_provider_owned_db_preimage".to_string(),
         })
@@ -1647,24 +1692,39 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Replace
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
+    atomic_write_bytes_before_replace(path, bytes, || Ok(()))
+}
+
+pub(crate) fn atomic_write_bytes_before_replace(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: impl FnOnce() -> Result<(), ReplaceError>,
+) -> Result<(), ReplaceError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| ReplaceError::OperationalError {
             message: format!("failed to create parent dir: {e}"),
         })?;
     }
     let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    write_new_file_synced(&tmp, bytes)?;
-    fs::rename(&tmp, path).map_err(|e| ReplaceError::OperationalError {
-        message: format!(
-            "failed to rename {} to {}: {e}",
-            tmp.display(),
-            path.display()
-        ),
-    })?;
-    if let Some(parent) = path.parent() {
-        fsync_dir(parent)?;
+    let result = (|| {
+        write_new_file_synced(&tmp, bytes)?;
+        before_replace()?;
+        fs::rename(&tmp, path).map_err(|e| ReplaceError::OperationalError {
+            message: format!(
+                "failed to rename {} to {}: {e}",
+                tmp.display(),
+                path.display()
+            ),
+        })?;
+        if let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 fn write_new_file_synced(path: &Path, bytes: &[u8]) -> Result<(), ReplaceError> {
@@ -1914,6 +1974,58 @@ mod tests {
     }
 
     #[test]
+    fn restoration_rejects_missing_or_non_integer_lineage_flags() {
+        let target = ProviderReplaceDbTarget {
+            provider_name: PROVIDER.to_string(),
+            session_id: SESSION_ID.to_string(),
+            chain_id: CHAIN_ID.to_string(),
+            active_segment_id: 1,
+            active_segment_started_at: "2026-04-17T08:00:00Z".to_string(),
+            source_file: "<session-transcript>".to_string(),
+        };
+        let row = json!([
+            PROVIDER,
+            SESSION_ID,
+            "turn-1",
+            "2026-04-17T08:00:00Z",
+            "assistant",
+            null,
+            1,
+            1,
+            "<session-transcript>",
+            null
+        ]);
+
+        let mut invalid_sidechain = row.clone();
+        invalid_sidechain.as_array_mut().unwrap()[6] = Value::String("invalid".to_string());
+        let mut invalid_boundary = row.clone();
+        invalid_boundary.as_array_mut().unwrap()[7] = Value::String("invalid".to_string());
+        let mut missing_sidechain = row.clone();
+        missing_sidechain.as_array_mut().unwrap().truncate(6);
+        let mut missing_boundary = row;
+        missing_boundary.as_array_mut().unwrap().truncate(7);
+
+        for invalid_row in [
+            invalid_sidechain,
+            invalid_boundary,
+            missing_sidechain,
+            missing_boundary,
+        ] {
+            let preimage = ProviderReplaceDbPreimage {
+                session_turns: Value::Array(vec![invalid_row]),
+                last_turn_id: Some("turn-1".to_string()),
+                last_used_at: "2026-04-17T08:00:00Z".to_string(),
+            };
+
+            assert!(matches!(
+                restoration_for_target(&target, &preimage),
+                Err(ReplaceError::OperationalError { message })
+                    if message == "invalid_provider_owned_db_preimage"
+            ));
+        }
+    }
+
+    #[test]
     fn import_replace_round_trips_canonical_content_into_session_turn_bodies() {
         // risk: atomic-transaction regression; level: particular-integration; source: contract §4 T9 / proposal A4.
         let dir = tempfile::tempdir().unwrap();
@@ -1979,14 +2091,15 @@ sessions_dir = "{}"
 
         with_homes(&config_home, &data_home, || {
             let db = StateDb::open_default().unwrap();
-            db.connection()
+            let connection = rusqlite::Connection::open(db.path()).unwrap();
+            connection
                 .execute(
                     "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                      VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:01Z', ?2)",
                     params![CHAIN_ID, MODEL],
                 )
                 .unwrap();
-            db.connection()
+            connection
                 .execute(
                     "INSERT INTO session_chain_segments
                         (chain_id, provider_name, session_id, started_at, last_turn_id, transition_reason)
@@ -1995,7 +2108,7 @@ sessions_dir = "{}"
                 )
                 .unwrap();
             for (turn_id, role) in [("old-user", "user"), ("old-assistant", "assistant")] {
-                db.connection()
+                connection
                     .execute(
                         "INSERT INTO session_turns
                             (provider_name, session_id, turn_id, timestamp, role,

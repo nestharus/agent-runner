@@ -16,7 +16,6 @@ pub(crate) const DB_APPLY_CAPABILITY: &str = "replace_session_turns_from_canonic
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptedProviderOwnedReplaceEvidence {
-    pub(crate) operation_id: String,
     pub(crate) recovery_id: String,
     pub(crate) operation_state: String,
     pub(crate) preimage_sha256_observed: String,
@@ -34,6 +33,37 @@ pub(crate) fn validate_changed_replace_result(
     input: &PreparedReplaceInput,
     result: &SessionReplaceResult,
 ) -> Result<AcceptedProviderOwnedReplaceEvidence, ExternalSessionProviderError> {
+    validate_replace_result_with_states(
+        identity,
+        session_id,
+        input,
+        result,
+        &["prepared", "committed", "atomic_committed"],
+    )
+}
+
+pub(crate) fn validate_recovery_replace_result(
+    identity: &ExternalSessionIdentity,
+    session_id: &str,
+    input: &PreparedReplaceInput,
+    result: &SessionReplaceResult,
+) -> Result<AcceptedProviderOwnedReplaceEvidence, ExternalSessionProviderError> {
+    validate_replace_result_with_states(
+        identity,
+        session_id,
+        input,
+        result,
+        &["prepared", "committed", "atomic_committed", "rolled_back"],
+    )
+}
+
+fn validate_replace_result_with_states(
+    identity: &ExternalSessionIdentity,
+    session_id: &str,
+    input: &PreparedReplaceInput,
+    result: &SessionReplaceResult,
+    allowed_states: &[&str],
+) -> Result<AcceptedProviderOwnedReplaceEvidence, ExternalSessionProviderError> {
     let operation_id = required_str(result.operation_id.as_deref(), "missing_operation_id")?;
     if operation_id != input.operation_id {
         return Err(map_provider_owned_token_error("operation_id_mismatch"));
@@ -41,10 +71,7 @@ pub(crate) fn validate_changed_replace_result(
     let recovery_id = required_str(result.recovery_id.as_deref(), "missing_recovery_id")?;
     let operation_state =
         required_str(result.operation_state.as_deref(), "missing_operation_state")?;
-    if !matches!(
-        operation_state,
-        "prepared" | "committed" | "atomic_committed"
-    ) {
+    if !allowed_states.contains(&operation_state) {
         return Err(map_provider_owned_token_error("invalid_operation_state"));
     }
     let observed = required_str(
@@ -85,7 +112,6 @@ pub(crate) fn validate_changed_replace_result(
     };
     let (last_turn_id, last_used_at) = validate_host_state_plan(plan, &plan_context)?;
     Ok(AcceptedProviderOwnedReplaceEvidence {
-        operation_id: operation_id.to_string(),
         recovery_id: recovery_id.to_string(),
         operation_state: operation_state.to_string(),
         preimage_sha256_observed: observed.to_string(),

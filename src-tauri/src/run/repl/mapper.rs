@@ -27,11 +27,13 @@ pub(super) fn prepared_repl_execution(
 pub(super) fn repl_invocation_attempt<'state>(
     invocation: CompositeInvocationId,
     invocation_row_id: i64,
+    completion_registration_authority: oulipoly_state::CompletionRegistrationAuthority,
     guard: crate::invocation::finalize::FinalizerGuard<'state>,
 ) -> super::execution::ReplInvocationAttempt<'state> {
     super::execution::ReplInvocationAttempt {
         invocation,
         invocation_row_id,
+        completion_registration_authority,
         guard,
     }
 }

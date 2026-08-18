@@ -50,6 +50,7 @@ impl StateDb {
         // Guardrail order: DROP TABLE invocations;
         Self::replace_invocations_with_migrated_table(&tx)?;
         Self::create_migrated_invocation_indexes(&tx)?;
+        Self::ensure_completion_registration_authority_trigger(&tx)?;
         Self::ensure_invocations_row_version_support(&tx)?;
 
         Self::commit_invocation_migration(tx)
@@ -209,7 +210,16 @@ impl StateDb {
                 resume_acceptance_evidence TEXT,
                 created_at TEXT NOT NULL,
                 finished_at TEXT,
-                row_version INTEGER NOT NULL DEFAULT 0
+                row_version INTEGER NOT NULL DEFAULT 0,
+                completion_registration_capability_digest TEXT
+                    CONSTRAINT invocation_completion_registration_capability_digest_shape
+                    CHECK (
+                        completion_registration_capability_digest IS NULL
+                        OR (
+                            length(completion_registration_capability_digest) = 64
+                            AND completion_registration_capability_digest NOT GLOB '*[^0-9a-f]*'
+                        )
+                    )
             );",
         )
         .map_err(Self::format_migrated_invocations_table_create_error)

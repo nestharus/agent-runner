@@ -604,7 +604,8 @@ fn usage_does_not_ingest_sessions() {
     fixture.write_model("fixture", &["claude"]);
     fixture.write_providers(&[ProviderFixture::no_usage("claude", "claude")]);
     let db = fixture.open_db();
-    db.connection()
+    let connection = rusqlite::Connection::open(db.path()).unwrap();
+    connection
         .execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
@@ -620,7 +621,7 @@ fn usage_does_not_ingest_sessions() {
             ],
         )
         .unwrap();
-    db.connection()
+    connection
         .execute(
             "INSERT INTO session_turns
                 (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at)
@@ -964,7 +965,8 @@ fn usage_refresh_writes_quota_cache_and_records_delta_learning_samples_per_windo
     )
     .unwrap();
     let prior_refresh = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
-    db.connection()
+    let connection = rusqlite::Connection::open(db.path()).unwrap();
+    connection
         .execute(
             "UPDATE provider_quotas SET refreshed_at = ?1 WHERE provider_name = ?2",
             params![prior_refresh.to_rfc3339(), "claude"],
@@ -972,7 +974,7 @@ fn usage_refresh_writes_quota_cache_and_records_delta_learning_samples_per_windo
         .unwrap();
     for i in 0..20 {
         let timestamp = prior_refresh + chrono::Duration::seconds((i + 1) as i64);
-        db.connection()
+        connection
             .execute(
                 "INSERT INTO session_turns
                     (provider_name, session_id, turn_id, timestamp, role, source_file, ingested_at, is_sidechain)

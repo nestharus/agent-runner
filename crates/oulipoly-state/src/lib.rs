@@ -41,6 +41,7 @@ pub mod migrations;
 pub mod paths;
 pub mod pid_identity;
 mod read_only_snapshot;
+pub mod rebuild_recovery;
 pub mod repositories;
 pub mod result_envelope;
 pub mod schema;
@@ -57,6 +58,9 @@ pub use db::ReadOnlyOpenError;
 pub use db::SessionTurnCounts;
 pub use db::SessionTurnIngest;
 pub use db::StateDb;
+pub use db::StateDbRebuildAuthority;
+pub use db::StateDbWriterAuthority;
+pub use db::StateReadConnection;
 pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
 pub use db::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
@@ -75,20 +79,28 @@ pub use db::{
     ResolvedResume, ResumeError, ResumeInputMatch, ResumeNativeCandidate, SessionMarkerPayload,
     TurnPreview, WrongIdKindInput,
 };
+pub use db::{
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, COMPLETION_REGISTRATION_AUTHORITY_LAUNCH_FIELD,
+    CompletionRegistrationAuthority, InvocationStartWithCompletionAuthority,
+};
 pub use db::{CliMapping, DiscoveredModel, ModelParameter, ParamType};
 pub use db::{CompactSummaryEvidence, OwnedTurnEvent, OwnedTurnEventRow};
 pub use db::{
-    CompletionObligationAdmission, CompletionObligationAdmissionResult,
-    CompletionObligationAuthority, CompletionObligationExpectation, EffectiveTerminalDisposition,
-    ListenerSettlementClass, OwnedCompletionEventState, OwnerLineageRelationship,
-    OwnershipAuthorityError, OwnershipAuthoritySnapshot, RecoveryDisposition,
-    SettlementVerifierIdentity, SidecarGenerationState,
+    CompletionContinuityRecoveryState, CompletionObligationAdmission,
+    CompletionObligationAdmissionResult, CompletionObligationAuthority,
+    CompletionObligationExpectation, EffectiveTerminalDisposition, ListenerSettlementClass,
+    OwnedCompletionEventState, OwnerLineageRelationship, OwnershipAuthorityError,
+    OwnershipAuthoritySnapshot, RecoveryDisposition, SettlementVerifierIdentity,
+    SidecarGenerationState,
 };
 pub use db::{
     ImportedSessionDisplayMetadata, ImportedSessionDisplayMetadataUpsert, ImportedSessionListRow,
 };
-pub use db::{InvocationRecord, InvocationStart, InvocationStatus};
+pub use db::{InvocationFinalizeError, InvocationRecord, InvocationStart, InvocationStatus};
 pub use db::{ProviderTurnEffectInput, ProviderTurnEffectWrite};
+pub use db::{
+    SessionTurnReplacement, SessionTurnRestoreRow, SessionTurnsReplacement, SessionTurnsRestore,
+};
 pub use invocation_marker::CompositeInvocationId;
 pub use lifecycle_log::{LifecycleEventSink, NoopLifecycleEventSink};
 pub use mailbox::{
@@ -101,6 +113,11 @@ pub use result_envelope::{
 
 #[cfg(doctest)]
 pub mod age_32_connection_boundary_doctest {
+    //! These compile failures prove only that `StateDb` does not lend or return
+    //! its owned writable connection. Callers with direct local SQLite write
+    //! permission, including `StateDbWriterAuthority`, are trusted terminal
+    //! storage authorities and are outside trigger-enforced append-only claims.
+
     /// ```compile_fail
     /// use oulipoly_state::StateDb;
     ///
@@ -139,6 +156,42 @@ pub mod age_32_connection_boundary_doctest {
     /// let mut state = StateDb::open_default().unwrap();
     /// let escaped: &mut rusqlite::Connection = state.connection_mut();
     /// escaped.execute_batch("CREATE TABLE bypass (id INTEGER)").unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use oulipoly_state::StateDb;
+    ///
+    /// let state = StateDb::open_default().unwrap();
+    /// state.connection().execute_batch(
+    ///     "DROP TRIGGER trg_invocation_completion_obligations_append_only_delete;
+    ///      DELETE FROM invocation_completion_obligations;",
+    /// ).unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use oulipoly_state::StateDb;
+    ///
+    /// let mut state = StateDb::open_default().unwrap();
+    /// state.with_write_txn(|tx| {
+    ///     tx.execute_batch(
+    ///         "DROP TRIGGER trg_invocation_completion_obligations_append_only_delete;
+    ///          DELETE FROM invocation_completion_obligations;",
+    ///     ).map_err(|error| error.to_string())
+    /// }).unwrap();
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use oulipoly_state::{CompletionObligationAdmission, StateDb};
+    ///
+    /// let state = StateDb::open_default().unwrap();
+    /// state.record_completion_obligation(CompletionObligationAdmission {
+    ///     admission_id: "forbidden-state-only-admission",
+    ///     invocation_uuid: "11111111-1111-4111-8111-111111111111",
+    ///     event_id: "forbidden-event",
+    ///     owner_invocation_uuid: "11111111-1111-4111-8111-111111111111",
+    ///     owner_session_id: "forbidden-session",
+    ///     expected_sidecar_generation: "22222222-2222-4222-8222-222222222222",
+    /// }).unwrap();
     /// ```
     pub struct StateDbRawConnectionEscapeMustNotCompile;
 }

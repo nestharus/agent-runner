@@ -113,14 +113,15 @@ prompt_mode = "arg"
         )
         .unwrap();
         let db = StateDb::open(&self.data_root.join("state.db")).unwrap();
-        db.connection()
+        let connection = rusqlite::Connection::open(db.path()).unwrap();
+        connection
             .execute(
                 "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
                  VALUES (?1, '2026-04-17T08:00:00Z', '2026-04-17T08:00:00Z', ?2)",
                 params![CHAIN_A, MODEL],
             )
             .unwrap();
-        db.connection()
+        connection
             .execute(
                 "INSERT INTO session_chain_segments
                     (chain_id, provider_name, session_id, started_at, transition_reason)

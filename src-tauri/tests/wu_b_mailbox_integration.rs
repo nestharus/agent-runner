@@ -9,7 +9,8 @@ use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
 };
 use oulipoly_state::{
-    CompositeInvocationId, InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
+    COMPLETION_REGISTRATION_AUTHORITY_ENV, CompletionRegistrationAuthority, CompositeInvocationId,
+    InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -20,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const INVOCATION_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -35,6 +37,8 @@ struct Fixture {
     home_dir: PathBuf,
     app_config_dir: PathBuf,
     models_dir: PathBuf,
+    completion_authorities:
+        Mutex<std::collections::HashMap<String, CompletionRegistrationAuthority>>,
 }
 
 struct NotifyArtifacts {
@@ -60,6 +64,7 @@ impl Fixture {
             home_dir,
             app_config_dir,
             models_dir,
+            completion_authorities: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -128,6 +133,21 @@ impl Fixture {
             .arg("--rc")
             .arg(&artifacts.rc)
             .arg("--json");
+        let metadata: Value = serde_json::from_slice(&fs::read(&artifacts.meta).unwrap()).unwrap();
+        if let Some(invocation_uuid) = metadata
+            .get("owner_invocation_uuid")
+            .and_then(Value::as_str)
+            && let Some(authority) = self
+                .completion_authorities
+                .lock()
+                .unwrap()
+                .get(invocation_uuid)
+        {
+            cmd.env(
+                COMPLETION_REGISTRATION_AUTHORITY_ENV,
+                authority.process_environment_value(),
+            );
+        }
         self.run(cmd)
     }
 
@@ -233,8 +253,8 @@ impl Fixture {
         provider_session_id: &str,
     ) {
         let db = self.open_state();
-        let id = db
-            .start_invocation(&InvocationStart {
+        let start = db
+            .start_invocation_with_completion_registration_authority(&InvocationStart {
                 invocation_uuid: invocation_uuid.to_string(),
                 model_name: "fixture-model".to_string(),
                 provider_name: "fixture-provider".to_string(),
@@ -242,6 +262,11 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
+        let id = start.invocation_row_id;
+        self.remember_completion_authority(
+            invocation_uuid,
+            start.completion_registration_authority,
+        );
         db.bind_invocation_provider_session_start(
             id,
             &ProviderSessionBinding {
@@ -259,8 +284,9 @@ impl Fixture {
         invocation_uuid: &str,
         session_id: &str,
     ) -> ProcessIdentity {
-        self.open_state()
-            .start_invocation(&InvocationStart {
+        let state = self.open_state();
+        let start = state
+            .start_invocation_with_completion_registration_authority(&InvocationStart {
                 invocation_uuid: invocation_uuid.to_string(),
                 model_name: "fixture-model".to_string(),
                 provider_name: "fixture-provider".to_string(),
@@ -268,6 +294,10 @@ impl Fixture {
                 parent_invocation_id: None,
             })
             .unwrap();
+        self.remember_completion_authority(
+            invocation_uuid,
+            start.completion_registration_authority,
+        );
         let identity = read_live_process_identity(i64::from(std::process::id()))
             .unwrap()
             .expect("test process identity");
@@ -284,6 +314,17 @@ impl Fixture {
             })
             .unwrap();
         identity
+    }
+
+    fn remember_completion_authority(
+        &self,
+        invocation_uuid: &str,
+        authority: CompletionRegistrationAuthority,
+    ) {
+        self.completion_authorities
+            .lock()
+            .unwrap()
+            .insert(invocation_uuid.to_string(), authority);
     }
 
     fn mailbox_rows(&self, session_id: &str, all: bool) -> Vec<MailboxRow> {
@@ -496,6 +537,10 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     );
 
     let registration = fixture.run_register_artifacts("h-explicit-owner", "async", &artifacts);
+    let expected_generation = MailboxDb::open(&fixture.sidecar_path())
+        .unwrap()
+        .sidecar_generation()
+        .unwrap();
     let completion = fixture.run_notify_artifacts("h-explicit-owner", &artifacts);
 
     assert!(registration.status.success(), "{registration:?}");
@@ -503,6 +548,18 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
     assert_eq!(registered["status"], "registered");
     assert_eq!(registered["owner_session_id"], SESSION_A);
     assert_eq!(registered["owner_invocation_uuid"], INVOCATION_A);
+    let obligations = fixture
+        .open_state()
+        .completion_obligations_for_invocation(INVOCATION_A)
+        .unwrap();
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].event_id, "h-explicit-owner");
+    assert_eq!(obligations[0].owner_invocation_uuid, INVOCATION_A);
+    assert_eq!(obligations[0].owner_session_id, SESSION_A);
+    assert_eq!(
+        obligations[0].expected_sidecar_generation,
+        expected_generation
+    );
     assert!(completion.status.success(), "{completion:?}");
     let completed = stdout_json(&completion);
     assert_eq!(completed["status"], "triggered");
@@ -512,6 +569,53 @@ fn completion_registration_binds_the_explicit_owner_without_pid_lineage() {
         "h-explicit-owner"
     );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_rejects_foreign_cli_without_invocation_capability() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-foreign-no-authority",
+        owner_metadata(SESSION_A, INVOCATION_A),
+        0,
+    );
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+    cmd.arg("notify")
+        .arg("agent-bash-register")
+        .arg("--handle")
+        .arg("h-foreign-no-authority")
+        .arg("--delivery-mode")
+        .arg("async")
+        .arg("--state-dir")
+        .arg(&artifacts.state_dir)
+        .arg("--meta")
+        .arg(&artifacts.meta)
+        .arg("--log")
+        .arg(&artifacts.log)
+        .arg("--rc")
+        .arg(&artifacts.rc)
+        .arg("--json")
+        .env_remove(COMPLETION_REGISTRATION_AUTHORITY_ENV);
+
+    let registration = fixture.run(cmd);
+
+    assert_eq!(registration.status.code(), Some(74), "{registration:?}");
+    let response = stdout_json(&registration);
+    assert!(
+        response["message"]
+            .as_str()
+            .unwrap()
+            .contains("caller-bound invocation authority"),
+        "{response}"
+    );
+    assert!(
+        fixture
+            .open_state()
+            .completion_obligations_for_invocation(INVOCATION_A)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -537,8 +641,8 @@ fn completion_registration_accepts_running_owner_from_exact_live_pid_sidecar() {
 fn completion_registration_waits_for_live_session_binding() {
     let fixture = Fixture::new();
     let state = fixture.open_state();
-    let invocation_row_id = state
-        .start_invocation(&InvocationStart {
+    let invocation_start = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
             invocation_uuid: INVOCATION_A.to_string(),
             model_name: "fixture-model".to_string(),
             provider_name: "fixture-provider".to_string(),
@@ -546,6 +650,7 @@ fn completion_registration_waits_for_live_session_binding() {
             parent_invocation_id: None,
         })
         .unwrap();
+    let invocation_row_id = invocation_start.invocation_row_id;
     let artifacts = fixture.write_notify_artifacts(
         "h-live-binding-owner",
         owner_metadata(SESSION_A, INVOCATION_A),
@@ -624,6 +729,12 @@ fn completion_registration_waits_for_live_session_binding() {
         .arg("--rc")
         .arg(&artifacts.rc)
         .arg("--json")
+        .env(
+            COMPLETION_REGISTRATION_AUTHORITY_ENV,
+            invocation_start
+                .completion_registration_authority
+                .process_environment_value(),
+        )
         .env("OULIPOLY_LIVE_SESSION_BIND_SOCKET", &socket_path)
         .env("OULIPOLY_LIVE_SESSION_BIND_TOKEN", "fixture-token");
     let registration = fixture.run(cmd);
@@ -962,7 +1073,8 @@ fn published_payload_without_metadata_commit_is_not_accepted() {
     let payload = r#"{"schema_version":1,"kind":"agent_bash_complete","body":"durable"}"#;
     let sidecar_path = fixture.sidecar_path();
     let mut db = MailboxDb::open(&sidecar_path).unwrap();
-    db.connection()
+    Connection::open(&sidecar_path)
+        .unwrap()
         .execute_batch(
             "CREATE TRIGGER reject_mailbox_acceptance
              BEFORE INSERT ON mailbox
@@ -1017,8 +1129,10 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
     let fixture = Fixture::new();
     let row = fixture.seed_mailbox(SESSION_A, "h-compact", 0);
     let original_payload = fs::read_to_string(row.payload_file_path.as_deref().unwrap()).unwrap();
-    let mut db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
-    db.connection()
+    let sidecar_path = fixture.sidecar_path();
+    let mut db = MailboxDb::open(&sidecar_path).unwrap();
+    Connection::open(&sidecar_path)
+        .unwrap()
         .execute(
             "UPDATE mailbox
              SET payload_json = ?2, payload_compacted_at = NULL
@@ -1036,9 +1150,9 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
     assert_eq!(dry_run_json["applied"], false);
     assert_eq!(dry_run_json["before"]["eligible_rows"], 1);
     assert!(dry_run_json["report"].is_null());
-    let db = MailboxDb::open(&fixture.sidecar_path()).unwrap();
     assert_eq!(
-        db.connection()
+        Connection::open(&sidecar_path)
+            .unwrap()
             .query_row(
                 "SELECT payload_compacted_at FROM mailbox WHERE seq = ?1",
                 params![row.seq],
@@ -1047,7 +1161,6 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
             .unwrap(),
         None
     );
-    drop(db);
 
     let apply = fixture.run_mailbox_compact(1, true);
     assert!(apply.status.success(), "{apply:?}");
@@ -1311,8 +1424,8 @@ fn chain_input_remains_reachable_after_active_segment_reselection() {
         .list_pending_for_delivery(SESSION_B, Some(CHAIN_ID))
         .unwrap();
     assert!(row.is_empty());
-    let stored = db
-        .connection()
+    let stored = Connection::open(fixture.sidecar_path())
+        .unwrap()
         .query_row(
             "SELECT delivered_at, target_kind, target_id FROM mailbox WHERE seq = ?1",
             params![accepted.seq],

@@ -6,7 +6,10 @@ use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const SENTINEL_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const SENTINEL_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
@@ -33,9 +36,33 @@ pub enum LockError {
     },
     TokenInvalid,
     LockExpired,
+    SentinelBusy {
+        timeout_ms: u64,
+    },
     Operational {
         message: String,
     },
+}
+
+#[derive(Debug)]
+pub struct ProcessAuthority {
+    _file: File,
+    session_id: String,
+}
+
+impl ProcessAuthority {
+    pub fn require_session(&self, session_id: &str) -> Result<(), LockError> {
+        if self.session_id == session_id {
+            Ok(())
+        } else {
+            Err(LockError::Operational {
+                message: format!(
+                    "process authority session mismatch: expected {}, got {session_id}",
+                    self.session_id
+                ),
+            })
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -105,6 +132,27 @@ impl SessionLock {
         provider_name: &str,
         ttl: Duration,
     ) -> Result<Lease, LockError> {
+        self.acquire_with_process_authority(session_id, provider_name, ttl)
+            .map(|(_, lease)| lease)
+    }
+
+    pub fn acquire_with_process_authority(
+        &self,
+        session_id: &str,
+        provider_name: &str,
+        ttl: Duration,
+    ) -> Result<(ProcessAuthority, Lease), LockError> {
+        let process_authority = self.acquire_process_authority(session_id)?;
+        let lease = self.acquire_metadata(session_id, provider_name, ttl)?;
+        Ok((process_authority, lease))
+    }
+
+    fn acquire_metadata(
+        &self,
+        session_id: &str,
+        provider_name: &str,
+        ttl: Duration,
+    ) -> Result<Lease, LockError> {
         self.with_lock(|| {
             let lock_path = self.lock_path(session_id);
             let now = Utc::now();
@@ -157,6 +205,37 @@ impl SessionLock {
                 lock_path,
             })
         })
+    }
+
+    pub fn acquire_process_authority(
+        &self,
+        session_id: &str,
+    ) -> Result<ProcessAuthority, LockError> {
+        let authority_path = self
+            .lock_dir
+            .join(format!("session-{session_id}.process-authority.lock"));
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&authority_path)
+            .map_err(|error| io_operational("failed to open process authority", error))?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => Ok(ProcessAuthority {
+                _file: file,
+                session_id: session_id.to_string(),
+            }),
+            Err(fs4::TryLockError::WouldBlock) => Err(LockError::Busy {
+                expires_at: "process-lifetime".to_string(),
+                token_hash: None,
+            }),
+            Err(fs4::TryLockError::Error(error)) => {
+                Err(io_operational("failed to acquire process authority", error))
+            }
+        }
     }
 
     pub fn release(&self, session_id: &str, token: &str) -> Result<ReleaseReceipt, LockError> {
@@ -218,9 +297,36 @@ impl SessionLock {
     }
 
     fn with_lock<T>(&self, f: impl FnOnce() -> Result<T, LockError>) -> Result<T, LockError> {
-        fs4::FileExt::lock(&self.sentinel).map_err(|err| LockError::Operational {
-            message: format!("acquire sentinel lock: {err}"),
-        })?;
+        self.with_lock_for(SENTINEL_LOCK_TIMEOUT, SENTINEL_LOCK_POLL_INTERVAL, f)
+    }
+
+    fn with_lock_for<T>(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+        f: impl FnOnce() -> Result<T, LockError>,
+    ) -> Result<T, LockError> {
+        let started = Instant::now();
+        loop {
+            match fs4::FileExt::try_lock(&self.sentinel) {
+                Ok(()) => break,
+                Err(fs4::TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                    std::thread::sleep(
+                        poll_interval.min(timeout.saturating_sub(started.elapsed())),
+                    );
+                }
+                Err(fs4::TryLockError::WouldBlock) => {
+                    return Err(LockError::SentinelBusy {
+                        timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    });
+                }
+                Err(fs4::TryLockError::Error(error)) => {
+                    return Err(LockError::Operational {
+                        message: format!("acquire sentinel lock: {error}"),
+                    });
+                }
+            }
+        }
         let result = f();
         let unlock_err =
             fs4::FileExt::unlock(&self.sentinel)
@@ -390,5 +496,62 @@ fn token_hash(token: &str) -> String {
 fn io_operational(context: &str, err: io::Error) -> LockError {
     LockError::Operational {
         message: format!("{context}: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn lock_fixture() -> (tempfile::TempDir, SessionLock) {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = SessionLock::new(dir.path()).unwrap();
+        (dir, lock)
+    }
+
+    #[test]
+    fn sentinel_try_lock_succeeds_without_contention() {
+        let (_dir, lock) = lock_fixture();
+        lock.with_lock_for(Duration::from_millis(20), Duration::from_millis(1), || {
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sentinel_try_lock_observes_release_before_deadline() {
+        let (dir, lock) = lock_fixture();
+        let holder = Arc::new(SessionLock::new(dir.path()).unwrap());
+        fs4::FileExt::lock(&holder.sentinel).unwrap();
+        let releasing = Arc::clone(&holder);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            fs4::FileExt::unlock(&releasing.sentinel).unwrap();
+        });
+
+        lock.with_lock_for(Duration::from_millis(500), Duration::from_millis(2), || {
+            Ok(())
+        })
+        .unwrap();
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn sentinel_try_lock_exhaustion_is_bounded_and_typed() {
+        let (dir, lock) = lock_fixture();
+        let holder = SessionLock::new(dir.path()).unwrap();
+        fs4::FileExt::lock(&holder.sentinel).unwrap();
+        let started = Instant::now();
+
+        let error = lock
+            .with_lock_for(Duration::from_millis(40), Duration::from_millis(2), || {
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, LockError::SentinelBusy { timeout_ms: 40 }));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        fs4::FileExt::unlock(&holder.sentinel).unwrap();
     }
 }
