@@ -44,8 +44,6 @@ pub(super) fn release_current_auto_wake_claim(session_id: &str) {
 pub(super) fn release_claim_after_wake_preparation_error(session_id: &str) {
     if crate::wake_coordinator::is_auto_wake_invocation() {
         release_current_auto_wake_claim(session_id);
-    } else if let Err(err) = crate::wake_coordinator::reset_manual_resume_wake_claim(session_id) {
-        tracing::warn!(session_id, "Failed to release manual wake claim: {err}");
     }
 }
 
@@ -308,6 +306,7 @@ pub(super) fn record_failed_mailbox_delivery_attempt(
 ) -> Result<(), String> {
     crate::mailbox_delivery::mark_headless_resume_delivery_failed(
         input.mailbox_session_id,
+        Some(&input.resolved.chain_id),
         input.mailbox_delivery_seqs,
         delivery_error,
     )

@@ -222,6 +222,7 @@ where
                 self.mailbox
                     .mark_delivery_failed(
                         &self.session_id,
+                        self.chain_id.as_deref(),
                         &[row.seq],
                         MAILBOX_PAYLOAD_VERIFICATION_FAILED_ERROR,
                     )
@@ -242,6 +243,7 @@ where
                     self.mailbox
                         .mark_delivery_failed(
                             &self.session_id,
+                            self.chain_id.as_deref(),
                             &[row.seq],
                             MAILBOX_INGRESS_EXPIRED_ERROR,
                         )

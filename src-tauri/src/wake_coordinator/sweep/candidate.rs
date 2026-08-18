@@ -20,7 +20,8 @@ pub(super) fn wake_sweep_candidate_disposition(
 ) -> Result<WakeSweepDisposition, String> {
     // Recoverable means either an idle headless runtime with durable resume
     // evidence, or a live owner PID identity that must not be reaped. Missing
-    // runtime/history with no live owner is abandoned debris, not resumable work.
+    // runtime/history with no live owner is retained abandoned debris, not
+    // resumable work.
     if db.notifications_paused(&candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
@@ -42,8 +43,9 @@ pub(super) fn wake_sweep_candidate_disposition(
 /// Disposition for an unclaimed session whose pending rows all have a dead owner
 /// PID lineage. Such a session is never auto-woken (anti-resurrection, #44/#55).
 /// When it also has no durable resume evidence, its pending rows are
-/// undeliverable debris and are reaped so they do not accumulate; a resumable
-/// session is left pending so a later deliberate resume can still consume it.
+/// undeliverable debris and are retained pending under the fail-closed policy;
+/// a resumable session is also left pending so a later deliberate resume can
+/// still consume it.
 fn abandoned_transient_disposition(
     db: &MailboxDb,
     state: Option<&StateDb>,
@@ -51,8 +53,8 @@ fn abandoned_transient_disposition(
 ) -> Result<WakeSweepDisposition, String> {
     // Preserve only sessions with durable WORK — at least one produced assistant
     // turn. A bare resume target (a registered chain segment with zero turns) is
-    // an empty registration, not work, so a dead-owner session with no produced
-    // turns is reaped rather than left pending forever.
+    // an empty registration, not work. Both cases remain pending because this
+    // scope assigns no terminal abandonment authority.
     if wake_sweep_candidate_has_produced_turns(db, state, candidate)? {
         trace_abandoned_transient_wake_skip(&candidate.session_id);
         return Ok(WakeSweepDisposition::Skip);

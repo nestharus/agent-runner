@@ -494,7 +494,7 @@ fn mark_unconfirmed_pty_ack(
         .unwrap_or_default();
     resolve_unacknowledged_pty_attempt_or_warn(mailbox, session_id, attempt_id);
     let failure = mailbox
-        .mark_delivery_failed(session_id, &seqs, "mailbox_delivery_unconfirmed")
+        .mark_delivery_failed(session_id, None, &seqs, "mailbox_delivery_unconfirmed")
         .err();
     pty_status(
         true,
@@ -999,6 +999,7 @@ pub(crate) fn mark_headless_resume_delivered(
 
 pub(crate) fn mark_headless_resume_delivery_failed(
     session_id: &str,
+    chain_id: Option<&str>,
     seqs: &[i64],
     delivery_error: &str,
 ) -> Result<(), String> {
@@ -1008,7 +1009,7 @@ pub(crate) fn mark_headless_resume_delivery_failed(
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("mailbox sidecar missing while marking failed delivery rows".to_string());
     };
-    db.mark_delivery_failed(session_id, seqs, delivery_error)
+    db.mark_delivery_failed(session_id, chain_id, seqs, delivery_error)
 }
 
 struct MailboxBatch {

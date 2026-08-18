@@ -43,8 +43,20 @@ pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), Str
     let Some(claim) = db.wake_claim(session_id)? else {
         return Ok(());
     };
-    db.release_wake_claim(session_id, &claim.claim_token)?;
-    Ok(())
+    release_manual_wake_claim(&mut db, session_id, &claim.claim_token)
+}
+
+fn release_manual_wake_claim(
+    db: &mut MailboxDb,
+    session_id: &str,
+    claim_token: &str,
+) -> Result<(), String> {
+    if db.release_wake_claim(session_id, claim_token)? {
+        return Ok(());
+    }
+    Err(format!(
+        "Manual resume lost wake-claim release authority for session {session_id}"
+    ))
 }
 
 pub(crate) fn release_current_auto_wake_claim_for_session(session_id: &str) {
@@ -249,4 +261,63 @@ fn warn_open_sidecar_for_release_failed(session_id: &str, err: String) {
         session_id,
         "Failed to open sidecar to release wake claim: {err}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_state::InboxTargetKind;
+    use oulipoly_state::mailbox::{
+        InboxTarget, SubmittedInputEnqueue, WakeClaimAcquireResult, WakeClaimRequest,
+    };
+
+    #[test]
+    fn manual_resume_stops_when_a_replacement_claim_wins_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        db.enqueue_submitted_input(&SubmittedInputEnqueue {
+            submission_token: "manual-release-input",
+            target: InboxTarget {
+                kind: InboxTargetKind::Session,
+                id: "session-a",
+            },
+            input: b"input",
+        })
+        .unwrap();
+        let initial = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "initial",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some("wake-a"),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        assert!(matches!(initial, WakeClaimAcquireResult::Acquired(_)));
+        let captured = db.wake_claim("session-a").unwrap().unwrap();
+        let replacement = db
+            .try_acquire_or_renew_wake_claim(
+                WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-b",
+                    reason: "replacement",
+                    auto_wake_count: 2,
+                    wake_invocation_uuid: Some("wake-b"),
+                    stale_after_seconds: 600,
+                },
+                Some(&captured.claim_token),
+            )
+            .unwrap();
+        assert!(matches!(replacement, WakeClaimAcquireResult::Acquired(_)));
+
+        let error =
+            release_manual_wake_claim(&mut db, "session-a", &captured.claim_token).unwrap_err();
+
+        assert!(error.contains("lost wake-claim release authority"));
+        assert_eq!(
+            db.wake_claim("session-a").unwrap().unwrap().claim_token,
+            "token-b"
+        );
+    }
 }

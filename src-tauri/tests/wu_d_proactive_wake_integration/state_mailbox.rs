@@ -468,7 +468,7 @@ fn mark_delivery_failed_twice(db: &mut MailboxDb, session_id: &str, seq: i64) {
 }
 
 fn mark_delivery_failed(db: &mut MailboxDb, session_id: &str, seq: i64) {
-    db.mark_delivery_failed(session_id, &[seq], "mailbox_delivery_unconfirmed")
+    db.mark_delivery_failed(session_id, None, &[seq], "mailbox_delivery_unconfirmed")
         .unwrap();
 }
 

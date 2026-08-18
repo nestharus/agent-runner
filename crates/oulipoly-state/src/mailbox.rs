@@ -3154,6 +3154,7 @@ impl MailboxDb {
     pub fn mark_delivery_failed(
         &mut self,
         session_id: &str,
+        chain_id: Option<&str>,
         seqs: &[i64],
         delivery_error: &str,
     ) -> Result<(), String> {
@@ -3161,18 +3162,32 @@ impl MailboxDb {
         if seqs.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction().map_err(|err| {
-            format!("Failed to start mailbox delivery failure transaction: {err}")
-        })?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start mailbox delivery failure transaction: {err}")
+            })?;
+        let delivery_states = mailbox_delivery_target_states_on(&tx, session_id, chain_id, seqs)
+            .map_err(|err| format!("Failed to validate mailbox delivery failure batch: {err}"))?;
+        if !all_mailbox_seqs_pending(&delivery_states) {
+            return Err(
+                "Mailbox delivery failure batch contains a missing, settled, or foreign-target row"
+                    .to_string(),
+            );
+        }
+        let update_sql = format!(
+            "UPDATE mailbox
+             SET delivery_attempts = delivery_attempts + 1,
+                 delivery_error = ?4
+             WHERE seq = ?3
+               AND delivered_at IS NULL
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+        );
         for seq in seqs {
             tx.execute(
-                "UPDATE mailbox
-                 SET delivery_attempts = delivery_attempts + 1,
-                     delivery_error = ?3
-                 WHERE session_id = ?1
-                   AND seq = ?2
-                   AND delivered_at IS NULL",
-                params![session_id, seq, delivery_error],
+                &update_sql,
+                params![session_id, chain_id, seq, delivery_error],
             )
             .map_err(|err| format!("Failed to mark mailbox row delivery failed: {err}"))?;
         }
@@ -10279,6 +10294,7 @@ mod tests {
         for _ in 0..MAX_UNCONFIRMED_DELIVERY_ATTEMPTS {
             db.mark_delivery_failed(
                 "session-a",
+                None,
                 &[exhausted.seq],
                 MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
             )
@@ -10600,8 +10616,13 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
 
-        db.mark_delivery_failed("session-a", &[row.seq], "mailbox_delivery_unconfirmed")
-            .unwrap();
+        db.mark_delivery_failed(
+            "session-a",
+            None,
+            &[row.seq],
+            "mailbox_delivery_unconfirmed",
+        )
+        .unwrap();
         let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
 
         assert!(failed.delivered_at.is_none());
@@ -10613,17 +10634,59 @@ mod tests {
     }
 
     #[test]
-    fn mark_delivery_failed_cannot_mutate_a_row_from_another_session() {
+    fn mark_delivery_failed_rejects_a_mixed_foreign_target_batch_without_mutation() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-b", "session-b")));
+        let owned = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        let foreign = inserted_row(db.enqueue_agent_bash_complete(&input("handle-b", "session-b")));
 
-        db.mark_delivery_failed("session-a", &[row.seq], "mailbox_delivery_unconfirmed")
-            .unwrap();
+        let error = db
+            .mark_delivery_failed(
+                "session-a",
+                None,
+                &[owned.seq, foreign.seq],
+                "mailbox_delivery_unconfirmed",
+            )
+            .unwrap_err();
 
-        let unchanged = db.list_mailbox("session-b", true).unwrap().remove(0);
-        assert_eq!(unchanged.delivery_attempts, 0);
-        assert!(unchanged.delivery_error.is_none());
+        assert!(error.contains("missing, settled, or foreign-target row"));
+        for session_id in ["session-a", "session-b"] {
+            let unchanged = db.list_mailbox(session_id, true).unwrap().remove(0);
+            assert_eq!(unchanged.delivery_attempts, 0);
+            assert!(unchanged.delivery_error.is_none());
+        }
+    }
+
+    #[test]
+    fn mark_delivery_failed_accepts_an_authorized_chain_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let EnqueueResult::Inserted(row) = db
+            .enqueue_submitted_input(&submitted_input(
+                "chain-failure-token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"chain input",
+            ))
+            .unwrap()
+        else {
+            panic!("expected chain-targeted input to be inserted");
+        };
+
+        db.mark_delivery_failed(
+            "active-session-a",
+            Some("chain-a"),
+            &[row.seq],
+            "mailbox_delivery_unconfirmed",
+        )
+        .unwrap();
+
+        let failed = db.list_mailbox("chain-a", true).unwrap().remove(0);
+        assert_eq!(failed.delivery_attempts, 1);
+        assert_eq!(
+            failed.delivery_error.as_deref(),
+            Some("mailbox_delivery_unconfirmed")
+        );
     }
 
     #[test]
@@ -10633,7 +10696,7 @@ mod tests {
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
 
         let error = db
-            .mark_delivery_failed("session-a", &[row.seq], WAKE_SWEEP_ABANDONED_ERROR)
+            .mark_delivery_failed("session-a", None, &[row.seq], WAKE_SWEEP_ABANDONED_ERROR)
             .unwrap_err();
 
         assert!(error.contains("dedicated authority-bearing disposition"));
