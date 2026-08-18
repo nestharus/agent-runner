@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 const INVOCATION_A: &str = "11111111-1111-4111-8111-111111111111";
 const LIVE_INVOCATION: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
+const REGISTRATION_AUTHORITY_FILE: &str = "completion-registration-authority";
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -90,7 +91,7 @@ impl Fixture {
     }
 
     fn registration_authority_path(&self) -> PathBuf {
-        self.dir.path().join("completion-registration-authority")
+        self.dir.path().join(REGISTRATION_AUTHORITY_FILE)
     }
 
     fn conn(&self) -> Connection {
@@ -1268,8 +1269,7 @@ while IFS= read -r line; do
 done
 "#,
             received = shell_single_quote(&path_string(received_log)),
-            authority =
-                shell_single_quote(&path_string(&dir.join("completion-registration-authority"))),
+            authority = shell_single_quote(&path_string(&dir.join(REGISTRATION_AUTHORITY_FILE))),
         ),
     )
     .unwrap();
@@ -1308,8 +1308,7 @@ while true; do
 done
 "#,
             received = shell_single_quote(&path_string(received_log)),
-            authority =
-                shell_single_quote(&path_string(&dir.join("completion-registration-authority"))),
+            authority = shell_single_quote(&path_string(&dir.join(REGISTRATION_AUTHORITY_FILE))),
         ),
     )
     .unwrap();

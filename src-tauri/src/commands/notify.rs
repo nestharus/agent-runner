@@ -134,13 +134,7 @@ pub(crate) fn run_agent_bash_register(args: AgentBashRegisterArgs<'_>) -> Result
             let owner = result.listeners.first();
             render(
                 &RegistrationResponse {
-                    status: if args.repair_admitted {
-                        "repaired".to_string()
-                    } else if result.inserted {
-                        "registered".to_string()
-                    } else {
-                        "already_registered".to_string()
-                    },
+                    status: registration_status(args.repair_admitted, result.inserted).to_string(),
                     event_id: result.event.event_id,
                     event_state: result.event.state,
                     listener_count: result.listeners.len(),
@@ -153,6 +147,15 @@ pub(crate) fn run_agent_bash_register(args: AgentBashRegisterArgs<'_>) -> Result
             Ok(0)
         }
         Err(message) => render_error(args.handle, args.json, message),
+    }
+}
+
+fn registration_status(repair_admitted: bool, inserted: bool) -> &'static str {
+    match (repair_admitted, inserted) {
+        (true, true) => "repaired",
+        (true, false) => "already_repaired",
+        (false, true) => "registered",
+        (false, false) => "already_registered",
     }
 }
 

@@ -988,19 +988,17 @@ fn completion_owner_authorization(
     if status == InvocationStatus::Running {
         return Ok(CompletionOwnerAuthorization::Running);
     }
-    let existing = completion_obligation_by_admission_id(conn, admission_id)
-        .map_err(|error| error.to_string())?
-        .filter(|existing| {
-            existing.invocation_uuid == invocation_uuid
-                && existing.event_id == event_id
-                && existing.owner_invocation_uuid == invocation_uuid
-                && existing.owner_session_id == owner_session_id
-        })
-        .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
-    completion_continuity_by_admission_on(conn, admission_id)
-        .map_err(|error| error.to_string())?
-        .filter(|continuity| completion_continuity_matches_expectation(continuity, &existing))
-        .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
+    let existing = exact_admitted_completion_expectation(
+        conn,
+        admission_id,
+        invocation_uuid,
+        owner_session_id,
+        event_id,
+    )?
+    .ok_or_else(|| terminal_owner_new_admission_error(invocation_uuid))?;
+    if !exact_completion_continuity_exists(conn, admission_id, &existing)? {
+        return Err(terminal_owner_new_admission_error(invocation_uuid));
+    }
     Ok(CompletionOwnerAuthorization::TerminalExactReplay(existing))
 }
 
@@ -1011,27 +1009,56 @@ fn require_exact_admitted_completion_replay(
     owner_session_id: &str,
     event_id: &str,
 ) -> Result<(), String> {
-    let expectation = completion_obligation_by_admission_id(conn, admission_id)
-        .map_err(|error| error.to_string())?
-        .filter(|expectation| {
-            expectation.invocation_uuid == owner_invocation_uuid
-                && expectation.event_id == event_id
-                && expectation.owner_invocation_uuid == owner_invocation_uuid
-                && expectation.owner_session_id == owner_session_id
-        })
+    let expectation = exact_admitted_completion_expectation(
+        conn,
+        admission_id,
+        owner_invocation_uuid,
+        owner_session_id,
+        event_id,
+    )?
         .ok_or_else(|| {
             format!(
                 "process_integrity: completion repair requires an exact admitted replay for event {event_id}"
             )
         })?;
+    if exact_completion_continuity_exists(conn, admission_id, &expectation)? {
+        return Ok(());
+    }
+    Err(format!(
+        "process_integrity: completion repair requires exact State continuity for event {event_id}"
+    ))
+}
+
+fn exact_admitted_completion_expectation(
+    conn: &sqlite::Connection,
+    admission_id: &str,
+    owner_invocation_uuid: &str,
+    owner_session_id: &str,
+    event_id: &str,
+) -> Result<Option<CompletionObligationExpectation>, String> {
+    completion_obligation_by_admission_id(conn, admission_id)
+        .map_err(|error| error.to_string())
+        .map(|expectation| {
+            expectation.filter(|expectation| {
+                expectation.invocation_uuid == owner_invocation_uuid
+                    && expectation.event_id == event_id
+                    && expectation.owner_invocation_uuid == owner_invocation_uuid
+                    && expectation.owner_session_id == owner_session_id
+            })
+        })
+}
+
+fn exact_completion_continuity_exists(
+    conn: &sqlite::Connection,
+    admission_id: &str,
+    expectation: &CompletionObligationExpectation,
+) -> Result<bool, String> {
     completion_continuity_by_admission_on(conn, admission_id)
-        .map_err(|error| error.to_string())?
-        .filter(|continuity| completion_continuity_matches_expectation(continuity, &expectation))
-        .map(|_| ())
-        .ok_or_else(|| {
-            format!(
-                "process_integrity: completion repair requires exact State continuity for event {event_id}"
-            )
+        .map_err(|error| error.to_string())
+        .map(|continuity| {
+            continuity
+                .as_ref()
+                .is_some_and(|row| completion_continuity_matches_expectation(row, expectation))
         })
 }
 

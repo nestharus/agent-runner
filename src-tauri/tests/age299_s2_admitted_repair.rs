@@ -94,8 +94,14 @@ fn cli_repairs_each_exact_missing_suffix_row_without_expired_owner_authority() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("\"status\": \"repaired\""));
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["status"], "repaired");
     }
+
+    let repeated = first.run_repair(&data_dir);
+    assert!(repeated.status.success(), "{repeated:?}");
+    let response: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(response["status"], "already_repaired");
 
     let unadmitted = CompletionFixture::new(directory.path(), "ab_age299_s2_repair_unadmitted");
     let rejected = unadmitted.run_repair(&data_dir);
