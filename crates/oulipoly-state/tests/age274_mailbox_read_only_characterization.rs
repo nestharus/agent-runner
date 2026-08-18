@@ -384,6 +384,14 @@ fn state_open_read_only_leaf_symlink_uses_only_canonical_sidecars() {
     let invocation = state.get_invocation_by_uuid(INVOCATION).unwrap().unwrap();
 
     assert_eq!(invocation.model_name, "model-in-canonical-wal");
+    assert_eq!(state.path(), state_path.canonicalize().unwrap());
+    let reopened = StateDb::open_read_only(state.path()).unwrap();
+    let reopened_invocation = reopened
+        .get_invocation_by_uuid(INVOCATION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_invocation.model_name, "model-in-canonical-wal");
+    drop(reopened);
     drop(state);
     drop(writer);
 }

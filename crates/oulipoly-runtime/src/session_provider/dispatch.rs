@@ -1,7 +1,8 @@
 use super::enumerate;
 use super::locate;
 use super::provider_client::{
-    invoke_session, provider_client, session_client, session_enumerate_client,
+    invoke_session, provider_client, session_client, session_client_with_cancellation,
+    session_enumerate_client,
 };
 use super::request::{
     base_request, capture_extra, enumerate_request, lifecycle_extra, live_capture_extra,
@@ -16,6 +17,7 @@ use super::types::{
     SessionProviderReadTurnsRequest, SessionProviderReadTurnsResult,
 };
 use crate::session_metadata::LocatedTranscript;
+use oulipoly_provider::client::CancellationToken;
 use oulipoly_provider::client::ProviderClient;
 use oulipoly_provider::generated::{
     JsonObject, SessionCaptureResult as ProviderCaptureResult,
@@ -38,8 +40,24 @@ pub fn locate_transcript_with_raw_metadata(
     request: SessionProviderLocateRequest<'_>,
 ) -> Result<SessionProviderLocatedTranscript, SessionProviderError> {
     let client = session_client(request.registry, &request.identity)?;
+    locate_transcript_with_client(&client, request)
+}
+
+pub(crate) fn locate_transcript_with_raw_metadata_with_cancellation(
+    request: SessionProviderLocateRequest<'_>,
+    cancellation: &CancellationToken,
+) -> Result<SessionProviderLocatedTranscript, SessionProviderError> {
+    let client =
+        session_client_with_cancellation(request.registry, &request.identity, cancellation)?;
+    locate_transcript_with_client(&client, request)
+}
+
+fn locate_transcript_with_client(
+    client: &ProviderClient,
+    request: SessionProviderLocateRequest<'_>,
+) -> Result<SessionProviderLocatedTranscript, SessionProviderError> {
     let provider_result = invoke_session::<SessionLocateTranscriptResult>(
-        &client,
+        client,
         "session.locate_transcript",
         base_request(
             &request.identity,

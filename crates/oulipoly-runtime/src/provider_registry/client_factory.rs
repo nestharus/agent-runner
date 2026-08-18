@@ -1,4 +1,6 @@
-use oulipoly_provider::client::{ProcessSpawnObserver, ProviderClient, ProviderClientOptions};
+use oulipoly_provider::client::{
+    CancellationToken, ProcessSpawnObserver, ProviderClient, ProviderClientOptions,
+};
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::stream::LaunchEventObserver;
 
@@ -14,6 +16,19 @@ impl ProviderClientFactory {
 
     pub fn client_for(&self, artifact: ProviderArtifactRef) -> ProviderClient {
         ProviderClient::new(artifact, self.options.clone())
+    }
+
+    pub(crate) fn client_for_with_cancellation(
+        &self,
+        artifact: ProviderArtifactRef,
+        cancellation: &CancellationToken,
+    ) -> ProviderClient {
+        ProviderClient::new(
+            artifact,
+            self.options
+                .clone()
+                .with_cancellation(Some(cancellation.clone())),
+        )
     }
 
     pub(crate) fn client_for_with_observers(

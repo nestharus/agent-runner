@@ -17,6 +17,7 @@ mod request;
 mod turns;
 mod types;
 
+pub(crate) use dispatch::locate_transcript_with_raw_metadata_with_cancellation;
 pub use dispatch::{
     capture, capture_for_lifecycle, capture_live_report, enumerate_sessions, locate_transcript,
     locate_transcript_with_raw_metadata, read_turns, read_turns_for_lifecycle,

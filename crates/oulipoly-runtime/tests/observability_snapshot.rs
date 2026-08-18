@@ -6,6 +6,8 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, SessionStorage,
     provider_implementation_ref::ProviderImplementationRef,
 };
+#[cfg(unix)]
+use oulipoly_provider::client::CancellationToken;
 use oulipoly_runtime::observability::{
     InspectRef, LivenessStatus, MonitorNodeKind, MonitorStatus, ObservabilityRoot,
     ObservabilitySnapshotPort, ProductionObservabilitySnapshotService, SnapshotLimits,
@@ -25,7 +27,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command};
+#[cfg(unix)]
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const CHILD_UUID: &str = "22222222-2222-4222-8222-222222222222";
@@ -657,6 +665,60 @@ fn provider_inspect_missing_format_id_attaches_no_transcript_ref() {
     assert_eq!(
         recorded_subcommand_count(&record_path, "session.locate_transcript"),
         1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_inspect_snapshot_cancellation_stops_blocked_provider_lookup() {
+    let fixture = Fixture::new();
+    seed_running_root(&fixture);
+    let record_path = fixture.data_dir.join("provider-blocking-records.jsonl");
+    let external_path = fixture.data_dir.join("external-blocking-session.jsonl");
+    let provider_path = write_external_locate_provider_with_behavior(
+        &fixture,
+        &record_path,
+        &external_path,
+        ExternalLocateProviderBehavior::Blocking,
+    );
+    let service = ProductionObservabilitySnapshotService::for_provider_inspect(
+        external_registry(&provider_path),
+        external_identity(),
+        SESSION_ID.to_string(),
+        Some(fixture.data_dir.join("provider-work")),
+    );
+    let root = fixture.root();
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let snapshot =
+            service.snapshot_with_cancel(&root, SnapshotLimits::default(), &worker_cancellation);
+        let _ = sender.send(snapshot);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while recorded_subcommand_count(&record_path, "session.locate_transcript") == 0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        recorded_subcommand_count(&record_path, "session.locate_transcript"),
+        1,
+        "provider lookup did not start"
+    );
+
+    cancellation.cancel();
+    let snapshot = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("cancelled provider lookup must return promptly");
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| !matches!(node.inspect_ref, Some(InspectRef::SessionTranscript { .. }))),
+        "cancelled snapshot must not publish a provider transcript"
     );
 }
 
@@ -1685,6 +1747,7 @@ enum ExternalLocateProviderBehavior {
     Located,
     LocatedWithoutFormatId,
     Failing,
+    Blocking,
 }
 
 #[cfg(unix)]
@@ -1741,19 +1804,23 @@ fn external_locate_provider_body(
     behavior: ExternalLocateProviderBehavior,
 ) -> String {
     let locate_ok = !matches!(behavior, ExternalLocateProviderBehavior::Failing);
+    let block_locate = matches!(behavior, ExternalLocateProviderBehavior::Blocking);
     let format_id = match behavior {
         ExternalLocateProviderBehavior::Located => r#""canonical-transcript-v1""#,
         ExternalLocateProviderBehavior::LocatedWithoutFormatId
-        | ExternalLocateProviderBehavior::Failing => "None",
+        | ExternalLocateProviderBehavior::Failing
+        | ExternalLocateProviderBehavior::Blocking => "None",
     };
     format!(
         r#"#!/usr/bin/env python3
 import json
 import pathlib
 import sys
+import time
 
 CONTRACT = "oulipoly.provider/v1"
 LOCATE_OK = {locate_ok}
+BLOCK_LOCATE = {block_locate}
 FORMAT_ID = {format_id}
 subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
 request = json.loads(sys.stdin.read() or "{{}}")
@@ -1790,6 +1857,9 @@ if subcommand == "describe":
         "settings_schema_id": "provider-a-test-settings",
     }})
 elif subcommand == "session.locate_transcript":
+    if BLOCK_LOCATE:
+        while True:
+            time.sleep(1)
     if LOCATE_OK:
         result = {{
             "located": True,
@@ -1829,6 +1899,7 @@ print(json.dumps(response))
         record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
         transcript_path = serde_json::to_string(&transcript_path.display().to_string()).unwrap(),
         locate_ok = if locate_ok { "True" } else { "False" },
+        block_locate = if block_locate { "True" } else { "False" },
         format_id = format_id,
     )
 }

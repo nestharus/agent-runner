@@ -284,11 +284,11 @@ impl StateDb {
     ) -> Result<Self, ReadOnlyOpenError> {
         let source = Self::validate_read_only_paths(path)?;
         let (conn, snapshot) = Self::open_read_only_connection(&source, is_cancelled)?;
-        Self::probe_read_only_schema(path, &conn)?;
+        Self::probe_read_only_schema(&source, &conn)?;
 
         Ok(Self {
             conn,
-            db_path: path.to_path_buf(),
+            db_path: source,
             completion_authority_state: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
             _read_only_snapshot: Some(snapshot),

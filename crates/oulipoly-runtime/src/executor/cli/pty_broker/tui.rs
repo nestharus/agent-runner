@@ -55,6 +55,8 @@ use crate::observability::{ObservabilitySnapshotPort, SnapshotLimits};
 use base64::Engine as _;
 #[cfg(test)]
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use oulipoly_provider::client::CancellationToken;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -8245,7 +8247,12 @@ mod tests {
     }
 
     impl ObservabilitySnapshotPort for FakeMonitor {
-        fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
+        fn snapshot_with_cancel(
+            &self,
+            _root: &ObservabilityRoot,
+            _limits: SnapshotLimits,
+            _cancellation: &CancellationToken,
+        ) -> MonitorSnapshot {
             self.snapshot.clone()
         }
     }
@@ -8269,11 +8276,11 @@ mod tests {
             }
         }
 
-        fn wait_for_release(&self, is_cancelled: &dyn Fn() -> bool) -> MonitorSnapshot {
+        fn wait_for_release(&self, cancellation: &CancellationToken) -> MonitorSnapshot {
             let _ = self.entered.try_send(());
             let (released, wake) = &*self.release;
             let mut guard = released.lock().expect("snapshot release lock");
-            while !*guard && !is_cancelled() {
+            while !*guard && !cancellation.is_cancelled() {
                 guard = wake
                     .wait_timeout(guard, Duration::from_millis(5))
                     .expect("snapshot release wait")
@@ -8284,17 +8291,13 @@ mod tests {
     }
 
     impl ObservabilitySnapshotPort for BlockingMonitor {
-        fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
-            self.wait_for_release(&|| false)
-        }
-
         fn snapshot_with_cancel(
             &self,
             _root: &ObservabilityRoot,
             _limits: SnapshotLimits,
-            is_cancelled: &dyn Fn() -> bool,
+            cancellation: &CancellationToken,
         ) -> MonitorSnapshot {
-            self.wait_for_release(is_cancelled)
+            self.wait_for_release(cancellation)
         }
     }
 

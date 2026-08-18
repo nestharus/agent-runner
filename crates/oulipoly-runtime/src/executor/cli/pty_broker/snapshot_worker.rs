@@ -3,7 +3,7 @@
 use crate::observability::{
     MonitorSnapshot, ObservabilityRoot, ObservabilitySnapshotPort, SnapshotLimits,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use oulipoly_provider::client::CancellationToken;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -67,7 +67,7 @@ struct SnapshotWorkerShared {
     latest: Mutex<Option<Arc<MonitorSnapshot>>>,
     state: Mutex<SnapshotWorkerState>,
     wake: Condvar,
-    shutdown: AtomicBool,
+    shutdown: CancellationToken,
 }
 
 impl SnapshotWorkerShared {
@@ -76,7 +76,7 @@ impl SnapshotWorkerShared {
             latest: Mutex::new(None),
             state: Mutex::new(SnapshotWorkerState::new(interval)),
             wake: Condvar::new(),
-            shutdown: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -112,12 +112,12 @@ impl SnapshotWorkerShared {
     }
 
     fn request_shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown.cancel();
         self.wake.notify_all();
     }
 
     fn shutdown_requested(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
+        self.shutdown.is_cancelled()
     }
 }
 
@@ -180,9 +180,7 @@ fn read_monitor_snapshot(
     root: &ObservabilityRoot,
     shared: &SnapshotWorkerShared,
 ) -> MonitorSnapshot {
-    provider.snapshot_with_cancel(root, SnapshotLimits::default(), &|| {
-        shared.shutdown_requested()
-    })
+    provider.snapshot_with_cancel(root, SnapshotLimits::default(), &shared.shutdown)
 }
 
 fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

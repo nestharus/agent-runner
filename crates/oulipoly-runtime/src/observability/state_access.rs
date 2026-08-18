@@ -20,10 +20,6 @@ pub(crate) struct SnapshotStores {
 }
 
 impl SnapshotStores {
-    pub(crate) fn open_default_read_only() -> Self {
-        Self::open_default_read_only_with_cancel(&|| false)
-    }
-
     pub(crate) fn open_default_read_only_with_cancel(is_cancelled: &dyn Fn() -> bool) -> Self {
         let mut diagnostics = Vec::new();
         let state = open_state_read_only(&mut diagnostics, is_cancelled);
