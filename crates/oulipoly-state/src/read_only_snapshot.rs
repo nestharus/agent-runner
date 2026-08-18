@@ -17,6 +17,26 @@ pub(crate) struct ReadOnlySnapshot {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SqliteArtifactIdentity {
+    storage: u64,
+    file: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SqliteArtifactSetIdentity {
+    artifacts: [Option<SqliteArtifactIdentity>; SQLITE_ARTIFACT_SUFFIXES.len()],
+}
+
+enum ValidatedSourceArtifact {
+    Absent,
+    Changed,
+    Present {
+        file: File,
+        identity: SqliteArtifactIdentity,
+    },
+}
+
 impl ReadOnlySnapshot {
     pub(crate) fn create_with_cancel(
         source: &Path,
@@ -58,15 +78,20 @@ impl ReadOnlySnapshot {
             io::Error::new(io::ErrorKind::InvalidInput, "SQLite path has no file name")
         })?;
         let path = dir.path().join(file_name);
-        let deadline = Instant::now() + timeout;
+        let mut retry_deadline = None;
         loop {
-            if copy_artifact_set(&source, &path, deadline, is_cancelled)? {
+            ensure_snapshot_not_cancelled(is_cancelled)?;
+            if let Some(deadline) = retry_deadline {
+                ensure_retry_active(deadline, is_cancelled)?;
+            }
+            if let Some(copied) = copy_artifact_set(&source, &path, is_cancelled)? {
                 after_copy()?;
-                if artifact_sets_match(&source, &path, deadline, is_cancelled)? {
+                if artifact_sets_match(&source, &path, copied, is_cancelled)? {
                     return Ok(Self { _dir: dir, path });
                 }
             }
-            ensure_snapshot_active(deadline, is_cancelled)?;
+            let deadline = *retry_deadline.get_or_insert_with(|| Instant::now() + timeout);
+            ensure_retry_active(deadline, is_cancelled)?;
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err(snapshot_changed_error());
             };
@@ -103,63 +128,64 @@ fn canonical_sqlite_source(source: &Path) -> io::Result<PathBuf> {
 fn copy_artifact_set(
     source: &Path,
     destination: &Path,
-    deadline: Instant,
     is_cancelled: &dyn Fn() -> bool,
-) -> io::Result<bool> {
-    for suffix in SQLITE_ARTIFACT_SUFFIXES {
-        ensure_snapshot_active(deadline, is_cancelled)?;
+) -> io::Result<Option<SqliteArtifactSetIdentity>> {
+    let mut artifacts = [None; SQLITE_ARTIFACT_SUFFIXES.len()];
+    for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
+        ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
         let destination_artifact = path_with_suffix(destination, suffix);
-        if source_artifact.exists() {
-            match copy_before_deadline(
-                &source_artifact,
-                &destination_artifact,
-                deadline,
-                is_cancelled,
-            ) {
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound && !suffix.is_empty() => {
-                    remove_if_present(&destination_artifact)?;
-                    return Ok(false);
+        match open_validated_source_artifact(&source_artifact)? {
+            ValidatedSourceArtifact::Absent if suffix.is_empty() => return Ok(None),
+            ValidatedSourceArtifact::Absent => remove_if_present(&destination_artifact)?,
+            ValidatedSourceArtifact::Changed => return Ok(None),
+            ValidatedSourceArtifact::Present { mut file, identity } => {
+                copy_artifact(&mut file, &destination_artifact, is_cancelled)?;
+                if validated_artifact_identity(&source_artifact)? != Some(identity) {
+                    return Ok(None);
                 }
-                Err(err) => return Err(err),
+                artifacts[index] = Some(identity);
             }
-        } else if destination_artifact.exists() {
-            std::fs::remove_file(destination_artifact)?;
         }
     }
-    Ok(true)
+    Ok(Some(SqliteArtifactSetIdentity { artifacts }))
 }
 
 fn artifact_sets_match(
     source: &Path,
     destination: &Path,
-    deadline: Instant,
+    copied: SqliteArtifactSetIdentity,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<bool> {
-    for suffix in SQLITE_ARTIFACT_SUFFIXES {
-        ensure_snapshot_active(deadline, is_cancelled)?;
+    for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
+        ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
         let destination_artifact = path_with_suffix(destination, suffix);
-        if !files_match(
-            &source_artifact,
-            &destination_artifact,
-            deadline,
-            is_cancelled,
-        )? {
-            return Ok(false);
+        match (
+            copied.artifacts[index],
+            open_validated_source_artifact(&source_artifact)?,
+        ) {
+            (None, ValidatedSourceArtifact::Absent) => {}
+            (Some(expected), ValidatedSourceArtifact::Present { mut file, identity })
+                if identity == expected =>
+            {
+                if !files_match(&mut file, &destination_artifact, is_cancelled)?
+                    || validated_artifact_identity(&source_artifact)? != Some(expected)
+                {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
         }
     }
     Ok(true)
 }
 
-fn copy_before_deadline(
-    source: &Path,
+fn copy_artifact(
+    reader: &mut File,
     destination: &Path,
-    deadline: Instant,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<()> {
-    let mut reader = File::open(source)?;
     let mut writer = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -167,7 +193,7 @@ fn copy_before_deadline(
         .open(destination)?;
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     loop {
-        ensure_snapshot_active(deadline, is_cancelled)?;
+        ensure_snapshot_not_cancelled(is_cancelled)?;
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             return Ok(());
@@ -176,23 +202,16 @@ fn copy_before_deadline(
     }
 }
 
-fn files_match(
-    left: &Path,
-    right: &Path,
-    deadline: Instant,
-    is_cancelled: &dyn Fn() -> bool,
-) -> io::Result<bool> {
-    let left = open_if_present(left)?;
-    let right = open_if_present(right)?;
-    let (mut left, mut right) = match (left, right) {
-        (Some(left), Some(right)) => (left, right),
-        (None, None) => return Ok(true),
-        _ => return Ok(false),
+fn files_match(left: &mut File, right: &Path, is_cancelled: &dyn Fn() -> bool) -> io::Result<bool> {
+    let mut right = match File::open(right) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
     };
     let mut left_buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut right_buffer = [0_u8; COPY_BUFFER_BYTES];
     loop {
-        ensure_snapshot_active(deadline, is_cancelled)?;
+        ensure_snapshot_not_cancelled(is_cancelled)?;
         let left_read = left.read(&mut left_buffer)?;
         let right_read = right.read(&mut right_buffer)?;
         if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
@@ -204,21 +223,69 @@ fn files_match(
     }
 }
 
-fn open_if_present(path: &Path) -> io::Result<Option<File>> {
-    match File::open(path) {
-        Ok(file) => Ok(Some(file)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err),
+fn open_validated_source_artifact(path: &Path) -> io::Result<ValidatedSourceArtifact> {
+    let Some(identity) = validated_artifact_identity(path)? else {
+        return Ok(ValidatedSourceArtifact::Absent);
+    };
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(ValidatedSourceArtifact::Changed);
+        }
+        Err(err) => return Err(err),
+    };
+    let opened_identity = validated_artifact_metadata(path, &file.metadata()?)?;
+    if opened_identity != identity || validated_artifact_identity(path)? != Some(identity) {
+        return Ok(ValidatedSourceArtifact::Changed);
     }
+    Ok(ValidatedSourceArtifact::Present { file, identity })
 }
 
-fn ensure_snapshot_active(deadline: Instant, is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+fn validated_artifact_identity(path: &Path) -> io::Result<Option<SqliteArtifactIdentity>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    validated_artifact_metadata(path, &metadata).map(Some)
+}
+
+fn validated_artifact_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> io::Result<SqliteArtifactIdentity> {
+    if !metadata.file_type().is_file() {
+        return Err(unsupported_artifact_error(path, "is not a regular file"));
+    }
+    if !sqlite_source_has_one_link(metadata) {
+        return Err(unsupported_artifact_error(
+            path,
+            "has multiple filesystem links",
+        ));
+    }
+    sqlite_artifact_identity(metadata)
+        .ok_or_else(|| unsupported_artifact_error(path, "has no stable filesystem identity"))
+}
+
+fn unsupported_artifact_error(path: &Path, reason: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("SQLite source artifact {} {reason}", path.display()),
+    )
+}
+
+fn ensure_snapshot_not_cancelled(is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
     if is_cancelled() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "Read-only SQLite snapshot cancelled",
         ));
     }
+    Ok(())
+}
+
+fn ensure_retry_active(deadline: Instant, is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+    ensure_snapshot_not_cancelled(is_cancelled)?;
     (Instant::now() < deadline)
         .then_some(())
         .ok_or_else(snapshot_changed_error)
@@ -227,7 +294,7 @@ fn ensure_snapshot_active(deadline: Instant, is_cancelled: &dyn Fn() -> bool) ->
 fn snapshot_changed_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
-        "SQLite source changed while creating a read-only snapshot",
+        "SQLite source continued changing while retrying a read-only snapshot",
     )
 }
 
@@ -262,6 +329,31 @@ fn sqlite_source_has_one_link(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn sqlite_source_has_one_link(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(unix)]
+fn sqlite_artifact_identity(metadata: &std::fs::Metadata) -> Option<SqliteArtifactIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(SqliteArtifactIdentity {
+        storage: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn sqlite_artifact_identity(metadata: &std::fs::Metadata) -> Option<SqliteArtifactIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    Some(SqliteArtifactIdentity {
+        storage: u64::from(metadata.volume_serial_number()?),
+        file: metadata.file_index()?,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sqlite_artifact_identity(_metadata: &std::fs::Metadata) -> Option<SqliteArtifactIdentity> {
+    None
 }
 
 #[cfg(test)]
@@ -350,5 +442,100 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(std::fs::read(&source).unwrap(), b"initial");
+    }
+
+    #[test]
+    fn stable_first_snapshot_attempt_completes_without_spending_retry_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        std::fs::write(&source, vec![b'x'; COPY_BUFFER_BYTES * 2]).unwrap();
+
+        let snapshot = ReadOnlySnapshot::create_with_retry_policy(
+            &source,
+            Duration::ZERO,
+            Duration::ZERO,
+            &|| false,
+            || Ok(()),
+        )
+        .expect("a stable first attempt must not be rejected by the retry deadline");
+
+        assert_eq!(
+            std::fs::read(snapshot.path()).unwrap(),
+            std::fs::read(source).unwrap()
+        );
+    }
+
+    #[test]
+    fn same_bytes_replacement_after_copy_forces_a_fresh_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let replaced = directory.path().join("state-replaced.db");
+        std::fs::write(&source, "stable bytes").unwrap();
+        let attempts = std::cell::Cell::new(0);
+
+        let snapshot = ReadOnlySnapshot::create_with_copy_hook(&source, || {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                std::fs::rename(&source, &replaced)?;
+                std::fs::write(&source, "stable bytes")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(std::fs::read(snapshot.path()).unwrap(), b"stable bytes");
+    }
+
+    #[test]
+    fn same_bytes_wal_replacement_after_copy_forces_a_fresh_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let wal = path_with_suffix(&source, "-wal");
+        let replaced = directory.path().join("state-replaced.db-wal");
+        std::fs::write(&source, "stable main").unwrap();
+        std::fs::write(&wal, "stable wal").unwrap();
+        let attempts = std::cell::Cell::new(0);
+
+        let snapshot = ReadOnlySnapshot::create_with_copy_hook(&source, || {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt == 0 {
+                std::fs::rename(&wal, &replaced)?;
+                std::fs::write(&wal, "stable wal")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(
+            std::fs::read(path_with_suffix(snapshot.path(), "-wal")).unwrap(),
+            b"stable wal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_wal_and_journal_artifacts_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        for suffix in ["-wal", "-journal"] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("state.db");
+            let sidecar = path_with_suffix(&source, suffix);
+            let target = directory.path().join(format!("aliased{suffix}"));
+            std::fs::write(&source, "stable main").unwrap();
+            std::fs::write(&target, "sidecar bytes").unwrap();
+            symlink(&target, &sidecar).unwrap();
+
+            let error = match ReadOnlySnapshot::create_with_cancel(&source, &|| false) {
+                Ok(_) => panic!("an aliased {suffix} artifact must fail closed"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 }

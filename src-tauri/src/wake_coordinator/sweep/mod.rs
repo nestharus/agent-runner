@@ -133,10 +133,10 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
     )?;
-    let plan = wake_sweep_plan(&mut db, candidates)?;
-    reap_abandoned_sweep_candidates(&mut db, &plan.reap)?;
+    let start =
+        plan_and_reap_wake_sweep(&mut db, candidates, state::open_default_state_read_only())?;
     drop(db);
-    for candidate in plan.start {
+    for candidate in start {
         let diagnostic = start_wake_chain(wake_sweep_start_input(&candidate, trigger));
         trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
     }
@@ -250,8 +250,9 @@ struct WakeSweepPlan {
 fn wake_sweep_plan(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
+    state: Option<&oulipoly_state::StateDb>,
 ) -> Result<WakeSweepPlan, String> {
-    let (recoverable, reap) = partition_wake_sweep_candidates(db, candidates)?;
+    let (recoverable, reap) = partition_wake_sweep_candidates(db, candidates, state)?;
     let start = select_recoverable_sweep_candidates(recoverable);
     Ok(wake_sweep_plan_from_selected(start, reap))
 }
@@ -259,12 +260,12 @@ fn wake_sweep_plan(
 fn partition_wake_sweep_candidates(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
+    state: Option<&oulipoly_state::StateDb>,
 ) -> Result<(Vec<WakeSweepCandidate>, Vec<WakeSweepCandidate>), String> {
-    let state = state::open_default_state_read_only()?;
     let mut recoverable = Vec::new();
     let mut reap = Vec::new();
     for candidate in candidates {
-        match candidate::wake_sweep_candidate_disposition(db, state.as_ref(), &candidate)? {
+        match candidate::wake_sweep_candidate_disposition(db, state, &candidate)? {
             WakeSweepDisposition::Recoverable => {
                 recoverable.push(candidate);
             }
@@ -277,6 +278,17 @@ fn partition_wake_sweep_candidates(
         }
     }
     Ok((recoverable, reap))
+}
+
+fn plan_and_reap_wake_sweep(
+    db: &mut MailboxDb,
+    candidates: Vec<WakeSweepCandidate>,
+    state: Result<Option<oulipoly_state::StateDb>, String>,
+) -> Result<Vec<WakeSweepCandidate>, String> {
+    let state = state?;
+    let plan = wake_sweep_plan(db, candidates, state.as_ref())?;
+    reap_abandoned_sweep_candidates(db, &plan.reap)?;
+    Ok(plan.start)
 }
 
 fn wake_sweep_plan_from_selected(
@@ -394,4 +406,92 @@ fn trace_live_pty_retry_skip(
         liveness.unwrap_or("unknown"),
         reason,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_state::mailbox::{
+        AgentBashCompleteEnqueue, EnqueueResult, WakeClaimAcquireResult, WakeClaimRequest,
+    };
+
+    #[test]
+    fn unavailable_state_prevents_terminal_reap_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join("agent-bash").join("blocked-state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let meta = state_dir.join("meta.json");
+        let log = state_dir.join("log");
+        let rc = state_dir.join("rc");
+        std::fs::write(&meta, r#"{"caller_chain":[]}"#).unwrap();
+        std::fs::write(&log, "pending\n").unwrap();
+        std::fs::write(&rc, "0\n").unwrap();
+        let state_dir = state_dir.to_string_lossy().into_owned();
+        let meta = meta.to_string_lossy().into_owned();
+        let log = log.to_string_lossy().into_owned();
+        let rc = rc.to_string_lossy().into_owned();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let row = match db
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "state-unavailable-session",
+                handle: "state-unavailable-handle",
+                payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete"}"#,
+                owner_invocation_uuid: None,
+                matched_os_pid: None,
+                matched_os_boot_id: None,
+                matched_os_pid_starttime_ticks: None,
+                matched_chain_index: None,
+                state_dir: &state_dir,
+                meta_path: &meta,
+                log_path: &log,
+                rc_path: &rc,
+                rc: 0,
+            })
+            .unwrap()
+        {
+            EnqueueResult::Inserted(row) => row,
+            other => panic!("unexpected enqueue result: {other:?}"),
+        };
+        let claim_token = "state-unavailable-claim";
+        let acquired = db
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: &row.session_id,
+                claim_token,
+                reason: "maintenance_tick",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        assert!(matches!(acquired, WakeClaimAcquireResult::Acquired(_)));
+        let claim_before = db.wake_claim(&row.session_id).unwrap().unwrap();
+        let candidate = WakeSweepCandidate {
+            session_id: row.session_id.clone(),
+            auto_wake_count: 0,
+            min_pending_seq: row.seq,
+            max_pending_seq: row.seq,
+        };
+
+        let invalid_state = directory.path().join("invalid-state.db");
+        std::fs::write(&invalid_state, "not sqlite").unwrap();
+        let result = plan_and_reap_wake_sweep(
+            &mut db,
+            vec![candidate],
+            state::open_state_read_only_at(&invalid_state),
+        );
+
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Failed to open State read-only for wake sweep")
+        );
+        let rows = db.list_mailbox("state-unavailable-session", true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        assert!(rows[0].delivery_error.is_none());
+        assert_eq!(rows[0].delivery_attempts, 0);
+        let claim_after = db.wake_claim(&row.session_id).unwrap().unwrap();
+        assert_eq!(claim_after.claim_token, claim_before.claim_token);
+        assert_eq!(claim_after.auto_wake_count, claim_before.auto_wake_count);
+    }
 }

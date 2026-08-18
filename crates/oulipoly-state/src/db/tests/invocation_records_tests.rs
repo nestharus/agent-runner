@@ -209,6 +209,87 @@ fn list_invocation_children_orders_by_created_at_then_row_id() {
 }
 
 #[test]
+fn bounded_invocation_children_stop_at_the_requested_row_limit() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "11000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    for (index, uuid) in [
+        "12000000-0000-0000-0000-000000000000",
+        "13000000-0000-0000-0000-000000000000",
+        "14000000-0000-0000-0000-000000000000",
+        "15000000-0000-0000-0000-000000000000",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        insert_invocation_fixture(
+            &db,
+            uuid,
+            Some(root_id),
+            &format!("2026-04-17T08:0{}:00Z", index + 1),
+        );
+    }
+
+    let children = db
+        .list_invocation_children_bounded(root_id, 2, false)
+        .unwrap();
+
+    assert_eq!(
+        invocation_record_uuids(&children),
+        vec![
+            "12000000-0000-0000-0000-000000000000",
+            "13000000-0000-0000-0000-000000000000",
+        ]
+    );
+}
+
+#[test]
+fn bounded_invocation_children_prioritize_running_over_terminal_history() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "16000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    for (uuid, created_at) in [
+        (
+            "17000000-0000-0000-0000-000000000000",
+            "2026-04-17T08:01:00Z",
+        ),
+        (
+            "18000000-0000-0000-0000-000000000000",
+            "2026-04-17T08:02:00Z",
+        ),
+        (
+            "19000000-0000-0000-0000-000000000000",
+            "2026-04-17T08:03:00Z",
+        ),
+    ] {
+        insert_invocation_fixture(&db, uuid, Some(root_id), created_at);
+    }
+    db.conn
+        .execute(
+            "UPDATE invocations SET status = 'succeeded' WHERE invocation_uuid != ?1",
+            sqlite::params!["19000000-0000-0000-0000-000000000000"],
+        )
+        .unwrap();
+
+    let children = db
+        .list_invocation_children_bounded(root_id, 1, true)
+        .unwrap();
+
+    assert_eq!(
+        invocation_record_uuids(&children),
+        vec!["19000000-0000-0000-0000-000000000000"]
+    );
+}
+
+#[test]
 fn list_invocation_children_returns_only_direct_children() {
     let db = test_db();
     let root_id = insert_invocation_fixture(

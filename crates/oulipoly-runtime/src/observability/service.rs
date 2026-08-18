@@ -160,6 +160,7 @@ impl ProductionObservabilitySnapshotService {
             stores.mailbox.as_ref(),
             root,
             limits,
+            cancellation,
         );
         if cancellation.is_cancelled() {
             return cancelled_snapshot(generated_at);
@@ -184,6 +185,7 @@ impl ProductionObservabilitySnapshotService {
             &invocation.invocation_uuids,
             &mailbox.rows,
             limits,
+            cancellation,
         ));
         if cancellation.is_cancelled() {
             return cancelled_snapshot(generated_at);
@@ -237,6 +239,7 @@ impl ProductionObservabilitySnapshotService {
         invocation_uuids: &'a HashSet<String>,
         mailbox_rows: &'a [MailboxRow],
         limits: SnapshotLimits,
+        cancellation: &'a CancellationToken,
     ) -> AgentBashProjectInput<'a> {
         AgentBashProjectInput {
             root_dir: self.agent_bash_root.as_deref(),
@@ -247,6 +250,7 @@ impl ProductionObservabilitySnapshotService {
             invocation_uuids,
             mailbox_rows,
             limits,
+            cancellation,
         }
     }
 

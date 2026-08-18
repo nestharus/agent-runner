@@ -29,6 +29,7 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::pid_row_liveness;
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::{process_identity_ref, storage_diagnostic};
+use oulipoly_provider::client::CancellationToken;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow};
 use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
@@ -49,11 +50,15 @@ pub(crate) fn project_invocations(
     mailbox: Option<&MailboxDb>,
     root: &ObservabilityRoot,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
 ) -> InvocationProjection {
     let mut diagnostics = Vec::new();
     let Some(state) = state else {
         return empty_projection(root);
     };
+    if cancellation.is_cancelled() {
+        return empty_projection(root);
+    }
     let root_record = match root_invocation_record(state, root) {
         Ok(record) => record,
         Err(err) => {
@@ -74,6 +79,7 @@ pub(crate) fn project_invocations(
             None,
             active_session_id,
             limits,
+            cancellation,
             &mut projection,
         );
     }
@@ -150,6 +156,7 @@ fn build_invocation_tree(
     parent_uuid: Option<String>,
     active_session_id: Option<String>,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     projection: &mut InvocationProjection,
 ) {
     let mut visited = HashSet::from([record.id]);
@@ -162,6 +169,7 @@ fn build_invocation_tree(
         active_session_id,
         0,
         limits,
+        cancellation,
         &mut visited,
         projection,
     );
@@ -177,9 +185,13 @@ fn build_invocation_node(
     active_session_id: Option<String>,
     depth: usize,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     visited: &mut HashSet<i64>,
     projection: &mut InvocationProjection,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     if invocation_node_limit_reached(projection, limits) {
         push_invocation_truncated_diagnostic(projection);
         return;
@@ -205,6 +217,7 @@ fn build_invocation_node(
         limits
             .max_invocation_nodes
             .saturating_sub(projection.invocation_count),
+        cancellation,
         &mut projection.diagnostics,
     ) else {
         return;
@@ -217,6 +230,7 @@ fn build_invocation_node(
         active_session_id,
         depth,
         limits,
+        cancellation,
         visited,
         projection,
         children,
@@ -278,15 +292,25 @@ fn invocation_children(
     record: &InvocationRecord,
     include_terminal: bool,
     remaining_nodes: usize,
+    cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<Vec<InvocationRecord>> {
-    match read_invocation_children(state, record.id) {
+    match read_invocation_children(
+        state,
+        record.id,
+        remaining_nodes.saturating_add(1),
+        !include_terminal,
+    ) {
         Ok(mut children) => {
+            if cancellation.is_cancelled() {
+                return None;
+            }
             append_delivery_invocation_children(
                 state,
                 mailbox,
                 record,
                 remaining_nodes,
+                cancellation,
                 &mut children,
                 diagnostics,
             );
@@ -305,6 +329,7 @@ fn append_delivery_invocation_children(
     mailbox: Option<&MailboxDb>,
     record: &InvocationRecord,
     limit: usize,
+    cancellation: &CancellationToken,
     children: &mut Vec<InvocationRecord>,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) {
@@ -324,6 +349,9 @@ fn append_delivery_invocation_children(
         .map(|child| child.id)
         .collect::<HashSet<_>>();
     for uuid in child_uuids {
+        if cancellation.is_cancelled() {
+            return;
+        }
         match state.get_invocation_by_uuid(&uuid) {
             Ok(Some(child)) if child.id != record.id && child_ids.insert(child.id) => {
                 children.push(child);
@@ -339,8 +367,10 @@ fn append_delivery_invocation_children(
 fn read_invocation_children(
     state: &StateDb,
     record_id: i64,
+    limit: usize,
+    prioritize_running: bool,
 ) -> Result<Vec<InvocationRecord>, String> {
-    state.list_invocation_children(record_id)
+    state.list_invocation_children_bounded(record_id, limit, prioritize_running)
 }
 
 fn order_invocation_children(children: &mut [InvocationRecord], include_terminal: bool) {
@@ -370,11 +400,15 @@ fn visit_invocation_children(
     active_session_id: Option<String>,
     depth: usize,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     visited: &mut HashSet<i64>,
     projection: &mut InvocationProjection,
     children: Vec<InvocationRecord>,
 ) {
     for child in children {
+        if cancellation.is_cancelled() {
+            return;
+        }
         if child_was_visited(visited, child.id) {
             continue;
         }
@@ -389,6 +423,7 @@ fn visit_invocation_children(
             active_session_id.clone(),
             depth + 1,
             limits,
+            cancellation,
             visited,
             projection,
         );

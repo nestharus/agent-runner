@@ -277,6 +277,41 @@ fn mailbox_open_read_only_rejects_multi_link_database_identity() {
 }
 
 #[test]
+fn mailbox_open_read_only_rejects_multi_link_wal_identity() {
+    let fixture = Fixture::seeded();
+    let mut writer = MailboxDb::open(&fixture.sidecar_path).unwrap();
+    writer
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: SESSION,
+            handle: "h-multi-link-wal",
+            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete","wal":true}"#,
+            owner_invocation_uuid: Some(INVOCATION),
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "/wal/state",
+            meta_path: "/wal/meta.json",
+            log_path: "/wal/log",
+            rc_path: "/wal/rc",
+            rc: 0,
+        })
+        .unwrap();
+    let wal = path_with_suffix(&fixture.sidecar_path, "-wal");
+    let second_link = fixture.sidecar_path.with_file_name("linked-wal");
+    assert!(wal.exists());
+    std::fs::hard_link(&wal, &second_link).unwrap();
+
+    let result = MailboxDb::open_read_only(&fixture.sidecar_path);
+
+    assert!(
+        result.is_err(),
+        "a multi-link WAL must be rejected like a multi-link main database"
+    );
+    drop(writer);
+}
+
+#[test]
 fn state_open_read_only_recovers_committed_wal_invocation_and_turn_without_mutating_source() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");

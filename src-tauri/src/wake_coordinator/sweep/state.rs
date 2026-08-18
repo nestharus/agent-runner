@@ -11,12 +11,11 @@ pub(super) fn open_default_state_read_only() -> Result<Option<StateDb>, String> 
     open_state_read_only_at(&path)
 }
 
-fn open_state_read_only_at(path: &Path) -> Result<Option<StateDb>, String> {
-    if !path
-        .try_exists()
-        .map_err(|error| format!("Failed to inspect State path: {error}"))?
-    {
-        return Ok(None);
+pub(super) fn open_state_read_only_at(path: &Path) -> Result<Option<StateDb>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Failed to inspect State path: {error}")),
     }
     StateDb::open_read_only(path)
         .map(Some)
@@ -47,6 +46,24 @@ mod tests {
             Ok(_) => panic!("invalid State must remain an unavailable observation"),
             Err(error) => error,
         };
+        assert!(error.contains("Failed to open State read-only for wake sweep"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_state_symlink_is_unavailable_not_absent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let missing_target = directory.path().join("temporarily-missing.db");
+        let state_link = directory.path().join("state.db");
+        symlink(&missing_target, &state_link).unwrap();
+
+        let error = match open_state_read_only_at(&state_link) {
+            Ok(_) => panic!("a configured dangling State identity must remain unavailable"),
+            Err(error) => error,
+        };
+
         assert!(error.contains("Failed to open State read-only for wake sweep"));
     }
 }

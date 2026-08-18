@@ -148,12 +148,18 @@ fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
             VALUES
                 ('p', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z', 0),
                 ('already-high', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z', 4);
-            INSERT INTO provider_quota_windows
-                (provider_name, window_id, used_percent, resets_at)
-            VALUES
-                ('p', 0, 0.20, '2026-04-22T00:00:00Z'),
-                ('p', 1, 0.30, '2026-04-28T00:00:00Z'),
-                ('already-high', 0, 0.20, '2026-04-22T00:00:00Z');",
+             INSERT INTO provider_quota_windows
+                 (provider_name, window_id, used_percent, resets_at)
+             VALUES
+                 ('p', 0, 0.20, '2026-04-22T00:00:00Z'),
+                 ('p', 1, 0.30, '2026-04-28T00:00:00Z'),
+                 ('already-high', 0, 0.20, '2026-04-22T00:00:00Z');
+             CREATE TABLE topology_update_audit (provider_name TEXT NOT NULL);
+             CREATE TRIGGER audit_topology_update
+             AFTER UPDATE OF topology_peak_live_window_count ON provider_quotas
+             BEGIN
+                 INSERT INTO topology_update_audit (provider_name) VALUES (NEW.provider_name);
+             END;",
         )
         .unwrap();
     mark_current_schema_version(&conn);
@@ -176,6 +182,16 @@ fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
         4,
         "schema repair must not lower a previously learned topology peak"
     );
+    drop(db);
+    let audit = sqlite::Connection::open(&path).unwrap();
+    let touched = audit
+        .prepare("SELECT provider_name FROM topology_update_audit ORDER BY provider_name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(touched, vec!["p"]);
 }
 
 #[test]

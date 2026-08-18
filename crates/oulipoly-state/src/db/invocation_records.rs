@@ -229,6 +229,38 @@ impl StateDb {
             .map_err(Self::format_invocation_children_map_error)
     }
 
+    pub fn list_invocation_children_bounded(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        prioritize_running: bool,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let clause = if prioritize_running {
+            "WHERE parent_invocation_id = ?1
+             ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END, created_at, id
+             LIMIT ?2"
+        } else {
+            "WHERE parent_invocation_id = ?1
+             ORDER BY created_at, id
+             LIMIT ?2"
+        };
+        let sql = Self::invocation_record_select_sql(&self.conn, clause)?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(sqlite::params![parent_id, limit], Self::map_invocation_row)
+            .map_err(Self::format_invocation_children_query_error)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocation_children_map_error)
+    }
+
     fn format_invocation_child_lookup_prepare_error(err: sqlite::Error) -> String {
         format!("Failed to prepare invocation child lookup: {err}")
     }
