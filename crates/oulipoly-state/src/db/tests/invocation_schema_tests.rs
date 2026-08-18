@@ -46,6 +46,7 @@ fn schema_creation() {
         indexes,
         vec![
             "idx_invocations_parent".to_string(),
+            "idx_invocations_parent_running_created".to_string(),
             "idx_invocations_provider_created".to_string(),
             "idx_invocations_provider_provider_session".to_string(),
             "idx_invocations_provider_session".to_string(),

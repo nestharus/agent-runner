@@ -564,6 +564,7 @@ fn schema_17_upgrade_backfills_only_an_exact_proven_materialization_summary() {
         .execute_batch(
             "DROP TRIGGER trg_invocation_completion_materialization_summary_continuity_insert;
              DROP TABLE invocation_completion_materialization_summary;
+             DROP INDEX idx_invocations_parent_running_created;
              PRAGMA user_version = 17;",
         )
         .unwrap();

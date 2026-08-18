@@ -88,6 +88,13 @@ impl StateDb {
             ON invocations (invocation_uuid);
         CREATE INDEX IF NOT EXISTS idx_invocations_parent
             ON invocations (parent_invocation_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_invocations_parent_running_created
+            ON invocations (
+                parent_invocation_id,
+                (status = 'running') DESC,
+                created_at,
+                id
+            );
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
             ON invocations (provider_name, created_at);
         CREATE INDEX IF NOT EXISTS idx_invocations_provider_session

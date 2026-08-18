@@ -217,32 +217,26 @@ fn bounded_invocation_children_stop_at_the_requested_row_limit() {
         None,
         "2026-04-17T08:00:00Z",
     );
-    for (index, uuid) in [
-        "12000000-0000-0000-0000-000000000000",
-        "13000000-0000-0000-0000-000000000000",
-        "14000000-0000-0000-0000-000000000000",
-        "15000000-0000-0000-0000-000000000000",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for index in 1..=128 {
         insert_invocation_fixture(
             &db,
-            uuid,
+            &format!("{index:08x}-0000-0000-0000-000000000000"),
             Some(root_id),
-            &format!("2026-04-17T08:0{}:00Z", index + 1),
+            &format!("2026-04-17T08:{:02}:00Z", index % 60),
         );
     }
 
+    StateDb::reset_invocation_row_map_count();
     let children = db
         .list_invocation_children_bounded(root_id, 2, false)
         .unwrap();
 
+    assert_eq!(StateDb::invocation_row_map_count(), 2);
     assert_eq!(
         invocation_record_uuids(&children),
         vec![
-            "12000000-0000-0000-0000-000000000000",
-            "13000000-0000-0000-0000-000000000000",
+            "0000003c-0000-0000-0000-000000000000",
+            "00000078-0000-0000-0000-000000000000",
         ]
     );
 }
@@ -286,6 +280,38 @@ fn bounded_invocation_children_prioritize_running_over_terminal_history() {
     assert_eq!(
         invocation_record_uuids(&children),
         vec!["19000000-0000-0000-0000-000000000000"]
+    );
+}
+
+#[test]
+fn running_first_bounded_query_uses_the_projection_index_without_a_temp_sort() {
+    let db = test_db();
+    let sql = StateDb::invocation_record_select_sql(
+        &db.conn,
+        "WHERE parent_invocation_id = ?1
+         ORDER BY (status = 'running') DESC, created_at, id
+         LIMIT ?2",
+    )
+    .unwrap();
+    let mut statement = db
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap();
+    let details = statement
+        .query_map(sqlite::params![1_i64, 2_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("idx_invocations_parent_running_created")),
+        "{details:?}"
+    );
+    assert!(
+        details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+        "{details:?}"
     );
 }
 

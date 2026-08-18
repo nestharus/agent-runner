@@ -111,6 +111,12 @@ static MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/0018_invocation_completion_materialization_summary.sql"),
         post_sql_hook: None,
     },
+    Migration {
+        target_version: 19,
+        id: "0019_invocation_running_projection_index",
+        sql: include_str!("../migrations/0019_invocation_running_projection_index.sql"),
+        post_sql_hook: Some(apply_v19_invocation_running_projection_index),
+    },
 ];
 
 pub fn manifest() -> &'static [Migration] {
@@ -189,6 +195,30 @@ pub(crate) fn register_connection_primitives(conn: &Connection) -> Result<(), ru
             ))
         },
     )
+}
+
+fn apply_v19_invocation_running_projection_index(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let mut statement = conn.prepare("PRAGMA table_info(invocations)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if ["parent_invocation_id", "status", "created_at"]
+        .iter()
+        .all(|required| columns.iter().any(|column| column == required))
+    {
+        conn.execute_batch(invocation_running_projection_index_sql())?;
+    }
+    Ok(())
+}
+
+fn invocation_running_projection_index_sql() -> &'static str {
+    "CREATE INDEX IF NOT EXISTS idx_invocations_parent_running_created
+     ON invocations (
+         parent_invocation_id,
+         (status = 'running') DESC,
+         created_at,
+         id
+     );"
 }
 
 fn map_primitive_registration_error(db_path: PathBuf, source: rusqlite::Error) -> MigrationError {

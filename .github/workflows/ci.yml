@@ -82,8 +82,18 @@ jobs:
       - run: cargo test -p ${{ matrix.client.name }}
       - run: cargo clippy -p ${{ matrix.client.name }} -- -D warnings
 
+  rust-state-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: state-windows
+      - run: cargo test -p oulipoly-state read_only_snapshot
+
   rust-integration:
-    needs: [rust-lib-check, rust-client-check]
+    needs: [rust-lib-check, rust-client-check, rust-state-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

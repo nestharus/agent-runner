@@ -754,7 +754,7 @@ fn cargo_command_inventory(workflow: &Value) -> Vec<(String, String)> {
 
 fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
     let inventory = cargo_command_inventory(workflow);
-    let allowed = [
+    let mut allowed = vec![
         (
             "rust-lib-check",
             r"^cargo\s+test\s+-p\s+\$\{\{\s*matrix\.crate\s*\}\}\s*$",
@@ -784,6 +784,12 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
             r"^cargo\s+clippy\s+--workspace\s+--\s+-D\s+warnings\s*$",
         ),
     ];
+    if workflow_name == "ci.yml" {
+        allowed.push((
+            "rust-state-windows",
+            r"^cargo\s+test\s+-p\s+oulipoly-state\s+read_only_snapshot\s*$",
+        ));
+    }
 
     for (job_name, line) in &inventory {
         assert!(
@@ -1307,6 +1313,7 @@ fn assertion_a10_dependency_graph_required_edges() {
         "frontend-check".to_string(),
         "rust-lib-check".to_string(),
         "rust-client-check".to_string(),
+        "rust-state-windows".to_string(),
         "rust-integration".to_string(),
     ]);
     let ci_expected_edges = BTreeSet::from([
@@ -1318,6 +1325,10 @@ fn assertion_a10_dependency_graph_required_edges() {
         ("rust-lib-check".to_string(), "rust-integration".to_string()),
         (
             "rust-client-check".to_string(),
+            "rust-integration".to_string(),
+        ),
+        (
+            "rust-state-windows".to_string(),
             "rust-integration".to_string(),
         ),
     ]);

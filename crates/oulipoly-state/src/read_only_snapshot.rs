@@ -1,7 +1,7 @@
 //! Physical snapshot support for SQLite readers that must not mutate source storage.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,15 @@ struct SqliteArtifactIdentity {
     file: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SqliteArtifactSetIdentity {
-    artifacts: [Option<SqliteArtifactIdentity>; SQLITE_ARTIFACT_SUFFIXES.len()],
+#[derive(Debug)]
+struct OpenedSqliteArtifact {
+    file: File,
+    identity: SqliteArtifactIdentity,
+}
+
+#[derive(Debug)]
+struct OpenedSqliteArtifactSet {
+    artifacts: [Option<OpenedSqliteArtifact>; SQLITE_ARTIFACT_SUFFIXES.len()],
 }
 
 enum ValidatedSourceArtifact {
@@ -84,9 +90,9 @@ impl ReadOnlySnapshot {
             if let Some(deadline) = retry_deadline {
                 ensure_retry_active(deadline, is_cancelled)?;
             }
-            if let Some(copied) = copy_artifact_set(&source, &path, is_cancelled)? {
+            if let Some(mut copied) = copy_artifact_set(&source, &path, is_cancelled)? {
                 after_copy()?;
-                if artifact_sets_match(&source, &path, copied, is_cancelled)? {
+                if artifact_sets_match(&source, &path, &mut copied, is_cancelled)? {
                     return Ok(Self { _dir: dir, path });
                 }
             }
@@ -129,8 +135,8 @@ fn copy_artifact_set(
     source: &Path,
     destination: &Path,
     is_cancelled: &dyn Fn() -> bool,
-) -> io::Result<Option<SqliteArtifactSetIdentity>> {
-    let mut artifacts = [None; SQLITE_ARTIFACT_SUFFIXES.len()];
+) -> io::Result<Option<OpenedSqliteArtifactSet>> {
+    let mut artifacts = std::array::from_fn(|_| None);
     for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
         ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
@@ -144,33 +150,30 @@ fn copy_artifact_set(
                 if validated_artifact_identity(&source_artifact)? != Some(identity) {
                     return Ok(None);
                 }
-                artifacts[index] = Some(identity);
+                artifacts[index] = Some(OpenedSqliteArtifact { file, identity });
             }
         }
     }
-    Ok(Some(SqliteArtifactSetIdentity { artifacts }))
+    Ok(Some(OpenedSqliteArtifactSet { artifacts }))
 }
 
 fn artifact_sets_match(
     source: &Path,
     destination: &Path,
-    copied: SqliteArtifactSetIdentity,
+    copied: &mut OpenedSqliteArtifactSet,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<bool> {
     for (index, suffix) in SQLITE_ARTIFACT_SUFFIXES.into_iter().enumerate() {
         ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
         let destination_artifact = path_with_suffix(destination, suffix);
-        match (
-            copied.artifacts[index],
-            open_validated_source_artifact(&source_artifact)?,
-        ) {
-            (None, ValidatedSourceArtifact::Absent) => {}
-            (Some(expected), ValidatedSourceArtifact::Present { mut file, identity })
-                if identity == expected =>
+        match copied.artifacts[index].as_mut() {
+            None if validated_artifact_identity(&source_artifact)?.is_none() => {}
+            Some(opened)
+                if validated_artifact_identity(&source_artifact)? == Some(opened.identity) =>
             {
-                if !files_match(&mut file, &destination_artifact, is_cancelled)?
-                    || validated_artifact_identity(&source_artifact)? != Some(expected)
+                if !files_match(&mut opened.file, &destination_artifact, is_cancelled)?
+                    || validated_artifact_identity(&source_artifact)? != Some(opened.identity)
                 {
                     return Ok(false);
                 }
@@ -203,6 +206,7 @@ fn copy_artifact(
 }
 
 fn files_match(left: &mut File, right: &Path, is_cancelled: &dyn Fn() -> bool) -> io::Result<bool> {
+    left.seek(SeekFrom::Start(0))?;
     let mut right = match File::open(right) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -445,6 +449,29 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_multi_chunk_copy_stops_before_the_source_is_consumed() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let destination = directory.path().join("snapshot.db");
+        let source_bytes = vec![b'x'; COPY_BUFFER_BYTES * 4];
+        std::fs::write(&source, &source_bytes).unwrap();
+        let mut reader = File::open(&source).unwrap();
+        let checks = std::cell::Cell::new(0);
+
+        let result = copy_artifact(&mut reader, &destination, &|| {
+            let check = checks.get();
+            checks.set(check + 1);
+            check >= 2
+        });
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        let copied_bytes = std::fs::metadata(&destination).unwrap().len();
+        assert_eq!(copied_bytes, (COPY_BUFFER_BYTES * 2) as u64);
+        assert!(copied_bytes < source_bytes.len() as u64);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    }
+
+    #[test]
     fn stable_first_snapshot_attempt_completes_without_spending_retry_budget() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("state.db");
@@ -463,6 +490,91 @@ mod tests {
             std::fs::read(snapshot.path()).unwrap(),
             std::fs::read(source).unwrap()
         );
+    }
+
+    #[test]
+    fn retry_does_not_start_after_the_deadline_expires() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        std::fs::write(&source, "initial").unwrap();
+        let attempts = std::cell::Cell::new(0);
+
+        let result = ReadOnlySnapshot::create_with_retry_policy(
+            &source,
+            Duration::from_millis(30),
+            Duration::from_secs(1),
+            &|| false,
+            || {
+                attempts.set(attempts.get() + 1);
+                std::fs::write(&source, format!("change-{}", attempts.get()))
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("a retry must not start after deadline exhaustion"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[test]
+    fn stable_retry_that_started_before_the_deadline_may_finish_after_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        std::fs::write(&source, "initial").unwrap();
+        let attempts = std::cell::Cell::new(0);
+
+        let snapshot = ReadOnlySnapshot::create_with_retry_policy(
+            &source,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            &|| false,
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    std::fs::write(&source, "stable retry")?;
+                } else {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(std::fs::read(snapshot.path()).unwrap(), b"stable retry");
+    }
+
+    #[test]
+    fn changed_retry_that_finishes_after_the_deadline_does_not_start_a_third_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        std::fs::write(&source, "initial").unwrap();
+        let attempts = std::cell::Cell::new(0);
+
+        let result = ReadOnlySnapshot::create_with_retry_policy(
+            &source,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            &|| false,
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+                std::fs::write(&source, format!("change-{}", attempt + 1))
+            },
+        );
+
+        let error = match result {
+            Ok(_) => panic!("a changed late retry must not publish or start another pass"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]
@@ -486,6 +598,26 @@ mod tests {
 
         assert_eq!(attempts.get(), 2);
         assert_eq!(std::fs::read(snapshot.path()).unwrap(), b"stable bytes");
+    }
+
+    #[test]
+    fn copied_artifact_set_retains_the_open_source_after_its_path_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let destination = directory.path().join("snapshot.db");
+        std::fs::write(&source, "retained source").unwrap();
+        let mut copied = copy_artifact_set(&source, &destination, &|| false)
+            .unwrap()
+            .unwrap();
+
+        std::fs::remove_file(&source).unwrap();
+        let retained = copied.artifacts[0].as_mut().unwrap();
+        retained.file.seek(SeekFrom::Start(0)).unwrap();
+        let mut retained_bytes = Vec::new();
+        retained.file.read_to_end(&mut retained_bytes).unwrap();
+
+        assert_eq!(retained_bytes, b"retained source");
+        assert!(!artifact_sets_match(&source, &destination, &mut copied, &|| false).unwrap());
     }
 
     #[test]

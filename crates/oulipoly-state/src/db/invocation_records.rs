@@ -27,6 +27,11 @@
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};
 
+#[cfg(test)]
+std::thread_local! {
+    static INVOCATION_ROW_MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct InvocationRecord {
@@ -142,6 +147,16 @@ fn format_unknown_invocation_status(raw: &str) -> String {
 }
 
 impl StateDb {
+    #[cfg(test)]
+    pub(super) fn reset_invocation_row_map_count() {
+        INVOCATION_ROW_MAPS.with(|maps| maps.set(0));
+    }
+
+    #[cfg(test)]
+    pub(super) fn invocation_row_map_count() -> usize {
+        INVOCATION_ROW_MAPS.with(std::cell::Cell::get)
+    }
+
     pub fn record_legacy_resume_input_session_id(
         &self,
         id: i64,
@@ -240,7 +255,7 @@ impl StateDb {
         }
         let clause = if prioritize_running {
             "WHERE parent_invocation_id = ?1
-             ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END, created_at, id
+             ORDER BY (status = 'running') DESC, created_at, id
              LIMIT ?2"
         } else {
             "WHERE parent_invocation_id = ?1
@@ -274,6 +289,8 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<InvocationRecord> {
+        #[cfg(test)]
+        INVOCATION_ROW_MAPS.with(|maps| maps.set(maps.get() + 1));
         let raw = Self::read_invocation_record_raw_fields(row)?;
         let parsed = Self::parse_invocation_record_raw_fields(&raw)?;
         Ok(Self::map_invocation_record(raw, parsed))

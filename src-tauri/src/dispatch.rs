@@ -108,7 +108,11 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
         return Ok(handle_pending_session_replace_error(&err));
     }
     if startup_wake_reclaim_sweep_enabled(&cli) {
-        crate::wake_coordinator::run_startup_wake_reclaim_sweep();
+        if provider_launch_schedules_startup_wake_reclaim(&cli) {
+            crate::wake_coordinator::start_startup_wake_reclaim_sweep();
+        } else {
+            crate::wake_coordinator::run_startup_wake_reclaim_sweep();
+        }
     }
 
     if cli.new {
@@ -179,6 +183,13 @@ fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
                 ..
             })
     )
+}
+
+fn provider_launch_schedules_startup_wake_reclaim(cli: &Cli) -> bool {
+    if cli.usage {
+        return false;
+    }
+    cli.command.is_none() || matches!(&cli.command, Some(Subcommands::Repl { resume: None, .. }))
 }
 
 fn recover_pending_session_replaces() -> Result<(), session_replace::ReplaceError> {
@@ -745,6 +756,28 @@ mod tests {
         .unwrap();
 
         assert!(!startup_wake_reclaim_sweep_enabled(&cli));
+    }
+
+    #[test]
+    fn provider_launch_schedules_startup_recovery_but_mailbox_inspection_does_not() {
+        let launch = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "-m",
+            "fixture-model",
+            "fixture prompt",
+        ])
+        .unwrap();
+        let mailbox = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "mailbox",
+            "list",
+            "--session-id",
+            "fixture-session",
+        ])
+        .unwrap();
+
+        assert!(provider_launch_schedules_startup_wake_reclaim(&launch));
+        assert!(!provider_launch_schedules_startup_wake_reclaim(&mailbox));
     }
 
     fn assert_resume_debug_contains_option_field(

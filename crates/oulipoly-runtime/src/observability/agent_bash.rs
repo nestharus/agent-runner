@@ -529,12 +529,23 @@ fn candidate_dirs_from_entries(
             return Vec::new();
         }
         if let Some(candidate) = entry.ok().and_then(candidate_dir) {
-            dirs.push(candidate);
-            dirs.sort_by(compare_candidate_dir);
-            dirs.truncate(limit);
+            retain_candidate_dir(&mut dirs, candidate, limit);
         }
     }
     dirs
+}
+
+fn retain_candidate_dir(dirs: &mut Vec<CandidateDir>, candidate: CandidateDir, limit: usize) {
+    let insertion = dirs
+        .binary_search_by(|existing| compare_candidate_dir(existing, &candidate))
+        .unwrap_or_else(|insertion| insertion);
+    if insertion >= limit {
+        return;
+    }
+    if dirs.len() == limit {
+        dirs.pop();
+    }
+    dirs.insert(insertion, candidate);
 }
 
 fn candidate_dir(entry: std::fs::DirEntry) -> Option<CandidateDir> {
@@ -886,9 +897,25 @@ fn resolve_owner(
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<ResolvedOwner> {
+    resolve_owner_until(
+        state,
+        pid,
+        chain,
+        &|| cancellation.is_cancelled(),
+        diagnostics,
+    )
+}
+
+fn resolve_owner_until(
+    state: Option<&StateDb>,
+    pid: Option<&PidIdentityDb>,
+    chain: &[CallerIdentity],
+    is_cancelled: &dyn Fn() -> bool,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) -> Option<ResolvedOwner> {
     let pid = pid?;
     for entry in chain {
-        if cancellation.is_cancelled() {
+        if is_cancelled() {
             return None;
         }
         match resolve_owner_for_entry(state, pid, entry) {
@@ -1253,6 +1280,7 @@ fn owned_strings(values: Vec<&str>) -> Vec<String> {
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    use oulipoly_state::pid_identity::PidIdentityRecord;
 
     struct CancelDuringDiscovery<'a> {
         entries: std::fs::ReadDir,
@@ -1294,5 +1322,91 @@ mod cancellation_tests {
 
         assert!(candidates.is_empty());
         assert!(visited.get() < 32);
+    }
+
+    #[test]
+    fn candidate_retention_never_exceeds_the_configured_bound() {
+        let mut candidates = Vec::new();
+        let mut peak_retained = 0;
+
+        for age in 0..100 {
+            retain_candidate_dir(
+                &mut candidates,
+                candidate_dir_from_parts(
+                    PathBuf::from(format!("ab_{age:08x}")),
+                    UNIX_EPOCH.checked_add(Duration::from_secs(age)),
+                ),
+                4,
+            );
+            peak_retained = peak_retained.max(candidates.len());
+        }
+
+        assert_eq!(peak_retained, 4);
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.modified_at.unwrap())
+                .collect::<Vec<_>>(),
+            [99, 98, 97, 96].map(|age| UNIX_EPOCH + Duration::from_secs(age))
+        );
+    }
+
+    #[test]
+    fn owner_resolution_stops_before_a_later_matching_chain_entry_after_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = PidIdentityDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let missing = ProcessIdentity {
+            os_pid: 1001,
+            os_boot_id: "boot-a".to_string(),
+            os_pid_starttime_ticks: 11,
+        };
+        let matching = ProcessIdentity {
+            os_pid: 1002,
+            os_boot_id: "boot-a".to_string(),
+            os_pid_starttime_ticks: 12,
+        };
+        pid.record_identity(PidIdentityRecord {
+            identity: &matching,
+            os_pgid: None,
+            invocation_uuid: "matching-invocation",
+            session_id: Some("matching-session"),
+            provider_name: None,
+            model_name: None,
+            recorded_at: "2026-08-18T00:00:00Z",
+        })
+        .unwrap();
+        let chain = [
+            CallerIdentity {
+                chain_index: 0,
+                identity: missing,
+            },
+            CallerIdentity {
+                chain_index: 1,
+                identity: matching,
+            },
+        ];
+        let checks = std::cell::Cell::new(0);
+        let mut diagnostics = Vec::new();
+
+        let cancelled = resolve_owner_until(
+            None,
+            Some(&pid),
+            &chain,
+            &|| {
+                let check = checks.get();
+                checks.set(check + 1);
+                check == 1
+            },
+            &mut diagnostics,
+        );
+
+        assert!(cancelled.is_none());
+        assert_eq!(checks.get(), 2);
+        assert!(diagnostics.is_empty());
+        let resolved =
+            resolve_owner_until(None, Some(&pid), &chain, &|| false, &mut diagnostics).unwrap();
+        assert_eq!(resolved.invocation_uuid, "matching-invocation");
+        assert_eq!(resolved.matched_chain_index, Some(1));
     }
 }

@@ -32,12 +32,23 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
     run_wake_reclaim_sweep_or_warn("process_start");
 }
 
+pub(crate) fn start_startup_wake_reclaim_sweep() {
+    if is_auto_wake_invocation() {
+        return;
+    }
+    start_wake_reclaim_driver("process_start");
+}
+
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
     if is_auto_wake_invocation() {
         return;
     }
+    start_wake_reclaim_driver("maintenance_start");
+}
+
+fn start_wake_reclaim_driver(initial_trigger: &'static str) {
     static DRIVER: OnceLock<()> = OnceLock::new();
-    DRIVER.get_or_init(spawn_wake_reclaim_maintenance_driver);
+    DRIVER.get_or_init(|| spawn_wake_reclaim_maintenance_driver(initial_trigger));
 }
 
 pub(crate) struct LivePtyRetryDriverGuard {
@@ -93,21 +104,27 @@ fn live_pty_retry_loop(stop: Arc<AtomicBool>) {
     }
 }
 
-fn spawn_wake_reclaim_maintenance_driver() {
-    let result = std::thread::Builder::new()
-        .name("oulipoly-wake-reclaim-sweep".to_string())
-        .spawn(wake_reclaim_maintenance_loop);
+fn spawn_wake_reclaim_maintenance_driver(initial_trigger: &'static str) {
+    let result = spawn_wake_reclaim_thread(move || wake_reclaim_maintenance_loop(initial_trigger));
     if let Err(err) = result {
         warn_wake_reclaim_driver_start_failed(err);
     }
+}
+
+fn spawn_wake_reclaim_thread(
+    worker: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle<()>, std::io::Error> {
+    std::thread::Builder::new()
+        .name("oulipoly-wake-reclaim-sweep".to_string())
+        .spawn(worker)
 }
 
 fn warn_wake_reclaim_driver_start_failed(err: std::io::Error) {
     tracing::warn!("Failed to start wake reclaim sweep driver: {err}");
 }
 
-fn wake_reclaim_maintenance_loop() {
-    run_wake_reclaim_sweep_or_warn("maintenance_start");
+fn wake_reclaim_maintenance_loop(initial_trigger: &'static str) {
+    run_wake_reclaim_sweep_or_warn(initial_trigger);
     loop {
         std::thread::sleep(Duration::from_secs(WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS));
         run_wake_reclaim_sweep_or_warn("maintenance_tick");
@@ -133,6 +150,9 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
     )?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
     let start =
         plan_and_reap_wake_sweep(&mut db, candidates, state::open_default_state_read_only())?;
     drop(db);
@@ -414,6 +434,32 @@ mod tests {
     use oulipoly_state::mailbox::{
         AgentBashCompleteEnqueue, EnqueueResult, WakeClaimAcquireResult, WakeClaimRequest,
     };
+
+    #[test]
+    fn startup_wake_reclaim_thread_returns_while_the_sweep_is_blocked() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let worker_release = Arc::clone(&release);
+
+        let handle = spawn_wake_reclaim_thread(move || {
+            started_tx.send(()).unwrap();
+            let (lock, condition) = &*worker_release;
+            let released = lock.lock().unwrap();
+            drop(
+                condition
+                    .wait_while(released, |released| !*released)
+                    .unwrap(),
+            );
+        })
+        .unwrap();
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!handle.is_finished());
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_one();
+        handle.join().unwrap();
+    }
 
     #[test]
     fn unavailable_state_prevents_terminal_reap_mutation() {

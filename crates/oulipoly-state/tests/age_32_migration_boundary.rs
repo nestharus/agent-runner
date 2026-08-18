@@ -100,6 +100,34 @@ fn ti_02_ti_23_previous_version_db_migrates_forward_and_preserves_representative
 }
 
 #[test]
+fn schema_18_migration_installs_the_running_projection_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+    drop(StateDb::open(&db_path).unwrap());
+    let mut connection = Connection::open(&db_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX idx_invocations_parent_running_created;
+             PRAGMA user_version = 18;",
+        )
+        .unwrap();
+    let plan = migrations::current_plan_from(18).unwrap();
+
+    migrations::run_with_db_path(&mut connection, &plan, db_path).unwrap();
+
+    let installed = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_invocations_parent_running_created'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(installed, 1);
+    assert_eq!(user_version(&connection), CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
 fn ti_03_current_version_open_is_noop_for_rows_and_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
@@ -259,9 +287,10 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             15,
             16,
             17,
-            CURRENT_SCHEMA_VERSION
+            18,
+            CURRENT_SCHEMA_VERSION,
         ],
-        "schema-4 DBs must take every ordered migration through materialization summary schema 18"
+        "schema-4 DBs must take every ordered migration through running-projection schema 19"
     );
     assert_eq!(
         plan_ids(&plan),
@@ -280,6 +309,7 @@ fn ti_10_age_54_schema4_plan_contains_only_schema5_step() {
             "0016_invocation_completion_authority_summary",
             "0017_completion_registration_authority",
             "0018_invocation_completion_materialization_summary",
+            "0019_invocation_running_projection_index",
         ]
     );
 }
