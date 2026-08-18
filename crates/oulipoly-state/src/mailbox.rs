@@ -7687,7 +7687,12 @@ fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFi
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+    let identity = match crate::filesystem_identity::path_file_identity(path, &metadata) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || identity.links != 1 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!(
@@ -7696,7 +7701,7 @@ fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFi
             ),
         ));
     }
-    Ok(Some(mailbox_file_identity(&metadata)?))
+    Ok(Some(mailbox_identity(identity)))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -7736,7 +7741,8 @@ fn opened_mailbox_file_identity(
     path: &Path,
 ) -> std::io::Result<MailboxFileIdentity> {
     let metadata = file.metadata()?;
-    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+    let identity = crate::filesystem_identity::open_file_identity(file)?;
+    if !metadata.is_file() || identity.links != 1 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!(
@@ -7745,41 +7751,14 @@ fn opened_mailbox_file_identity(
             ),
         ));
     }
-    mailbox_file_identity(&metadata)
+    Ok(mailbox_identity(identity))
 }
 
-#[cfg(unix)]
-fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink() == 1
-}
-
-#[cfg(unix)]
-fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(MailboxFileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.number_of_links() == Some(1)
-}
-
-#[cfg(windows)]
-fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-    Ok(MailboxFileIdentity {
-        volume: u64::from(metadata.volume_serial_number().ok_or_else(|| {
-            std::io::Error::new(ErrorKind::Unsupported, "missing volume serial number")
-        })?),
-        file: metadata
-            .file_index()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::Unsupported, "missing file index"))?,
-    })
+fn mailbox_identity(identity: crate::filesystem_identity::OpenFileIdentity) -> MailboxFileIdentity {
+    MailboxFileIdentity {
+        volume: identity.storage,
+        file: identity.file,
+    }
 }
 
 fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {

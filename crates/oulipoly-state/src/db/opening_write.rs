@@ -396,10 +396,12 @@ impl StateDb {
         let authority = self.completion_authority_state.as_ref()?;
         let canonical = std::fs::canonicalize(&authority.source_path).ok()?;
         let metadata = std::fs::metadata(&canonical).ok()?;
+        let identity =
+            crate::filesystem_identity::path_file_identity(&canonical, &metadata).ok()?;
         if canonical != authority.path
             || !metadata.is_file()
-            || !state_file_has_one_link(&metadata)
-            || state_file_identity(&metadata)? != authority.file
+            || identity.links != 1
+            || state_identity(identity) != authority.file
         {
             return None;
         }
@@ -442,13 +444,15 @@ impl StateDb {
             return None;
         }
         let metadata = std::fs::metadata(&canonical).ok()?;
-        if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+        let identity =
+            crate::filesystem_identity::path_file_identity(&canonical, &metadata).ok()?;
+        if !metadata.is_file() || identity.links != 1 {
             return None;
         }
         Some(CompletionAuthorityStateIdentity {
             source_path,
             path: canonical,
-            file: state_file_identity(&metadata)?,
+            file: state_identity(identity),
         })
     }
 
@@ -555,18 +559,23 @@ fn inspect_state_storage_file(
             ));
         }
     };
-    if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+    let identity = match crate::filesystem_identity::path_file_identity(path, &metadata) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect State DB {role} file identity {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !metadata.is_file() || identity.links != 1 {
         return Err(format!(
             "State DB {role} requires a regular file with exactly one hard link: {}",
             path.display(),
         ));
     }
-    state_file_identity(&metadata).map(Some).ok_or_else(|| {
-        format!(
-            "State DB {role} file identity is unavailable: {}",
-            path.display()
-        )
-    })
+    Ok(Some(state_identity(identity)))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -607,48 +616,11 @@ impl StateDb {
     }
 }
 
-#[cfg(unix)]
-fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    metadata.nlink() == 1
-}
-
-#[cfg(unix)]
-fn state_file_identity(metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    Some(StateFileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.number_of_links() == Some(1)
-}
-
-#[cfg(windows)]
-fn state_file_identity(metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-
-    Some(StateFileIdentity {
-        volume: u64::from(metadata.volume_serial_number()?),
-        file: metadata.file_index()?,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn state_file_has_one_link(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(not(any(unix, windows)))]
-fn state_file_identity(_metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
-    None
+fn state_identity(identity: crate::filesystem_identity::OpenFileIdentity) -> StateFileIdentity {
+    StateFileIdentity {
+        volume: identity.storage,
+        file: identity.file,
+    }
 }
 
 impl StateNamespaceGuard {
@@ -741,18 +713,19 @@ fn opened_state_storage_file_identity(
             path.display()
         )
     })?;
-    if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+    let identity = crate::filesystem_identity::open_file_identity(file).map_err(|error| {
+        format!(
+            "Failed to inspect opened State DB {role} identity {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || identity.links != 1 {
         return Err(format!(
             "State DB {role} requires a regular file with exactly one hard link: {}",
             path.display()
         ));
     }
-    state_file_identity(&metadata).ok_or_else(|| {
-        format!(
-            "State DB {role} file identity is unavailable: {}",
-            path.display()
-        )
-    })
+    Ok(state_identity(identity))
 }
 
 impl Drop for StateNamespaceGuard {

@@ -122,7 +122,7 @@ fn canonical_sqlite_source(source: &Path) -> io::Result<PathBuf> {
             "SQLite source is not a regular file",
         ));
     }
-    if !sqlite_source_has_one_link(&metadata) {
+    if crate::filesystem_identity::path_file_identity(&canonical, &metadata)?.links != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "SQLite source has multiple filesystem links",
@@ -238,7 +238,7 @@ fn open_validated_source_artifact(path: &Path) -> io::Result<ValidatedSourceArti
         }
         Err(err) => return Err(err),
     };
-    let opened_identity = validated_artifact_metadata(path, &file.metadata()?)?;
+    let opened_identity = validated_artifact_metadata(path, &file, &file.metadata()?)?;
     if opened_identity != identity || validated_artifact_identity(path)? != Some(identity) {
         return Ok(ValidatedSourceArtifact::Changed);
     }
@@ -251,24 +251,44 @@ fn validated_artifact_identity(path: &Path) -> io::Result<Option<SqliteArtifactI
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    validated_artifact_metadata(path, &metadata).map(Some)
+    let identity = match crate::filesystem_identity::path_file_identity(path, &metadata) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    validated_artifact_identity_parts(path, &metadata, identity).map(Some)
 }
 
 fn validated_artifact_metadata(
     path: &Path,
+    file: &File,
     metadata: &std::fs::Metadata,
+) -> io::Result<SqliteArtifactIdentity> {
+    validated_artifact_identity_parts(
+        path,
+        metadata,
+        crate::filesystem_identity::open_file_identity(file)?,
+    )
+}
+
+fn validated_artifact_identity_parts(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    identity: crate::filesystem_identity::OpenFileIdentity,
 ) -> io::Result<SqliteArtifactIdentity> {
     if !metadata.file_type().is_file() {
         return Err(unsupported_artifact_error(path, "is not a regular file"));
     }
-    if !sqlite_source_has_one_link(metadata) {
+    if identity.links != 1 {
         return Err(unsupported_artifact_error(
             path,
             "has multiple filesystem links",
         ));
     }
-    sqlite_artifact_identity(metadata)
-        .ok_or_else(|| unsupported_artifact_error(path, "has no stable filesystem identity"))
+    Ok(SqliteArtifactIdentity {
+        storage: identity.storage,
+        file: identity.file,
+    })
 }
 
 fn unsupported_artifact_error(path: &Path, reason: &str) -> io::Error {
@@ -314,50 +334,6 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut path = path.as_os_str().to_owned();
     path.push(suffix);
     PathBuf::from(path)
-}
-
-#[cfg(unix)]
-fn sqlite_source_has_one_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    metadata.nlink() == 1
-}
-
-#[cfg(windows)]
-fn sqlite_source_has_one_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.number_of_links() == Some(1)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sqlite_source_has_one_link(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(unix)]
-fn sqlite_artifact_identity(metadata: &std::fs::Metadata) -> Option<SqliteArtifactIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    Some(SqliteArtifactIdentity {
-        storage: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn sqlite_artifact_identity(metadata: &std::fs::Metadata) -> Option<SqliteArtifactIdentity> {
-    use std::os::windows::fs::MetadataExt;
-
-    Some(SqliteArtifactIdentity {
-        storage: u64::from(metadata.volume_serial_number()?),
-        file: metadata.file_index()?,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sqlite_artifact_identity(_metadata: &std::fs::Metadata) -> Option<SqliteArtifactIdentity> {
-    None
 }
 
 #[cfg(test)]

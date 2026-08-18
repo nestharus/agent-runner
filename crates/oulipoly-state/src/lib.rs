@@ -34,6 +34,7 @@ mod chain_segments;
 pub mod continuation;
 mod db;
 pub mod deployment;
+mod filesystem_identity;
 pub mod invocation_marker;
 mod lifecycle_log;
 pub mod mailbox;
