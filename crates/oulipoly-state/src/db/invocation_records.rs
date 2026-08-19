@@ -295,21 +295,49 @@ impl StateDb {
             return Ok(children);
         }
 
-        let live_child_ids = live_child_ids
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        let candidates = self.list_invocation_children_bounded(
+        let candidates = self.list_invocation_children_excluding_ids_bounded(
             parent_id,
-            limit.saturating_add(live_child_ids.len()),
-            true,
+            limit - children.len(),
+            &live_child_ids,
         )?;
-        children.extend(
-            candidates
-                .into_iter()
-                .filter(|record| !live_child_ids.contains(&record.id))
-                .take(limit - children.len()),
-        );
+        children.extend(candidates);
         Ok(children)
+    }
+
+    fn list_invocation_children_excluding_ids_bounded(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        excluded_ids: &[i64],
+    ) -> Result<Vec<InvocationRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if excluded_ids.is_empty() {
+            return self.list_invocation_children_bounded(parent_id, limit, true);
+        }
+        let excluded_ids = excluded_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let clause = format!(
+            "WHERE parent_invocation_id = ?1
+               AND id NOT IN ({excluded_ids})
+             ORDER BY (status = 'running') DESC, created_at, id
+             LIMIT ?2"
+        );
+        let sql = Self::invocation_record_select_sql(&self.conn, &clause)?;
+        let mut statement = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(sqlite::params![parent_id, limit], Self::map_invocation_row)
+            .map_err(Self::format_invocation_children_query_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocation_children_map_error)
     }
 
     fn list_live_subtree_child_ids(

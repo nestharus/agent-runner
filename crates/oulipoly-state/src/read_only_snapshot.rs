@@ -1,8 +1,12 @@
 //! Physical snapshot support for SQLite readers that must not mutate source storage.
 
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -25,7 +29,7 @@ struct SqliteArtifactIdentity {
 
 #[derive(Debug)]
 struct OpenedSqliteArtifact {
-    file: File,
+    file: ManagedSourceFile,
     identity: SqliteArtifactIdentity,
 }
 
@@ -38,9 +42,71 @@ enum ValidatedSourceArtifact {
     Absent,
     Changed,
     Present {
-        file: File,
+        file: ManagedSourceFile,
         identity: SqliteArtifactIdentity,
     },
+}
+
+#[derive(Debug)]
+struct ManagedSourceFile {
+    file: Option<File>,
+    source: PathBuf,
+}
+
+pub(crate) struct SourceConnectionGuard {
+    source: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct SourceDescriptorState {
+    connection_count: usize,
+    deferred_files: Vec<File>,
+}
+
+#[cfg(unix)]
+fn source_descriptor_registry() -> &'static Mutex<HashMap<PathBuf, SourceDescriptorState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, SourceDescriptorState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl ManagedSourceFile {
+    fn new(source: &Path, file: File) -> Self {
+        Self {
+            file: Some(file),
+            source: source.to_path_buf(),
+        }
+    }
+
+    fn file(&self) -> &File {
+        self.file.as_ref().expect("managed source file is present")
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("managed source file is present")
+    }
+}
+
+impl Drop for ManagedSourceFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            retire_source_file(&self.source, file);
+        }
+    }
+}
+
+impl SourceConnectionGuard {
+    pub(crate) fn acquire(source: &Path) -> io::Result<Self> {
+        let source = source_registry_key(source)?;
+        register_source_connection(&source);
+        Ok(Self { source })
+    }
+}
+
+impl Drop for SourceConnectionGuard {
+    fn drop(&mut self) {
+        unregister_source_connection(&self.source);
+    }
 }
 
 impl ReadOnlySnapshot {
@@ -121,6 +187,106 @@ impl ReadOnlySnapshot {
     }
 }
 
+fn source_registry_key(source: &Path) -> io::Result<PathBuf> {
+    match std::fs::canonicalize(source) {
+        Ok(source) => Ok(source),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = source.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "SQLite source has no parent")
+            })?;
+            let file_name = source.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SQLite source has no file name",
+                )
+            })?;
+            Ok(std::fs::canonicalize(parent)?.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn register_source_connection(source: &Path) {
+    let mut registry = source_descriptor_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry
+        .entry(source.to_path_buf())
+        .or_default()
+        .connection_count += 1;
+}
+
+#[cfg(not(unix))]
+fn register_source_connection(_source: &Path) {}
+
+#[cfg(unix)]
+fn unregister_source_connection(source: &Path) {
+    let mut registry = source_descriptor_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let should_remove = if let Some(state) = registry.get_mut(source) {
+        state.connection_count = state.connection_count.saturating_sub(1);
+        state.connection_count == 0
+    } else {
+        false
+    };
+    if should_remove {
+        // Close deferred descriptors while registration is excluded. A new
+        // managed SQLite connection cannot appear between this close and its
+        // own registry admission.
+        drop(registry.remove(source));
+    }
+}
+
+#[cfg(not(unix))]
+fn unregister_source_connection(_source: &Path) {}
+
+#[cfg(unix)]
+fn retire_source_file(source: &Path, file: File) {
+    let mut registry = source_descriptor_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = registry
+        .get_mut(source)
+        .filter(|state| state.connection_count > 0)
+    {
+        state.deferred_files.push(file);
+    } else {
+        // Closing under the registry lock prevents a managed SQLite open from
+        // racing the process-scoped fcntl lock side effect of close(2).
+        drop(file);
+    }
+}
+
+#[cfg(not(unix))]
+fn retire_source_file(_source: &Path, file: File) {
+    drop(file);
+}
+
+#[cfg(unix)]
+fn take_deferred_source_file(source: &Path, expected: SqliteArtifactIdentity) -> Option<File> {
+    let mut registry = source_descriptor_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = registry.get_mut(source)?;
+    let index = state.deferred_files.iter().position(|file| {
+        crate::filesystem_identity::open_file_identity(file)
+            .map(|identity| {
+                identity.storage == expected.storage
+                    && identity.file == expected.file
+                    && identity.links > 0
+            })
+            .unwrap_or(false)
+    })?;
+    Some(state.deferred_files.swap_remove(index))
+}
+
+#[cfg(not(unix))]
+fn take_deferred_source_file(_source: &Path, _expected: SqliteArtifactIdentity) -> Option<File> {
+    None
+}
+
 fn canonical_sqlite_source(source: &Path) -> io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(source)?;
     let metadata = std::fs::metadata(&canonical)?;
@@ -149,12 +315,12 @@ fn copy_artifact_set(
         ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
         let destination_artifact = path_with_suffix(destination, suffix);
-        match open_validated_source_artifact(&source_artifact)? {
+        match open_validated_source_artifact(source, &source_artifact)? {
             ValidatedSourceArtifact::Absent if suffix.is_empty() => return Ok(None),
             ValidatedSourceArtifact::Absent => remove_if_present(&destination_artifact)?,
             ValidatedSourceArtifact::Changed => return Ok(None),
             ValidatedSourceArtifact::Present { mut file, identity } => {
-                copy_artifact(&mut file, &destination_artifact, is_cancelled)?;
+                copy_artifact(file.file_mut(), &destination_artifact, is_cancelled)?;
                 if validated_artifact_identity(&source_artifact)? != Some(identity) {
                     return Ok(None);
                 }
@@ -190,7 +356,7 @@ fn artifact_sets_match_with_hook(
             Some(opened)
                 if validated_artifact_identity(&source_artifact)? == Some(opened.identity) =>
             {
-                if !files_match(&mut opened.file, &destination_artifact, is_cancelled)?
+                if !files_match(opened.file.file_mut(), &destination_artifact, is_cancelled)?
                     || validated_artifact_identity(&source_artifact)? != Some(opened.identity)
                 {
                     return Ok(false);
@@ -226,6 +392,7 @@ fn copy_artifact(
     destination: &Path,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<()> {
+    reader.seek(SeekFrom::Start(0))?;
     let mut writer = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -264,18 +431,38 @@ fn files_match(left: &mut File, right: &Path, is_cancelled: &dyn Fn() -> bool) -
     }
 }
 
-fn open_validated_source_artifact(path: &Path) -> io::Result<ValidatedSourceArtifact> {
+fn open_validated_source_artifact(
+    source: &Path,
+    path: &Path,
+) -> io::Result<ValidatedSourceArtifact> {
+    open_validated_source_artifact_with_hook(source, path, || Ok(()))
+}
+
+fn open_validated_source_artifact_with_hook(
+    source: &Path,
+    path: &Path,
+    after_open: impl FnOnce() -> io::Result<()>,
+) -> io::Result<ValidatedSourceArtifact> {
     let Some(identity) = validated_artifact_identity(path)? else {
         return Ok(ValidatedSourceArtifact::Absent);
     };
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(ValidatedSourceArtifact::Changed);
-        }
-        Err(err) => return Err(err),
+    let file = match take_deferred_source_file(source, identity) {
+        Some(file) => file,
+        None => match File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(ValidatedSourceArtifact::Changed);
+            }
+            Err(err) => return Err(err),
+        },
     };
-    let opened_identity = validated_artifact_metadata(path, &file, &file.metadata()?)?;
+    let file = ManagedSourceFile::new(source, file);
+    after_open()?;
+    let Some(opened_identity) =
+        validated_artifact_metadata(path, file.file(), &file.file().metadata()?)?
+    else {
+        return Ok(ValidatedSourceArtifact::Changed);
+    };
     if opened_identity != identity || validated_artifact_identity(path)? != Some(identity) {
         return Ok(ValidatedSourceArtifact::Changed);
     }
@@ -293,6 +480,9 @@ fn validated_artifact_identity(path: &Path) -> io::Result<Option<SqliteArtifactI
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
+    if identity.links == 0 {
+        return Ok(None);
+    }
     validated_artifact_identity_parts(path, &metadata, identity).map(Some)
 }
 
@@ -300,12 +490,12 @@ fn validated_artifact_metadata(
     path: &Path,
     file: &File,
     metadata: &std::fs::Metadata,
-) -> io::Result<SqliteArtifactIdentity> {
-    validated_artifact_identity_parts(
-        path,
-        metadata,
-        crate::filesystem_identity::open_file_identity(file)?,
-    )
+) -> io::Result<Option<SqliteArtifactIdentity>> {
+    let identity = crate::filesystem_identity::open_file_identity(file)?;
+    if identity.links == 0 {
+        return Ok(None);
+    }
+    validated_artifact_identity_parts(path, metadata, identity).map(Some)
 }
 
 fn validated_artifact_identity_parts(
@@ -625,9 +815,13 @@ mod tests {
 
         std::fs::remove_file(&source).unwrap();
         let retained = copied.artifacts[0].as_mut().unwrap();
-        retained.file.seek(SeekFrom::Start(0)).unwrap();
+        retained.file.file_mut().seek(SeekFrom::Start(0)).unwrap();
         let mut retained_bytes = Vec::new();
-        retained.file.read_to_end(&mut retained_bytes).unwrap();
+        retained
+            .file
+            .file_mut()
+            .read_to_end(&mut retained_bytes)
+            .unwrap();
 
         assert_eq!(retained_bytes, b"retained source");
         assert!(!artifact_sets_match(&source, &destination, &mut copied, &|| false).unwrap());
@@ -659,6 +853,96 @@ mod tests {
             std::fs::read(path_with_suffix(snapshot.path(), "-wal")).unwrap(),
             b"stable wal"
         );
+    }
+
+    #[test]
+    fn unlinked_wal_after_open_is_a_retryable_source_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let wal = path_with_suffix(&source, "-wal");
+        std::fs::write(&source, "stable main").unwrap();
+        std::fs::write(&wal, "transient wal").unwrap();
+
+        let opened =
+            open_validated_source_artifact_with_hook(&source, &wal, || std::fs::remove_file(&wal))
+                .unwrap();
+
+        assert!(matches!(opened, ValidatedSourceArtifact::Changed));
+        let snapshot = ReadOnlySnapshot::create_with_cancel(&source, &|| false).unwrap();
+        assert_eq!(std::fs::read(snapshot.path()).unwrap(), b"stable main");
+        assert!(!path_with_suffix(snapshot.path(), "-wal").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snapshot_descriptor_retirement_preserves_same_process_record_lock() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let state = crate::StateDb::open(&source).unwrap();
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)
+            .unwrap();
+        let mut lock = libc::flock {
+            l_type: libc::F_WRLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        assert_eq!(
+            unsafe { libc::fcntl(lock_file.as_raw_fd(), libc::F_SETLK, &lock) },
+            0
+        );
+        let inode = lock_file.metadata().unwrap().ino();
+        assert!(process_holds_record_lock(inode));
+
+        let snapshot = ReadOnlySnapshot::create_with_cancel(&source, &|| false).unwrap();
+
+        assert!(process_holds_record_lock(inode));
+        drop(snapshot);
+        for _ in 0..8 {
+            drop(ReadOnlySnapshot::create_with_cancel(&source, &|| false).unwrap());
+        }
+        let retained = deferred_source_file_count(&source);
+        assert!((1..=SQLITE_ARTIFACT_SUFFIXES.len()).contains(&retained));
+        lock.l_type = libc::F_UNLCK as libc::c_short;
+        assert_eq!(
+            unsafe { libc::fcntl(lock_file.as_raw_fd(), libc::F_SETLK, &lock) },
+            0
+        );
+        drop(state);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_holds_record_lock(inode: u64) -> bool {
+        let pid = std::process::id().to_string();
+        let inode_suffix = format!(":{inode}");
+        std::fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .any(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.get(4) == Some(&pid.as_str())
+                    && fields
+                        .get(5)
+                        .is_some_and(|identity| identity.ends_with(&inode_suffix))
+            })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deferred_source_file_count(source: &Path) -> usize {
+        let source = source_registry_key(source).unwrap();
+        source_descriptor_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&source)
+            .map(|state| state.deferred_files.len())
+            .unwrap_or(0)
     }
 
     #[test]

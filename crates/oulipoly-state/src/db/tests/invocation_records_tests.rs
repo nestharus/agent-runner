@@ -325,14 +325,17 @@ fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendan
         "2026-04-17T08:03:00Z",
     );
 
+    StateDb::reset_invocation_row_map_count();
     let children = db
-        .list_invocation_children_with_running_descendants_bounded(root_id, 1)
+        .list_invocation_children_with_running_descendants_bounded(root_id, 2)
         .unwrap();
 
+    assert_eq!(children.len(), 2);
     assert_eq!(
-        invocation_record_uuids(&children),
-        vec!["23000000-0000-0000-0000-000000000000"]
+        children[0].invocation_uuid,
+        "23000000-0000-0000-0000-000000000000"
     );
+    assert_eq!(StateDb::invocation_row_map_count(), 2);
 }
 
 #[test]

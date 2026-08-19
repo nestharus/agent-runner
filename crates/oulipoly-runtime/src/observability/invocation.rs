@@ -295,12 +295,7 @@ fn invocation_children(
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<Vec<InvocationRecord>> {
-    match read_invocation_children(
-        state,
-        record.id,
-        remaining_nodes.saturating_add(1),
-        !include_terminal,
-    ) {
+    match read_invocation_children(state, record.id, remaining_nodes, !include_terminal) {
         Ok(mut children) => {
             if cancellation.is_cancelled() {
                 return None;
@@ -309,12 +304,13 @@ fn invocation_children(
                 state,
                 mailbox,
                 record,
-                remaining_nodes,
+                remaining_nodes.saturating_sub(children.len()),
                 cancellation,
                 &mut children,
                 diagnostics,
             );
             order_invocation_children(&mut children, include_terminal);
+            children.truncate(remaining_nodes);
             Some(children)
         }
         Err(err) => {
@@ -333,6 +329,9 @@ fn append_delivery_invocation_children(
     children: &mut Vec<InvocationRecord>,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) {
+    if limit == 0 {
+        return;
+    }
     let Some(mailbox) = mailbox else {
         return;
     };
@@ -624,5 +623,56 @@ fn invocation_truncated_diagnostic() -> MonitorDiagnostic {
         severity: MonitorDiagnosticSeverity::Warning,
         message: "invocation subtree exceeded the snapshot node cap".to_string(),
         node_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_state::InvocationStart;
+
+    #[test]
+    fn invocation_children_never_materializes_the_lookahead_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let root_id = start_invocation(&state, "70000000-0000-4000-8000-000000000000", None);
+        for index in 1..=3 {
+            start_invocation(
+                &state,
+                &format!("70000000-0000-4000-8000-{index:012}"),
+                Some(root_id),
+            );
+        }
+        let root = state
+            .get_invocation_by_uuid("70000000-0000-4000-8000-000000000000")
+            .unwrap()
+            .unwrap();
+        let mut diagnostics = Vec::new();
+
+        let children = invocation_children(
+            &state,
+            None,
+            &root,
+            true,
+            2,
+            &CancellationToken::new(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(children.len(), 2);
+        assert!(diagnostics.is_empty());
+    }
+
+    fn start_invocation(state: &StateDb, uuid: &str, parent_invocation_id: Option<i64>) -> i64 {
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: uuid.to_string(),
+                model_name: "model-a".to_string(),
+                provider_name: "provider-a".to_string(),
+                provider_index: 0,
+                parent_invocation_id,
+            })
+            .unwrap()
     }
 }
