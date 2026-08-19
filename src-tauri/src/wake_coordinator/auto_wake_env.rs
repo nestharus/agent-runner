@@ -3,6 +3,7 @@
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator`
 
 use oulipoly_state::mailbox::{MailboxDb, SessionMetadataRow};
+use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 use std::time::Duration;
 
 use super::constants::{
@@ -53,7 +54,7 @@ fn release_manual_wake_claim(
 ) -> Result<(), String> {
     if db
         .wake_sessions()
-        .release_wake_claim(session_id, claim_token)?
+        .release_wake_claim_for_manual_resume(session_id, claim_token)?
     {
         return Ok(());
     }
@@ -116,9 +117,16 @@ fn validate_auto_wake_claim_with_db(
     session_id: &str,
     claim_token: &str,
 ) -> Result<Option<i32>, String> {
+    let child_identity = current_process_identity()?;
     db.wake_sessions()
-        .validate_wake_claim_for_child(session_id, claim_token)
+        .validate_wake_claim_for_child(session_id, claim_token, &child_identity)
         .map(auto_wake_child_validation_result)
+}
+
+fn current_process_identity() -> Result<ProcessIdentity, String> {
+    let pid = i64::from(std::process::id());
+    read_live_process_identity(pid)?
+        .ok_or_else(|| format!("Auto-wake child process {pid} is not live during claim admission"))
 }
 
 fn auto_wake_child_validation_result(valid: bool) -> Option<i32> {
@@ -335,6 +343,45 @@ mod tests {
                 .unwrap()
                 .claim_token,
             "token-b"
+        );
+    }
+
+    #[test]
+    fn manual_resume_releases_a_dead_admitted_wake_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        db.enqueue_submitted_input(&SubmittedInputEnqueue {
+            submission_token: "manual-dead-release-input",
+            target: InboxTarget {
+                kind: InboxTargetKind::Session,
+                id: "session-a",
+            },
+            input: b"input",
+        })
+        .unwrap();
+        let initial = db
+            .wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "initial",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some("wake-a"),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        assert!(matches!(initial, WakeClaimAcquireResult::Acquired(_)));
+        db.wake_sessions()
+            .record_wake_claim_pid("session-a", "token-a", i64::MAX)
+            .unwrap();
+
+        release_manual_wake_claim(&mut db, "session-a", "token-a").unwrap();
+
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
         );
     }
 }
