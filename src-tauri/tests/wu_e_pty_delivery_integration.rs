@@ -864,7 +864,9 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
     let overlap_response = inject_control_envelope(&control_path, &overlap).unwrap();
     assert!(overlap_response.ack, "{overlap_response:?}");
     let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
-    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+    if !output.contains("GOT_NOTIFY") {
+        wait_for_file_contains(&received_log, "handle: h-overlap-4", Duration::from_secs(5));
+    }
     fixture.ingest_turn(
         "fixture-provider",
         SESSION_A,

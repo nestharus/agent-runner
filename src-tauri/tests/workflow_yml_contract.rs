@@ -785,10 +785,16 @@ fn assert_cargo_inventory_matches(workflow_name: &str, workflow: &Value) {
         ),
     ];
     if workflow_name == "ci.yml" {
-        allowed.push((
-            "rust-state-windows",
-            r"^cargo\s+test\s+-p\s+oulipoly-state\s+read_only_snapshot\s*$",
-        ));
+        for job in ["rust-state-windows", "rust-state-macos"] {
+            allowed.push((
+                job,
+                r"^cargo\s+test\s+-p\s+oulipoly-state\s+read_only_snapshot\s*$",
+            ));
+            allowed.push((
+                job,
+                r"^cargo\s+test\s+-p\s+oulipoly-state\s+pid_identity::tests\s*$",
+            ));
+        }
     }
 
     for (job_name, line) in &inventory {
@@ -1314,6 +1320,7 @@ fn assertion_a10_dependency_graph_required_edges() {
         "rust-lib-check".to_string(),
         "rust-client-check".to_string(),
         "rust-state-windows".to_string(),
+        "rust-state-macos".to_string(),
         "rust-integration".to_string(),
     ]);
     let ci_expected_edges = BTreeSet::from([
@@ -1329,6 +1336,10 @@ fn assertion_a10_dependency_graph_required_edges() {
         ),
         (
             "rust-state-windows".to_string(),
+            "rust-integration".to_string(),
+        ),
+        (
+            "rust-state-macos".to_string(),
             "rust-integration".to_string(),
         ),
     ]);

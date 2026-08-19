@@ -14,6 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -26,6 +27,8 @@ use super::diagnostics::WakeDiagnostic;
 use super::wake_start::{StartWakeInput, start_wake_chain};
 use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
 
+const STARTUP_SWEEP_COMPLETION_GRACE: Duration = Duration::from_secs(5);
+
 pub(crate) fn run_startup_wake_reclaim_sweep() {
     if is_auto_wake_invocation() {
         return;
@@ -35,14 +38,21 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
 
 pub(crate) struct StartupWakeReclaimGuard {
     stop: Arc<AtomicBool>,
+    done: Receiver<()>,
     handle: Option<JoinHandle<()>>,
+    completion_grace: Duration,
 }
 
 impl Drop for StartupWakeReclaimGuard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            handle.thread().unpark();
+            if matches!(
+                self.done.recv_timeout(self.completion_grace),
+                Err(RecvTimeoutError::Timeout)
+            ) {
+                self.stop.store(true, Ordering::SeqCst);
+                handle.thread().unpark();
+            }
             if let Err(err) = handle.join() {
                 tracing::warn!(?err, "Startup wake reclaim sweep failed to join cleanly");
             }
@@ -63,14 +73,18 @@ pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGua
     }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let (done_tx, done) = mpsc::channel();
     match spawn_wake_reclaim_thread(move || {
         run_wake_reclaim_sweep_or_warn_with_cancel("process_start", &|| {
             thread_stop.load(Ordering::SeqCst)
         });
+        let _ = done_tx.send(());
     }) {
         Ok(handle) => Some(StartupWakeReclaimGuard {
             stop,
+            done,
             handle: Some(handle),
+            completion_grace: STARTUP_SWEEP_COMPLETION_GRACE,
         }),
         Err(err) => {
             STARTUP_SWEEP_STARTED.store(false, Ordering::SeqCst);
@@ -589,6 +603,59 @@ mod tests {
         *lock.lock().unwrap() = true;
         condition.notify_one();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn startup_guard_allows_a_short_sweep_to_finish_after_provider_settlement() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let (done_tx, done) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            worker_completed.store(true, Ordering::SeqCst);
+            done_tx.send(()).unwrap();
+        });
+        let guard = StartupWakeReclaimGuard {
+            stop: Arc::clone(&stop),
+            done,
+            handle: Some(handle),
+            completion_grace: Duration::from_secs(1),
+        };
+
+        drop(guard);
+
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(!stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn startup_guard_cancels_and_joins_after_its_completion_grace() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let (done_tx, done) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            while !worker_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let guard = StartupWakeReclaimGuard {
+            stop: Arc::clone(&stop),
+            done,
+            handle: Some(handle),
+            completion_grace: Duration::from_millis(20),
+        };
+        let started = std::time::Instant::now();
+
+        drop(guard);
+
+        assert!(stop.load(Ordering::SeqCst));
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

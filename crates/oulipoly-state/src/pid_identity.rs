@@ -3,7 +3,7 @@
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `validator`
 //!
 //! PID identity sidecar storage. This module owns the PID identity table and
-//! Linux `/proc` identity reads used to guard against PID reuse.
+//! platform process-creation identity reads used to guard against PID reuse.
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -273,7 +273,7 @@ pub fn observe_live_process_identity(os_pid: i64) -> ProcessIdentityObservation 
     observe_live_process_identity_impl(os_pid)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn observe_live_process_identity_impl(os_pid: i64) -> ProcessIdentityObservation {
     match read_live_process_identity_impl(os_pid) {
         Ok(Some(identity)) => ProcessIdentityObservation::ExactLive(identity),
@@ -282,7 +282,7 @@ fn observe_live_process_identity_impl(os_pid: i64) -> ProcessIdentityObservation
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn observe_live_process_identity_impl(_os_pid: i64) -> ProcessIdentityObservation {
     ProcessIdentityObservation::Unsupported
 }
@@ -521,7 +521,106 @@ fn process_identity(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn read_live_process_identity_impl(os_pid: i64) -> Result<Option<ProcessIdentity>, String> {
+    let Ok(pid) = libc::pid_t::try_from(os_pid) else {
+        return Ok(None);
+    };
+    if pid <= 0 {
+        return Ok(None);
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected as libc::c_int,
+        )
+    };
+    if read == 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH | libc::ENOENT) => Ok(None),
+            _ => Err(format!(
+                "Failed to read macOS process identity for PID {os_pid}: {error}"
+            )),
+        };
+    }
+    if read < 0 || read as usize != expected {
+        return Err(format!(
+            "Failed to read complete macOS process identity for PID {os_pid}: expected {expected} bytes, read {read}"
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    let start_micros = info
+        .pbi_start_tvsec
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(info.pbi_start_tvusec))
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| format!("macOS process start time overflowed for PID {os_pid}"))?;
+    Ok(Some(ProcessIdentity {
+        os_pid,
+        os_boot_id: "macos-absolute-process-start-v1".to_string(),
+        os_pid_starttime_ticks: start_micros,
+    }))
+}
+
+#[cfg(windows)]
+fn read_live_process_identity_impl(os_pid: i64) -> Result<Option<ProcessIdentity>, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Ok(pid) = u32::try_from(os_pid) else {
+        return Ok(None);
+    };
+    if pid == 0 {
+        return Ok(None);
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            Ok(None)
+        } else {
+            Err(format!(
+                "Failed to open Windows process identity for PID {os_pid}: {error}"
+            ))
+        };
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = creation;
+    let mut kernel = creation;
+    let mut user = creation;
+    let read = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if read == 0 {
+        return Err(format!(
+            "Failed to read Windows process identity for PID {os_pid}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let start_filetime =
+        (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    let start_filetime = i64::try_from(start_filetime)
+        .map_err(|_| format!("Windows process start time overflowed for PID {os_pid}"))?;
+    Ok(Some(ProcessIdentity {
+        os_pid,
+        os_boot_id: "windows-absolute-process-start-v1".to_string(),
+        os_pid_starttime_ticks: start_filetime,
+    }))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn read_live_process_identity_impl(_os_pid: i64) -> Result<Option<ProcessIdentity>, String> {
     Ok(None)
 }
@@ -601,6 +700,10 @@ fn process_group_id(_os_pid: i64) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::StateDb;
+    use crate::mailbox::{
+        BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb, RuntimeGenerationFence,
+        RuntimeGenerationId, RuntimeLifecycleState, SessionLiveness,
+    };
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -772,6 +875,111 @@ mod tests {
         let cross_boot = identity(100, "boot-d");
         assert!(db.lookup_by_identity(&recycled).unwrap().is_none());
         assert!(db.lookup_by_identity(&cross_boot).unwrap().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn live_process_identity_is_stable_and_observable() {
+        let pid = i64::from(std::process::id());
+        let first = read_live_process_identity(pid).unwrap().unwrap();
+        let second = read_live_process_identity(pid).unwrap().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.os_pid, pid);
+        assert_eq!(
+            observe_live_process_identity(pid),
+            ProcessIdentityObservation::ExactLive(first)
+        );
+        assert!(read_live_process_identity(i64::MAX).unwrap().is_none());
+        assert_eq!(
+            observe_live_process_identity(i64::MAX),
+            ProcessIdentityObservation::Dead
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn dead_child_identity_reconciles_runtime_generation() {
+        let mut child = spawn_sleeping_child();
+        let os_pid = i64::from(child.id());
+        let identity = read_live_process_identity(os_pid).unwrap().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut mailbox = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: INVOCATION_UUID,
+                session_id: Some("session-crash-recovery"),
+                runtime_mode: "headless",
+                provider_name: "fixture-provider",
+                model_name: Some("fixture~high"),
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: INVOCATION_UUID,
+                },
+                spawned_os_pid: os_pid,
+                exact_process_identity: Some(&identity),
+                os_pgid: None,
+            })
+            .unwrap();
+        assert_eq!(
+            mailbox
+                .runtime_lifecycle()
+                .reconcile_session_liveness("session-crash-recovery")
+                .unwrap(),
+            SessionLiveness::Busy
+        );
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(
+            observe_live_process_identity(os_pid),
+            ProcessIdentityObservation::Dead
+        );
+        assert_eq!(
+            mailbox
+                .runtime_lifecycle()
+                .reconcile_session_liveness("session-crash-recovery")
+                .unwrap(),
+            SessionLiveness::Idle
+        );
+        assert_eq!(
+            mailbox
+                .runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            RuntimeLifecycleState::Exited
+        );
+    }
+
+    #[cfg(unix)]
+    fn spawn_sleeping_child() -> std::process::Child {
+        std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn spawn_sleeping_child() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "ping 127.0.0.1 -n 30 >NUL"])
+            .spawn()
+            .unwrap()
     }
 
     #[test]

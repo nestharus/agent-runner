@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb};
+use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb, SessionMetadataUpsert};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -28,7 +28,7 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
     std::fs::write(
         &provider,
         format!(
-            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"${{1:-missing}}\" >> {}\nprintf 'fixture-ok\\n'\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nprintf 'fixture-ok\\n'\n",
             starts.display()
         ),
     )
@@ -42,7 +42,7 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
     std::fs::write(
         app_config.join("providers.toml"),
         format!(
-            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n",
+            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
             provider.display()
         ),
     )
@@ -79,7 +79,7 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
         )
         .unwrap();
     drop(connection);
-    seed_pending_wake_candidate(directory.path(), &mailbox_path);
+    seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
     std::fs::write(&starts, []).unwrap();
     let baseline_temp_entries = directory_entries(&snapshot_temp);
 
@@ -138,9 +138,33 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
         assert!(!stderr.contains("database is locked"));
         assert!(!stderr.contains("database is busy"));
     }
+    wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&starts).unwrap().lines().count() > CONCURRENCY
+            && sqlite_count(
+                &mailbox_path,
+                "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+            ) >= 1
+            && sqlite_count(
+                &mailbox_path,
+                "SELECT COUNT(*) FROM runtime_generation WHERE lifecycle_state != 'exited'",
+            ) == 0
+            && sqlite_count(
+                &state_path,
+                "SELECT COUNT(*) FROM invocations WHERE status = 'running'",
+            ) == 0
+    });
+    let starts_content = std::fs::read_to_string(&starts).unwrap();
+    assert!(
+        starts_content.lines().count() > CONCURRENCY,
+        "the recoverable pending session was not automatically woken: {starts_content}"
+    );
     assert_eq!(
-        std::fs::read_to_string(&starts).unwrap().lines().count(),
-        CONCURRENCY
+        sqlite_count(
+            &mailbox_path,
+            "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+        ),
+        1,
+        "wake retry cap was not preserved; provider starts: {starts_content}"
     );
     let helper_peak = helper_peak.load(Ordering::SeqCst);
     assert_eq!(
@@ -197,7 +221,30 @@ fn runner_command(
     command
 }
 
-fn seed_pending_wake_candidate(root: &Path, mailbox_path: &Path) {
+fn seed_recoverable_wake_candidate(
+    root: &Path,
+    state_path: &Path,
+    mailbox_path: &Path,
+    models: &Path,
+) {
+    let state = rusqlite::Connection::open(state_path).unwrap();
+    state
+        .execute(
+            "INSERT INTO session_chains (chain_id, created_at, last_used_at, model_name)
+             VALUES ('11111111-1111-4111-8111-111111111111', '2026-08-19T00:00:00Z', '2026-08-19T00:00:00Z', 'fixture')",
+            [],
+        )
+        .unwrap();
+    state
+        .execute(
+            "INSERT INTO session_chain_segments
+                (chain_id, provider_name, session_id, started_at, transition_reason)
+             VALUES ('11111111-1111-4111-8111-111111111111', 'fixture-provider', 'candidate-bearing-session', '2026-08-19T00:00:00Z', 'initial')",
+            [],
+        )
+        .unwrap();
+    drop(state);
+
     let payload_root = root.join("pending-payload");
     std::fs::create_dir(&payload_root).unwrap();
     let meta = payload_root.join("meta.json");
@@ -207,6 +254,20 @@ fn seed_pending_wake_candidate(root: &Path, mailbox_path: &Path) {
     std::fs::write(&log, "pending\n").unwrap();
     std::fs::write(&rc, "0\n").unwrap();
     let mut mailbox = MailboxDb::open(mailbox_path).unwrap();
+    let models = models.to_str().unwrap();
+    mailbox
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
+            session_id: "candidate-bearing-session",
+            mode: "headless",
+            invocation_uuid: None,
+            provider_name: Some("fixture-provider"),
+            model_name: Some("fixture"),
+            models_dir: Some(models),
+            effective_cwd: None,
+            selected_auto_wake_max: Some(1),
+        })
+        .unwrap();
     mailbox
         .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
             session_id: "candidate-bearing-session",
