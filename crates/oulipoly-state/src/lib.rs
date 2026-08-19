@@ -54,6 +54,8 @@ pub type StateDbError = String;
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
+#[cfg(feature = "test-support")]
+pub use db::InvocationQueryProgressPause;
 pub use db::LegacyProviderNames;
 pub use db::ProviderRecord;
 pub use db::ReadOnlyOpenError;

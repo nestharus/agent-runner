@@ -295,7 +295,13 @@ fn invocation_children(
     cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<Vec<InvocationRecord>> {
-    match read_invocation_children(state, record.id, remaining_nodes, !include_terminal) {
+    match read_invocation_children(
+        state,
+        record.id,
+        remaining_nodes,
+        !include_terminal,
+        cancellation,
+    ) {
         Ok(mut children) => {
             if cancellation.is_cancelled() {
                 return None;
@@ -368,11 +374,16 @@ fn read_invocation_children(
     record_id: i64,
     limit: usize,
     prioritize_running: bool,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<InvocationRecord>, String> {
     if prioritize_running {
-        state.list_invocation_children_with_running_descendants_bounded(record_id, limit)
+        state.list_invocation_children_with_running_descendants_bounded_with_cancel(
+            record_id,
+            limit,
+            cancellation,
+        )
     } else {
-        state.list_invocation_children_bounded(record_id, limit, false)
+        state.list_invocation_children_bounded_with_cancel(record_id, limit, false, cancellation)
     }
 }
 

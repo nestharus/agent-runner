@@ -286,31 +286,31 @@ fn bounded_invocation_children_prioritize_running_over_terminal_history() {
 #[test]
 fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendant() {
     let db = test_db();
+    let unrelated_root_id = insert_invocation_fixture(
+        &db,
+        "20000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T07:00:00Z",
+    );
+    for index in 0..512 {
+        insert_invocation_fixture(
+            &db,
+            &format!("20000000-0000-0000-0001-{index:012}"),
+            Some(unrelated_root_id),
+            "2026-04-17T07:01:00Z",
+        );
+    }
     let root_id = insert_invocation_fixture(
         &db,
         "21000000-0000-0000-0000-000000000000",
         None,
         "2026-04-17T08:00:00Z",
     );
-    for index in 0..128 {
-        let child_id = insert_invocation_fixture(
-            &db,
-            &format!("22000000-0000-0000-0000-{index:012}"),
-            Some(root_id),
-            "2026-04-17T08:01:00Z",
-        );
-        db.conn
-            .execute(
-                "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
-                sqlite::params![child_id],
-            )
-            .unwrap();
-    }
     let ancestor_id = insert_invocation_fixture(
         &db,
         "23000000-0000-0000-0000-000000000000",
         Some(root_id),
-        "2026-04-17T08:02:00Z",
+        "2026-04-17T08:01:00Z",
     );
     db.conn
         .execute(
@@ -322,8 +322,22 @@ fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendan
         &db,
         "24000000-0000-0000-0000-000000000000",
         Some(ancestor_id),
-        "2026-04-17T08:03:00Z",
+        "2026-04-17T08:02:00Z",
     );
+    for index in 0..128 {
+        let child_id = insert_invocation_fixture(
+            &db,
+            &format!("22000000-0000-0000-0000-{index:012}"),
+            Some(root_id),
+            "2026-04-17T08:03:00Z",
+        );
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                sqlite::params![child_id],
+            )
+            .unwrap();
+    }
 
     StateDb::reset_invocation_row_map_count();
     let children = db
@@ -336,6 +350,119 @@ fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendan
         "23000000-0000-0000-0000-000000000000"
     );
     assert_eq!(StateDb::invocation_row_map_count(), 2);
+}
+
+#[test]
+fn running_descendant_queries_are_root_scoped_indexed_and_sort_free() {
+    let db = test_db();
+    let mut candidate_statement = db
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            StateDb::running_descendant_candidates_sql()
+        ))
+        .unwrap();
+    let candidate_details = candidate_statement
+        .query_map(sqlite::params![1_i64, 8_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        candidate_details
+            .iter()
+            .any(|detail| detail.contains("idx_invocations_parent_running_created")),
+        "{candidate_details:?}"
+    );
+    assert!(
+        candidate_details
+            .iter()
+            .all(|detail| !detail.contains("TEMP B-TREE")),
+        "{candidate_details:?}"
+    );
+
+    let mut descendant_statement = db
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            StateDb::running_descendant_exists_sql()
+        ))
+        .unwrap();
+    let descendant_details = descendant_statement
+        .query_map(sqlite::params![1_i64, 16_i64], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        descendant_details
+            .iter()
+            .any(|detail| detail.contains("idx_invocations_parent")),
+        "{descendant_details:?}"
+    );
+    assert!(
+        descendant_details
+            .iter()
+            .all(|detail| !detail.contains("idx_invocations_running_parent")),
+        "{descendant_details:?}"
+    );
+    assert!(
+        descendant_details
+            .iter()
+            .all(|detail| !detail.contains("TEMP B-TREE")),
+        "{descendant_details:?}"
+    );
+}
+
+#[test]
+fn running_descendant_query_interrupts_after_cancellation() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "25000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    let mut parent_id = insert_invocation_fixture(
+        &db,
+        "26000000-0000-0000-0000-000000000000",
+        Some(root_id),
+        "2026-04-17T08:01:00Z",
+    );
+    for index in 0..512 {
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                sqlite::params![parent_id],
+            )
+            .unwrap();
+        parent_id = insert_invocation_fixture(
+            &db,
+            &format!("27000000-0000-0000-0000-{index:012}"),
+            Some(parent_id),
+            "2026-04-17T08:02:00Z",
+        );
+    }
+    let pause = db.pause_invocation_query_progress_for_test();
+    let cancellation = oulipoly_core::CancellationToken::new();
+    let query_cancellation = cancellation.clone();
+    let query = std::thread::spawn(move || {
+        db.list_invocation_children_with_running_descendants_bounded_with_cancel(
+            root_id,
+            200,
+            &query_cancellation,
+        )
+    });
+    assert!(
+        pause.wait_until_entered(std::time::Duration::from_secs(5)),
+        "production invocation query never reached its SQLite progress callback"
+    );
+    let cancelled_at = std::time::Instant::now();
+    cancellation.cancel();
+    let result = query.join().unwrap();
+
+    assert_eq!(result.unwrap_err(), "Invocation child lookup cancelled");
+    assert!(cancelled_at.elapsed() < std::time::Duration::from_secs(1));
 }
 
 #[test]

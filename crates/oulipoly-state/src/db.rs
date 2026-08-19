@@ -174,6 +174,8 @@ use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
     active_lifecycle_session_id, lifecycle_terminal_status,
 };
+#[cfg(feature = "test-support")]
+pub use self::invocation_records::InvocationQueryProgressPause;
 pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};

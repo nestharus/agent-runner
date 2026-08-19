@@ -51,7 +51,9 @@ use crate::observability::{
     MonitorNodeId, MonitorNodeKind, MonitorSnapshot, MonitorStatus, ObservabilityRoot,
 };
 #[cfg(test)]
-use crate::observability::{ObservabilitySnapshotPort, SnapshotLimits};
+use crate::observability::{
+    ObservabilitySnapshotPort, ProductionObservabilitySnapshotService, SnapshotLimits,
+};
 use base64::Engine as _;
 #[cfg(test)]
 use chrono::{DateTime, Utc};
@@ -5823,7 +5825,9 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 mod tests {
     use super::super::{PtyPair, configure_child_pty};
     use super::*;
+    use oulipoly_state::{InvocationStart, StateDb};
     use ratatui::backend::TestBackend;
+    use std::ffi::OsString;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::FromRawFd;
     use std::process::Command;
@@ -5831,6 +5835,47 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    struct DataDirOverride {
+        prior: Option<OsString>,
+    }
+
+    impl DataDirOverride {
+        fn install(path: &std::path::Path) -> Self {
+            let prior = std::env::var_os("OULIPOLY_DATA_DIR");
+            unsafe {
+                std::env::set_var("OULIPOLY_DATA_DIR", path);
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for DataDirOverride {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prior.as_ref() {
+                    Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                    None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+                }
+            }
+        }
+    }
+
+    fn start_monitor_invocation(
+        state: &StateDb,
+        invocation_uuid: &str,
+        parent_invocation_id: Option<i64>,
+    ) -> i64 {
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "fixture~high".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id,
+            })
+            .unwrap()
+    }
 
     fn row_text(buf: &Buffer, area_y: u16, width: u16) -> String {
         (0..width)
@@ -8064,6 +8109,114 @@ mod tests {
             Some(42),
             "child read timeout proves input was forwarded without waiting for the slow snapshot"
         );
+    }
+
+    #[test]
+    fn observed_relay_interrupts_active_production_invocation_query_after_child_exit() {
+        let _env_lock = crate::test_support::lock_env();
+        let data_root = tempfile::tempdir().expect("data root");
+        let _data_dir = DataDirOverride::install(data_root.path());
+        let state = StateDb::open_default().expect("state");
+        let root_uuid = "31000000-0000-0000-0000-000000000000";
+        let root_id = start_monitor_invocation(&state, root_uuid, None);
+        let ancestor_id = start_monitor_invocation(
+            &state,
+            "32000000-0000-0000-0000-000000000000",
+            Some(root_id),
+        );
+        state
+            .finalize_invocation(ancestor_id, true, 0, None, None)
+            .unwrap();
+        start_monitor_invocation(
+            &state,
+            "33000000-0000-0000-0000-000000000000",
+            Some(ancestor_id),
+        );
+        for index in 0..128 {
+            let id = start_monitor_invocation(
+                &state,
+                &format!("34000000-0000-0000-0000-{index:012}"),
+                Some(root_id),
+            );
+            state.finalize_invocation(id, true, 0, None, None).unwrap();
+        }
+        let unrelated_root =
+            start_monitor_invocation(&state, "35000000-0000-0000-0000-000000000000", None);
+        for index in 0..512 {
+            start_monitor_invocation(
+                &state,
+                &format!("36000000-0000-0000-0000-{index:012}"),
+                Some(unrelated_root),
+            );
+        }
+        let query_pause = state.pause_invocation_query_progress_for_test();
+        drop(state);
+
+        let outer = open_outer_pty(24, 80);
+        make_raw(outer.slave.as_raw_fd());
+        let full = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let termios = tty_termios(outer.slave.as_raw_fd());
+        let pty = PtyPair::open(&top_pane_winsize(&full), &termios).expect("inner pty");
+        let observation_path = data_root.path().join("input-observed");
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(
+            r#"IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] || exit 8; printf observed > "$OBSERVED_INPUT_PATH"; exit 42"#,
+        );
+        cmd.env("OBSERVED_INPUT_PATH", &observation_path);
+        configure_child_pty(&mut cmd, &pty).expect("configure child pty");
+        let child = cmd.spawn().expect("spawn child");
+        drop(pty.slave);
+
+        let writer = outer.slave.try_clone().expect("clone writer");
+        let input_fd = outer.slave.as_raw_fd();
+        let master = pty.master;
+        let monitor = Box::new(ProductionObservabilitySnapshotService::new(None));
+        let root = ObservabilityRoot {
+            invocation_uuid: Some(root_uuid.to_string()),
+            ..ObservabilityRoot::default()
+        };
+        let (relay_done_tx, relay_done_rx) = mpsc::sync_channel(1);
+        let relay = thread::spawn(move || {
+            let mut child = child;
+            let result = relay_until_exit_observed(
+                input_fd,
+                writer,
+                &master,
+                None,
+                &mut child,
+                monitor,
+                root,
+                OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
+            );
+            let _ = relay_done_tx.send(result);
+        });
+
+        assert!(
+            query_pause.wait_until_entered(Duration::from_secs(5)),
+            "production invocation query never reached its SQLite progress callback"
+        );
+        (&outer.master).write_all(b"ping\n").expect("write input");
+        set_nonblocking(outer.master.as_raw_fd());
+        let mut buf = [0_u8; 8192];
+        let observation_deadline = Instant::now() + Duration::from_secs(2);
+        while !observation_path.exists() && Instant::now() < observation_deadline {
+            let _ = (&outer.master).read(&mut buf);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(observation_path.exists(), "child never observed input");
+
+        let settled_at = Instant::now();
+        let result = relay_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("child settlement should interrupt the active SQLite query");
+        relay.join().expect("relay thread panicked");
+        assert!(settled_at.elapsed() < Duration::from_secs(1));
+        assert_eq!(result.expect("relay error").code(), Some(42));
     }
 
     // The child PTY is resized to the TOP pane (persistent overlay rows reserved) on terminal
