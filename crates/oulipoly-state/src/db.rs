@@ -255,7 +255,6 @@ use uuid::Uuid;
 
 pub struct StateDb {
     conn: sqlite::Connection,
-    _source_connection_guard: Option<crate::read_only_snapshot::SourceConnectionGuard>,
     db_path: PathBuf,
     // Completion authority rejoins the accepted source path to one canonical local file identity.
     completion_authority_state: Option<CompletionAuthorityStateIdentity>,

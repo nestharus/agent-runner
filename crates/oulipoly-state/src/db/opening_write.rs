@@ -204,11 +204,6 @@ impl StateDb {
         provider_names: &LegacyProviderNames,
         state_namespace_guard: Option<StateNamespaceGuard>,
     ) -> Result<Self, String> {
-        let source_connection_guard = state_namespace_guard
-            .as_ref()
-            .map(|_| crate::read_only_snapshot::SourceConnectionGuard::acquire(&db_path))
-            .transpose()
-            .map_err(|error| format!("Failed to register State DB connection: {error}"))?;
         let mut conn = Self::open_state_connection(&db_path)?;
 
         let ran_open_migrations = Self::run_open_migrations(&db_path, &mut conn)?;
@@ -217,7 +212,6 @@ impl StateDb {
             Self::durable_completion_authority_path(source_path, &db_path);
         let db = StateDb {
             conn,
-            _source_connection_guard: source_connection_guard,
             db_path,
             completion_authority_state,
             lifecycle_sink: Mutex::new(sink),
@@ -312,7 +306,6 @@ impl StateDb {
 
         Ok(Self {
             conn,
-            _source_connection_guard: None,
             db_path: source,
             completion_authority_state: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),

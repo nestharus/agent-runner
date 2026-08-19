@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 chrono.workspace = true
+ctor.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 getrandom.workspace = true

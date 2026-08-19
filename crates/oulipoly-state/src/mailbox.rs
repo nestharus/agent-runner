@@ -788,7 +788,6 @@ struct WakeSweepSessionState {
 /// ```
 pub struct MailboxDb {
     conn: Connection,
-    _source_connection_guard: Option<crate::read_only_snapshot::SourceConnectionGuard>,
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
     _namespace_authority: Option<MailboxAuthorityFence>,
@@ -850,7 +849,6 @@ pub(crate) struct MailboxAuthorityFence {
 pub struct MailboxDbRebuildAuthority<'state> {
     namespace: MailboxAuthorityFence,
     writer: Option<Connection>,
-    writer_source_guard: Option<crate::read_only_snapshot::SourceConnectionGuard>,
     _state_authority: &'state crate::StateDbRebuildAuthority,
 }
 
@@ -1162,11 +1160,10 @@ impl MailboxDb {
                 ));
             }
         };
-        let (writer, writer_source_guard) = acquire_mailbox_rebuild_writer(&namespace)?;
+        let writer = acquire_mailbox_rebuild_writer(&namespace)?;
         Ok(MailboxDbRebuildAuthority {
             namespace,
             writer,
-            writer_source_guard,
             _state_authority: state_authority,
         })
     }
@@ -1208,9 +1205,6 @@ impl MailboxDb {
 
     pub(crate) fn open_with_authority(authority: &MailboxAuthorityFence) -> Result<Self, String> {
         let path = authority.path();
-        let source_connection_guard =
-            crate::read_only_snapshot::SourceConnectionGuard::acquire(path)
-                .map_err(|error| format!("Failed to register PID mailbox connection: {error}"))?;
         let mut conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID mailbox sidecar: {err}"))?;
         authority.validate_opened_target()?;
@@ -1219,7 +1213,6 @@ impl MailboxDb {
         ensure_shared_sidecar_schema(&mut conn)?;
         Ok(Self {
             conn,
-            _source_connection_guard: Some(source_connection_guard),
             path: path.to_path_buf(),
             _read_only_snapshot: None,
             _namespace_authority: None,
@@ -1241,7 +1234,6 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         Ok(Self {
             conn,
-            _source_connection_guard: None,
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
             _namespace_authority: None,
@@ -1252,9 +1244,6 @@ impl MailboxDb {
         authority: &MailboxAuthorityFence,
     ) -> Result<Self, String> {
         let path = authority.path();
-        let source_connection_guard =
-            crate::read_only_snapshot::SourceConnectionGuard::acquire(path)
-                .map_err(|error| format!("Failed to register PID mailbox connection: {error}"))?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
@@ -1263,7 +1252,6 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
             conn,
-            _source_connection_guard: Some(source_connection_guard),
             path: path.to_path_buf(),
             _read_only_snapshot: None,
             _namespace_authority: None,
@@ -4059,25 +4047,15 @@ impl MailboxDbRebuildAuthority<'_> {
 
     fn release_writer(&mut self) {
         drop(self.writer.take());
-        drop(self.writer_source_guard.take());
     }
 }
 
 fn acquire_mailbox_rebuild_writer(
     namespace: &MailboxAuthorityFence,
-) -> Result<
-    (
-        Option<Connection>,
-        Option<crate::read_only_snapshot::SourceConnectionGuard>,
-    ),
-    String,
-> {
+) -> Result<Option<Connection>, String> {
     if !namespace.path().exists() {
-        return Ok((None, None));
+        return Ok(None);
     }
-    let source_connection_guard =
-        crate::read_only_snapshot::SourceConnectionGuard::acquire(namespace.path())
-            .map_err(|error| format!("Failed to register PID mailbox rebuild writer: {error}"))?;
     let connection =
         Connection::open_with_flags(namespace.path(), OpenFlags::SQLITE_OPEN_READ_WRITE).map_err(
             |error| {
@@ -4090,7 +4068,7 @@ fn acquire_mailbox_rebuild_writer(
         .busy_timeout(mailbox_writer_sqlite_timeout())
         .map_err(|error| format!("Failed to configure PID mailbox rebuild writer: {error}"))?;
     match connection.execute_batch("BEGIN IMMEDIATE") {
-        Ok(()) => Ok((Some(connection), Some(source_connection_guard))),
+        Ok(()) => Ok(Some(connection)),
         Err(error)
             if matches!(
                 error.sqlite_error_code(),
@@ -4102,7 +4080,7 @@ fn acquire_mailbox_rebuild_writer(
                 "process_integrity: completion_authority_contention: timed out acquiring PID mailbox rebuild writer: {error}"
             ))
         }
-        Err(error) if sqlite_error_is_corrupt(&error) => Ok((None, None)),
+        Err(error) if sqlite_error_is_corrupt(&error) => Ok(None),
         Err(error) => Err(format!(
             "process_integrity: completion_authority_rebuild_writer_unavailable: failed to prove the existing PID mailbox writer cut; retry after reconciling sidecar access: {error}"
         )),

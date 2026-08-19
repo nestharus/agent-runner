@@ -82,7 +82,6 @@ pub struct LiveProcessIdentityRecord<'a> {
 /// ```
 pub struct PidIdentityDb {
     conn: Connection,
-    _source_connection_guard: Option<crate::read_only_snapshot::SourceConnectionGuard>,
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
     _namespace_authority: Option<crate::mailbox::MailboxAuthorityFence>,
@@ -111,9 +110,6 @@ impl PidIdentityDb {
         authority: &crate::mailbox::MailboxAuthorityFence,
     ) -> Result<Self, String> {
         let path = authority.path();
-        let source_connection_guard =
-            crate::read_only_snapshot::SourceConnectionGuard::acquire(path)
-                .map_err(|error| format!("Failed to register PID identity connection: {error}"))?;
         let conn = Connection::open(path)
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
         authority.validate_opened_target()?;
@@ -122,7 +118,6 @@ impl PidIdentityDb {
         ensure_identity_schema(&conn)?;
         Ok(Self {
             conn,
-            _source_connection_guard: Some(source_connection_guard),
             path: path.to_path_buf(),
             _read_only_snapshot: None,
             _namespace_authority: None,
@@ -150,7 +145,6 @@ impl PidIdentityDb {
                 .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
         Ok(Self {
             conn,
-            _source_connection_guard: None,
             path: path.to_path_buf(),
             _read_only_snapshot: Some(snapshot),
             _namespace_authority: None,

@@ -47,6 +47,7 @@ pub mod repositories;
 pub mod result_envelope;
 pub mod schema;
 pub mod schema_probe;
+mod snapshot_helper;
 
 pub type StateDbError = String;
 
