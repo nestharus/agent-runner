@@ -10,6 +10,8 @@ use oulipoly_state::mailbox::{
     MailboxDb, RuntimeGenerationRow, RuntimeLifecycleState, SessionGenerationProjection,
     SessionLiveness, WakeSweepCandidate,
 };
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -31,27 +33,67 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
     run_wake_reclaim_sweep_or_warn("process_start");
 }
 
-pub(crate) fn start_startup_wake_reclaim_sweep() {
-    if is_auto_wake_invocation() {
-        return;
+pub(crate) struct StartupWakeReclaimGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for StartupWakeReclaimGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            if let Err(err) = handle.join() {
+                tracing::warn!(?err, "Startup wake reclaim sweep failed to join cleanly");
+            }
+        }
     }
-    start_wake_reclaim_driver("process_start");
+}
+
+pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGuard> {
+    if is_auto_wake_invocation() {
+        return None;
+    }
+    static STARTUP_SWEEP_STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTUP_SWEEP_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return None;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    match spawn_wake_reclaim_thread(move || {
+        run_wake_reclaim_sweep_or_warn_with_cancel("process_start", &|| {
+            thread_stop.load(Ordering::SeqCst)
+        });
+    }) {
+        Ok(handle) => Some(StartupWakeReclaimGuard {
+            stop,
+            handle: Some(handle),
+        }),
+        Err(err) => {
+            STARTUP_SWEEP_STARTED.store(false, Ordering::SeqCst);
+            warn_wake_reclaim_driver_start_failed(err);
+            None
+        }
+    }
 }
 
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
     if is_auto_wake_invocation() {
         return;
     }
-    start_wake_reclaim_driver("maintenance_start");
-}
-
-fn start_wake_reclaim_driver(initial_trigger: &'static str) {
-    static DRIVER_STARTED: AtomicBool = AtomicBool::new(false);
-    if let Err(err) = try_start_wake_reclaim_driver(&DRIVER_STARTED, || {
-        spawn_wake_reclaim_thread(move || wake_reclaim_maintenance_loop(initial_trigger)).map(drop)
+    static MAINTENANCE_DRIVER_STARTED: AtomicBool = AtomicBool::new(false);
+    if let Err(err) = try_start_wake_reclaim_driver(&MAINTENANCE_DRIVER_STARTED, || {
+        spawn_wake_reclaim_thread(|| wake_reclaim_maintenance_loop("maintenance_start")).map(drop)
     }) {
         warn_wake_reclaim_driver_start_failed(err);
     }
+}
+
+struct WakeSweepAdmission {
+    _file: File,
 }
 
 pub(crate) struct LivePtyRetryDriverGuard {
@@ -145,7 +187,11 @@ fn wake_reclaim_maintenance_loop(initial_trigger: &'static str) {
 }
 
 fn run_wake_reclaim_sweep_or_warn(trigger: &str) {
-    if let Err(err) = run_wake_reclaim_sweep(trigger) {
+    run_wake_reclaim_sweep_or_warn_with_cancel(trigger, &|| false);
+}
+
+fn run_wake_reclaim_sweep_or_warn_with_cancel(trigger: &str, is_cancelled: &dyn Fn() -> bool) {
+    if let Err(err) = run_wake_reclaim_sweep(trigger, is_cancelled) {
         warn_wake_reclaim_sweep_failed(trigger, err);
     }
 }
@@ -154,11 +200,28 @@ fn warn_wake_reclaim_sweep_failed(trigger: &str, err: String) {
     tracing::warn!(trigger, "Wake reclaim sweep failed: {err}");
 }
 
-fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
+fn run_wake_reclaim_sweep(trigger: &str, is_cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+    if is_cancelled() {
+        return Ok(());
+    }
+    let mailbox_path = MailboxDb::default_path()?;
+    if !mailbox_path.exists() {
+        return Ok(());
+    }
+    let Some(_admission) = try_acquire_wake_sweep_admission(&mailbox_path)? else {
+        tracing::debug!(
+            trigger,
+            "Wake reclaim sweep already owned by another process"
+        );
+        return Ok(());
+    };
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    retry_pending_live_pty_deliveries(&mut db, trigger)?;
+    retry_pending_live_pty_deliveries(&mut db, trigger, is_cancelled)?;
+    if is_cancelled() {
+        return Ok(());
+    }
     let candidates = db.wake_sessions().wake_sweep_candidates(
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
@@ -169,16 +232,56 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
     let start = plan_wake_sweep(
         &mut db,
         candidates,
-        state::open_default_state_read_only_with_timeout(Duration::from_secs(
-            WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
-        )),
+        state::open_default_state_read_only_with_timeout_and_cancel(
+            Duration::from_secs(WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS),
+            is_cancelled,
+        ),
     )?;
     drop(db);
     for candidate in start {
+        if is_cancelled() {
+            return Ok(());
+        }
         let diagnostic = start_wake_chain(wake_sweep_start_input(&candidate, trigger));
         trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
     }
     Ok(())
+}
+
+fn try_acquire_wake_sweep_admission(
+    mailbox_path: &Path,
+) -> Result<Option<WakeSweepAdmission>, String> {
+    let path = wake_sweep_admission_path(mailbox_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|error| {
+        format!(
+            "Failed to open wake sweep admission {}: {error}",
+            path.display()
+        )
+    })?;
+    match <File as fs4::FileExt>::try_lock(&file) {
+        Ok(()) => Ok(Some(WakeSweepAdmission { _file: file })),
+        Err(fs4::TryLockError::WouldBlock) => Ok(None),
+        Err(fs4::TryLockError::Error(error)) => Err(format!(
+            "Failed to acquire wake sweep admission {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn wake_sweep_admission_path(mailbox_path: &Path) -> Result<PathBuf, String> {
+    let file_name = mailbox_path
+        .file_name()
+        .ok_or_else(|| "PID mailbox path has no file name".to_string())?;
+    let mut admission_name = file_name.to_os_string();
+    admission_name.push(".wake-reclaim.lock");
+    Ok(mailbox_path.with_file_name(admission_name))
 }
 
 fn retry_pending_live_pty_deliveries_or_warn(trigger: &str) {
@@ -191,14 +294,21 @@ fn retry_pending_live_pty_deliveries_from_default_db(trigger: &str) -> Result<()
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    retry_pending_live_pty_deliveries(&mut db, trigger)
+    retry_pending_live_pty_deliveries(&mut db, trigger, &|| false)
 }
 
-fn retry_pending_live_pty_deliveries(db: &mut MailboxDb, trigger: &str) -> Result<(), String> {
+fn retry_pending_live_pty_deliveries(
+    db: &mut MailboxDb,
+    trigger: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
     let session_ids = db
         .wake_sessions()
         .pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
     for session_id in session_ids {
+        if is_cancelled() {
+            return Ok(());
+        }
         match live_pty_retry_applicability(db, &session_id)? {
             LivePtyRetryApplicability::Applicable => {
                 let diagnostic = crate::mailbox_delivery::attempt_pty_mailbox_delivery_with_trigger(
@@ -506,6 +616,30 @@ mod tests {
         });
         assert_eq!(third.unwrap(), false);
         assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn wake_sweep_admission_is_cross_handle_single_flight_and_reusable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&mailbox_path).unwrap());
+
+        let first = try_acquire_wake_sweep_admission(&mailbox_path)
+            .unwrap()
+            .expect("first sweep must acquire admission");
+        assert!(
+            try_acquire_wake_sweep_admission(&mailbox_path)
+                .unwrap()
+                .is_none(),
+            "a second handle must not enter the same sweep"
+        );
+        drop(first);
+        assert!(
+            try_acquire_wake_sweep_admission(&mailbox_path)
+                .unwrap()
+                .is_some(),
+            "admission must return after the owner exits"
+        );
     }
 
     #[test]

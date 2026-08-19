@@ -107,13 +107,16 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = recover_pending_session_replaces() {
         return Ok(handle_pending_session_replace_error(&err));
     }
-    if startup_wake_reclaim_sweep_enabled(&cli) {
+    let _startup_wake_reclaim_guard = if startup_wake_reclaim_sweep_enabled(&cli) {
         if provider_launch_schedules_startup_wake_reclaim(&cli) {
-            crate::wake_coordinator::start_startup_wake_reclaim_sweep();
+            crate::wake_coordinator::start_startup_wake_reclaim_sweep()
         } else {
             crate::wake_coordinator::run_startup_wake_reclaim_sweep();
+            None
         }
-    }
+    } else {
+        None
+    };
 
     if cli.new {
         return run_default_provider_repl(&cli);
@@ -218,6 +221,7 @@ fn pending_session_replace_exit_code(err: &session_replace::ReplaceError) -> i32
 }
 
 fn run_default_provider_repl(cli: &Cli) -> Result<i32, String> {
+    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
     run_default_provider_repl_for_project(cli.project.clone())
 }
 

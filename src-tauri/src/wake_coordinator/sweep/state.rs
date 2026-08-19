@@ -7,11 +7,12 @@ use oulipoly_state::mailbox::MailboxDb;
 use std::path::Path;
 use std::time::Duration;
 
-pub(super) fn open_default_state_read_only_with_timeout(
+pub(super) fn open_default_state_read_only_with_timeout_and_cancel(
     timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<StateDb>, String> {
     let path = StateDb::default_path()?;
-    open_state_read_only_at_with_timeout(&path, timeout)
+    open_state_read_only_at_with_retry_timeout(&path, timeout, is_cancelled)
 }
 
 #[cfg(test)]
@@ -19,11 +20,12 @@ pub(super) fn open_state_read_only_at(path: &Path) -> Result<Option<StateDb>, St
     open_state_read_only_at_with_cancel(path, &|| false)
 }
 
+#[cfg(test)]
 fn open_state_read_only_at_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<Option<StateDb>, String> {
-    open_state_read_only_at_with_retry_timeout(path, timeout)
+    open_state_read_only_at_with_retry_timeout(path, timeout, &|| false)
 }
 
 #[cfg(test)]
@@ -44,13 +46,14 @@ fn open_state_read_only_at_with_cancel(
 fn open_state_read_only_at_with_retry_timeout(
     path: &Path,
     retry_timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<StateDb>, String> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("Failed to inspect State path: {error}")),
     }
-    StateDb::open_read_only_with_retry_timeout(path, retry_timeout)
+    StateDb::open_read_only_with_retry_timeout_and_cancel(path, retry_timeout, is_cancelled)
         .map(Some)
         .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
 }

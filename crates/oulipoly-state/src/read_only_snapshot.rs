@@ -4,6 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -141,7 +143,7 @@ fn copy_artifact_set_in_helper(
         .arg(source)
         .arg(destination)
         .arg(control.path())
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = command.spawn()?;
@@ -228,9 +230,22 @@ fn read_helper_result(control: &Path, succeeded: bool) -> io::Result<bool> {
 }
 
 pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i32 {
-    match execute_helper(source, destination, control) {
+    let parent_connected = match watch_parent_connection() {
+        Ok(parent_connected) => parent_connected,
+        Err(error) => {
+            let result = format!("error\n{}\n{error}", helper_error_kind_code(error.kind()));
+            let _ = std::fs::write(control.join("result"), result);
+            return 1;
+        }
+    };
+    let is_cancelled = || !parent_connected.load(Ordering::SeqCst);
+    match execute_helper(source, destination, control, &is_cancelled) {
         Ok(()) => 0,
         Err(error) => {
+            if is_cancelled() {
+                cleanup_abandoned_helper_files(destination, control);
+                return 1;
+            }
             let result = format!("error\n{}\n{error}", helper_error_kind_code(error.kind()));
             let _ = std::fs::write(control.join("result"), result);
             1
@@ -238,14 +253,56 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
     }
 }
 
-fn execute_helper(source: &Path, destination: &Path, control: &Path) -> io::Result<()> {
-    let Some(mut copied) = copy_artifact_set_inline(source, destination, &|| false)? else {
+fn watch_parent_connection() -> io::Result<Arc<AtomicBool>> {
+    let parent_connected = Arc::new(AtomicBool::new(true));
+    let watcher_state = Arc::clone(&parent_connected);
+    std::thread::Builder::new()
+        .name("oulipoly-snapshot-parent-watch".to_string())
+        .spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buffer = [0_u8; 1];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        watcher_state.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })?;
+    Ok(parent_connected)
+}
+
+fn cleanup_abandoned_helper_files(destination: &Path, control: &Path) {
+    for suffix in SQLITE_ARTIFACT_SUFFIXES {
+        let _ = std::fs::remove_file(path_with_suffix(destination, suffix));
+    }
+    for marker in ["ready", "compare", "result"] {
+        let _ = std::fs::remove_file(control.join(marker));
+    }
+    let _ = std::fs::remove_dir(control);
+    if destination.parent() == control.parent()
+        && let Some(parent) = destination.parent()
+    {
+        let _ = std::fs::remove_dir(parent);
+    }
+}
+
+fn execute_helper(
+    source: &Path,
+    destination: &Path,
+    control: &Path,
+    is_cancelled: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    let Some(mut copied) = copy_artifact_set_inline(source, destination, is_cancelled)? else {
         std::fs::write(control.join("result"), "changed\n")?;
         return Ok(());
     };
     std::fs::write(control.join("ready"), [])?;
     let deadline = Instant::now() + HELPER_COMPARE_TIMEOUT;
     while !control.join("compare").exists() {
+        ensure_snapshot_not_cancelled(is_cancelled)?;
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -254,7 +311,7 @@ fn execute_helper(source: &Path, destination: &Path, control: &Path) -> io::Resu
         }
         std::thread::sleep(HELPER_POLL_INTERVAL);
     }
-    let outcome = if artifact_sets_match(source, destination, &mut copied, &|| false)? {
+    let outcome = if artifact_sets_match(source, destination, &mut copied, is_cancelled)? {
         "stable\n"
     } else {
         "changed\n"
@@ -913,6 +970,56 @@ mod tests {
             0
         );
         drop(state);
+    }
+
+    #[test]
+    fn snapshot_helper_exits_and_cleans_up_when_parent_connection_closes() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let source = source_directory.path().join("state.db");
+        std::fs::write(&source, vec![7_u8; COPY_BUFFER_BYTES * 4]).unwrap();
+        let snapshot_directory = tempfile::tempdir().unwrap().keep();
+        let destination = snapshot_directory.join("state.db");
+        let control = snapshot_directory.join("control");
+        std::fs::create_dir(&control).unwrap();
+
+        let mut child = snapshot_helper_command().unwrap();
+        child
+            .arg(&source)
+            .arg(&destination)
+            .arg(&control)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = child.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !control.join("ready").exists() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "snapshot helper exited before publishing readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "snapshot helper did not become ready"
+            );
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        }
+
+        drop(child.stdin.take());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "disconnected snapshot helper did not exit"
+            );
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        };
+
+        assert!(!status.success());
+        assert!(source.exists());
+        assert!(!snapshot_directory.exists());
     }
 
     #[cfg(target_os = "linux")]

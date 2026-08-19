@@ -14,7 +14,7 @@ mod turn_recheck;
 mod wake_start;
 
 pub(crate) type WakeDiagnostic = diagnostics::WakeDiagnostic;
-pub(crate) use sweep::LivePtyRetryDriverGuard;
+pub(crate) use sweep::{LivePtyRetryDriverGuard, StartupWakeReclaimGuard};
 
 pub(crate) fn selected_auto_wake_max() -> i64 {
     auto_wake_env::auto_wake_max()
@@ -36,8 +36,8 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
     sweep::run_startup_wake_reclaim_sweep();
 }
 
-pub(crate) fn start_startup_wake_reclaim_sweep() {
-    sweep::start_startup_wake_reclaim_sweep();
+pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGuard> {
+    sweep::start_startup_wake_reclaim_sweep()
 }
 
 pub(crate) fn start_wake_reclaim_maintenance_driver() {

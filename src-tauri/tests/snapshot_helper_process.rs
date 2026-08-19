@@ -1,4 +1,5 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[test]
 fn runner_executes_physical_snapshot_protocol_before_cli_dispatch() {
@@ -10,19 +11,30 @@ fn runner_executes_physical_snapshot_protocol_before_cli_dispatch() {
     std::fs::write(&source, "physical snapshot bytes").unwrap();
     std::fs::write(control.join("compare"), []).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
         .arg("__oulipoly-snapshot-helper")
         .arg(&source)
         .arg(&destination)
         .arg(&control)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("snapshot helper did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
 
-    assert!(
-        output.status.success(),
-        "snapshot helper failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(status.success(), "snapshot helper failed: {status}");
     assert_eq!(
         std::fs::read(&destination).unwrap(),
         b"physical snapshot bytes"

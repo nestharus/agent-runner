@@ -185,6 +185,7 @@ impl StateDb {
     pub(super) fn open_read_only_connection_with_retry_timeout(
         path: &Path,
         retry_timeout: std::time::Duration,
+        is_cancelled: &dyn Fn() -> bool,
     ) -> Result<
         (
             sqlite::Connection,
@@ -195,7 +196,7 @@ impl StateDb {
         let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_timeout(
             path,
             retry_timeout,
-            &|| false,
+            is_cancelled,
         )
         .map_err(|err| ReadOnlyOpenError::Operational {
             message: format!("Failed to snapshot read-only SQLite database: {err}"),
