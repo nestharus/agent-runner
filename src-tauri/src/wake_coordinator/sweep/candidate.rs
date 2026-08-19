@@ -14,7 +14,7 @@ use crate::wake_coordinator::auto_wake_env::{
 };
 
 pub(super) fn wake_sweep_candidate_disposition(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<WakeSweepDisposition, String> {
@@ -124,10 +124,17 @@ fn option_is_present<T>(value: Option<T>) -> bool {
 }
 
 fn wake_sweep_candidate_resumable_runtime(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<Option<SessionMetadataRow>, String> {
+    if db
+        .runtime_lifecycle()
+        .reconcile_session_liveness(&candidate.session_id)?
+        == oulipoly_state::mailbox::SessionLiveness::Busy
+    {
+        return Ok(None);
+    }
     if !matches!(
         db.runtime_lifecycle_reader()
             .session_generation_projection(&candidate.session_id)

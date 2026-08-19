@@ -10,17 +10,20 @@ use oulipoly_state::mailbox::{
     MailboxDb, RuntimeGenerationRow, RuntimeLifecycleState, SessionGenerationProjection,
     SessionLiveness, WakeSweepCandidate,
 };
+use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::auto_wake_env::is_auto_wake_invocation;
 use super::constants::{
-    LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
+    LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_HANDOFF_OWNER_ENV,
+    WAKE_RECLAIM_HANDOFF_TOKEN_ENV, WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
     WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
 };
 use super::diagnostics::WakeDiagnostic;
@@ -28,6 +31,11 @@ use super::wake_start::{StartWakeInput, start_wake_chain};
 use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
 
 const STARTUP_SWEEP_COMPLETION_GRACE: Duration = Duration::from_secs(5);
+const STARTUP_SWEEP_CANCELLATION_GRACE: Duration = Duration::from_secs(1);
+const WAKE_SWEEP_LEASE_DURATION: Duration = Duration::from_secs(10);
+const WAKE_SWEEP_HANDOFF_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const WAKE_SWEEP_LEASE_SCHEMA_VERSION: u8 = 1;
+const WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN: &str = "wake-reclaim-bootstrap";
 
 pub(crate) fn run_startup_wake_reclaim_sweep() {
     if is_auto_wake_invocation() {
@@ -41,17 +49,34 @@ pub(crate) struct StartupWakeReclaimGuard {
     done: Receiver<()>,
     handle: Option<JoinHandle<()>>,
     completion_grace: Duration,
+    cancellation_grace: Duration,
+    schedule_handoff: Option<fn()>,
 }
 
 impl Drop for StartupWakeReclaimGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            if matches!(
+            let timed_out = matches!(
                 self.done.recv_timeout(self.completion_grace),
                 Err(RecvTimeoutError::Timeout)
-            ) {
+            );
+            if timed_out {
+                if let Some(schedule_handoff) = self.schedule_handoff {
+                    schedule_handoff();
+                }
                 self.stop.store(true, Ordering::SeqCst);
                 handle.thread().unpark();
+            }
+            if timed_out
+                && matches!(
+                    self.done.recv_timeout(self.cancellation_grace),
+                    Err(RecvTimeoutError::Timeout)
+                )
+            {
+                tracing::warn!(
+                    "Startup wake reclaim sweep did not settle after cancellation; detached handoff retains retry authority"
+                );
+                return;
             }
             if let Err(err) = handle.join() {
                 tracing::warn!(?err, "Startup wake reclaim sweep failed to join cleanly");
@@ -85,6 +110,8 @@ pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGua
             done,
             handle: Some(handle),
             completion_grace: STARTUP_SWEEP_COMPLETION_GRACE,
+            cancellation_grace: STARTUP_SWEEP_CANCELLATION_GRACE,
+            schedule_handoff: Some(spawn_wake_reclaim_bootstrap_or_warn),
         }),
         Err(err) => {
             STARTUP_SWEEP_STARTED.store(false, Ordering::SeqCst);
@@ -107,7 +134,38 @@ pub(crate) fn start_wake_reclaim_maintenance_driver() {
 }
 
 struct WakeSweepAdmission {
-    _file: File,
+    mailbox_path: PathBuf,
+    token: String,
+}
+
+// The OS lock protects only lease-file mutation. The lease may expire while an
+// old sweep is alive because per-session wake claims fence the valuable action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WakeSweepLease {
+    schema_version: u8,
+    owner_token: String,
+    expires_at_unix_ms: u64,
+    handoff_token: Option<String>,
+}
+
+enum WakeSweepAdmissionAttempt {
+    Acquired(WakeSweepAdmission),
+    Owned(String),
+    CoordinationBusy,
+}
+
+enum WakeSweepRunOutcome {
+    Completed,
+    Contended(String),
+    CoordinationBusy,
+}
+
+impl Drop for WakeSweepAdmission {
+    fn drop(&mut self) {
+        if let Err(error) = clear_wake_sweep_lease(&self.mailbox_path, &self.token) {
+            tracing::warn!("Failed to clear wake sweep lease: {error}");
+        }
+    }
 }
 
 pub(crate) struct LivePtyRetryDriverGuard {
@@ -205,8 +263,14 @@ fn run_wake_reclaim_sweep_or_warn(trigger: &str) {
 }
 
 fn run_wake_reclaim_sweep_or_warn_with_cancel(trigger: &str, is_cancelled: &dyn Fn() -> bool) {
-    if let Err(err) = run_wake_reclaim_sweep(trigger, is_cancelled) {
-        warn_wake_reclaim_sweep_failed(trigger, err);
+    match run_wake_reclaim_sweep(trigger, is_cancelled) {
+        Ok(WakeSweepRunOutcome::Contended(owner_token)) if trigger == "process_start" => {
+            if let Ok(mailbox_path) = MailboxDb::default_path() {
+                ensure_wake_sweep_handoff(&mailbox_path, &owner_token);
+            }
+        }
+        Ok(_) => {}
+        Err(err) => warn_wake_reclaim_sweep_failed(trigger, err),
     }
 }
 
@@ -214,34 +278,44 @@ fn warn_wake_reclaim_sweep_failed(trigger: &str, err: String) {
     tracing::warn!(trigger, "Wake reclaim sweep failed: {err}");
 }
 
-fn run_wake_reclaim_sweep(trigger: &str, is_cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+fn run_wake_reclaim_sweep(
+    trigger: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<WakeSweepRunOutcome, String> {
     if is_cancelled() {
-        return Ok(());
+        return Ok(WakeSweepRunOutcome::Completed);
     }
     let mailbox_path = MailboxDb::default_path()?;
     if !mailbox_path.exists() {
-        return Ok(());
+        return Ok(WakeSweepRunOutcome::Completed);
     }
-    let Some(_admission) = try_acquire_wake_sweep_admission(&mailbox_path)? else {
-        tracing::debug!(
-            trigger,
-            "Wake reclaim sweep already owned by another process"
-        );
-        return Ok(());
+    let _admission = match try_acquire_wake_sweep_admission(&mailbox_path)? {
+        WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+        WakeSweepAdmissionAttempt::Owned(owner_token) => {
+            tracing::debug!(
+                trigger,
+                "Wake reclaim sweep already owned by another process"
+            );
+            return Ok(WakeSweepRunOutcome::Contended(owner_token));
+        }
+        WakeSweepAdmissionAttempt::CoordinationBusy => {
+            tracing::debug!(trigger, "Wake reclaim sweep coordination is busy");
+            return Ok(WakeSweepRunOutcome::CoordinationBusy);
+        }
     };
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(());
+        return Ok(WakeSweepRunOutcome::Completed);
     };
     retry_pending_live_pty_deliveries(&mut db, trigger, is_cancelled)?;
     if is_cancelled() {
-        return Ok(());
+        return Ok(WakeSweepRunOutcome::Completed);
     }
     let candidates = db.wake_sessions().wake_sweep_candidates(
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
     )?;
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(WakeSweepRunOutcome::Completed);
     }
     let start = plan_wake_sweep(
         &mut db,
@@ -254,17 +328,43 @@ fn run_wake_reclaim_sweep(trigger: &str, is_cancelled: &dyn Fn() -> bool) -> Res
     drop(db);
     for candidate in start {
         if is_cancelled() {
-            return Ok(());
+            return Ok(WakeSweepRunOutcome::Completed);
         }
         let diagnostic = start_wake_chain(wake_sweep_start_input(&candidate, trigger));
         trace_wake_sweep_candidate(&candidate.session_id, &diagnostic);
     }
-    Ok(())
+    Ok(WakeSweepRunOutcome::Completed)
 }
 
 fn try_acquire_wake_sweep_admission(
     mailbox_path: &Path,
-) -> Result<Option<WakeSweepAdmission>, String> {
+) -> Result<WakeSweepAdmissionAttempt, String> {
+    let Some(_coordination) = try_acquire_wake_sweep_coordination(mailbox_path)? else {
+        return Ok(WakeSweepAdmissionAttempt::CoordinationBusy);
+    };
+    let now = unix_time_ms()?;
+    if let Some(lease) = read_wake_sweep_lease(mailbox_path)?
+        && lease.expires_at_unix_ms > now
+    {
+        return Ok(WakeSweepAdmissionAttempt::Owned(lease.owner_token));
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    write_wake_sweep_lease(
+        mailbox_path,
+        &WakeSweepLease {
+            schema_version: WAKE_SWEEP_LEASE_SCHEMA_VERSION,
+            owner_token: token.clone(),
+            expires_at_unix_ms: now.saturating_add(wake_sweep_lease_duration_ms()),
+            handoff_token: None,
+        },
+    )?;
+    Ok(WakeSweepAdmissionAttempt::Acquired(WakeSweepAdmission {
+        mailbox_path: mailbox_path.to_path_buf(),
+        token,
+    }))
+}
+
+fn try_acquire_wake_sweep_coordination(mailbox_path: &Path) -> Result<Option<File>, String> {
     let path = wake_sweep_admission_path(mailbox_path)?;
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
@@ -280,13 +380,37 @@ fn try_acquire_wake_sweep_admission(
         )
     })?;
     match <File as fs4::FileExt>::try_lock(&file) {
-        Ok(()) => Ok(Some(WakeSweepAdmission { _file: file })),
+        Ok(()) => Ok(Some(file)),
         Err(fs4::TryLockError::WouldBlock) => Ok(None),
         Err(fs4::TryLockError::Error(error)) => Err(format!(
             "Failed to acquire wake sweep admission {}: {error}",
             path.display()
         )),
     }
+}
+
+fn acquire_wake_sweep_coordination(mailbox_path: &Path) -> Result<File, String> {
+    let path = wake_sweep_admission_path(mailbox_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|error| {
+        format!(
+            "Failed to open wake sweep coordination {}: {error}",
+            path.display()
+        )
+    })?;
+    <File as fs4::FileExt>::lock(&file).map_err(|error| {
+        format!(
+            "Failed to lock wake sweep coordination {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(file)
 }
 
 fn wake_sweep_admission_path(mailbox_path: &Path) -> Result<PathBuf, String> {
@@ -296,6 +420,327 @@ fn wake_sweep_admission_path(mailbox_path: &Path) -> Result<PathBuf, String> {
     let mut admission_name = file_name.to_os_string();
     admission_name.push(".wake-reclaim.lock");
     Ok(mailbox_path.with_file_name(admission_name))
+}
+
+fn wake_sweep_lease_path(mailbox_path: &Path) -> Result<PathBuf, String> {
+    let file_name = mailbox_path
+        .file_name()
+        .ok_or_else(|| "PID mailbox path has no file name".to_string())?;
+    let mut lease_name = file_name.to_os_string();
+    lease_name.push(".wake-reclaim-owner.json");
+    Ok(mailbox_path.with_file_name(lease_name))
+}
+
+fn read_wake_sweep_lease(mailbox_path: &Path) -> Result<Option<WakeSweepLease>, String> {
+    let path = wake_sweep_lease_path(mailbox_path)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to read wake sweep lease {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    match serde_json::from_str::<WakeSweepLease>(&text) {
+        Ok(lease) if lease.schema_version == WAKE_SWEEP_LEASE_SCHEMA_VERSION => Ok(Some(lease)),
+        Ok(lease) => {
+            tracing::warn!(
+                path = %path.display(),
+                schema_version = lease.schema_version,
+                "Replacing unsupported wake sweep lease"
+            );
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), "Replacing malformed wake sweep lease: {error}");
+            Ok(None)
+        }
+    }
+}
+
+fn write_wake_sweep_lease(mailbox_path: &Path, lease: &WakeSweepLease) -> Result<(), String> {
+    let path = wake_sweep_lease_path(mailbox_path)?;
+    let text = serde_json::to_vec(lease)
+        .map_err(|error| format!("Failed to encode wake sweep lease: {error}"))?;
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temporary).map_err(|error| {
+            format!(
+                "Failed to create wake sweep lease temporary {}: {error}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(&text).map_err(|error| {
+            format!(
+                "Failed to write wake sweep lease temporary {}: {error}",
+                temporary.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "Failed to sync wake sweep lease temporary {}: {error}",
+                temporary.display()
+            )
+        })?;
+        drop(file);
+        replace_wake_sweep_lease_file(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn replace_wake_sweep_lease_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+    match std::fs::rename(temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            std::fs::remove_file(destination).map_err(|remove_error| {
+                format!(
+                    "Failed to replace wake sweep lease {} after {error}: {remove_error}",
+                    destination.display()
+                )
+            })?;
+            std::fs::rename(temporary, destination).map_err(|rename_error| {
+                format!(
+                    "Failed to install wake sweep lease {}: {rename_error}",
+                    destination.display()
+                )
+            })
+        }
+        Err(error) => Err(format!(
+            "Failed to install wake sweep lease {}: {error}",
+            destination.display()
+        )),
+    }
+}
+
+fn clear_wake_sweep_lease(mailbox_path: &Path, owner_token: &str) -> Result<(), String> {
+    let _coordination = acquire_wake_sweep_coordination(mailbox_path)?;
+    let Some(lease) = read_wake_sweep_lease(mailbox_path)? else {
+        return Ok(());
+    };
+    if lease.owner_token != owner_token {
+        return Ok(());
+    }
+    if lease.expires_at_unix_ms == 0 && lease.handoff_token.is_some() {
+        return Ok(());
+    }
+    let path = wake_sweep_lease_path(mailbox_path)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to clear wake sweep lease {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn unix_time_ms() -> Result<u64, String> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System time precedes Unix epoch: {error}"))?;
+    Ok(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn wake_sweep_lease_duration_ms() -> u64 {
+    u64::try_from(WAKE_SWEEP_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn spawn_wake_reclaim_bootstrap_or_warn() {
+    if let Err(error) = super::spawn::spawn_detached_wake_reclaim_handoff(
+        WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN,
+        &uuid::Uuid::new_v4().to_string(),
+    ) {
+        tracing::warn!("{error}");
+    }
+}
+
+fn ensure_wake_sweep_handoff(mailbox_path: &Path, owner_token: &str) {
+    ensure_wake_sweep_handoff_inner(mailbox_path, owner_token, false);
+}
+
+fn ensure_wake_sweep_handoff_inner(mailbox_path: &Path, owner_token: &str, expire_owner: bool) {
+    let handoff_token = match register_wake_sweep_handoff(mailbox_path, owner_token, expire_owner) {
+        Ok(Some(token)) => token,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!("Failed to register wake sweep handoff: {error}");
+            return;
+        }
+    };
+    if let Err(error) =
+        super::spawn::spawn_detached_wake_reclaim_handoff(owner_token, &handoff_token)
+    {
+        let _ = clear_wake_sweep_handoff(mailbox_path, owner_token, &handoff_token);
+        tracing::warn!("{error}");
+    }
+}
+
+fn current_wake_sweep_lease(mailbox_path: &Path) -> Result<Option<WakeSweepLease>, String> {
+    let _coordination = acquire_wake_sweep_coordination(mailbox_path)?;
+    read_wake_sweep_lease(mailbox_path)
+}
+
+fn register_wake_sweep_handoff(
+    mailbox_path: &Path,
+    owner_token: &str,
+    expire_owner: bool,
+) -> Result<Option<String>, String> {
+    let _coordination = acquire_wake_sweep_coordination(mailbox_path)?;
+    let Some(mut lease) = read_wake_sweep_lease(mailbox_path)? else {
+        return Ok(None);
+    };
+    if lease.owner_token != owner_token {
+        return Ok(None);
+    }
+    if expire_owner {
+        lease.expires_at_unix_ms = 0;
+    }
+    if lease.handoff_token.is_some() {
+        write_wake_sweep_lease(mailbox_path, &lease)?;
+        return Ok(None);
+    }
+    let handoff_token = uuid::Uuid::new_v4().to_string();
+    lease.handoff_token = Some(handoff_token.clone());
+    write_wake_sweep_lease(mailbox_path, &lease)?;
+    Ok(Some(handoff_token))
+}
+
+fn clear_wake_sweep_handoff(
+    mailbox_path: &Path,
+    owner_token: &str,
+    handoff_token: &str,
+) -> Result<(), String> {
+    let _coordination = acquire_wake_sweep_coordination(mailbox_path)?;
+    let Some(mut lease) = read_wake_sweep_lease(mailbox_path)? else {
+        return Ok(());
+    };
+    if lease.owner_token != owner_token || lease.handoff_token.as_deref() != Some(handoff_token) {
+        return Ok(());
+    }
+    lease.handoff_token = None;
+    write_wake_sweep_lease(mailbox_path, &lease)
+}
+
+pub(crate) fn is_wake_reclaim_handoff_invocation() -> bool {
+    std::env::var_os(WAKE_RECLAIM_HANDOFF_OWNER_ENV).is_some()
+        || std::env::var_os(WAKE_RECLAIM_HANDOFF_TOKEN_ENV).is_some()
+}
+
+pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
+    let owner_token = required_handoff_env(WAKE_RECLAIM_HANDOFF_OWNER_ENV)?;
+    let handoff_token = required_handoff_env(WAKE_RECLAIM_HANDOFF_TOKEN_ENV)?;
+    if owner_token == WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN {
+        return run_wake_reclaim_bootstrap_handoff();
+    }
+    let mailbox_path = MailboxDb::default_path()?;
+    // A monotonic deadline prevents a wall-clock rollback from retaining a
+    // detached waiter forever.
+    let wait_deadline = Instant::now() + WAKE_SWEEP_LEASE_DURATION;
+    loop {
+        let Some(lease) = current_wake_sweep_lease(&mailbox_path)? else {
+            return Ok(());
+        };
+        if lease.owner_token != owner_token
+            || lease.handoff_token.as_deref() != Some(handoff_token.as_str())
+        {
+            return Ok(());
+        }
+        if lease.expires_at_unix_ms > unix_time_ms()? {
+            if Instant::now() >= wait_deadline {
+                expire_wake_sweep_handoff_owner(&mailbox_path, &owner_token, &handoff_token)?;
+                continue;
+            }
+            std::thread::sleep(WAKE_SWEEP_HANDOFF_RETRY_INTERVAL);
+            continue;
+        }
+        match run_wake_reclaim_sweep("process_start_handoff", &|| false)? {
+            WakeSweepRunOutcome::Completed | WakeSweepRunOutcome::Contended(_) => return Ok(()),
+            WakeSweepRunOutcome::CoordinationBusy => {
+                std::thread::sleep(WAKE_SWEEP_HANDOFF_RETRY_INTERVAL);
+            }
+        }
+    }
+}
+
+fn run_wake_reclaim_bootstrap_handoff() -> Result<(), String> {
+    let mailbox_path = MailboxDb::default_path()?;
+    let mut waiting_owner: Option<(String, Instant)> = None;
+    loop {
+        match run_wake_reclaim_sweep("process_start_handoff", &|| false)? {
+            WakeSweepRunOutcome::Completed => return Ok(()),
+            WakeSweepRunOutcome::Contended(owner_token) => {
+                let waiting_since = match waiting_owner.as_ref() {
+                    Some((waiting_token, waiting_since)) if waiting_token == &owner_token => {
+                        *waiting_since
+                    }
+                    _ => {
+                        let waiting_since = Instant::now();
+                        waiting_owner = Some((owner_token.clone(), waiting_since));
+                        waiting_since
+                    }
+                };
+                if waiting_since.elapsed() >= WAKE_SWEEP_LEASE_DURATION {
+                    try_expire_wake_sweep_owner(&mailbox_path, &owner_token)?;
+                }
+            }
+            WakeSweepRunOutcome::CoordinationBusy => {}
+        }
+        std::thread::sleep(WAKE_SWEEP_HANDOFF_RETRY_INTERVAL);
+    }
+}
+
+fn try_expire_wake_sweep_owner(mailbox_path: &Path, owner_token: &str) -> Result<(), String> {
+    let Some(_coordination) = try_acquire_wake_sweep_coordination(mailbox_path)? else {
+        return Ok(());
+    };
+    let Some(mut lease) = read_wake_sweep_lease(mailbox_path)? else {
+        return Ok(());
+    };
+    if lease.owner_token == owner_token {
+        lease.expires_at_unix_ms = 0;
+        write_wake_sweep_lease(mailbox_path, &lease)?;
+    }
+    Ok(())
+}
+
+fn expire_wake_sweep_handoff_owner(
+    mailbox_path: &Path,
+    owner_token: &str,
+    handoff_token: &str,
+) -> Result<(), String> {
+    let _coordination = acquire_wake_sweep_coordination(mailbox_path)?;
+    let Some(mut lease) = read_wake_sweep_lease(mailbox_path)? else {
+        return Ok(());
+    };
+    if lease.owner_token == owner_token && lease.handoff_token.as_deref() == Some(handoff_token) {
+        lease.expires_at_unix_ms = 0;
+        write_wake_sweep_lease(mailbox_path, &lease)?;
+    }
+    Ok(())
+}
+
+fn required_handoff_env(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Missing wake reclaim handoff environment: {name}"))
 }
 
 fn retry_pending_live_pty_deliveries_or_warn(trigger: &str) {
@@ -579,6 +1024,12 @@ mod tests {
         AgentBashCompleteEnqueue, EnqueueResult, WakeClaimAcquireResult, WakeClaimRequest,
     };
 
+    static TEST_HANDOFF_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+    fn record_test_handoff() {
+        TEST_HANDOFF_SCHEDULED.store(true, Ordering::SeqCst);
+    }
+
     #[test]
     fn startup_wake_reclaim_thread_returns_while_the_sweep_is_blocked() {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -621,6 +1072,8 @@ mod tests {
             done,
             handle: Some(handle),
             completion_grace: Duration::from_secs(1),
+            cancellation_grace: Duration::from_secs(1),
+            schedule_handoff: None,
         };
 
         drop(guard);
@@ -648,6 +1101,8 @@ mod tests {
             done,
             handle: Some(handle),
             completion_grace: Duration::from_millis(20),
+            cancellation_grace: Duration::from_secs(1),
+            schedule_handoff: None,
         };
         let started = std::time::Instant::now();
 
@@ -656,6 +1111,42 @@ mod tests {
         assert!(stop.load(Ordering::SeqCst));
         assert!(started.elapsed() >= Duration::from_millis(15));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn startup_guard_does_not_join_an_uncooperative_worker_without_a_bound() {
+        TEST_HANDOFF_SCHEDULED.store(false, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let (done_tx, done) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            while !worker_release.load(Ordering::SeqCst) {
+                std::thread::park_timeout(Duration::from_millis(5));
+            }
+            let _ = done_tx.send(());
+            finished_tx.send(()).unwrap();
+        });
+        let worker_thread = handle.thread().clone();
+        let guard = StartupWakeReclaimGuard {
+            stop: Arc::clone(&stop),
+            done,
+            handle: Some(handle),
+            completion_grace: Duration::from_millis(10),
+            cancellation_grace: Duration::from_millis(10),
+            schedule_handoff: Some(record_test_handoff),
+        };
+        let started = std::time::Instant::now();
+
+        drop(guard);
+
+        assert!(stop.load(Ordering::SeqCst));
+        assert!(TEST_HANDOFF_SCHEDULED.load(Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release.store(true, Ordering::SeqCst);
+        worker_thread.unpark();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -691,22 +1182,126 @@ mod tests {
         let mailbox_path = directory.path().join("pid-identity.db");
         drop(MailboxDb::open(&mailbox_path).unwrap());
 
-        let first = try_acquire_wake_sweep_admission(&mailbox_path)
-            .unwrap()
-            .expect("first sweep must acquire admission");
+        let first = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
+            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+            _ => panic!("first sweep must acquire admission"),
+        };
         assert!(
-            try_acquire_wake_sweep_admission(&mailbox_path)
-                .unwrap()
-                .is_none(),
+            matches!(
+                try_acquire_wake_sweep_admission(&mailbox_path).unwrap(),
+                WakeSweepAdmissionAttempt::Owned(_)
+            ),
             "a second handle must not enter the same sweep"
         );
         drop(first);
         assert!(
-            try_acquire_wake_sweep_admission(&mailbox_path)
-                .unwrap()
-                .is_some(),
+            matches!(
+                try_acquire_wake_sweep_admission(&mailbox_path).unwrap(),
+                WakeSweepAdmissionAttempt::Acquired(_)
+            ),
             "admission must return after the owner exits"
         );
+    }
+
+    #[test]
+    fn expired_wake_sweep_lease_is_replaceable_while_old_owner_remains_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&mailbox_path).unwrap());
+        let first = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
+            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+            _ => panic!("first sweep must acquire admission"),
+        };
+        let first_token = first.token.clone();
+        {
+            let _coordination = acquire_wake_sweep_coordination(&mailbox_path).unwrap();
+            let mut lease = read_wake_sweep_lease(&mailbox_path).unwrap().unwrap();
+            lease.expires_at_unix_ms = 0;
+            write_wake_sweep_lease(&mailbox_path, &lease).unwrap();
+        }
+
+        let second = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
+            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+            _ => panic!("an expired owner must not suppress a later sweep"),
+        };
+        assert_ne!(second.token, first_token);
+        drop(first);
+        assert_eq!(
+            read_wake_sweep_lease(&mailbox_path)
+                .unwrap()
+                .unwrap()
+                .owner_token,
+            second.token
+        );
+        drop(second);
+        assert!(read_wake_sweep_lease(&mailbox_path).unwrap().is_none());
+    }
+
+    #[test]
+    fn wake_sweep_handoff_registration_is_single_and_can_expire_the_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&mailbox_path).unwrap());
+        let owner = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
+            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+            _ => panic!("sweep must acquire admission"),
+        };
+
+        let handoff = register_wake_sweep_handoff(&mailbox_path, &owner.token, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            register_wake_sweep_handoff(&mailbox_path, &owner.token, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            register_wake_sweep_handoff(&mailbox_path, &owner.token, true)
+                .unwrap()
+                .is_none()
+        );
+        let lease = read_wake_sweep_lease(&mailbox_path).unwrap().unwrap();
+        assert_eq!(lease.handoff_token.as_deref(), Some(handoff.as_str()));
+        assert_eq!(lease.expires_at_unix_ms, 0);
+        drop(owner);
+        assert!(read_wake_sweep_lease(&mailbox_path).unwrap().is_some());
+        let successor = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
+            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+            _ => panic!("the handoff must replace the expired owner"),
+        };
+        drop(successor);
+        assert!(read_wake_sweep_lease(&mailbox_path).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wake_sweep_lease_replacement_does_not_follow_a_leaf_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&mailbox_path).unwrap());
+        let protected = directory.path().join("protected.txt");
+        std::fs::write(&protected, "do not mutate").unwrap();
+        let lease_path = wake_sweep_lease_path(&mailbox_path).unwrap();
+        symlink(&protected, &lease_path).unwrap();
+
+        let admission = match try_acquire_wake_sweep_admission(&mailbox_path).unwrap() {
+            WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+            _ => panic!("malformed aliased lease must be replaceable"),
+        };
+
+        assert_eq!(
+            std::fs::read_to_string(&protected).unwrap(),
+            "do not mutate"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&lease_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(admission);
     }
 
     #[test]

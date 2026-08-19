@@ -11,7 +11,8 @@ use std::os::unix::process::CommandExt;
 
 use super::constants::{
     AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_MAX_ENV, AUTO_WAKE_SESSION_ID_ENV,
-    AUTO_WAKE_TOKEN_ENV, PARENT_INVOCATION_ENV,
+    AUTO_WAKE_TOKEN_ENV, PARENT_INVOCATION_ENV, WAKE_RECLAIM_HANDOFF_OWNER_ENV,
+    WAKE_RECLAIM_HANDOFF_TOKEN_ENV,
 };
 
 pub(super) fn spawn_detached_resume(
@@ -31,6 +32,25 @@ pub(super) fn spawn_detached_resume(
         auto_wake_max,
     );
     spawn_detached_child(cmd)
+}
+
+pub(super) fn spawn_detached_wake_reclaim_handoff(
+    owner_token: &str,
+    handoff_token: &str,
+) -> Result<(), String> {
+    let mut command = Command::new(current_agents_exe()?);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env(WAKE_RECLAIM_HANDOFF_OWNER_ENV, owner_token)
+        .env(WAKE_RECLAIM_HANDOFF_TOKEN_ENV, handoff_token)
+        .env_remove(AUTO_WAKE_ENV);
+    configure_handoff_detached(&mut command);
+    command
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("Failed to spawn detached wake reclaim handoff: {error}"))
 }
 
 fn current_agents_exe() -> Result<PathBuf, String> {
@@ -119,7 +139,9 @@ fn configure_wake_stdio_and_env(
         .env(AUTO_WAKE_SESSION_ID_ENV, session_id)
         .env(AUTO_WAKE_TOKEN_ENV, claim_token)
         .env(AUTO_WAKE_COUNT_ENV, auto_wake_count.to_string())
-        .env(AUTO_WAKE_MAX_ENV, auto_wake_max.to_string());
+        .env(AUTO_WAKE_MAX_ENV, auto_wake_max.to_string())
+        .env_remove(WAKE_RECLAIM_HANDOFF_OWNER_ENV)
+        .env_remove(WAKE_RECLAIM_HANDOFF_TOKEN_ENV);
     configure_parent_invocation(cmd, runtime);
 }
 
@@ -182,6 +204,22 @@ fn configure_detached(cmd: &mut Command) {
 
 #[cfg(not(unix))]
 fn configure_detached(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn configure_handoff_detached(cmd: &mut Command) {
+    configure_detached(cmd);
+}
+
+#[cfg(windows)]
+fn configure_handoff_detached(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_handoff_detached(_cmd: &mut Command) {}
 
 #[cfg(test)]
 mod tests {

@@ -1,7 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb, SessionMetadataUpsert};
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb,
+    RuntimeGenerationFence, RuntimeGenerationId, SessionMetadataUpsert,
+};
+use oulipoly_state::pid_identity::read_live_process_identity;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -80,6 +84,13 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
         .unwrap();
     drop(connection);
     seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
+    assert_eq!(
+        sqlite_count(
+            &mailbox_path,
+            "SELECT selected_auto_wake_max FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+        ),
+        1
+    );
     std::fs::write(&starts, []).unwrap();
     let baseline_temp_entries = directory_entries(&snapshot_temp);
 
@@ -194,6 +205,128 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
         ),
         0
     );
+    assert_eq!(
+        sqlite_count(
+            &mailbox_path,
+            "SELECT COUNT(*) FROM runtime_generation
+             WHERE generation_uuid = '22222222-2222-4222-8222-222222222222'
+               AND lifecycle_state = 'exited'
+               AND terminal_reason = 'recovered_dead'",
+        ),
+        1,
+        "the exact recorded-dead incumbent was not reconciled before candidate planning"
+    );
+}
+
+#[test]
+fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_home = directory.path().join("config");
+    let data_home = directory.path().join("data");
+    let home = directory.path().join("home");
+    let snapshot_temp = directory.path().join("snapshot-temp");
+    let app_config = config_home.join("oulipoly-agent-runner");
+    let models = app_config.join("models");
+    std::fs::create_dir_all(&models).unwrap();
+    std::fs::create_dir_all(&data_home).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&snapshot_temp).unwrap();
+    let starts = directory.path().join("handoff-provider-starts.log");
+    let provider = directory.path().join("handoff-fixture-provider.sh");
+    std::fs::write(
+        &provider,
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\nprintf '%s\\n' \"$*\" >> {}\nprintf 'fixture-ok\\n'\n",
+            starts.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&provider);
+    std::fs::write(
+        models.join("fixture.toml"),
+        "[[providers]]\nname = \"fixture-provider\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app_config.join("providers.toml"),
+        format!(
+            "[fixture-provider]\ncommand = \"{}\"\nargs = []\nprompt_mode = \"arg\"\n\n[fixture-provider.resume]\nkind = \"flag\"\nflag = \"--resume\"\n",
+            provider.display()
+        ),
+    )
+    .unwrap();
+
+    let data_root = data_home.join("oulipoly-agent-runner");
+    std::fs::create_dir_all(&data_root).unwrap();
+    let state_path = data_root.join("state.db");
+    let mailbox_path = data_root.join("pid-identity.db");
+    drop(StateDb::open(&state_path).unwrap());
+    seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
+    std::fs::write(&starts, []).unwrap();
+    let owner_token = "wake-reclaim-bootstrap";
+    let handoff_token = "bootstrap-handoff-token";
+    let lease_path = data_root.join("pid-identity.db.wake-reclaim-owner.json");
+    assert!(!lease_path.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"))
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("HOME", &home)
+        .env("TMPDIR", &snapshot_temp)
+        .env("OULIPOLY_WAKE_RECLAIM_HANDOFF_OWNER", owner_token)
+        .env("OULIPOLY_WAKE_RECLAIM_HANDOFF_TOKEN", handoff_token)
+        .env_remove("OULIPOLY_DATA_DIR")
+        .env_remove("OULIPOLY_PARENT_INVOCATION")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "handoff helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&starts)
+            .map(|content| !content.is_empty())
+            .unwrap_or(false)
+            && sqlite_count(
+                &mailbox_path,
+                "SELECT COUNT(*) FROM runtime_generation WHERE lifecycle_state != 'exited'",
+            ) == 0
+    });
+
+    let starts_content = std::fs::read_to_string(&starts).unwrap();
+    assert_eq!(
+        starts_content
+            .matches("--resume candidate-bearing-session")
+            .count(),
+        1,
+        "unexpected provider starts with auto_wake_count={} selected_auto_wake_max={}: {starts_content}",
+        sqlite_count(
+            &mailbox_path,
+            "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+        ),
+        sqlite_count(
+            &mailbox_path,
+            "SELECT selected_auto_wake_max FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+        ),
+    );
+    assert_eq!(
+        sqlite_count(
+            &mailbox_path,
+            "SELECT auto_wake_count FROM session_runtime WHERE session_id = 'candidate-bearing-session'",
+        ),
+        1
+    );
+    assert_eq!(
+        sqlite_count(
+            &mailbox_path,
+            "SELECT COUNT(*) FROM runtime_generation
+             WHERE generation_uuid = '22222222-2222-4222-8222-222222222222'
+               AND terminal_reason = 'recovered_dead'",
+        ),
+        1
+    );
+    assert!(!lease_path.exists());
 }
 
 fn runner_command(
@@ -285,6 +418,44 @@ fn seed_recoverable_wake_candidate(
             rc: 0,
         })
         .unwrap();
+
+    let mut incumbent = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60")
+        .spawn()
+        .unwrap();
+    let identity = read_live_process_identity(i64::from(incumbent.id()))
+        .unwrap()
+        .unwrap();
+    let generation_id = RuntimeGenerationId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+    mailbox
+        .runtime_lifecycle()
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "33333333-3333-4333-8333-333333333333",
+            session_id: Some("candidate-bearing-session"),
+            runtime_mode: "headless",
+            provider_name: "fixture-provider",
+            model_name: Some("fixture"),
+            pty_control_path: None,
+            models_dir: Some(models),
+            effective_cwd: None,
+        })
+        .unwrap();
+    mailbox
+        .runtime_lifecycle()
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "33333333-3333-4333-8333-333333333333",
+            },
+            spawned_os_pid: identity.os_pid,
+            exact_process_identity: Some(&identity),
+            os_pgid: None,
+        })
+        .unwrap();
+    incumbent.kill().unwrap();
+    incumbent.wait().unwrap();
 }
 
 fn snapshot_helper_count(root: &Path) -> usize {

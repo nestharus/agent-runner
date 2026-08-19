@@ -40,6 +40,14 @@ pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGua
     sweep::start_startup_wake_reclaim_sweep()
 }
 
+pub(crate) fn is_wake_reclaim_handoff_invocation() -> bool {
+    sweep::is_wake_reclaim_handoff_invocation()
+}
+
+pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
+    sweep::run_wake_reclaim_handoff_invocation()
+}
+
 pub(crate) fn start_wake_reclaim_maintenance_driver() {
     sweep::start_wake_reclaim_maintenance_driver();
 }
