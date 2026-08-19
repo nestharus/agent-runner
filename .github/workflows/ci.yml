@@ -54,6 +54,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: lib-${{ matrix.crate }}
+      - if: matrix.crate == 'oulipoly-provider'
+        name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: cargo test -p ${{ matrix.crate }}
       - run: cargo clippy -p ${{ matrix.crate }} -- -D warnings
 
