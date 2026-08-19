@@ -5,7 +5,7 @@
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::MailboxDb;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(super) fn open_default_state_read_only_with_timeout(
     timeout: Duration,
@@ -23,10 +23,10 @@ fn open_state_read_only_at_with_timeout(
     path: &Path,
     timeout: Duration,
 ) -> Result<Option<StateDb>, String> {
-    let started = Instant::now();
-    open_state_read_only_at_with_cancel(path, &|| started.elapsed() >= timeout)
+    open_state_read_only_at_with_retry_timeout(path, timeout)
 }
 
+#[cfg(test)]
 fn open_state_read_only_at_with_cancel(
     path: &Path,
     is_cancelled: &dyn Fn() -> bool,
@@ -37,6 +37,20 @@ fn open_state_read_only_at_with_cancel(
         Err(error) => return Err(format!("Failed to inspect State path: {error}")),
     }
     StateDb::open_read_only_with_cancel(path, is_cancelled)
+        .map(Some)
+        .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
+}
+
+fn open_state_read_only_at_with_retry_timeout(
+    path: &Path,
+    retry_timeout: Duration,
+) -> Result<Option<StateDb>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Failed to inspect State path: {error}")),
+    }
+    StateDb::open_read_only_with_retry_timeout(path, retry_timeout)
         .map(Some)
         .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
 }
@@ -103,6 +117,20 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a timed-out sweep must not consume later retry authority"
+        );
+    }
+
+    #[test]
+    fn stable_first_state_snapshot_ignores_the_retry_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+
+        assert!(
+            open_state_read_only_at_with_timeout(&state_path, Duration::ZERO)
+                .unwrap()
+                .is_some(),
+            "the retry budget must begin only after the first source mismatch"
         );
     }
 

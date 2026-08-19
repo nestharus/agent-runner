@@ -182,6 +182,32 @@ impl StateDb {
         Ok((conn, snapshot))
     }
 
+    pub(super) fn open_read_only_connection_with_retry_timeout(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+    ) -> Result<
+        (
+            sqlite::Connection,
+            crate::read_only_snapshot::ReadOnlySnapshot,
+        ),
+        ReadOnlyOpenError,
+    > {
+        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_timeout(
+            path,
+            retry_timeout,
+            &|| false,
+        )
+        .map_err(|err| ReadOnlyOpenError::Operational {
+            message: format!("Failed to snapshot read-only SQLite database: {err}"),
+        })?;
+        let conn = sqlite::Connection::open_with_flags(
+            snapshot.path(),
+            sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| classify_read_only_open_error(path, err))?;
+        Ok((conn, snapshot))
+    }
+
     pub(super) fn probe_read_only_schema(
         path: &Path,
         conn: &sqlite::Connection,

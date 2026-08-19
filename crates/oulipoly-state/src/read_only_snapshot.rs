@@ -48,9 +48,17 @@ impl ReadOnlySnapshot {
         source: &Path,
         is_cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
+        Self::create_with_retry_timeout(source, SNAPSHOT_TIMEOUT, is_cancelled)
+    }
+
+    pub(crate) fn create_with_retry_timeout(
+        source: &Path,
+        timeout: Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Self> {
         Self::create_with_retry_policy(
             source,
-            SNAPSHOT_TIMEOUT,
+            timeout,
             SNAPSHOT_RETRY_INTERVAL,
             is_cancelled,
             || Ok(()),

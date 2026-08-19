@@ -251,7 +251,10 @@ pub(super) fn release_current_auto_wake_claim(session_id: &str, auto_wake: Optio
 }
 
 fn release_wake_claim_or_warn(db: &mut MailboxDb, session_id: &str, token: &str) {
-    if let Err(err) = db.wake_sessions().release_wake_claim(session_id, token) {
+    if let Err(err) = db
+        .wake_sessions()
+        .release_admitted_wake_claim(session_id, token)
+    {
         warn_release_wake_claim_failed(session_id, err);
     }
 }

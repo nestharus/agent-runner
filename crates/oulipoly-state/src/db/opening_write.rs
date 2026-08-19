@@ -284,6 +284,24 @@ impl StateDb {
     ) -> Result<Self, ReadOnlyOpenError> {
         let source = Self::validate_read_only_paths(path)?;
         let (conn, snapshot) = Self::open_read_only_connection(&source, is_cancelled)?;
+        Self::open_from_read_only_parts(source, conn, snapshot)
+    }
+
+    pub fn open_read_only_with_retry_timeout(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        let source = Self::validate_read_only_paths(path)?;
+        let (conn, snapshot) =
+            Self::open_read_only_connection_with_retry_timeout(&source, retry_timeout)?;
+        Self::open_from_read_only_parts(source, conn, snapshot)
+    }
+
+    fn open_from_read_only_parts(
+        source: PathBuf,
+        conn: sqlite::Connection,
+        snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
+    ) -> Result<Self, ReadOnlyOpenError> {
         Self::probe_read_only_schema(&source, &conn)?;
 
         Ok(Self {

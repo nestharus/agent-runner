@@ -3615,10 +3615,31 @@ impl WakeSessionRepository<'_> {
         let changed = self
             .conn
             .execute(
-                "DELETE FROM session_wake_claim WHERE session_id = ?1 AND claim_token = ?2",
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NULL",
                 params![session_id, claim_token],
             )
             .map_err(|err| format!("Failed to release wake claim: {err}"))?;
+        Ok(changed > 0)
+    }
+
+    pub fn release_admitted_wake_claim(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NOT NULL",
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release admitted wake claim: {err}"))?;
         Ok(changed > 0)
     }
 
@@ -3807,9 +3828,52 @@ impl WakeSessionRepository<'_> {
         session_id: &str,
         claim_token: &str,
     ) -> Result<bool, String> {
-        let claim = wake_claim(self.conn, session_id)?;
-        let valid = wake_claim_is_valid_for_child(claim.as_ref(), claim_token);
-        self.release_after_child_claim_validation(session_id, claim_token, valid)
+        let observed_busy = self.session_is_busy(session_id)?;
+        let admission_id = Uuid::new_v4().to_string();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start wake-child admission transaction: {err}"))?;
+        let claim = wake_claim(&tx, session_id)?;
+        let Some(claim) = claim.filter(|claim| wake_claim_matches_child(claim, claim_token)) else {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit rejected wake-child admission: {err}"))?;
+            return Ok(false);
+        };
+        if claim.wake_invocation_uuid.is_some() {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit replayed wake-child admission: {err}"))?;
+            return Ok(true);
+        }
+        if observed_busy || wake_claim_runtime_is_busy_tx(&tx, session_id)? {
+            tx.execute(
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NULL",
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release busy wake-child claim: {err}"))?;
+            tx.commit()
+                .map_err(|err| format!("Failed to commit busy wake-child rejection: {err}"))?;
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE session_wake_claim
+                 SET wake_invocation_uuid = ?3
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NULL",
+                params![session_id, claim_token, &admission_id],
+            )
+            .map_err(|err| format!("Failed to admit wake child: {err}"))?;
+        if changed != 1 {
+            return Err("Wake claim changed during child admission".to_string());
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit wake-child admission: {err}"))?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -3893,18 +3957,6 @@ impl WakeSessionRepository<'_> {
             .map_err(|err| format!("Failed to read pending wake session row: {err}"))
     }
 
-    fn release_after_child_claim_validation(
-        &mut self,
-        session_id: &str,
-        claim_token: &str,
-        valid: bool,
-    ) -> Result<bool, String> {
-        if !valid {
-            return Ok(false);
-        }
-        self.release_busy_child_wake_claim(session_id, claim_token)
-    }
-
     fn pending_seq_bounds(&self, session_id: &str) -> Result<Option<(i64, i64)>, String> {
         pending_seq_bounds_on(self.conn, session_id)
     }
@@ -3949,31 +4001,6 @@ impl WakeSessionRepository<'_> {
         RuntimeLifecycleRepository { conn: self.conn }
             .reconcile_session_liveness(session_id)
             .map(|liveness| liveness == SessionLiveness::Busy)
-    }
-
-    fn release_busy_child_wake_claim(
-        &mut self,
-        session_id: &str,
-        claim_token: &str,
-    ) -> Result<bool, String> {
-        if self.busy_child_wake_claim_should_release(session_id)? {
-            self.release_child_wake_claim(session_id, claim_token)?;
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn busy_child_wake_claim_should_release(&mut self, session_id: &str) -> Result<bool, String> {
-        self.session_is_busy(session_id)
-    }
-
-    fn release_child_wake_claim(
-        &mut self,
-        session_id: &str,
-        claim_token: &str,
-    ) -> Result<(), String> {
-        self.release_wake_claim(session_id, claim_token)?;
-        Ok(())
     }
 }
 
@@ -6567,10 +6594,6 @@ fn update_session_runtime_auto_wake_count_tx(
 
 fn wake_claim_matches_child(claim: &WakeClaimRow, claim_token: &str) -> bool {
     claim.claim_token == claim_token
-}
-
-fn wake_claim_is_valid_for_child(claim: Option<&WakeClaimRow>, claim_token: &str) -> bool {
-    claim.is_some_and(|claim| wake_claim_matches_child(claim, claim_token))
 }
 
 pub(crate) fn validate_completion_event_registration(
@@ -11870,7 +11893,7 @@ mod tests {
                     claim_token: "token-a",
                     reason: "notify_idle",
                     auto_wake_count: 3,
-                    wake_invocation_uuid: Some("wake-a"),
+                    wake_invocation_uuid: None,
                     stale_after_seconds: 600,
                 },
                 None,
@@ -11941,7 +11964,7 @@ mod tests {
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 5,
-                wake_invocation_uuid: Some("wake-a"),
+                wake_invocation_uuid: None,
                 stale_after_seconds: 600,
             })
             .unwrap();
@@ -11975,7 +11998,7 @@ mod tests {
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 1,
-                wake_invocation_uuid: Some("wake-a"),
+                wake_invocation_uuid: None,
                 stale_after_seconds: 600,
             })
             .unwrap();
@@ -11996,6 +12019,101 @@ mod tests {
         assert!(
             db.wake_sessions()
                 .release_wake_claim("session-a", "token-a")
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn admitted_wake_child_blocks_manual_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+
+        assert!(
+            !db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-b")
+                .unwrap()
+        );
+        assert!(
+            db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a")
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .wake_invocation_uuid
+                .is_some(),
+            "child validation must durably reserve the wake claim"
+        );
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap(),
+            "manual release must not erase a child-admitted wake claim"
+        );
+        assert!(
+            db.wake_sessions()
+                .release_admitted_wake_claim("session-a", "token-a")
+                .unwrap(),
+            "the admitted child must retain exact-token cleanup authority"
+        );
+    }
+
+    #[test]
+    fn wake_child_validation_rejects_claim_when_runtime_authority_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("92222222-2222-4222-8222-222222222222").unwrap();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "runtime-invocation",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: Some("model-a"),
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+
+        assert!(
+            !db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a")
                 .unwrap()
         );
         assert!(
