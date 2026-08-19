@@ -5877,6 +5877,13 @@ mod tests {
             .unwrap()
     }
 
+    fn lock_terminal_render_test() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn row_text(buf: &Buffer, area_y: u16, width: u16) -> String {
         (0..width)
             .map(|x| buf[(x, area_y)].symbol().to_string())
@@ -7736,6 +7743,7 @@ mod tests {
 
     #[test]
     fn render_thread_keeps_drawing_while_processing_side_is_busy() {
+        let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
         let mut drain_master = outer.master.try_clone().expect("clone drain master");
@@ -7928,6 +7936,7 @@ mod tests {
     // exit status, and paints the collapsed monitor row to the real terminal.
     #[test]
     fn observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor() {
+        let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
         let full = libc::winsize {
@@ -8020,6 +8029,7 @@ mod tests {
 
     #[test]
     fn observed_relay_forwards_input_while_snapshot_provider_is_slow() {
+        let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
         let full = libc::winsize {
@@ -8113,6 +8123,7 @@ mod tests {
 
     #[test]
     fn observed_relay_interrupts_active_production_invocation_query_after_child_exit() {
+        let _terminal_lock = lock_terminal_render_test();
         let _env_lock = crate::test_support::lock_env();
         let data_root = tempfile::tempdir().expect("data root");
         let _data_dir = DataDirOverride::install(data_root.path());
