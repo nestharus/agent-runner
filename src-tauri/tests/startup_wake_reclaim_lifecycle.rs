@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 const CONCURRENCY: usize = 8;
 
 #[test]
-fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
+fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
     let directory = tempfile::tempdir().unwrap();
     let config_home = directory.path().join("config");
     let data_home = directory.path().join("data");
@@ -118,7 +118,8 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
             let snapshot_temp = snapshot_temp.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                runner_command(
+                let started = Instant::now();
+                let output = runner_command(
                     &runner,
                     &models,
                     &config_home,
@@ -128,7 +129,8 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
                     &format!("launch-{index}"),
                 )
                 .output()
-                .unwrap()
+                .unwrap();
+                (output, started.elapsed())
             })
         })
         .collect::<Vec<_>>();
@@ -139,11 +141,15 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
     stop_sampling.store(true, Ordering::SeqCst);
     sampler.join().unwrap();
 
-    for output in outputs {
+    for (output, elapsed) in outputs {
         assert!(
             output.status.success(),
             "candidate-bearing launch failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "foreground launch waited for best-effort wake reclamation: {elapsed:?}"
         );
         let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
         assert!(!stderr.contains("database is locked"));
@@ -178,12 +184,13 @@ fn candidate_bearing_launches_single_flight_and_leave_no_snapshot_helpers() {
         "wake retry cap was not preserved; provider starts: {starts_content}"
     );
     let helper_peak = helper_peak.load(Ordering::SeqCst);
-    assert_eq!(
-        helper_peak, 1,
-        "expected exactly one admitted snapshot helper"
+    assert!(
+        (1..=2).contains(&helper_peak),
+        "expected at most the expiring owner and its fenced successor, observed {helper_peak}"
     );
     wait_until(Duration::from_secs(5), || {
         snapshot_helper_count(directory.path()) == 0
+            && directory_entries(&snapshot_temp) == baseline_temp_entries
     });
     assert_eq!(snapshot_helper_count(directory.path()), 0);
     let snapshot_temp_entries = directory_entries(&snapshot_temp);
@@ -264,7 +271,7 @@ fn detached_bootstrap_handoff_completes_one_wake_without_an_owner_lease() {
     seed_recoverable_wake_candidate(directory.path(), &state_path, &mailbox_path, &models);
     std::fs::write(&starts, []).unwrap();
     let owner_token = "wake-reclaim-bootstrap";
-    let handoff_token = "bootstrap-handoff-token";
+    let handoff_token = "wake-reclaim-bootstrap";
     let lease_path = data_root.join("pid-identity.db.wake-reclaim-owner.json");
     assert!(!lease_path.exists());
 

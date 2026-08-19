@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,12 +30,12 @@ use super::diagnostics::WakeDiagnostic;
 use super::wake_start::{StartWakeInput, start_wake_chain};
 use crate::mailbox_delivery::PtyMailboxDeliveryDiagnostic;
 
-const STARTUP_SWEEP_COMPLETION_GRACE: Duration = Duration::from_secs(5);
-const STARTUP_SWEEP_CANCELLATION_GRACE: Duration = Duration::from_secs(1);
 const WAKE_SWEEP_LEASE_DURATION: Duration = Duration::from_secs(10);
 const WAKE_SWEEP_HANDOFF_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const WAKE_SWEEP_BOOTSTRAP_OWNER_GRACE: Duration = Duration::from_millis(250);
 const WAKE_SWEEP_LEASE_SCHEMA_VERSION: u8 = 1;
 const WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN: &str = "wake-reclaim-bootstrap";
+const WAKE_SWEEP_BOOTSTRAP_HANDOFF_TOKEN: &str = "wake-reclaim-bootstrap";
 
 pub(crate) fn run_startup_wake_reclaim_sweep() {
     if is_auto_wake_invocation() {
@@ -46,40 +46,49 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
 
 pub(crate) struct StartupWakeReclaimGuard {
     stop: Arc<AtomicBool>,
+    owned_lease: Arc<Mutex<Option<String>>>,
     done: Receiver<()>,
     handle: Option<JoinHandle<()>>,
-    completion_grace: Duration,
-    cancellation_grace: Duration,
-    schedule_handoff: Option<fn()>,
+    schedule_handoff: Option<fn(Option<&str>)>,
+}
+
+impl StartupWakeReclaimGuard {
+    fn schedule_handoff(&self) {
+        let owner_token = self
+            .owned_lease
+            .try_lock()
+            .ok()
+            .and_then(|owner| owner.clone());
+        if let Some(schedule_handoff) = self.schedule_handoff {
+            schedule_handoff(owner_token.as_deref());
+        }
+    }
 }
 
 impl Drop for StartupWakeReclaimGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            let timed_out = matches!(
-                self.done.recv_timeout(self.completion_grace),
-                Err(RecvTimeoutError::Timeout)
-            );
-            if timed_out {
-                if let Some(schedule_handoff) = self.schedule_handoff {
-                    schedule_handoff();
+            match self.done.try_recv() {
+                Ok(()) => {
+                    if handle.is_finished()
+                        && let Err(err) = handle.join()
+                    {
+                        tracing::warn!(?err, "Startup wake reclaim sweep failed after completion");
+                    }
                 }
-                self.stop.store(true, Ordering::SeqCst);
-                handle.thread().unpark();
-            }
-            if timed_out
-                && matches!(
-                    self.done.recv_timeout(self.cancellation_grace),
-                    Err(RecvTimeoutError::Timeout)
-                )
-            {
-                tracing::warn!(
-                    "Startup wake reclaim sweep did not settle after cancellation; detached handoff retains retry authority"
-                );
-                return;
-            }
-            if let Err(err) = handle.join() {
-                tracing::warn!(?err, "Startup wake reclaim sweep failed to join cleanly");
+                Err(TryRecvError::Empty) => {
+                    self.schedule_handoff();
+                    self.stop.store(true, Ordering::SeqCst);
+                    handle.thread().unpark();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.schedule_handoff();
+                    if handle.is_finished()
+                        && let Err(err) = handle.join()
+                    {
+                        tracing::warn!(?err, "Startup wake reclaim sweep failed after disconnect");
+                    }
+                }
             }
         }
     }
@@ -98,19 +107,22 @@ pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGua
     }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let owned_lease = Arc::new(Mutex::new(None));
+    let thread_owned_lease = Arc::clone(&owned_lease);
     let (done_tx, done) = mpsc::channel();
     match spawn_wake_reclaim_thread(move || {
-        run_wake_reclaim_sweep_or_warn_with_cancel("process_start", &|| {
-            thread_stop.load(Ordering::SeqCst)
-        });
+        run_wake_reclaim_sweep_or_warn_with_cancel_and_owner(
+            "process_start",
+            &|| thread_stop.load(Ordering::SeqCst),
+            Some(&thread_owned_lease),
+        );
         let _ = done_tx.send(());
     }) {
         Ok(handle) => Some(StartupWakeReclaimGuard {
             stop,
+            owned_lease,
             done,
             handle: Some(handle),
-            completion_grace: STARTUP_SWEEP_COMPLETION_GRACE,
-            cancellation_grace: STARTUP_SWEEP_CANCELLATION_GRACE,
             schedule_handoff: Some(spawn_wake_reclaim_bootstrap_or_warn),
         }),
         Err(err) => {
@@ -263,14 +275,48 @@ fn run_wake_reclaim_sweep_or_warn(trigger: &str) {
 }
 
 fn run_wake_reclaim_sweep_or_warn_with_cancel(trigger: &str, is_cancelled: &dyn Fn() -> bool) {
-    match run_wake_reclaim_sweep(trigger, is_cancelled) {
-        Ok(WakeSweepRunOutcome::Contended(owner_token)) if trigger == "process_start" => {
-            if let Ok(mailbox_path) = MailboxDb::default_path() {
-                ensure_wake_sweep_handoff(&mailbox_path, &owner_token);
+    run_wake_reclaim_sweep_or_warn_with_cancel_and_owner(trigger, is_cancelled, None);
+}
+
+fn run_wake_reclaim_sweep_or_warn_with_cancel_and_owner(
+    trigger: &str,
+    is_cancelled: &dyn Fn() -> bool,
+    owned_lease: Option<&Mutex<Option<String>>>,
+) {
+    run_wake_reclaim_sweep_or_warn_with_runner(trigger, is_cancelled, || {
+        run_wake_reclaim_sweep_with_owner(trigger, is_cancelled, owned_lease)
+    });
+}
+
+fn run_wake_reclaim_sweep_or_warn_with_runner(
+    trigger: &str,
+    is_cancelled: &dyn Fn() -> bool,
+    mut run_sweep: impl FnMut() -> Result<WakeSweepRunOutcome, String>,
+) {
+    loop {
+        match run_sweep() {
+            Ok(WakeSweepRunOutcome::Contended(owner_token)) if trigger == "process_start" => {
+                if let Ok(mailbox_path) = MailboxDb::default_path()
+                    && !ensure_wake_sweep_handoff(&mailbox_path, &owner_token)
+                {
+                    spawn_wake_reclaim_bootstrap_or_warn(None);
+                }
+                return;
+            }
+            Ok(WakeSweepRunOutcome::CoordinationBusy)
+                if trigger == "process_start" && !is_cancelled() =>
+            {
+                std::thread::park_timeout(WAKE_SWEEP_HANDOFF_RETRY_INTERVAL);
+            }
+            Ok(_) => return,
+            Err(err) => {
+                if trigger == "process_start" {
+                    spawn_wake_reclaim_bootstrap_or_warn(None);
+                }
+                warn_wake_reclaim_sweep_failed(trigger, err);
+                return;
             }
         }
-        Ok(_) => {}
-        Err(err) => warn_wake_reclaim_sweep_failed(trigger, err),
     }
 }
 
@@ -282,6 +328,14 @@ fn run_wake_reclaim_sweep(
     trigger: &str,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<WakeSweepRunOutcome, String> {
+    run_wake_reclaim_sweep_with_owner(trigger, is_cancelled, None)
+}
+
+fn run_wake_reclaim_sweep_with_owner(
+    trigger: &str,
+    is_cancelled: &dyn Fn() -> bool,
+    owned_lease: Option<&Mutex<Option<String>>>,
+) -> Result<WakeSweepRunOutcome, String> {
     if is_cancelled() {
         return Ok(WakeSweepRunOutcome::Completed);
     }
@@ -290,7 +344,15 @@ fn run_wake_reclaim_sweep(
         return Ok(WakeSweepRunOutcome::Completed);
     }
     let _admission = match try_acquire_wake_sweep_admission(&mailbox_path)? {
-        WakeSweepAdmissionAttempt::Acquired(admission) => admission,
+        WakeSweepAdmissionAttempt::Acquired(admission) => {
+            if let Some(owned_lease) = owned_lease {
+                *owned_lease
+                    .lock()
+                    .map_err(|_| "Wake sweep owner token lock was poisoned".to_string())? =
+                    Some(admission.token.clone());
+            }
+            admission
+        }
         WakeSweepAdmissionAttempt::Owned(owner_token) => {
             tracing::debug!(
                 trigger,
@@ -431,6 +493,40 @@ fn wake_sweep_lease_path(mailbox_path: &Path) -> Result<PathBuf, String> {
     Ok(mailbox_path.with_file_name(lease_name))
 }
 
+fn wake_sweep_bootstrap_admission_path(mailbox_path: &Path) -> Result<PathBuf, String> {
+    let file_name = mailbox_path
+        .file_name()
+        .ok_or_else(|| "PID mailbox path has no file name".to_string())?;
+    let mut admission_name = file_name.to_os_string();
+    admission_name.push(".wake-reclaim-bootstrap.lock");
+    Ok(mailbox_path.with_file_name(admission_name))
+}
+
+fn try_acquire_wake_sweep_bootstrap_admission(mailbox_path: &Path) -> Result<Option<File>, String> {
+    let path = wake_sweep_bootstrap_admission_path(mailbox_path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).map_err(|error| {
+        format!(
+            "Failed to open wake sweep bootstrap admission {}: {error}",
+            path.display()
+        )
+    })?;
+    match <File as fs4::FileExt>::try_lock(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(fs4::TryLockError::WouldBlock) => Ok(None),
+        Err(fs4::TryLockError::Error(error)) => Err(format!(
+            "Failed to acquire wake sweep bootstrap admission {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn read_wake_sweep_lease(mailbox_path: &Path) -> Result<Option<WakeSweepLease>, String> {
     let path = wake_sweep_lease_path(mailbox_path)?;
     let text = match std::fs::read_to_string(&path) {
@@ -562,26 +658,30 @@ fn wake_sweep_lease_duration_ms() -> u64 {
     u64::try_from(WAKE_SWEEP_LEASE_DURATION.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn spawn_wake_reclaim_bootstrap_or_warn() {
+fn spawn_wake_reclaim_bootstrap_or_warn(owner_token: Option<&str>) {
     if let Err(error) = super::spawn::spawn_detached_wake_reclaim_handoff(
-        WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN,
-        &uuid::Uuid::new_v4().to_string(),
+        owner_token.unwrap_or(WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN),
+        WAKE_SWEEP_BOOTSTRAP_HANDOFF_TOKEN,
     ) {
         tracing::warn!("{error}");
     }
 }
 
-fn ensure_wake_sweep_handoff(mailbox_path: &Path, owner_token: &str) {
-    ensure_wake_sweep_handoff_inner(mailbox_path, owner_token, false);
+fn ensure_wake_sweep_handoff(mailbox_path: &Path, owner_token: &str) -> bool {
+    ensure_wake_sweep_handoff_inner(mailbox_path, owner_token, false)
 }
 
-fn ensure_wake_sweep_handoff_inner(mailbox_path: &Path, owner_token: &str, expire_owner: bool) {
+fn ensure_wake_sweep_handoff_inner(
+    mailbox_path: &Path,
+    owner_token: &str,
+    expire_owner: bool,
+) -> bool {
     let handoff_token = match register_wake_sweep_handoff(mailbox_path, owner_token, expire_owner) {
         Ok(Some(token)) => token,
-        Ok(None) => return,
+        Ok(None) => return true,
         Err(error) => {
             tracing::warn!("Failed to register wake sweep handoff: {error}");
-            return;
+            return false;
         }
     };
     if let Err(error) =
@@ -589,7 +689,9 @@ fn ensure_wake_sweep_handoff_inner(mailbox_path: &Path, owner_token: &str, expir
     {
         let _ = clear_wake_sweep_handoff(mailbox_path, owner_token, &handoff_token);
         tracing::warn!("{error}");
+        return false;
     }
+    true
 }
 
 fn current_wake_sweep_lease(mailbox_path: &Path) -> Result<Option<WakeSweepLease>, String> {
@@ -646,8 +748,10 @@ pub(crate) fn is_wake_reclaim_handoff_invocation() -> bool {
 pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
     let owner_token = required_handoff_env(WAKE_RECLAIM_HANDOFF_OWNER_ENV)?;
     let handoff_token = required_handoff_env(WAKE_RECLAIM_HANDOFF_TOKEN_ENV)?;
-    if owner_token == WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN {
-        return run_wake_reclaim_bootstrap_handoff();
+    if handoff_token == WAKE_SWEEP_BOOTSTRAP_HANDOFF_TOKEN {
+        let expected_owner =
+            (owner_token != WAKE_SWEEP_BOOTSTRAP_OWNER_TOKEN).then_some(owner_token.as_str());
+        return run_wake_reclaim_bootstrap_handoff(expected_owner);
     }
     let mailbox_path = MailboxDb::default_path()?;
     // A monotonic deadline prevents a wall-clock rollback from retaining a
@@ -679,25 +783,39 @@ pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
     }
 }
 
-fn run_wake_reclaim_bootstrap_handoff() -> Result<(), String> {
+fn run_wake_reclaim_bootstrap_handoff(expected_owner: Option<&str>) -> Result<(), String> {
     let mailbox_path = MailboxDb::default_path()?;
+    if !mailbox_path.exists() {
+        return Ok(());
+    }
+    let Some(_bootstrap_admission) = try_acquire_wake_sweep_bootstrap_admission(&mailbox_path)?
+    else {
+        return Ok(());
+    };
     let mut waiting_owner: Option<(String, Instant)> = None;
     loop {
         match run_wake_reclaim_sweep("process_start_handoff", &|| false)? {
             WakeSweepRunOutcome::Completed => return Ok(()),
             WakeSweepRunOutcome::Contended(owner_token) => {
-                let waiting_since = match waiting_owner.as_ref() {
-                    Some((waiting_token, waiting_since)) if waiting_token == &owner_token => {
-                        *waiting_since
+                if let Some(expected_owner) = expected_owner {
+                    if owner_token != expected_owner {
+                        return Ok(());
                     }
-                    _ => {
-                        let waiting_since = Instant::now();
-                        waiting_owner = Some((owner_token.clone(), waiting_since));
-                        waiting_since
-                    }
-                };
-                if waiting_since.elapsed() >= WAKE_SWEEP_LEASE_DURATION {
                     try_expire_wake_sweep_owner(&mailbox_path, &owner_token)?;
+                } else {
+                    let waiting_since = match waiting_owner.as_ref() {
+                        Some((waiting_token, waiting_since)) if waiting_token == &owner_token => {
+                            *waiting_since
+                        }
+                        _ => {
+                            let waiting_since = Instant::now();
+                            waiting_owner = Some((owner_token.clone(), waiting_since));
+                            waiting_since
+                        }
+                    };
+                    if waiting_since.elapsed() >= WAKE_SWEEP_BOOTSTRAP_OWNER_GRACE {
+                        try_expire_wake_sweep_owner(&mailbox_path, &owner_token)?;
+                    }
                 }
             }
             WakeSweepRunOutcome::CoordinationBusy => {}
@@ -1025,9 +1143,11 @@ mod tests {
     };
 
     static TEST_HANDOFF_SCHEDULED: AtomicBool = AtomicBool::new(false);
+    static TEST_HANDOFF_OWNER_MATCHED: AtomicBool = AtomicBool::new(false);
 
-    fn record_test_handoff() {
+    fn record_test_handoff(owner_token: Option<&str>) {
         TEST_HANDOFF_SCHEDULED.store(true, Ordering::SeqCst);
+        TEST_HANDOFF_OWNER_MATCHED.store(owner_token == Some("test-owner"), Ordering::SeqCst);
     }
 
     #[test]
@@ -1057,22 +1177,23 @@ mod tests {
     }
 
     #[test]
-    fn startup_guard_allows_a_short_sweep_to_finish_after_provider_settlement() {
+    fn startup_guard_joins_an_already_finished_sweep() {
         let stop = Arc::new(AtomicBool::new(false));
         let completed = Arc::new(AtomicBool::new(false));
         let worker_completed = Arc::clone(&completed);
         let (done_tx, done) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
             worker_completed.store(true, Ordering::SeqCst);
             done_tx.send(()).unwrap();
+            finished_tx.send(()).unwrap();
         });
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let guard = StartupWakeReclaimGuard {
             stop: Arc::clone(&stop),
+            owned_lease: Arc::new(Mutex::new(None)),
             done,
             handle: Some(handle),
-            completion_grace: Duration::from_secs(1),
-            cancellation_grace: Duration::from_secs(1),
             schedule_handoff: None,
         };
 
@@ -1083,39 +1204,43 @@ mod tests {
     }
 
     #[test]
-    fn startup_guard_cancels_and_joins_after_its_completion_grace() {
+    fn startup_guard_hands_off_and_cancels_without_waiting() {
+        TEST_HANDOFF_SCHEDULED.store(false, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let (done_tx, done) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             started_tx.send(()).unwrap();
             while !worker_stop.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            done_tx.send(()).unwrap();
+            let _ = done_tx.send(());
+            finished_tx.send(()).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let guard = StartupWakeReclaimGuard {
             stop: Arc::clone(&stop),
+            owned_lease: Arc::new(Mutex::new(None)),
             done,
             handle: Some(handle),
-            completion_grace: Duration::from_millis(20),
-            cancellation_grace: Duration::from_secs(1),
-            schedule_handoff: None,
+            schedule_handoff: Some(record_test_handoff),
         };
         let started = std::time::Instant::now();
 
         drop(guard);
 
         assert!(stop.load(Ordering::SeqCst));
-        assert!(started.elapsed() >= Duration::from_millis(15));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(TEST_HANDOFF_SCHEDULED.load(Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
     fn startup_guard_does_not_join_an_uncooperative_worker_without_a_bound() {
         TEST_HANDOFF_SCHEDULED.store(false, Ordering::SeqCst);
+        TEST_HANDOFF_OWNER_MATCHED.store(false, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         let worker_release = Arc::clone(&release);
@@ -1131,10 +1256,9 @@ mod tests {
         let worker_thread = handle.thread().clone();
         let guard = StartupWakeReclaimGuard {
             stop: Arc::clone(&stop),
+            owned_lease: Arc::new(Mutex::new(Some("test-owner".to_string()))),
             done,
             handle: Some(handle),
-            completion_grace: Duration::from_millis(10),
-            cancellation_grace: Duration::from_millis(10),
             schedule_handoff: Some(record_test_handoff),
         };
         let started = std::time::Instant::now();
@@ -1143,10 +1267,48 @@ mod tests {
 
         assert!(stop.load(Ordering::SeqCst));
         assert!(TEST_HANDOFF_SCHEDULED.load(Ordering::SeqCst));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(TEST_HANDOFF_OWNER_MATCHED.load(Ordering::SeqCst));
+        assert!(started.elapsed() < Duration::from_millis(100));
         release.store(true, Ordering::SeqCst);
         worker_thread.unpark();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn process_start_coordination_contention_retries_after_holder_releases() {
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&mailbox_path).unwrap());
+        let holder = acquire_wake_sweep_coordination(&mailbox_path).unwrap();
+        let worker_mailbox_path = mailbox_path.clone();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut first_attempt = true;
+            run_wake_reclaim_sweep_or_warn_with_runner("process_start", &|| false, || {
+                let attempt = try_acquire_wake_sweep_admission(&worker_mailbox_path)?;
+                if first_attempt {
+                    first_attempt = false;
+                    attempted_tx.send(()).unwrap();
+                }
+                Ok(match attempt {
+                    WakeSweepAdmissionAttempt::Acquired(_) => WakeSweepRunOutcome::Completed,
+                    WakeSweepAdmissionAttempt::Owned(owner_token) => {
+                        WakeSweepRunOutcome::Contended(owner_token)
+                    }
+                    WakeSweepAdmissionAttempt::CoordinationBusy => {
+                        WakeSweepRunOutcome::CoordinationBusy
+                    }
+                })
+            });
+            finished_tx.send(()).unwrap();
+        });
+
+        attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(finished_rx.try_recv().is_err());
+        drop(holder);
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
@@ -1200,6 +1362,30 @@ mod tests {
                 WakeSweepAdmissionAttempt::Acquired(_)
             ),
             "admission must return after the owner exits"
+        );
+    }
+
+    #[test]
+    fn wake_sweep_bootstrap_is_cross_handle_single_flight_and_reusable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&mailbox_path).unwrap());
+
+        let first = try_acquire_wake_sweep_bootstrap_admission(&mailbox_path)
+            .unwrap()
+            .expect("first bootstrap must acquire admission");
+        assert!(
+            try_acquire_wake_sweep_bootstrap_admission(&mailbox_path)
+                .unwrap()
+                .is_none(),
+            "a second bootstrap must not run concurrently"
+        );
+        drop(first);
+        assert!(
+            try_acquire_wake_sweep_bootstrap_admission(&mailbox_path)
+                .unwrap()
+                .is_some(),
+            "bootstrap admission must return after the owner exits"
         );
     }
 
