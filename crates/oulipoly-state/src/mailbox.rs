@@ -812,7 +812,6 @@ pub struct PayloadRetentionRepository<'a> {
 /// Session metadata plus atomic wake-claim admission and lifecycle authority.
 pub struct WakeSessionRepository<'a> {
     conn: &'a mut Connection,
-    path: &'a Path,
 }
 
 /// Read-only session metadata, compatibility projection, and wake-claim surface.
@@ -1325,7 +1324,6 @@ impl MailboxDb {
     pub fn wake_sessions(&mut self) -> WakeSessionRepository<'_> {
         WakeSessionRepository {
             conn: &mut self.conn,
-            path: &self.path,
         }
     }
 
@@ -3634,7 +3632,9 @@ impl WakeSessionRepository<'_> {
             .conn
             .execute(
                 "UPDATE session_wake_claim
-                 SET wake_pid = ?3
+                 SET wake_pid = ?3,
+                     wake_os_boot_id = NULL,
+                     wake_os_pid_starttime_ticks = NULL
                  WHERE session_id = ?1
                    AND claim_token = ?2",
                 params![session_id, claim_token, wake_pid],
@@ -3648,22 +3648,29 @@ impl WakeSessionRepository<'_> {
         session_id: &str,
         claim_token: &str,
         wake_pid: i64,
-        provider_name: Option<&str>,
-        model_name: Option<&str>,
     ) -> Result<bool, String> {
-        if let Some(identity) = pid_identity::read_live_process_identity(wake_pid)? {
-            let recorded_at = now_rfc3339();
-            let record = wake_claim_pid_identity_record(
-                &identity,
-                claim_token,
-                session_id,
-                provider_name,
-                model_name,
-                &recorded_at,
-            );
-            pid_identity::PidIdentityDb::open(self.path)?.record_identity(record)?;
-        }
-        self.record_wake_claim_pid(session_id, claim_token, wake_pid)
+        let identity = pid_identity::read_live_process_identity(wake_pid)?;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE session_wake_claim
+                 SET wake_pid = ?3,
+                     wake_os_boot_id = ?4,
+                     wake_os_pid_starttime_ticks = ?5
+                 WHERE session_id = ?1
+                   AND claim_token = ?2",
+                params![
+                    session_id,
+                    claim_token,
+                    wake_pid,
+                    identity.as_ref().map(|identity| &identity.os_boot_id),
+                    identity
+                        .as_ref()
+                        .map(|identity| identity.os_pid_starttime_ticks),
+                ],
+            )
+            .map_err(|err| format!("Failed to record wake claim process identity: {err}"))?;
+        Ok(changed > 0)
     }
 
     pub fn wake_sweep_candidates(
@@ -4554,25 +4561,6 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         "Durable mailbox payload directory publication is unsupported on this platform: {}",
         path.display()
     ))
-}
-
-fn wake_claim_pid_identity_record<'a>(
-    identity: &'a ProcessIdentity,
-    claim_token: &'a str,
-    session_id: &'a str,
-    provider_name: Option<&'a str>,
-    model_name: Option<&'a str>,
-    recorded_at: &'a str,
-) -> pid_identity::PidIdentityRecord<'a> {
-    pid_identity::PidIdentityRecord {
-        identity,
-        os_pgid: None,
-        invocation_uuid: claim_token,
-        session_id: Some(session_id),
-        provider_name,
-        model_name,
-        recorded_at,
-    }
 }
 
 #[cfg(test)]
@@ -6445,23 +6433,23 @@ fn wake_claim_pid_is_live_identity_matched(
     let Some(live) = wake_claim_live_process_identity(wake_pid)? else {
         return Ok(false);
     };
-    wake_claim_live_identity_has_matching_sidecar_row(conn, claim, &live)
+    wake_claim_has_matching_live_process_identity(conn, claim, &live)
 }
 
 fn wake_claim_live_process_identity(wake_pid: i64) -> Result<Option<ProcessIdentity>, String> {
     pid_identity::read_live_process_identity(wake_pid)
 }
 
-fn wake_claim_live_identity_has_matching_sidecar_row(
+fn wake_claim_has_matching_live_process_identity(
     conn: &Connection,
     claim: &WakeClaimRow,
     live: &ProcessIdentity,
 ) -> Result<bool, String> {
-    let exists = wake_claim_live_identity_matching_sidecar_exists(conn, claim, live)?;
+    let exists = wake_claim_matching_live_process_identity_exists(conn, claim, live)?;
     Ok(sqlite_exists_value_to_bool(exists))
 }
 
-fn wake_claim_live_identity_matching_sidecar_exists(
+fn wake_claim_matching_live_process_identity_exists(
     conn: &Connection,
     claim: &WakeClaimRow,
     live: &ProcessIdentity,
@@ -6469,23 +6457,23 @@ fn wake_claim_live_identity_matching_sidecar_exists(
     conn.query_row(
         "SELECT EXISTS(
             SELECT 1
-            FROM pid_identity
-            WHERE os_pid = ?1
-              AND os_boot_id = ?2
-              AND os_pid_starttime_ticks = ?3
-              AND invocation_uuid = ?4
-              AND session_id = ?5
+            FROM session_wake_claim
+            WHERE session_id = ?1
+              AND claim_token = ?2
+              AND wake_pid = ?3
+              AND wake_os_boot_id = ?4
+              AND wake_os_pid_starttime_ticks = ?5
         )",
         params![
+            &claim.session_id,
+            &claim.claim_token,
             live.os_pid,
             &live.os_boot_id,
             live.os_pid_starttime_ticks,
-            &claim.claim_token,
-            &claim.session_id,
         ],
         |row| row.get::<_, i64>(0),
     )
-    .map_err(|err| format!("Failed to verify wake PID sidecar identity: {err}"))
+    .map_err(|err| format!("Failed to verify wake claim process identity: {err}"))
 }
 
 fn sqlite_exists_value_to_bool(value: i64) -> bool {
@@ -6528,6 +6516,8 @@ fn upsert_wake_claim_tx(
             claim_token = excluded.claim_token,
             claimed_at = excluded.claimed_at,
             wake_pid = excluded.wake_pid,
+            wake_os_boot_id = NULL,
+            wake_os_pid_starttime_ticks = NULL,
             wake_invocation_uuid = excluded.wake_invocation_uuid,
             reason = excluded.reason,
             auto_wake_count = excluded.auto_wake_count,
@@ -7970,6 +7960,8 @@ fn mailbox_schema_definition() -> &'static str {
             claim_token                      TEXT NOT NULL,
             claimed_at                       TEXT NOT NULL,
             wake_pid                         INTEGER,
+            wake_os_boot_id                  TEXT,
+            wake_os_pid_starttime_ticks      INTEGER,
             wake_invocation_uuid             TEXT,
             reason                           TEXT NOT NULL,
             auto_wake_count                  INTEGER NOT NULL,
@@ -8234,6 +8226,20 @@ fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
     let columns = table_columns(conn, "session_runtime", &sql)?;
     for (name, definition) in missing_session_runtime_columns(&columns) {
         add_session_runtime_column(conn, name, definition)?;
+    }
+    Ok(())
+}
+
+fn ensure_wake_claim_process_identity_columns(conn: &Connection) -> Result<(), String> {
+    let sql = format_table_columns_pragma("session_wake_claim");
+    let columns = table_columns(conn, "session_wake_claim", &sql)?;
+    for (name, definition) in [
+        ("wake_os_boot_id", "TEXT"),
+        ("wake_os_pid_starttime_ticks", "INTEGER"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            add_sidecar_column(conn, "session_wake_claim", name, definition)?;
+        }
     }
     Ok(())
 }
@@ -8766,6 +8772,56 @@ mod tests {
         assert!(
             current_open_steps < 512,
             "current-schema open performed unexpected SQLite work: {current_open_steps}"
+        );
+    }
+
+    #[test]
+    fn v2_upgrade_adds_wake_claim_process_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE session_wake_claim;
+                 CREATE TABLE session_wake_claim (
+                    session_id                       TEXT PRIMARY KEY,
+                    claim_token                      TEXT NOT NULL,
+                    claimed_at                       TEXT NOT NULL,
+                    wake_pid                         INTEGER,
+                    wake_invocation_uuid             TEXT,
+                    reason                           TEXT NOT NULL,
+                    auto_wake_count                  INTEGER NOT NULL,
+                    min_pending_seq_at_claim         INTEGER,
+                    max_pending_seq_at_claim         INTEGER
+                 );
+                 CREATE INDEX idx_session_wake_claim_claimed_at
+                    ON session_wake_claim(claimed_at);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+        let columns = table_columns(
+            &connection,
+            "session_wake_claim",
+            "PRAGMA table_info(session_wake_claim)",
+        )
+        .unwrap();
+        assert!(columns.iter().any(|column| column == "wake_os_boot_id"));
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "wake_os_pid_starttime_ticks")
         );
     }
 
@@ -12134,21 +12190,11 @@ mod tests {
             WakeClaimAcquireResult::Acquired(_)
         ));
         let identity = current_identity();
-        let sidecar = pid_identity::PidIdentityDb::open(db.path()).unwrap();
-        sidecar
-            .record_identity(pid_identity::PidIdentityRecord {
-                identity: &identity,
-                os_pgid: None,
-                invocation_uuid: "token-a",
-                session_id: Some("session-a"),
-                provider_name: Some("wake"),
-                model_name: Some("model-a"),
-                recorded_at: "2026-06-08T00:00:00Z",
-            })
-            .unwrap();
         db.wake_sessions()
-            .record_wake_claim_pid("session-a", "token-a", identity.os_pid)
+            .record_wake_claim_pid_identity("session-a", "token-a", identity.os_pid)
             .unwrap();
+        let sidecar = pid_identity::PidIdentityDb::open(db.path()).unwrap();
+        assert!(sidecar.lookup_by_identity(&identity).unwrap().is_none());
         db.wake_sessions()
             .force_wake_claim_age_for_test("session-a", 601)
             .unwrap();

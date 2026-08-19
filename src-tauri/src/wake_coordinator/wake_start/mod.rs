@@ -55,13 +55,7 @@ pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         context.input.auto_wake_count,
         context.auto_wake_max,
     );
-    wake_spawn_diagnostic(
-        &mut context.db,
-        context.input,
-        context.runtime.as_ref(),
-        context.claim,
-        spawn,
-    )
+    wake_spawn_diagnostic(&mut context.db, context.input, context.claim, spawn)
 }
 
 fn prepare_wake_start_context<'a>(
@@ -183,12 +177,11 @@ fn wake_claim_to_start(
 fn wake_spawn_diagnostic(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
-    runtime: Option<&SessionMetadataRow>,
     claim: WakeClaimRow,
     spawn: Result<i64, String>,
 ) -> WakeDiagnostic {
     match spawn {
-        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, runtime, claim, wake_pid),
+        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, claim, wake_pid),
         Err(err) => failed_wake_spawn_diagnostic(db, input, claim, err),
     }
 }
@@ -196,11 +189,10 @@ fn wake_spawn_diagnostic(
 fn successful_wake_spawn_diagnostic(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
-    runtime: Option<&SessionMetadataRow>,
     claim: WakeClaimRow,
     wake_pid: i64,
 ) -> WakeDiagnostic {
-    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid, runtime);
+    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid);
     spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
 }
 
@@ -227,30 +219,13 @@ fn session_metadata_for_wake(
     db.wake_session_reader().session_metadata(session_id)
 }
 
-fn record_wake_pid_or_warn(
-    db: &mut MailboxDb,
-    session_id: &str,
-    claim_token: &str,
-    wake_pid: i64,
-    runtime: Option<&SessionMetadataRow>,
-) {
-    let (provider_name, model_name) = wake_pid_identity_names(runtime);
-    if let Err(err) = db.wake_sessions().record_wake_claim_pid_identity(
-        session_id,
-        claim_token,
-        wake_pid,
-        provider_name,
-        model_name,
-    ) {
+fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &str, wake_pid: i64) {
+    if let Err(err) =
+        db.wake_sessions()
+            .record_wake_claim_pid_identity(session_id, claim_token, wake_pid)
+    {
         warn_wake_pid_record_failed(session_id, claim_token, err);
     }
-}
-
-fn wake_pid_identity_names(runtime: Option<&SessionMetadataRow>) -> (Option<&str>, Option<&str>) {
-    (
-        runtime.and_then(|row| row.provider_name.as_deref()),
-        runtime.and_then(|row| row.model_name.as_deref()),
-    )
 }
 
 fn warn_wake_pid_record_failed(session_id: &str, claim_token: &str, err: String) {

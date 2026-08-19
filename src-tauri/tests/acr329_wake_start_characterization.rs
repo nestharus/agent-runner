@@ -206,13 +206,7 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     assert!(matches!(acquired, WakeClaimAcquireResult::Acquired(_)));
     claim_db
         .wake_sessions()
-        .record_wake_claim_pid_identity(
-            SESSION,
-            claim_token,
-            i64::from(std::process::id()),
-            Some(PROVIDER),
-            Some(MODEL),
-        )
+        .record_wake_claim_pid_identity(SESSION, claim_token, i64::from(std::process::id()))
         .unwrap();
     let before = claim_db
         .wake_session_reader()

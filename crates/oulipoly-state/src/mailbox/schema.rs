@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 2;
+pub(super) const CURRENT_VERSION: i64 = 3;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,7 +26,7 @@ struct MigrationStep {
     apply: fn(&Connection) -> Result<(), String>,
 }
 
-const V2_STEPS: &[MigrationStep] = &[
+const SCHEMA_STEPS: &[MigrationStep] = &[
     MigrationStep {
         target_version: 2,
         owner: SidecarEntity::NamespaceAuthority,
@@ -56,6 +56,11 @@ const V2_STEPS: &[MigrationStep] = &[
         target_version: 2,
         owner: SidecarEntity::PayloadRetention,
         apply: ensure_payload_retention_schema,
+    },
+    MigrationStep {
+        target_version: 3,
+        owner: SidecarEntity::WakeAndSessionMetadata,
+        apply: ensure_wake_process_identity_schema,
     },
 ];
 
@@ -113,12 +118,12 @@ fn validate_supported_version(version: i64) -> Result<(), String> {
 }
 
 fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
-    apply_steps(conn, V2_STEPS)
+    apply_steps(conn, SCHEMA_STEPS)
 }
 
 fn upgrade_installed_schema(conn: &Connection, stored_version: i64) -> Result<(), String> {
     for target_version in (stored_version + 1)..=CURRENT_VERSION {
-        let steps = V2_STEPS
+        let steps = SCHEMA_STEPS
             .iter()
             .filter(|step| step.target_version == target_version)
             .collect::<Vec<_>>();
@@ -209,6 +214,10 @@ fn ensure_runtime_lifecycle_schema(conn: &Connection) -> Result<(), String> {
 
 fn ensure_wake_and_session_metadata_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_session_runtime_columns(conn)
+}
+
+fn ensure_wake_process_identity_schema(conn: &Connection) -> Result<(), String> {
+    super::ensure_wake_claim_process_identity_columns(conn)
 }
 
 fn ensure_payload_retention_schema(conn: &Connection) -> Result<(), String> {

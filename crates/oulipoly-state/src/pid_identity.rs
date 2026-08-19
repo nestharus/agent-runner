@@ -161,7 +161,11 @@ impl PidIdentityDb {
     }
 
     pub fn record_identity(&self, record: PidIdentityRecord<'_>) -> Result<PidIdentityRow, String> {
-        upsert_pid_identity_row(&self.conn, record)?;
+        if !bind_identity_on(&self.conn, record)? {
+            return Err(
+                "Exact PID identity is already bound to another invocation or session".to_string(),
+            );
+        }
         let row = self.lookup_by_identity(record.identity)?;
         require_recorded_identity(row)
     }
@@ -178,7 +182,8 @@ impl PidIdentityDb {
                  SET session_id = ?4
                  WHERE os_pid = ?1
                    AND os_boot_id = ?2
-                   AND os_pid_starttime_ticks = ?3",
+                   AND os_pid_starttime_ticks = ?3
+                   AND (session_id IS NULL OR session_id = ?4)",
                 params![
                     identity.os_pid,
                     &identity.os_boot_id,
@@ -324,19 +329,7 @@ pub(crate) fn bind_identity_on(
     conn: &Connection,
     record: PidIdentityRecord<'_>,
 ) -> Result<bool, String> {
-    let existing = lookup_by_identity_on(conn, record.identity)?;
-    if let Some(existing) = existing
-        && (existing.invocation_uuid != record.invocation_uuid
-            || existing.session_id.as_deref().is_some_and(|session_id| {
-                record
-                    .session_id
-                    .is_some_and(|requested| requested != session_id)
-            }))
-    {
-        return Ok(false);
-    }
-    upsert_pid_identity_row(conn, record)?;
-    Ok(true)
+    upsert_pid_identity_row(conn, record)
 }
 
 pub(crate) fn attach_identity_session_on(
@@ -416,9 +409,13 @@ where
         .map_err(|err| format!("Failed to read PID identity row: {err}"))
 }
 
-fn upsert_pid_identity_row(conn: &Connection, record: PidIdentityRecord<'_>) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO pid_identity (
+fn upsert_pid_identity_row(
+    conn: &Connection,
+    record: PidIdentityRecord<'_>,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "INSERT INTO pid_identity (
             os_pid,
             os_boot_id,
             os_pid_starttime_ticks,
@@ -431,26 +428,29 @@ fn upsert_pid_identity_row(conn: &Connection, record: PidIdentityRecord<'_>) -> 
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(os_pid, os_boot_id, os_pid_starttime_ticks)
          DO UPDATE SET
-            os_pgid = excluded.os_pgid,
-            invocation_uuid = excluded.invocation_uuid,
-            session_id = COALESCE(excluded.session_id, pid_identity.session_id),
+            os_pgid = COALESCE(excluded.os_pgid, pid_identity.os_pgid),
+            session_id = COALESCE(pid_identity.session_id, excluded.session_id),
             provider_name = COALESCE(excluded.provider_name, pid_identity.provider_name),
             model_name = COALESCE(excluded.model_name, pid_identity.model_name),
-            recorded_at = excluded.recorded_at",
-        params![
-            record.identity.os_pid,
-            &record.identity.os_boot_id,
-            record.identity.os_pid_starttime_ticks,
-            record.os_pgid,
-            record.invocation_uuid,
-            record.session_id,
-            record.provider_name,
-            record.model_name,
-            record.recorded_at,
-        ],
-    )
-    .map_err(|err| format!("Failed to record PID identity: {err}"))?;
-    Ok(())
+            recorded_at = excluded.recorded_at
+          WHERE pid_identity.invocation_uuid = excluded.invocation_uuid
+            AND (pid_identity.session_id IS NULL
+              OR excluded.session_id IS NULL
+              OR pid_identity.session_id = excluded.session_id)",
+            params![
+                record.identity.os_pid,
+                &record.identity.os_boot_id,
+                record.identity.os_pid_starttime_ticks,
+                record.os_pgid,
+                record.invocation_uuid,
+                record.session_id,
+                record.provider_name,
+                record.model_name,
+                record.recorded_at,
+            ],
+        )
+        .map_err(|err| format!("Failed to record PID identity: {err}"))?;
+    Ok(changed > 0)
 }
 
 fn require_recorded_identity(row: Option<PidIdentityRow>) -> Result<PidIdentityRow, String> {
@@ -728,6 +728,35 @@ mod tests {
 
         let row = db.lookup_by_identity(&identity).unwrap().unwrap();
         assert_eq!(row.session_id.as_deref(), Some("session-late"));
+    }
+
+    #[test]
+    fn exact_process_identity_rejects_invocation_and_session_reassignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let db = PidIdentityDb::open(&path).unwrap();
+        let identity = identity(100, "boot-binding");
+        db.record_identity(record(&identity, Some("session-a")))
+            .unwrap();
+
+        let error = db
+            .record_identity(PidIdentityRecord {
+                identity: &identity,
+                os_pgid: Some(4242),
+                invocation_uuid: "22222222-2222-2222-2222-222222222222",
+                session_id: Some("session-b"),
+                provider_name: Some("replacement-provider"),
+                model_name: Some("replacement~high"),
+                recorded_at: "2026-06-04T12:01:00Z",
+            })
+            .unwrap_err();
+
+        assert!(error.contains("already bound"), "{error}");
+        assert!(!db.set_session_id(&identity, "session-b").unwrap());
+        let row = db.lookup_by_identity(&identity).unwrap().unwrap();
+        assert_eq!(row.invocation_uuid, INVOCATION_UUID);
+        assert_eq!(row.session_id.as_deref(), Some("session-a"));
+        assert_eq!(row.provider_name.as_deref(), Some("fixture-provider"));
     }
 
     #[test]

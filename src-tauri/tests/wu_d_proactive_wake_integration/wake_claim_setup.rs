@@ -4,12 +4,10 @@
 //!
 //! TEST: wake-claim setup mutators for proactive wake integration cases.
 
+use crate::SESSION;
 use crate::fixtures::Fixture;
-use crate::{MODEL, PROVIDER, SESSION};
 use chrono::Utc;
-use oulipoly_state::pid_identity::{
-    PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
-};
+use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
 pub(crate) fn seed_dead_wake_claim(fixture: &Fixture, claim_token: &str, seconds_old: i64) {
     seed_dead_wake_claim_for(fixture, SESSION, claim_token, seconds_old);
@@ -33,22 +31,10 @@ pub(crate) fn seed_dead_wake_claim_for(
 pub(crate) fn seed_live_wake_claim(fixture: &Fixture, claim_token: &str) {
     acquire_seed_wake_claim(fixture, claim_token);
     let identity = current_process_identity();
-    PidIdentityDb::open(&fixture.sidecar_path())
-        .unwrap()
-        .record_identity(PidIdentityRecord {
-            identity: &identity,
-            os_pgid: None,
-            invocation_uuid: claim_token,
-            session_id: Some(SESSION),
-            provider_name: Some(PROVIDER),
-            model_name: Some(MODEL),
-            recorded_at: "2026-06-04T12:02:00Z",
-        })
-        .unwrap();
     fixture
         .mailbox()
         .wake_sessions()
-        .record_wake_claim_pid(SESSION, claim_token, identity.os_pid)
+        .record_wake_claim_pid_identity(SESSION, claim_token, identity.os_pid)
         .unwrap();
 }
 
