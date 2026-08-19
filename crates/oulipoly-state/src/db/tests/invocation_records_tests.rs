@@ -227,13 +227,20 @@ fn bounded_invocation_children_stop_at_the_requested_row_limit() {
     }
 
     StateDb::reset_invocation_row_map_count();
-    let children = db
-        .list_invocation_children_bounded(root_id, 2, false)
+    let page = db
+        .list_invocation_children_bounded_page_with_cancel(
+            root_id,
+            2,
+            false,
+            &oulipoly_core::CancellationToken::new(),
+        )
         .unwrap();
 
     assert_eq!(StateDb::invocation_row_map_count(), 2);
+    assert!(page.has_more_children);
+    assert!(!page.live_coverage_incomplete);
     assert_eq!(
-        invocation_record_uuids(&children),
+        invocation_record_uuids(&page.children),
         vec![
             "0000003c-0000-0000-0000-000000000000",
             "00000078-0000-0000-0000-000000000000",
@@ -353,6 +360,210 @@ fn bounded_invocation_children_prioritize_terminal_ancestor_of_running_descendan
 }
 
 #[test]
+fn bounded_invocation_children_report_live_coverage_when_candidate_window_saturates() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "28000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    for index in 0..8 {
+        let child_id = insert_invocation_fixture(
+            &db,
+            &format!("28000000-0000-0000-0001-{index:012}"),
+            Some(root_id),
+            "2026-04-17T08:01:00Z",
+        );
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                sqlite::params![child_id],
+            )
+            .unwrap();
+    }
+    let hidden_ancestor_id = insert_invocation_fixture(
+        &db,
+        "29000000-0000-0000-0000-000000000000",
+        Some(root_id),
+        "2026-04-17T08:02:00Z",
+    );
+    db.conn
+        .execute(
+            "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+            sqlite::params![hidden_ancestor_id],
+        )
+        .unwrap();
+    insert_invocation_fixture(
+        &db,
+        "2a000000-0000-0000-0000-000000000000",
+        Some(hidden_ancestor_id),
+        "2026-04-17T08:03:00Z",
+    );
+
+    let page = db
+        .list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            root_id,
+            2,
+            &oulipoly_core::CancellationToken::new(),
+        )
+        .unwrap();
+
+    assert_eq!(page.children.len(), 2);
+    assert!(page.has_more_children);
+    assert!(page.live_coverage_incomplete);
+    assert!(
+        page.children
+            .iter()
+            .all(|child| child.id != hidden_ancestor_id)
+    );
+}
+
+#[test]
+fn bounded_invocation_children_report_live_coverage_when_descendant_window_saturates() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "2b000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    let ancestor_id = insert_invocation_fixture(
+        &db,
+        "2c000000-0000-0000-0000-000000000000",
+        Some(root_id),
+        "2026-04-17T08:01:00Z",
+    );
+    db.conn
+        .execute(
+            "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+            sqlite::params![ancestor_id],
+        )
+        .unwrap();
+    let mut parent_id = ancestor_id;
+    for index in 0..17 {
+        let child_id = insert_invocation_fixture(
+            &db,
+            &format!("2d000000-0000-0000-0000-{index:012}"),
+            Some(parent_id),
+            "2026-04-17T08:02:00Z",
+        );
+        if index < 16 {
+            db.conn
+                .execute(
+                    "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                    sqlite::params![child_id],
+                )
+                .unwrap();
+        }
+        parent_id = child_id;
+    }
+
+    let page = db
+        .list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            root_id,
+            2,
+            &oulipoly_core::CancellationToken::new(),
+        )
+        .unwrap();
+
+    assert_eq!(page.children.len(), 1);
+    assert!(!page.has_more_children);
+    assert!(page.live_coverage_incomplete);
+}
+
+#[test]
+fn bounded_invocation_children_report_live_coverage_when_final_child_limit_saturates() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "2e000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    for index in 0..3 {
+        let child_id = insert_invocation_fixture(
+            &db,
+            &format!("2e000000-0000-0000-0001-{index:012}"),
+            Some(root_id),
+            "2026-04-17T08:01:00Z",
+        );
+        db.conn
+            .execute(
+                "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                sqlite::params![child_id],
+            )
+            .unwrap();
+    }
+
+    let page = db
+        .list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            root_id,
+            2,
+            &oulipoly_core::CancellationToken::new(),
+        )
+        .unwrap();
+
+    assert_eq!(page.children.len(), 2);
+    assert!(page.has_more_children);
+    assert!(page.live_coverage_incomplete);
+}
+
+#[test]
+fn bounded_invocation_children_report_live_coverage_at_descendant_scan_boundary() {
+    let db = test_db();
+    let root_id = insert_invocation_fixture(
+        &db,
+        "2f000000-0000-0000-0000-000000000000",
+        None,
+        "2026-04-17T08:00:00Z",
+    );
+    let ancestor_id = insert_invocation_fixture(
+        &db,
+        "30000000-0000-0000-0000-000000000000",
+        Some(root_id),
+        "2026-04-17T08:01:00Z",
+    );
+    db.conn
+        .execute(
+            "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+            sqlite::params![ancestor_id],
+        )
+        .unwrap();
+    for index in 0..16 {
+        let child_id = insert_invocation_fixture(
+            &db,
+            &format!("31000000-0000-0000-0000-{index:012}"),
+            Some(ancestor_id),
+            "2026-04-17T08:02:00Z",
+        );
+        if index != 0 {
+            db.conn
+                .execute(
+                    "UPDATE invocations SET status = 'succeeded' WHERE id = ?1",
+                    sqlite::params![child_id],
+                )
+                .unwrap();
+        }
+    }
+
+    let page = db
+        .list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            root_id,
+            2,
+            &oulipoly_core::CancellationToken::new(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        invocation_record_uuids(&page.children),
+        vec!["30000000-0000-0000-0000-000000000000"]
+    );
+    assert!(!page.has_more_children);
+    assert!(page.live_coverage_incomplete);
+}
+
+#[test]
 fn running_descendant_queries_are_root_scoped_indexed_and_sort_free() {
     let db = test_db();
     let mut candidate_statement = db
@@ -411,6 +622,25 @@ fn running_descendant_queries_are_root_scoped_indexed_and_sort_free() {
             .iter()
             .all(|detail| !detail.contains("TEMP B-TREE")),
         "{descendant_details:?}"
+    );
+
+    let mut overflow_statement = db
+        .conn
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            StateDb::invocation_children_overflow_sql()
+        ))
+        .unwrap();
+    let overflow_details = overflow_statement
+        .query_map(sqlite::params![1_i64, 8_i64], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        overflow_details
+            .iter()
+            .any(|detail| detail.contains("idx_invocations_parent")),
+        "{overflow_details:?}"
     );
 }
 

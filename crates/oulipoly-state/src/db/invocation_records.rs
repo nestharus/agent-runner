@@ -49,7 +49,15 @@ const RUNNING_DESCENDANT_EXISTS_SQL: &str = "WITH RECURSIVE descendants(id, stat
          WHERE parent.status != 'running'
          LIMIT ?2
      )
-     SELECT EXISTS(SELECT 1 FROM descendants WHERE status = 'running')";
+     SELECT EXISTS(SELECT 1 FROM descendants WHERE status = 'running'),
+            COUNT(*)
+     FROM descendants";
+const INVOCATION_CHILDREN_OVERFLOW_SQL: &str = "SELECT EXISTS(
+         SELECT 1
+         FROM invocations INDEXED BY idx_invocations_parent
+         WHERE parent_invocation_id = ?1
+         LIMIT 1 OFFSET ?2
+     )";
 
 #[cfg(test)]
 std::thread_local! {
@@ -184,6 +192,17 @@ pub struct InvocationRecord {
     pub resume_acceptance_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+pub struct InvocationChildrenPage {
+    pub children: Vec<InvocationRecord>,
+    pub has_more_children: bool,
+    pub live_coverage_incomplete: bool,
+}
+
+struct LiveSubtreeChildIds {
+    ids: Vec<i64>,
+    coverage_incomplete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -405,8 +424,30 @@ impl StateDb {
         prioritize_running: bool,
         cancellation: &CancellationToken,
     ) -> Result<Vec<InvocationRecord>, String> {
+        self.list_invocation_children_bounded_page_with_cancel(
+            parent_id,
+            limit,
+            prioritize_running,
+            cancellation,
+        )
+        .map(|page| page.children)
+    }
+
+    pub fn list_invocation_children_bounded_page_with_cancel(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        prioritize_running: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<InvocationChildrenPage, String> {
         self.with_invocation_query_cancellation(cancellation, || {
-            self.list_invocation_children_bounded_inner(parent_id, limit, prioritize_running)
+            let children =
+                self.list_invocation_children_bounded_inner(parent_id, limit, prioritize_running)?;
+            Ok(InvocationChildrenPage {
+                children,
+                has_more_children: self.invocation_children_overflow(parent_id, limit)?,
+                live_coverage_incomplete: false,
+            })
         })
     }
 
@@ -452,6 +493,7 @@ impl StateDb {
             limit,
             &CancellationToken::new(),
         )
+        .map(|(children, _)| children)
     }
 
     pub fn list_invocation_children_with_running_descendants_bounded_with_cancel(
@@ -460,12 +502,33 @@ impl StateDb {
         limit: usize,
         cancellation: &CancellationToken,
     ) -> Result<Vec<InvocationRecord>, String> {
+        self.list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            parent_id,
+            limit,
+            cancellation,
+        )
+        .map(|page| page.children)
+    }
+
+    pub fn list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<InvocationChildrenPage, String> {
         self.with_invocation_query_cancellation(cancellation, || {
-            self.list_invocation_children_with_running_descendants_bounded_inner(
-                parent_id,
-                limit,
-                cancellation,
-            )
+            let (children, live_coverage_incomplete) = self
+                .list_invocation_children_with_running_descendants_bounded_inner(
+                    parent_id,
+                    limit,
+                    cancellation,
+                )?;
+            let has_more_children = self.invocation_children_overflow(parent_id, limit)?;
+            Ok(InvocationChildrenPage {
+                children,
+                has_more_children,
+                live_coverage_incomplete: live_coverage_incomplete || has_more_children,
+            })
         })
     }
 
@@ -474,28 +537,28 @@ impl StateDb {
         parent_id: i64,
         limit: usize,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<InvocationRecord>, String> {
+    ) -> Result<(Vec<InvocationRecord>, bool), String> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), self.invocation_children_overflow(parent_id, 0)?));
         }
-        let live_child_ids = self.list_live_subtree_child_ids(parent_id, limit, cancellation)?;
+        let live_subtrees = self.list_live_subtree_child_ids(parent_id, limit, cancellation)?;
         let mut children = Vec::with_capacity(limit);
-        for id in &live_child_ids {
+        for id in &live_subtrees.ids {
             if let Some(record) = self.get_invocation_by_id(*id)? {
                 children.push(record);
             }
         }
         if children.len() >= limit {
-            return Ok(children);
+            return Ok((children, live_subtrees.coverage_incomplete));
         }
 
         let candidates = self.list_invocation_children_excluding_ids_bounded(
             parent_id,
             limit - children.len(),
-            &live_child_ids,
+            &live_subtrees.ids,
         )?;
         children.extend(candidates);
-        Ok(children)
+        Ok((children, live_subtrees.coverage_incomplete))
     }
 
     fn list_invocation_children_excluding_ids_bounded(
@@ -539,17 +602,17 @@ impl StateDb {
         parent_id: i64,
         limit: usize,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<i64>, String> {
-        let candidate_limit =
-            Self::scaled_invocation_query_limit(limit, RUNNING_DESCENDANT_CANDIDATE_FACTOR);
+    ) -> Result<LiveSubtreeChildIds, String> {
+        let candidate_limit = limit.saturating_mul(RUNNING_DESCENDANT_CANDIDATE_FACTOR);
+        let mut coverage_incomplete =
+            self.invocation_children_overflow(parent_id, candidate_limit)?;
+        let query_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
         let mut statement = self
             .conn
             .prepare(RUNNING_DESCENDANT_CANDIDATES_SQL)
             .map_err(Self::format_invocation_child_lookup_prepare_error)?;
         let candidate_ids = statement
-            .query_map(sqlite::params![parent_id, candidate_limit], |row| {
-                row.get(0)
-            })
+            .query_map(sqlite::params![parent_id, query_limit], |row| row.get(0))
             .map_err(Self::format_invocation_children_query_error)?;
         let candidate_ids = candidate_ids
             .collect::<Result<Vec<_>, _>>()
@@ -567,11 +630,14 @@ impl StateDb {
             if cancellation.is_cancelled() {
                 return Err("Invocation child lookup cancelled".to_string());
             }
-            let has_running_descendant = statement
+            let (has_running_descendant, visited_rows) = statement
                 .query_row(sqlite::params![candidate_id, descendant_limit], |row| {
-                    row.get::<_, bool>(0)
+                    Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?))
                 })
                 .map_err(Self::format_invocation_children_query_error)?;
+            if visited_rows >= descendant_limit {
+                coverage_incomplete = true;
+            }
             if has_running_descendant {
                 live_child_ids.push(candidate_id);
                 if live_child_ids.len() == limit {
@@ -579,7 +645,20 @@ impl StateDb {
                 }
             }
         }
-        Ok(live_child_ids)
+        Ok(LiveSubtreeChildIds {
+            ids: live_child_ids,
+            coverage_incomplete,
+        })
+    }
+
+    fn invocation_children_overflow(&self, parent_id: i64, limit: usize) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                INVOCATION_CHILDREN_OVERFLOW_SQL,
+                sqlite::params![parent_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )
+            .map_err(Self::format_invocation_children_query_error)
     }
 
     fn scaled_invocation_query_limit(limit: usize, factor: usize) -> i64 {
@@ -632,6 +711,11 @@ impl StateDb {
     #[cfg(test)]
     pub(super) fn running_descendant_exists_sql() -> &'static str {
         RUNNING_DESCENDANT_EXISTS_SQL
+    }
+
+    #[cfg(test)]
+    pub(super) fn invocation_children_overflow_sql() -> &'static str {
+        INVOCATION_CHILDREN_OVERFLOW_SQL
     }
 
     fn get_invocation_by_id(&self, id: i64) -> Result<Option<InvocationRecord>, String> {

@@ -176,7 +176,9 @@ use self::invocation_lifecycle_start::{
 };
 #[cfg(feature = "test-support")]
 pub use self::invocation_records::InvocationQueryProgressPause;
-pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
+pub use self::invocation_records::{
+    InvocationChildrenPage, InvocationRecord, InvocationStart, InvocationStatus,
+};
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;

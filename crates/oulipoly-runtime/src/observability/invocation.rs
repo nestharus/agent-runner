@@ -32,7 +32,7 @@ use crate::observability::state_access::{process_identity_ref, storage_diagnosti
 use oulipoly_core::CancellationToken;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow};
-use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
+use oulipoly_state::{InvocationChildrenPage, InvocationRecord, InvocationStatus, StateDb};
 use std::collections::HashSet;
 
 pub(crate) struct InvocationProjection {
@@ -302,10 +302,17 @@ fn invocation_children(
         !include_terminal,
         cancellation,
     ) {
-        Ok(mut children) => {
+        Ok(page) => {
             if cancellation.is_cancelled() {
                 return None;
             }
+            if page.has_more_children {
+                diagnostics.push(invocation_truncated_diagnostic());
+            }
+            if page.live_coverage_incomplete {
+                diagnostics.push(invocation_live_coverage_diagnostic());
+            }
+            let mut children = page.children;
             append_delivery_invocation_children(
                 state,
                 mailbox,
@@ -375,15 +382,20 @@ fn read_invocation_children(
     limit: usize,
     prioritize_running: bool,
     cancellation: &CancellationToken,
-) -> Result<Vec<InvocationRecord>, String> {
+) -> Result<InvocationChildrenPage, String> {
     if prioritize_running {
-        state.list_invocation_children_with_running_descendants_bounded_with_cancel(
+        state.list_invocation_children_with_running_descendants_bounded_page_with_cancel(
             record_id,
             limit,
             cancellation,
         )
     } else {
-        state.list_invocation_children_bounded_with_cancel(record_id, limit, false, cancellation)
+        state.list_invocation_children_bounded_page_with_cancel(
+            record_id,
+            limit,
+            false,
+            cancellation,
+        )
     }
 }
 
@@ -637,6 +649,16 @@ fn invocation_truncated_diagnostic() -> MonitorDiagnostic {
     }
 }
 
+fn invocation_live_coverage_diagnostic() -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "truncated:invocation-live-coverage".to_string(),
+        severity: MonitorDiagnosticSeverity::Warning,
+        message: "bounded live-descendant scan saturated; active descendants may be omitted"
+            .to_string(),
+        node_id: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,7 +694,67 @@ mod tests {
         .unwrap();
 
         assert_eq!(children.len(), 2);
-        assert!(diagnostics.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "truncated:invocation-nodes");
+    }
+
+    #[test]
+    fn invocation_children_disclose_saturated_live_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let root_id = start_invocation(&state, "71000000-0000-4000-8000-000000000000", None);
+        for index in 0..8 {
+            let child_id = start_invocation(
+                &state,
+                &format!("71000000-0000-4000-8001-{index:012}"),
+                Some(root_id),
+            );
+            state
+                .finalize_invocation(child_id, true, 0, None, None)
+                .unwrap();
+        }
+        let hidden_ancestor_id = start_invocation(
+            &state,
+            "72000000-0000-4000-8000-000000000000",
+            Some(root_id),
+        );
+        state
+            .finalize_invocation(hidden_ancestor_id, true, 0, None, None)
+            .unwrap();
+        start_invocation(
+            &state,
+            "73000000-0000-4000-8000-000000000000",
+            Some(hidden_ancestor_id),
+        );
+        let root = state
+            .get_invocation_by_uuid("71000000-0000-4000-8000-000000000000")
+            .unwrap()
+            .unwrap();
+        let mut diagnostics = Vec::new();
+
+        let children = invocation_children(
+            &state,
+            None,
+            &root,
+            false,
+            2,
+            &CancellationToken::new(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(children.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "truncated:invocation-nodes")
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "truncated:invocation-live-coverage"
+                && diagnostic
+                    .message
+                    .contains("active descendants may be omitted")
+        }));
     }
 
     fn start_invocation(state: &StateDb, uuid: &str, parent_invocation_id: Option<i64>) -> i64 {

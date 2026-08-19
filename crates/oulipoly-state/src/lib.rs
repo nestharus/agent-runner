@@ -65,7 +65,7 @@ pub use db::StateDb;
 pub use db::StateDbRebuildAuthority;
 pub use db::StateDbWriterAuthority;
 pub use db::StateReadConnection;
-pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
+pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord, InvocationChildrenPage};
 pub use db::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
     DeliveryEvidenceKind, DispositionWrite, EventDisposition, ExactProcessIdentity,
