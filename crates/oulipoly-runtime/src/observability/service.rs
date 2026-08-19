@@ -23,7 +23,7 @@ use crate::observability::visibility::retain_live_subtrees;
 use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::SessionProviderIdentity;
 use oulipoly_config::SessionStorage;
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use oulipoly_state::mailbox::MailboxRow;
 use serde::Serialize;
 use std::collections::HashSet;

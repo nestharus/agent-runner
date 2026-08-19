@@ -159,28 +159,6 @@ impl StateDb {
         format!("{}: {err}", repair.error_context)
     }
 
-    pub(super) fn invocations_index_sql() -> &'static str {
-        "CREATE INDEX IF NOT EXISTS idx_invocations_uuid
-            ON invocations (invocation_uuid);
-        CREATE INDEX IF NOT EXISTS idx_invocations_parent
-            ON invocations (parent_invocation_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_invocations_parent_running_created
-            ON invocations (
-                parent_invocation_id,
-                (status = 'running') DESC,
-                created_at,
-                id
-            );
-        CREATE INDEX IF NOT EXISTS idx_invocations_running_parent
-            ON invocations (parent_invocation_id, id)
-            WHERE status = 'running';
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
-            ON invocations (provider_name, created_at);
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
-            ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;"
-    }
-
     pub(super) fn session_turns_index_sql() -> &'static str {
         "CREATE INDEX IF NOT EXISTS idx_session_turns_provider_ts
             ON session_turns (provider_name, role, timestamp);

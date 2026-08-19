@@ -40,7 +40,7 @@
 //!     Domain: provider subprocess supervision and bounded byte capture
 //!     Owns:
 //!       - ByteLimit, CapturedBytes, and accumulator truncation semantics
-//!       - CancellationToken and ProcessLimits lifecycle inputs
+//!       - ProcessLimits lifecycle inputs using the shared core CancellationToken
 //!       - ProcessCommand, ProcessOutcome, and ProcessRunner public surfaces
 //!       - total-runtime and stdout-line-gap timeout behavior
 //!       - cross-platform process group termination and executable checks
@@ -48,12 +48,12 @@
 
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
+pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -266,41 +266,6 @@ fn capture_window(limit: ByteLimit, current_len: usize, incoming_len: usize) -> 
     CaptureWindow {
         captured_len,
         discarded_len: incoming_len - captured_len,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    pub fn cancel_after(&self, duration: Duration) {
-        let token = self.clone();
-        thread::spawn(move || {
-            thread::sleep(duration);
-            token.cancel();
-        });
-    }
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

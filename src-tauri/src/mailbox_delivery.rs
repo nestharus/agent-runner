@@ -7,7 +7,7 @@ use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
     ExactProcessEvidence, ExitRuntimeGenerationNonOrderly, GenerationMutation, MailboxDb,
     MailboxRow, RuntimeGenerationFence, RuntimeLifecycleState, RuntimeTerminalReason,
-    SUBMITTED_INPUT_KIND, SessionGenerationProjection, SessionRuntimeRow, SessionRuntimeUpsert,
+    SUBMITTED_INPUT_KIND, SessionGenerationProjection, SessionMetadataUpsert,
     mailbox_row_is_deliverable_pending,
 };
 use oulipoly_state::pid_identity::{ProcessIdentityObservation, observe_live_process_identity};
@@ -182,7 +182,10 @@ fn pty_runtime_authority(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> Result<PtyRuntimeAuthority, PtyMailboxDeliveryDiagnostic> {
-    match mailbox.session_generation_projection(session_id) {
+    match mailbox
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+    {
         Ok(SessionGenerationProjection::One(generation)) => {
             let control_path = generation.pty_control_path.clone();
             if terminalize_stale_runtime_generation(
@@ -246,7 +249,14 @@ fn pty_runtime_authority(
             pending_count(mailbox, session_id),
             Some("multiple nonterminal runtime generations".to_string()),
         )),
-        Ok(SessionGenerationProjection::None) => legacy_pty_runtime_authority(mailbox, session_id),
+        Ok(SessionGenerationProjection::None) => Err(pty_status(
+            false,
+            "no_runtime",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        )),
         Err(err) => Err(pty_status(
             false,
             "no_runtime",
@@ -256,71 +266,6 @@ fn pty_runtime_authority(
             Some(err.to_string()),
         )),
     }
-}
-
-#[cfg(unix)]
-fn legacy_pty_runtime_authority(
-    mailbox: &MailboxDb,
-    session_id: &str,
-) -> Result<PtyRuntimeAuthority, PtyMailboxDeliveryDiagnostic> {
-    let runtime = match mailbox.session_runtime(session_id) {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => {
-            return Err(pty_status(
-                false,
-                "no_runtime",
-                None,
-                Vec::new(),
-                pending_count(mailbox, session_id),
-                None,
-            ));
-        }
-        Err(err) => {
-            return Err(pty_status(
-                false,
-                "no_runtime",
-                None,
-                Vec::new(),
-                None,
-                Some(err),
-            ));
-        }
-    };
-    if runtime.mode != "pty_interactive" {
-        return Err(pty_status(
-            false,
-            "not_pty",
-            None,
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            None,
-        ));
-    }
-    let Some(control_path) = live_pty_control_path(&runtime) else {
-        return Err(pty_status(
-            false,
-            "no_socket",
-            runtime.pty_control_path,
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            None,
-        ));
-    };
-    let Some(delivery_invocation_uuid) = runtime.running_invocation_uuid else {
-        return Err(pty_status(
-            false,
-            "protocol_error",
-            Some(control_path),
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            Some("running invocation missing".to_string()),
-        ));
-    };
-    Ok(PtyRuntimeAuthority {
-        control_path,
-        delivery_invocation_uuid,
-        turn_generation_id: None,
-    })
 }
 
 #[cfg(unix)]
@@ -382,15 +327,6 @@ pub(crate) fn prepare_pty_mailbox_delivery(
 
 pub(crate) fn mailbox_prefix_max_bytes() -> usize {
     MAILBOX_PREFIX_MAX_BYTES
-}
-
-#[cfg(unix)]
-fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
-    (runtime.run_state == "running")
-        .then_some(runtime.pty_control_path.as_ref())
-        .flatten()
-        .filter(|path| !path.is_empty())
-        .cloned()
 }
 
 #[cfg(unix)]
@@ -545,7 +481,10 @@ fn terminalize_stale_runtime_generation(
     session_id: &str,
     control_path: &str,
 ) -> bool {
-    let generation = match mailbox.session_generation_projection(session_id) {
+    let generation = match mailbox
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+    {
         Ok(SessionGenerationProjection::One(generation)) => generation,
         Ok(SessionGenerationProjection::None | SessionGenerationProjection::Multiple(_))
         | Err(_) => return false,
@@ -566,6 +505,7 @@ fn terminalize_stale_runtime_generation(
         spawn_invocation_uuid: &generation.spawn_invocation_uuid,
     };
     let terminalized = mailbox
+        .runtime_lifecycle()
         .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
             fence,
             reason: RuntimeTerminalReason::RecoveredDead,
@@ -577,7 +517,6 @@ fn terminalize_stale_runtime_generation(
                 GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_)
             )
         });
-    let _ = mailbox.session_liveness(session_id);
     let _ = unlink_control_socket_if_owned(control_path);
     terminalized
 }
@@ -625,6 +564,7 @@ fn acknowledge_injected_pty_delivery_attempts(
         return Ok(());
     }
     let generations = mailbox
+        .runtime_lifecycle_reader()
         .runtime_generation_history(session_id)
         .map_err(|error| error.to_string())?;
     for window in windows {
@@ -835,7 +775,7 @@ pub(crate) fn prepare_headless_resume_delivery(
     let Some(mut db) = open_mailbox_sidecar()? else {
         return Ok(empty_delivery(answer, session_id));
     };
-    record_headless_session_runtime(&mut db, resolved, models_dir)?;
+    record_headless_session_metadata(&mut db, resolved, models_dir)?;
     if db.notifications_paused(&session_id)? {
         return Ok(empty_delivery(answer, session_id));
     }
@@ -892,7 +832,8 @@ fn load_pending_mailbox_rows(
 
 fn verify_pending_mailbox_payloads(db: &MailboxDb, rows: &[MailboxRow]) -> Result<(), String> {
     for row in rows {
-        db.verify_mailbox_row_payload(row)
+        db.payloads()
+            .verify_mailbox_row_payload(row)
             .map_err(|err| format_mailbox_payload_unavailable(row.seq, err))?;
     }
     Ok(())
@@ -1017,27 +958,26 @@ struct MailboxBatch {
     remaining_count: usize,
 }
 
-fn record_headless_session_runtime(
+fn record_headless_session_metadata(
     db: &mut MailboxDb,
     resolved: &oulipoly_state::ResolvedResume,
     models_dir: Option<&Path>,
 ) -> Result<(), String> {
     let models_dir = models_dir_string(models_dir);
-    let input = headless_session_runtime_upsert(resolved, models_dir.as_deref());
-    db.upsert_session_runtime(input)
+    let input = headless_session_metadata_upsert(resolved, models_dir.as_deref());
+    db.wake_sessions().upsert_session_metadata(input)
 }
 
-fn headless_session_runtime_upsert<'a>(
+fn headless_session_metadata_upsert<'a>(
     resolved: &'a oulipoly_state::ResolvedResume,
     models_dir: Option<&'a str>,
-) -> SessionRuntimeUpsert<'a> {
-    SessionRuntimeUpsert {
+) -> SessionMetadataUpsert<'a> {
+    SessionMetadataUpsert {
         session_id: &resolved.active_session_id,
         mode: "headless",
         invocation_uuid: None,
         provider_name: Some(&resolved.active_provider),
         model_name: resolved.model_name.as_deref(),
-        pty_control_path: None,
         models_dir,
         effective_cwd: None,
         selected_auto_wake_max: None,

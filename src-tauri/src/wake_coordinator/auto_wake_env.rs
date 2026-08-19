@@ -2,7 +2,7 @@
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `predicate`, `validator`
 
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeRow};
+use oulipoly_state::mailbox::{MailboxDb, SessionMetadataRow};
 use std::time::Duration;
 
 use super::constants::{
@@ -40,7 +40,7 @@ pub(crate) fn reset_manual_resume_wake_claim(session_id: &str) -> Result<(), Str
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(());
     };
-    let Some(claim) = db.wake_claim(session_id)? else {
+    let Some(claim) = db.wake_session_reader().wake_claim(session_id)? else {
         return Ok(());
     };
     release_manual_wake_claim(&mut db, session_id, &claim.claim_token)
@@ -51,7 +51,10 @@ fn release_manual_wake_claim(
     session_id: &str,
     claim_token: &str,
 ) -> Result<(), String> {
-    if db.release_wake_claim(session_id, claim_token)? {
+    if db
+        .wake_sessions()
+        .release_wake_claim(session_id, claim_token)?
+    {
         return Ok(());
     }
     Err(format!(
@@ -113,7 +116,8 @@ fn validate_auto_wake_claim_with_db(
     session_id: &str,
     claim_token: &str,
 ) -> Result<Option<i32>, String> {
-    db.validate_wake_claim_for_child(session_id, claim_token)
+    db.wake_sessions()
+        .validate_wake_claim_for_child(session_id, claim_token)
         .map(auto_wake_child_validation_result)
 }
 
@@ -179,7 +183,7 @@ pub(super) fn auto_wake_max() -> i64 {
     validated_auto_wake_max(parsed_auto_wake_max())
 }
 
-pub(super) fn auto_wake_max_for_runtime(runtime: Option<&SessionRuntimeRow>) -> i64 {
+pub(super) fn auto_wake_max_for_runtime(runtime: Option<&SessionMetadataRow>) -> i64 {
     runtime
         .and_then(|runtime| runtime.selected_auto_wake_max)
         .unwrap_or_else(auto_wake_max)
@@ -189,7 +193,7 @@ pub(super) fn auto_wake_max_for_session(session_id: &str) -> Result<i64, String>
     let Some(db) = MailboxDb::open_default_if_exists()? else {
         return Ok(auto_wake_max());
     };
-    let runtime = db.session_runtime(session_id)?;
+    let runtime = db.wake_session_reader().session_metadata(session_id)?;
     Ok(auto_wake_max_for_runtime(runtime.as_ref()))
 }
 
@@ -247,7 +251,7 @@ pub(super) fn release_current_auto_wake_claim(session_id: &str, auto_wake: Optio
 }
 
 fn release_wake_claim_or_warn(db: &mut MailboxDb, session_id: &str, token: &str) {
-    if let Err(err) = db.release_wake_claim(session_id, token) {
+    if let Err(err) = db.wake_sessions().release_wake_claim(session_id, token) {
         warn_release_wake_claim_failed(session_id, err);
     }
 }
@@ -285,6 +289,7 @@ mod tests {
         })
         .unwrap();
         let initial = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
@@ -295,8 +300,13 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(initial, WakeClaimAcquireResult::Acquired(_)));
-        let captured = db.wake_claim("session-a").unwrap().unwrap();
+        let captured = db
+            .wake_session_reader()
+            .wake_claim("session-a")
+            .unwrap()
+            .unwrap();
         let replacement = db
+            .wake_sessions()
             .try_acquire_or_renew_wake_claim(
                 WakeClaimRequest {
                     session_id: "session-a",
@@ -316,7 +326,11 @@ mod tests {
 
         assert!(error.contains("lost wake-claim release authority"));
         assert_eq!(
-            db.wake_claim("session-a").unwrap().unwrap().claim_token,
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .claim_token,
             "token-b"
         );
     }

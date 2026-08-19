@@ -9,7 +9,7 @@
 //! - predicate: [`is_rs_file`], [`is_directory`].
 //! - validator: [`assert_no_terms`],
 //!   [`provider_source_uses_neutral_vocabulary`],
-//!   [`provider_manifest_has_no_internal_crate_dependencies`].
+//!   [`provider_manifest_has_only_neutral_internal_dependency`].
 //!
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,7 +69,6 @@ fn guarded_terms() -> Vec<String> {
 
 fn disallowed_manifest_terms() -> Vec<String> {
     vec![
-        "oulipoly-core".to_string(),
         "oulipoly-config".to_string(),
         "oulipoly-runtime".to_string(),
         "oulipoly-state".to_string(),
@@ -116,15 +115,20 @@ fn provider_source_uses_neutral_vocabulary() {
     }
 }
 
-// Risk: the leaf contract crate could accidentally depend on another internal
-// crate, especially the runtime owner of later integration bridges.
+// Risk: the contract crate could depend on a non-neutral internal owner,
+// especially the runtime owner of later integration bridges. Neutral core is
+// the intentional owner of shared cancellation identity.
 // Level: integration. Source: contract C5.6/C6 and proposal test-intent item 6.
 #[test]
-fn provider_manifest_has_no_internal_crate_dependencies() {
+fn provider_manifest_has_only_neutral_internal_dependency() {
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let manifest = read_source_text(&manifest_path);
     let normalized = normalize(&manifest);
     let terms = disallowed_manifest_terms();
 
+    assert!(
+        normalized.contains("oulipoly-core"),
+        "provider manifest must consume neutral core identities"
+    );
     assert_no_terms(&normalized, &terms, "provider manifest");
 }

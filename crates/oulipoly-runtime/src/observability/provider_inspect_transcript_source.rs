@@ -5,7 +5,7 @@ use crate::observability::transcript_source::ResolvedSessionTranscript;
 use crate::provider_registry::ProviderRegistry;
 use crate::session_metadata::TranscriptLookupMode;
 use crate::session_provider::{self, SessionProviderIdentity, SessionProviderLocateRequest};
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use std::path::PathBuf;
 use std::sync::Arc;
 

@@ -6,7 +6,7 @@
 //! predicates for proactive wake integration cases.
 
 use crate::fixtures::Fixture;
-use oulipoly_state::mailbox::{MailboxRow, SessionRuntimeRow, WakeClaimRow};
+use oulipoly_state::mailbox::{MailboxRow, SessionGenerationProjection, WakeClaimRow};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -65,7 +65,11 @@ pub(crate) fn settle_wake_sweep() {
 }
 
 pub(crate) fn runtime_is_idle(fixture: &Fixture, session_id: &str) -> bool {
-    session_runtime_row(fixture, session_id).is_some_and(|row| runtime_row_is_idle(&row))
+    fixture
+        .mailbox()
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+        .is_ok_and(|projection| matches!(projection, SessionGenerationProjection::None))
 }
 
 pub(crate) fn delivered_rows_without_claim(
@@ -126,15 +130,11 @@ fn pending_rows(fixture: &Fixture, session_id: &str) -> Vec<MailboxRow> {
 }
 
 fn wake_claim(fixture: &Fixture, session_id: &str) -> Option<WakeClaimRow> {
-    fixture.mailbox().wake_claim(session_id).unwrap()
-}
-
-fn session_runtime_row(fixture: &Fixture, session_id: &str) -> Option<SessionRuntimeRow> {
-    fixture.mailbox().session_runtime(session_id).unwrap()
-}
-
-fn runtime_row_is_idle(row: &SessionRuntimeRow) -> bool {
-    row.run_state == "idle"
+    fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(session_id)
+        .unwrap()
 }
 
 fn mailbox_rows_are_delivered(rows: &[MailboxRow], expected_len: usize) -> bool {

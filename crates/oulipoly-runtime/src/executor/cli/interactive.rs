@@ -277,10 +277,8 @@ fn execute_interactive_with_result_and_monitor_context(
     }
 
     let status = wait_for_interactive_child(&mut child)?;
-    mark_runtime_generation_orderly_completed(
-        spawn_identity.as_ref(),
-        Some(crate::executor::cli::terminal_signal::exit_code_from_status(&status)),
-    )?;
+    let exit_code = Some(crate::executor::cli::terminal_signal::exit_code_from_status(&status));
+    mark_runtime_generation_orderly_completed(spawn_identity.as_ref(), exit_code, exit_code)?;
 
     #[cfg(unix)]
     drop(signal_guard);

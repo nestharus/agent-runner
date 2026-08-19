@@ -45,7 +45,8 @@ pub(super) fn pending_mailbox_provider_name(
     db: &MailboxDb,
     session_id: &str,
 ) -> Result<Option<String>, String> {
-    db.session_runtime(session_id)
+    db.wake_session_reader()
+        .session_metadata(session_id)
         .map(|runtime| runtime.and_then(|runtime| runtime.provider_name))
 }
 

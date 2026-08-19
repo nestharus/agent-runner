@@ -176,13 +176,11 @@ fn attempt_account_dispatch(
         .map_err(|_| {
             terminal_attempt_error(protocol_service_error("runtime_generation_attach_failed"))
         })?;
-        mark_runtime_generation_orderly_completed(
-            spawn_identity.as_ref(),
-            launch_exit_code(&launch_result.exit.status),
-        )
-        .map_err(|_| {
-            terminal_attempt_error(protocol_service_error("runtime_generation_exit_failed"))
-        })?;
+        let exit_code = launch_exit_code(&launch_result.exit.status);
+        mark_runtime_generation_orderly_completed(spawn_identity.as_ref(), exit_code, exit_code)
+            .map_err(|_| {
+                terminal_attempt_error(protocol_service_error("runtime_generation_exit_failed"))
+            })?;
     }
     let classification = classify_after_launch_success(registry, context, &launch_result);
 

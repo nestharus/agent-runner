@@ -8,8 +8,8 @@ mod wake_coordinator;
 
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
-    RuntimeGenerationId, SessionGenerationProjection, SessionRuntimeUpsert, WakeClaimAcquireResult,
-    WakeClaimRequest,
+    RuntimeGenerationId, SessionGenerationProjection, SessionMetadataUpsert,
+    WakeClaimAcquireResult, WakeClaimRequest,
 };
 use std::fs;
 
@@ -82,18 +82,18 @@ impl Fixture {
     }
 
     fn seed_runtime(&self, db: &mut MailboxDb, wake_max: i64, wake_count: i64) {
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: SESSION,
-            mode: "headless",
-            invocation_uuid: Some(INVOCATION),
-            provider_name: Some(PROVIDER),
-            model_name: Some(MODEL),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: Some(wake_max),
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: SESSION,
+                mode: "headless",
+                invocation_uuid: Some(INVOCATION),
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: Some(wake_max),
+            })
+            .unwrap();
         rusqlite::Connection::open(MailboxDb::default_path().unwrap())
             .unwrap()
             .execute(
@@ -123,6 +123,7 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     generation_fixture.seed_pending(&mut generation_db, "h-generation");
     let generation_id = RuntimeGenerationId::parse("22222222-2222-4222-8222-222222222222").unwrap();
     generation_db
+        .runtime_lifecycle()
         .create_runtime_generation(CreateRuntimeGeneration {
             generation_id: &generation_id,
             spawn_invocation_uuid: INVOCATION,
@@ -142,9 +143,16 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     assert!(!generation.attempted);
     assert!(generation.claim_token.is_none());
     assert!(generation.wake_pid.is_none());
-    assert!(generation_db.wake_claim(SESSION).unwrap().is_none());
+    assert!(
+        generation_db
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         generation_db
+            .runtime_lifecycle_reader()
             .session_generation_projection(SESSION)
             .unwrap(),
         SessionGenerationProjection::One(_)
@@ -163,8 +171,18 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     assert_eq!(cap.auto_wake_count, Some(3));
     assert!(cap.claim_token.is_none());
     assert!(cap.wake_pid.is_none());
-    assert!(cap_db.wake_claim(SESSION).unwrap().is_none());
-    let cap_runtime = cap_db.session_runtime(SESSION).unwrap().unwrap();
+    assert!(
+        cap_db
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
+    );
+    let cap_runtime = cap_db
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(cap_runtime.selected_auto_wake_max, Some(3));
     assert_eq!(cap_runtime.auto_wake_count, 3);
     cap_fixture.assert_pending_without_spawn_attempt(&cap_db, &cap);
@@ -175,6 +193,7 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     claim_fixture.seed_runtime(&mut claim_db, 8, 0);
     let claim_token = "acr329-live-claim";
     let acquired = claim_db
+        .wake_sessions()
         .try_acquire_wake_claim(WakeClaimRequest {
             session_id: SESSION,
             claim_token,
@@ -186,6 +205,7 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
         .unwrap();
     assert!(matches!(acquired, WakeClaimAcquireResult::Acquired(_)));
     claim_db
+        .wake_sessions()
         .record_wake_claim_pid_identity(
             SESSION,
             claim_token,
@@ -194,7 +214,11 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
             Some(MODEL),
         )
         .unwrap();
-    let before = claim_db.wake_claim(SESSION).unwrap().unwrap();
+    let before = claim_db
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
 
     let in_flight = wake_coordinator::trigger_notify_wake(SESSION);
 
@@ -203,11 +227,19 @@ fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
     assert_eq!(in_flight.claim_token.as_deref(), Some(claim_token));
     assert_eq!(in_flight.wake_pid, before.wake_pid);
     assert_eq!(in_flight.auto_wake_count, Some(4));
-    let after = claim_db.wake_claim(SESSION).unwrap().unwrap();
+    let after = claim_db
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(after.claim_token, before.claim_token);
     assert_eq!(after.wake_pid, before.wake_pid);
     assert_eq!(after.auto_wake_count, before.auto_wake_count);
-    let claim_runtime = claim_db.session_runtime(SESSION).unwrap().unwrap();
+    let claim_runtime = claim_db
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(claim_runtime.selected_auto_wake_max, Some(8));
     assert_eq!(claim_runtime.auto_wake_count, 4);
     claim_fixture.assert_pending_without_spawn_attempt(&claim_db, &in_flight);

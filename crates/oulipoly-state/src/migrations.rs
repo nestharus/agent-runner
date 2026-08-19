@@ -206,22 +206,9 @@ fn apply_v19_invocation_running_projection_index(conn: &Connection) -> Result<()
         .iter()
         .all(|required| columns.iter().any(|column| column == required))
     {
-        conn.execute_batch(invocation_running_projection_index_sql())?;
+        conn.execute_batch(crate::db::invocation_running_projection_index_sql())?;
     }
     Ok(())
-}
-
-fn invocation_running_projection_index_sql() -> &'static str {
-    "CREATE INDEX IF NOT EXISTS idx_invocations_parent_running_created
-     ON invocations (
-         parent_invocation_id,
-         (status = 'running') DESC,
-         created_at,
-         id
-     );
-     CREATE INDEX IF NOT EXISTS idx_invocations_running_parent
-     ON invocations (parent_invocation_id, id)
-     WHERE status = 'running';"
 }
 
 fn map_primitive_registration_error(db_path: PathBuf, source: rusqlite::Error) -> MigrationError {

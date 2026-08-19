@@ -328,6 +328,7 @@ prompt_mode = "stdin"
             EnqueueResult::Conflict { existing } => existing,
         };
         let result = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id,
                 claim_token,
@@ -667,7 +668,11 @@ fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provid
         assert_eq!(pending[0].seq, seq, "{case}");
         assert_eq!(pending[0].delivery_attempts, 0, "{case}");
         assert!(pending[0].delivered_at.is_none(), "{case}");
-        let claim = db.wake_claim(CHAIN_ID).unwrap().unwrap();
+        let claim = db
+            .wake_session_reader()
+            .wake_claim(CHAIN_ID)
+            .unwrap()
+            .unwrap();
         assert_eq!(claim.claim_token, CLAIM_TOKEN, "{case}");
         assert_eq!(claim.auto_wake_count, 1, "{case}");
     }

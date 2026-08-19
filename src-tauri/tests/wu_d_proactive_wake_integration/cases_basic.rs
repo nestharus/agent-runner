@@ -242,8 +242,14 @@ fn automatic_delivery_settled(fixture: &Fixture, session_id: &str, expected_len:
 
 fn panic_automatic_delivery_timeout(fixture: &Fixture, session_id: &str) -> ! {
     let rows = fixture.mailbox().list_mailbox(session_id, true);
-    let claim = fixture.mailbox().wake_claim(session_id);
-    let runtime = fixture.mailbox().session_runtime(session_id);
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(session_id);
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(session_id);
     panic!(
         "{}",
         format_automatic_delivery_timeout(&rows, &claim, &runtime)
@@ -353,7 +359,12 @@ fn assert_failed_delivery(fixture: &Fixture, invocation_id: &str) {
     );
     assert_eq!(rows[0].delivery_attempts, 1);
     assert!(rows[0].delivery_error.is_none());
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.run_state, "idle");
     assert_eq!(runtime.last_exit_code, Some(0));
     assert_no_wake_claim(fixture, SESSION);

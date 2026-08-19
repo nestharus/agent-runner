@@ -2,48 +2,50 @@
 //!
 //! `accessor`, `filter`, `orchestration`, `predicate`
 
-use oulipoly_state::mailbox::{MailboxDb, SessionLiveness, SessionRuntimeRow};
+use oulipoly_state::mailbox::{
+    MailboxDb, RuntimeLifecycleState, SessionGenerationProjection, SessionLiveness,
+};
 
 #[cfg(unix)]
 use oulipoly_runtime::executor::cli::pty_broker;
 
-pub(super) fn pty_runtime_liveness(
-    db: &mut MailboxDb,
-    session_id: &str,
-    runtime: Option<&SessionRuntimeRow>,
-) -> Result<Option<SessionLiveness>, String> {
-    if running_pty_runtime(runtime).is_none() {
-        return Ok(None);
-    };
-    session_liveness_for_runtime(db, session_id).map(Some)
+pub(super) struct RuntimeLivenessCheck {
+    pub(super) liveness: SessionLiveness,
+    pty_control_path: Option<String>,
 }
 
-pub(super) fn cleanup_idle_runtime(
-    runtime: Option<&SessionRuntimeRow>,
-    liveness: Option<SessionLiveness>,
-) {
-    if let (Some(row), Some(SessionLiveness::Idle)) = (running_pty_runtime(runtime), liveness) {
-        unlink_stale_pty_socket(row.pty_control_path.as_deref());
+pub(super) fn runtime_liveness(
+    db: &mut MailboxDb,
+    session_id: &str,
+) -> Result<RuntimeLivenessCheck, String> {
+    let pty_control_path = running_pty_control_path(db, session_id)?;
+    let liveness = db
+        .runtime_lifecycle()
+        .reconcile_session_liveness(session_id)?;
+    Ok(RuntimeLivenessCheck {
+        liveness,
+        pty_control_path,
+    })
+}
+
+pub(super) fn cleanup_idle_runtime(check: &RuntimeLivenessCheck) {
+    if check.liveness == SessionLiveness::Idle {
+        unlink_stale_pty_socket(check.pty_control_path.as_deref());
     }
 }
 
-pub(super) fn optional_pty_liveness_is_busy(liveness: Option<SessionLiveness>) -> bool {
-    liveness.is_some_and(pty_liveness_is_busy)
-}
-
-fn running_pty_runtime(runtime: Option<&SessionRuntimeRow>) -> Option<&SessionRuntimeRow> {
-    runtime.filter(|row| row.mode == "pty_interactive" && row.run_state == "running")
-}
-
-fn session_liveness_for_runtime(
-    db: &mut MailboxDb,
-    session_id: &str,
-) -> Result<SessionLiveness, String> {
-    db.session_liveness(session_id)
-}
-
-fn pty_liveness_is_busy(liveness: SessionLiveness) -> bool {
-    liveness == SessionLiveness::Busy
+fn running_pty_control_path(db: &MailboxDb, session_id: &str) -> Result<Option<String>, String> {
+    let projection = db
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+        .map_err(|error| error.to_string())?;
+    let SessionGenerationProjection::One(generation) = projection else {
+        return Ok(None);
+    };
+    Ok((generation.runtime_mode == "pty_interactive"
+        && generation.lifecycle_state == RuntimeLifecycleState::Running)
+        .then_some(generation.pty_control_path)
+        .flatten())
 }
 
 #[cfg(unix)]

@@ -11,8 +11,8 @@ use crate::parse::ts;
 use crate::{INVOCATION, MODEL, PROVIDER, SESSION};
 use chrono::Utc;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, MailboxDb, MailboxRow,
-    SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+    AgentBashCompleteEnqueue, CompletionEventRegistrationInput, LegacyRuntimeProjection, MailboxDb,
+    MailboxRow, SessionMetadataUpsert,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord};
 use oulipoly_state::{InvocationStart, ProviderSessionBinding, SessionTurnIngest, StateDb};
@@ -119,20 +119,21 @@ impl Fixture {
         let mut mailbox = self.mailbox();
         let models_dir = path_string(&self.models_dir);
         mailbox
-            .upsert_session_runtime(SessionRuntimeUpsert {
+            .wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
                 session_id,
                 mode: "pty_interactive",
                 invocation_uuid: Some(invocation_uuid),
                 provider_name: Some(PROVIDER),
                 model_name: Some(MODEL),
-                pty_control_path: None,
                 models_dir: Some(&models_dir),
                 effective_cwd: None,
                 selected_auto_wake_max: None,
             })
             .unwrap();
         mailbox
-            .mark_session_running(SessionRuntimeRunningUpdate {
+            .wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id,
                 mode: "pty_interactive",
                 invocation_uuid,
@@ -223,34 +224,34 @@ impl Fixture {
     ) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id,
-            mode: "headless",
-            invocation_uuid: None,
-            provider_name: Some(provider_name),
-            model_name: Some(model_name),
-            pty_control_path: None,
-            models_dir: Some(&models_dir),
-            effective_cwd: None,
-            selected_auto_wake_max: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id,
+                mode: "headless",
+                invocation_uuid: None,
+                provider_name: Some(provider_name),
+                model_name: Some(model_name),
+                models_dir: Some(&models_dir),
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
     }
 
     pub(crate) fn seed_idle_runtime_without_models_dir(&self, session_id: &str) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id,
-            mode: "headless",
-            invocation_uuid: None,
-            provider_name: Some(PROVIDER),
-            model_name: Some(MODEL),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id,
+                mode: "headless",
+                invocation_uuid: None,
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
     }
 
     pub(crate) fn seed_idle_runtime_with_wake_policy(
@@ -261,18 +262,18 @@ impl Fixture {
     ) {
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
         let models_dir = path_string(&self.models_dir);
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id,
-            mode: "headless",
-            invocation_uuid: Some(INVOCATION),
-            provider_name: Some(PROVIDER),
-            model_name: Some(MODEL),
-            pty_control_path: None,
-            models_dir: Some(&models_dir),
-            effective_cwd: None,
-            selected_auto_wake_max: Some(selected_auto_wake_max),
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id,
+                mode: "headless",
+                invocation_uuid: Some(INVOCATION),
+                provider_name: Some(PROVIDER),
+                model_name: Some(MODEL),
+                models_dir: Some(&models_dir),
+                effective_cwd: None,
+                selected_auto_wake_max: Some(selected_auto_wake_max),
+            })
+            .unwrap();
         self.sidecar_conn()
             .execute(
                 "UPDATE session_runtime SET auto_wake_count = ?2 WHERE session_id = ?1",

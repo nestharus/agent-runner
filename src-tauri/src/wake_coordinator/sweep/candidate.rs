@@ -4,7 +4,7 @@
 
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxRow, SessionGenerationProjection, SessionRuntimeRow, WakeSweepCandidate,
+    MailboxDb, MailboxRow, SessionGenerationProjection, SessionMetadataRow, WakeSweepCandidate,
 };
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
@@ -83,7 +83,7 @@ fn runtime_has_produced_turns(evidence: Option<(bool, u64)>) -> bool {
 
 fn resumable_disposition_with_cap_emit(
     candidate: &WakeSweepCandidate,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> WakeSweepDisposition {
     let auto_wake_max = auto_wake_max_for_runtime(Some(runtime));
     emit_cap_reached_if_capped(candidate, auto_wake_max);
@@ -127,9 +127,10 @@ fn wake_sweep_candidate_resumable_runtime(
     db: &MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<Option<SessionRuntimeRow>, String> {
+) -> Result<Option<SessionMetadataRow>, String> {
     if !matches!(
-        db.session_generation_projection(&candidate.session_id)
+        db.runtime_lifecycle_reader()
+            .session_generation_projection(&candidate.session_id)
             .map_err(|err| err.to_string())?,
         SessionGenerationProjection::None
     ) {
@@ -148,13 +149,14 @@ fn wake_sweep_candidate_resumable_runtime(
 fn wake_sweep_candidate_runtime(
     db: &MailboxDb,
     candidate: &WakeSweepCandidate,
-) -> Result<Option<SessionRuntimeRow>, String> {
-    db.session_runtime(&candidate.session_id)
+) -> Result<Option<SessionMetadataRow>, String> {
+    db.wake_session_reader()
+        .session_metadata(&candidate.session_id)
 }
 
 fn wake_sweep_runtime_is_resumable(
     state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> Result<bool, String> {
     if !wake_sweep_runtime_can_resume(runtime) {
         return Ok(false);
@@ -162,9 +164,8 @@ fn wake_sweep_runtime_is_resumable(
     wake_sweep_runtime_has_resume_evidence(state, runtime)
 }
 
-fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
+fn wake_sweep_runtime_can_resume(runtime: &SessionMetadataRow) -> bool {
     runtime.mode == "headless"
-        && runtime.run_state != "running"
         && runtime
             .provider_name
             .as_deref()
@@ -173,7 +174,7 @@ fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
 
 fn wake_sweep_runtime_has_resume_evidence(
     state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> Result<bool, String> {
     let evidence = wake_sweep_runtime_resume_evidence_values(state, runtime)?;
     Ok(resume_evidence_values_present(evidence))
@@ -181,7 +182,7 @@ fn wake_sweep_runtime_has_resume_evidence(
 
 fn wake_sweep_runtime_resume_evidence_values(
     state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> Result<Option<(bool, u64)>, String> {
     let Some(state) = state else {
         return Ok(None);
@@ -257,7 +258,9 @@ fn wake_sweep_candidate_is_unclaimed_abandoned_transient(
 }
 
 fn wake_sweep_candidate_has_wake_claim(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    db.wake_claim(session_id).map(option_is_present)
+    db.wake_session_reader()
+        .wake_claim(session_id)
+        .map(option_is_present)
 }
 
 fn pending_rows_are_abandoned_transient(rows: &[MailboxRow]) -> Result<bool, String> {

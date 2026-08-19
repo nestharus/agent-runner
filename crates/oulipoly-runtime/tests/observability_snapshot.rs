@@ -6,7 +6,7 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, SessionStorage,
     provider_implementation_ref::ProviderImplementationRef,
 };
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use oulipoly_runtime::observability::{
     InspectRef, LivenessStatus, MonitorNodeKind, MonitorStatus, ObservabilityRoot,
     ObservabilitySnapshotPort, ProductionObservabilitySnapshotService, SnapshotLimits,
@@ -14,8 +14,8 @@ use oulipoly_runtime::observability::{
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
-    RuntimeGenerationId, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
+    MailboxDb, RuntimeGenerationFence, RuntimeGenerationId, SessionMetadataUpsert,
     WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
@@ -802,18 +802,31 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
     let mut stale = current_identity();
     stale.os_pid_starttime_ticks += 1;
     let mut mailbox = fixture.open_mailbox();
+    let generation = RuntimeGenerationId::parse("99999999-9999-4999-8999-999999999999").unwrap();
     mailbox
-        .mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: SESSION_ID,
-            mode: "pty_interactive",
-            invocation_uuid: ROOT_UUID,
-            provider_name: Some("provider-a"),
+        .runtime_lifecycle()
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation,
+            spawn_invocation_uuid: ROOT_UUID,
+            session_id: Some(SESSION_ID),
+            runtime_mode: "pty_interactive",
+            provider_name: "provider-a",
             model_name: Some("model-a"),
-            identity: &stale,
             pty_control_path: Some("/tmp/oulipoly-observe.sock"),
-            turn_start_max_mailbox_seq: None,
             models_dir: None,
             effective_cwd: Some("/tmp/work"),
+        })
+        .unwrap();
+    mailbox
+        .runtime_lifecycle()
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation,
+                spawn_invocation_uuid: ROOT_UUID,
+            },
+            spawned_os_pid: stale.os_pid,
+            exact_process_identity: Some(&stale),
+            os_pgid: None,
         })
         .unwrap();
     drop(mailbox);
@@ -864,6 +877,7 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
             .unwrap()
     );
     let claim = mailbox
+        .wake_sessions()
         .try_acquire_wake_claim(WakeClaimRequest {
             session_id: SESSION_ID,
             claim_token: "claim-physical-read-only",
@@ -876,6 +890,7 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
     assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
     let generation = RuntimeGenerationId::parse("88888888-8888-4888-8888-888888888888").unwrap();
     mailbox
+        .runtime_lifecycle()
         .create_runtime_generation(CreateRuntimeGeneration {
             generation_id: &generation,
             spawn_invocation_uuid: ROOT_UUID,
@@ -888,14 +903,27 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
             effective_cwd: Some("/work/observability-read-only"),
         })
         .unwrap();
+    let identity = current_identity();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .runtime_lifecycle()
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation,
+                spawn_invocation_uuid: ROOT_UUID,
+            },
+            spawned_os_pid: identity.os_pid,
+            exact_process_identity: Some(&identity),
+            os_pgid: None,
+        })
+        .unwrap();
+    mailbox
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_ID,
             mode: "headless",
             invocation_uuid: Some(ROOT_UUID),
             provider_name: Some("provider-a"),
             model_name: Some("model-a"),
-            pty_control_path: None,
             models_dir: Some("/models/observability-read-only"),
             effective_cwd: Some("/work/observability-read-only"),
             selected_auto_wake_max: Some(5),
@@ -925,13 +953,13 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
     seed_root_session(&fixture);
     let mut mailbox = fixture.open_mailbox();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_ID,
             mode: "pty_interactive",
             invocation_uuid: Some(ROOT_UUID),
             provider_name: Some("provider-a"),
             model_name: Some("model-a"),
-            pty_control_path: Some("/tmp/oulipoly-observe.sock"),
             models_dir: None,
             effective_cwd: None,
             selected_auto_wake_max: None,
@@ -1009,6 +1037,7 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
         .enqueue_agent_bash_complete(&mailbox_input("handle-pending", SESSION_ID))
         .unwrap();
     let claim = mailbox
+        .wake_sessions()
         .try_acquire_wake_claim(WakeClaimRequest {
             session_id: SESSION_ID,
             claim_token: "claim-a",
@@ -1021,6 +1050,7 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
     assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
     assert!(
         mailbox
+            .wake_sessions()
             .record_wake_claim_pid(SESSION_ID, "claim-a", 999_999_999)
             .unwrap()
     );

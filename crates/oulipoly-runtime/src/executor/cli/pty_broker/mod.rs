@@ -25,7 +25,7 @@ use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::SessionProviderIdentity;
 use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
-use oulipoly_state::mailbox::{MailboxDb, MailboxRow, SessionRuntimeIdleUpdate};
+use oulipoly_state::mailbox::{LegacyRuntimeProjectionSettlement, MailboxDb, MailboxRow};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -1297,10 +1297,16 @@ impl SessionRuntimeIdleGuard {
 impl Drop for SessionRuntimeIdleGuard {
     fn drop(&mut self) {
         if self.exit_code.is_some() {
-            let _ =
-                mark_runtime_generation_orderly_completed(self.context.as_ref(), self.exit_code);
+            let _ = mark_runtime_generation_orderly_completed(
+                self.context.as_ref(),
+                self.exit_code,
+                self.exit_code,
+            );
         } else {
             let _ = mark_runtime_generation_exited(self.context.as_ref(), self.exit_code);
+        }
+        if self.context.is_some() {
+            return;
         }
         let session_id = self.session_id.clone().or_else(|| {
             self.live_session_id
@@ -1323,11 +1329,13 @@ impl Drop for SessionRuntimeIdleGuard {
             {
                 return;
             }
-            let _ = db.mark_session_idle(SessionRuntimeIdleUpdate {
-                session_id: &session_id,
-                invocation_uuid,
-                last_exit_code: self.exit_code,
-            });
+            let _ = db.wake_sessions().settle_legacy_runtime_projection(
+                LegacyRuntimeProjectionSettlement {
+                    session_id: &session_id,
+                    invocation_uuid,
+                    last_exit_code: self.exit_code,
+                },
+            );
         }
     }
 }

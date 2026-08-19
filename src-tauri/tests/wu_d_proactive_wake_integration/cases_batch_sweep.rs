@@ -73,7 +73,8 @@ fn assert_one_failed_delivery(fixture: &Fixture, session_id: &str) {
     assert_age270_invocation(fixture, invocation_id);
     let runtime = fixture
         .mailbox()
-        .session_runtime(session_id)
+        .wake_session_reader()
+        .legacy_runtime_projection(session_id)
         .unwrap()
         .unwrap();
     assert_eq!(runtime.run_state, "idle");
@@ -328,7 +329,12 @@ pub(crate) fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
     wait_until("persisted-max sweep delivery", || {
         delivered_single_row_without_error_or_claim(&fixture, SESSION)
     });
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.selected_auto_wake_max, Some(32));
     assert_eq!(runtime.auto_wake_count, 6);
     assert_one_failed_delivery(&fixture, SESSION);
@@ -426,7 +432,12 @@ fi"#,
         .unwrap()
         .parse::<i64>()
         .unwrap();
-    let claim = fixture.mailbox().wake_claim(SESSION).unwrap().unwrap();
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.claim_token, renewed_token);
     assert_ne!(claim.claim_token, old_token);
     assert_eq!(claim.wake_pid, Some(renewed_pid));
@@ -533,7 +544,12 @@ pub(crate) fn persisted_wake_max_caps_sweep_at_selected_value() {
 
     assert_prompt_file_missing(&fixture, "sweep-cap-should-not-run.txt");
     assert_pending_mailbox_count(&fixture, SESSION, 1);
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.selected_auto_wake_max, Some(32));
     assert_eq!(runtime.auto_wake_count, 32);
     assert_xdg_isolated(&fixture);

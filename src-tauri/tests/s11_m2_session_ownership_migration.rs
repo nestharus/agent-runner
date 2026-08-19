@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use oulipoly_config::{ProvidersConfig, load_models};
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
+use oulipoly_state::mailbox::{MailboxDb, SessionMetadataUpsert};
 use oulipoly_state::{CURRENT_SCHEMA_VERSION, ResolvedResume, StateDb};
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -6631,18 +6631,18 @@ fn drift_merge_survivor_identity(path: &Path, survivor_id: i64, column: &str) {
 
 fn seed_mailbox(path: &Path, session_id: &str, cwd: Option<&str>) {
     let mut db = MailboxDb::open(path).unwrap();
-    db.upsert_session_runtime(SessionRuntimeUpsert {
-        session_id,
-        mode: "pty_interactive",
-        invocation_uuid: None,
-        provider_name: Some(&canonical_account()),
-        model_name: Some(&target_model_name()),
-        pty_control_path: None,
-        models_dir: None,
-        effective_cwd: cwd,
-        selected_auto_wake_max: None,
-    })
-    .unwrap();
+    db.wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
+            session_id,
+            mode: "pty_interactive",
+            invocation_uuid: None,
+            provider_name: Some(&canonical_account()),
+            model_name: Some(&target_model_name()),
+            models_dir: None,
+            effective_cwd: cwd,
+            selected_auto_wake_max: None,
+        })
+        .unwrap();
 }
 
 fn snapshot(path: &Path) -> OwnershipSnapshot {

@@ -218,7 +218,12 @@ where
             )
             .map_err(SessionIngressError::Mailbox)?;
         for row in rows {
-            if self.mailbox.verify_mailbox_row_payload(&row).is_err() {
+            if self
+                .mailbox
+                .payloads()
+                .verify_mailbox_row_payload(&row)
+                .is_err()
+            {
                 self.mailbox
                     .mark_delivery_failed(
                         &self.session_id,

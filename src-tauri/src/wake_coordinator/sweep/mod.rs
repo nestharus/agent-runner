@@ -6,7 +6,10 @@ mod candidate;
 mod consumed;
 mod state;
 
-use oulipoly_state::mailbox::{MailboxDb, SessionLiveness, SessionRuntimeRow, WakeSweepCandidate};
+use oulipoly_state::mailbox::{
+    MailboxDb, RuntimeGenerationRow, RuntimeLifecycleState, SessionGenerationProjection,
+    SessionLiveness, WakeSweepCandidate,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -156,7 +159,7 @@ fn run_wake_reclaim_sweep(trigger: &str) -> Result<(), String> {
         return Ok(());
     };
     retry_pending_live_pty_deliveries(&mut db, trigger)?;
-    let candidates = db.wake_sweep_candidates(
+    let candidates = db.wake_sessions().wake_sweep_candidates(
         super::constants::WAKE_CLAIM_STALE_AFTER_SECONDS,
         WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
     )?;
@@ -192,7 +195,9 @@ fn retry_pending_live_pty_deliveries_from_default_db(trigger: &str) -> Result<()
 }
 
 fn retry_pending_live_pty_deliveries(db: &mut MailboxDb, trigger: &str) -> Result<(), String> {
-    let session_ids = db.pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
+    let session_ids = db
+        .wake_sessions()
+        .pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
     for session_id in session_ids {
         match live_pty_retry_applicability(db, &session_id)? {
             LivePtyRetryApplicability::Applicable => {
@@ -223,11 +228,24 @@ fn live_pty_retry_applicability(
     db: &mut MailboxDb,
     session_id: &str,
 ) -> Result<LivePtyRetryApplicability, String> {
-    let Some(runtime) = db.session_runtime(session_id)? else {
-        return Ok(LivePtyRetryApplicability::Skip {
-            reason: "no_runtime",
-            liveness: None,
-        });
+    let runtime = match db
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+        .map_err(|error| error.to_string())?
+    {
+        SessionGenerationProjection::One(runtime) => runtime,
+        SessionGenerationProjection::None => {
+            return Ok(LivePtyRetryApplicability::Skip {
+                reason: "no_runtime",
+                liveness: None,
+            });
+        }
+        SessionGenerationProjection::Multiple(_) => {
+            return Ok(LivePtyRetryApplicability::Skip {
+                reason: "ambiguous_runtime",
+                liveness: None,
+            });
+        }
     };
     if !runtime_is_running_pty_with_socket(&runtime) {
         return Ok(LivePtyRetryApplicability::Skip {
@@ -235,7 +253,9 @@ fn live_pty_retry_applicability(
             liveness: None,
         });
     }
-    let liveness = db.session_liveness(session_id)?;
+    let liveness = db
+        .runtime_lifecycle()
+        .reconcile_session_liveness(session_id)?;
     if liveness == SessionLiveness::Busy {
         Ok(LivePtyRetryApplicability::Applicable)
     } else {
@@ -246,19 +266,19 @@ fn live_pty_retry_applicability(
     }
 }
 
-fn runtime_skip_reason(runtime: &SessionRuntimeRow) -> &'static str {
-    if runtime.mode != "pty_interactive" {
+fn runtime_skip_reason(runtime: &RuntimeGenerationRow) -> &'static str {
+    if runtime.runtime_mode != "pty_interactive" {
         "not_pty"
-    } else if runtime.run_state != "running" {
+    } else if runtime.lifecycle_state != RuntimeLifecycleState::Running {
         "not_running"
     } else {
         "no_socket"
     }
 }
 
-fn runtime_is_running_pty_with_socket(runtime: &SessionRuntimeRow) -> bool {
-    runtime.mode == "pty_interactive"
-        && runtime.run_state == "running"
+fn runtime_is_running_pty_with_socket(runtime: &RuntimeGenerationRow) -> bool {
+    runtime.runtime_mode == "pty_interactive"
+        && runtime.lifecycle_state == RuntimeLifecycleState::Running
         && runtime
             .pty_control_path
             .as_deref()
@@ -527,6 +547,7 @@ mod tests {
         };
         let claim_token = "state-unavailable-claim";
         let acquired = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: &row.session_id,
                 claim_token,
@@ -537,7 +558,11 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(acquired, WakeClaimAcquireResult::Acquired(_)));
-        let claim_before = db.wake_claim(&row.session_id).unwrap().unwrap();
+        let claim_before = db
+            .wake_session_reader()
+            .wake_claim(&row.session_id)
+            .unwrap()
+            .unwrap();
         let candidate = WakeSweepCandidate {
             session_id: row.session_id.clone(),
             auto_wake_count: 0,
@@ -563,7 +588,11 @@ mod tests {
         assert!(rows[0].delivered_at.is_none());
         assert!(rows[0].delivery_error.is_none());
         assert_eq!(rows[0].delivery_attempts, 0);
-        let claim_after = db.wake_claim(&row.session_id).unwrap().unwrap();
+        let claim_after = db
+            .wake_session_reader()
+            .wake_claim(&row.session_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(claim_after.claim_token, claim_before.claim_token);
         assert_eq!(claim_after.auto_wake_count, claim_before.auto_wake_count);
 
@@ -592,7 +621,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.delivery_error.is_none()));
         assert_eq!(
-            db.wake_claim("state-unavailable-session")
+            db.wake_session_reader()
+                .wake_claim("state-unavailable-session")
                 .unwrap()
                 .unwrap()
                 .claim_token,

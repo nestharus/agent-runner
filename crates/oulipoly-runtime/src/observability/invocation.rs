@@ -29,7 +29,7 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::pid_row_liveness;
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::{process_identity_ref, storage_diagnostic};
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow};
 use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};

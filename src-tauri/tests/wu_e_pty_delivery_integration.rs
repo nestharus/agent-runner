@@ -6,7 +6,7 @@ use oulipoly_runtime::executor::cli::pty_broker::{
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
     MailboxDb, MailboxRow, RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState,
-    RuntimeTerminalReason, SessionRuntimeRunningUpdate,
+    RuntimeTerminalReason, SessionGenerationProjection,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -249,6 +249,7 @@ impl Fixture {
         let mut mailbox = MailboxDb::open(&self.sidecar_path()).unwrap();
         let generation_id = RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap();
         mailbox
+            .runtime_lifecycle()
             .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id: &generation_id,
                 spawn_invocation_uuid: INVOCATION_A,
@@ -262,6 +263,7 @@ impl Fixture {
             })
             .unwrap();
         mailbox
+            .runtime_lifecycle()
             .bind_runtime_generation_running(BindRuntimeGenerationRunning {
                 fence: RuntimeGenerationFence {
                     generation_id: &generation_id,
@@ -270,20 +272,6 @@ impl Fixture {
                 spawned_os_pid: identity.os_pid,
                 exact_process_identity: Some(identity),
                 os_pgid: None,
-            })
-            .unwrap();
-        mailbox
-            .mark_session_running(SessionRuntimeRunningUpdate {
-                session_id: SESSION_A,
-                mode: "pty_interactive",
-                invocation_uuid: LIVE_INVOCATION,
-                provider_name: Some("fixture-provider"),
-                model_name: Some("fixture-model"),
-                identity,
-                pty_control_path: Some(&path_string(control_path)),
-                turn_start_max_mailbox_seq: None,
-                models_dir: None,
-                effective_cwd: None,
             })
             .unwrap();
     }
@@ -509,6 +497,7 @@ fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
     assert_eq!(rows[0].delivery_attempts, 1);
     let generation = fixture
         .mailbox()
+        .runtime_lifecycle_reader()
         .runtime_generation(&RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap())
         .unwrap()
         .unwrap();
@@ -577,13 +566,14 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     assert_eq!(value["pty_delivery"]["status"], "stale_generation");
     assert_eq!(value["pty_delivery"]["submitted"], false);
     assert_eq!(value["wake"]["status"], "spawned");
-    let runtime = fixture
+    let projection = fixture
         .mailbox()
-        .session_runtime(SESSION_A)
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION_A)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.run_state, "idle");
-    assert!(runtime.pty_control_path.is_none());
+    assert_eq!(projection.run_state, "idle");
+    assert!(projection.pty_control_path.is_none());
     assert!(!stale_socket.exists());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     let rows = fixture.mailbox().list_pending(SESSION_A).unwrap();
@@ -653,15 +643,17 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
         &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
     );
     assert!(repl.wait().unwrap().success());
-    let runtime = fixture
+    let projection = fixture
         .mailbox()
-        .session_runtime(SESSION_A)
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION_A)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.run_state, "idle");
-    assert!(runtime.pty_control_path.is_none());
+    assert_eq!(projection.run_state, "idle");
+    assert!(projection.pty_control_path.is_none());
     let history = fixture
         .mailbox()
+        .runtime_lifecycle_reader()
         .runtime_generation_history(SESSION_A)
         .unwrap();
     assert_eq!(history.len(), 1);
@@ -1416,10 +1408,11 @@ fn wait_for_running_invocation(fixture: &Fixture) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(db) = MailboxDb::open(&fixture.sidecar_path())
-            && let Ok(Some(runtime)) = db.session_runtime(SESSION_A)
-            && let Some(invocation_uuid) = runtime.running_invocation_uuid
+            && let Ok(SessionGenerationProjection::One(generation)) = db
+                .runtime_lifecycle_reader()
+                .session_generation_projection(SESSION_A)
         {
-            return invocation_uuid;
+            return generation.spawn_invocation_uuid;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1427,13 +1420,15 @@ fn wait_for_running_invocation(fixture: &Fixture) -> String {
 }
 
 fn running_control_path(fixture: &Fixture) -> String {
-    fixture
+    let projection = fixture
         .mailbox()
-        .session_runtime(SESSION_A)
-        .unwrap()
-        .expect("running session runtime")
-        .pty_control_path
-        .expect("PTY control path")
+        .runtime_lifecycle_reader()
+        .session_generation_projection(SESSION_A)
+        .unwrap();
+    let SessionGenerationProjection::One(generation) = projection else {
+        panic!("expected one running runtime generation");
+    };
+    generation.pty_control_path.expect("PTY control path")
 }
 
 fn wait_for_child_identity(fixture: &Fixture, invocation_uuid: &str) -> ProcessIdentity {

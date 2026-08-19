@@ -56,7 +56,7 @@ use base64::Engine as _;
 #[cfg(test)]
 use chrono::{DateTime, Utc};
 #[cfg(test)]
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;

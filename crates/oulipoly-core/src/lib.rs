@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+mod cancellation;
+
+pub use cancellation::CancellationToken;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionReason {

@@ -378,9 +378,13 @@ fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing()
     wait_until("initial invocation finalized", || {
         fixture.finalized_invocation_count() >= 1
     });
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     let expected_models_dir = path_string(&fixture.models_dir);
-    assert_eq!(runtime.run_state, "idle");
     assert_eq!(runtime.provider_name.as_deref(), Some(PROVIDER));
     assert_eq!(runtime.model_name.as_deref(), Some(MODEL));
     assert_eq!(

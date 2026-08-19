@@ -2,14 +2,14 @@
 //!
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `parser`, `validator`
 //!
-//! PID identity sidecar storage. This module owns the independent
-//! `pid-identity.db` schema and Linux `/proc` identity reads used to guard
-//! against PID reuse.
+//! PID identity sidecar storage. This module owns the PID identity table and
+//! Linux `/proc` identity reads used to guard against PID reuse.
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const SIDECAR_DB_NAME: &str = "pid-identity.db";
 
@@ -114,7 +114,7 @@ impl PidIdentityDb {
             .map_err(|err| format!("Failed to open PID identity sidecar: {err}"))?;
         authority.validate_opened_target()?;
         crate::mailbox::configure_writable_sidecar_connection(&conn)?;
-        set_wal_mode(&conn)?;
+        crate::mailbox::set_wal_mode(&conn)?;
         ensure_identity_schema(&conn)?;
         Ok(Self {
             conn,
@@ -282,14 +282,10 @@ fn observe_live_process_identity_impl(_os_pid: i64) -> ProcessIdentityObservatio
     ProcessIdentityObservation::Unsupported
 }
 
-fn set_wal_mode(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA journal_mode=WAL;")
-        .map_err(|err| format!("Failed to set PID identity sidecar WAL mode: {err}"))
-}
-
 pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS pid_identity (
+    const RETRY_INTERVAL: Duration = Duration::from_millis(10);
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS pid_identity (
             os_pid                  INTEGER NOT NULL,
             os_boot_id              TEXT    NOT NULL,
             os_pid_starttime_ticks  INTEGER NOT NULL,
@@ -300,9 +296,28 @@ pub(crate) fn ensure_identity_schema(conn: &Connection) -> Result<(), String> {
             model_name              TEXT,
             recorded_at             TEXT    NOT NULL,
             PRIMARY KEY (os_pid, os_boot_id, os_pid_starttime_ticks)
-        );",
-    )
-    .map_err(|err| format!("Failed to ensure PID identity sidecar schema: {err}"))
+        );";
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match conn.execute_batch(SCHEMA) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ffi::ErrorCode::DatabaseBusy)
+                        | Some(rusqlite::ffi::ErrorCode::DatabaseLocked)
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Failed to ensure PID identity sidecar schema: {error}"
+                ));
+            }
+        }
+    }
 }
 
 pub(crate) fn bind_identity_on(

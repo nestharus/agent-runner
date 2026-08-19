@@ -59,7 +59,12 @@ pub(crate) fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending
         newer.delivered_by_invocation_uuid.as_deref().unwrap(),
     );
     wait_until("unconfirmed wake claim released", || {
-        fixture.mailbox().wake_claim(SESSION).unwrap().is_none()
+        fixture
+            .mailbox()
+            .wake_session_reader()
+            .wake_claim(SESSION)
+            .unwrap()
+            .is_none()
     });
     assert_xdg_isolated(&fixture);
 }
@@ -126,7 +131,14 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_deb
             &fixture,
             rows[0].delivered_by_invocation_uuid.as_deref().unwrap(),
         );
-        assert!(fixture.mailbox().wake_claim(session_id).unwrap().is_none());
+        assert!(
+            fixture
+                .mailbox()
+                .wake_session_reader()
+                .wake_claim(session_id)
+                .unwrap()
+                .is_none()
+        );
     }
     for session_id in &dead_sessions {
         let rows = fixture.mailbox().list_mailbox(session_id, true).unwrap();
@@ -134,7 +146,14 @@ pub(crate) fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_deb
         assert!(rows[0].delivered_at.is_none());
         assert_eq!(rows[0].delivery_attempts, 0);
         assert!(rows[0].delivery_error.is_none());
-        assert!(fixture.mailbox().wake_claim(session_id).unwrap().is_some());
+        assert!(
+            fixture
+                .mailbox()
+                .wake_session_reader()
+                .wake_claim(session_id)
+                .unwrap()
+                .is_some()
+        );
     }
     assert_xdg_isolated(&fixture);
 }

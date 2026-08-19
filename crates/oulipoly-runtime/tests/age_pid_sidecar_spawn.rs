@@ -109,6 +109,7 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
     assert_eq!(row.model_name.as_deref(), Some("fixture-model"));
     let mailbox = MailboxDb::open(&sidecar_path).unwrap();
     let generation = mailbox
+        .runtime_lifecycle_reader()
         .resolve_runtime_generation(RuntimeGenerationSelector::ProcessIdentity(&row.identity()))
         .unwrap();
     assert!(matches!(
@@ -120,7 +121,8 @@ fn spawn_capture_writes_verified_sidecar_row_without_state_schema_change() {
     ));
     assert!(
         mailbox
-            .session_runtime("fixture-missing-session")
+            .wake_session_reader()
+            .session_metadata("fixture-missing-session")
             .unwrap()
             .is_none(),
         "no capture plan must not invent a session_runtime row"
@@ -179,6 +181,7 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
 
     let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
     let generations = mailbox
+        .runtime_lifecycle_reader()
         .runtime_generation_history(CAPTURED_SESSION_ID)
         .unwrap();
     assert_eq!(generations.len(), 1);
@@ -190,39 +193,38 @@ fn stdout_json_event_capture_backfills_sidecar_and_marks_runtime_running() {
         generations[0].terminal_reason,
         Some(RuntimeTerminalReason::OrderlyCompletion)
     );
-    let runtime = mailbox
-        .session_runtime(CAPTURED_SESSION_ID)
+    let metadata = mailbox
+        .wake_session_reader()
+        .session_metadata(CAPTURED_SESSION_ID)
         .unwrap()
-        .expect("captured session must be marked running");
-    assert_eq!(runtime.run_state, "running");
-    assert_eq!(runtime.invocation_uuid.as_deref(), Some(INVOCATION_UUID));
-    assert_eq!(runtime.provider_name.as_deref(), Some("fixture-provider"));
-    assert_eq!(runtime.model_name.as_deref(), Some("fixture-model"));
+        .expect("captured session metadata must remain available");
+    assert_eq!(metadata.invocation_uuid.as_deref(), Some(INVOCATION_UUID));
+    assert_eq!(metadata.provider_name.as_deref(), Some("fixture-provider"));
+    assert_eq!(metadata.model_name.as_deref(), Some("fixture-model"));
     let expected_models_dir = models_dir.to_string_lossy();
     assert_eq!(
-        runtime.models_dir.as_deref(),
+        metadata.models_dir.as_deref(),
         Some(expected_models_dir.as_ref())
     );
-    assert_eq!(
-        runtime.running_invocation_uuid.as_deref(),
-        Some(INVOCATION_UUID)
-    );
-    assert_eq!(runtime.running_os_pid, Some(row.os_pid));
-    assert_eq!(
-        runtime.running_os_boot_id.as_deref(),
-        Some(row.os_boot_id.as_str())
-    );
-    assert_eq!(
-        runtime.running_os_pid_starttime_ticks,
-        Some(row.os_pid_starttime_ticks)
-    );
+    let projection = mailbox
+        .wake_session_reader()
+        .legacy_runtime_projection(CAPTURED_SESSION_ID)
+        .unwrap()
+        .expect("captured session compatibility projection must remain available");
+    assert_eq!(projection.run_state, "idle");
+    assert!(projection.running_invocation_uuid.is_none());
+    assert!(projection.running_os_pid.is_none());
 
     assert_eq!(
-        mailbox.session_liveness(CAPTURED_SESSION_ID).unwrap(),
+        mailbox
+            .runtime_lifecycle()
+            .reconcile_session_liveness(CAPTURED_SESSION_ID)
+            .unwrap(),
         SessionLiveness::Idle
     );
     let idle_runtime = mailbox
-        .session_runtime(CAPTURED_SESSION_ID)
+        .wake_session_reader()
+        .legacy_runtime_projection(CAPTURED_SESSION_ID)
         .unwrap()
         .expect("captured session runtime row must remain after idle cleanup");
     assert_eq!(idle_runtime.run_state, "idle");

@@ -2,7 +2,7 @@
 //!
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`
 
-use oulipoly_state::{CompositeInvocationId, mailbox::SessionRuntimeRow};
+use oulipoly_state::{CompositeInvocationId, mailbox::SessionMetadataRow};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
@@ -16,7 +16,7 @@ use super::constants::{
 
 pub(super) fn spawn_detached_resume(
     session_id: &str,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     claim_token: &str,
     auto_wake_count: i64,
     auto_wake_max: i64,
@@ -56,7 +56,7 @@ fn detached_spawn_error(err: std::io::Error) -> String {
 fn detached_resume_command(
     exe: PathBuf,
     session_id: &str,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     claim_token: &str,
     auto_wake_count: i64,
     auto_wake_max: i64,
@@ -75,7 +75,11 @@ fn detached_resume_command(
     cmd
 }
 
-fn configure_resume_args(cmd: &mut Command, session_id: &str, runtime: Option<&SessionRuntimeRow>) {
+fn configure_resume_args(
+    cmd: &mut Command,
+    session_id: &str,
+    runtime: Option<&SessionMetadataRow>,
+) {
     cmd.arg("resume").arg("--session-id").arg(session_id);
     append_non_empty_arg(cmd, "-m", runtime.and_then(|row| row.model_name.as_deref()));
     append_non_empty_arg(
@@ -103,7 +107,7 @@ fn append_arg(cmd: &mut Command, flag: &str, value: &str) {
 fn configure_wake_stdio_and_env(
     cmd: &mut Command,
     session_id: &str,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     claim_token: &str,
     auto_wake_count: i64,
     auto_wake_max: i64,
@@ -119,7 +123,7 @@ fn configure_wake_stdio_and_env(
     configure_parent_invocation(cmd, runtime);
 }
 
-fn configure_parent_invocation(cmd: &mut Command, runtime: Option<&SessionRuntimeRow>) {
+fn configure_parent_invocation(cmd: &mut Command, runtime: Option<&SessionMetadataRow>) {
     match parent_invocation_env(runtime) {
         Some(parent) => {
             cmd.env(PARENT_INVOCATION_ENV, parent);
@@ -130,13 +134,13 @@ fn configure_parent_invocation(cmd: &mut Command, runtime: Option<&SessionRuntim
     }
 }
 
-fn parent_invocation_env(runtime: Option<&SessionRuntimeRow>) -> Option<String> {
+fn parent_invocation_env(runtime: Option<&SessionMetadataRow>) -> Option<String> {
     let (source, invocation_uuid) = parent_invocation_fields(runtime)?;
     let invocation_uuid = validate_parent_invocation_uuid(invocation_uuid)?;
     format_parent_invocation_env(source, invocation_uuid)
 }
 
-fn parent_invocation_fields(runtime: Option<&SessionRuntimeRow>) -> Option<(&str, &str)> {
+fn parent_invocation_fields(runtime: Option<&SessionMetadataRow>) -> Option<(&str, &str)> {
     let runtime = runtime?;
     let invocation_uuid = runtime
         .invocation_uuid
@@ -183,24 +187,14 @@ fn configure_detached(_cmd: &mut Command) {}
 mod tests {
     use super::*;
 
-    fn runtime(invocation_uuid: Option<&str>, provider_name: Option<&str>) -> SessionRuntimeRow {
-        SessionRuntimeRow {
+    fn runtime(invocation_uuid: Option<&str>, provider_name: Option<&str>) -> SessionMetadataRow {
+        SessionMetadataRow {
             session_id: "session-a".to_string(),
             mode: "headless".to_string(),
             invocation_uuid: invocation_uuid.map(str::to_string),
             provider_name: provider_name.map(str::to_string),
             model_name: None,
-            pty_control_path: None,
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            run_state: "idle".to_string(),
-            running_invocation_uuid: None,
-            running_os_pid: None,
-            running_os_boot_id: None,
-            running_os_pid_starttime_ticks: None,
-            turn_started_at: None,
-            turn_ended_at: None,
-            turn_start_max_mailbox_seq: None,
-            last_exit_code: None,
             models_dir: None,
             effective_cwd: None,
             auto_wake_count: 0,

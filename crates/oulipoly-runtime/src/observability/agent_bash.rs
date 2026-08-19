@@ -15,7 +15,7 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::{process_identity_liveness, unverified_pid_liveness};
 use crate::observability::mailbox::mailbox_state;
 use crate::observability::state_access::storage_diagnostic;
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use oulipoly_state::invocation_marker::INVOCATION_MARKER_PREFIX;
 use oulipoly_state::mailbox::{AGENT_BASH_COMPLETE_KIND, MailboxRow};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};

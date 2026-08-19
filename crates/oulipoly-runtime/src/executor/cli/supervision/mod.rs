@@ -219,7 +219,16 @@ fn execute_with_supervisor(
         real_status,
     );
     output.streamed_session_id = streamed_session_id;
-    mark_runtime_generation_orderly_completed(spawn_identity, Some(output.exit_code))?;
+    let compatibility_exit_code = if output.exit_code == 0 && output.terminal_reason.is_some() {
+        1
+    } else {
+        output.exit_code
+    };
+    mark_runtime_generation_orderly_completed(
+        spawn_identity,
+        Some(output.exit_code),
+        Some(compatibility_exit_code),
+    )?;
     if stdin_predicates::stdin_write_error_is_fatal(stdin_write_error.as_deref(), &output)
         && let Some(err) = stdin_write_error
     {

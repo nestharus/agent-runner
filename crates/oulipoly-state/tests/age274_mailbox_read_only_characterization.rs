@@ -7,7 +7,7 @@
 use chrono::Utc;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
-    MailboxDeliveryAttemptDisposition, RuntimeGenerationId, SessionRuntimeUpsert,
+    MailboxDeliveryAttemptDisposition, RuntimeGenerationId, SessionMetadataUpsert,
     WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
@@ -69,6 +69,7 @@ impl Fixture {
                 .unwrap()
         );
         let claim = mailbox
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: SESSION,
                 claim_token: CLAIM,
@@ -81,6 +82,7 @@ impl Fixture {
         assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
         let generation = RuntimeGenerationId::parse(GENERATION).unwrap();
         mailbox
+            .runtime_lifecycle()
             .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id: &generation,
                 spawn_invocation_uuid: INVOCATION,
@@ -94,13 +96,13 @@ impl Fixture {
             })
             .unwrap();
         mailbox
-            .upsert_session_runtime(SessionRuntimeUpsert {
+            .wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: SESSION,
                 mode: "headless",
                 invocation_uuid: Some(INVOCATION),
                 provider_name: Some("provider-read-only"),
                 model_name: Some("model-read-only"),
-                pty_control_path: None,
                 models_dir: Some("/models/read-only"),
                 effective_cwd: Some("/work/read-only"),
                 selected_auto_wake_max: Some(5),
@@ -135,7 +137,11 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].handle, "h-read-only");
     assert_eq!(rows[0].delivery_attempts, 0);
-    let claim = mailbox.wake_claim(SESSION).unwrap().unwrap();
+    let claim = mailbox
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.claim_token, CLAIM);
     assert_eq!(claim.min_pending_seq_at_claim, Some(rows[0].seq));
     assert_eq!(claim.max_pending_seq_at_claim, Some(rows[0].seq));
@@ -154,16 +160,29 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
         [rows[0].seq]
     );
     let generation = mailbox
+        .runtime_lifecycle_reader()
         .runtime_generation(&RuntimeGenerationId::parse(GENERATION).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(generation.spawn_invocation_uuid, INVOCATION);
     assert_eq!(generation.session_id.as_deref(), Some(SESSION));
     assert_eq!(generation.provider_name, "provider-read-only");
-    let runtime = mailbox.session_runtime(SESSION).unwrap().unwrap();
-    assert_eq!(runtime.invocation_uuid.as_deref(), Some(INVOCATION));
-    assert_eq!(runtime.run_state, "idle");
-    assert_eq!(runtime.provider_name.as_deref(), Some("provider-read-only"));
+    let metadata = mailbox
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    let projection = mailbox
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.invocation_uuid.as_deref(), Some(INVOCATION));
+    assert_eq!(projection.run_state, "idle");
+    assert_eq!(
+        metadata.provider_name.as_deref(),
+        Some("provider-read-only")
+    );
     drop(mailbox);
 
     assert_physical_snapshot_unchanged(&before, &physical_snapshot(parent));

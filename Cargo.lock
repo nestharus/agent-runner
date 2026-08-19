@@ -3125,6 +3125,7 @@ dependencies = [
  "base64 0.22.1",
  "jsonschema",
  "libc",
+ "oulipoly-core",
  "serde",
  "serde_json",
  "sha2",

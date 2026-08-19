@@ -3,7 +3,7 @@
 use crate::observability::{
     MonitorSnapshot, ObservabilityRoot, ObservabilitySnapshotPort, SnapshotLimits,
 };
-use oulipoly_provider::client::CancellationToken;
+use oulipoly_core::CancellationToken;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
