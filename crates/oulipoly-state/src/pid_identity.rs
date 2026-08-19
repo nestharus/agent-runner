@@ -609,6 +609,9 @@ fn read_live_process_identity_impl(os_pid: i64) -> Result<Option<ProcessIdentity
             std::io::Error::last_os_error()
         ));
     }
+    if exit.dwLowDateTime != 0 || exit.dwHighDateTime != 0 {
+        return Ok(None);
+    }
     let start_filetime =
         (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
     let start_filetime = i64::try_from(start_filetime)
@@ -792,7 +795,7 @@ mod tests {
 
         let db = PidIdentityDb::open_with_authority(&authority).unwrap();
 
-        assert_eq!(db.path(), path);
+        assert_eq!(db.path(), authority.path().canonicalize().unwrap());
     }
 
     #[test]
