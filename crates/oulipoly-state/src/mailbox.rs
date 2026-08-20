@@ -35,6 +35,8 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
+// Agent-bash registration must not inherit test-support's shortened generic writer wait.
+const COMPLETION_AUTHORITY_SQLITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, enqueued_at,
     delivered_at, delivered_by_invocation_uuid, delivery_attempts,
     delivery_error, owner_invocation_uuid, matched_os_pid,
@@ -1275,7 +1277,7 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
-        conn.busy_timeout(mailbox_writer_sqlite_timeout())
+        conn.busy_timeout(COMPLETION_AUTHORITY_SQLITE_TIMEOUT)
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
             conn,
@@ -9034,6 +9036,14 @@ mod tests {
 
         let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
         let existing = MailboxDb::open_existing_for_completion_authority(&authority).unwrap();
+        let completion_authority_timeout = existing
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(
+            completion_authority_timeout >= 5_000,
+            "completion authority busy timeout was {completion_authority_timeout}ms"
+        );
         assert_writable_sidecar_rejects_orphan(existing.connection(), "existing-authority");
         drop(existing);
         drop(authority);

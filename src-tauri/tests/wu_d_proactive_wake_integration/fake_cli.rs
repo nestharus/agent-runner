@@ -96,14 +96,22 @@ for _ in $(seq 1 200); do
   sleep 0.01
 done
 [ -e "$writer_ready" ]
-AGENT_BASH_OWNER_SESSION_ID="$session" \
-AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
-AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
-{agent_bash_bin} run --completion-scope tree --delivery async -- \
-  bash -lc '( sleep 1; printf nested-tree-complete ) &' \
-  > "$work/agent-bash-dispatch.json" \
-  2> "$work/agent-bash-dispatch.err"
-wait "$writer_pid""#,
+if AGENT_BASH_OWNER_SESSION_ID="$session" \
+   AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
+   AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
+   {agent_bash_bin} run --completion-scope tree --delivery async -- \
+     bash -lc '( sleep 1; printf nested-tree-complete ) &' \
+     > "$work/agent-bash-dispatch.json" \
+     2> "$work/agent-bash-dispatch.err"; then
+  :
+else
+  rc=$?
+  cat "$work/agent-bash-dispatch.err" >&2
+  wait "$writer_pid" || true
+  exit "$rc"
+fi
+wait "$writer_pid"
+"#,
         ),
         "",
         "acr329-resumed-input.txt",

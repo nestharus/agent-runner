@@ -12,9 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SIDECAR_DB_NAME: &str = "pid-identity.db";
-// Shell owner lookup has a 60-second caller bound and can wait through a short
-// writer burst. Cancellable monitor snapshots keep the shared 250 ms policy.
-const DIRECT_LOOKUP_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+const DIRECT_LOOKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessIdentity {
@@ -133,12 +131,19 @@ impl PidIdentityDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
-        Self::open_read_only_with_retry_and_work_timeout(
+        let path = canonical_read_only_path(path)?;
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        conn.busy_timeout(DIRECT_LOOKUP_BUSY_TIMEOUT)
+            .map_err(|err| format!("Failed to configure PID identity sidecar read-only: {err}"))?;
+        conn.pragma_update(None, "query_only", true)
+            .map_err(|err| format!("Failed to configure PID identity sidecar read-only: {err}"))?;
+        Ok(Self {
+            conn,
             path,
-            DIRECT_LOOKUP_SNAPSHOT_TIMEOUT,
-            DIRECT_LOOKUP_SNAPSHOT_TIMEOUT,
-            &|| false,
-        )
+            _read_only_snapshot: None,
+            _namespace_authority: None,
+        })
     }
 
     pub fn open_read_only_with_cancel(
@@ -148,23 +153,6 @@ impl PidIdentityDb {
         let snapshot =
             crate::read_only_snapshot::ReadOnlySnapshot::create_with_cancel(path, is_cancelled)
                 .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
-        Self::open_snapshot(path, snapshot)
-    }
-
-    fn open_read_only_with_retry_and_work_timeout(
-        path: &Path,
-        retry_timeout: Duration,
-        work_timeout: Duration,
-        is_cancelled: &dyn Fn() -> bool,
-    ) -> Result<Self, String> {
-        let snapshot =
-            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
-                path,
-                retry_timeout,
-                work_timeout,
-                is_cancelled,
-            )
-            .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
         Self::open_snapshot(path, snapshot)
     }
 
@@ -279,6 +267,22 @@ impl PidIdentityDb {
 
 pub fn default_path() -> Result<PathBuf, String> {
     Ok(crate::paths::data_dir()?.join(SIDECAR_DB_NAME))
+}
+
+fn canonical_read_only_path(path: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|err| format!("Failed to resolve PID identity sidecar read-only: {err}"))?;
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|err| format!("Failed to inspect PID identity sidecar read-only: {err}"))?;
+    let identity = crate::filesystem_identity::path_file_identity(&canonical, &metadata)
+        .map_err(|err| format!("Failed to identify PID identity sidecar read-only: {err}"))?;
+    if !metadata.is_file() || identity.links != 1 {
+        return Err(format!(
+            "PID identity sidecar read-only requires a regular file with exactly one hard link: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 pub fn record_live_process_identity(
@@ -739,7 +743,8 @@ mod tests {
         BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb, RuntimeGenerationFence,
         RuntimeGenerationId, RuntimeLifecycleState, SessionLiveness,
     };
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
     const INVOCATION_UUID: &str = "11111111-1111-1111-1111-111111111111";
@@ -787,6 +792,12 @@ mod tests {
         drop(db);
 
         let db = PidIdentityDb::open_read_only(&path).unwrap();
+        let query_only: i64 = db
+            .connection()
+            .query_row("PRAGMA query_only", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(query_only, 1);
+        assert_eq!(db.path(), path.canonicalize().unwrap());
         let reopened = db.lookup_by_identity(&identity).unwrap().unwrap();
         assert_eq!(reopened.invocation_uuid, INVOCATION_UUID);
         assert_eq!(reopened.provider_name.as_deref(), Some("fixture-provider"));
@@ -794,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_read_only_lookup_waits_through_a_sidecar_write_burst() {
+    fn direct_read_only_lookup_succeeds_while_sidecar_writer_remains_active() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pid-identity.db");
         let writer_db = PidIdentityDb::open(&path).unwrap();
@@ -804,11 +815,11 @@ mod tests {
             .record_identity(record(&target_identity, Some("session-write-burst")))
             .unwrap();
         let (started_tx, started_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_stop = Arc::clone(&stop);
         let writer = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(1);
             let mut revision = 0_u64;
-            while Instant::now() < deadline {
+            while !writer_stop.load(Ordering::SeqCst) {
                 writer_db
                     .connection()
                     .execute(
@@ -817,19 +828,19 @@ mod tests {
                     )
                     .unwrap();
                 revision += 1;
+                if revision == 1 {
+                    started_tx.send(()).unwrap();
+                }
             }
+            revision
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let result = PidIdentityDb::open_read_only(&path);
-        writer.join().unwrap();
-        let reader = result.unwrap();
-        assert!(
-            reader
-                .lookup_by_identity(&target_identity)
-                .unwrap()
-                .is_some()
-        );
+        let result = PidIdentityDb::open_read_only(&path)
+            .and_then(|reader| reader.lookup_by_identity(&target_identity));
+        stop.store(true, Ordering::SeqCst);
+        assert!(writer.join().unwrap() > 0);
+        assert!(result.unwrap().is_some());
     }
 
     #[test]

@@ -491,7 +491,6 @@ fn pid_identity_open_read_only_preserves_source_and_recovers_exact_identity() {
             recorded_at: "2026-08-07T00:00:00Z",
         })
         .unwrap();
-    drop(writer);
     let before = physical_snapshot(dir.path());
 
     let pid = PidIdentityDb::open_read_only(&sidecar_path).unwrap();
@@ -502,6 +501,7 @@ fn pid_identity_open_read_only_preserves_source_and_recovers_exact_identity() {
     assert_eq!(row.identity(), identity);
     drop(pid);
     assert_physical_snapshot_unchanged(&before, &physical_snapshot(dir.path()));
+    drop(writer);
 }
 
 #[test]
