@@ -22,19 +22,19 @@ fn runner_executes_physical_snapshot_protocol_before_cli_dispatch() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("snapshot helper did not finish");
-        }
+    while !control.join("result").exists() {
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(
+            Instant::now() < deadline,
+            "snapshot helper did not finish copying"
+        );
         std::thread::sleep(Duration::from_millis(2));
-    };
+    }
 
-    assert!(status.success(), "snapshot helper failed: {status}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "stable snapshot helper did not retain cleanup guardianship"
+    );
     assert_eq!(
         std::fs::read(&destination).unwrap(),
         b"physical snapshot bytes"
@@ -43,4 +43,22 @@ fn runner_executes_physical_snapshot_protocol_before_cli_dispatch() {
         std::fs::read_to_string(control.join("result")).unwrap(),
         "stable\n"
     );
+
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("snapshot cleanup guardian did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(status.success(), "snapshot helper failed: {status}");
+    assert!(source.exists());
+    assert!(!destination.exists());
+    assert!(!control.exists());
 }
