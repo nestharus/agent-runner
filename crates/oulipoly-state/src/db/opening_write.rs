@@ -308,6 +308,22 @@ impl StateDb {
         Self::open_from_read_only_parts(source, conn, snapshot)
     }
 
+    pub fn open_read_only_with_retry_and_work_timeout_and_cancel(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+        work_timeout: std::time::Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        let source = Self::validate_read_only_paths(path)?;
+        let (conn, snapshot) = Self::open_read_only_connection_with_retry_and_work_timeout(
+            &source,
+            retry_timeout,
+            work_timeout,
+            is_cancelled,
+        )?;
+        Self::open_from_read_only_parts(source, conn, snapshot)
+    }
+
     fn open_from_read_only_parts(
         source: PathBuf,
         conn: sqlite::Connection,

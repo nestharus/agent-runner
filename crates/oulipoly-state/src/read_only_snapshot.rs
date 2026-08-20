@@ -12,6 +12,7 @@ const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 // One observability scan opens up to three stores serially. Keep transient
 // source churn from turning best-effort observation into multi-second delay.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(250);
+const SNAPSHOT_WORK_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_ARTIFACT_SUFFIXES: [&str; 3] = ["", "-wal", "-journal"];
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -22,7 +23,12 @@ const HELPER_RETRY_MARKER: &str = "retry";
 #[cfg(test)]
 const STALLED_HELPER_SOURCE_NAME: &str = "stall-snapshot-helper.db";
 
+#[derive(Clone)]
 pub(crate) struct ReadOnlySnapshot {
+    inner: Arc<ReadOnlySnapshotInner>,
+}
+
+struct ReadOnlySnapshotInner {
     _helper: SnapshotHelperGuard,
     path: PathBuf,
 }
@@ -188,7 +194,12 @@ impl ReadOnlySnapshot {
         source: &Path,
         is_cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
-        Self::create_with_retry_timeout(source, SNAPSHOT_TIMEOUT, is_cancelled)
+        Self::create_with_retry_and_work_timeout(
+            source,
+            SNAPSHOT_TIMEOUT,
+            SNAPSHOT_WORK_TIMEOUT,
+            is_cancelled,
+        )
     }
 
     pub(crate) fn create_with_retry_timeout(
@@ -196,10 +207,27 @@ impl ReadOnlySnapshot {
         timeout: Duration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> io::Result<Self> {
-        Self::create_with_retry_policy(
+        Self::create_with_retry_and_work_policy(
             source,
             timeout,
             SNAPSHOT_RETRY_INTERVAL,
+            Some(SNAPSHOT_WORK_TIMEOUT),
+            is_cancelled,
+            || Ok(()),
+        )
+    }
+
+    pub(crate) fn create_with_retry_and_work_timeout(
+        source: &Path,
+        retry_timeout: Duration,
+        work_timeout: Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<Self> {
+        Self::create_with_retry_and_work_policy(
+            source,
+            retry_timeout,
+            SNAPSHOT_RETRY_INTERVAL,
+            Some(work_timeout),
             is_cancelled,
             || Ok(()),
         )
@@ -219,10 +247,29 @@ impl ReadOnlySnapshot {
         )
     }
 
+    #[cfg(test)]
     fn create_with_retry_policy(
         source: &Path,
         timeout: Duration,
         retry_interval: Duration,
+        is_cancelled: &dyn Fn() -> bool,
+        after_copy: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<Self> {
+        Self::create_with_retry_and_work_policy(
+            source,
+            timeout,
+            retry_interval,
+            None,
+            is_cancelled,
+            after_copy,
+        )
+    }
+
+    fn create_with_retry_and_work_policy(
+        source: &Path,
+        timeout: Duration,
+        retry_interval: Duration,
+        work_timeout: Option<Duration>,
         is_cancelled: &dyn Fn() -> bool,
         mut after_copy: impl FnMut() -> io::Result<()>,
     ) -> io::Result<Self> {
@@ -233,19 +280,33 @@ impl ReadOnlySnapshot {
         })?;
         let path = dir.path().join(file_name);
         let mut retry_deadline = None;
+        let work_deadline = work_timeout.map(|timeout| Instant::now() + timeout);
         let mut helper = start_snapshot_helper(&source, &path, dir)?;
         loop {
-            ensure_snapshot_not_cancelled(is_cancelled)?;
+            ensure_snapshot_work_active(is_cancelled, work_deadline)?;
             if let Some(deadline) = retry_deadline {
                 ensure_retry_active(deadline, is_cancelled)?;
             }
             let control = helper.control_path()?.to_path_buf();
-            let outcome =
-                wait_for_helper_copy(helper.child_mut()?, &control, is_cancelled, &mut after_copy)?;
+            let should_abort = || {
+                is_cancelled() || work_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            };
+            let outcome = map_work_timeout(
+                wait_for_helper_copy(
+                    helper.child_mut()?,
+                    &control,
+                    &should_abort,
+                    &mut after_copy,
+                ),
+                is_cancelled,
+                work_deadline,
+            )?;
             if outcome == HelperCopyOutcome::Stable {
                 return Ok(Self {
-                    _helper: helper,
-                    path,
+                    inner: Arc::new(ReadOnlySnapshotInner {
+                        _helper: helper,
+                        path,
+                    }),
                 });
             }
             let deadline = *retry_deadline.get_or_insert_with(|| Instant::now() + timeout);
@@ -256,14 +317,60 @@ impl ReadOnlySnapshot {
             if remaining.is_zero() {
                 return Err(snapshot_changed_error());
             }
-            std::thread::sleep(retry_interval.min(remaining));
-            helper.request_retry(is_cancelled)?;
+            let mut retry_sleep = retry_interval.min(remaining);
+            if let Some(deadline) = work_deadline {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(snapshot_work_timeout_error());
+                };
+                retry_sleep = retry_sleep.min(remaining);
+            }
+            std::thread::sleep(retry_sleep);
+            map_work_timeout(
+                helper.request_retry(&should_abort),
+                is_cancelled,
+                work_deadline,
+            )?;
         }
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
+}
+
+fn ensure_snapshot_work_active(
+    is_cancelled: &dyn Fn() -> bool,
+    work_deadline: Option<Instant>,
+) -> io::Result<()> {
+    ensure_snapshot_not_cancelled(is_cancelled)?;
+    if work_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(snapshot_work_timeout_error());
+    }
+    Ok(())
+}
+
+fn map_work_timeout<T>(
+    result: io::Result<T>,
+    is_cancelled: &dyn Fn() -> bool,
+    work_deadline: Option<Instant>,
+) -> io::Result<T> {
+    match result {
+        Err(error)
+            if error.kind() == io::ErrorKind::Interrupted
+                && !is_cancelled()
+                && work_deadline.is_some_and(|deadline| Instant::now() >= deadline) =>
+        {
+            Err(snapshot_work_timeout_error())
+        }
+        result => result,
+    }
+}
+
+fn snapshot_work_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Read-only SQLite snapshot exceeded its total work budget",
+    )
 }
 
 fn start_snapshot_helper(
@@ -1261,6 +1368,27 @@ mod tests {
             "deferred helper reaper left snapshot storage behind"
         );
         assert!(source.exists());
+    }
+
+    #[test]
+    fn total_work_budget_bounds_a_stalled_first_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join(STALLED_HELPER_SOURCE_NAME);
+        std::fs::write(&source, vec![7_u8; COPY_BUFFER_BYTES * 4]).unwrap();
+        let started = Instant::now();
+
+        let error = ReadOnlySnapshot::create_with_retry_and_work_timeout(
+            &source,
+            Duration::from_secs(5),
+            Duration::from_millis(25),
+            &|| false,
+        )
+        .err()
+        .expect("a stalled first attempt must exhaust its total work budget");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("total work budget"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

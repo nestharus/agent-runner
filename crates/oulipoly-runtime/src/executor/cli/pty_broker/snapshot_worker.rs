@@ -8,6 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+// Four idle units per work unit cap the snapshot worker at a 20% duty cycle.
+const SNAPSHOT_IDLE_MULTIPLIER: u32 = 4;
+
 pub(super) type MonitorSnapshotProvider = Box<dyn ObservabilitySnapshotPort + Send>;
 
 pub(super) struct MonitorSnapshotWorker {
@@ -141,33 +144,66 @@ fn run_snapshot_worker(
     shared: Arc<SnapshotWorkerShared>,
 ) {
     let mut next_scan = Instant::now();
-    while wait_for_scan(&shared, next_scan) {
+    let mut earliest_forced_scan = next_scan;
+    while wait_for_scan(&shared, next_scan, earliest_forced_scan) {
         if shared.shutdown_requested() {
             return;
         }
+        let snapshot_started = Instant::now();
         let snapshot = read_monitor_snapshot(provider.as_ref(), &root, &shared);
+        let snapshot_elapsed = snapshot_started.elapsed();
         if shared.shutdown_requested() {
             return;
         }
         shared.publish(snapshot);
-        next_scan = Instant::now() + shared.interval();
+        let now = Instant::now();
+        earliest_forced_scan = now + snapshot_idle_duration(snapshot_elapsed);
+        next_scan = now + refresh_delay(shared.interval(), snapshot_elapsed);
     }
 }
 
-fn wait_for_scan(shared: &SnapshotWorkerShared, deadline: Instant) -> bool {
+fn snapshot_idle_duration(snapshot_elapsed: Duration) -> Duration {
+    snapshot_elapsed.saturating_mul(SNAPSHOT_IDLE_MULTIPLIER)
+}
+
+fn refresh_delay(configured_interval: Duration, snapshot_elapsed: Duration) -> Duration {
+    configured_interval.max(snapshot_idle_duration(snapshot_elapsed))
+}
+
+fn scan_is_due(
+    refresh_requested: bool,
+    now: Instant,
+    scheduled_deadline: Instant,
+    earliest_forced_scan: Instant,
+) -> bool {
+    (refresh_requested && now >= earliest_forced_scan) || now >= scheduled_deadline
+}
+
+fn wait_for_scan(
+    shared: &SnapshotWorkerShared,
+    scheduled_deadline: Instant,
+    earliest_forced_scan: Instant,
+) -> bool {
     let mut state = lock_or_recover(&shared.state);
     loop {
         if shared.shutdown_requested() {
             return false;
         }
-        if state.refresh_requested {
+        let now = Instant::now();
+        if scan_is_due(
+            state.refresh_requested,
+            now,
+            scheduled_deadline,
+            earliest_forced_scan,
+        ) {
             state.refresh_requested = false;
             return true;
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return true;
-        }
+        let deadline = if state.refresh_requested {
+            scheduled_deadline.min(earliest_forced_scan)
+        } else {
+            scheduled_deadline
+        };
         state = match shared.wake.wait_timeout(state, deadline - now) {
             Ok((guard, _)) => guard,
             Err(poisoned) => poisoned.into_inner().0,
@@ -196,6 +232,47 @@ fn format_snapshot_worker_spawn_error(err: std::io::Error) -> String {
 
 fn snapshot_worker_panic_error() -> String {
     "TUI snapshot worker panicked".to_string()
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+
+    #[test]
+    fn fast_snapshot_keeps_configured_interval() {
+        assert_eq!(
+            refresh_delay(Duration::from_millis(500), Duration::from_millis(100)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn slow_snapshot_caps_worker_duty_cycle() {
+        assert_eq!(
+            refresh_delay(Duration::from_millis(500), Duration::from_secs(2)),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn forced_refresh_cannot_bypass_snapshot_idle_window() {
+        let now = Instant::now();
+        let earliest_forced_scan = now + Duration::from_secs(8);
+        let scheduled_deadline = now + Duration::from_secs(10);
+
+        assert!(!scan_is_due(
+            true,
+            now + Duration::from_secs(7),
+            scheduled_deadline,
+            earliest_forced_scan
+        ));
+        assert!(scan_is_due(
+            true,
+            earliest_forced_scan,
+            scheduled_deadline,
+            earliest_forced_scan
+        ));
+    }
 }
 
 #[cfg(all(test, unix))]

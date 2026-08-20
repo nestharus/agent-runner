@@ -11,6 +11,10 @@ use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, ProcessIdentity};
 use oulipoly_state::{ReadOnlyOpenError, StateDb};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const SIDECAR_SNAPSHOT_RETRY_TIMEOUT: Duration = Duration::from_millis(250);
+const SIDECAR_SNAPSHOT_WORK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct SnapshotStores {
     pub(crate) state: Option<StateDb>,
@@ -34,12 +38,7 @@ impl SnapshotStores {
                 return snapshot_stores(state, None, None, diagnostics);
             }
         };
-        let pid = open_pid_read_only(&pid_path, &mut diagnostics, is_cancelled);
-        if is_cancelled() {
-            diagnostics.push(snapshot_cancelled_diagnostic());
-            return snapshot_stores(state, pid, None, diagnostics);
-        }
-        let mailbox = open_mailbox_read_only(&pid_path, &mut diagnostics, is_cancelled);
+        let (pid, mailbox) = open_sidecar_read_only(&pid_path, &mut diagnostics, is_cancelled);
         snapshot_stores(state, pid, mailbox, diagnostics)
     }
 }
@@ -151,56 +150,31 @@ fn state_open_read_only_diagnostic(err: ReadOnlyOpenError) -> MonitorDiagnostic 
     storage_diagnostic("state:open-read-only", format!("{err:?}"))
 }
 
-fn open_pid_read_only(
+fn open_sidecar_read_only(
     path: &Path,
     diagnostics: &mut Vec<MonitorDiagnostic>,
     is_cancelled: &dyn Fn() -> bool,
-) -> Option<PidIdentityDb> {
+) -> (Option<PidIdentityDb>, Option<MailboxDb>) {
     if path_is_missing(path) {
-        return None;
+        return (None, None);
     }
-    match read_existing_pid_identity(path, is_cancelled) {
-        Ok(db) => Some(db),
+    match MailboxDb::open_read_only_with_pid_identity_and_work_timeout(
+        path,
+        SIDECAR_SNAPSHOT_RETRY_TIMEOUT,
+        SIDECAR_SNAPSHOT_WORK_TIMEOUT,
+        is_cancelled,
+    ) {
+        Ok((pid, mailbox)) => (Some(pid), Some(mailbox)),
         Err(err) => {
-            diagnostics.push(pid_open_read_only_diagnostic(err));
-            None
+            diagnostics.push(pid_open_read_only_diagnostic(err.clone()));
+            diagnostics.push(mailbox_open_read_only_diagnostic(err));
+            (None, None)
         }
     }
-}
-
-fn read_existing_pid_identity(
-    path: &Path,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<PidIdentityDb, String> {
-    PidIdentityDb::open_read_only_with_cancel(path, is_cancelled)
 }
 
 fn pid_open_read_only_diagnostic(message: String) -> MonitorDiagnostic {
     storage_diagnostic("pid-identity:open-read-only", message)
-}
-
-fn open_mailbox_read_only(
-    path: &Path,
-    diagnostics: &mut Vec<MonitorDiagnostic>,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Option<MailboxDb> {
-    if path_is_missing(path) {
-        return None;
-    }
-    match read_existing_mailbox(path, is_cancelled) {
-        Ok(db) => Some(db),
-        Err(err) => {
-            diagnostics.push(mailbox_open_read_only_diagnostic(err));
-            None
-        }
-    }
-}
-
-fn read_existing_mailbox(
-    path: &Path,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Result<MailboxDb, String> {
-    MailboxDb::open_read_only_with_cancel(path, is_cancelled)
 }
 
 fn mailbox_open_read_only_diagnostic(message: String) -> MonitorDiagnostic {

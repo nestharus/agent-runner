@@ -12,7 +12,7 @@ pub(super) fn open_default_state_read_only_with_timeout_and_cancel(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<StateDb>, String> {
     let path = StateDb::default_path()?;
-    open_state_read_only_at_with_retry_timeout(&path, timeout, is_cancelled)
+    open_state_read_only_at_with_retry_and_work_timeout(&path, timeout, timeout, is_cancelled)
 }
 
 #[cfg(test)]
@@ -43,6 +43,7 @@ fn open_state_read_only_at_with_cancel(
         .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
 }
 
+#[cfg(test)]
 fn open_state_read_only_at_with_retry_timeout(
     path: &Path,
     retry_timeout: Duration,
@@ -56,6 +57,27 @@ fn open_state_read_only_at_with_retry_timeout(
     StateDb::open_read_only_with_retry_timeout_and_cancel(path, retry_timeout, is_cancelled)
         .map(Some)
         .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
+}
+
+fn open_state_read_only_at_with_retry_and_work_timeout(
+    path: &Path,
+    retry_timeout: Duration,
+    work_timeout: Duration,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Option<StateDb>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Failed to inspect State path: {error}")),
+    }
+    StateDb::open_read_only_with_retry_and_work_timeout_and_cancel(
+        path,
+        retry_timeout,
+        work_timeout,
+        is_cancelled,
+    )
+    .map(Some)
+    .map_err(|error| format!("Failed to open State read-only for wake sweep: {error:?}"))
 }
 
 pub(super) fn pending_mailbox_provider_name(
@@ -135,6 +157,27 @@ mod tests {
                 .is_some(),
             "the retry budget must begin only after the first source mismatch"
         );
+    }
+
+    #[test]
+    fn wake_snapshot_total_work_budget_is_an_unavailable_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        drop(StateDb::open(&state_path).unwrap());
+        let started = std::time::Instant::now();
+
+        let error = match open_state_read_only_at_with_retry_and_work_timeout(
+            &state_path,
+            Duration::from_secs(5),
+            Duration::ZERO,
+            &|| false,
+        ) {
+            Ok(_) => panic!("a wake snapshot must honor its total work budget"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("total work budget"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]

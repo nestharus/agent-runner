@@ -1231,6 +1231,32 @@ impl MailboxDb {
         let snapshot =
             crate::read_only_snapshot::ReadOnlySnapshot::create_with_cancel(path, is_cancelled)
                 .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        Self::open_snapshot(path, snapshot)
+    }
+
+    pub fn open_read_only_with_pid_identity_and_work_timeout(
+        path: &Path,
+        retry_timeout: StdDuration,
+        work_timeout: StdDuration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(crate::pid_identity::PidIdentityDb, Self), String> {
+        let snapshot =
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
+                path,
+                retry_timeout,
+                work_timeout,
+                is_cancelled,
+            )
+            .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        let pid = crate::pid_identity::PidIdentityDb::open_snapshot(path, snapshot.clone())?;
+        let mailbox = Self::open_snapshot(path, snapshot)?;
+        Ok((pid, mailbox))
+    }
+
+    fn open_snapshot(
+        path: &Path,
+        snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
+    ) -> Result<Self, String> {
         let conn = Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         Ok(Self {
@@ -8703,6 +8729,30 @@ mod tests {
 
     const STARTING_GENERATION_FIXTURE_PATH: &str = "OULIPOLY_TEST_STARTING_GENERATION_FIXTURE_PATH";
     const WAKE_CLAIM_FOREIGN_CHILD_FIXTURE: &str = "OULIPOLY_TEST_WAKE_CLAIM_FOREIGN_CHILD";
+
+    #[test]
+    fn pid_and_mailbox_readers_share_one_snapshot_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let (pid, mailbox) = MailboxDb::open_read_only_with_pid_identity_and_work_timeout(
+            &sidecar_path,
+            StdDuration::from_millis(250),
+            StdDuration::from_secs(5),
+            &|| false,
+        )
+        .unwrap();
+
+        assert_eq!(pid.path(), sidecar_path);
+        assert_eq!(mailbox.path(), sidecar_path);
+        drop(pid);
+        let schema_version: i64 = mailbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, schema::CURRENT_VERSION);
+    }
 
     #[test]
     fn starting_runtime_generation_fixture() {

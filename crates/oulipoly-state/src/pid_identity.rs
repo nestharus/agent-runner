@@ -133,7 +133,12 @@ impl PidIdentityDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
-        Self::open_read_only_with_retry_timeout(path, DIRECT_LOOKUP_SNAPSHOT_TIMEOUT, &|| false)
+        Self::open_read_only_with_retry_and_work_timeout(
+            path,
+            DIRECT_LOOKUP_SNAPSHOT_TIMEOUT,
+            DIRECT_LOOKUP_SNAPSHOT_TIMEOUT,
+            &|| false,
+        )
     }
 
     pub fn open_read_only_with_cancel(
@@ -146,21 +151,24 @@ impl PidIdentityDb {
         Self::open_snapshot(path, snapshot)
     }
 
-    fn open_read_only_with_retry_timeout(
+    fn open_read_only_with_retry_and_work_timeout(
         path: &Path,
         retry_timeout: Duration,
+        work_timeout: Duration,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<Self, String> {
-        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_timeout(
-            path,
-            retry_timeout,
-            is_cancelled,
-        )
-        .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        let snapshot =
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
+                path,
+                retry_timeout,
+                work_timeout,
+                is_cancelled,
+            )
+            .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
         Self::open_snapshot(path, snapshot)
     }
 
-    fn open_snapshot(
+    pub(crate) fn open_snapshot(
         path: &Path,
         snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
     ) -> Result<Self, String> {
