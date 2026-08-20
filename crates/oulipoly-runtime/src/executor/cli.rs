@@ -87,6 +87,7 @@ mod terminal_signal;
 
 pub use headless::{
     execute, execute_effective, execute_effective_with_start_known_provider_session_id,
+    execute_with_mailbox_db_path,
 };
 pub(crate) use input_flags::resolve_input_flags;
 pub(crate) use interactive::execute_interactive_with_result_and_state_db_path;
