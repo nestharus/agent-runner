@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SIDECAR_DB_NAME: &str = "pid-identity.db";
+// Shell owner lookup has a 60-second caller bound and can wait through a short
+// writer burst. Cancellable monitor snapshots keep the shared 250 ms policy.
+const DIRECT_LOOKUP_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProcessIdentity {
@@ -130,7 +133,7 @@ impl PidIdentityDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
-        Self::open_read_only_with_cancel(path, &|| false)
+        Self::open_read_only_with_retry_timeout(path, DIRECT_LOOKUP_SNAPSHOT_TIMEOUT, &|| false)
     }
 
     pub fn open_read_only_with_cancel(
@@ -140,6 +143,27 @@ impl PidIdentityDb {
         let snapshot =
             crate::read_only_snapshot::ReadOnlySnapshot::create_with_cancel(path, is_cancelled)
                 .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        Self::open_snapshot(path, snapshot)
+    }
+
+    fn open_read_only_with_retry_timeout(
+        path: &Path,
+        retry_timeout: Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_timeout(
+            path,
+            retry_timeout,
+            is_cancelled,
+        )
+        .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
+        Self::open_snapshot(path, snapshot)
+    }
+
+    fn open_snapshot(
+        path: &Path,
+        snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
+    ) -> Result<Self, String> {
         let conn =
             Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .map_err(|err| format!("Failed to open PID identity sidecar read-only: {err}"))?;
@@ -759,6 +783,45 @@ mod tests {
         assert_eq!(reopened.invocation_uuid, INVOCATION_UUID);
         assert_eq!(reopened.provider_name.as_deref(), Some("fixture-provider"));
         assert_eq!(reopened.model_name.as_deref(), Some("fixture~high"));
+    }
+
+    #[test]
+    fn direct_read_only_lookup_waits_through_a_sidecar_write_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let writer_db = PidIdentityDb::open(&path).unwrap();
+        let target_identity = identity(99, "boot-write-burst");
+        let target_pid = target_identity.os_pid;
+        writer_db
+            .record_identity(record(&target_identity, Some("session-write-burst")))
+            .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut revision = 0_u64;
+            while Instant::now() < deadline {
+                writer_db
+                    .connection()
+                    .execute(
+                        "UPDATE pid_identity SET recorded_at = ?1 WHERE os_pid = ?2",
+                        params![format!("revision-{revision}"), target_pid],
+                    )
+                    .unwrap();
+                revision += 1;
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let result = PidIdentityDb::open_read_only(&path);
+        writer.join().unwrap();
+        let reader = result.unwrap();
+        assert!(
+            reader
+                .lookup_by_identity(&target_identity)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

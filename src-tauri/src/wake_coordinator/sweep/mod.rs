@@ -1144,6 +1144,7 @@ mod tests {
 
     static TEST_HANDOFF_SCHEDULED: AtomicBool = AtomicBool::new(false);
     static TEST_HANDOFF_OWNER_MATCHED: AtomicBool = AtomicBool::new(false);
+    static TEST_HANDOFF_ASSERTION_LOCK: Mutex<()> = Mutex::new(());
 
     fn record_test_handoff(owner_token: Option<&str>) {
         TEST_HANDOFF_SCHEDULED.store(true, Ordering::SeqCst);
@@ -1205,6 +1206,7 @@ mod tests {
 
     #[test]
     fn startup_guard_hands_off_and_cancels_without_waiting() {
+        let _handoff_assertion = TEST_HANDOFF_ASSERTION_LOCK.lock().unwrap();
         TEST_HANDOFF_SCHEDULED.store(false, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -1239,6 +1241,7 @@ mod tests {
 
     #[test]
     fn startup_guard_does_not_join_an_uncooperative_worker_without_a_bound() {
+        let _handoff_assertion = TEST_HANDOFF_ASSERTION_LOCK.lock().unwrap();
         TEST_HANDOFF_SCHEDULED.store(false, Ordering::SeqCst);
         TEST_HANDOFF_OWNER_MATCHED.store(false, Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));

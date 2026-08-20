@@ -16,31 +16,44 @@ const SQLITE_ARTIFACT_SUFFIXES: [&str; 3] = ["", "-wal", "-journal"];
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const HELPER_COMPARE_TIMEOUT: Duration = Duration::from_secs(30);
-const HELPER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const HELPER_RETRY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+const HELPER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const HELPER_RETRY_MARKER: &str = "retry";
+#[cfg(test)]
+const STALLED_HELPER_SOURCE_NAME: &str = "stall-snapshot-helper.db";
 
 pub(crate) struct ReadOnlySnapshot {
     _helper: SnapshotHelperGuard,
-    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 struct SnapshotHelperGuard {
     child: Option<Child>,
-    control: tempfile::TempDir,
+    control: Option<tempfile::TempDir>,
+    snapshot: Option<tempfile::TempDir>,
 }
 
 impl SnapshotHelperGuard {
+    fn control_path(&self) -> io::Result<&Path> {
+        self.control
+            .as_ref()
+            .map(tempfile::TempDir::path)
+            .ok_or_else(|| io::Error::other("snapshot helper control is unavailable"))
+    }
+
     fn child_mut(&mut self) -> io::Result<&mut Child> {
         self.child
             .as_mut()
             .ok_or_else(|| io::Error::other("snapshot helper is unavailable"))
     }
 
-    fn request_retry(&mut self) -> io::Result<()> {
-        std::fs::write(self.control.path().join(HELPER_RETRY_MARKER), [])?;
-        let deadline = Instant::now() + HELPER_SHUTDOWN_TIMEOUT;
-        while self.control.path().join(HELPER_RETRY_MARKER).exists() {
+    fn request_retry(&mut self, is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+        ensure_snapshot_not_cancelled(is_cancelled)?;
+        let retry_marker = self.control_path()?.join(HELPER_RETRY_MARKER);
+        std::fs::write(&retry_marker, [])?;
+        let deadline = Instant::now() + HELPER_RETRY_ACCEPT_TIMEOUT;
+        while retry_marker.exists() {
+            ensure_snapshot_not_cancelled(is_cancelled)?;
             if self.child_mut()?.try_wait()?.is_some() {
                 return Err(io::Error::other(
                     "snapshot helper exited before accepting a retry",
@@ -64,24 +77,42 @@ impl Drop for SnapshotHelperGuard {
             return;
         };
         drop(child.stdin.take());
-        wait_for_helper_shutdown(&mut child);
+        if wait_for_helper_shutdown(&mut child) {
+            return;
+        }
+        let control = self.control.take();
+        let snapshot = self.snapshot.take();
+        defer_helper_reap(child, control, snapshot);
     }
 }
 
-fn wait_for_helper_shutdown(child: &mut Child) {
-    let deadline = Instant::now() + HELPER_SHUTDOWN_TIMEOUT;
+fn wait_for_helper_shutdown(child: &mut Child) -> bool {
+    let deadline = Instant::now() + HELPER_SHUTDOWN_GRACE;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return true,
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(HELPER_POLL_INTERVAL);
             }
-            Ok(None) | Err(_) => {
-                terminate_helper(child);
-                return;
-            }
+            Ok(None) | Err(_) => return false,
         }
     }
+}
+
+fn defer_helper_reap(
+    mut child: Child,
+    control: Option<tempfile::TempDir>,
+    snapshot: Option<tempfile::TempDir>,
+) {
+    // The closed parent pipe leaves cleanup authority with the helper while its
+    // potentially stalled exit is kept off the caller's settlement path.
+    let _ = std::thread::Builder::new()
+        .name("oulipoly-snapshot-helper-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+            drop(control);
+            drop(snapshot);
+        });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,19 +191,18 @@ impl ReadOnlySnapshot {
         })?;
         let path = dir.path().join(file_name);
         let mut retry_deadline = None;
-        let mut helper = start_snapshot_helper(&source, &path)?;
+        let mut helper = start_snapshot_helper(&source, &path, dir)?;
         loop {
             ensure_snapshot_not_cancelled(is_cancelled)?;
             if let Some(deadline) = retry_deadline {
                 ensure_retry_active(deadline, is_cancelled)?;
             }
-            let control = helper.control.path().to_path_buf();
+            let control = helper.control_path()?.to_path_buf();
             let outcome =
                 wait_for_helper_copy(helper.child_mut()?, &control, is_cancelled, &mut after_copy)?;
             if outcome == HelperCopyOutcome::Stable {
                 return Ok(Self {
                     _helper: helper,
-                    _dir: dir,
                     path,
                 });
             }
@@ -185,7 +215,7 @@ impl ReadOnlySnapshot {
                 return Err(snapshot_changed_error());
             }
             std::thread::sleep(retry_interval.min(remaining));
-            helper.request_retry()?;
+            helper.request_retry(is_cancelled)?;
         }
     }
 
@@ -194,7 +224,11 @@ impl ReadOnlySnapshot {
     }
 }
 
-fn start_snapshot_helper(source: &Path, destination: &Path) -> io::Result<SnapshotHelperGuard> {
+fn start_snapshot_helper(
+    source: &Path,
+    destination: &Path,
+    snapshot: tempfile::TempDir,
+) -> io::Result<SnapshotHelperGuard> {
     let mut command = snapshot_helper_command()?;
     let destination_parent = destination.parent().ok_or_else(|| {
         io::Error::new(
@@ -214,7 +248,8 @@ fn start_snapshot_helper(source: &Path, destination: &Path) -> io::Result<Snapsh
         .stderr(Stdio::null());
     Ok(SnapshotHelperGuard {
         child: Some(command.spawn()?),
-        control,
+        control: Some(control),
+        snapshot: Some(snapshot),
     })
 }
 
@@ -239,7 +274,7 @@ fn wait_for_helper_copy(
 ) -> io::Result<HelperCopyOutcome> {
     let ready = control.join("ready");
     loop {
-        terminate_cancelled_helper(child, is_cancelled)?;
+        terminate_cancelled_helper(is_cancelled)?;
         if control.join("result").exists() {
             return read_helper_result(control);
         }
@@ -253,13 +288,10 @@ fn wait_for_helper_copy(
         }
         std::thread::sleep(HELPER_POLL_INTERVAL);
     }
-    if let Err(error) = after_copy() {
-        terminate_helper(child);
-        return Err(error);
-    }
+    after_copy()?;
     std::fs::write(control.join("compare"), [])?;
     loop {
-        terminate_cancelled_helper(child, is_cancelled)?;
+        terminate_cancelled_helper(is_cancelled)?;
         if control.join("result").exists() {
             return read_helper_result(control);
         }
@@ -272,23 +304,14 @@ fn wait_for_helper_copy(
     }
 }
 
-fn terminate_cancelled_helper(
-    child: &mut Child,
-    is_cancelled: &dyn Fn() -> bool,
-) -> io::Result<()> {
+fn terminate_cancelled_helper(is_cancelled: &dyn Fn() -> bool) -> io::Result<()> {
     if !is_cancelled() {
         return Ok(());
     }
-    terminate_helper(child);
     Err(io::Error::new(
         io::ErrorKind::Interrupted,
         "Read-only SQLite snapshot cancelled",
     ))
-}
-
-fn terminate_helper(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn read_helper_result(control: &Path) -> io::Result<HelperCopyOutcome> {
@@ -319,6 +342,14 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
         }
     };
     let is_cancelled = || !parent_connected.load(Ordering::SeqCst);
+    #[cfg(test)]
+    if source
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(STALLED_HELPER_SOURCE_NAME))
+    {
+        let _ = std::fs::write(control.join("ready"), []);
+        std::thread::sleep(Duration::from_millis(500));
+    }
     let exit_code = 'attempts: loop {
         match execute_helper(source, destination, control, &is_cancelled) {
             Ok(HelperCopyOutcome::Changed) => {
@@ -1136,6 +1167,56 @@ mod tests {
         assert!(!status.success());
         assert!(source.exists());
         assert!(!snapshot_directory.exists());
+    }
+
+    #[test]
+    fn stalled_snapshot_helper_is_reaped_without_blocking_owner_shutdown() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let source = source_directory.path().join(STALLED_HELPER_SOURCE_NAME);
+        std::fs::write(&source, vec![7_u8; COPY_BUFFER_BYTES * 4]).unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+        let snapshot_directory = snapshot.path().to_path_buf();
+        let destination = snapshot_directory.join("state.db");
+        let mut helper = start_snapshot_helper(&source, &destination, snapshot).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !helper.control_path().unwrap().join("ready").exists() {
+            assert!(helper.child_mut().unwrap().try_wait().unwrap().is_none());
+            assert!(
+                Instant::now() < deadline,
+                "snapshot helper did not enter the stalled fixture"
+            );
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        }
+
+        let cancellation_checks = std::sync::atomic::AtomicUsize::new(0);
+        let error = helper
+            .request_retry(&|| cancellation_checks.fetch_add(1, Ordering::SeqCst) > 0)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(
+            helper
+                .control_path()
+                .unwrap()
+                .join(HELPER_RETRY_MARKER)
+                .exists(),
+            "retry cancellation happened before the helper request was published"
+        );
+        let started = Instant::now();
+        drop(helper);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stalled snapshot helper blocked owner shutdown"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while snapshot_directory.exists() && Instant::now() < deadline {
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        }
+        assert!(
+            !snapshot_directory.exists(),
+            "deferred helper reaper left snapshot storage behind"
+        );
+        assert!(source.exists());
     }
 
     #[test]

@@ -178,10 +178,8 @@ fn assert_late_consumed_completion_outcome(fixture: &Fixture, session_id: &str, 
     );
     let stderr = String::from_utf8_lossy(&initial.stderr);
     assert!(
-        stderr.contains(&format!(
-            "late_consumed_completion_acknowledged session_id={session_id}"
-        )),
-        "missing late-consumption acknowledgement in stderr: {stderr}"
+        !stderr.contains("late_consumed_completion_acknowledged"),
+        "internal late-consumption acknowledgement leaked to stderr: {stderr}"
     );
     assert_eq!(invocation_count(fixture), 2);
     assert_prompt_file_missing(fixture, "late-consumed-resumed-input.txt");
