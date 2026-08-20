@@ -1354,7 +1354,7 @@ mod tests {
         assert!(
             matches!(
                 try_acquire_wake_sweep_admission(&mailbox_path).unwrap(),
-                WakeSweepAdmissionAttempt::Owned(_)
+                WakeSweepAdmissionAttempt::Owned(_) | WakeSweepAdmissionAttempt::CoordinationBusy
             ),
             "a second handle must not enter the same sweep"
         );

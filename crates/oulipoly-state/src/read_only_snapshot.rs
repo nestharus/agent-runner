@@ -4,8 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
@@ -31,7 +31,16 @@ struct SnapshotHelperGuard {
     child: Option<Child>,
     control: Option<tempfile::TempDir>,
     snapshot: Option<tempfile::TempDir>,
+    reaper: mpsc::Sender<SnapshotHelperReapTask>,
 }
+
+struct SnapshotHelperReapTask {
+    child: Child,
+    _control: Option<tempfile::TempDir>,
+    _snapshot: Option<tempfile::TempDir>,
+}
+
+static SNAPSHOT_HELPER_REAPER: OnceLock<mpsc::Sender<SnapshotHelperReapTask>> = OnceLock::new();
 
 impl SnapshotHelperGuard {
     fn control_path(&self) -> io::Result<&Path> {
@@ -82,7 +91,13 @@ impl Drop for SnapshotHelperGuard {
         }
         let control = self.control.take();
         let snapshot = self.snapshot.take();
-        defer_helper_reap(child, control, snapshot);
+        self.reaper
+            .send(SnapshotHelperReapTask {
+                child,
+                _control: control,
+                _snapshot: snapshot,
+            })
+            .expect("snapshot helper reaper stopped while guards remain");
     }
 }
 
@@ -99,20 +114,47 @@ fn wait_for_helper_shutdown(child: &mut Child) -> bool {
     }
 }
 
-fn defer_helper_reap(
-    mut child: Child,
-    control: Option<tempfile::TempDir>,
-    snapshot: Option<tempfile::TempDir>,
-) {
-    // The closed parent pipe leaves cleanup authority with the helper while its
-    // potentially stalled exit is kept off the caller's settlement path.
-    let _ = std::thread::Builder::new()
+fn snapshot_helper_reaper() -> io::Result<mpsc::Sender<SnapshotHelperReapTask>> {
+    if let Some(reaper) = SNAPSHOT_HELPER_REAPER.get() {
+        return Ok(reaper.clone());
+    }
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
         .name("oulipoly-snapshot-helper-reaper".to_string())
-        .spawn(move || {
-            let _ = child.wait();
-            drop(control);
-            drop(snapshot);
-        });
+        .spawn(move || run_snapshot_helper_reaper(receiver))?;
+    match SNAPSHOT_HELPER_REAPER.set(sender) {
+        Ok(()) => Ok(SNAPSHOT_HELPER_REAPER
+            .get()
+            .expect("snapshot helper reaper was initialized")
+            .clone()),
+        Err(sender) => {
+            drop(sender);
+            Ok(SNAPSHOT_HELPER_REAPER
+                .get()
+                .expect("another snapshot helper reaper was initialized")
+                .clone())
+        }
+    }
+}
+
+fn run_snapshot_helper_reaper(receiver: mpsc::Receiver<SnapshotHelperReapTask>) {
+    let mut pending = Vec::new();
+    loop {
+        match receiver.recv_timeout(HELPER_POLL_INTERVAL) {
+            Ok(task) => pending.push(task),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if pending.is_empty() => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        let mut index = 0;
+        while index < pending.len() {
+            if matches!(pending[index].child.try_wait(), Ok(Some(_))) {
+                pending.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +271,7 @@ fn start_snapshot_helper(
     destination: &Path,
     snapshot: tempfile::TempDir,
 ) -> io::Result<SnapshotHelperGuard> {
+    let reaper = snapshot_helper_reaper()?;
     let mut command = snapshot_helper_command()?;
     let destination_parent = destination.parent().ok_or_else(|| {
         io::Error::new(
@@ -250,6 +293,7 @@ fn start_snapshot_helper(
         child: Some(command.spawn()?),
         control: Some(control),
         snapshot: Some(snapshot),
+        reaper,
     })
 }
 

@@ -829,7 +829,7 @@ mod tests {
             let generation = record_child_identity(child.id(), Some(&spawn_context))
                 .unwrap()
                 .unwrap();
-            let process_identity = generation.exact_process_identity.clone().unwrap();
+            let process_identity = generation.exact_process_identity.clone();
             server.start(spawn_context, generation).unwrap();
             Self {
                 _temp: temp,

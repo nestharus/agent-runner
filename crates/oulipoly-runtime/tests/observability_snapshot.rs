@@ -825,7 +825,7 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
                 spawn_invocation_uuid: ROOT_UUID,
             },
             spawned_os_pid: stale.os_pid,
-            exact_process_identity: Some(&stale),
+            exact_process_identity: &stale,
             os_pgid: None,
         })
         .unwrap();
@@ -912,7 +912,7 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
                 spawn_invocation_uuid: ROOT_UUID,
             },
             spawned_os_pid: identity.os_pid,
-            exact_process_identity: Some(&identity),
+            exact_process_identity: &identity,
             os_pgid: None,
         })
         .unwrap();

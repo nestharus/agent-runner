@@ -165,9 +165,12 @@ fn attempt_account_dispatch(
         }
     };
     if spawn_identity.is_some() {
-        require_recorded_external_generation(&recorded_generation).map_err(|_| {
-            terminal_attempt_error(protocol_service_error("runtime_generation_bind_failed"))
-        })?;
+        if require_recorded_external_generation(&recorded_generation).is_err() {
+            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(protocol_service_error(
+                "runtime_generation_bind_failed",
+            )));
+        }
         backfill_external_launch_session_id(
             spawn_identity.as_ref(),
             &recorded_generation,

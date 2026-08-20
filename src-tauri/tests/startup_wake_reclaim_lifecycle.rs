@@ -457,7 +457,7 @@ fn seed_recoverable_wake_candidate(
                 spawn_invocation_uuid: "33333333-3333-4333-8333-333333333333",
             },
             spawned_os_pid: identity.os_pid,
-            exact_process_identity: Some(&identity),
+            exact_process_identity: &identity,
             os_pgid: None,
         })
         .unwrap();

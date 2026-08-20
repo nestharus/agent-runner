@@ -995,7 +995,7 @@ mod tests {
                     spawn_invocation_uuid: INVOCATION_UUID,
                 },
                 spawned_os_pid: os_pid,
-                exact_process_identity: Some(&identity),
+                exact_process_identity: &identity,
                 os_pgid: None,
             })
             .unwrap();

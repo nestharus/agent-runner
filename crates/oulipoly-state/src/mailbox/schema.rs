@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 3;
+pub(super) const CURRENT_VERSION: i64 = 4;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -61,6 +61,11 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 3,
         owner: SidecarEntity::WakeAndSessionMetadata,
         apply: ensure_wake_process_identity_schema,
+    },
+    MigrationStep {
+        target_version: 4,
+        owner: SidecarEntity::RuntimeLifecycle,
+        apply: ensure_runtime_creator_identity_schema,
     },
 ];
 
@@ -218,6 +223,11 @@ fn ensure_wake_and_session_metadata_schema(conn: &Connection) -> Result<(), Stri
 
 fn ensure_wake_process_identity_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_wake_claim_process_identity_columns(conn)
+}
+
+fn ensure_runtime_creator_identity_schema(conn: &Connection) -> Result<(), String> {
+    super::ensure_runtime_generation_columns(conn)?;
+    super::settle_unverifiable_runtime_generations(conn)
 }
 
 fn ensure_payload_retention_schema(conn: &Connection) -> Result<(), String> {

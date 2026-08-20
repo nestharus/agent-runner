@@ -209,7 +209,7 @@ impl SpawnIdentityContext {
 pub(crate) struct RunningRuntimeGeneration {
     pub generation_id: RuntimeGenerationId,
     pub spawned_os_pid: i64,
-    pub exact_process_identity: Option<ProcessIdentity>,
+    pub exact_process_identity: ProcessIdentity,
 }
 
 pub(crate) fn register_runtime_generation_starting(
@@ -257,7 +257,12 @@ fn recover_stale_session_generations(
         if generation.lifecycle_state == RuntimeLifecycleState::Exited {
             continue;
         }
-        let ExactProcessEvidence::Recorded(identity) = &generation.exact_process_evidence else {
+        let liveness_evidence = if generation.lifecycle_state == RuntimeLifecycleState::Starting {
+            &generation.creator_process_evidence
+        } else {
+            &generation.exact_process_evidence
+        };
+        let ExactProcessEvidence::Recorded(identity) = liveness_evidence else {
             continue;
         };
         let stale = match observe_live_process_identity(identity.os_pid) {
@@ -299,10 +304,15 @@ pub(crate) fn record_child_identity(
     };
     let os_pid = i64::from(child_id);
     let exact_process_identity = match pid_identity::read_live_process_identity(os_pid) {
-        Ok(identity) => identity,
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            let err = format!("Spawned child process {os_pid} is not live during identity binding");
+            warn_child_identity_record_failed(context, child_id, &err);
+            return Err(err);
+        }
         Err(err) => {
             warn_child_identity_record_failed(context, child_id, &err);
-            None
+            return Err(err);
         }
     };
     let mut db = context.open_mailbox()?;
@@ -311,7 +321,7 @@ pub(crate) fn record_child_identity(
         .bind_runtime_generation_running(BindRuntimeGenerationRunning {
             fence: generation_fence(context),
             spawned_os_pid: os_pid,
-            exact_process_identity: exact_process_identity.as_ref(),
+            exact_process_identity: &exact_process_identity,
             os_pgid: None,
         })
         .map_err(|err| err.to_string())?;
@@ -501,7 +511,7 @@ fn parse_invocation_env_silent(value: &str) -> Option<CompositeInvocationId> {
 
 #[cfg(test)]
 mod tests {
-    use super::provider_parent_invocation_env_for;
+    use super::*;
 
     const CURRENT: &str = r#"{"source":"opencode3","id":"11111111-1111-4111-8111-111111111111"}"#;
     const OWNER: &str = r#"{"source":"opencode3","id":"22222222-2222-4222-8222-222222222222"}"#;
@@ -527,6 +537,60 @@ mod tests {
         assert_eq!(
             provider_parent_invocation_env_for(Some(CURRENT), true, Some("not-json")).as_deref(),
             Some(CURRENT)
+        );
+    }
+
+    #[test]
+    fn failed_child_identity_binding_never_commits_identityless_running_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let context = context_from_parent_invocation_env(
+            Some(CURRENT),
+            "provider-a",
+            Some("model-a"),
+            Some("session-a"),
+            SpawnRuntimeMode::Headless,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_mailbox_db_path(sidecar_path.clone());
+        register_runtime_generation_starting(Some(&context)).unwrap();
+
+        let mut dead_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead_child_id = dead_child.id();
+        dead_child.wait().unwrap();
+        assert!(record_child_identity(dead_child_id, Some(&context)).is_err());
+
+        let db = MailboxDb::open(&sidecar_path).unwrap();
+        let starting = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(starting.lifecycle_state, RuntimeLifecycleState::Starting);
+        assert_eq!(
+            starting.exact_process_evidence,
+            ExactProcessEvidence::NotRecorded
+        );
+        drop(db);
+
+        mark_runtime_generation_exited(Some(&context), None).unwrap();
+        let db = MailboxDb::open(&sidecar_path).unwrap();
+        let exited = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exited.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(
+            exited.terminal_reason,
+            Some(RuntimeTerminalReason::AbnormalTermination)
         );
     }
 }

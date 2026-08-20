@@ -233,6 +233,7 @@ pub struct RuntimeGenerationRow {
     pub effective_cwd: Option<String>,
     pub spawned_os_pid: Option<i64>,
     pub exact_process_evidence: ExactProcessEvidence,
+    pub creator_process_evidence: ExactProcessEvidence,
     pub created_at: String,
     pub running_at: Option<String>,
     pub draining_at: Option<String>,
@@ -270,7 +271,7 @@ pub struct CreateRuntimeGeneration<'a> {
 pub struct BindRuntimeGenerationRunning<'a> {
     pub fence: RuntimeGenerationFence<'a>,
     pub spawned_os_pid: i64,
-    pub exact_process_identity: Option<&'a ProcessIdentity>,
+    pub exact_process_identity: &'a ProcessIdentity,
     pub os_pgid: Option<i64>,
 }
 
@@ -1338,6 +1339,7 @@ impl RuntimeLifecycleRepository<'_> {
         request: CreateRuntimeGeneration<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
         validate_runtime_generation_create(&request)?;
+        let creator_process_identity = current_runtime_creator_identity()?;
         let now = now_rfc3339();
         let tx = self
             .conn
@@ -1350,8 +1352,9 @@ impl RuntimeLifecycleRepository<'_> {
                 "INSERT OR IGNORE INTO runtime_generation (
                     generation_uuid, lifecycle_state, spawn_invocation_uuid, session_id,
                     runtime_mode, provider_name, model_name, pty_control_path, models_dir,
-                    effective_cwd, created_at
-                 ) VALUES (?1, 'starting', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    effective_cwd, created_at, creator_identity_os_pid,
+                    creator_identity_os_boot_id, creator_identity_os_pid_starttime_ticks
+                 ) VALUES (?1, 'starting', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     request.generation_id.to_string(),
                     request.spawn_invocation_uuid,
@@ -1363,6 +1366,9 @@ impl RuntimeLifecycleRepository<'_> {
                     request.models_dir,
                     request.effective_cwd,
                     &now,
+                    creator_process_identity.os_pid,
+                    &creator_process_identity.os_boot_id,
+                    creator_process_identity.os_pid_starttime_ticks,
                 ],
             )
             .map_err(generation_storage_error(
@@ -1371,7 +1377,8 @@ impl RuntimeLifecycleRepository<'_> {
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
         })?;
-        let result = map_runtime_generation_create(changed, row, &request);
+        let result =
+            map_runtime_generation_create(changed, row, &request, &creator_process_identity);
         tx.commit().map_err(generation_storage_error(
             "commit generation creation transaction",
         ))?;
@@ -1440,9 +1447,9 @@ impl RuntimeLifecycleRepository<'_> {
                     request.fence.generation_id.to_string(),
                     request.fence.spawn_invocation_uuid,
                     request.spawned_os_pid,
-                    identity.map(|identity| identity.os_pid),
-                    identity.map(|identity| identity.os_boot_id.as_str()),
-                    identity.map(|identity| identity.os_pid_starttime_ticks),
+                    identity.os_pid,
+                    &identity.os_boot_id,
+                    identity.os_pid_starttime_ticks,
                     &now,
                 ],
             )
@@ -3885,9 +3892,11 @@ impl WakeSessionRepository<'_> {
             return Ok(false);
         };
         if claim.wake_invocation_uuid.is_some() {
+            let replay_matches =
+                wake_claim_has_matching_live_process_identity(&tx, &claim, child_identity)?;
             tx.commit()
                 .map_err(|err| format!("Failed to commit replayed wake-child admission: {err}"))?;
-            return Ok(true);
+            return Ok(replay_matches);
         }
         if observed_busy || wake_claim_runtime_is_busy_tx(&tx, session_id)? {
             tx.execute(
@@ -5310,6 +5319,17 @@ fn validate_runtime_generation_create(
     validate_runtime_mode(request.runtime_mode)
 }
 
+fn current_runtime_creator_identity() -> Result<ProcessIdentity, GenerationStorageError> {
+    let os_pid = i64::from(std::process::id());
+    pid_identity::read_live_process_identity(os_pid)
+        .map_err(GenerationStorageError::new)?
+        .ok_or_else(|| {
+            GenerationStorageError::new(format!(
+                "Runtime generation creator process {os_pid} is not live"
+            ))
+        })
+}
+
 fn validate_runtime_mode(mode: &str) -> Result<(), GenerationStorageError> {
     match mode {
         "headless" | "pty_interactive" => Ok(()),
@@ -5327,10 +5347,7 @@ fn validate_runtime_generation_binding(
             "Runtime generation spawned OS PID must be positive".to_string(),
         ));
     }
-    if request
-        .exact_process_identity
-        .is_some_and(|identity| identity.os_pid != request.spawned_os_pid)
-    {
+    if request.exact_process_identity.os_pid != request.spawned_os_pid {
         return Err(GenerationStorageError::new(
             "Exact process identity PID does not match spawned OS PID".to_string(),
         ));
@@ -5341,6 +5358,7 @@ fn validate_runtime_generation_binding(
 fn runtime_generation_create_matches(
     row: &RuntimeGenerationRow,
     request: &CreateRuntimeGeneration<'_>,
+    creator_process_identity: &ProcessIdentity,
 ) -> bool {
     row.lifecycle_state == RuntimeLifecycleState::Starting
         && row.spawn_invocation_uuid == request.spawn_invocation_uuid
@@ -5351,6 +5369,8 @@ fn runtime_generation_create_matches(
         && row.pty_control_path.as_deref() == request.pty_control_path
         && row.models_dir.as_deref() == request.models_dir
         && row.effective_cwd.as_deref() == request.effective_cwd
+        && row.creator_process_evidence
+            == ExactProcessEvidence::Recorded(creator_process_identity.clone())
 }
 
 fn runtime_generation_binding_matches(
@@ -5358,22 +5378,20 @@ fn runtime_generation_binding_matches(
     request: &BindRuntimeGenerationRunning<'_>,
 ) -> bool {
     row.spawned_os_pid == Some(request.spawned_os_pid)
-        && match (&row.exact_process_evidence, request.exact_process_identity) {
-            (ExactProcessEvidence::NotRecorded, None) => true,
-            (ExactProcessEvidence::Recorded(recorded), Some(requested)) => recorded == requested,
-            _ => false,
-        }
+        && row.exact_process_evidence
+            == ExactProcessEvidence::Recorded(request.exact_process_identity.clone())
 }
 
 fn map_runtime_generation_create(
     changed: usize,
     row: RuntimeGenerationRow,
     request: &CreateRuntimeGeneration<'_>,
+    creator_process_identity: &ProcessIdentity,
 ) -> GenerationMutation<RuntimeGenerationRow> {
     if changed == 1 {
         return GenerationMutation::Applied(row);
     }
-    if runtime_generation_create_matches(&row, request) {
+    if runtime_generation_create_matches(&row, request, creator_process_identity) {
         GenerationMutation::AlreadyApplied(row)
     } else {
         GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
@@ -5416,9 +5434,7 @@ fn bind_generation_process_identity(
     request: &BindRuntimeGenerationRunning<'_>,
     recorded_at: &str,
 ) -> Result<bool, GenerationStorageError> {
-    let Some(identity) = request.exact_process_identity else {
-        return Ok(true);
-    };
+    let identity = request.exact_process_identity;
     pid_identity::bind_identity_on(
         conn,
         pid_identity::PidIdentityRecord {
@@ -5815,7 +5831,8 @@ fn runtime_generation_select_sql(predicate: &str) -> String {
                 exited_at, terminal_reason, exit_code, drain_request_uuid,
                 drain_requested_at, drain_requested_by_invocation_uuid,
                 active_delivery_claim_uuid, active_delivery_claimed_at,
-                active_delivery_seqs_json
+                active_delivery_seqs_json, creator_identity_os_pid,
+                creator_identity_os_boot_id, creator_identity_os_pid_starttime_ticks
          FROM runtime_generation
          WHERE {predicate}"
     )
@@ -5837,6 +5854,9 @@ struct RawRuntimeGenerationFields {
     identity_os_pid: Option<i64>,
     identity_os_boot_id: Option<String>,
     identity_os_pid_starttime_ticks: Option<i64>,
+    creator_identity_os_pid: Option<i64>,
+    creator_identity_os_boot_id: Option<String>,
+    creator_identity_os_pid_starttime_ticks: Option<i64>,
     terminal_reason: Option<String>,
     drain_request_uuid: Option<String>,
     active_delivery_claim_uuid: Option<String>,
@@ -5848,6 +5868,7 @@ struct ParsedRuntimeGenerationFields {
     generation_id: RuntimeGenerationId,
     lifecycle_state: RuntimeLifecycleState,
     exact_process_evidence: ExactProcessEvidence,
+    creator_process_evidence: ExactProcessEvidence,
     terminal_reason: Option<RuntimeTerminalReason>,
     drain_request_id: Option<DrainRequestId>,
     active_delivery_claim_id: Option<DeliveryClaimId>,
@@ -5865,6 +5886,13 @@ fn parse_runtime_generation_fields(
         raw.identity_os_pid,
         raw.identity_os_boot_id,
         raw.identity_os_pid_starttime_ticks,
+        11,
+    )?;
+    let creator_process_evidence = exact_process_evidence_from_columns(
+        raw.creator_identity_os_pid,
+        raw.creator_identity_os_boot_id,
+        raw.creator_identity_os_pid_starttime_ticks,
+        26,
     )?;
     let terminal_reason = raw
         .terminal_reason
@@ -5899,6 +5927,7 @@ fn parse_runtime_generation_fields(
         generation_id,
         lifecycle_state,
         exact_process_evidence,
+        creator_process_evidence,
         terminal_reason,
         drain_request_id,
         active_delivery_claim_id,
@@ -5913,6 +5942,9 @@ fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Runti
         identity_os_pid: row.get(11)?,
         identity_os_boot_id: row.get(12)?,
         identity_os_pid_starttime_ticks: row.get(13)?,
+        creator_identity_os_pid: row.get(26)?,
+        creator_identity_os_boot_id: row.get(27)?,
+        creator_identity_os_pid_starttime_ticks: row.get(28)?,
         terminal_reason: row.get(18)?,
         drain_request_uuid: row.get(20)?,
         active_delivery_claim_uuid: row.get(23)?,
@@ -5931,6 +5963,7 @@ fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Runti
         effective_cwd: row.get(9)?,
         spawned_os_pid: row.get(10)?,
         exact_process_evidence: parsed.exact_process_evidence,
+        creator_process_evidence: parsed.creator_process_evidence,
         created_at: row.get(14)?,
         running_at: row.get(15)?,
         draining_at: row.get(16)?,
@@ -5950,6 +5983,7 @@ fn exact_process_evidence_from_columns(
     os_pid: Option<i64>,
     os_boot_id: Option<String>,
     os_pid_starttime_ticks: Option<i64>,
+    column_index: usize,
 ) -> rusqlite::Result<ExactProcessEvidence> {
     match (os_pid, os_boot_id, os_pid_starttime_ticks) {
         (None, None, None) => Ok(ExactProcessEvidence::NotRecorded),
@@ -5961,7 +5995,7 @@ fn exact_process_evidence_from_columns(
             }))
         }
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            11,
+            column_index,
             rusqlite::types::Type::Null,
             Box::new(GenerationStorageError::new(
                 "Runtime generation has partial exact process identity evidence".to_string(),
@@ -6409,7 +6443,7 @@ enum GenerationLivenessObservation {
 fn generation_liveness_observation(
     generation: &RuntimeGenerationRow,
 ) -> GenerationLivenessObservation {
-    let ExactProcessEvidence::Recorded(recorded) = &generation.exact_process_evidence else {
+    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation) else {
         return GenerationLivenessObservation::Busy;
     };
     match pid_identity::observe_live_process_identity(recorded.os_pid) {
@@ -6425,6 +6459,14 @@ fn generation_liveness_observation(
     }
 }
 
+fn generation_liveness_process(generation: &RuntimeGenerationRow) -> &ExactProcessEvidence {
+    if generation.lifecycle_state == RuntimeLifecycleState::Starting {
+        &generation.creator_process_evidence
+    } else {
+        &generation.exact_process_evidence
+    }
+}
+
 fn classify_generation_liveness_read_only(
     generations: &[RuntimeGenerationRow],
 ) -> RuntimeGenerationReadOnlyLiveness {
@@ -6433,7 +6475,8 @@ fn classify_generation_liveness_read_only(
     }
     let mut stale = RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity;
     for generation in generations {
-        let ExactProcessEvidence::Recorded(recorded) = &generation.exact_process_evidence else {
+        let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation)
+        else {
             continue;
         };
         match pid_identity::observe_live_process_identity(recorded.os_pid) {
@@ -7990,12 +8033,24 @@ fn mailbox_schema_definition() -> &'static str {
             active_delivery_claim_uuid         TEXT,
             active_delivery_claimed_at          TEXT,
             active_delivery_seqs_json           TEXT,
+            creator_identity_os_pid             INTEGER,
+            creator_identity_os_boot_id         TEXT,
+            creator_identity_os_pid_starttime_ticks INTEGER,
             CHECK (
                 (identity_os_pid IS NULL AND identity_os_boot_id IS NULL AND identity_os_pid_starttime_ticks IS NULL)
                 OR
                 (identity_os_pid IS NOT NULL AND identity_os_boot_id IS NOT NULL AND identity_os_pid_starttime_ticks IS NOT NULL)
             ),
             CHECK (identity_os_pid IS NULL OR identity_os_pid = spawned_os_pid),
+            CHECK (
+                (creator_identity_os_pid IS NULL
+                    AND creator_identity_os_boot_id IS NULL
+                    AND creator_identity_os_pid_starttime_ticks IS NULL)
+                OR
+                (creator_identity_os_pid IS NOT NULL
+                    AND creator_identity_os_boot_id IS NOT NULL
+                    AND creator_identity_os_pid_starttime_ticks IS NOT NULL)
+            ),
             CHECK (
                 (active_delivery_claim_uuid IS NULL
                     AND active_delivery_claimed_at IS NULL
@@ -8368,10 +8423,40 @@ fn ensure_runtime_generation_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn runtime_generation_column_additions() -> [(&'static str, &'static str); 2] {
+fn settle_unverifiable_runtime_generations(conn: &Connection) -> Result<(), String> {
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE runtime_generation
+         SET lifecycle_state = 'exited',
+             exited_at = ?1,
+             terminal_reason = CASE lifecycle_state
+                 WHEN 'starting' THEN 'startup_failed'
+                 ELSE 'abnormal_termination'
+             END,
+             active_delivery_claim_uuid = NULL,
+             active_delivery_claimed_at = NULL,
+             active_delivery_seqs_json = NULL
+         WHERE (lifecycle_state = 'starting'
+                AND creator_identity_os_pid IS NULL
+                AND creator_identity_os_boot_id IS NULL
+                AND creator_identity_os_pid_starttime_ticks IS NULL)
+            OR (lifecycle_state IN ('running', 'draining')
+                AND identity_os_pid IS NULL
+                AND identity_os_boot_id IS NULL
+                AND identity_os_pid_starttime_ticks IS NULL)",
+        params![&now],
+    )
+    .map_err(|err| format!("Failed to settle unverifiable runtime generations: {err}"))?;
+    Ok(())
+}
+
+fn runtime_generation_column_additions() -> [(&'static str, &'static str); 5] {
     [
         ("active_delivery_claimed_at", "TEXT"),
         ("active_delivery_seqs_json", "TEXT"),
+        ("creator_identity_os_pid", "INTEGER"),
+        ("creator_identity_os_boot_id", "TEXT"),
+        ("creator_identity_os_pid_starttime_ticks", "INTEGER"),
     ]
 }
 
@@ -8616,6 +8701,92 @@ mod tests {
     use super::*;
     use crate::StateDb;
 
+    const STARTING_GENERATION_FIXTURE_PATH: &str = "OULIPOLY_TEST_STARTING_GENERATION_FIXTURE_PATH";
+    const WAKE_CLAIM_FOREIGN_CHILD_FIXTURE: &str = "OULIPOLY_TEST_WAKE_CLAIM_FOREIGN_CHILD";
+
+    #[test]
+    fn starting_runtime_generation_fixture() {
+        let Some(path) = std::env::var_os(STARTING_GENERATION_FIXTURE_PATH) else {
+            return;
+        };
+        let generation_id =
+            RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+        let mut db = MailboxDb::open(Path::new(&path)).unwrap();
+        let GenerationMutation::Applied(row) = db
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "starting-fixture-invocation",
+                session_id: Some("starting-fixture-session"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: Some("model-a"),
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap()
+        else {
+            panic!("fixture generation was not created");
+        };
+        assert!(matches!(
+            row.creator_process_evidence,
+            ExactProcessEvidence::Recorded(_)
+        ));
+    }
+
+    #[test]
+    fn wake_claim_foreign_child_fixture() {
+        if std::env::var_os(WAKE_CLAIM_FOREIGN_CHILD_FIXTURE).is_none() {
+            return;
+        }
+        std::thread::sleep(StdDuration::from_secs(30));
+    }
+
+    #[test]
+    fn dead_starting_generation_creator_is_recovered_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("mailbox::tests::starting_runtime_generation_fixture")
+            .arg("--nocapture")
+            .env(STARTING_GENERATION_FIXTURE_PATH, &sidecar_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let generation_id =
+            RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+        let mut db = MailboxDb::open(&sidecar_path).unwrap();
+        let before = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.lifecycle_state, RuntimeLifecycleState::Starting);
+        assert!(matches!(
+            before.creator_process_evidence,
+            ExactProcessEvidence::Recorded(_)
+        ));
+        assert_eq!(
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("starting-fixture-session")
+                .unwrap(),
+            SessionLiveness::Idle
+        );
+        let after = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(
+            after.terminal_reason,
+            Some(RuntimeTerminalReason::RecoveredDead)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unlinked_sqlite_artifact_is_absent_not_a_hard_link_violation() {
@@ -8759,6 +8930,11 @@ mod tests {
         let (bound_tx, bound_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             started_tx.send(()).unwrap();
+            let identity = ProcessIdentity {
+                os_pid: 901,
+                os_boot_id: "launch-contention-boot".to_string(),
+                os_pid_starttime_ticks: 1,
+            };
             let generation_id =
                 RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
             let result = launch
@@ -8769,7 +8945,7 @@ mod tests {
                         spawn_invocation_uuid: "launch-contention-invocation",
                     },
                     spawned_os_pid: 901,
-                    exact_process_identity: None,
+                    exact_process_identity: &identity,
                     os_pgid: None,
                 })
                 .map(|mutation| matches!(mutation, GenerationMutation::Applied(_)))
@@ -8941,6 +9117,87 @@ mod tests {
     }
 
     #[test]
+    fn v3_upgrade_settles_unverifiable_runtime_authorities() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runtime_generation (
+                    generation_uuid TEXT PRIMARY KEY,
+                    lifecycle_state TEXT NOT NULL,
+                    identity_os_pid INTEGER,
+                    identity_os_boot_id TEXT,
+                    identity_os_pid_starttime_ticks INTEGER,
+                    exited_at TEXT,
+                    terminal_reason TEXT,
+                    active_delivery_claim_uuid TEXT,
+                    active_delivery_claimed_at TEXT,
+                    active_delivery_seqs_json TEXT
+                 );
+                 INSERT INTO runtime_generation (generation_uuid, lifecycle_state)
+                 VALUES ('legacy-starting', 'starting');
+                 INSERT INTO runtime_generation (generation_uuid, lifecycle_state)
+                 VALUES ('legacy-unverified-running', 'running');
+                 INSERT INTO runtime_generation (
+                    generation_uuid, lifecycle_state, identity_os_pid,
+                    identity_os_boot_id, identity_os_pid_starttime_ticks
+                 ) VALUES ('legacy-verified-running', 'running', 42, 'legacy-boot', 7);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+        let columns = table_columns(
+            &connection,
+            "runtime_generation",
+            "PRAGMA table_info(runtime_generation)",
+        )
+        .unwrap();
+        for column in [
+            "creator_identity_os_pid",
+            "creator_identity_os_boot_id",
+            "creator_identity_os_pid_starttime_ticks",
+        ] {
+            assert!(columns.iter().any(|candidate| candidate == column));
+        }
+        for (generation_uuid, expected_state, expected_reason) in [
+            ("legacy-starting", "exited", Some("startup_failed")),
+            (
+                "legacy-unverified-running",
+                "exited",
+                Some("abnormal_termination"),
+            ),
+            ("legacy-verified-running", "running", None),
+        ] {
+            let observed = connection
+                .query_row(
+                    "SELECT lifecycle_state, terminal_reason
+                     FROM runtime_generation
+                     WHERE generation_uuid = ?1",
+                    params![generation_uuid],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                observed,
+                (
+                    expected_state.to_string(),
+                    expected_reason.map(str::to_string)
+                )
+            );
+        }
+    }
+
+    #[test]
     fn v1_upgrade_promotes_complete_legacy_runtime_authority_once() {
         let directory = tempfile::tempdir().unwrap();
         let sidecar_path = directory.path().join("pid-identity.db");
@@ -9032,7 +9289,7 @@ mod tests {
             .bind_runtime_generation_running(BindRuntimeGenerationRunning {
                 fence,
                 spawned_os_pid: identity.os_pid,
-                exact_process_identity: Some(&identity),
+                exact_process_identity: &identity,
                 os_pgid: None,
             })
             .unwrap();
@@ -10161,6 +10418,9 @@ mod tests {
             identity_os_pid: None,
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -10180,6 +10440,9 @@ mod tests {
             identity_os_pid: Some(42),
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -10193,6 +10456,9 @@ mod tests {
             identity_os_pid: Some(42),
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -10212,6 +10478,9 @@ mod tests {
             identity_os_pid: None,
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -11788,7 +12057,7 @@ mod tests {
                     spawn_invocation_uuid: "invocation-a",
                 },
                 spawned_os_pid: identity.os_pid,
-                exact_process_identity: Some(&identity),
+                exact_process_identity: &identity,
                 os_pgid: None,
             })
             .unwrap();
@@ -11837,7 +12106,7 @@ mod tests {
                     spawn_invocation_uuid: "invocation-a",
                 },
                 spawned_os_pid: identity.os_pid,
-                exact_process_identity: Some(&identity),
+                exact_process_identity: &identity,
                 os_pgid: None,
             })
             .unwrap();
@@ -12137,16 +12406,46 @@ mod tests {
                 stale_after_seconds: 600,
             })
             .unwrap();
+        let admitted_identity = current_identity();
 
         assert!(
             !db.wake_sessions()
-                .validate_wake_claim_for_child("session-a", "token-b", &current_identity())
+                .validate_wake_claim_for_child("session-a", "token-b", &admitted_identity)
                 .unwrap()
         );
         assert!(
             db.wake_sessions()
-                .validate_wake_claim_for_child("session-a", "token-a", &current_identity())
+                .validate_wake_claim_for_child("session-a", "token-a", &admitted_identity)
                 .unwrap()
+        );
+        assert!(
+            db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a", &admitted_identity)
+                .unwrap(),
+            "the exact admitted child must retain idempotent replay authority"
+        );
+        let mut foreign_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("mailbox::tests::wake_claim_foreign_child_fixture")
+            .arg("--nocapture")
+            .env(WAKE_CLAIM_FOREIGN_CHILD_FIXTURE, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let foreign_identity =
+            pid_identity::read_live_process_identity(i64::from(foreign_child.id()))
+                .unwrap()
+                .unwrap();
+        let foreign_replay = db
+            .wake_sessions()
+            .validate_wake_claim_for_child("session-a", "token-a", &foreign_identity)
+            .unwrap();
+        foreign_child.kill().unwrap();
+        foreign_child.wait().unwrap();
+        assert!(
+            !foreign_replay,
+            "a different process identity must not replay an admitted wake token"
         );
         assert!(
             db.wake_session_reader()
@@ -12613,7 +12912,7 @@ mod tests {
                             spawn_invocation_uuid: invocation_uuid,
                         },
                         spawned_os_pid: identity.os_pid,
-                        exact_process_identity: Some(identity),
+                        exact_process_identity: identity,
                         os_pgid: None,
                     })
                     .unwrap(),
@@ -12658,6 +12957,11 @@ mod tests {
             RuntimeGenerationId::parse("33333333-3333-4333-8333-333333333333").unwrap();
         let drain_request_id =
             DrainRequestId::parse("44444444-4444-4444-8444-444444444444").unwrap();
+        let identity = ProcessIdentity {
+            os_pid: 103,
+            os_boot_id: "drain-test-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
         db.runtime_lifecycle()
             .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id: &generation_id,
@@ -12678,7 +12982,7 @@ mod tests {
                     spawn_invocation_uuid: "invocation-a",
                 },
                 spawned_os_pid: 103,
-                exact_process_identity: None,
+                exact_process_identity: &identity,
                 os_pgid: None,
             })
             .unwrap();
@@ -13068,6 +13372,11 @@ mod tests {
         invocation_uuid: &str,
         session_id: &str,
     ) {
+        let identity = ProcessIdentity {
+            os_pid: 103,
+            os_boot_id: "delivery-test-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
         db.runtime_lifecycle()
             .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id,
@@ -13088,7 +13397,7 @@ mod tests {
                     spawn_invocation_uuid: invocation_uuid,
                 },
                 spawned_os_pid: 103,
-                exact_process_identity: None,
+                exact_process_identity: &identity,
                 os_pgid: None,
             })
             .unwrap();
