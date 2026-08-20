@@ -17,6 +17,7 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 const HELPER_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const HELPER_COMPARE_TIMEOUT: Duration = Duration::from_secs(30);
 const HELPER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const HELPER_RETRY_MARKER: &str = "retry";
 
 pub(crate) struct ReadOnlySnapshot {
     _helper: SnapshotHelperGuard,
@@ -25,24 +26,59 @@ pub(crate) struct ReadOnlySnapshot {
 }
 
 struct SnapshotHelperGuard {
-    child: Child,
-    _control: tempfile::TempDir,
+    child: Option<Child>,
+    control: tempfile::TempDir,
+}
+
+impl SnapshotHelperGuard {
+    fn child_mut(&mut self) -> io::Result<&mut Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("snapshot helper is unavailable"))
+    }
+
+    fn request_retry(&mut self) -> io::Result<()> {
+        std::fs::write(self.control.path().join(HELPER_RETRY_MARKER), [])?;
+        let deadline = Instant::now() + HELPER_SHUTDOWN_TIMEOUT;
+        while self.control.path().join(HELPER_RETRY_MARKER).exists() {
+            if self.child_mut()?.try_wait()?.is_some() {
+                return Err(io::Error::other(
+                    "snapshot helper exited before accepting a retry",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "snapshot helper did not accept a retry",
+                ));
+            }
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SnapshotHelperGuard {
     fn drop(&mut self) {
-        drop(self.child.stdin.take());
-        let deadline = Instant::now() + HELPER_SHUTDOWN_TIMEOUT;
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(HELPER_POLL_INTERVAL);
-                }
-                Ok(None) | Err(_) => {
-                    terminate_helper(&mut self.child);
-                    return;
-                }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        drop(child.stdin.take());
+        wait_for_helper_shutdown(&mut child);
+    }
+}
+
+fn wait_for_helper_shutdown(child: &mut Child) {
+    let deadline = Instant::now() + HELPER_SHUTDOWN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(HELPER_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => {
+                terminate_helper(child);
+                return;
             }
         }
     }
@@ -124,14 +160,16 @@ impl ReadOnlySnapshot {
         })?;
         let path = dir.path().join(file_name);
         let mut retry_deadline = None;
+        let mut helper = start_snapshot_helper(&source, &path)?;
         loop {
             ensure_snapshot_not_cancelled(is_cancelled)?;
             if let Some(deadline) = retry_deadline {
                 ensure_retry_active(deadline, is_cancelled)?;
             }
-            if let Some(helper) =
-                copy_artifact_set_in_helper(&source, &path, is_cancelled, &mut after_copy)?
-            {
+            let control = helper.control.path().to_path_buf();
+            let outcome =
+                wait_for_helper_copy(helper.child_mut()?, &control, is_cancelled, &mut after_copy)?;
+            if outcome == HelperCopyOutcome::Stable {
                 return Ok(Self {
                     _helper: helper,
                     _dir: dir,
@@ -147,6 +185,7 @@ impl ReadOnlySnapshot {
                 return Err(snapshot_changed_error());
             }
             std::thread::sleep(retry_interval.min(remaining));
+            helper.request_retry()?;
         }
     }
 
@@ -155,12 +194,7 @@ impl ReadOnlySnapshot {
     }
 }
 
-fn copy_artifact_set_in_helper(
-    source: &Path,
-    destination: &Path,
-    is_cancelled: &dyn Fn() -> bool,
-    after_copy: &mut dyn FnMut() -> io::Result<()>,
-) -> io::Result<Option<SnapshotHelperGuard>> {
+fn start_snapshot_helper(source: &Path, destination: &Path) -> io::Result<SnapshotHelperGuard> {
     let mut command = snapshot_helper_command()?;
     let destination_parent = destination.parent().ok_or_else(|| {
         io::Error::new(
@@ -178,28 +212,10 @@ fn copy_artifact_set_in_helper(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command.spawn()?;
-    let result = wait_for_helper_copy(&mut child, control.path(), is_cancelled, after_copy);
-    match result {
-        Ok(HelperCopyOutcome::Stable) => Ok(Some(SnapshotHelperGuard {
-            child,
-            _control: control,
-        })),
-        Ok(HelperCopyOutcome::Changed) => {
-            let status = child.wait()?;
-            if status.success() {
-                Ok(None)
-            } else {
-                Err(io::Error::other(
-                    "snapshot helper rejected a changed source",
-                ))
-            }
-        }
-        Err(error) => {
-            terminate_helper(&mut child);
-            Err(error)
-        }
-    }
+    Ok(SnapshotHelperGuard {
+        child: Some(command.spawn()?),
+        control,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,11 +240,16 @@ fn wait_for_helper_copy(
     let ready = control.join("ready");
     loop {
         terminate_cancelled_helper(child, is_cancelled)?;
+        if control.join("result").exists() {
+            return read_helper_result(control);
+        }
         if ready.exists() {
             break;
         }
-        if let Some(status) = child.try_wait()? {
-            return read_exited_helper_result(control, status.success());
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::other(
+                "snapshot helper exited before assuming cleanup guardianship",
+            ));
         }
         std::thread::sleep(HELPER_POLL_INTERVAL);
     }
@@ -240,16 +261,12 @@ fn wait_for_helper_copy(
     loop {
         terminate_cancelled_helper(child, is_cancelled)?;
         if control.join("result").exists() {
-            let result = read_helper_result(control)?;
-            if result == HelperCopyOutcome::Stable && child.try_wait()?.is_some() {
-                return Err(io::Error::other(
-                    "stable snapshot helper exited before assuming cleanup guardianship",
-                ));
-            }
-            return Ok(result);
+            return read_helper_result(control);
         }
-        if let Some(status) = child.try_wait()? {
-            return read_exited_helper_result(control, status.success());
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::other(
+                "snapshot helper exited before assuming cleanup guardianship",
+            ));
         }
         std::thread::sleep(HELPER_POLL_INTERVAL);
     }
@@ -272,16 +289,6 @@ fn terminate_cancelled_helper(
 fn terminate_helper(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
-}
-
-fn read_exited_helper_result(control: &Path, succeeded: bool) -> io::Result<HelperCopyOutcome> {
-    let result = read_helper_result(control)?;
-    if succeeded && result == HelperCopyOutcome::Changed {
-        return Ok(result);
-    }
-    Err(io::Error::other(format!(
-        "snapshot helper exited unexpectedly after reporting {result:?}"
-    )))
 }
 
 fn read_helper_result(control: &Path) -> io::Result<HelperCopyOutcome> {
@@ -312,25 +319,34 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
         }
     };
     let is_cancelled = || !parent_connected.load(Ordering::SeqCst);
-    match execute_helper(source, destination, control, &is_cancelled) {
-        Ok(HelperCopyOutcome::Changed) => 0,
-        Ok(HelperCopyOutcome::Stable) => {
-            while parent_connected.load(Ordering::SeqCst) {
-                std::thread::sleep(HELPER_POLL_INTERVAL);
+    let exit_code = 'attempts: loop {
+        match execute_helper(source, destination, control, &is_cancelled) {
+            Ok(HelperCopyOutcome::Changed) => {
+                while parent_connected.load(Ordering::SeqCst) {
+                    if control.join(HELPER_RETRY_MARKER).exists() {
+                        if prepare_snapshot_retry(control).is_err() {
+                            break 'attempts 1;
+                        }
+                        continue 'attempts;
+                    }
+                    std::thread::sleep(HELPER_POLL_INTERVAL);
+                }
+                break 1;
             }
-            cleanup_abandoned_helper_files(destination, control);
-            0
-        }
-        Err(error) => {
-            if is_cancelled() {
-                cleanup_abandoned_helper_files(destination, control);
-                return 1;
+            Ok(HelperCopyOutcome::Stable) => break 0,
+            Err(_) if is_cancelled() => break 1,
+            Err(error) => {
+                let result = format!("error\n{}\n{error}", helper_error_kind_code(error.kind()));
+                let _ = publish_helper_result(control, &result);
+                break 1;
             }
-            let result = format!("error\n{}\n{error}", helper_error_kind_code(error.kind()));
-            let _ = publish_helper_result(control, &result);
-            1
         }
+    };
+    while parent_connected.load(Ordering::SeqCst) {
+        std::thread::sleep(HELPER_POLL_INTERVAL);
     }
+    cleanup_abandoned_helper_files(destination, control);
+    exit_code
 }
 
 fn watch_parent_connection() -> io::Result<Arc<AtomicBool>> {
@@ -341,24 +357,30 @@ fn watch_parent_connection() -> io::Result<Arc<AtomicBool>> {
         .spawn(move || {
             let mut stdin = std::io::stdin().lock();
             let mut buffer = [0_u8; 1];
-            loop {
-                match stdin.read(&mut buffer) {
-                    Ok(0) | Err(_) => {
-                        watcher_state.store(false, Ordering::SeqCst);
-                        return;
-                    }
-                    Ok(_) => {}
-                }
-            }
+            while matches!(stdin.read(&mut buffer), Ok(1)) {}
+            watcher_state.store(false, Ordering::SeqCst);
         })?;
     Ok(parent_connected)
+}
+
+fn prepare_snapshot_retry(control: &Path) -> io::Result<()> {
+    for marker in ["ready", "compare", "result", ".result-writing"] {
+        remove_if_present(&control.join(marker))?;
+    }
+    remove_if_present(&control.join(HELPER_RETRY_MARKER))
 }
 
 fn cleanup_abandoned_helper_files(destination: &Path, control: &Path) {
     for suffix in SQLITE_ARTIFACT_SUFFIXES {
         let _ = std::fs::remove_file(path_with_suffix(destination, suffix));
     }
-    for marker in ["ready", "compare", "result", ".result-writing"] {
+    for marker in [
+        "ready",
+        "compare",
+        "result",
+        ".result-writing",
+        HELPER_RETRY_MARKER,
+    ] {
         let _ = std::fs::remove_file(control.join(marker));
     }
     let _ = std::fs::remove_dir(control);
@@ -1149,6 +1171,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_owner_exit_between_changed_attempts_does_not_leave_snapshot_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let snapshot_temp = directory.path().join("snapshot-temp");
+        let snapshot_path = directory.path().join("snapshot-path");
+        std::fs::write(&source, vec![7_u8; COPY_BUFFER_BYTES * 4]).unwrap();
+        std::fs::create_dir(&snapshot_temp).unwrap();
+
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("read_only_snapshot::tests::changed_snapshot_owner_fixture")
+            .arg("--nocapture")
+            .env("OULIPOLY_TEST_CHANGED_SNAPSHOT_SOURCE", &source)
+            .env("OULIPOLY_TEST_CHANGED_SNAPSHOT_PATH", &snapshot_path)
+            .env("OULIPOLY_TEST_CHANGED_SNAPSHOT_TEMP", &snapshot_temp)
+            .env("TMPDIR", &snapshot_temp)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !snapshot_path.exists() {
+            assert!(child.try_wait().unwrap().is_none());
+            assert!(
+                Instant::now() < deadline,
+                "changed snapshot owner did not reach the retry boundary"
+            );
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        }
+        let leaked_path = PathBuf::from(std::fs::read_to_string(&snapshot_path).unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while leaked_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(HELPER_POLL_INTERVAL);
+        }
+        assert!(
+            !leaked_path.exists(),
+            "changed snapshot storage survived its owner process: {}",
+            leaked_path.display()
+        );
+    }
+
+    #[test]
     fn abrupt_snapshot_owner_fixture() {
         let Some(source) = std::env::var_os("OULIPOLY_TEST_ABRUPT_SNAPSHOT_SOURCE") else {
             return;
@@ -1167,6 +1232,37 @@ mod tests {
         .unwrap();
 
         std::process::exit(0);
+    }
+
+    #[test]
+    fn changed_snapshot_owner_fixture() {
+        let Some(source) = std::env::var_os("OULIPOLY_TEST_CHANGED_SNAPSHOT_SOURCE") else {
+            return;
+        };
+        let snapshot_path = std::env::var_os("OULIPOLY_TEST_CHANGED_SNAPSHOT_PATH").unwrap();
+        let snapshot_temp = std::env::var_os("OULIPOLY_TEST_CHANGED_SNAPSHOT_TEMP").unwrap();
+        let source = Path::new(&source);
+        let _ = ReadOnlySnapshot::create_with_retry_policy(
+            source,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            &|| false,
+            || {
+                std::fs::write(source, vec![8_u8; COPY_BUFFER_BYTES * 4])?;
+                let snapshot_directory = std::fs::read_dir(&snapshot_temp)?
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with(".tmp"))
+                    })
+                    .ok_or_else(|| io::Error::other("snapshot directory was not created"))?;
+                std::fs::write(
+                    &snapshot_path,
+                    snapshot_directory.to_string_lossy().as_bytes(),
+                )
+            },
+        );
     }
 
     #[cfg(target_os = "linux")]
