@@ -144,13 +144,13 @@ fn attempt_account_dispatch(
     );
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
-    let policy_request = build_policy_request(context, &candidate)
+    let policy_request = build_policy_request(context, &candidate, registry.host_options())
         .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     let policy_result = invoke_provider_policy(&client, policy_request)
         .map_err(classify_provider_client_attempt_error)?;
     let candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    let launch_request = build_launch_request(context, &candidate)
+    let launch_request = build_launch_request(context, &candidate, registry.host_options())
         .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
         terminal_attempt_error(protocol_service_error(

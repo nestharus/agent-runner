@@ -82,8 +82,13 @@ pub fn export_session(
     let settings_id = identity_formatter::settings_id(&describe, &identity.settings_id);
     let identity = identity::map_described_identity(identity, provider_instance_id, settings_id);
     let request_id = request_id_formatter::session_request_id("export");
-    let request = request_builder::build_export_request(&identity, session_id, request_id)
-        .map_err(service_error_mapper::export_adapter_error)?;
+    let request = request_builder::build_export_request(
+        &identity,
+        session_id,
+        registry.host_options(),
+        request_id,
+    )
+    .map_err(service_error_mapper::export_adapter_error)?;
     let client =
         provider_registry_accessor::provider_client_for_model(registry.as_ref(), &identity)
             .map_err(registry_transport_mapper::registry_error_as_transport)
@@ -146,14 +151,19 @@ pub fn replace_session(
         lease,
     )?;
     let request_id = request_id_formatter::session_request_id("replace");
-    let request =
-        match request_builder::build_replace_request(&identity, session_id, &input, request_id) {
-            Ok(request) => request,
-            Err(error) => {
-                let mapped = service_error_mapper::replace_adapter_error(error);
-                return Err(pending_journal.retire_after_error(mapped));
-            }
-        };
+    let request = match request_builder::build_replace_request(
+        &identity,
+        session_id,
+        &input,
+        registry.host_options(),
+        request_id,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            let mapped = service_error_mapper::replace_adapter_error(error);
+            return Err(pending_journal.retire_after_error(mapped));
+        }
+    };
     pending_journal.require_current()?;
     let result = match client_invoker::invoke_replace(&client, request) {
         Ok(result) => result,
@@ -228,6 +238,7 @@ pub fn replace_session(
             pending_journal.authority()?,
             "commit",
             Some(&input),
+            registry.host_options(),
         )?;
     }
     pending_journal.retire()?;
@@ -346,6 +357,7 @@ fn recover_provider_owned_journal(
         journal.recovery_id.as_deref(),
         "query",
         recovery_input.as_ref(),
+        registry.host_options(),
         request_id_formatter::session_request_id("replace"),
     )
     .map_err(service_error_mapper::replace_adapter_error)
@@ -469,7 +481,14 @@ fn recover_provider_owned_journal(
                     retain_provider_owned_failure(path, &journal, lease, format!("{error:?}"))
                 })?;
             send_provider_owned_recovery_action(
-                &client, &identity, &journal, path, lease, "rollback", None,
+                &client,
+                &identity,
+                &journal,
+                path,
+                lease,
+                "rollback",
+                None,
+                registry.host_options(),
             )?;
             retire_provider_owned_journal(path, &journal, lease)?;
         }
@@ -504,6 +523,7 @@ fn recover_provider_owned_journal(
                 lease,
                 "commit",
                 recovery_input.as_ref(),
+                registry.host_options(),
             )?;
             journal.db_apply_marker = "applied".to_string();
             retire_provider_owned_journal(path, &journal, lease)?;
@@ -547,6 +567,7 @@ fn send_provider_owned_recovery_action(
     lease: &ProviderOwnedReplaceLease<'_>,
     action: &str,
     input: Option<&replace_input_mapper::PreparedReplaceInput>,
+    host_options: &crate::provider_registry::DescribeHostOptions,
 ) -> Result<(), ReplaceError> {
     let recovery_id = journal.recovery_id.as_deref().ok_or_else(|| {
         operator_recovery_required(
@@ -565,6 +586,7 @@ fn send_provider_owned_recovery_action(
             Some(recovery_id),
             action,
             Some(input),
+            host_options,
             request_id_formatter::session_request_id("replace"),
         )
     } else {
@@ -574,6 +596,7 @@ fn send_provider_owned_recovery_action(
             &journal.operation_id,
             Some(recovery_id),
             action,
+            host_options,
             request_id_formatter::session_request_id("replace"),
         )
     }

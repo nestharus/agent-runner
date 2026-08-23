@@ -360,8 +360,15 @@ fn execute_dispatch_aware_result(
 fn execute_external_fixture(
     fixture: &ExternalFixture,
 ) -> Result<executor::ExecutionResult, ServiceError> {
+    execute_external_fixture_with_options(fixture, ProviderRegistryOptions::default())
+}
+
+fn execute_external_fixture_with_options(
+    fixture: &ExternalFixture,
+    options: ProviderRegistryOptions,
+) -> Result<executor::ExecutionResult, ServiceError> {
     let model = external_model(fixture);
-    let registry = dispatch_registry_for_models(std::slice::from_ref(&model));
+    let registry = dispatch_registry_for_models_with_options(std::slice::from_ref(&model), options);
     execute_dispatch_aware_result(
         registry,
         ExecutorServiceRequest::Facade {
@@ -949,7 +956,15 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provid
         LaunchMode::Success,
     );
 
-    let result = execute_external_fixture(&fixture).expect("external dispatch should succeed");
+    let config_root = fixture._dir.path().join("config-root");
+    let data_root = fixture._dir.path().join("data-root");
+    let result = execute_external_fixture_with_options(
+        &fixture,
+        ProviderRegistryOptions::default()
+            .with_config_root(config_root.clone())
+            .with_data_root(data_root.clone()),
+    )
+    .expect("external dispatch should succeed");
 
     assert_eq!(
         order_lines(&fixture.order_path),
@@ -964,6 +979,17 @@ fn external_provider_policy_evaluate_runs_before_launch_and_uses_selected_provid
         read_json(&fixture.launch_record_path)["params"]["settings_id"],
         SELECTED_PROVIDER_SETTINGS_ID
     );
+    for request_path in [&fixture.policy_record_path, &fixture.launch_record_path] {
+        let request = read_json(request_path);
+        assert_eq!(
+            request["host"]["config_root"],
+            config_root.display().to_string()
+        );
+        assert_eq!(
+            request["host"]["data_root"],
+            data_root.display().to_string()
+        );
+    }
     assert!(!fixture.legacy_record_path.exists());
 }
 

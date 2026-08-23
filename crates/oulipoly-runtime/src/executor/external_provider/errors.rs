@@ -4,12 +4,28 @@ use oulipoly_provider::generated::Diagnostic;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ExternalProviderDispatchError {
-    MissingCapability { capability: &'static str },
+    MissingCapability {
+        capability: &'static str,
+    },
     RuntimeDisabledCrate,
-    ProviderTransport { category: String },
-    ProviderProtocol { category: String },
-    CancellationFallback { reason: String },
-    PolicyRejected { diagnostics: Vec<Diagnostic> },
+    ProviderTransport {
+        category: String,
+    },
+    ProviderProtocol {
+        category: String,
+    },
+    ProviderFailure {
+        operation: String,
+        code: String,
+        message: String,
+        diagnostics: Vec<Diagnostic>,
+    },
+    CancellationFallback {
+        reason: String,
+    },
+    PolicyRejected {
+        diagnostics: Vec<Diagnostic>,
+    },
 }
 
 impl ExternalProviderDispatchError {
@@ -36,6 +52,20 @@ impl ExternalProviderDispatchError {
     pub(crate) fn cancellation_fallback(reason: impl Into<String>) -> Self {
         Self::CancellationFallback {
             reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn provider_failure(
+        operation: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self::ProviderFailure {
+            operation: operation.into(),
+            code: code.into(),
+            message: message.into(),
+            diagnostics,
         }
     }
 
