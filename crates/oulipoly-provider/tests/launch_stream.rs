@@ -43,6 +43,7 @@ pub mod support {
 }
 
 use oulipoly_provider::client::{ProviderClient, ProviderClientOptions, ProviderOutputLimits};
+use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{ProcessStatus, TerminalSignalKind};
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use oulipoly_provider::stream::DecodedLaunchEvent;
@@ -110,6 +111,29 @@ fn launch_model_nonzero_final_exit_is_outcome_not_provider_transport_failure() {
         TerminalSignalKind::NonzeroExit
     );
     assert!(!result.diagnostics.provider_process_nonzero);
+}
+
+#[test]
+fn launch_maps_provider_error_envelope_to_capability_error() {
+    let fake = FakeProvider::compile(fake_provider_source());
+    let error = launch_client(fake.path())
+        .launch(
+            launch_request(),
+            FakeProviderMode::LaunchProviderError.env(),
+        )
+        .expect_err("launch provider error envelope should remain actionable");
+
+    let ProviderClientError::ProviderCapability(error) = error else {
+        panic!("launch provider error envelope must not collapse to a stream protocol error");
+    };
+    assert_eq!(error.subcommand(), "launch");
+    assert_eq!(error.error().code, "launch_conflict");
+    assert_eq!(error.error().message, "conflict from fake-provider");
+    assert_eq!(
+        error.process_status(),
+        Some(&ProcessStatus::Exited { code: 2 })
+    );
+    assert!(error.diagnostics().provider_process_nonzero);
 }
 
 #[test]

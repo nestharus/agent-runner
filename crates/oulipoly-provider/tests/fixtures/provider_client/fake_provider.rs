@@ -135,6 +135,7 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
         "early-stdin-error" => early_stdin_error(),
         "early-stdin-empty" => early_stdin_empty(),
         "launch-valid" => launch_valid(0),
+        "launch-provider-error" => provider_error("conflict", "launch_conflict", 2),
         "launch-model-nonzero" => launch_valid(9),
         "launch-provider-nonzero-after-final" => launch_provider_nonzero_after_final(),
         "launch-provider-nonzero-no-final" => launch_provider_nonzero_no_final(),
