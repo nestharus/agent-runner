@@ -226,7 +226,7 @@ fn register_completion_event(
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
     let mut state = StateDb::open_default()?;
-    validate_owner_binding(&state, &owner, &metadata)?;
+    reconcile_owner_binding(&state, &owner, &metadata)?;
     let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
     let registration = CompletionEventRegistrationInput {
         event_id: args.handle,
@@ -420,7 +420,7 @@ fn optional_nonempty_string(metadata: &Value, field: &str) -> Result<Option<Stri
         .ok_or_else(|| format!("meta.json {field} must be a non-empty string"))
 }
 
-fn validate_owner_binding(
+fn reconcile_owner_binding(
     state: &StateDb,
     owner: &OwnerBinding,
     metadata: &Value,
