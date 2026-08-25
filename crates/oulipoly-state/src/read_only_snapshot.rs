@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 // One observability scan opens up to three stores serially. Keep transient
 // source churn from turning best-effort observation into multi-second delay.
@@ -379,7 +382,7 @@ fn start_snapshot_helper(
     snapshot: tempfile::TempDir,
 ) -> io::Result<SnapshotHelperGuard> {
     let reaper = snapshot_helper_reaper()?;
-    let mut command = snapshot_helper_command()?;
+    let mut launch = snapshot_helper_command()?;
     let destination_parent = destination.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -389,7 +392,8 @@ fn start_snapshot_helper(
     let control = tempfile::Builder::new()
         .prefix(".snapshot-helper-")
         .tempdir_in(destination_parent)?;
-    command
+    launch
+        .command
         .arg(source)
         .arg(destination)
         .arg(control.path())
@@ -397,7 +401,7 @@ fn start_snapshot_helper(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     Ok(SnapshotHelperGuard {
-        child: Some(command.spawn()?),
+        child: Some(launch.command.spawn()?),
         control: Some(control),
         snapshot: Some(snapshot),
         reaper,
@@ -410,11 +414,41 @@ enum HelperCopyOutcome {
     Changed,
 }
 
-fn snapshot_helper_command() -> io::Result<Command> {
-    let current = std::env::current_exe()?;
-    let mut command = Command::new(current);
+struct SnapshotHelperCommand {
+    command: Command,
+    #[cfg(target_os = "linux")]
+    _executable: File,
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_helper_command() -> io::Result<SnapshotHelperCommand> {
+    let executable = File::open("/proc/self/exe")?;
+    let fd = executable.as_raw_fd();
+    let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command.arg(crate::snapshot_helper::MODE_ARG);
-    Ok(command)
+    Ok(SnapshotHelperCommand {
+        command,
+        _executable: executable,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn snapshot_helper_command() -> io::Result<SnapshotHelperCommand> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg(crate::snapshot_helper::MODE_ARG);
+    Ok(SnapshotHelperCommand { command })
 }
 
 fn wait_for_helper_copy(
@@ -502,7 +536,9 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
         std::thread::sleep(Duration::from_millis(500));
     }
     let exit_code = 'attempts: loop {
-        match execute_helper(source, destination, control, &is_cancelled) {
+        let outcome = execute_helper(source, destination, control, &is_cancelled)
+            .or_else(|error| retry_transient_helper_not_found(control, error));
+        match outcome {
             Ok(HelperCopyOutcome::Changed) => {
                 while parent_connected.load(Ordering::SeqCst) {
                     if control.join(HELPER_RETRY_MARKER).exists() {
@@ -529,6 +565,23 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
     }
     cleanup_abandoned_helper_files(destination, control);
     exit_code
+}
+
+fn retry_transient_helper_not_found(
+    control: &Path,
+    error: io::Error,
+) -> io::Result<HelperCopyOutcome> {
+    if error.kind() != io::ErrorKind::NotFound {
+        return Err(error);
+    }
+    publish_helper_result(control, "changed\n").map_err(|publish_error| {
+        path_io_error(
+            "publishing retry after a transient SQLite artifact disappearance",
+            control,
+            publish_error,
+        )
+    })?;
+    Ok(HelperCopyOutcome::Changed)
 }
 
 fn watch_parent_connection() -> io::Result<Arc<AtomicBool>> {
@@ -579,11 +632,15 @@ fn execute_helper(
     control: &Path,
     is_cancelled: &dyn Fn() -> bool,
 ) -> io::Result<HelperCopyOutcome> {
-    let Some(mut copied) = copy_artifact_set_inline(source, destination, is_cancelled)? else {
+    let Some(mut copied) = copy_artifact_set_inline(source, destination, is_cancelled)
+        .map_err(|error| path_io_error("copying the SQLite artifact set", source, error))?
+    else {
         publish_helper_result(control, "changed\n")?;
         return Ok(HelperCopyOutcome::Changed);
     };
-    std::fs::write(control.join("ready"), [])?;
+    let ready = control.join("ready");
+    std::fs::write(&ready, [])
+        .map_err(|error| path_io_error("publishing snapshot copy readiness", &ready, error))?;
     let deadline = Instant::now() + HELPER_COMPARE_TIMEOUT;
     while !control.join("compare").exists() {
         ensure_snapshot_not_cancelled(is_cancelled)?;
@@ -595,11 +652,14 @@ fn execute_helper(
         }
         std::thread::sleep(HELPER_POLL_INTERVAL);
     }
-    let outcome = if artifact_sets_match(source, destination, &mut copied, is_cancelled)? {
-        HelperCopyOutcome::Stable
-    } else {
-        HelperCopyOutcome::Changed
-    };
+    let outcome =
+        if artifact_sets_match(source, destination, &mut copied, is_cancelled).map_err(|error| {
+            path_io_error("validating the copied SQLite artifact set", source, error)
+        })? {
+            HelperCopyOutcome::Stable
+        } else {
+            HelperCopyOutcome::Changed
+        };
     drop(copied);
     publish_helper_result(
         control,
@@ -613,8 +673,18 @@ fn execute_helper(
 
 fn publish_helper_result(control: &Path, result: &str) -> io::Result<()> {
     let staging = control.join(".result-writing");
-    std::fs::write(&staging, result)?;
-    std::fs::rename(staging, control.join("result"))
+    std::fs::write(&staging, result)
+        .map_err(|error| path_io_error("writing a snapshot helper result", &staging, error))?;
+    let published = control.join("result");
+    std::fs::rename(&staging, &published)
+        .map_err(|error| path_io_error("publishing a snapshot helper result", &published, error))
+}
+
+fn path_io_error(operation: &str, path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{operation} at {} failed: {error}", path.display()),
+    )
 }
 
 fn helper_error_kind_code(kind: io::ErrorKind) -> &'static str {
@@ -669,13 +739,40 @@ fn copy_artifact_set_inline(
         ensure_snapshot_not_cancelled(is_cancelled)?;
         let source_artifact = path_with_suffix(source, suffix);
         let destination_artifact = path_with_suffix(destination, suffix);
-        match open_validated_source_artifact(&source_artifact)? {
+        match open_validated_source_artifact(&source_artifact).map_err(|error| {
+            path_io_error(
+                "opening a validated SQLite source artifact",
+                &source_artifact,
+                error,
+            )
+        })? {
             ValidatedSourceArtifact::Absent if suffix.is_empty() => return Ok(None),
-            ValidatedSourceArtifact::Absent => remove_if_present(&destination_artifact)?,
+            ValidatedSourceArtifact::Absent => {
+                remove_if_present(&destination_artifact).map_err(|error| {
+                    path_io_error(
+                        "removing an absent SQLite snapshot artifact",
+                        &destination_artifact,
+                        error,
+                    )
+                })?
+            }
             ValidatedSourceArtifact::Changed => return Ok(None),
             ValidatedSourceArtifact::Present { mut file, identity } => {
-                copy_artifact(&mut file, &destination_artifact, is_cancelled)?;
-                if validated_artifact_identity(&source_artifact)? != Some(identity) {
+                copy_artifact(&mut file, &destination_artifact, is_cancelled).map_err(|error| {
+                    path_io_error(
+                        "copying a SQLite snapshot artifact",
+                        &destination_artifact,
+                        error,
+                    )
+                })?;
+                if validated_artifact_identity(&source_artifact).map_err(|error| {
+                    path_io_error(
+                        "revalidating a copied SQLite source artifact",
+                        &source_artifact,
+                        error,
+                    )
+                })? != Some(identity)
+                {
                     return Ok(None);
                 }
                 artifacts[index] = Some(OpenedSqliteArtifact { file, identity });
@@ -910,6 +1007,53 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_helper_not_found_is_published_as_a_retryable_change() {
+        let control = tempfile::tempdir().unwrap();
+
+        let outcome = retry_transient_helper_not_found(
+            control.path(),
+            io::Error::new(io::ErrorKind::NotFound, "transient WAL disappearance"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, HelperCopyOutcome::Changed);
+        assert_eq!(
+            read_helper_result(control.path()).unwrap(),
+            HelperCopyOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn non_transient_helper_error_preserves_its_kind_and_message() {
+        let control = tempfile::tempdir().unwrap();
+
+        let error = retry_transient_helper_not_found(
+            control.path(),
+            io::Error::new(io::ErrorKind::PermissionDenied, "source access denied"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "source access denied");
+        assert!(!control.path().join("result").exists());
+    }
+
+    #[test]
+    fn path_io_error_preserves_kind_and_names_the_failed_stage() {
+        let error = path_io_error(
+            "copying a SQLite snapshot artifact",
+            Path::new("/state/state.db-wal"),
+            io::Error::new(io::ErrorKind::NotFound, "missing"),
+        );
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "copying a SQLite snapshot artifact at /state/state.db-wal failed: missing"
+        );
+    }
 
     #[test]
     fn snapshot_retries_after_four_consecutive_source_changes() {
@@ -1280,15 +1424,16 @@ mod tests {
         let control = snapshot_directory.join("control");
         std::fs::create_dir(&control).unwrap();
 
-        let mut child = snapshot_helper_command().unwrap();
-        child
+        let mut launch = snapshot_helper_command().unwrap();
+        launch
+            .command
             .arg(&source)
             .arg(&destination)
             .arg(&control)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = child.spawn().unwrap();
+        let mut child = launch.command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !control.join("ready").exists() {
             assert!(

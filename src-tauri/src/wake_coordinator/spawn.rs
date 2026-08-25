@@ -3,11 +3,12 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`
 
 use oulipoly_state::{CompositeInvocationId, mailbox::SessionMetadataRow};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::{fs::File, os::fd::AsRawFd};
 
 use super::constants::{
     AUTO_WAKE_COUNT_ENV, AUTO_WAKE_ENV, AUTO_WAKE_MAX_ENV, AUTO_WAKE_SESSION_ID_ENV,
@@ -22,47 +23,86 @@ pub(super) fn spawn_detached_resume(
     auto_wake_count: i64,
     auto_wake_max: i64,
 ) -> Result<i64, String> {
-    let exe = current_agents_exe()?;
-    let cmd = detached_resume_command(
-        exe,
+    let mut launch = current_agents_command()?;
+    configure_resume_command(
+        &mut launch.command,
         session_id,
         runtime,
         claim_token,
         auto_wake_count,
         auto_wake_max,
     );
-    spawn_detached_child(cmd)
+    spawn_detached_child(launch)
 }
 
 pub(super) fn spawn_detached_wake_reclaim_handoff(
     owner_token: &str,
     handoff_token: &str,
 ) -> Result<(), String> {
-    let mut command = Command::new(current_agents_exe()?);
-    command
+    let mut launch = current_agents_command()?;
+    launch
+        .command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .env(WAKE_RECLAIM_HANDOFF_OWNER_ENV, owner_token)
         .env(WAKE_RECLAIM_HANDOFF_TOKEN_ENV, handoff_token)
         .env_remove(AUTO_WAKE_ENV);
-    configure_handoff_detached(&mut command);
-    command
+    configure_handoff_detached(&mut launch.command);
+    launch
+        .command
         .spawn()
         .map(drop)
         .map_err(|error| format!("Failed to spawn detached wake reclaim handoff: {error}"))
 }
 
-fn current_agents_exe() -> Result<PathBuf, String> {
-    std::env::current_exe().map_err(current_agents_exe_error)
+struct CurrentAgentsCommand {
+    command: Command,
+    #[cfg(target_os = "linux")]
+    _executable: File,
+}
+
+#[cfg(target_os = "linux")]
+fn current_agents_command() -> Result<CurrentAgentsCommand, String> {
+    let executable = File::open("/proc/self/exe").map_err(current_agents_exe_error)?;
+    let fd = executable.as_raw_fd();
+    let mut command = Command::new(format!("/proc/self/fd/{fd}"));
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(CurrentAgentsCommand {
+        command,
+        _executable: executable,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_agents_command() -> Result<CurrentAgentsCommand, String> {
+    let executable = std::env::current_exe().map_err(current_agents_exe_error)?;
+    Ok(CurrentAgentsCommand {
+        command: Command::new(executable),
+    })
 }
 
 fn current_agents_exe_error(err: std::io::Error) -> String {
-    format!("Failed to resolve current agents binary: {err}")
+    format!("Failed to open the running agents executable for re-launch: {err}")
 }
 
-fn spawn_detached_child(mut cmd: Command) -> Result<i64, String> {
-    cmd.spawn().map(child_pid).map_err(detached_spawn_error)
+fn spawn_detached_child(mut launch: CurrentAgentsCommand) -> Result<i64, String> {
+    launch
+        .command
+        .spawn()
+        .map(child_pid)
+        .map_err(detached_spawn_error)
 }
 
 fn child_pid(child: Child) -> i64 {
@@ -73,26 +113,24 @@ fn detached_spawn_error(err: std::io::Error) -> String {
     format!("Failed to spawn detached wake resume: {err}")
 }
 
-fn detached_resume_command(
-    exe: PathBuf,
+fn configure_resume_command(
+    cmd: &mut Command,
     session_id: &str,
     runtime: Option<&SessionMetadataRow>,
     claim_token: &str,
     auto_wake_count: i64,
     auto_wake_max: i64,
-) -> Command {
-    let mut cmd = Command::new(exe);
-    configure_resume_args(&mut cmd, session_id, runtime);
+) {
+    configure_resume_args(cmd, session_id, runtime);
     configure_wake_stdio_and_env(
-        &mut cmd,
+        cmd,
         session_id,
         runtime,
         claim_token,
         auto_wake_count,
         auto_wake_max,
     );
-    configure_detached(&mut cmd);
-    cmd
+    configure_detached(cmd);
 }
 
 fn configure_resume_args(
