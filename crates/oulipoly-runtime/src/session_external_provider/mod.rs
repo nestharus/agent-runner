@@ -233,9 +233,11 @@ pub fn replace_session(
         send_provider_owned_recovery_action(
             &client,
             &identity,
-            &journal,
-            &pending_journal.pending_path,
-            pending_journal.authority()?,
+            ProviderOwnedRecoveryJournalContext {
+                journal: &journal,
+                path: &pending_journal.pending_path,
+                lease: pending_journal.authority()?,
+            },
             "commit",
             Some(&input),
             registry.host_options(),
@@ -350,13 +352,15 @@ fn recover_provider_owned_journal(
         }
     };
     let recovery_input = debug_recovery_canonical_input(&journal.session_id)?;
-    let query = match request_builder::build_recovery_replace_request_with_input(
+    let query = match request_builder::build_recovery_replace_request(
         &identity,
         &journal.session_id,
-        &journal.operation_id,
-        journal.recovery_id.as_deref(),
-        "query",
-        recovery_input.as_ref(),
+        request_builder::RecoveryReplaceRequest {
+            operation_id: &journal.operation_id,
+            recovery_id: journal.recovery_id.as_deref(),
+            action: "query",
+            input: recovery_input.as_ref(),
+        },
         registry.host_options(),
         request_id_formatter::session_request_id("replace"),
     )
@@ -483,9 +487,11 @@ fn recover_provider_owned_journal(
             send_provider_owned_recovery_action(
                 &client,
                 &identity,
-                &journal,
-                path,
-                lease,
+                ProviderOwnedRecoveryJournalContext {
+                    journal: &journal,
+                    path,
+                    lease,
+                },
                 "rollback",
                 None,
                 registry.host_options(),
@@ -518,9 +524,11 @@ fn recover_provider_owned_journal(
             send_provider_owned_recovery_action(
                 &client,
                 &identity,
-                &journal,
-                path,
-                lease,
+                ProviderOwnedRecoveryJournalContext {
+                    journal: &journal,
+                    path,
+                    lease,
+                },
                 "commit",
                 recovery_input.as_ref(),
                 registry.host_options(),
@@ -559,16 +567,25 @@ fn recover_provider_owned_journal(
     Ok(())
 }
 
+struct ProviderOwnedRecoveryJournalContext<'a, 'lease> {
+    journal: &'a ProviderOwnedReplaceJournal,
+    path: &'a Path,
+    lease: &'a ProviderOwnedReplaceLease<'lease>,
+}
+
 fn send_provider_owned_recovery_action(
     client: &oulipoly_provider::client::ProviderClient,
     identity: &identity::ExternalSessionIdentity,
-    journal: &ProviderOwnedReplaceJournal,
-    path: &Path,
-    lease: &ProviderOwnedReplaceLease<'_>,
+    context: ProviderOwnedRecoveryJournalContext<'_, '_>,
     action: &str,
     input: Option<&replace_input_mapper::PreparedReplaceInput>,
     host_options: &crate::provider_registry::DescribeHostOptions,
 ) -> Result<(), ReplaceError> {
+    let ProviderOwnedRecoveryJournalContext {
+        journal,
+        path,
+        lease,
+    } = context;
     let recovery_id = journal.recovery_id.as_deref().ok_or_else(|| {
         operator_recovery_required(
             path,
@@ -578,28 +595,18 @@ fn send_provider_owned_recovery_action(
             ),
         )
     })?;
-    let request = if let Some(input) = input {
-        request_builder::build_recovery_replace_request_with_input(
-            identity,
-            &journal.session_id,
-            &journal.operation_id,
-            Some(recovery_id),
+    let request = request_builder::build_recovery_replace_request(
+        identity,
+        &journal.session_id,
+        request_builder::RecoveryReplaceRequest {
+            operation_id: &journal.operation_id,
+            recovery_id: Some(recovery_id),
             action,
-            Some(input),
-            host_options,
-            request_id_formatter::session_request_id("replace"),
-        )
-    } else {
-        request_builder::build_recovery_replace_request(
-            identity,
-            &journal.session_id,
-            &journal.operation_id,
-            Some(recovery_id),
-            action,
-            host_options,
-            request_id_formatter::session_request_id("replace"),
-        )
-    }
+            input,
+        },
+        host_options,
+        request_id_formatter::session_request_id("replace"),
+    )
     .map_err(service_error_mapper::replace_adapter_error);
     let request = match request {
         Ok(request) => request,
