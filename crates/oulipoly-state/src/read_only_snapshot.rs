@@ -536,8 +536,7 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
         std::thread::sleep(Duration::from_millis(500));
     }
     let exit_code = 'attempts: loop {
-        let outcome = execute_helper(source, destination, control, &is_cancelled)
-            .or_else(|error| retry_transient_helper_not_found(control, error));
+        let outcome = execute_helper(source, destination, control, &is_cancelled);
         match outcome {
             Ok(HelperCopyOutcome::Changed) => {
                 while parent_connected.load(Ordering::SeqCst) {
@@ -565,23 +564,6 @@ pub(crate) fn run_helper(source: &Path, destination: &Path, control: &Path) -> i
     }
     cleanup_abandoned_helper_files(destination, control);
     exit_code
-}
-
-fn retry_transient_helper_not_found(
-    control: &Path,
-    error: io::Error,
-) -> io::Result<HelperCopyOutcome> {
-    if error.kind() != io::ErrorKind::NotFound {
-        return Err(error);
-    }
-    publish_helper_result(control, "changed\n").map_err(|publish_error| {
-        path_io_error(
-            "publishing retry after a transient SQLite artifact disappearance",
-            control,
-            publish_error,
-        )
-    })?;
-    Ok(HelperCopyOutcome::Changed)
 }
 
 fn watch_parent_connection() -> io::Result<Arc<AtomicBool>> {
@@ -1009,35 +991,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_helper_not_found_is_published_as_a_retryable_change() {
-        let control = tempfile::tempdir().unwrap();
+    fn missing_control_path_remains_a_control_protocol_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("state.db");
+        let destination = directory.path().join("snapshot.db");
+        let missing_control = directory.path().join("missing-control");
+        std::fs::write(&source, "state").unwrap();
 
-        let outcome = retry_transient_helper_not_found(
-            control.path(),
-            io::Error::new(io::ErrorKind::NotFound, "transient WAL disappearance"),
-        )
-        .unwrap();
+        let error = execute_helper(&source, &destination, &missing_control, &|| false).unwrap_err();
 
-        assert_eq!(outcome, HelperCopyOutcome::Changed);
-        assert_eq!(
-            read_helper_result(control.path()).unwrap(),
-            HelperCopyOutcome::Changed
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .contains("publishing snapshot copy readiness"),
+            "{error}"
         );
-    }
-
-    #[test]
-    fn non_transient_helper_error_preserves_its_kind_and_message() {
-        let control = tempfile::tempdir().unwrap();
-
-        let error = retry_transient_helper_not_found(
-            control.path(),
-            io::Error::new(io::ErrorKind::PermissionDenied, "source access denied"),
-        )
-        .unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(error.to_string(), "source access denied");
-        assert!(!control.path().join("result").exists());
+        assert!(!missing_control.join("result").exists());
     }
 
     #[test]
