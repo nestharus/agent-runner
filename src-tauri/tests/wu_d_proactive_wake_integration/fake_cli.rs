@@ -75,19 +75,45 @@ import sys
 import time
 
 path, owner_invocation, ready = sys.argv[1:]
-connection = sqlite3.connect(path, timeout=5)
-deadline = time.monotonic() + 1
+connection = sqlite3.connect(path, timeout=0.1)
+admission_deadline = time.monotonic() + 5
 revision = 0
+while True:
+    try:
+        cursor = connection.execute(
+            "UPDATE pid_identity SET recorded_at = ? WHERE invocation_uuid = ?",
+            ("owner-lookup-admission", owner_invocation),
+        )
+        connection.commit()
+    except sqlite3.OperationalError as error:
+        connection.rollback()
+        if "locked" not in str(error).lower() or time.monotonic() >= admission_deadline:
+            raise
+        time.sleep(0.01)
+        continue
+    if cursor.rowcount == 1:
+        break
+    if time.monotonic() >= admission_deadline:
+        raise RuntimeError("owner identity did not appear before write burst")
+    time.sleep(0.01)
+
+open(ready, "w", encoding="utf-8").close()
+deadline = time.monotonic() + 1
 while time.monotonic() < deadline:
-    cursor = connection.execute(
-        "UPDATE pid_identity SET recorded_at = ? WHERE invocation_uuid = ?",
-        ("owner-lookup-burst-" + str(revision), owner_invocation),
-    )
-    connection.commit()
+    try:
+        cursor = connection.execute(
+            "UPDATE pid_identity SET recorded_at = ? WHERE invocation_uuid = ?",
+            ("owner-lookup-burst-" + str(revision), owner_invocation),
+        )
+        connection.commit()
+    except sqlite3.OperationalError as error:
+        connection.rollback()
+        if "locked" not in str(error).lower():
+            raise
+        time.sleep(0.001)
+        continue
     if cursor.rowcount != 1:
         raise RuntimeError("owner identity disappeared during write burst")
-    if revision == 0:
-        open(ready, "w", encoding="utf-8").close()
     revision += 1
 PY
 writer_pid=$!

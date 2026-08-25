@@ -614,7 +614,27 @@ fn inspect_state_storage_file(
             ));
         }
     };
-    if !metadata.is_file() || identity.links != 1 {
+    classify_state_storage_metadata(path, role, &metadata, identity)
+}
+
+fn classify_state_storage_metadata(
+    path: &Path,
+    role: &str,
+    metadata: &std::fs::Metadata,
+    identity: crate::filesystem_identity::OpenFileIdentity,
+) -> Result<Option<StateFileIdentity>, String> {
+    if !metadata.is_file() {
+        return Err(format!(
+            "State DB {role} requires a regular file with exactly one hard link: {}",
+            path.display(),
+        ));
+    }
+    // SQLite may unlink a WAL, journal, or shared-memory file between path
+    // lookup and metadata inspection. The zero-link inode is already absent.
+    if identity.links == 0 {
+        return Ok(None);
+    }
+    if identity.links != 1 {
         return Err(format!(
             "State DB {role} requires a regular file with exactly one hard link: {}",
             path.display(),
@@ -833,6 +853,29 @@ impl StateDbRebuildAuthority {
 #[cfg(test)]
 mod state_namespace_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinked_sqlite_artifact_is_absent_not_a_hard_link_violation() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_path = directory.path().join("state.db-shm");
+        let artifact = std::fs::File::create(&artifact_path).unwrap();
+        std::fs::remove_file(&artifact_path).unwrap();
+        let metadata = artifact.metadata().unwrap();
+        let identity = crate::filesystem_identity::open_file_identity(&artifact).unwrap();
+
+        assert_eq!(identity.links, 0);
+        assert!(
+            classify_state_storage_metadata(
+                &artifact_path,
+                "SQLite artifact",
+                &metadata,
+                identity,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
 
     #[test]
     fn concurrent_current_schema_opens_do_not_request_state_writer() {

@@ -36,7 +36,7 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
     fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash_bin()));
 
     let initial = fixture.run_agent("dispatch delayed nested work");
-    assert_exit_code_zero(&initial);
+    assert_delayed_dispatch_exit_code_zero(&fixture, &initial);
     assert_eq!(invocation_count(&fixture), 2);
 
     let handle = dispatch_handle(&fixture, "agent-bash-dispatch.json");
@@ -45,6 +45,16 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
     let session_id = wait_for_sidecar_session(&fixture, "mailbox");
     wait_for_automatic_delivery(&fixture, &session_id, 1);
     assert_delayed_completion_outcome(&fixture, &session_id, &handle);
+}
+
+fn assert_delayed_dispatch_exit_code_zero(fixture: &Fixture, output: &Output) {
+    let dispatch_error = std::fs::read_to_string(fixture.prompt_file("agent-bash-dispatch.err"))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{output:?}; agent-bash dispatch stderr: {dispatch_error}"
+    );
 }
 
 pub(crate) fn polled_completion_after_enqueue_does_not_wake_parent() {
