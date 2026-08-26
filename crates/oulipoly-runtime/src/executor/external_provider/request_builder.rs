@@ -17,7 +17,8 @@
 
 use super::context::ExternalProviderDispatchContext;
 use crate::executor::cli::spawn_identity::{
-    provider_parent_invocation_env, split_invocation_launch_environment,
+    RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES, provider_parent_invocation_env,
+    split_invocation_launch_environment,
 };
 use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
 use crate::provider_registry::DescribeHostOptions;
@@ -71,6 +72,9 @@ fn declared_launch_env(
     let inherited_authority = env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     remove_configured_launch_env(&mut env, &context.provider.unset_environment);
     env.extend(context.provider.environment.clone());
+    for name in RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES {
+        env.remove(name);
+    }
     env.remove(oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV);
     insert_pinned_agent_data_dir(&mut env);
     let mut completion_registration_authority = None;

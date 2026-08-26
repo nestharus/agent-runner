@@ -30,18 +30,31 @@ for ((i=1; i <= $#; i++)); do
 done
 last="${{@: -1}}"
 if [ -n "$resume" ]; then
+  sequence_lock="$work/provider-resume-sequence.lock"
+  until mkdir "$sequence_lock" 2>/dev/null; do
+    sleep 0.01
+  done
+  sequence_file="$work/provider-resume-sequence.txt"
+  WU_D_PROVIDER_RESUME_INDEX=0
+  if [ -f "$sequence_file" ]; then
+    WU_D_PROVIDER_RESUME_INDEX="$(cat "$sequence_file")"
+  fi
+  WU_D_PROVIDER_RESUME_INDEX=$((WU_D_PROVIDER_RESUME_INDEX + 1))
+  printf '%s' "$WU_D_PROVIDER_RESUME_INDEX" > "$sequence_file"
+  rmdir "$sequence_lock"
+  export WU_D_PROVIDER_RESUME_INDEX
   target="$work/{prompt_file}"
   mkdir -p "$(dirname "$target")"
   printf '%s' "$last" > "$target"
   {on_resume}
-  python3 - "$work/session-turns" "$resume" "${{OULIPOLY_AUTO_WAKE_COUNT:-manual}}" "$last" <<'PY'
+  python3 - "$work/session-turns" "$resume" "$last" "$WU_D_PROVIDER_RESUME_INDEX" <<'PY'
 import hashlib
 import json
 import os
 import sys
 
-turns_dir, session_id, wake_count, prompt = sys.argv[1:]
-turn_id = f"wu-d-delivery-{{session_id}}-{{wake_count}}"
+turns_dir, session_id, prompt, provider_resume_index = sys.argv[1:]
+turn_id = f"wu-d-delivery-{{session_id}}-{{provider_resume_index}}"
 record = {{
     "session_id": session_id,
     "turn_id": turn_id,

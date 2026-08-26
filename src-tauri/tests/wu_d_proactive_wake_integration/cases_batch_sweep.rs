@@ -88,7 +88,7 @@ pub(crate) fn persisted_count_at_five_allows_turn_end_followup_wake() {
     fixture.write_provider(&provider_script(
         "",
         "",
-        "batch-${OULIPOLY_AUTO_WAKE_COUNT:-manual}.txt",
+        "batch-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime_with_wake_count(SESSION, 5);
@@ -99,13 +99,13 @@ pub(crate) fn persisted_count_at_five_allows_turn_end_followup_wake() {
     let output = fixture.run_resume();
     let manual_invocation = direct_unconfirmed_invocation(&output);
 
-    let first = wait_for_file(&fixture.prompt_file("batch-manual.txt"));
-    let second = wait_for_file(&fixture.prompt_file("batch-6.txt"));
+    let first = wait_for_file(&fixture.prompt_file("batch-1.txt"));
     assert_additional_notifications_remain_queued(&first);
-    assert_prompt_contains_handle(&second, "h-batch-20");
     wait_until("batch rows delivered", || {
         delivered_rows_without_pending_or_claim(&fixture, SESSION, 25)
     });
+    let second = wait_for_file(&fixture.prompt_file("batch-2.txt"));
+    assert_prompt_contains_handle(&second, "h-batch-20");
     let rows = fixture.mailbox().list_mailbox(SESSION, true).unwrap();
     assert!(
         rows.iter()
@@ -126,9 +126,14 @@ pub(crate) fn persisted_count_at_five_allows_turn_end_followup_wake() {
     assert_eq!(*followup.1, 5);
     assert_age270_invocation(&fixture, &manual_invocation);
     assert_age270_invocation(&fixture, followup.0);
-    assert!(fixture.prompt_file("batch-manual.txt").exists());
-    assert!(fixture.prompt_file("batch-6.txt").exists());
-    assert!(!fixture.prompt_file("batch-7.txt").exists());
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.auto_wake_count, 6);
+    assert!(!fixture.prompt_file("batch-3.txt").exists());
     assert_xdg_isolated(&fixture);
 }
 
@@ -307,7 +312,6 @@ pub(crate) fn wake_sweep_does_not_rewake_twice_unconfirmed_pending_mailbox() {
 #[cfg(target_os = "linux")]
 #[test]
 fn renewed_followup_claim_survives_old_failed_child_recheck() {
-    use sha2::{Digest, Sha256};
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     let fifo = fixture.work_dir.join("renewed-release.fifo");
@@ -321,38 +325,35 @@ fn renewed_followup_claim_survives_old_failed_child_recheck() {
     let ledger = fixture.work_dir.join("renewed-ledger.txt");
     let count1_pid = fixture.work_dir.join("count1.pid");
     let count1_start = fixture.work_dir.join("count1.start");
-    let count1_token = fixture.work_dir.join("count1.token");
     let count2_pid = fixture.work_dir.join("count2.pid");
-    let count2_token = fixture.work_dir.join("count2.token");
     let held = fixture.work_dir.join("count2.held");
     let hook = format!(
-        r#"count="${{OULIPOLY_AUTO_WAKE_COUNT:-manual}}"
-token="${{OULIPOLY_AUTO_WAKE_TOKEN:-manual}}"
-printf '%s|%s|%s\n' "$count" "$PPID" "$token" >> {ledger}
-if [ "$count" = 1 ]; then
+        r#"index="$WU_D_PROVIDER_RESUME_INDEX"
+label=manual
+if [ "$index" -gt 1 ]; then
+  label=$((index - 1))
+fi
+printf '%s|%s\n' "$label" "$PPID" >> {ledger}
+if [ "$index" = 2 ]; then
   printf '%s' "$PPID" > {count1_pid}
   awk '{{print $22}}' "/proc/$PPID/stat" > {count1_start}
-  printf '%s' "$token" > {count1_token}
 fi
-if [ "$count" = 2 ]; then
+if [ "$index" = 3 ]; then
   printf '%s' "$PPID" > {count2_pid}
-  printf '%s' "$token" > {count2_token}
   : > {held}
   IFS= read -r _ < {fifo}
 fi"#,
         ledger = shell_path(&ledger),
         count1_pid = shell_path(&count1_pid),
         count1_start = shell_path(&count1_start),
-        count1_token = shell_path(&count1_token),
         count2_pid = shell_path(&count2_pid),
-        count2_token = shell_path(&count2_token),
         held = shell_path(&held),
         fifo = shell_path(&fifo),
     );
     fixture.write_provider(&provider_script(
         "",
         &hook,
-        "batch-${OULIPOLY_AUTO_WAKE_COUNT:-manual}.txt",
+        "batch-${WU_D_PROVIDER_RESUME_INDEX}.txt",
     ));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime();
@@ -361,21 +362,12 @@ fi"#,
     }
     let output = fixture.run_resume();
     let manual_invocation = direct_unconfirmed_invocation(&output);
-    wait_until("count 2 held", || {
-        held.exists() && count2_pid.exists() && count2_token.exists()
-    });
-    let turn_id = format!("wu-d-delivery-{SESSION}-2");
-    let turn_name = Sha256::digest(turn_id.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        + ".jsonl";
-    assert!(
-        !fixture
-            .work_dir
-            .join("session-turns")
-            .join(turn_name)
-            .exists()
+    wait_until("count 2 held", || held.exists() && count2_pid.exists());
+    assert_eq!(
+        std::fs::read_dir(fixture.work_dir.join("session-turns"))
+            .unwrap()
+            .count(),
+        2
     );
     assert_eq!(fixture.mailbox().list_pending(SESSION).unwrap().len(), 5);
     let old_pid = std::fs::read_to_string(&count1_pid)
@@ -389,8 +381,6 @@ fi"#,
     wait_until("count 1 process identity gone", || {
         process_start(old_pid).as_deref() != Some(old_start.as_str())
     });
-    let old_token = std::fs::read_to_string(&count1_token).unwrap();
-    let renewed_token = std::fs::read_to_string(&count2_token).unwrap();
     let renewed_pid = std::fs::read_to_string(&count2_pid)
         .unwrap()
         .parse::<i64>()
@@ -401,8 +391,7 @@ fi"#,
         .wake_claim(SESSION)
         .unwrap()
         .unwrap();
-    assert_eq!(claim.claim_token, renewed_token);
-    assert_ne!(claim.claim_token, old_token);
+    assert!(!claim.claim_token.is_empty());
     assert_eq!(claim.wake_pid, Some(renewed_pid));
     assert_eq!(claim.auto_wake_count, 2);
     assert_eq!(invocation_count(&fixture), 3);
@@ -433,10 +422,10 @@ fi"#,
             .count(),
         1
     );
-    assert!(fixture.prompt_file("batch-manual.txt").exists());
     assert!(fixture.prompt_file("batch-1.txt").exists());
     assert!(fixture.prompt_file("batch-2.txt").exists());
-    assert!(!fixture.prompt_file("batch-3.txt").exists());
+    assert!(fixture.prompt_file("batch-3.txt").exists());
+    assert!(!fixture.prompt_file("batch-4.txt").exists());
     std::fs::write(&fifo, "release\n").unwrap();
     wait_until("renewed delivery settled", || {
         delivered_rows_without_pending_or_claim(&fixture, SESSION, 45)
@@ -495,11 +484,7 @@ fn process_start(pid: u32) -> Option<String> {
 pub(crate) fn persisted_count_at_five_allows_startup_sweep_delivery() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
-    fixture.write_provider(&provider_script(
-        "",
-        "",
-        "sweep-count-${OULIPOLY_AUTO_WAKE_COUNT:-missing}.txt",
-    ));
+    fixture.write_provider(&provider_script("", "", "sweep-count.txt"));
     fixture.seed_session_turn();
     fixture.seed_idle_runtime_with_wake_count(SESSION, 5);
     fixture.seed_mailbox_for(SESSION, "h-sweep-count", None);
@@ -508,7 +493,7 @@ pub(crate) fn persisted_count_at_five_allows_startup_sweep_delivery() {
     let output = fixture.run_mailbox_list(SESSION);
     assert_success(&output);
 
-    let prompt = wait_for_file(&fixture.prompt_file("sweep-count-6.txt"));
+    let prompt = wait_for_file(&fixture.prompt_file("sweep-count.txt"));
     assert_prompt_contains_handle(&prompt, "h-sweep-count");
     wait_until("count-five startup sweep delivery", || {
         delivered_single_row_without_error_or_claim(&fixture, SESSION)

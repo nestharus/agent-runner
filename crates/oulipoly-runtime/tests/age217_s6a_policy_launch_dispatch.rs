@@ -1531,6 +1531,48 @@ fn external_provider_launch_env_inherits_application_agnostic_parent_entries() {
 }
 
 #[test]
+fn external_provider_launch_env_removes_runner_private_auto_wake_entries() {
+    const PRIVATE_NAMES: [&str; 5] = [
+        "OULIPOLY_AUTO_WAKE",
+        "OULIPOLY_AUTO_WAKE_SESSION_ID",
+        "OULIPOLY_AUTO_WAKE_TOKEN",
+        "OULIPOLY_AUTO_WAKE_COUNT",
+        "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
+    ];
+
+    let _lock = env_lock();
+    let inherited = PRIVATE_NAMES.map(|name| (name, Some("inherited-private")));
+    let _env = EnvScope::set_optional(&inherited);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let mut model = external_model(&fixture);
+    model.providers[0].environment = PRIVATE_NAMES
+        .into_iter()
+        .map(|name| (name.to_string(), "configured-private".to_string()))
+        .collect();
+
+    execute_external_model_effective(model, None, HashMap::new(), None)
+        .expect("external dispatch should remove runner-private wake entries");
+
+    let policy = read_json(&fixture.policy_record_path);
+    let launch = read_json(&fixture.launch_record_path);
+    for env in provider_launch_envs(&policy, &launch) {
+        for name in PRIVATE_NAMES {
+            assert!(
+                env.get(name).is_none(),
+                "runner-private {name} must not cross the provider boundary"
+            );
+        }
+    }
+}
+
+#[test]
 fn external_provider_launch_env_applies_configured_removals_then_overlays() {
     const REMOVED_ENV: &str = "CONFIG_REMOVED_ENV";
     const OVERLAID_ENV: &str = "CONFIG_OVERLAID_ENV";

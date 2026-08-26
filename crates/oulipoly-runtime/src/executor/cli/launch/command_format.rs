@@ -21,7 +21,8 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::executor::cli::spawn_identity::{
-    provider_parent_invocation_env, split_invocation_launch_environment,
+    RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES, provider_parent_invocation_env,
+    split_invocation_launch_environment,
 };
 
 pub(super) fn command_from_parts(
@@ -44,6 +45,9 @@ pub(super) fn command_from_parts(
         cmd.env_remove(name);
     }
     cmd.envs(environment);
+    for name in RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES {
+        cmd.env_remove(name);
+    }
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -118,5 +122,37 @@ mod tests {
             Some(authority.process_environment_value())
         );
         assert!(!format!("{authority:?}").contains(authority.process_environment_value()));
+    }
+
+    #[test]
+    fn provider_launch_removes_runner_private_auto_wake_environment() {
+        let environment = RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES
+            .into_iter()
+            .map(|name| (name.to_string(), "private".to_string()))
+            .collect();
+
+        let command = command_from_parts(
+            &["provider".to_string()],
+            &[],
+            &environment,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let explicit_environment: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        for name in RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES {
+            assert_eq!(explicit_environment.get(name), Some(&None));
+        }
     }
 }
