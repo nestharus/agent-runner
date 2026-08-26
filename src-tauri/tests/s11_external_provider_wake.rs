@@ -463,6 +463,10 @@ fn trusted_submission_settles_mailbox_delivery_after_provider_nonzero() {
     assert_eq!(result["status"], "failed");
     assert_eq!(result["exit_code"], 29);
     assert_eq!(
+        result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    assert_eq!(
         fixture.latest_resume_acceptance().0.as_deref(),
         Some("accepted")
     );

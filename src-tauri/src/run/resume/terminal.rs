@@ -22,6 +22,9 @@ use crate::terminal_outcome_adapter::{
 };
 use crate::zero_turn_orchestration::{ZeroTurnAction, next_action};
 
+const ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON: &str =
+    "resume_prompt_accepted_provider_failed";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Age270MailboxEligibility {
     Ineligible,
@@ -74,6 +77,13 @@ pub(super) fn handle_resume_attempt_result(
     );
     let submitted_turn_confirmation = wake::validate_submitted_user_turn(input, result);
     wake::project_validated_submitted_turn_acceptance(result, submitted_turn_confirmation);
+    let mailbox_submission_confirmed_after_nonzero = result.exit_code != 0
+        && submitted_turn_confirmation.is_some()
+        && !classification.recovered_generic_nonzero
+        && !input.mailbox_delivery_seqs.is_empty();
+    if mailbox_submission_confirmed_after_nonzero {
+        result.terminal_reason = Some(ACCEPTED_PROMPT_PROVIDER_FAILED_TERMINAL_REASON.to_string());
+    }
     record_resume_acceptance_if_present(input, bound_attempt.attempt.invocation_row_id, result)?;
     emit_captured_child_marker_lines(&result.captured_child_invocations);
     let completion_evidence = wake::ResumeCompletionEvidence {
@@ -82,11 +92,7 @@ pub(super) fn handle_resume_attempt_result(
         submitted_turn_confirmation,
     };
     let provenance = classification.age270_mailbox_provenance;
-    let mailbox_delivery_outcome = if result.exit_code != 0
-        && submitted_turn_confirmation.is_some()
-        && !classification.recovered_generic_nonzero
-        && !input.mailbox_delivery_seqs.is_empty()
-    {
+    let mailbox_delivery_outcome = if mailbox_submission_confirmed_after_nonzero {
         Some(wake::MailboxDeliveryOutcome::Confirmed)
     } else {
         match age270_mailbox_eligibility_for_classification(
@@ -303,7 +309,10 @@ fn handle_resume_attempt_terminal_signal(
             recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
             terminal_completion_confirmed,
             mailbox_submission_confirmed_after_nonzero: result.exit_code != 0
-                && completion_evidence.submitted_turn_confirmation.is_some()
+                && matches!(
+                    mailbox_delivery_outcome,
+                    Some(wake::MailboxDeliveryOutcome::Confirmed)
+                )
                 && !completion_evidence.recovered_generic_nonzero
                 && !input.mailbox_delivery_seqs.is_empty(),
         },
