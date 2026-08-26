@@ -7,6 +7,8 @@ use std::marker::PhantomData;
 pub const CONTRACT_VERSION: &str = "oulipoly.provider/v1";
 pub const PROMPT_ACCEPTANCE_V1: &str = "oulipoly.prompt_acceptance/v1";
 pub const PROMPT_ACCEPTED_MARKER_V1: &str = "oulipoly.prompt_accepted/v1";
+pub const HOST_PROMPT_ACCEPTANCE_V1_ENV: &str = "OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1";
+pub const HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE: &str = "1";
 
 pub type JsonObject = BTreeMap<String, Value>;
 
@@ -31,6 +33,13 @@ pub struct HostContext {
     pub env: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline_unix_ms: Option<u64>,
+}
+
+pub fn host_requested_prompt_acceptance_v1(host: &HostContext) -> bool {
+    host.env
+        .get(HOST_PROMPT_ACCEPTANCE_V1_ENV)
+        .map(String::as_str)
+        == Some(HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

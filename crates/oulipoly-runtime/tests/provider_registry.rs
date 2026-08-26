@@ -1264,6 +1264,11 @@ fn describe_request_envelope_matches_provider_contract() {
         Some("oulipoly-agent-runner")
     );
     assert_eq!(
+        request["host"]["env"]["OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1"].as_str(),
+        Some("1"),
+        "new hosts must select the v1-compatible prompt-acceptance extension before a provider advertises it"
+    );
+    assert_eq!(
         request["host"]["config_root"].as_str(),
         None,
         "describe must not disclose host config roots to provider subprocesses"

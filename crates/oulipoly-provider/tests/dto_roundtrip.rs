@@ -5,10 +5,32 @@ pub mod support {
 use oulipoly_provider::generated as dto;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use support::contract_matrix::{
     LAUNCH_EVENT_ROWS, NON_LAUNCH_ROWS, fixtures, launch_event_fixture, launch_fixture,
     non_launch_fixture,
 };
+
+#[test]
+fn prompt_acceptance_capability_requires_explicit_v1_host_selection() {
+    let mut host = dto::HostContext {
+        app: "older-host".to_string(),
+        app_version: None,
+        platform: None,
+        working_directory: None,
+        config_root: None,
+        data_root: None,
+        env: BTreeMap::new(),
+        deadline_unix_ms: None,
+    };
+
+    assert!(!dto::host_requested_prompt_acceptance_v1(&host));
+    host.env.insert(
+        dto::HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
+        dto::HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE.to_string(),
+    );
+    assert!(dto::host_requested_prompt_acceptance_v1(&host));
+}
 
 #[test]
 fn dto_roundtrip_covers_every_s2_contract_type() {

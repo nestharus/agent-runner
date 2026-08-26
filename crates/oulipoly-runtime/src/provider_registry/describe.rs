@@ -2,7 +2,8 @@ use super::{ProviderClientFactory, ProviderRegistryError};
 use oulipoly_provider::client::{CancellationToken, ProviderEnv};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::{
-    CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HostContext,
+    CONTRACT_VERSION, DescribeRequest, DescribeResult, EmptyParams, HOST_PROMPT_ACCEPTANCE_V1_ENV,
+    HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE, HostContext,
 };
 use oulipoly_provider::resolver::ProviderArtifactRef;
 use serde_json::Value;
@@ -45,6 +46,10 @@ fn invoke_describe(
 }
 
 fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, ProviderRegistryError> {
+    let env = BTreeMap::from([(
+        HOST_PROMPT_ACCEPTANCE_V1_ENV.to_string(),
+        HOST_PROMPT_ACCEPTANCE_V1_ENV_VALUE.to_string(),
+    )]);
     serde_json::to_value(DescribeRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: format!("provider-registry-{}", uuid::Uuid::new_v4()),
@@ -56,7 +61,7 @@ fn describe_request(_host_options: &DescribeHostOptions) -> Result<Value, Provid
             working_directory: None,
             config_root: None,
             data_root: None,
-            env: BTreeMap::new(),
+            env,
             deadline_unix_ms: None,
         },
         params: EmptyParams {},
