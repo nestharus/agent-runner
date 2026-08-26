@@ -153,6 +153,7 @@ fn attempt_account_dispatch(
         .map_err(classify_provider_client_attempt_error)?;
     let candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
+    let prompt_acceptance_v1 = prompt_acceptance_v1 && candidate.prompt_acceptance.is_some();
     let launch_request = build_launch_request(
         context,
         &candidate,

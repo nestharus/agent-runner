@@ -23,6 +23,7 @@
     },
     "PolicyEvaluateResult": {
       "type": "object",
+      "description": "Accepted replacements remain independently effective launch inputs. If argv, stdin, or prompt changes bytes, the host invalidates its exact-prompt acceptance fact and omits prompt acceptance from the resulting launch request; byte-identical replacements retain that fact.",
       "properties": {
         "accepted": { "type": "boolean" },
         "argv": { "type": "array", "items": { "type": "string" } },

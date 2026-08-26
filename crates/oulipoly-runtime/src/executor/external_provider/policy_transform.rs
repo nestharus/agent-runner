@@ -32,10 +32,19 @@ fn apply_accepted_policy_transform(
     mut candidate: LaunchCandidate,
     result: PolicyEvaluateResult,
 ) -> LaunchCandidate {
+    let original_argv = candidate.argv.clone();
+    let original_stdin = candidate.stdin.clone();
+    let original_prompt = candidate.prompt.clone();
     let argv_transformed = apply_optional_argv(&mut candidate, result.argv);
     apply_optional_env(&mut candidate, result.env);
     apply_optional_stdin(&mut candidate, result.stdin);
     apply_optional_prompt(&mut candidate, result.prompt, argv_transformed);
+    if candidate.argv != original_argv
+        || candidate.stdin != original_stdin
+        || candidate.prompt != original_prompt
+    {
+        candidate.prompt_acceptance = None;
+    }
     candidate
 }
 
@@ -65,13 +74,8 @@ fn apply_optional_prompt(
     argv_transformed: bool,
 ) {
     if let Some(prompt) = prompt {
-        let prompt_changed = prompt != candidate.prompt;
         rewrite_arg_prompt_if_needed(candidate, &prompt, argv_transformed);
         candidate.prompt = prompt;
-        if prompt_changed {
-            // Acceptance of replacement text cannot prove delivery of the original batch.
-            candidate.mailbox_delivery_correlation = None;
-        }
     }
 }
 
@@ -115,26 +119,39 @@ fn replace_prompt_arg(target: &mut String, next: &str) {
 #[cfg(test)]
 mod tests {
     use super::apply_policy_transform;
-    use crate::executor::external_provider::request_builder::LaunchCandidate;
+    use crate::executor::external_provider::request_builder::{
+        LaunchCandidate, PromptAcceptanceCandidate,
+    };
     use crate::services::MailboxDeliveryCorrelation;
     use oulipoly_config::PromptMode;
     use oulipoly_provider::generated::PolicyEvaluateResult;
     use std::collections::BTreeMap;
 
-    #[test]
-    fn prompt_replacement_clears_mailbox_delivery_correlation() {
-        let candidate = LaunchCandidate {
-            argv: vec!["provider".to_string(), "original".to_string()],
+    fn launch_candidate(
+        argv: &[&str],
+        stdin: Option<&str>,
+        prompt_mode: PromptMode,
+    ) -> LaunchCandidate {
+        LaunchCandidate {
+            argv: argv.iter().map(|value| (*value).to_string()).collect(),
             env: BTreeMap::new(),
-            stdin: None,
+            stdin: stdin.map(str::to_string),
             prompt: "original".to_string(),
-            prompt_mode: PromptMode::Arg,
+            prompt_mode,
             working_directory: ".".to_string(),
-            mailbox_delivery_correlation: Some(MailboxDeliveryCorrelation {
-                delivery_nonce: "delivery-123".to_string(),
+            prompt_acceptance: Some(PromptAcceptanceCandidate {
+                prompt: "original".to_string(),
+                mailbox_delivery_correlation: Some(MailboxDeliveryCorrelation {
+                    delivery_nonce: "delivery-123".to_string(),
+                }),
             }),
             completion_registration_authority: None,
-        };
+        }
+    }
+
+    #[test]
+    fn prompt_replacement_clears_mailbox_delivery_correlation() {
+        let candidate = launch_candidate(&["provider", "original"], None, PromptMode::Arg);
         let transformed = apply_policy_transform(
             candidate,
             PolicyEvaluateResult {
@@ -150,6 +167,77 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.prompt, "replacement");
-        assert_eq!(transformed.mailbox_delivery_correlation, None);
+        assert_eq!(transformed.prompt_acceptance, None);
+    }
+
+    #[test]
+    fn argv_replacement_clears_mailbox_delivery_correlation() {
+        let candidate = launch_candidate(&["provider", "original"], None, PromptMode::Arg);
+        let transformed = apply_policy_transform(
+            candidate,
+            PolicyEvaluateResult {
+                accepted: true,
+                argv: Some(vec!["provider".to_string(), "replacement".to_string()]),
+                env: None,
+                stdin: None,
+                prompt: None,
+                diagnostics: Vec::new(),
+                markers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(transformed.prompt_acceptance, None);
+    }
+
+    #[test]
+    fn stdin_replacement_clears_mailbox_delivery_correlation() {
+        let candidate = launch_candidate(&["provider"], Some("original"), PromptMode::Stdin);
+        let transformed = apply_policy_transform(
+            candidate,
+            PolicyEvaluateResult {
+                accepted: true,
+                argv: None,
+                env: None,
+                stdin: Some("replacement".to_string()),
+                prompt: None,
+                diagnostics: Vec::new(),
+                markers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(transformed.prompt_acceptance, None);
+    }
+
+    #[test]
+    fn byte_identical_carriers_retain_prompt_acceptance_eligibility() {
+        let candidate = launch_candidate(&["provider"], Some("original"), PromptMode::Stdin);
+        let transformed = apply_policy_transform(
+            candidate,
+            PolicyEvaluateResult {
+                accepted: true,
+                argv: Some(vec!["provider".to_string()]),
+                env: Some(BTreeMap::from([(
+                    "POLICY_ENV".to_string(),
+                    "changed".to_string(),
+                )])),
+                stdin: Some("original".to_string()),
+                prompt: Some("original".to_string()),
+                diagnostics: Vec::new(),
+                markers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            transformed.prompt_acceptance,
+            Some(PromptAcceptanceCandidate {
+                prompt: "original".to_string(),
+                mailbox_delivery_correlation: Some(MailboxDeliveryCorrelation {
+                    delivery_nonce: "delivery-123".to_string(),
+                }),
+            })
+        );
     }
 }

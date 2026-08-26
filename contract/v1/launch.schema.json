@@ -16,7 +16,10 @@
         "env": { "$ref": "common.schema.json#/$defs/StringMap" },
         "stdin": { "$ref": "common.schema.json#/$defs/BytePayload" },
         "session": { "$ref": "#/$defs/LaunchSession" },
-        "prompt_acceptance": { "$ref": "#/$defs/PromptAcceptanceRequestV1" }
+        "prompt_acceptance": {
+          "description": "Present only when the host has one authoritative exact-prompt fact after policy evaluation. The host omits this property when policy changes argv, stdin, or prompt bytes.",
+          "$ref": "#/$defs/PromptAcceptanceRequestV1"
+        }
       },
       "required": ["settings_id", "mode", "model", "argv", "working_directory"],
       "additionalProperties": false

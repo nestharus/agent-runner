@@ -7,6 +7,7 @@
 //! - mapper: derives sidecar metadata from the existing parent-invocation env
 //!   payload threaded through executor launches.
 
+use oulipoly_core::AUTO_WAKE_ENV;
 use oulipoly_state::CompositeInvocationId;
 use oulipoly_state::mailbox::{
     AdvanceRuntimeGenerationDrain, AttachRuntimeGenerationSession, BindRuntimeGenerationRunning,
@@ -22,14 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
-pub(crate) const RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES: [&str; 5] = [
-    AUTO_WAKE_ENV,
-    "OULIPOLY_AUTO_WAKE_SESSION_ID",
-    "OULIPOLY_AUTO_WAKE_TOKEN",
-    "OULIPOLY_AUTO_WAKE_COUNT",
-    "OULIPOLY_AUTO_WAKE_RETRY_BASE_MS",
-];
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
 const CHILD_CUSTODY_TEST_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 

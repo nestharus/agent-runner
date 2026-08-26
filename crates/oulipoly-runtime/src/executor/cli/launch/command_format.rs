@@ -21,9 +21,9 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::executor::cli::spawn_identity::{
-    RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES, provider_parent_invocation_env,
-    split_invocation_launch_environment,
+    provider_parent_invocation_env, split_invocation_launch_environment,
 };
+use oulipoly_core::RUNNER_PRIVATE_AUTO_WAKE_ENV_NAMES;
 
 pub(super) fn command_from_parts(
     parts: &[String],
