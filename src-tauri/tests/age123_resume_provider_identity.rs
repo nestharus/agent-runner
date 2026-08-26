@@ -506,6 +506,53 @@ fn successful_resume_records_resolved_provider_identity() {
 }
 
 #[test]
+fn resumed_provider_observes_exact_durable_admission_before_launch() {
+    let fixture = Fixture::new();
+    fixture.write_resume_pool(
+        "age123-resume",
+        &[
+            ProviderFixture {
+                name: "provider-a",
+                body: "printf '%s\\n' 'unexpected provider a launch' >&2\nexit 99",
+            },
+            ProviderFixture {
+                name: "provider-b",
+                body: r#"python3 - <<'PY'
+import os
+import sqlite3
+
+path = os.path.join(os.environ["XDG_DATA_HOME"], "oulipoly-agent-runner", "pid-identity.db")
+connection = sqlite3.connect(path)
+rows = connection.execute(
+    "SELECT session_id, state FROM session_admission_queue WHERE state = 'launching'"
+).fetchall()
+assert rows == [("6169694d-de0f-40d1-890c-6e28e55bab28", "launching")], rows
+PY
+printf '%s\n' 'resume admission observed'
+exit 0"#,
+            },
+        ],
+    );
+    fixture.seed_rotated_chain("provider-a", "provider-b");
+
+    let output = fixture.run_resume(CHAIN_ID);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let connection = Connection::open(fixture.sidecar_path()).unwrap();
+    let (session_id, state, generation): (Option<String>, String, Option<String>) = connection
+        .query_row(
+            "SELECT session_id, state, runtime_generation_uuid
+             FROM session_admission_queue",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(session_id.as_deref(), Some(SESSION_B));
+    assert_eq!(state, "settled");
+    assert!(generation.is_some());
+}
+
+#[test]
 fn quota_retry_records_resolved_provider_identity_per_attempt() {
     let fixture = Fixture::new();
     fixture.write_resume_pool(

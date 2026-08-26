@@ -13,11 +13,11 @@
 
 use super::live_session_binding::LiveSessionBindingServer;
 use super::spawn_identity::{
-    SpawnIdentityContext, mark_runtime_generation_exited,
-    mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
-    record_child_identity, register_runtime_generation_starting,
+    ChildGenerationCustody, SpawnIdentityContext, child_custody_test_fault,
+    mark_runtime_generation_spawn_failed, record_child_identity,
+    register_runtime_generation_starting,
 };
-use super::terminal_signal::{InteractiveSignalGuard, exit_code_from_status};
+use super::terminal_signal::exit_code_from_status;
 use crate::observability::{
     ObservabilityRoot, ObservabilitySnapshotPort, ProductionObservabilitySnapshotService,
 };
@@ -25,7 +25,7 @@ use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::SessionProviderIdentity;
 use chrono::{SecondsFormat, Utc};
 use oulipoly_config::ProviderConfig;
-use oulipoly_state::mailbox::{LegacyRuntimeProjectionSettlement, MailboxDb, MailboxRow};
+use oulipoly_state::mailbox::{MailboxDb, MailboxRow};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
@@ -75,6 +75,14 @@ const OVERLAY_INPUT_TRACE_MAX_BYTES: u64 = 1024 * 1024;
 const OVERLAY_INPUT_TRACE_FILE: &str = "overlay-input-trace.log";
 const OVERLAY_INPUT_TRACE_ROTATED_FILE: &str = "overlay-input-trace.log.1";
 const BOUNDARY_PROBE_MAX_BYTES: usize = 16;
+// Integration-only fault controls are inert unless explicitly supplied to the broker process.
+const PTY_DELIVERY_TEST_FAULT_ENV: &str = "OULIPOLY_PTY_DELIVERY_TEST_FAULT";
+const PTY_DELIVERY_AFTER_CONFIRM_TEST_BARRIER_ENV: &str =
+    "OULIPOLY_PTY_DELIVERY_AFTER_CONFIRM_TEST_BARRIER";
+
+pub(super) struct InteractiveChildExit {
+    pub(super) status: ExitStatus,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtyControlClientErrorKind {
@@ -222,7 +230,7 @@ pub(super) fn execute_interactive_child(
     provider: &ProviderConfig,
     context: Option<&SpawnIdentityContext>,
     mut live_session_server: Option<LiveSessionBindingServer>,
-) -> Result<ExitStatus, String> {
+) -> Result<InteractiveChildExit, String> {
     let real_tty = RealTerminal::open()?;
     let winsize = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
     let pty = PtyPair::open(&winsize, &real_tty.original)?;
@@ -236,43 +244,36 @@ pub(super) fn execute_interactive_child(
     });
     let generation_context = recorded_context.as_ref().or(context);
     register_runtime_generation_starting(generation_context)?;
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             let _ = mark_runtime_generation_spawn_failed(generation_context);
             return Err(format_provider_spawn_error(&provider.command, err));
         }
     };
+    let mut custody = ChildGenerationCustody::new(child, generation_context)?;
     if let Some(control) = control.as_mut() {
         control.mark_child_spawned();
     }
-    let generation = match record_child_identity(child.id(), generation_context) {
-        Ok(generation) => generation,
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = mark_runtime_generation_exited(generation_context, None);
-            return Err(err);
-        }
-    };
+    let generation = record_child_identity(custody.child().id(), generation_context)?;
     if let (Some(server), Some(context), Some(generation)) =
         (live_session_server.as_mut(), generation_context, generation)
-        && let Err(err) = server.start(context.clone(), generation)
     {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = mark_runtime_generation_exited(generation_context, None);
-        return Err(err);
+        server.start(context.clone(), generation);
     }
-    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context, live_session_state);
     drop(pty.slave);
 
-    let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
+    child_custody_test_fault("plain_signal_install")?;
+    custody.install_signal_forwarding()?;
+    child_custody_test_fault("plain_raw_terminal")?;
     let mut raw_tty = real_tty.into_raw_mode()?;
-    let status = relay_until_exit(&mut raw_tty, &pty.master, control.as_ref(), &mut child)?;
-    idle_guard.exit_code = Some(exit_code_from_status(&status));
-    drop(signal_guard);
-    Ok(status)
+    child_custody_test_fault("plain_relay")?;
+    let status = relay_until_exit(&mut raw_tty, &pty.master, control.as_ref(), &mut custody)?;
+    custody.observe_exit()?;
+    let exit_code = Some(exit_code_from_status(&status));
+    drop(raw_tty);
+    custody.complete_orderly(exit_code, exit_code)?;
+    Ok(InteractiveChildExit { status })
 }
 
 /// Launch the interactive child inside the split-pane observability TUI.
@@ -287,7 +288,7 @@ pub(super) fn execute_interactive_child_observed(
     context: Option<&SpawnIdentityContext>,
     provider_inspect: Option<&ProviderInspectMonitorContext>,
     mut live_session_server: Option<LiveSessionBindingServer>,
-) -> Result<ExitStatus, String> {
+) -> Result<InteractiveChildExit, String> {
     let real_tty = RealTerminal::open()?;
     let full = terminal_winsize(real_tty.fd()).map_err(format_terminal_window_size_error)?;
     let child_winsize = tui::top_pane_winsize(&full);
@@ -310,57 +311,53 @@ pub(super) fn execute_interactive_child_observed(
     });
     let generation_context = recorded_context.as_ref().or(context);
     register_runtime_generation_starting(generation_context)?;
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             let _ = mark_runtime_generation_spawn_failed(generation_context);
             return Err(format_provider_spawn_error(&provider.command, err));
         }
     };
+    let mut custody = ChildGenerationCustody::new(child, generation_context)?;
     if let Some(control) = control.as_mut() {
         control.mark_child_spawned();
     }
-    let generation = match record_child_identity(child.id(), generation_context) {
-        Ok(generation) => generation,
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = mark_runtime_generation_exited(generation_context, None);
-            return Err(err);
-        }
-    };
+    let generation = record_child_identity(custody.child().id(), generation_context)?;
     if let (Some(server), Some(context), Some(generation)) =
         (live_session_server.as_mut(), generation_context, generation)
-        && let Err(err) = server.start(context.clone(), generation)
     {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = mark_runtime_generation_exited(generation_context, None);
-        return Err(err);
+        server.start(context.clone(), generation);
     }
-    let mut idle_guard = SessionRuntimeIdleGuard::new(generation_context, live_session_state);
     drop(pty.slave);
 
-    let signal_guard = InteractiveSignalGuard::install_process_group(child.id())?;
+    child_custody_test_fault("observed_signal_install")?;
+    custody.install_signal_forwarding()?;
+    child_custody_test_fault("observed_raw_terminal")?;
     let raw_tty = real_tty.into_raw_mode()?;
+    child_custody_test_fault("observed_writer_clone")?;
     let writer = raw_tty
         .writer_clone()
         .map_err(format_tui_writer_clone_error)?;
     let root = observability_root(provider, context);
+    child_custody_test_fault("observed_relay")?;
     let status = tui::relay_until_exit_observed(
         raw_tty.fd(),
         writer,
         &pty.master,
         control.as_ref(),
-        &mut child,
+        &mut custody,
         monitor,
         root,
         outbound_source,
     );
-    idle_guard.exit_code = status.as_ref().ok().map(exit_code_from_status);
-    drop(signal_guard);
+    if status.is_ok() {
+        custody.observe_exit()?;
+    }
     drop(raw_tty);
-    status
+    let status = status?;
+    let exit_code = Some(exit_code_from_status(&status));
+    custody.complete_orderly(exit_code, exit_code)?;
+    Ok(InteractiveChildExit { status })
 }
 
 fn format_terminal_window_size_error(err: io::Error) -> String {
@@ -1269,82 +1266,11 @@ fn unlink_owned_socket(path: &Path, owned_dir: &Path) {
     }
 }
 
-struct SessionRuntimeIdleGuard {
-    context: Option<SpawnIdentityContext>,
-    session_id: Option<String>,
-    invocation_uuid: Option<String>,
-    live_session_id: Option<Arc<Mutex<Option<String>>>>,
-    exit_code: Option<i32>,
-}
-
-impl SessionRuntimeIdleGuard {
-    fn new(
-        context: Option<&SpawnIdentityContext>,
-        live_session_id: Option<Arc<Mutex<Option<String>>>>,
-    ) -> Self {
-        Self {
-            context: context.cloned(),
-            session_id: context
-                .and_then(SpawnIdentityContext::session_id)
-                .map(str::to_string),
-            invocation_uuid: context.map(|context| context.invocation_uuid().to_string()),
-            live_session_id,
-            exit_code: None,
-        }
-    }
-}
-
-impl Drop for SessionRuntimeIdleGuard {
-    fn drop(&mut self) {
-        if self.exit_code.is_some() {
-            let _ = mark_runtime_generation_orderly_completed(
-                self.context.as_ref(),
-                self.exit_code,
-                self.exit_code,
-            );
-        } else {
-            let _ = mark_runtime_generation_exited(self.context.as_ref(), self.exit_code);
-        }
-        if self.context.is_some() {
-            return;
-        }
-        let session_id = self.session_id.clone().or_else(|| {
-            self.live_session_id
-                .as_ref()
-                .and_then(|state| state.lock().ok()?.clone())
-        });
-        let (Some(session_id), Some(invocation_uuid)) = (session_id, &self.invocation_uuid) else {
-            return;
-        };
-        if let Some(context) = self.context.as_ref()
-            && let Ok(mut db) = context.open_mailbox()
-        {
-            if db
-                .accepted_delivery_attempt_windows(&session_id)
-                .is_ok_and(|windows| {
-                    windows.iter().any(|window| {
-                        window.delivery_invocation_uuid.as_str() == invocation_uuid.as_str()
-                    })
-                })
-            {
-                return;
-            }
-            let _ = db.wake_sessions().settle_legacy_runtime_projection(
-                LegacyRuntimeProjectionSettlement {
-                    session_id: &session_id,
-                    invocation_uuid,
-                    last_exit_code: self.exit_code,
-                },
-            );
-        }
-    }
-}
-
 fn relay_until_exit(
     real_tty: &mut RawTerminalGuard,
     master: &File,
     control: Option<&ControlSocket>,
-    child: &mut std::process::Child,
+    custody: &mut ChildGenerationCustody<'_>,
 ) -> Result<ExitStatus, String> {
     let mut line_state = InputLineState::default();
     let mut current_winsize = terminal_winsize(real_tty.fd()).ok();
@@ -1356,7 +1282,7 @@ fn relay_until_exit(
         maybe_propagate_winsize(
             real_tty.fd(),
             master.as_raw_fd(),
-            child.id(),
+            custody.child().id(),
             &mut current_winsize,
         );
         let ready = poll_relay_fds(
@@ -1384,14 +1310,14 @@ fn relay_until_exit(
         {
             let mut request_io = ControlRequestIo {
                 master_fd: master.as_raw_fd(),
-                child_pid: Some(child.id()),
+                child_pid: Some(custody.child().id()),
                 line_state: &mut line_state,
                 child_output_state: &mut child_output_state,
                 pending_child_input: &mut pending_child_input,
             };
             let _ = handle_control_request(control, &mut request_io);
         }
-        status = child.try_wait().map_err(format_child_poll_error)?;
+        status = custody.try_wait().map_err(format_child_poll_error)?;
     }
     drain_pty_output(master.as_raw_fd(), real_tty.fd(), &mut buffer)?;
     Ok(status.expect("status checked above"))
@@ -2134,6 +2060,14 @@ struct ControlRequestIo<'a> {
 struct PreparedControlPayload {
     bytes: Vec<u8>,
     delivery_attempt_id: Option<String>,
+    submission_started: bool,
+    submission_uncertain: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlPayloadOutcome {
+    Accepted(Option<String>),
+    SubmissionUncertain(String),
 }
 
 struct ControlRequest {
@@ -2188,10 +2122,15 @@ fn format_control_write_timeout_error(err: io::Error) -> String {
     format!("Failed to set PTY control write timeout: {err}")
 }
 
-fn control_response_parts(response: Result<Option<String>, String>) -> (bool, String) {
+fn control_response_parts(response: Result<ControlPayloadOutcome, String>) -> (bool, String) {
     match response {
-        Ok(Some(delivery_nonce)) => (true, pty_delivery_ack_message(&delivery_nonce)),
-        Ok(None) => (true, "ok".to_string()),
+        Ok(ControlPayloadOutcome::Accepted(Some(delivery_nonce))) => {
+            (true, pty_delivery_ack_message(&delivery_nonce))
+        }
+        Ok(ControlPayloadOutcome::Accepted(None)) => (true, "ok".to_string()),
+        Ok(ControlPayloadOutcome::SubmissionUncertain(delivery_nonce)) => {
+            (true, pty_delivery_uncertain_message(&delivery_nonce))
+        }
         Err(message) => (false, message),
     }
 }
@@ -2230,18 +2169,21 @@ fn process_control_request_with_pending(
     stream: &mut UnixStream,
     io: &mut ControlRequestIo<'_>,
     expected_target: Option<(&str, &str)>,
-) -> Result<Option<String>, String> {
+) -> Result<ControlPayloadOutcome, String> {
     validate_control_request_peer(stream)?;
     let request = read_control_request_payload(stream)?;
-    let payload = prepare_control_payload(require_inject_operation(request)?, expected_target)?;
+    let mut payload = prepare_control_payload(require_inject_operation(request)?, expected_target)?;
     if payload.bytes.is_empty() {
-        acknowledge_control_payload(&payload)?;
-        return Ok(payload.delivery_attempt_id);
+        if payload.submission_uncertain {
+            return Ok(submission_uncertain_outcome(&payload));
+        }
+        return settle_control_payload(&payload);
     }
-    submit_control_request_payload(io.pending_child_input, &payload.bytes);
-    io.line_state.mark_submitted();
-    acknowledge_control_payload(&payload)?;
-    Ok(payload.delivery_attempt_id)
+    begin_control_payload_submission(&mut payload)?;
+    if submit_plain_control_payload(io, &payload.bytes).is_err() {
+        return Ok(submission_uncertain_outcome(&payload));
+    }
+    settle_control_payload(&payload)
 }
 
 fn prepare_control_payload(
@@ -2252,32 +2194,33 @@ fn prepare_control_payload(
         return Ok(PreparedControlPayload {
             bytes: payload,
             delivery_attempt_id: None,
+            submission_started: false,
+            submission_uncertain: false,
         });
     };
     let Some(db) = MailboxDb::open_default_if_exists()? else {
-        return Ok(PreparedControlPayload {
-            bytes: payload,
-            delivery_attempt_id: None,
-        });
+        return Err("mailbox_delivery_attempt_unavailable".to_string());
     };
     let Some(window) = db.delivery_attempt_window(&attempt_id)? else {
-        return Ok(PreparedControlPayload {
-            bytes: payload,
-            delivery_attempt_id: None,
-        });
+        return Err("mailbox_delivery_attempt_unavailable".to_string());
     };
     if let Some((session_id, invocation_uuid)) = expected_target
         && (window.session_id != session_id || window.delivery_invocation_uuid != invocation_uuid)
     {
         return Err("mailbox_delivery_target_mismatch".to_string());
     }
-    if window.rows.is_empty() {
-        return Ok(PreparedControlPayload {
-            bytes: Vec::new(),
-            delivery_attempt_id: None,
-        });
-    }
     if window.resolved_at.is_some() {
+        if window.acknowledged_at.is_some() {
+            return Ok(PreparedControlPayload {
+                bytes: Vec::new(),
+                delivery_attempt_id: Some(attempt_id),
+                submission_started: true,
+                submission_uncertain: false,
+            });
+        }
+        return Err("mailbox_delivery_stale".to_string());
+    }
+    if window.rows.is_empty() {
         return Err("mailbox_delivery_stale".to_string());
     }
     if window.acknowledged_at.is_none()
@@ -2288,7 +2231,7 @@ fn prepare_control_payload(
     {
         return Err("mailbox_delivery_owned".to_string());
     }
-    let bytes = if window.acknowledged_at.is_some() {
+    let bytes = if window.submission_started_at.is_some() {
         Vec::new()
     } else {
         render_mailbox_notification_envelope(&window.rows, window.remaining_count, &attempt_id)
@@ -2297,7 +2240,55 @@ fn prepare_control_payload(
     Ok(PreparedControlPayload {
         bytes,
         delivery_attempt_id: Some(attempt_id),
+        submission_started: window.submission_started_at.is_some(),
+        submission_uncertain: window.submission_started_at.is_some()
+            && window.acknowledged_at.is_none(),
     })
+}
+
+fn begin_control_payload_submission(payload: &mut PreparedControlPayload) -> Result<(), String> {
+    let Some(attempt_id) = payload.delivery_attempt_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+        return Err("Mailbox sidecar disappeared before delivery submission".to_string());
+    };
+    if !db.begin_delivery_attempt_submission(attempt_id)? {
+        return Err(format!(
+            "Mailbox delivery attempt {attempt_id} could not start submission"
+        ));
+    }
+    payload.submission_started = true;
+    Ok(())
+}
+
+fn submission_uncertain_outcome(payload: &PreparedControlPayload) -> ControlPayloadOutcome {
+    ControlPayloadOutcome::SubmissionUncertain(
+        payload
+            .delivery_attempt_id
+            .clone()
+            .expect("submission uncertainty requires a delivery attempt"),
+    )
+}
+
+fn settle_control_payload(
+    payload: &PreparedControlPayload,
+) -> Result<ControlPayloadOutcome, String> {
+    if payload.submission_uncertain {
+        return Ok(submission_uncertain_outcome(payload));
+    }
+    match acknowledge_control_payload(payload) {
+        Ok(()) => Ok(ControlPayloadOutcome::Accepted(
+            payload.delivery_attempt_id.clone(),
+        )),
+        Err(_) if payload.submission_started => Ok(ControlPayloadOutcome::SubmissionUncertain(
+            payload
+                .delivery_attempt_id
+                .clone()
+                .expect("submission state requires a delivery attempt"),
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), String> {
@@ -2307,8 +2298,8 @@ fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), S
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("Mailbox sidecar disappeared while acknowledging delivery".to_string());
     };
-    let acknowledged = db.record_delivery_attempt_transport_ack(attempt_id)?;
-    if acknowledged && db.confirm_delivery_attempt(attempt_id)? {
+    if db.confirm_delivery_attempt(attempt_id)? {
+        wait_at_pty_delivery_after_confirm_test_barrier()?;
         return Ok(());
     }
     if matches!(
@@ -2320,6 +2311,34 @@ fn acknowledge_control_payload(payload: &PreparedControlPayload) -> Result<(), S
     Err(format!(
         "Mailbox delivery attempt {attempt_id} could not be confirmed"
     ))
+}
+
+pub fn pty_delivery_uncertain_message(delivery_nonce: &str) -> String {
+    format!("delivery_submission_uncertain:{delivery_nonce}")
+}
+
+#[cfg(test)]
+fn seed_test_mailbox_delivery(data_dir: &Path, attempt_id: &str) -> PathBuf {
+    let path = data_dir.join("pid-identity.db");
+    let mut db = MailboxDb::open(&path).unwrap();
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO mailbox (
+                session_id, kind, handle, payload_json, enqueued_at,
+                state_dir, meta_path, log_path, rc_path, rc
+             ) VALUES (
+                'session-a', 'agent_bash_complete', ?1, '{}',
+                '2026-08-25T00:00:00Z', '/tmp/state', '/tmp/meta',
+                '/tmp/log', '/tmp/rc', 0
+             )",
+            rusqlite::params![format!("handle-{attempt_id}")],
+        )
+        .unwrap();
+    let seq = connection.last_insert_rowid();
+    db.register_delivery_attempt(attempt_id, "session-a", "invocation-a", &[seq], 0)
+        .unwrap();
+    path
 }
 
 fn delivery_attempt_id(payload: &[u8]) -> Option<String> {
@@ -2335,12 +2354,99 @@ fn validate_control_request_peer(stream: &UnixStream) -> Result<(), String> {
     validate_peer_uid(stream)
 }
 
-fn submit_control_request_payload(pending_child_input: &mut PendingChildInput, payload: &[u8]) {
+fn submit_plain_control_payload(
+    io: &mut ControlRequestIo<'_>,
+    payload: &[u8],
+) -> Result<(), String> {
     // Submit with a carriage return (`\r`), the byte the Enter key sends. Raw-mode TUI
     // children submit on `\r` and treat `\n` as a literal newline, so a `\n` here would
     // leave the payload sitting unsubmitted in the input box. Cooked-mode children still
     // submit because the pty's `ICRNL` maps the incoming `\r` to `\n`.
-    queue_control_injection(pending_child_input, payload, false, true);
+    queue_control_injection(io.pending_child_input, payload, false, false);
+    drain_plain_control_payload(
+        io.master_fd,
+        io.pending_child_input,
+        PlainControlSubmitDrainPhase::Body,
+    )?;
+    io.pending_child_input.enqueue(b"\r");
+    io.line_state.mark_submitted();
+    drain_plain_control_payload(
+        io.master_fd,
+        io.pending_child_input,
+        PlainControlSubmitDrainPhase::Delimiter,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PlainControlSubmitDrainPhase {
+    Body,
+    Delimiter,
+}
+
+impl PlainControlSubmitDrainPhase {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Body => "body",
+            Self::Delimiter => "delimiter",
+        }
+    }
+}
+
+fn drain_plain_control_payload(
+    master_fd: RawFd,
+    pending_child_input: &mut PendingChildInput,
+    phase: PlainControlSubmitDrainPhase,
+) -> Result<(), String> {
+    pty_delivery_test_fault(&format!("plain_{}_drain", phase.token()))?;
+    let start = Instant::now();
+    while !pending_child_input.is_empty() {
+        if start.elapsed() >= INJECT_WAIT_LIMIT {
+            return Err(format!("control_submit_{}_drain_timeout", phase.token()));
+        }
+        let mut pollfd = poll_master_fd(master_fd, true);
+        poll_fds(
+            std::slice::from_mut(&mut pollfd),
+            format_control_submit_poll_error,
+        )?;
+        if writable(pollfd.revents) {
+            flush_pending_child_input(master_fd, pending_child_input).map_err(|error| {
+                format!("control_submit_{}_drain_failed:{error}", phase.token())
+            })?;
+        } else if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(format!("control_submit_{}_pty_closed", phase.token()));
+        }
+    }
+    Ok(())
+}
+
+fn pty_delivery_test_fault(token: &str) -> Result<(), String> {
+    if std::env::var(PTY_DELIVERY_TEST_FAULT_ENV).ok().as_deref() == Some(token) {
+        return Err(format!("injected_{token}_failure"));
+    }
+    Ok(())
+}
+
+fn wait_at_pty_delivery_after_confirm_test_barrier() -> Result<(), String> {
+    let Some(directory) = std::env::var_os(PTY_DELIVERY_AFTER_CONFIRM_TEST_BARRIER_ENV) else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Failed to create PTY delivery test barrier: {error}"))?;
+    fs::write(directory.join("ready"), b"ready")
+        .map_err(|error| format!("Failed to signal PTY delivery test barrier: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if directory.join("release").exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err("Timed out waiting at PTY delivery test barrier".to_string())
+}
+
+fn format_control_submit_poll_error(error: io::Error) -> String {
+    format!("Failed to poll PTY before control submit: {error}")
 }
 
 fn read_control_request_payload(stream: &mut UnixStream) -> Result<ControlRequest, String> {
@@ -2758,8 +2864,222 @@ mod tests {
         ModelConfig, PromptMode, ProviderConfig, ProvidersConfig,
         provider_implementation_ref::ProviderImplementationRef,
     };
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
+
+    struct DataDirOverride {
+        prior: Option<OsString>,
+    }
+
+    impl DataDirOverride {
+        fn install(path: &Path) -> Self {
+            let prior = std::env::var_os("OULIPOLY_DATA_DIR");
+            unsafe { std::env::set_var("OULIPOLY_DATA_DIR", path) };
+            Self { prior }
+        }
+    }
+
+    impl Drop for DataDirOverride {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prior.as_ref() {
+                    Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                    None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_relay_retains_one_submission_when_confirmation_fails_after_drain() {
+        let _env_lock = crate::test_support::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(dir.path());
+        let attempt_id = "plain-fault-attempt";
+        let path = seed_test_mailbox_delivery(dir.path(), attempt_id);
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_plain_confirmation
+                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected plain confirmation failure'); END;",
+            )
+            .unwrap();
+        let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
+        let (mut first_client, mut first_server) = UnixStream::pair().unwrap();
+        write_inject_frame(&mut first_client, envelope.as_bytes()).unwrap();
+        let (master, child_peer) = socketpair_files();
+        let mut state = InputLineState::default();
+        let mut output_state = ChildOutputState::default();
+        let mut pending = PendingChildInput::new();
+
+        let first = {
+            let mut request_io = ControlRequestIo {
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut state,
+                child_output_state: &mut output_state,
+                pending_child_input: &mut pending,
+            };
+            process_control_request_with_pending(&mut first_server, &mut request_io, None)
+        };
+        assert_eq!(
+            control_response_parts(first),
+            (true, pty_delivery_uncertain_message(attempt_id))
+        );
+        assert!(pending.is_empty());
+        let mut retained = MailboxDb::open(&path).unwrap();
+        let window = retained
+            .delivery_attempt_window(attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(window.submission_started_at.is_some());
+        assert!(window.acknowledged_at.is_none());
+        assert!(window.resolved_at.is_none());
+        assert_eq!(window.rows.len(), 1);
+        assert!(
+            retained
+                .register_or_reuse_delivery_attempt(
+                    "replacement",
+                    "session-a",
+                    "invocation-b",
+                    "generation-b",
+                    &[window.rows[0].seq],
+                    0,
+                )
+                .unwrap_err()
+                .contains("mailbox_delivery_submission_uncertain:plain-fault-attempt")
+        );
+        drop(retained);
+        fault
+            .execute_batch("DROP TRIGGER fail_plain_confirmation")
+            .unwrap();
+
+        let (mut retry_client, mut retry_server) = UnixStream::pair().unwrap();
+        write_inject_frame(&mut retry_client, envelope.as_bytes()).unwrap();
+        let retry = {
+            let mut request_io = ControlRequestIo {
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut state,
+                child_output_state: &mut output_state,
+                pending_child_input: &mut pending,
+            };
+            process_control_request_with_pending(&mut retry_server, &mut request_io, None)
+        };
+        assert_eq!(
+            retry,
+            Ok(ControlPayloadOutcome::SubmissionUncertain(
+                attempt_id.to_string()
+            ))
+        );
+        assert!(pending.is_empty());
+        set_nonblocking(child_peer.as_raw_fd());
+        let mut submitted = Vec::new();
+        drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
+        let submitted = String::from_utf8(submitted).unwrap();
+        assert_eq!(
+            submitted
+                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+                .count(),
+            1,
+            "{submitted}"
+        );
+        let db = MailboxDb::open(&path).unwrap();
+        assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
+        assert!(db.delivery_attempt_window("replacement").unwrap().is_none());
+    }
+
+    #[test]
+    fn plain_relay_queues_no_provider_input_when_submission_start_faults() {
+        let _env_lock = crate::test_support::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(dir.path());
+        let attempt_id = "plain-pre-submit-fault";
+        let path = seed_test_mailbox_delivery(dir.path(), attempt_id);
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_plain_submission_start
+                 BEFORE UPDATE OF submission_started_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected submission-start failure'); END;",
+            )
+            .unwrap();
+        let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_inject_frame(&mut client, envelope.as_bytes()).unwrap();
+        let (master, child_peer) = socketpair_files();
+        let mut state = InputLineState::default();
+        let mut output_state = ChildOutputState::default();
+        let mut pending = PendingChildInput::new();
+        let result = {
+            let mut request_io = ControlRequestIo {
+                master_fd: master.as_raw_fd(),
+                child_pid: None,
+                line_state: &mut state,
+                child_output_state: &mut output_state,
+                pending_child_input: &mut pending,
+            };
+            process_control_request_with_pending(&mut server, &mut request_io, None)
+        };
+
+        assert!(result.is_err());
+        assert!(pending.is_empty());
+        set_nonblocking(child_peer.as_raw_fd());
+        let mut submitted = Vec::new();
+        drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
+        assert!(submitted.is_empty());
+        let mut db = MailboxDb::open(&path).unwrap();
+        assert!(!db.delivery_attempt_submission_started(attempt_id).unwrap());
+        fault
+            .execute_batch("DROP TRIGGER fail_plain_submission_start")
+            .unwrap();
+        assert!(
+            db.resolve_unacknowledged_delivery_attempt(attempt_id)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn marked_plain_payload_fails_closed_when_exact_attempt_is_unavailable() {
+        let _env_lock = crate::test_support::lock_env();
+        for sidecar_state in ["absent", "missing-attempt", "unreadable"] {
+            let dir = tempfile::tempdir().unwrap();
+            let _data_dir = DataDirOverride::install(dir.path());
+            let sidecar_path = dir.path().join("pid-identity.db");
+            match sidecar_state {
+                "missing-attempt" => drop(MailboxDb::open(&sidecar_path).unwrap()),
+                "unreadable" => fs::write(&sidecar_path, b"not sqlite").unwrap(),
+                "absent" => {}
+                _ => unreachable!(),
+            }
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            write_inject_frame(&mut client, b"notify\n[OULIPOLY-DELIVERY missing-attempt]")
+                .unwrap();
+            let (master, child_peer) = socketpair_files();
+            let mut state = InputLineState::default();
+            let mut output_state = ChildOutputState::default();
+            let mut pending = PendingChildInput::new();
+            let result = {
+                let mut request_io = ControlRequestIo {
+                    master_fd: master.as_raw_fd(),
+                    child_pid: None,
+                    line_state: &mut state,
+                    child_output_state: &mut output_state,
+                    pending_child_input: &mut pending,
+                };
+                process_control_request_with_pending(&mut server, &mut request_io, None)
+            };
+
+            assert!(result.is_err(), "{sidecar_state}: {result:?}");
+            assert!(pending.is_empty());
+            set_nonblocking(child_peer.as_raw_fd());
+            let mut submitted = Vec::new();
+            drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
+            assert!(submitted.is_empty());
+        }
+    }
 
     #[test]
     fn provider_default_identity_uses_unique_account_artifact() {
@@ -3291,7 +3611,7 @@ print(json.dumps({
             process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
-        assert_eq!(result, Ok(None));
+        assert_eq!(result, Ok(ControlPayloadOutcome::Accepted(None)));
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "active child output must not delay control injection"
@@ -3340,7 +3660,7 @@ print(json.dumps({
             process_control_request_with_pending(&mut server, &mut request_io, None)
         };
 
-        assert_eq!(result, Ok(None));
+        assert_eq!(result, Ok(ControlPayloadOutcome::Accepted(None)));
         assert!(started.elapsed() < Duration::from_millis(200));
         set_nonblocking(child_reader.as_raw_fd());
         let mut injected = Vec::new();

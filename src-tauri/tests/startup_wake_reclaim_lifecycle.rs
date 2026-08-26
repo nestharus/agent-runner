@@ -2,7 +2,8 @@
 
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, MailboxDb,
+    AdvanceRuntimeGenerationDrain, AgentBashCompleteEnqueue, BindRuntimeGenerationRunning,
+    CreateRuntimeGeneration, DrainRequestId, MailboxDb, RequestRuntimeGenerationDrain,
     RuntimeGenerationFence, RuntimeGenerationId, SessionMetadataUpsert,
 };
 use oulipoly_state::pid_identity::read_live_process_identity;
@@ -218,7 +219,10 @@ fn candidate_bearing_launches_bound_snapshot_helpers_and_leave_none() {
             "SELECT COUNT(*) FROM runtime_generation
              WHERE generation_uuid = '22222222-2222-4222-8222-222222222222'
                AND lifecycle_state = 'exited'
-               AND terminal_reason = 'recovered_dead'",
+               AND terminal_reason = 'recovered_dead'
+               AND drain_request_uuid = '44444444-4444-4444-8444-444444444444'
+               AND drain_requested_by_invocation_uuid = '33333333-3333-4333-8333-333333333333'
+               AND draining_at IS NOT NULL",
         ),
         1,
         "the exact recorded-dead incumbent was not reconciled before candidate planning"
@@ -459,6 +463,26 @@ fn seed_recoverable_wake_candidate(
             spawned_os_pid: identity.os_pid,
             exact_process_identity: &identity,
             os_pgid: None,
+        })
+        .unwrap();
+    let drain_request_id = DrainRequestId::parse("44444444-4444-4444-8444-444444444444").unwrap();
+    let fence = RuntimeGenerationFence {
+        generation_id: &generation_id,
+        spawn_invocation_uuid: "33333333-3333-4333-8333-333333333333",
+    };
+    mailbox
+        .runtime_lifecycle()
+        .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+            fence,
+            drain_request_id: &drain_request_id,
+            requested_by_invocation_uuid: "33333333-3333-4333-8333-333333333333",
+        })
+        .unwrap();
+    mailbox
+        .runtime_lifecycle()
+        .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+            fence,
+            drain_request_id: &drain_request_id,
         })
         .unwrap();
     incumbent.kill().unwrap();

@@ -98,11 +98,15 @@ impl InteractiveLauncher for RuntimeLauncherService {
     }
 }
 
-pub fn run_repl_with_default_provider<O: StateDbOpener>(
+pub fn run_repl_with_default_provider<O: StateDbOpener, A, G>(
     services: RuntimeServices<O>,
-) -> Result<i32, String> {
+    admit: A,
+) -> Result<i32, String>
+where
+    A: FnOnce(&CompositeInvocationId) -> Result<G, String>,
+{
     let launcher = RuntimeLauncherService;
-    run_repl_with_default_provider_with_launcher(services, &launcher)
+    run_repl_with_default_provider_with_launcher_and_admission(services, &launcher, admit)
 }
 
 #[allow(dead_code)]
@@ -110,6 +114,17 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
     services: RuntimeServices<O>,
     launcher: &dyn InteractiveLauncher,
 ) -> Result<i32, String> {
+    run_repl_with_default_provider_with_launcher_and_admission(services, launcher, |_| Ok(()))
+}
+
+fn run_repl_with_default_provider_with_launcher_and_admission<O: StateDbOpener, A, G>(
+    services: RuntimeServices<O>,
+    launcher: &dyn InteractiveLauncher,
+    admit: A,
+) -> Result<i32, String>
+where
+    A: FnOnce(&CompositeInvocationId) -> Result<G, String>,
+{
     let app_config_path = services.config_root.join("config.toml");
     let app = oulipoly_config::app::AppConfig::load(&app_config_path)?;
     let family = app.default_provider.ok_or_else(|| {
@@ -185,18 +200,21 @@ pub(crate) fn run_repl_with_default_provider_with_launcher<O: StateDbOpener>(
         ..provider
     };
 
-    run_registered_default_provider_repl(RegisteredDefaultProviderReplInput {
-        services: &services,
-        state: &state,
-        providers: &providers,
-        provider_name: &selected_provider_name,
-        provider_index,
-        carrier_model: &carrier_model,
-        provider_registry,
-        state_db_path: state_db_path.as_deref(),
-        launch_provider: &launch_provider,
-        launcher,
-    })
+    run_registered_default_provider_repl(
+        RegisteredDefaultProviderReplInput {
+            services: &services,
+            state: &state,
+            providers: &providers,
+            provider_name: &selected_provider_name,
+            provider_index,
+            carrier_model: &carrier_model,
+            provider_registry,
+            state_db_path: state_db_path.as_deref(),
+            launch_provider: &launch_provider,
+            launcher,
+        },
+        admit,
+    )
 }
 
 struct RegisteredDefaultProviderReplInput<'a, O: StateDbOpener> {
@@ -212,9 +230,13 @@ struct RegisteredDefaultProviderReplInput<'a, O: StateDbOpener> {
     launcher: &'a dyn InteractiveLauncher,
 }
 
-fn run_registered_default_provider_repl<O: StateDbOpener>(
+fn run_registered_default_provider_repl<O: StateDbOpener, A, G>(
     input: RegisteredDefaultProviderReplInput<'_, O>,
-) -> Result<i32, String> {
+    admit: A,
+) -> Result<i32, String>
+where
+    A: FnOnce(&CompositeInvocationId) -> Result<G, String>,
+{
     let lifecycle = ProductionInvocationLifecycleService::new();
     let invocation = default_provider_invocation(input.provider_name);
     let invocation_start =
@@ -230,6 +252,7 @@ fn run_registered_default_provider_repl<O: StateDbOpener>(
     let parent_invocation_env = invocation_start
         .completion_registration_authority
         .invocation_launch_environment(&invocation)?;
+    let _admission = admit(&invocation)?;
 
     let result = match input.launcher.launch(
         input.launch_provider,
@@ -876,8 +899,9 @@ exit 17"#,
         let temp = tempfile::tempdir().unwrap();
         write_config(temp.path(), r#"diagnostics_model = "codex~high""#);
 
-        let error = run_repl_with_default_provider(runtime_services(temp.path().to_path_buf()))
-            .expect_err("missing default_provider should be rejected");
+        let error =
+            run_repl_with_default_provider(runtime_services(temp.path().to_path_buf()), |_| Ok(()))
+                .expect_err("missing default_provider should be rejected");
 
         assert_eq!(
             error,
@@ -894,8 +918,9 @@ exit 17"#,
         write_config(temp.path(), r#"default_provider = "claude""#);
         write_providers(temp.path(), &provider_fixture("codex"));
 
-        let error = run_repl_with_default_provider(runtime_services(temp.path().to_path_buf()))
-            .expect_err("empty provider family should be rejected");
+        let error =
+            run_repl_with_default_provider(runtime_services(temp.path().to_path_buf()), |_| Ok(()))
+                .expect_err("empty provider family should be rejected");
 
         assert_eq!(
             error,
@@ -1061,6 +1086,26 @@ interactive_args = ["ok"]
         assert_eq!(code, 0);
         assert_eq!(launcher.calls.borrow().len(), 1);
         assert_eq!(launcher.calls.borrow()[0].0, "<provider-family:claude>");
+    }
+
+    #[test]
+    fn admission_failure_prevents_default_provider_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.db");
+        StateDb::open(&state_path).unwrap();
+        write_config(temp.path(), r#"default_provider = "fixture""#);
+        write_providers(temp.path(), &provider_fixture("fixture"));
+        let launcher = RecordingLauncher::default();
+
+        let error = run_repl_with_default_provider_with_launcher_and_admission(
+            runtime_services_with_state(temp.path().to_path_buf(), state_path),
+            &launcher,
+            |_| Err::<(), _>("injected admission refusal".to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "injected admission refusal");
+        assert!(launcher.calls.borrow().is_empty());
     }
 
     #[test]

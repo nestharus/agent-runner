@@ -73,6 +73,10 @@ pub(crate) fn run_repl(
     )?;
     emit_repl_invocation(stderr_is_terminal, &attempt.invocation);
     let _live_pty_retry_driver = crate::wake_coordinator::start_live_pty_retry_driver_for_owner();
+    let _admission = crate::wake_coordinator::admit_session_launch(
+        &attempt.invocation.id,
+        resume_session_id.as_deref(),
+    )?;
 
     execute_and_finalize_repl_attempt(ReplExecutionInput {
         agent_runtime_services,

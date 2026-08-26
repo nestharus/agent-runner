@@ -47,7 +47,7 @@
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 #[cfg(unix)]
 use signal_hook::iterator::{Handle as SignalsHandle, Signals};
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 #[cfg(unix)]
 use std::sync::{
     Arc,
@@ -274,10 +274,6 @@ pub(super) struct InteractiveSignalGuard {
 
 #[cfg(unix)]
 impl InteractiveSignalGuard {
-    pub(super) fn install(child: &mut Child) -> Result<Self, String> {
-        Self::install_for_target(SignalForwardTarget::ChildPid(child_signal_pid(child)))
-    }
-
     pub(super) fn install_process_group(child_pid: u32) -> Result<Self, String> {
         Self::install_for_target(SignalForwardTarget::ProcessGroup(child_pid as i32))
     }
@@ -305,14 +301,8 @@ fn signal_install_error(err: std::io::Error) -> String {
 }
 
 #[cfg(unix)]
-fn child_signal_pid(child: &Child) -> i32 {
-    child.id() as i32
-}
-
-#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum SignalForwardTarget {
-    ChildPid(i32),
     ProcessGroup(i32),
 }
 
@@ -349,9 +339,6 @@ fn should_forward_interactive_signal(
     forwarded_sigterm: &AtomicBool,
 ) -> bool {
     match target {
-        SignalForwardTarget::ChildPid(_) => {
-            should_forward_interactive_sigterm(signal, forwarded_sigterm)
-        }
         SignalForwardTarget::ProcessGroup(_) => {
             (signal == SIGINT || signal == SIGHUP)
                 || should_forward_interactive_sigterm(signal, forwarded_sigterm)
@@ -381,7 +368,6 @@ fn send_signal(target: SignalForwardTarget, signal: i32) {
     }
 
     let pid = match target {
-        SignalForwardTarget::ChildPid(pid) => pid,
         SignalForwardTarget::ProcessGroup(pid) => -pid,
     };
     let _ = unsafe { kill(pid, signal) };

@@ -16,10 +16,12 @@ use oulipoly_runtime::executor;
 use oulipoly_runtime::executor::cli::{self, EffectiveExecuteRequest};
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
+use rusqlite::Connection;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -29,6 +31,9 @@ const SELECTED_PROVIDER_SETTINGS_ID: &str = "provider-a-account";
 const GENERIC_PARENT_ENV_VALUE: &str = "unicode-\u{2603}";
 const OPENAI_KEY_VALUE: &str = "ambient-openai-secret-for-provider-policy";
 const OPENAI_BASE_URL_VALUE: &str = "https://ambient-openai.example.invalid";
+const CHILD_CUSTODY_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
+const CHILD_CUSTODY_READY_FILE_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE";
+const CHILD_PID_FILE_ENV: &str = "OULIPOLY_CHILD_PID_FILE";
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct ScriptFixture {
@@ -519,6 +524,7 @@ fn fake_provider_script_body(
     format!(
         r#"#!/usr/bin/env python3
 import json
+import os
 import pathlib
 import sys
 
@@ -530,6 +536,16 @@ CAP_POLICY = {cap_policy}
 CAP_LAUNCH = {cap_launch}
 POLICY_MODE = {policy_mode}
 LAUNCH_MODE = {launch_mode}
+
+PID_FILE = os.environ.get("OULIPOLY_CHILD_PID_FILE")
+READY_FILE = os.environ.get("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE")
+if PID_FILE and READY_FILE:
+    pathlib.Path(PID_FILE).write_text(str(os.getpid()))
+    pathlib.Path(READY_FILE).touch()
+
+def clear_custody_readiness():
+    if READY_FILE:
+        pathlib.Path(READY_FILE).unlink(missing_ok=True)
 
 def read_request():
     text = sys.stdin.read()
@@ -576,6 +592,7 @@ def describe(request):
             "migration": False
         }}
     }})
+    clear_custody_readiness()
 
 def policy(request):
     append_order("policy.evaluate")
@@ -602,6 +619,7 @@ def policy(request):
         result["stdin"] = "stdin-from-policy"
         result["prompt"] = "prompt-from-policy"
     response(request, result)
+    clear_custody_readiness()
 
 def hybrid_policy_result(request):
     params = request.get("params", {{}})
@@ -1198,6 +1216,167 @@ fn assert_no_arg_mode_stdin(launch: &Value) {
         launch["params"].get("stdin").is_none(),
         "arg-mode provider launches must not send the prompt on stdin"
     );
+}
+
+#[test]
+fn external_provider_post_spawn_failures_reap_before_fenced_generation_exit() {
+    let _lock = env_lock();
+    for (fault, invocation_uuid, terminal_reason, expect_bound_pid) in [
+        (
+            "external_spawn_observer",
+            "72727272-7272-4272-8272-727272727272",
+            "startup_failed",
+            false,
+        ),
+        (
+            "external_status_poll",
+            "73737373-7373-4373-8373-737373737373",
+            "abnormal_termination",
+            true,
+        ),
+    ] {
+        run_external_child_custody_fault(fault, invocation_uuid, terminal_reason, expect_bound_pid);
+    }
+}
+
+#[test]
+fn external_provider_success_reaps_and_completes_the_exact_generation_orderly() {
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().expect("custody tempdir");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("custody data dir");
+    let pid_path = dir.path().join("provider.pid");
+    let ready_path = dir.path().join("provider.ready");
+    let data_dir_text = data_dir.to_string_lossy().into_owned();
+    let pid_path_text = pid_path.to_string_lossy().into_owned();
+    let ready_path_text = ready_path.to_string_lossy().into_owned();
+    let _env = EnvScope::set_optional(&[
+        ("OULIPOLY_DATA_DIR", Some(&data_dir_text)),
+        (CHILD_CUSTODY_FAULT_ENV, None),
+        (CHILD_CUSTODY_READY_FILE_ENV, Some(&ready_path_text)),
+        (CHILD_PID_FILE_ENV, Some(&pid_path_text)),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let invocation_uuid = "74747474-7474-4474-8474-747474747474";
+    let invocation = serde_json::to_string(&oulipoly_state::CompositeInvocationId {
+        source: "external-custody-test".to_string(),
+        id: invocation_uuid.to_string(),
+    })
+    .expect("parent invocation");
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(invocation))
+        .expect("external custody success must complete");
+
+    let pid = fs::read_to_string(&pid_path)
+        .expect("provider pid")
+        .trim()
+        .parse::<libc::pid_t>()
+        .expect("numeric provider pid");
+    assert_external_child_reaped(pid);
+    assert_external_terminal_generation(
+        &data_dir,
+        invocation_uuid,
+        "orderly_completion",
+        Some(i64::from(pid)),
+    );
+}
+
+fn run_external_child_custody_fault(
+    fault: &str,
+    invocation_uuid: &str,
+    terminal_reason: &str,
+    expect_bound_pid: bool,
+) {
+    let dir = tempfile::tempdir().expect("custody tempdir");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("custody data dir");
+    let pid_path = dir.path().join("provider.pid");
+    let ready_path = dir.path().join("provider.ready");
+    let data_dir_text = data_dir.to_string_lossy().into_owned();
+    let pid_path_text = pid_path.to_string_lossy().into_owned();
+    let ready_path_text = ready_path.to_string_lossy().into_owned();
+    let _env = EnvScope::set(&[
+        ("OULIPOLY_DATA_DIR", &data_dir_text),
+        (CHILD_CUSTODY_FAULT_ENV, fault),
+        (CHILD_CUSTODY_READY_FILE_ENV, &ready_path_text),
+        (CHILD_PID_FILE_ENV, &pid_path_text),
+    ]);
+    let fixture = make_external_fixture(
+        Capabilities {
+            policy: true,
+            launch: true,
+        },
+        PolicyMode::Accept,
+        LaunchMode::Success,
+    );
+    let invocation = serde_json::to_string(&oulipoly_state::CompositeInvocationId {
+        source: "external-custody-test".to_string(),
+        id: invocation_uuid.to_string(),
+    })
+    .expect("parent invocation");
+
+    execute_external_fixture_effective(&fixture, None, HashMap::new(), Some(invocation))
+        .expect_err("external custody fault must fail dispatch");
+
+    let pid = fs::read_to_string(&pid_path)
+        .expect("provider pid")
+        .trim()
+        .parse::<libc::pid_t>()
+        .expect("numeric provider pid");
+    assert_external_child_reaped(pid);
+    assert_external_terminal_generation(
+        &data_dir,
+        invocation_uuid,
+        terminal_reason,
+        expect_bound_pid.then_some(i64::from(pid)),
+    );
+}
+
+fn assert_external_child_reaped(pid: libc::pid_t) {
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "provider remained live");
+    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD),
+        "provider child was not reaped"
+    );
+}
+
+fn assert_external_terminal_generation(
+    data_dir: &Path,
+    invocation_uuid: &str,
+    terminal_reason: &str,
+    expected_pid: Option<i64>,
+) {
+    let connection = Connection::open(data_dir.join("pid-identity.db")).expect("identity db");
+    let (count, exited, reason, spawned_pid): (i64, i64, String, Option<i64>) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    SUM(lifecycle_state = 'exited'),
+                    MIN(terminal_reason),
+                    MIN(spawned_os_pid)
+             FROM runtime_generation
+             WHERE spawn_invocation_uuid = ?1",
+            [invocation_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("terminal generation row");
+    assert_eq!(count, 1);
+    assert_eq!(exited, 1);
+    assert_eq!(reason, terminal_reason);
+    assert_eq!(spawned_pid, expected_pid);
 }
 
 #[test]

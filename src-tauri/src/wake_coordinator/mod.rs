@@ -3,6 +3,7 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
 //! `predicate`, `validator`
 
+mod admission;
 mod auto_wake_env;
 mod constants;
 mod consumed_completion;
@@ -15,6 +16,15 @@ mod wake_start;
 
 pub(crate) type WakeDiagnostic = diagnostics::WakeDiagnostic;
 pub(crate) use sweep::{LivePtyRetryDriverGuard, StartupWakeReclaimGuard};
+
+pub(crate) use admission::SessionAdmissionGuard;
+
+pub(crate) fn admit_session_launch(
+    registration_identity: &str,
+    session_id: Option<&str>,
+) -> Result<SessionAdmissionGuard, String> {
+    admission::enqueue_and_wait(registration_identity, session_id)
+}
 
 pub(crate) fn selected_auto_wake_max() -> i64 {
     auto_wake_env::auto_wake_max()

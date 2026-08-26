@@ -28,13 +28,7 @@ impl PtyTransportAcknowledgementEvidence {
         &self,
         repository: &mut dyn SessionLifecycleRepository,
     ) -> SessionLifecycleResult<AcknowledgementWrite> {
-        repository.accept_pending(
-            &self.delivery_attempt_id,
-            &self.session_id,
-            &self.turn_generation_id,
-            self.observed_at,
-        )?;
-        repository.record_delivery_evidence(&DeliveryEvidence {
+        repository.accept_pending_with_delivery_evidence(&DeliveryEvidence {
             evidence_id: self.evidence_id.clone(),
             kind: DeliveryEvidenceKind::PtyTransportAck,
             delivery_id: self.delivery_attempt_id.clone(),

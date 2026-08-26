@@ -11,6 +11,7 @@ use oulipoly_state::mailbox::{
     RuntimeGenerationId, SessionGenerationProjection, SessionMetadataUpsert,
     WakeClaimAcquireResult, WakeClaimRequest,
 };
+use std::ffi::OsString;
 use std::fs;
 
 const SESSION: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
@@ -20,6 +21,43 @@ const MODEL: &str = "acr329-poison-model";
 
 struct Fixture {
     dir: tempfile::TempDir,
+}
+
+struct EnvSnapshot(Vec<(&'static str, Option<OsString>)>);
+
+impl EnvSnapshot {
+    fn capture() -> Self {
+        Self(
+            [
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_STATE_HOME",
+                "HOME",
+                "OULIPOLY_DATA_DIR",
+                "OULIPOLY_AUTO_WAKE",
+                "OULIPOLY_AUTO_WAKE_SESSION_ID",
+                "OULIPOLY_AUTO_WAKE_TOKEN",
+                "OULIPOLY_AUTO_WAKE_COUNT",
+                "OULIPOLY_AUTO_WAKE_MAX",
+            ]
+            .into_iter()
+            .map(|name| (name, std::env::var_os(name)))
+            .collect(),
+        )
+    }
+}
+
+impl Drop for EnvSnapshot {
+    fn drop(&mut self) {
+        for (name, value) in self.0.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }
 
 impl Fixture {
@@ -118,6 +156,8 @@ impl Fixture {
 
 #[test]
 fn notify_wake_preserves_generation_cap_and_live_claim_authority() {
+    let _env_lock = mailbox_delivery::DATA_DIR_ENV_LOCK.lock().unwrap();
+    let _env_snapshot = EnvSnapshot::capture();
     let generation_fixture = Fixture::new();
     let mut generation_db = generation_fixture.mailbox();
     generation_fixture.seed_pending(&mut generation_db, "h-generation");

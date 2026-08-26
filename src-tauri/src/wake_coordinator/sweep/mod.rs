@@ -24,7 +24,7 @@ use super::auto_wake_env::is_auto_wake_invocation;
 use super::constants::{
     LIVE_PTY_RETRY_INTERVAL_SECONDS, WAKE_RECLAIM_HANDOFF_OWNER_ENV,
     WAKE_RECLAIM_HANDOFF_TOKEN_ENV, WAKE_RECLAIM_STATE_SNAPSHOT_TIMEOUT_SECONDS,
-    WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_LIMIT, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
+    WAKE_RECLAIM_SWEEP_INTERVAL_SECONDS, WAKE_RECLAIM_SWEEP_SCAN_LIMIT,
 };
 use super::diagnostics::WakeDiagnostic;
 use super::wake_start::{StartWakeInput, start_wake_chain};
@@ -42,6 +42,10 @@ pub(crate) fn run_startup_wake_reclaim_sweep() {
         return;
     }
     run_wake_reclaim_sweep_or_warn("process_start");
+}
+
+pub(crate) fn run_post_settlement_wake_reclaim_sweep() {
+    run_wake_reclaim_sweep_or_warn("session_settlement");
 }
 
 pub(crate) struct StartupWakeReclaimGuard {
@@ -368,6 +372,7 @@ fn run_wake_reclaim_sweep_with_owner(
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Ok(WakeSweepRunOutcome::Completed);
     };
+    super::admission::drain_one_owned(&mut db)?;
     retry_pending_live_pty_deliveries(&mut db, trigger, is_cancelled)?;
     if is_cancelled() {
         return Ok(WakeSweepRunOutcome::Completed);
@@ -388,7 +393,7 @@ fn run_wake_reclaim_sweep_with_owner(
         ),
     )?;
     drop(db);
-    for candidate in start {
+    if let Some(candidate) = start {
         if is_cancelled() {
             return Ok(WakeSweepRunOutcome::Completed);
         }
@@ -424,6 +429,18 @@ fn try_acquire_wake_sweep_admission(
         mailbox_path: mailbox_path.to_path_buf(),
         token,
     }))
+}
+
+pub(super) fn try_with_serialized_drain<T>(
+    mailbox_path: &Path,
+    drain: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    match try_acquire_wake_sweep_admission(mailbox_path)? {
+        WakeSweepAdmissionAttempt::Acquired(_admission) => drain().map(Some),
+        WakeSweepAdmissionAttempt::Owned(_) | WakeSweepAdmissionAttempt::CoordinationBusy => {
+            Ok(None)
+        }
+    }
 }
 
 fn try_acquire_wake_sweep_coordination(mailbox_path: &Path) -> Result<Option<File>, String> {
@@ -879,6 +896,22 @@ fn retry_pending_live_pty_deliveries(
     trigger: &str,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
+    let evidence_sessions =
+        db.pending_delivery_evidence_obligation_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
+    for session_id in evidence_sessions {
+        if is_cancelled() {
+            return Ok(());
+        }
+        if let Err(error) =
+            crate::mailbox_delivery::reconcile_pending_pty_delivery_evidence(db, &session_id)
+        {
+            tracing::warn!(
+                trigger,
+                session_id,
+                "Failed to reconcile pending PTY delivery evidence: {error}"
+            );
+        }
+    }
     let session_ids = db
         .wake_sessions()
         .pending_delivery_session_ids(WAKE_RECLAIM_SWEEP_SCAN_LIMIT)?;
@@ -985,7 +1018,7 @@ fn wake_sweep_start_input<'a>(
 }
 
 struct WakeSweepPlan {
-    start: Vec<WakeSweepCandidate>,
+    start: Option<WakeSweepCandidate>,
 }
 
 fn wake_sweep_plan(
@@ -994,7 +1027,7 @@ fn wake_sweep_plan(
     state: Option<&oulipoly_state::StateDb>,
 ) -> Result<WakeSweepPlan, String> {
     let recoverable = partition_wake_sweep_candidates(db, candidates, state)?;
-    let start = select_recoverable_sweep_candidates(recoverable);
+    let start = select_recoverable_sweep_candidate(recoverable);
     Ok(wake_sweep_plan_from_selected(start))
 }
 
@@ -1022,39 +1055,22 @@ fn plan_wake_sweep(
     db: &mut MailboxDb,
     candidates: Vec<WakeSweepCandidate>,
     state: Result<Option<oulipoly_state::StateDb>, String>,
-) -> Result<Vec<WakeSweepCandidate>, String> {
+) -> Result<Option<WakeSweepCandidate>, String> {
     let state = state?;
     let plan = wake_sweep_plan(db, candidates, state.as_ref())?;
     Ok(plan.start)
 }
 
-fn wake_sweep_plan_from_selected(start: Vec<WakeSweepCandidate>) -> WakeSweepPlan {
+fn wake_sweep_plan_from_selected(start: Option<WakeSweepCandidate>) -> WakeSweepPlan {
     WakeSweepPlan { start }
 }
 
-fn select_recoverable_sweep_candidates(
-    mut candidates: Vec<WakeSweepCandidate>,
-) -> Vec<WakeSweepCandidate> {
-    if candidates.len() <= WAKE_RECLAIM_SWEEP_LIMIT {
-        return candidates;
-    }
-    candidates.sort_by_key(|candidate| candidate.min_pending_seq);
-    let oldest_slots = WAKE_RECLAIM_SWEEP_LIMIT.div_ceil(2);
-    let newest_slots = WAKE_RECLAIM_SWEEP_LIMIT.saturating_sub(oldest_slots);
-    let mut selected = candidates
-        .iter()
-        .take(oldest_slots)
-        .cloned()
-        .collect::<Vec<_>>();
-    for candidate in candidates.iter().rev().take(newest_slots) {
-        if !selected
-            .iter()
-            .any(|existing| existing.session_id == candidate.session_id)
-        {
-            selected.push(candidate.clone());
-        }
-    }
-    selected
+fn select_recoverable_sweep_candidate(
+    candidates: Vec<WakeSweepCandidate>,
+) -> Option<WakeSweepCandidate> {
+    candidates
+        .into_iter()
+        .min_by_key(|candidate| candidate.min_pending_seq)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1149,6 +1165,33 @@ mod tests {
     fn record_test_handoff(owner_token: Option<&str>) {
         TEST_HANDOFF_SCHEDULED.store(true, Ordering::SeqCst);
         TEST_HANDOFF_OWNER_MATCHED.store(owner_token == Some("test-owner"), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn wake_sweep_selects_only_the_oldest_recoverable_session() {
+        let selected = select_recoverable_sweep_candidate(vec![
+            WakeSweepCandidate {
+                session_id: "newer".to_string(),
+                auto_wake_count: 0,
+                min_pending_seq: 20,
+                max_pending_seq: 20,
+            },
+            WakeSweepCandidate {
+                session_id: "oldest".to_string(),
+                auto_wake_count: 0,
+                min_pending_seq: 10,
+                max_pending_seq: 10,
+            },
+            WakeSweepCandidate {
+                session_id: "newest".to_string(),
+                auto_wake_count: 0,
+                min_pending_seq: 30,
+                max_pending_seq: 30,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(selected.session_id, "oldest");
     }
 
     #[test]
@@ -1601,7 +1644,7 @@ mod tests {
         assert!(matches!(second, EnqueueResult::Inserted(_)));
 
         let start = plan_wake_sweep(&mut db, vec![candidate], Ok(None)).unwrap();
-        assert!(start.is_empty());
+        assert!(start.is_none());
         let rows = db.list_mailbox("state-unavailable-session", true).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.delivery_error.is_none()));

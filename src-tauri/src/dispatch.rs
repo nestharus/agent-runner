@@ -229,7 +229,10 @@ fn run_default_provider_repl_for_project(
     project: Option<std::path::PathBuf>,
 ) -> Result<i32, String> {
     let services = oulipoly_runtime::repl_default_provider::RuntimeServices::production(project)?;
-    oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services)
+    oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(
+        services,
+        |invocation| crate::wake_coordinator::admit_session_launch(&invocation.id, None),
+    )
 }
 
 fn run_usage_command(

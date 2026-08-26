@@ -281,6 +281,13 @@ impl SessionLifecycleRepository for FakeRepository {
         self.inner.record_delivery_evidence(evidence)
     }
 
+    fn accept_pending_with_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite> {
+        self.inner.accept_pending_with_delivery_evidence(evidence)
+    }
+
     fn delivery_evidence(
         &self,
         evidence_id: &str,

@@ -19,9 +19,12 @@ use oulipoly_state::pid_identity::{
     self, ProcessIdentity, ProcessIdentityObservation, observe_live_process_identity,
 };
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::time::{Duration, Instant};
 
 const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+const CHILD_CUSTODY_TEST_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnRuntimeMode {
@@ -212,6 +215,217 @@ pub(crate) struct RunningRuntimeGeneration {
     pub exact_process_identity: ProcessIdentity,
 }
 
+pub(crate) struct ChildGenerationCustody<'a> {
+    child: Option<Child>,
+    context: Option<&'a SpawnIdentityContext>,
+    #[cfg(unix)]
+    signal_guard: Option<super::terminal_signal::InteractiveSignalGuard>,
+    exit_observed: bool,
+    generation_completed: bool,
+}
+
+impl<'a> ChildGenerationCustody<'a> {
+    pub(crate) fn new(
+        child: Child,
+        context: Option<&'a SpawnIdentityContext>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            child: Some(child),
+            context,
+            #[cfg(unix)]
+            signal_guard: None,
+            exit_observed: false,
+            generation_completed: false,
+        })
+    }
+
+    pub(crate) fn child(&self) -> &Child {
+        self.child.as_ref().expect("child custody is armed")
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("child custody is armed")
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn install_signal_forwarding(&mut self) -> Result<(), String> {
+        self.signal_guard = Some(
+            super::terminal_signal::InteractiveSignalGuard::install_process_group(
+                self.child().id(),
+            )?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        {
+            if !exact_generation_exit_pending(self.child())? {
+                return Ok(None);
+            }
+            self.signal_guard.take();
+            let child = self.child.as_mut().expect("child custody is armed");
+            // WNOWAIT keeps the exact leader unreaped while descendants are cleaned.
+            let status = terminate_and_reap_exact_generation(child)?;
+            self.exit_observed = true;
+            Ok(Some(status))
+        }
+        #[cfg(not(unix))]
+        {
+            let status = self.child_mut().try_wait()?;
+            if status.is_some() {
+                self.exit_observed = true;
+            }
+            Ok(status)
+        }
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub(crate) fn terminate_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        self.signal_guard.take();
+        let status = terminate_and_reap_exact_generation(self.child_mut())?;
+        self.exit_observed = true;
+        Ok(status)
+    }
+
+    pub(crate) fn observe_exit(&mut self) -> Result<(), String> {
+        self.exit_observed = true;
+        Ok(())
+    }
+
+    pub(crate) fn complete_orderly(
+        mut self,
+        exit_code: Option<i32>,
+        compatibility_exit_code: Option<i32>,
+    ) -> Result<(), String> {
+        if !self.exit_observed {
+            return Err("Cannot complete child generation before observing exit".to_string());
+        }
+        mark_runtime_generation_orderly_completed(
+            self.context,
+            exit_code,
+            compatibility_exit_code,
+        )?;
+        self.generation_completed = true;
+        #[cfg(unix)]
+        self.signal_guard.take();
+        self.child.take();
+        Ok(())
+    }
+}
+
+fn signal_owned_generation(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    {
+        let process_group = child.id() as libc::pid_t;
+        if unsafe { libc::killpg(process_group, libc::SIGKILL) } == 0 {
+            return;
+        }
+    }
+    let _ = child.kill();
+}
+
+trait ExactGenerationFinalizer {
+    type Exit;
+
+    fn terminate_owned_generation(&mut self);
+    fn reap_exact_leader(&mut self) -> std::io::Result<Self::Exit>;
+}
+
+impl ExactGenerationFinalizer for Child {
+    type Exit = std::process::ExitStatus;
+
+    fn terminate_owned_generation(&mut self) {
+        signal_owned_generation(self);
+    }
+
+    fn reap_exact_leader(&mut self) -> std::io::Result<Self::Exit> {
+        self.wait()
+    }
+}
+
+fn terminate_and_reap_exact_generation<T: ExactGenerationFinalizer>(
+    generation: &mut T,
+) -> std::io::Result<T::Exit> {
+    generation.terminate_owned_generation();
+    generation.reap_exact_leader()
+}
+
+impl Drop for ChildGenerationCustody<'_> {
+    fn drop(&mut self) {
+        let mut observed_exit_code = None;
+        #[cfg(unix)]
+        self.signal_guard.take();
+        if let Some(child) = self.child.as_mut() {
+            if !self.exit_observed {
+                if let Ok(status) = terminate_and_reap_exact_generation(child) {
+                    observed_exit_code = status.code();
+                    self.exit_observed = true;
+                }
+            } else if let Ok(status) = child.wait() {
+                observed_exit_code = status.code();
+                self.exit_observed = true;
+            }
+        }
+        if !self.generation_completed {
+            let _ = mark_runtime_generation_exited(self.context, observed_exit_code);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exact_generation_exit_pending(child: &Child) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+pub(crate) fn child_custody_test_fault(site: &str) -> Result<(), String> {
+    if std::env::var(CHILD_CUSTODY_TEST_FAULT_ENV).ok().as_deref() == Some(site) {
+        wait_for_child_custody_test_ready()?;
+        return Err(format!("injected child custody failure at {site}"));
+    }
+    Ok(())
+}
+
+fn wait_for_child_custody_test_ready() -> Result<(), String> {
+    let Some(path) = std::env::var_os("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if path.is_file() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(format!(
+        "timed out waiting for child custody test readiness at {}",
+        path.display()
+    ))
+}
+
 pub(crate) fn register_runtime_generation_starting(
     context: Option<&SpawnIdentityContext>,
 ) -> Result<(), String> {
@@ -302,6 +516,7 @@ pub(crate) fn record_child_identity(
     let Some(context) = context else {
         return Ok(None);
     };
+    child_custody_test_fault("identity_capture")?;
     let os_pid = i64::from(child_id);
     let exact_process_identity = match pid_identity::read_live_process_identity(os_pid) {
         Ok(Some(identity)) => identity,
@@ -591,6 +806,49 @@ mod tests {
         assert_eq!(
             exited.terminal_reason,
             Some(RuntimeTerminalReason::AbnormalTermination)
+        );
+    }
+
+    #[test]
+    fn exact_generation_finalizer_never_signals_after_reap_and_target_substitution() {
+        #[derive(Default)]
+        struct SubstitutingFinalizer {
+            reaped: bool,
+            foreign_target_substituted: bool,
+            events: Vec<&'static str>,
+        }
+
+        impl ExactGenerationFinalizer for SubstitutingFinalizer {
+            type Exit = ();
+
+            fn terminate_owned_generation(&mut self) {
+                assert!(
+                    !self.reaped,
+                    "numeric target was signaled after leader reap"
+                );
+                assert!(!self.foreign_target_substituted);
+                self.events.push("terminate_exact_generation");
+            }
+
+            fn reap_exact_leader(&mut self) -> std::io::Result<Self::Exit> {
+                self.reaped = true;
+                self.foreign_target_substituted = true;
+                self.events.push("reap_and_substitute_foreign_target");
+                Ok(())
+            }
+        }
+
+        let mut finalizer = SubstitutingFinalizer::default();
+        terminate_and_reap_exact_generation(&mut finalizer).unwrap();
+
+        assert!(finalizer.reaped);
+        assert!(finalizer.foreign_target_substituted);
+        assert_eq!(
+            finalizer.events,
+            [
+                "terminate_exact_generation",
+                "reap_and_substitute_foreign_target"
+            ]
         );
     }
 }

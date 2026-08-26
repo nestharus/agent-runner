@@ -279,6 +279,7 @@ pub enum FakeProviderMode {
     SleepWithCancellation,
     ChildGrandchild,
     SigtermResistantChildGrandchild,
+    SigtermExitingLeaderResistantDescendant,
     ExitWithPipeHoldingDescendant,
     EarlyStdinSuccess,
     EarlyStdinError,
@@ -348,6 +349,9 @@ impl FakeProviderMode {
             Self::Sleep | Self::SleepWithCancellation => "sleep",
             Self::ChildGrandchild => "child-grandchild",
             Self::SigtermResistantChildGrandchild => "sigterm-resistant-child-grandchild",
+            Self::SigtermExitingLeaderResistantDescendant => {
+                "sigterm-exiting-leader-resistant-descendant"
+            }
             Self::ExitWithPipeHoldingDescendant => "exit-with-pipe-holding-descendant",
             Self::EarlyStdinSuccess => "early-stdin-success",
             Self::EarlyStdinError => "early-stdin-error",

@@ -23,7 +23,7 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
     );
     assert_eq!(
         PtyTransportAcknowledgementEvidence {
-            observed_at: 11,
+            observed_at: 10,
             ..pty.clone()
         }
         .record(&mut state)
@@ -130,4 +130,54 @@ fn pty_and_manual_acknowledgements_remain_transport_evidence_under_exact_fences(
         wrong_attempt.record(&mut state),
         Err(SessionLifecycleError::Missing("delivery acknowledgement"))
     ));
+}
+
+#[test]
+fn pty_acceptance_and_evidence_roll_back_together_when_evidence_insert_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let mut state = StateDb::open(&path).unwrap();
+    let fault = rusqlite::Connection::open(&path).unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_pty_evidence_insert
+             BEFORE INSERT ON session_delivery_evidence
+             BEGIN SELECT RAISE(FAIL, 'injected evidence failure'); END;",
+        )
+        .unwrap();
+    let evidence = PtyTransportAcknowledgementEvidence {
+        evidence_id: "pty:atomic-attempt".to_owned(),
+        delivery_attempt_id: "atomic-attempt".to_owned(),
+        session_id: "session-a".to_owned(),
+        turn_generation_id: "generation-a".to_owned(),
+        observed_at: 10,
+    };
+
+    assert!(evidence.record(&mut state).is_err());
+    assert!(state.acknowledgement("atomic-attempt").unwrap().is_none());
+    assert!(
+        state
+            .delivery_evidence("pty:atomic-attempt")
+            .unwrap()
+            .is_none()
+    );
+    fault
+        .execute_batch("DROP TRIGGER fail_pty_evidence_insert")
+        .unwrap();
+
+    assert_eq!(
+        evidence.record(&mut state).unwrap(),
+        AcknowledgementWrite::Advanced
+    );
+    assert!(state.acknowledgement("atomic-attempt").unwrap().is_some());
+    assert!(
+        state
+            .delivery_evidence("pty:atomic-attempt")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        evidence.record(&mut state).unwrap(),
+        AcknowledgementWrite::AlreadyRecorded
+    );
 }

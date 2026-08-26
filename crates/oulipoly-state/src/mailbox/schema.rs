@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(super) const CURRENT_VERSION: i64 = 4;
+pub(super) const CURRENT_VERSION: i64 = 7;
 const SCHEMA_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const SCHEMA_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -16,6 +16,7 @@ enum SidecarEntity {
     MailboxDelivery,
     CompletionAuthority,
     RuntimeLifecycle,
+    SessionAdmission,
     WakeAndSessionMetadata,
     PayloadRetention,
 }
@@ -66,6 +67,21 @@ const SCHEMA_STEPS: &[MigrationStep] = &[
         target_version: 4,
         owner: SidecarEntity::RuntimeLifecycle,
         apply: ensure_runtime_creator_identity_schema,
+    },
+    MigrationStep {
+        target_version: 5,
+        owner: SidecarEntity::MailboxDelivery,
+        apply: ensure_mailbox_delivery_settlement_schema,
+    },
+    MigrationStep {
+        target_version: 6,
+        owner: SidecarEntity::SessionAdmission,
+        apply: ensure_session_admission_schema,
+    },
+    MigrationStep {
+        target_version: 7,
+        owner: SidecarEntity::SessionAdmission,
+        apply: ensure_session_admission_launcher_identity_schema,
     },
 ];
 
@@ -174,6 +190,10 @@ fn ensure_mailbox_delivery_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_mailbox_delivery_owner_index(conn)
 }
 
+fn ensure_mailbox_delivery_settlement_schema(conn: &Connection) -> Result<(), String> {
+    super::ensure_mailbox_delivery_attempt_columns(conn)
+}
+
 fn ensure_completion_authority_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "INSERT OR IGNORE INTO completion_authority_materialization_summary (
@@ -215,6 +235,15 @@ fn ensure_completion_authority_schema(conn: &Connection) -> Result<(), String> {
 fn ensure_runtime_lifecycle_schema(conn: &Connection) -> Result<(), String> {
     super::ensure_runtime_generation_columns(conn)?;
     promote_legacy_runtime_authorities(conn)
+}
+
+fn ensure_session_admission_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(super::session_admission_schema_definition())
+        .map_err(|err| format!("Failed to ensure session admission queue: {err}"))
+}
+
+fn ensure_session_admission_launcher_identity_schema(conn: &Connection) -> Result<(), String> {
+    super::ensure_session_admission_launcher_identity_schema(conn)
 }
 
 fn ensure_wake_and_session_metadata_schema(conn: &Connection) -> Result<(), String> {

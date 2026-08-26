@@ -36,16 +36,21 @@ use super::outbound_observer::{
     ObservedUserTurn, OutboundObservation, OutboundObservationIdentity, OutboundObservationResult,
     OutboundObserverSource, OutboundObserverWorker,
 };
+#[cfg(test)]
+use super::seed_test_mailbox_delivery;
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::transcript_view::project_transcript_tail;
 use super::{
-    ChildOutputState, ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput,
-    RELAY_BUFFER_BYTES, acknowledge_control_payload, flush_pending_child_input, is_pty_eof_error,
-    poll_fds, poll_master_fd, poll_relay_fds, poll_single_fd, prepare_control_payload,
-    pty_delivery_ack_message, queue_control_injection, read_control_request, read_fd, readable,
-    send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq,
-    writable, write_control_response,
+    ChildOutputState, ControlPayloadOutcome, ControlSocket, INJECT_WAIT_LIMIT, InputLineState,
+    PendingChildInput, RELAY_BUFFER_BYTES, begin_control_payload_submission,
+    flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd, poll_relay_fds,
+    poll_single_fd, prepare_control_payload, pty_delivery_ack_message, pty_delivery_test_fault,
+    pty_delivery_uncertain_message, queue_control_injection, read_control_request, read_fd,
+    readable, send_signal_to_child_group, set_pty_winsize, settle_control_payload,
+    submission_uncertain_outcome, terminal_winsize, validate_peer_uid, winsize_eq, writable,
+    write_control_response,
 };
+use crate::executor::cli::spawn_identity::ChildGenerationCustody;
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
     MonitorNodeId, MonitorNodeKind, MonitorSnapshot, MonitorStatus, ObservabilityRoot,
@@ -71,7 +76,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3695,10 +3700,6 @@ fn format_tui_terminal_init_error(err: io::Error) -> String {
     format!("Failed to initialize TUI terminal: {err}")
 }
 
-fn try_wait_child(child: &mut Child) -> io::Result<Option<ExitStatus>> {
-    child.try_wait()
-}
-
 fn format_interactive_child_poll_error(err: io::Error) -> String {
     format!("Failed to poll interactive child: {err}")
 }
@@ -4043,7 +4044,7 @@ pub(super) fn relay_until_exit_observed(
     writer: File,
     master: &File,
     control: Option<&ControlSocket>,
-    child: &mut Child,
+    custody: &mut ChildGenerationCustody<'_>,
     monitor: MonitorSnapshotProvider,
     root: ObservabilityRoot,
     outbound_source: OutboundObserverSource,
@@ -4110,7 +4111,7 @@ pub(super) fn relay_until_exit_observed(
             apply_sizing(
                 real_fd,
                 master_fd,
-                child.id(),
+                custody.child().id(),
                 &pane,
                 protection,
                 &mut parser,
@@ -4268,7 +4269,7 @@ pub(super) fn relay_until_exit_observed(
                 pending_child_input: &mut pending_child_input,
                 outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
-                child_pid: Some(child.id()),
+                child_pid: Some(custody.child().id()),
             };
             let _ = service_control(control, &mut control_io);
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
@@ -4282,7 +4283,7 @@ pub(super) fn relay_until_exit_observed(
             apply_sizing(
                 real_fd,
                 master_fd,
-                child.id(),
+                custody.child().id(),
                 &pane,
                 protection,
                 &mut parser,
@@ -4304,7 +4305,9 @@ pub(super) fn relay_until_exit_observed(
             );
         }
         publisher.check_error()?;
-        status = try_wait_child(child).map_err(format_interactive_child_poll_error)?;
+        status = custody
+            .try_wait()
+            .map_err(format_interactive_child_poll_error)?;
     }
 
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
@@ -5649,10 +5652,15 @@ fn format_control_accept_error(err: io::Error) -> String {
     format!("Failed to accept PTY control connection: {err}")
 }
 
-fn control_response_message(response: Result<Option<String>, String>) -> (bool, String) {
+fn control_response_message(response: Result<ControlPayloadOutcome, String>) -> (bool, String) {
     match response {
-        Ok(Some(delivery_nonce)) => (true, pty_delivery_ack_message(&delivery_nonce)),
-        Ok(None) => (true, "ok".to_string()),
+        Ok(ControlPayloadOutcome::Accepted(Some(delivery_nonce))) => {
+            (true, pty_delivery_ack_message(&delivery_nonce))
+        }
+        Ok(ControlPayloadOutcome::Accepted(None)) => (true, "ok".to_string()),
+        Ok(ControlPayloadOutcome::SubmissionUncertain(delivery_nonce)) => {
+            (true, pty_delivery_uncertain_message(&delivery_nonce))
+        }
         Err(message) => (false, message),
     }
 }
@@ -5669,18 +5677,20 @@ fn inject_control_payload(
     stream: &mut UnixStream,
     io: &mut ControlInjectionIo<'_>,
     control: &ControlSocket,
-) -> Result<Option<String>, String> {
+) -> Result<ControlPayloadOutcome, String> {
     validate_control_peer(stream)?;
     let session_id = control
         .session_id()
         .ok_or_else(|| "awaiting_session_identity".to_string())?;
-    let payload = prepare_control_payload(
+    let mut payload = prepare_control_payload(
         read_tui_control_payload(stream)?,
         Some((&session_id, control.invocation_uuid())),
     )?;
     if payload.bytes.is_empty() {
-        acknowledge_control_payload(&payload)?;
-        return Ok(payload.delivery_attempt_id);
+        if payload.submission_uncertain {
+            return Ok(submission_uncertain_outcome(&payload));
+        }
+        return settle_control_payload(&payload);
     }
     validate_control_input_ready(
         io.parser.screen().bracketed_paste(),
@@ -5688,9 +5698,16 @@ fn inject_control_payload(
         control.age(),
     )?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
-    submit_control_payload(io, &payload.bytes, bracketed_paste)?;
-    acknowledge_control_payload(&payload)?;
-    Ok(payload.delivery_attempt_id)
+    pty_delivery_test_fault("tui_pre_submission")?;
+    begin_control_payload_submission(&mut payload)?;
+    if let Err(error) = submit_control_payload(io, &payload.bytes, bracketed_paste) {
+        return if payload.submission_started {
+            Ok(submission_uncertain_outcome(&payload))
+        } else {
+            Err(error)
+        };
+    }
+    settle_control_payload(&payload)
 }
 
 fn validate_control_input_ready(
@@ -5749,6 +5766,7 @@ fn drain_control_payload(
     io: &mut ControlInjectionIo<'_>,
     phase: ControlSubmitDrainPhase,
 ) -> Result<(), String> {
+    pty_delivery_test_fault(&format!("tui_{}_drain", phase.token()))?;
     let start = Instant::now();
     while !io.pending_child_input.is_empty() {
         if start.elapsed() >= INJECT_WAIT_LIMIT {
@@ -5825,6 +5843,7 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 mod tests {
     use super::super::{PtyPair, configure_child_pty};
     use super::*;
+    use oulipoly_state::mailbox::MailboxDb;
     use oulipoly_state::{InvocationStart, StateDb};
     use ratatui::backend::TestBackend;
     use std::ffi::OsString;
@@ -6550,6 +6569,101 @@ mod tests {
         let error = drain_control_payload(&mut io, ControlSubmitDrainPhase::Delimiter)
             .expect_err("a delimiter drain failure must not report success");
         assert!(error.starts_with("control_submit_delimiter_"), "{error}");
+    }
+
+    #[test]
+    fn tui_retains_one_submission_when_confirmation_fails_after_body_and_enter_drain() {
+        let _env_lock = crate::test_support::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(dir.path());
+        let attempt_id = "tui-fault-attempt";
+        let path = seed_test_mailbox_delivery(dir.path(), attempt_id);
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_tui_confirmation
+                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected TUI confirmation failure'); END;",
+            )
+            .unwrap();
+        let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
+        let mut payload = prepare_control_payload(envelope.into_bytes(), None).unwrap();
+        let (child_peer, master) = pipe_files();
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut line_state = InputLineState::default();
+        let mut child_output_state = ChildOutputState::default();
+        let mut pending_child_input = PendingChildInput::new();
+        let mut outbound_release_gate = OutboundReleaseGate::default();
+        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
+        let mut io = ControlInjectionIo {
+            master_fd: master.as_raw_fd(),
+            parser: &mut parser,
+            line_state: &mut line_state,
+            child_output_state: &mut child_output_state,
+            pending_child_input: &mut pending_child_input,
+            outbound_release_gate: &mut outbound_release_gate,
+            buffer: &mut buffer,
+            child_pid: None,
+        };
+
+        begin_control_payload_submission(&mut payload).unwrap();
+        submit_control_payload(&mut io, &payload.bytes, false).unwrap();
+        assert_eq!(
+            control_response_message(settle_control_payload(&payload)),
+            (true, pty_delivery_uncertain_message(attempt_id))
+        );
+        let mut retained = MailboxDb::open(&path).unwrap();
+        let window = retained
+            .delivery_attempt_window(attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(window.submission_started_at.is_some());
+        assert!(window.acknowledged_at.is_none());
+        assert!(window.resolved_at.is_none());
+        assert_eq!(window.rows.len(), 1);
+        assert!(
+            retained
+                .register_or_reuse_delivery_attempt(
+                    "replacement",
+                    "session-a",
+                    "invocation-b",
+                    "generation-b",
+                    &[window.rows[0].seq],
+                    0,
+                )
+                .unwrap_err()
+                .contains("mailbox_delivery_submission_uncertain:tui-fault-attempt")
+        );
+        drop(retained);
+        fault
+            .execute_batch("DROP TRIGGER fail_tui_confirmation")
+            .unwrap();
+        let retry = prepare_control_payload(
+            format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]").into_bytes(),
+            None,
+        )
+        .unwrap();
+        assert!(retry.bytes.is_empty());
+        assert_eq!(
+            settle_control_payload(&retry),
+            Ok(ControlPayloadOutcome::SubmissionUncertain(
+                attempt_id.to_string()
+            ))
+        );
+        set_nonblocking(child_peer.as_raw_fd());
+        let mut submitted = Vec::new();
+        drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
+        let submitted = String::from_utf8(submitted).unwrap();
+        assert_eq!(
+            submitted
+                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+                .count(),
+            1,
+            "{submitted}"
+        );
+        assert!(submitted.ends_with('\r'));
+        let db = MailboxDb::open(&path).unwrap();
+        assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
     }
 
     #[test]
@@ -7964,17 +8078,20 @@ mod tests {
         let monitor = Box::new(FakeMonitor::new(empty_snapshot()));
         let root = ObservabilityRoot::default();
         let relay = thread::spawn(move || {
-            let mut child = child;
+            let mut custody = ChildGenerationCustody::new(child, None).unwrap();
             let result = relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
                 None,
-                &mut child,
+                &mut custody,
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
             );
+            if result.is_ok() {
+                custody.observe_exit().unwrap();
+            }
             done_relay.store(true, Ordering::SeqCst);
             result
         });
@@ -8065,17 +8182,20 @@ mod tests {
         let root = ObservabilityRoot::default();
         let (relay_done_tx, relay_done_rx) = mpsc::sync_channel(1);
         let relay = thread::spawn(move || {
-            let mut child = child;
+            let mut custody = ChildGenerationCustody::new(child, None).unwrap();
             let result = relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
                 None,
-                &mut child,
+                &mut custody,
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
             );
+            if result.is_ok() {
+                custody.observe_exit().unwrap();
+            }
             let _ = relay_done_tx.send(result);
         });
 
@@ -8193,17 +8313,20 @@ mod tests {
         };
         let (relay_done_tx, relay_done_rx) = mpsc::sync_channel(1);
         let relay = thread::spawn(move || {
-            let mut child = child;
+            let mut custody = ChildGenerationCustody::new(child, None).unwrap();
             let result = relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
                 None,
-                &mut child,
+                &mut custody,
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
             );
+            if result.is_ok() {
+                custody.observe_exit().unwrap();
+            }
             let _ = relay_done_tx.send(result);
         });
 

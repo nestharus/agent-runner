@@ -51,29 +51,6 @@ pub(super) fn poll_child_status_error(err: &std::io::Error) -> String {
     format!("try_wait failed: {err}")
 }
 
-pub(super) fn live_quota_try_wait_error(err: &std::io::Error) -> String {
-    format!("try_wait before quota terminate failed: {err}")
-}
-
-pub(super) fn terminate_try_wait_error(err: &std::io::Error) -> String {
-    format!("try_wait before terminate failed: {err}")
-}
-
-pub(super) fn termination_grace_try_wait_error(
-    try_wait_context: &str,
-    err: &std::io::Error,
-) -> String {
-    format!("{try_wait_context}: {err}")
-}
-
-pub(super) fn kill_child_process_error(err: &std::io::Error) -> String {
-    format!("Failed to kill child process: {err}")
-}
-
-pub(super) fn reap_child_process_error(err: &std::io::Error) -> String {
-    format!("Failed to reap child process: {err}")
-}
-
 pub(super) fn write_stdin_error(err: &std::io::Error) -> String {
     format!("Failed to write to stdin: {err}")
 }
