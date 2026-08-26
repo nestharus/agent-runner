@@ -16,7 +16,7 @@ use crate::zero_turn_orchestration::ZeroTurnAction;
 pub(super) struct ResumeCompletionEvidence {
     pub(super) zero_turn_action: ZeroTurnAction,
     pub(super) recovered_generic_nonzero: bool,
-    pub(super) submitted_turn_confirmation: Option<ValidatedSubmittedUserTurn>,
+    pub(super) prompt_acceptance_confirmation: Option<ValidatedPromptAcceptance>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,57 +184,59 @@ fn mailbox_delivery_turn_confirmed(
     matches!(
         completion_evidence.zero_turn_action,
         ZeroTurnAction::Continue
-    ) || completion_evidence.submitted_turn_confirmation.is_some()
+    ) || completion_evidence.prompt_acceptance_confirmation.is_some()
         || ingested_user_turn_confirms_mailbox_delivery(input, provider_name)
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum ValidatedSubmittedUserTurn {
+pub(super) enum ValidatedPromptAcceptance {
     DeliveryNonceAndPromptSha256,
     PromptSha256,
 }
 
-impl ValidatedSubmittedUserTurn {
+impl ValidatedPromptAcceptance {
     fn evidence(self) -> &'static str {
         match self {
             Self::DeliveryNonceAndPromptSha256 => {
-                "validated submitted user turn: exact session, delivery nonce, and prompt SHA-256"
+                "validated prompt acceptance: exact session, delivery nonce, and prompt SHA-256"
             }
-            Self::PromptSha256 => "validated submitted user turn: exact session and prompt SHA-256",
+            Self::PromptSha256 => "validated prompt acceptance: exact session and prompt SHA-256",
         }
     }
 }
 
-pub(super) fn validate_submitted_user_turn(
+pub(super) fn validate_prompt_acceptance_attestation(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
-) -> Option<ValidatedSubmittedUserTurn> {
-    let submitted = result.submitted_user_turn.as_ref()?;
+) -> Option<ValidatedPromptAcceptance> {
+    let attestation = result.prompt_acceptance_attestation.as_ref()?;
     let answer = input.answer?;
-    if submitted.provider_session_id != input.resolved.active_session_id {
+    if attestation.provider_session_id != input.resolved.active_session_id {
         return None;
     }
-    validate_submitted_user_turn_payload(input, submitted, answer)
+    validate_prompt_acceptance_attestation_payload(input, attestation, answer)
 }
 
-fn validate_submitted_user_turn_payload(
+fn validate_prompt_acceptance_attestation_payload(
     input: &ResumeAttemptInput<'_>,
-    submitted: &executor::SubmittedUserTurn,
+    attestation: &oulipoly_provider::generated::PromptAcceptedMarkerValueV1,
     answer: &str,
-) -> Option<ValidatedSubmittedUserTurn> {
-    if submitted.prompt_sha256 != sha256_hex(answer.as_bytes()) {
+) -> Option<ValidatedPromptAcceptance> {
+    if attestation.protocol != oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1
+        || attestation.prompt_sha256 != sha256_hex(answer.as_bytes())
+    {
         return None;
     }
     if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
-        return (submitted.delivery_nonce.as_deref() == Some(delivery_nonce))
-            .then_some(ValidatedSubmittedUserTurn::DeliveryNonceAndPromptSha256);
+        return (attestation.delivery_nonce.as_deref() == Some(delivery_nonce))
+            .then_some(ValidatedPromptAcceptance::DeliveryNonceAndPromptSha256);
     }
-    Some(ValidatedSubmittedUserTurn::PromptSha256)
+    Some(ValidatedPromptAcceptance::PromptSha256)
 }
 
-pub(super) fn project_validated_submitted_turn_acceptance(
+pub(super) fn project_validated_prompt_acceptance(
     result: &mut executor::ExecutionResult,
-    confirmation: Option<ValidatedSubmittedUserTurn>,
+    confirmation: Option<ValidatedPromptAcceptance>,
 ) {
     if result.resume_acceptance.is_some() {
         return;

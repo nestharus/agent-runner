@@ -495,6 +495,19 @@ pub struct PromptAcceptanceRequestV1 {
     pub delivery_nonce: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptAcceptedMarkerValueV1 {
+    pub protocol: String,
+    pub provider_session_id: String,
+    pub prompt_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_nonce: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchParams {
     pub settings_id: String,

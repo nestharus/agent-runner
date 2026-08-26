@@ -57,7 +57,7 @@ pub(super) fn execution_result_from_raw(
         terminal_reason: result.terminal_reason,
         terminal_signal: result.terminal_signal,
         produced_assistant_response,
-        submitted_user_turn: None,
+        prompt_acceptance_attestation: None,
         captured_child_invocations: result.captured_child_invocations,
         returned_artifacts: result.returned_artifacts,
     }

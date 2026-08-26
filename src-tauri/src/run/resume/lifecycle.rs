@@ -179,7 +179,12 @@ pub(super) fn record_resume_acceptance_if_present(
 pub(super) struct ResumeCompletionClassification {
     pub(super) recovered_generic_nonzero: bool,
     pub(super) terminal_completion_confirmed: bool,
-    pub(super) mailbox_submission_confirmed_after_nonzero: bool,
+    pub(super) confirmed_prompt_acceptance_failure: Option<ConfirmedPromptAcceptanceFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ConfirmedPromptAcceptanceFailure {
+    pub(super) physical_exit_code: i32,
 }
 
 pub(super) fn finalize_completed_attempt_for_resume(
@@ -210,8 +215,13 @@ pub(super) fn finalize_completed_attempt_for_resume(
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
         terminal_completion_confirmed: completion.terminal_completion_confirmed,
     })?;
-    if completion.mailbox_submission_confirmed_after_nonzero {
-        return finalize_confirmed_nonzero_submission(input, attempt, provider_session_id, result);
+    if let Some(failure) = completion.confirmed_prompt_acceptance_failure {
+        return finalize_confirmed_prompt_acceptance_failure(
+            input,
+            attempt,
+            provider_session_id,
+            failure,
+        );
     }
     match control {
         CompletedAttemptControl::Continue => {
@@ -230,21 +240,43 @@ pub(super) fn finalize_completed_attempt_for_resume(
     }
 }
 
-fn finalize_confirmed_nonzero_submission(
+fn finalize_confirmed_prompt_acceptance_failure(
     input: &ResumeAttemptInput<'_>,
     attempt: &ResumeInvocationAttempt<'_>,
     provider_session_id: &str,
-    result: &oulipoly_runtime::executor::ExecutionResult,
+    failure: ConfirmedPromptAcceptanceFailure,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    wake::complete_successful_mailbox_delivery(
+    let shell_exit_code = mapper::failure_exit_code(failure.physical_exit_code);
+    settle_confirmed_prompt_acceptance_failure(
         input,
         provider_session_id,
         &attempt.invocation.id,
-        result.exit_code,
+        failure,
+        shell_exit_code,
     )?;
-    Ok(ResumeAttemptLoopControl::Return(mapper::failure_exit_code(
-        result.exit_code,
-    )))
+    Ok(ResumeAttemptLoopControl::Return(shell_exit_code))
+}
+
+pub(super) fn settle_confirmed_prompt_acceptance_failure(
+    input: &ResumeAttemptInput<'_>,
+    provider_session_id: &str,
+    invocation_uuid: &str,
+    failure: ConfirmedPromptAcceptanceFailure,
+    shell_exit_code: i32,
+) -> Result<(), String> {
+    let mailbox_outcome = if input.mailbox_delivery_seqs.is_empty() {
+        wake::MailboxDeliveryOutcome::Absent
+    } else {
+        wake::MailboxDeliveryOutcome::Confirmed
+    };
+    wake::settle_age270_mailbox_delivery_outcome(
+        input,
+        provider_session_id,
+        invocation_uuid,
+        failure.physical_exit_code,
+        shell_exit_code,
+        mailbox_outcome,
+    )
 }
 
 fn finalize_retrying_resume(

@@ -5,15 +5,14 @@
 //! - mapper: `map_launch_result_with_terminal_classification`,
 //!   `launch_session_capture`, and `launch_provider_session_id` translate
 //!   provider launch results into runtime execution, terminal, session-capture,
-//!   submitted-turn, and assistant-productivity surfaces.
-//! - accessor: `marker_string` and `raw_provider_session_id` read optional
-//!   marker/session fields from launch JSON values.
+//!   prompt-acceptance-attestation, and assistant-productivity surfaces.
+//! - accessor: `raw_provider_session_id` reads optional session fields from
+//!   launch JSON values.
 //! - predicate: `provider_session_id_is_present` reports whether a session
 //!   identifier is present before runtime capture.
-//! - filter: `nonempty_marker_string` and `accepted_provider_session_id` select
-//!   non-empty/accepted marker and session values, dropping empties.
-//! - validator: `submitted_user_turn_from_marker_value` validates the
-//!   submitted-user-turn marker payload before constructing the runtime DTO.
+//! - filter: `accepted_provider_session_id` selects non-empty session values.
+//! - validator: `prompt_acceptance_attestation_from_marker_value` validates the
+//!   versioned provider attestation before exposing it to runtime consumers.
 //!
 //! ## Adapter declarations
 //!
@@ -26,7 +25,7 @@
 //!       - runtime-execution-result-contract
 //!       - terminal-cancel-outcome-contract
 //!       - session-capture-contract
-//!       - submitted-user-turn-marker-contract
+//!       - prompt-acceptance-attestation-contract
 //! intrinsic_surface_declarations:
 //!   - component: crates/oulipoly-runtime/src/executor/external_provider/launch_result_mapper.rs
 //!     role: intrinsic-surface
@@ -35,18 +34,18 @@
 //!       - LaunchResult stdout/stderr projection into ExecutionResult
 //!       - terminal classification override and fallback mapping
 //!       - launch session object to runtime session-capture mapping
-//!       - submitted-user-turn marker extraction semantics
+//!       - prompt-acceptance attestation extraction semantics
 //!       - assistant-response productivity evidence projection
 //!       - returned-artifact and child-invocation empty defaults for launch results
 //! ```
 
 use super::terminal_cancel_mapper::map_terminal_cancel_outcome;
 use crate::executor::assistant_response::launch_result_produced_assistant_response;
-use crate::executor::{
-    ExecutionResult, SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn,
-};
+use crate::executor::{ExecutionResult, SessionCaptureMethod, SessionCaptureResult};
 use crate::services::TerminalClassification;
-use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PROMPT_ACCEPTED_MARKER_V1};
+use oulipoly_provider::generated::{
+    PROMPT_ACCEPTANCE_V1, PROMPT_ACCEPTED_MARKER_V1, PromptAcceptedMarkerValueV1,
+};
 use oulipoly_provider::stream::LaunchResult;
 use serde_json::Value;
 
@@ -82,46 +81,29 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         terminal_reason: terminal.terminal_reason,
         terminal_signal: Some(terminal.terminal_signal),
         produced_assistant_response,
-        submitted_user_turn: submitted_user_turn(&result, prompt_acceptance_v1),
+        prompt_acceptance_attestation: prompt_acceptance_attestation(&result, prompt_acceptance_v1),
         captured_child_invocations: Vec::new(),
         returned_artifacts: Vec::new(),
     }
 }
 
-fn submitted_user_turn(
+fn prompt_acceptance_attestation(
     result: &LaunchResult,
     prompt_acceptance_v1: bool,
-) -> Option<SubmittedUserTurn> {
+) -> Option<PromptAcceptedMarkerValueV1> {
     if !prompt_acceptance_v1 {
         return None;
     }
     result
         .retained_marker_value(PROMPT_ACCEPTED_MARKER_V1)
-        .and_then(submitted_user_turn_from_marker_value)
+        .and_then(prompt_acceptance_attestation_from_marker_value)
 }
 
-fn submitted_user_turn_from_marker_value(value: &Value) -> Option<SubmittedUserTurn> {
-    if nonempty_marker_string(value, "protocol").as_deref() != Some(PROMPT_ACCEPTANCE_V1) {
-        return None;
-    }
-    let provider_session_id = nonempty_marker_string(value, "provider_session_id")
-        .or_else(|| nonempty_marker_string(value, "session_id"))?;
-    let prompt_sha256 = nonempty_marker_string(value, "prompt_sha256")?;
-    Some(SubmittedUserTurn {
-        provider_session_id,
-        prompt_sha256,
-        delivery_nonce: marker_string(value, "delivery_nonce"),
-        source: marker_string(value, "source"),
-        message_id: marker_string(value, "message_id"),
-    })
-}
-
-fn nonempty_marker_string(value: &Value, key: &str) -> Option<String> {
-    marker_string(value, key).filter(|value| !value.trim().is_empty())
-}
-
-fn marker_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
+fn prompt_acceptance_attestation_from_marker_value(
+    value: &Value,
+) -> Option<PromptAcceptedMarkerValueV1> {
+    let attestation: PromptAcceptedMarkerValueV1 = serde_json::from_value(value.clone()).ok()?;
+    (attestation.protocol == PROMPT_ACCEPTANCE_V1).then_some(attestation)
 }
 
 fn launch_session_capture(result: &LaunchResult) -> SessionCaptureResult {

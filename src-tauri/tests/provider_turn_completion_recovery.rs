@@ -650,7 +650,7 @@ def launch():
         "provider_session_id": session_id,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "source": "age270.fixture",
-        "message_id": "age270-submitted-turn",
+        "message_id": "age270-prompt-accepted",
     }
     if acceptance.get("delivery_nonce"):
         value["delivery_nonce"] = acceptance["delivery_nonce"]

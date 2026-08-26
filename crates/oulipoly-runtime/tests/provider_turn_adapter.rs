@@ -14,10 +14,11 @@ use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, Stor
 use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ResumeAcceptanceRules, ResumeKind, ResumeStrategy,
 };
+use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PromptAcceptedMarkerValueV1};
 use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
 use oulipoly_runtime::executor::{
     CapturedChildInvocation, ExecutionResult, ResumeAcceptanceResult, ResumeAcceptanceStatus,
-    SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn, TerminalSignal,
+    SessionCaptureMethod, SessionCaptureResult, TerminalSignal,
 };
 use oulipoly_runtime::provider_turn_adapter::{
     CliResumeRequest, EffectWrite, EvidenceStrength, FencedProviderEvidence, InvocationOwnership,
@@ -376,7 +377,8 @@ fn execution_result(
         terminal_reason: None,
         terminal_signal: None,
         produced_assistant_response,
-        submitted_user_turn: Some(SubmittedUserTurn {
+        prompt_acceptance_attestation: Some(PromptAcceptedMarkerValueV1 {
+            protocol: PROMPT_ACCEPTANCE_V1.to_string(),
             provider_session_id: session_id.to_string(),
             prompt_sha256: prompt_sha256(prompt),
             delivery_nonce: nonce.map(str::to_string),
@@ -486,7 +488,7 @@ fn resident_owner_publishes_exact_results_and_accepts_a_later_turn() {
             .submitted_evidence
             .as_deref()
             .unwrap()
-            .contains("submitted_user_turn")
+            .contains("prompt_acceptance_attestation")
     );
     assert!(
         acknowledgement
@@ -1005,13 +1007,14 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
             EvidenceStrength::Informational,
         ),
         (
-            ProviderEvidence::SubmittedUserTurn {
+            ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+                protocol: PROMPT_ACCEPTANCE_V1.to_string(),
                 provider_session_id: SESSION.to_string(),
                 prompt_sha256: prompt_hash.clone(),
                 delivery_nonce: None,
                 source: None,
                 message_id: None,
-            },
+            }),
             EvidenceStrength::Submitted,
         ),
         (
@@ -1095,13 +1098,14 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
     ] {
         let evidence = FencedProviderEvidence {
             fence: fence.clone(),
-            evidence: ProviderEvidence::SubmittedUserTurn {
+            evidence: ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+                protocol: PROMPT_ACCEPTANCE_V1.to_string(),
                 provider_session_id: SESSION.to_string(),
                 prompt_sha256: submitted_prompt_hash,
                 delivery_nonce: Some("delivery-nonce".to_string()),
                 source: None,
                 message_id: None,
-            },
+            }),
         };
         assert_eq!(
             classify_provider_evidence(
@@ -1115,6 +1119,24 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
             expected
         );
     }
+
+    let wrong_protocol = FencedProviderEvidence {
+        fence: fence.clone(),
+        evidence: ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+            protocol: "oulipoly.prompt_acceptance/v2".to_string(),
+            provider_session_id: SESSION.to_string(),
+            prompt_sha256: prompt_hash.clone(),
+            delivery_nonce: None,
+            source: None,
+            message_id: None,
+        }),
+    };
+    assert_eq!(
+        classify_provider_evidence(&fence, SESSION, Some(&prompt_hash), None, &wrong_protocol,)
+            .unwrap(),
+        EvidenceStrength::Informational,
+        "a different attestation protocol cannot become trusted evidence"
+    );
 
     let wrong_session = FencedProviderEvidence {
         fence: fence.clone(),
@@ -1148,7 +1170,7 @@ fn confirmation_only_evidence_advances_both_required_acknowledgement_stages() {
     let parent = seed_invocation(&state, PARENT_UUID, None);
     let invocation = seed_invocation(&state, FIRST_UUID, Some(parent.invocation_row_id));
     let mut result = execution_result(SESSION, "prompt", None, true, Vec::new());
-    result.submitted_user_turn = None;
+    result.prompt_acceptance_attestation = None;
     result.resume_acceptance = None;
     let executor = QueueExecutor::new([complete_outcome(result)]);
     let mut adapter = ProviderTurnAdapter::new(executor);
@@ -1194,7 +1216,7 @@ fn confirmation_only_evidence_advances_both_required_acknowledgement_stages() {
 #[test]
 fn execution_status_does_not_overstate_unconfirmed_or_failure_evidence() {
     let mut unconfirmed = execution_result(SESSION, "prompt", None, false, Vec::new());
-    unconfirmed.submitted_user_turn = None;
+    unconfirmed.prompt_acceptance_attestation = None;
     unconfirmed.resume_acceptance = Some(ResumeAcceptanceResult {
         status: ResumeAcceptanceStatus::Unconfirmed,
         evidence: Some("exit zero without affirmative resume evidence".to_string()),

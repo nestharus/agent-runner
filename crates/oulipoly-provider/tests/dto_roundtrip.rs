@@ -55,6 +55,20 @@ fn describe_fixture_binds_prompt_acceptance_to_host_selection() {
 }
 
 #[test]
+fn prompt_acceptance_attestation_has_a_named_provider_contract_dto() {
+    let value = json!({
+        "protocol": dto::PROMPT_ACCEPTANCE_V1,
+        "provider_session_id": "session-1",
+        "prompt_sha256": "a".repeat(64),
+        "delivery_nonce": "delivery-1",
+        "source": "fixture",
+        "message_id": "message-1"
+    });
+
+    assert_json_round_trip::<dto::PromptAcceptedMarkerValueV1>(&value);
+}
+
+#[test]
 fn dto_roundtrip_covers_every_s2_contract_type() {
     let fixtures = fixtures();
 

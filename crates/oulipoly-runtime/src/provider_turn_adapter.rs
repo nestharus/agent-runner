@@ -16,9 +16,10 @@ use sha2::{Digest, Sha256};
 
 use crate::executor::cli::{self, ResumePayload};
 use crate::executor::terminal_signal::TerminalSignalKind;
-use crate::executor::{ExecutionResult, ResumeAcceptanceStatus, SubmittedUserTurn};
+use crate::executor::{ExecutionResult, ResumeAcceptanceStatus};
 use crate::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
 use crate::session_supervisor::{SupervisorError, TurnRequest};
+use oulipoly_provider::generated::PromptAcceptedMarkerValueV1;
 
 const MAX_MAILBOX_BATCH_ROWS: usize = 20;
 
@@ -271,13 +272,7 @@ impl ProviderTurnExecutor for ProductionProviderTurnExecutor {
 pub enum ProviderEvidence {
     ProcessLaunched,
     TransportAccepted,
-    SubmittedUserTurn {
-        provider_session_id: String,
-        prompt_sha256: String,
-        delivery_nonce: Option<String>,
-        source: Option<String>,
-        message_id: Option<String>,
-    },
+    PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1),
     ResumeAccepted {
         provider_session_id: String,
         evidence: String,
@@ -506,18 +501,15 @@ pub fn classify_provider_evidence(
 ) -> Result<EvidenceStrength, ProviderTurnAdapterError> {
     validate_evidence_fence(expected_fence, evidence)?;
     let strength = match &evidence.evidence {
-        ProviderEvidence::SubmittedUserTurn {
-            provider_session_id,
-            prompt_sha256,
-            delivery_nonce,
-            ..
-        } if provider_session_id == expected_session_id
-            && submitted_payload_matches(
-                prompt_sha256,
-                delivery_nonce.as_deref(),
-                expected_prompt_sha256,
-                expected_delivery_nonce,
-            ) =>
+        ProviderEvidence::PromptAcceptanceAttestation(attestation)
+            if attestation.protocol == oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1
+                && attestation.provider_session_id == expected_session_id
+                && prompt_acceptance_attestation_matches(
+                    &attestation.prompt_sha256,
+                    attestation.delivery_nonce.as_deref(),
+                    expected_prompt_sha256,
+                    expected_delivery_nonce,
+                ) =>
         {
             EvidenceStrength::Submitted
         }
@@ -620,7 +612,7 @@ fn validate_mailbox_batch(
     Ok(())
 }
 
-fn submitted_payload_matches(
+fn prompt_acceptance_attestation_matches(
     prompt_sha256: &str,
     delivery_nonce: Option<&str>,
     expected_prompt_sha256: Option<&str>,
@@ -711,8 +703,11 @@ fn evidence_from_execution(
         return evidence;
     };
     evidence.push(fenced(fence, ProviderEvidence::ProcessLaunched));
-    if let Some(submitted) = result.submitted_user_turn.as_ref() {
-        evidence.push(fenced(fence, submitted_user_evidence(submitted)));
+    if let Some(attestation) = result.prompt_acceptance_attestation.as_ref() {
+        evidence.push(fenced(
+            fence,
+            prompt_acceptance_attestation_evidence(attestation),
+        ));
     }
     if let Some(acceptance) = result.resume_acceptance.as_ref() {
         let fact = match acceptance.status {
@@ -759,14 +754,10 @@ fn fenced(fence: &TurnFence, evidence: ProviderEvidence) -> FencedProviderEviden
     }
 }
 
-fn submitted_user_evidence(submitted: &SubmittedUserTurn) -> ProviderEvidence {
-    ProviderEvidence::SubmittedUserTurn {
-        provider_session_id: submitted.provider_session_id.clone(),
-        prompt_sha256: submitted.prompt_sha256.clone(),
-        delivery_nonce: submitted.delivery_nonce.clone(),
-        source: submitted.source.clone(),
-        message_id: submitted.message_id.clone(),
-    }
+fn prompt_acceptance_attestation_evidence(
+    attestation: &PromptAcceptedMarkerValueV1,
+) -> ProviderEvidence {
+    ProviderEvidence::PromptAcceptanceAttestation(attestation.clone())
 }
 
 fn failure_evidence(execution: &ProviderExecutionOutcome) -> ProviderEvidence {
@@ -853,7 +844,7 @@ fn select_evidence(
 
 fn evidence_rank(evidence: &ProviderEvidence) -> u8 {
     match evidence {
-        ProviderEvidence::SubmittedUserTurn { .. } => 0,
+        ProviderEvidence::PromptAcceptanceAttestation(_) => 0,
         ProviderEvidence::IngestedUserTurn { .. } => 1,
         ProviderEvidence::ResumeAccepted { .. } => 2,
         ProviderEvidence::IngestedAssistantTurn { .. } => 0,
@@ -873,20 +864,15 @@ fn evidence_rank(evidence: &ProviderEvidence) -> u8 {
 
 fn encode_evidence(evidence: &ProviderEvidence) -> String {
     let value = match evidence {
-        ProviderEvidence::SubmittedUserTurn {
-            provider_session_id,
-            prompt_sha256,
-            delivery_nonce,
-            source,
-            message_id,
-        } => json!({
+        ProviderEvidence::PromptAcceptanceAttestation(attestation) => json!({
             "schema": "oulipoly.provider-turn-evidence/v1",
-            "kind": "submitted_user_turn",
-            "provider_session_id": provider_session_id,
-            "prompt_sha256": prompt_sha256,
-            "delivery_nonce": delivery_nonce,
-            "source": source,
-            "message_id": message_id,
+            "kind": "prompt_acceptance_attestation",
+            "protocol": attestation.protocol,
+            "provider_session_id": attestation.provider_session_id,
+            "prompt_sha256": attestation.prompt_sha256,
+            "delivery_nonce": attestation.delivery_nonce,
+            "source": attestation.source,
+            "message_id": attestation.message_id,
         }),
         ProviderEvidence::ResumeAccepted {
             provider_session_id,

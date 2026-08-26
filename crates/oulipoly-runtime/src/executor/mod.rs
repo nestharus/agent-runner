@@ -32,6 +32,7 @@ use crate::services::{
 use external_provider::context::{ExternalProviderDispatchContext, ExternalProviderDispatchInput};
 pub use oulipoly_agent_messenger::ReturnedArtifactRef;
 use oulipoly_config::{ModelConfig, ProviderConfig};
+use oulipoly_provider::generated::PromptAcceptedMarkerValueV1;
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::path::Path;
@@ -73,18 +74,9 @@ pub struct ExecutionResult {
     /// response. Terminal cleanliness is checked by callers before treating it
     /// as productive completion.
     pub produced_assistant_response: bool,
-    pub submitted_user_turn: Option<SubmittedUserTurn>,
+    pub prompt_acceptance_attestation: Option<PromptAcceptedMarkerValueV1>,
     pub captured_child_invocations: Vec<CapturedChildInvocation>,
     pub returned_artifacts: Vec<ReturnedArtifactRef>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmittedUserTurn {
-    pub provider_session_id: String,
-    pub prompt_sha256: String,
-    pub delivery_nonce: Option<String>,
-    pub source: Option<String>,
-    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

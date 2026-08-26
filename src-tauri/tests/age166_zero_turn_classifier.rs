@@ -67,7 +67,7 @@ fn nonzero_result_without_typed_signal() -> ExecutionResult {
         terminal_reason: Some("exit_nonzero".to_string()),
         terminal_signal: None,
         produced_assistant_response: false,
-        submitted_user_turn: None,
+        prompt_acceptance_attestation: None,
         captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
         returned_artifacts: Vec::new(),
     }

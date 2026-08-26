@@ -196,7 +196,7 @@ fn execution_result_with_signal(
             observed_at: SystemTime::UNIX_EPOCH,
         }),
         produced_assistant_response: false,
-        submitted_user_turn: None,
+        prompt_acceptance_attestation: None,
         captured_child_invocations: Vec::<CapturedChildInvocation>::new(),
         returned_artifacts: Vec::new(),
     }

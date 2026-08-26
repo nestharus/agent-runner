@@ -4,8 +4,8 @@
 //!
 //! Roles: orchestration, formatter, accessor, parser, validator.
 //!
-//! TEST: external-provider runtime fixtures for session ingestion, submitted
-//! turn acceptance, and policy diagnostics.
+//! TEST: external-provider runtime fixtures for session ingestion, prompt
+//! acceptance, and policy diagnostics.
 
 use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, EnqueueResult, MailboxDb, MailboxRow};
 use rusqlite::{Connection, OptionalExtension};
@@ -395,14 +395,14 @@ fn external_provider_runtime_uses_ingested_session_when_launch_capture_missing()
 }
 
 #[test]
-fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_delivery_nonce() {
+fn prompt_acceptance_hash_accepts_exact_and_rejects_mismatch_without_delivery_nonce() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
     assert_success(&fixture.run_agent_with_env("seed manual resume", &[]));
 
     let output = fixture.run_resume_with_env(
         "manual exact payload",
-        &[("S11_EMIT_SUBMITTED_TURN_MARKER", "1")],
+        &[("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1")],
     );
     assert_unconfirmed_resume(&output);
     let (status, evidence) = fixture.latest_resume_acceptance();
@@ -420,7 +420,7 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
     let output = fixture.run_resume_with_env(
         "manual hash mismatch",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
         ],
     );
@@ -433,7 +433,7 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
 }
 
 #[test]
-fn submitted_turn_marker_requires_declared_prompt_acceptance_capability() {
+fn prompt_acceptance_marker_requires_declared_capability() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
     assert_success(&fixture.run_agent_with_env(
@@ -444,7 +444,7 @@ fn submitted_turn_marker_requires_declared_prompt_acceptance_capability() {
     let output = fixture.run_resume_with_env(
         "manual undeclared attestation",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1"),
         ],
     );
@@ -461,7 +461,37 @@ fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evid
 }
 
 #[test]
-fn trusted_submission_settles_mailbox_delivery_after_provider_nonzero() {
+fn accepted_manual_prompt_nonzero_has_one_typed_terminal_outcome() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env("seed manual failure", &[]));
+
+    let output = fixture.run_resume_with_env(
+        "accepted manual payload",
+        &[
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(29), "{output:?}");
+    let result = result_envelope(&output);
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["exit_code"], 29);
+    assert_eq!(
+        result["terminal_reason"],
+        "resume_prompt_accepted_provider_failed"
+    );
+    assert_eq!(
+        fixture.latest_resume_acceptance().0.as_deref(),
+        Some("accepted")
+    );
+    fixture.assert_xdg_isolated();
+}
+
+#[test]
+fn trusted_prompt_acceptance_settles_mailbox_delivery_after_provider_nonzero() {
     let fixture = Fixture::new();
     fixture.write_external_provider();
     fixture.remove_turn_script_fallback();
@@ -472,7 +502,7 @@ fn trusted_submission_settles_mailbox_delivery_after_provider_nonzero() {
     let resumed = fixture.run_resume_with_env(
         "continue owning workflow",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_NO_ASSISTANT_RESULT", "1"),
             ("S11_EXIT_NONZERO", "1"),
         ],
@@ -513,7 +543,7 @@ fn delivery_nonce_does_not_override_a_mismatched_prompt_hash() {
     let resumed = fixture.run_resume_with_env(
         "continue owning workflow",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
             ("S11_NO_ASSISTANT_RESULT", "1"),
             ("S11_EXIT_NONZERO", "1"),
@@ -546,7 +576,7 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let resumed = positive.run_resume_with_env(
         "continue owning workflow",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
             ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
         ],
@@ -558,7 +588,7 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     assert_eq!(acceptance.as_deref(), Some("accepted"));
     assert_eq!(
         evidence.as_deref(),
-        Some("validated submitted user turn: exact session, delivery nonce, and prompt SHA-256")
+        Some("validated prompt acceptance: exact session, delivery nonce, and prompt SHA-256")
     );
     assert_eq!(resumed_result["exit_code"], 0);
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
@@ -593,7 +623,7 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let unconfirmed = no_assistant.run_resume_with_env(
         "continue owning workflow",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_NO_ASSISTANT_RESULT", "1"),
             ("S11_READ_TURNS_STDOUT_LIMIT", "1"),
         ],
@@ -617,7 +647,7 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let later_resume = no_assistant.run_resume_with_env(
         "continue after child completion",
         &[
-            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1"),
             ("S11_EMIT_AFFIRMATIVE_ASSISTANT_RESULT", "1"),
         ],
     );
@@ -764,7 +794,7 @@ def provider_session_marker_event(request, seq, session_id):
         "value": {"provider_session_id": session_id},
     }
 
-def submitted_turn_marker_event(request, seq, session_id, prompt):
+def prompt_acceptance_marker_event(request, seq, session_id, prompt):
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     acceptance = request.get("params", {}).get("prompt_acceptance", {})
     if os.environ.get("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY") != "1":
@@ -777,7 +807,7 @@ def submitted_turn_marker_event(request, seq, session_id, prompt):
         "provider_session_id": session_id,
         "prompt_sha256": prompt_sha,
         "source": "s11.fixture",
-        "message_id": "msg-s11-submitted",
+        "message_id": "msg-s11-prompt-accepted",
     }
     if acceptance.get("delivery_nonce"):
         value["delivery_nonce"] = acceptance["delivery_nonce"]
@@ -839,8 +869,8 @@ def launch(request):
                 produced_assistant_response = True
             emit(stdout_event(request, seq, text))
             seq += 1
-        if os.environ.get("S11_EMIT_SUBMITTED_TURN_MARKER") == "1":
-            emit(submitted_turn_marker_event(request, seq, known, prompt))
+        if os.environ.get("S11_EMIT_PROMPT_ACCEPTANCE_MARKER") == "1":
+            emit(prompt_acceptance_marker_event(request, seq, known, prompt))
             seq += 1
         if produced_assistant_response:
             emit(produced_assistant_response_marker_event(request, seq))
