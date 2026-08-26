@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::executor::cli::{self, ResumePayload};
+use crate::executor::prompt_acceptance::{
+    ExpectedPromptAcceptance, promote_prompt_acceptance_attestation,
+};
 use crate::executor::terminal_signal::TerminalSignalKind;
 use crate::executor::{ExecutionResult, ResumeAcceptanceStatus};
 use crate::services::{ExecutorServicePort, ExecutorServiceRequest, ServiceError};
@@ -502,14 +505,17 @@ pub fn classify_provider_evidence(
     validate_evidence_fence(expected_fence, evidence)?;
     let strength = match &evidence.evidence {
         ProviderEvidence::PromptAcceptanceAttestation(attestation)
-            if attestation.protocol == oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1
-                && attestation.provider_session_id == expected_session_id
-                && prompt_acceptance_attestation_matches(
-                    &attestation.prompt_sha256,
-                    attestation.delivery_nonce.as_deref(),
-                    expected_prompt_sha256,
-                    expected_delivery_nonce,
-                ) =>
+            if expected_prompt_sha256.is_some_and(|expected_prompt_sha256| {
+                promote_prompt_acceptance_attestation(
+                    ExpectedPromptAcceptance {
+                        provider_session_id: expected_session_id,
+                        prompt_sha256: expected_prompt_sha256,
+                        delivery_nonce: expected_delivery_nonce,
+                    },
+                    attestation,
+                )
+                .is_some()
+            }) =>
         {
             EvidenceStrength::Submitted
         }
@@ -610,22 +616,6 @@ fn validate_mailbox_batch(
         return Err(ProviderTurnAdapterError::InvalidFence("mailbox ordering"));
     }
     Ok(())
-}
-
-fn prompt_acceptance_attestation_matches(
-    prompt_sha256: &str,
-    delivery_nonce: Option<&str>,
-    expected_prompt_sha256: Option<&str>,
-    expected_delivery_nonce: Option<&str>,
-) -> bool {
-    match (expected_prompt_sha256, expected_delivery_nonce) {
-        (Some(expected_prompt), Some(expected_nonce)) => {
-            prompt_sha256 == expected_prompt && delivery_nonce == Some(expected_nonce)
-        }
-        (Some(expected_prompt), None) => prompt_sha256 == expected_prompt,
-        (None, Some(expected_nonce)) => delivery_nonce == Some(expected_nonce),
-        (None, None) => false,
-    }
 }
 
 fn validate_evidence_fence(

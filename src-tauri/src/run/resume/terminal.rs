@@ -3,6 +3,7 @@
 //! `mapper`, `orchestration`, `predicate`
 
 use oulipoly_runtime::executor;
+use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;
 
 use super::disposition::{ResumeTerminalDispositionInput, handle_terminal_signal_disposition};
 use super::lifecycle::{
@@ -77,7 +78,7 @@ pub(super) fn handle_resume_attempt_result(
         result,
     );
     let prompt_acceptance_confirmation =
-        wake::validate_prompt_acceptance_attestation(input, result);
+        wake::validated_prompt_acceptance_for_resume(input, result);
     wake::project_validated_prompt_acceptance(result, prompt_acceptance_confirmation);
     let confirmed_prompt_acceptance_failure = classify_confirmed_prompt_acceptance_failure(
         result.exit_code,
@@ -129,7 +130,7 @@ pub(super) fn handle_resume_attempt_result(
 
 fn classify_confirmed_prompt_acceptance_failure(
     physical_exit_code: i32,
-    confirmation: Option<wake::ValidatedPromptAcceptance>,
+    confirmation: Option<ValidatedPromptAcceptance>,
     recovered_generic_nonzero: bool,
 ) -> Option<ConfirmedPromptAcceptanceFailure> {
     (physical_exit_code != 0 && confirmation.is_some() && !recovered_generic_nonzero)
@@ -483,7 +484,7 @@ mod tests {
         apply_unconfirmed_resume_completion_failure, classify_confirmed_prompt_acceptance_failure,
         stop_retry_after_confirmed_prompt_acceptance_failure,
     };
-    use crate::run::resume::wake::ValidatedPromptAcceptance;
+    use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_runtime::executor::{
         ExecutionResult, ResumeAcceptanceStatus, SessionCaptureMethod, SessionCaptureResult,

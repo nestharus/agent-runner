@@ -3,6 +3,9 @@
 //! `accessor`, `formatter`, `mapper`, `orchestration`, `predicate`
 
 use oulipoly_runtime::executor;
+use oulipoly_runtime::executor::prompt_acceptance::{
+    ExpectedPromptAcceptance, ValidatedPromptAcceptance, promote_prompt_acceptance_attestation,
+};
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_runtime::sessions;
 use sha2::{Digest, Sha256};
@@ -188,50 +191,21 @@ fn mailbox_delivery_turn_confirmed(
         || ingested_user_turn_confirms_mailbox_delivery(input, provider_name)
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum ValidatedPromptAcceptance {
-    DeliveryNonceAndPromptSha256,
-    PromptSha256,
-}
-
-impl ValidatedPromptAcceptance {
-    fn evidence(self) -> &'static str {
-        match self {
-            Self::DeliveryNonceAndPromptSha256 => {
-                "validated prompt acceptance: exact session, delivery nonce, and prompt SHA-256"
-            }
-            Self::PromptSha256 => "validated prompt acceptance: exact session and prompt SHA-256",
-        }
-    }
-}
-
-pub(super) fn validate_prompt_acceptance_attestation(
+pub(super) fn validated_prompt_acceptance_for_resume(
     input: &ResumeAttemptInput<'_>,
     result: &executor::ExecutionResult,
 ) -> Option<ValidatedPromptAcceptance> {
     let attestation = result.prompt_acceptance_attestation.as_ref()?;
     let answer = input.answer?;
-    if attestation.provider_session_id != input.resolved.active_session_id {
-        return None;
-    }
-    validate_prompt_acceptance_attestation_payload(input, attestation, answer)
-}
-
-fn validate_prompt_acceptance_attestation_payload(
-    input: &ResumeAttemptInput<'_>,
-    attestation: &oulipoly_provider::generated::PromptAcceptedMarkerValueV1,
-    answer: &str,
-) -> Option<ValidatedPromptAcceptance> {
-    if attestation.protocol != oulipoly_provider::generated::PROMPT_ACCEPTANCE_V1
-        || attestation.prompt_sha256 != sha256_hex(answer.as_bytes())
-    {
-        return None;
-    }
-    if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
-        return (attestation.delivery_nonce.as_deref() == Some(delivery_nonce))
-            .then_some(ValidatedPromptAcceptance::DeliveryNonceAndPromptSha256);
-    }
-    Some(ValidatedPromptAcceptance::PromptSha256)
+    let prompt_sha256 = sha256_hex(answer.as_bytes());
+    promote_prompt_acceptance_attestation(
+        ExpectedPromptAcceptance {
+            provider_session_id: &input.resolved.active_session_id,
+            prompt_sha256: &prompt_sha256,
+            delivery_nonce: input.mailbox_delivery_nonce,
+        },
+        attestation,
+    )
 }
 
 pub(super) fn project_validated_prompt_acceptance(

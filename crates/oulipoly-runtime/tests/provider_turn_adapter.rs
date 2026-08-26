@@ -1138,6 +1138,30 @@ fn evidence_strength_is_conservative_exact_fenced_and_monotonic() {
         "a different attestation protocol cannot become trusted evidence"
     );
 
+    let nonce_without_expected_prompt = FencedProviderEvidence {
+        fence: fence.clone(),
+        evidence: ProviderEvidence::PromptAcceptanceAttestation(PromptAcceptedMarkerValueV1 {
+            protocol: PROMPT_ACCEPTANCE_V1.to_string(),
+            provider_session_id: SESSION.to_string(),
+            prompt_sha256: prompt_hash.clone(),
+            delivery_nonce: Some("delivery-nonce".to_string()),
+            source: None,
+            message_id: None,
+        }),
+    };
+    assert_eq!(
+        classify_provider_evidence(
+            &fence,
+            SESSION,
+            None,
+            Some("delivery-nonce"),
+            &nonce_without_expected_prompt,
+        )
+        .unwrap(),
+        EvidenceStrength::Informational,
+        "a nonce cannot promote an attestation without the exact expected prompt hash"
+    );
+
     let wrong_session = FencedProviderEvidence {
         fence: fence.clone(),
         evidence: ProviderEvidence::AssistantOutput {
