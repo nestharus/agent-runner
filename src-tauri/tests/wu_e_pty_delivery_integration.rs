@@ -25,7 +25,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,7 @@ const SESSION_A: &str = "5169694d-de0f-40d1-890c-6e28e55bab27";
 const REGISTRATION_AUTHORITY_FILE: &str = "completion-registration-authority";
 
 struct Fixture {
+    _integration_test_guard: MutexGuard<'static, ()>,
     dir: tempfile::TempDir,
     config_home: PathBuf,
     data_home: PathBuf,
@@ -56,6 +57,9 @@ struct NotifyArtifacts {
 
 impl Fixture {
     fn new() -> Self {
+        let integration_test_guard = integration_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let config_home = dir.path().join("xdg-config");
         let data_home = dir.path().join("xdg-data");
@@ -72,6 +76,7 @@ impl Fixture {
         fs::create_dir_all(&models_dir).unwrap();
         fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
+            _integration_test_guard: integration_test_guard,
             dir,
             config_home,
             data_home,
@@ -437,6 +442,11 @@ flag = "--resume"
         );
         assert!(!self.home_dir.join(".config/oulipoly-agent-runner").exists());
     }
+}
+
+fn integration_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[test]
