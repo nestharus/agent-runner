@@ -16,16 +16,17 @@ use super::{formatter, mapper};
 use crate::zero_turn_orchestration::ZeroTurnAction;
 
 #[derive(Clone, Copy)]
-pub(super) struct ResumeCompletionEvidence {
+pub(super) struct ResumeCompletionEvidence<'a> {
     pub(super) zero_turn_action: ZeroTurnAction,
     pub(super) recovered_generic_nonzero: bool,
-    pub(super) prompt_acceptance_confirmation: Option<ValidatedPromptAcceptance>,
+    pub(super) prompt_acceptance_confirmation: Option<&'a ValidatedPromptAcceptance>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum MailboxDeliveryOutcome {
     Absent,
     Confirmed,
+    ConfirmedPromptAcceptance(ValidatedPromptAcceptance),
     Unconfirmed,
 }
 
@@ -72,7 +73,7 @@ pub(super) fn ingest_mailbox_delivery_confirmation_turn_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) {
     let errors = ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
         input,
@@ -87,7 +88,7 @@ fn ingest_mailbox_delivery_confirmation_turn_silently_if_needed(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> Vec<String> {
     if !mailbox_delivery_requires_turn_confirmation(
         input,
@@ -119,7 +120,7 @@ pub(super) fn resolve_mailbox_delivery_outcome(
     input: &ResumeAttemptInput<'_>,
     provider: &oulipoly_config::ProviderConfig,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> MailboxDeliveryOutcome {
     if input.mailbox_delivery_seqs.is_empty() {
         return MailboxDeliveryOutcome::Absent;
@@ -133,6 +134,8 @@ pub(super) fn resolve_mailbox_delivery_outcome(
     emit_session_ingest_warnings(&provider.name, &errors);
     if mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
         MailboxDeliveryOutcome::Unconfirmed
+    } else if let Some(acceptance) = completion_evidence.prompt_acceptance_confirmation {
+        MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance.clone())
     } else {
         MailboxDeliveryOutcome::Confirmed
     }
@@ -144,7 +147,7 @@ pub(super) fn handle_unconfirmed_mailbox_delivery_if_needed(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> Result<Option<ResumeAttemptLoopControl>, String> {
     if !mailbox_delivery_unconfirmed(input, &provider.name, result, completion_evidence) {
         return Ok(None);
@@ -159,7 +162,7 @@ fn mailbox_delivery_unconfirmed(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
     result: &executor::ExecutionResult,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> bool {
     mailbox_delivery_requires_turn_confirmation(
         input,
@@ -182,7 +185,7 @@ fn mailbox_delivery_requires_turn_confirmation(
 fn mailbox_delivery_turn_confirmed(
     input: &ResumeAttemptInput<'_>,
     provider_name: &str,
-    completion_evidence: ResumeCompletionEvidence,
+    completion_evidence: ResumeCompletionEvidence<'_>,
 ) -> bool {
     matches!(
         completion_evidence.zero_turn_action,
@@ -206,22 +209,6 @@ pub(super) fn validated_prompt_acceptance_for_resume(
         },
         attestation,
     )
-}
-
-pub(super) fn project_validated_prompt_acceptance(
-    result: &mut executor::ExecutionResult,
-    confirmation: Option<ValidatedPromptAcceptance>,
-) {
-    if result.resume_acceptance.is_some() {
-        return;
-    }
-    let Some(confirmation) = confirmation else {
-        return;
-    };
-    result.resume_acceptance = Some(executor::ResumeAcceptanceResult {
-        status: executor::ResumeAcceptanceStatus::Accepted,
-        evidence: Some(confirmation.evidence().to_string()),
-    });
 }
 
 fn ingested_user_turn_confirms_mailbox_delivery(
@@ -350,6 +337,14 @@ pub(super) fn settle_age270_mailbox_delivery_outcome(
             invocation_uuid,
             physical_exit_code,
         ),
+        MailboxDeliveryOutcome::ConfirmedPromptAcceptance(acceptance) => {
+            complete_successful_mailbox_delivery(
+                input,
+                acceptance.provider_session_id(),
+                invocation_uuid,
+                physical_exit_code,
+            )
+        }
         MailboxDeliveryOutcome::Unconfirmed => {
             record_failed_mailbox_delivery_attempt(input, "mailbox_delivery_unconfirmed")?;
             mark_resume_attempt_idle(provider_session_id, invocation_uuid, Some(shell_exit_code))

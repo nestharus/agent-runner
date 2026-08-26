@@ -504,20 +504,13 @@ pub fn classify_provider_evidence(
 ) -> Result<EvidenceStrength, ProviderTurnAdapterError> {
     validate_evidence_fence(expected_fence, evidence)?;
     let strength = match &evidence.evidence {
-        ProviderEvidence::PromptAcceptanceAttestation(attestation)
-            if expected_prompt_sha256.is_some_and(|expected_prompt_sha256| {
-                promote_prompt_acceptance_attestation(
-                    ExpectedPromptAcceptance {
-                        provider_session_id: expected_session_id,
-                        prompt_sha256: expected_prompt_sha256,
-                        delivery_nonce: expected_delivery_nonce,
-                    },
-                    attestation,
-                )
-                .is_some()
-            }) =>
-        {
-            EvidenceStrength::Submitted
+        ProviderEvidence::PromptAcceptanceAttestation(attestation) => {
+            prompt_acceptance_evidence_strength(
+                expected_session_id,
+                expected_prompt_sha256,
+                expected_delivery_nonce,
+                attestation,
+            )
         }
         ProviderEvidence::ResumeAccepted {
             provider_session_id,
@@ -549,6 +542,34 @@ pub fn classify_provider_evidence(
         _ => EvidenceStrength::Informational,
     };
     Ok(strength)
+}
+
+fn prompt_acceptance_evidence_strength(
+    expected_session_id: &str,
+    expected_prompt_sha256: Option<&str>,
+    expected_delivery_nonce: Option<&str>,
+    attestation: &PromptAcceptedMarkerValueV1,
+) -> EvidenceStrength {
+    let Some(expected_prompt_sha256) = expected_prompt_sha256 else {
+        return EvidenceStrength::Informational;
+    };
+    let Some(validated) = promote_prompt_acceptance_attestation(
+        ExpectedPromptAcceptance {
+            provider_session_id: expected_session_id,
+            prompt_sha256: expected_prompt_sha256,
+            delivery_nonce: expected_delivery_nonce,
+        },
+        attestation,
+    ) else {
+        return EvidenceStrength::Informational;
+    };
+    submitted_strength_from_prompt_acceptance(&validated)
+}
+
+fn submitted_strength_from_prompt_acceptance(
+    _acceptance: &crate::executor::prompt_acceptance::ValidatedPromptAcceptance,
+) -> EvidenceStrength {
+    EvidenceStrength::Submitted
 }
 
 pub fn prompt_sha256(prompt: &str) -> String {

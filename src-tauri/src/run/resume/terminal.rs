@@ -79,10 +79,9 @@ pub(super) fn handle_resume_attempt_result(
     );
     let prompt_acceptance_confirmation =
         wake::validated_prompt_acceptance_for_resume(input, result);
-    wake::project_validated_prompt_acceptance(result, prompt_acceptance_confirmation);
     let confirmed_prompt_acceptance_failure = classify_confirmed_prompt_acceptance_failure(
         result.exit_code,
-        prompt_acceptance_confirmation,
+        prompt_acceptance_confirmation.as_ref(),
         classification.recovered_generic_nonzero,
     );
     if confirmed_prompt_acceptance_failure.is_some() {
@@ -93,7 +92,7 @@ pub(super) fn handle_resume_attempt_result(
     let completion_evidence = wake::ResumeCompletionEvidence {
         zero_turn_action: classification.zero_turn_action,
         recovered_generic_nonzero: classification.recovered_generic_nonzero,
-        prompt_acceptance_confirmation,
+        prompt_acceptance_confirmation: prompt_acceptance_confirmation.as_ref(),
     };
     let provenance = classification.age270_mailbox_provenance;
     let mailbox_delivery_outcome = if confirmed_prompt_acceptance_failure.is_some() {
@@ -130,11 +129,16 @@ pub(super) fn handle_resume_attempt_result(
 
 fn classify_confirmed_prompt_acceptance_failure(
     physical_exit_code: i32,
-    confirmation: Option<ValidatedPromptAcceptance>,
+    confirmation: Option<&ValidatedPromptAcceptance>,
     recovered_generic_nonzero: bool,
 ) -> Option<ConfirmedPromptAcceptanceFailure> {
-    (physical_exit_code != 0 && confirmation.is_some() && !recovered_generic_nonzero)
-        .then_some(ConfirmedPromptAcceptanceFailure { physical_exit_code })
+    if physical_exit_code == 0 || recovered_generic_nonzero {
+        return None;
+    }
+    Some(ConfirmedPromptAcceptanceFailure {
+        physical_exit_code,
+        prompt_acceptance: confirmation?.clone(),
+    })
 }
 
 fn apply_resume_attempt_classification(
@@ -252,7 +256,7 @@ fn handle_resume_attempt_terminal_signal(
     provider: &oulipoly_config::ProviderConfig,
     provider_session_id: &str,
     result: &executor::ExecutionResult,
-    completion_evidence: wake::ResumeCompletionEvidence,
+    completion_evidence: wake::ResumeCompletionEvidence<'_>,
     terminal_completion_confirmed: bool,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
     confirmed_prompt_acceptance_failure: Option<ConfirmedPromptAcceptanceFailure>,
@@ -283,7 +287,7 @@ fn handle_resume_attempt_terminal_signal(
         mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
     let outcome = stop_retry_after_confirmed_prompt_acceptance_failure(
         outcome,
-        confirmed_prompt_acceptance_failure,
+        confirmed_prompt_acceptance_failure.as_ref(),
     );
     apply_resume_terminal_disposition_effects(
         input,
@@ -292,7 +296,7 @@ fn handle_resume_attempt_terminal_signal(
         result,
         &outcome,
         mailbox_delivery_outcome,
-        confirmed_prompt_acceptance_failure,
+        confirmed_prompt_acceptance_failure.as_ref(),
     )?;
     if let Some(control) = terminal_disposition_loop_control(outcome) {
         return Ok(control);
@@ -337,7 +341,7 @@ pub(super) enum ResumeTerminalDispositionOutcome {
 
 fn stop_retry_after_confirmed_prompt_acceptance_failure(
     outcome: ResumeTerminalDispositionOutcome,
-    failure: Option<ConfirmedPromptAcceptanceFailure>,
+    failure: Option<&ConfirmedPromptAcceptanceFailure>,
 ) -> ResumeTerminalDispositionOutcome {
     match (failure, outcome) {
         (Some(failure), ResumeTerminalDispositionOutcome::Continue(_)) => {
@@ -356,7 +360,7 @@ fn apply_resume_terminal_disposition_effects(
     result: &executor::ExecutionResult,
     outcome: &ResumeTerminalDispositionOutcome,
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
-    confirmed_prompt_acceptance_failure: Option<ConfirmedPromptAcceptanceFailure>,
+    confirmed_prompt_acceptance_failure: Option<&ConfirmedPromptAcceptanceFailure>,
 ) -> Result<(), String> {
     if let Some(failure) = confirmed_prompt_acceptance_failure {
         let shell_exit_code = match outcome {
@@ -371,7 +375,6 @@ fn apply_resume_terminal_disposition_effects(
         };
         return super::lifecycle::settle_confirmed_prompt_acceptance_failure(
             input,
-            provider_session_id,
             &attempt.invocation.id,
             failure,
             shell_exit_code,
@@ -484,7 +487,10 @@ mod tests {
         apply_unconfirmed_resume_completion_failure, classify_confirmed_prompt_acceptance_failure,
         stop_retry_after_confirmed_prompt_acceptance_failure,
     };
-    use oulipoly_runtime::executor::prompt_acceptance::ValidatedPromptAcceptance;
+    use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PromptAcceptedMarkerValueV1};
+    use oulipoly_runtime::executor::prompt_acceptance::{
+        ExpectedPromptAcceptance, ValidatedPromptAcceptance, promote_prompt_acceptance_attestation,
+    };
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_runtime::executor::{
         ExecutionResult, ResumeAcceptanceStatus, SessionCaptureMethod, SessionCaptureResult,
@@ -508,6 +514,26 @@ mod tests {
             captured_child_invocations: Vec::new(),
             returned_artifacts: Vec::new(),
         }
+    }
+
+    fn validated_prompt_acceptance(delivery_nonce: Option<&str>) -> ValidatedPromptAcceptance {
+        let attestation = PromptAcceptedMarkerValueV1 {
+            protocol: PROMPT_ACCEPTANCE_V1.to_string(),
+            provider_session_id: "session-1".to_string(),
+            prompt_sha256: "prompt-hash".to_string(),
+            delivery_nonce: delivery_nonce.map(str::to_string),
+            source: None,
+            message_id: None,
+        };
+        promote_prompt_acceptance_attestation(
+            ExpectedPromptAcceptance {
+                provider_session_id: "session-1",
+                prompt_sha256: "prompt-hash",
+                delivery_nonce,
+            },
+            &attestation,
+        )
+        .expect("test attestation must promote")
     }
 
     #[test]
@@ -585,17 +611,16 @@ mod tests {
 
     #[test]
     fn confirmed_prompt_acceptance_failure_is_classified_once_and_stops_retry() {
-        let failure = classify_confirmed_prompt_acceptance_failure(
-            29,
-            Some(ValidatedPromptAcceptance::DeliveryNonceAndPromptSha256),
-            false,
-        )
-        .expect("validated nonzero mailbox acceptance must classify as a failure outcome");
+        let mailbox_acceptance = validated_prompt_acceptance(Some("delivery-1"));
+        let failure =
+            classify_confirmed_prompt_acceptance_failure(29, Some(&mailbox_acceptance), false)
+                .expect("validated nonzero mailbox acceptance must classify as a failure outcome");
+        assert_eq!(failure.prompt_acceptance, mailbox_acceptance);
 
         assert_eq!(
             stop_retry_after_confirmed_prompt_acceptance_failure(
                 ResumeTerminalDispositionOutcome::Continue(29),
-                Some(failure),
+                Some(&failure),
             ),
             ResumeTerminalDispositionOutcome::Return(29)
         );
@@ -609,7 +634,7 @@ mod tests {
         assert!(
             classify_confirmed_prompt_acceptance_failure(
                 29,
-                Some(ValidatedPromptAcceptance::PromptSha256),
+                Some(&validated_prompt_acceptance(None)),
                 true,
             )
             .is_none(),

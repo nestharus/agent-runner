@@ -317,18 +317,8 @@ fn resumed_clean_exit_without_terminal_completion_is_unconfirmed_failure() {
         persisted.terminal_reason.as_deref(),
         Some("resume_completion_unconfirmed")
     );
-    assert_eq!(
-        persisted.resume_acceptance_status.as_deref(),
-        Some("accepted")
-    );
-    assert!(
-        persisted
-            .resume_acceptance_evidence
-            .as_deref()
-            .is_some_and(|evidence| evidence.contains("exact session and prompt SHA-256")),
-        "{:?}",
-        persisted.resume_acceptance_evidence
-    );
+    assert_eq!(persisted.resume_acceptance_status, None);
+    assert_eq!(persisted.resume_acceptance_evidence, None);
     assert!(
         stderr.contains("fixture provider stderr retained"),
         "{stderr}"

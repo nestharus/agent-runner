@@ -405,13 +405,10 @@ fn prompt_acceptance_hash_accepts_exact_and_rejects_mismatch_without_delivery_no
         &[("S11_EMIT_PROMPT_ACCEPTANCE_MARKER", "1")],
     );
     assert_unconfirmed_resume(&output);
-    let (status, evidence) = fixture.latest_resume_acceptance();
-    assert_eq!(status.as_deref(), Some("accepted"));
-    assert!(
-        evidence
-            .as_deref()
-            .is_some_and(|value| value.contains("exact session and prompt SHA-256")),
-        "{evidence:?}"
+    assert_eq!(
+        fixture.latest_resume_acceptance(),
+        (None, None),
+        "exact-prompt acceptance must not adopt the session-resume acceptance identity"
     );
 
     let fixture = Fixture::new();
@@ -483,10 +480,7 @@ fn accepted_manual_prompt_nonzero_has_one_typed_terminal_outcome() {
         result["terminal_reason"],
         "resume_prompt_accepted_provider_failed"
     );
-    assert_eq!(
-        fixture.latest_resume_acceptance().0.as_deref(),
-        Some("accepted")
-    );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     fixture.assert_xdg_isolated();
 }
 
@@ -517,10 +511,7 @@ fn trusted_prompt_acceptance_settles_mailbox_delivery_after_provider_nonzero() {
         result["terminal_reason"],
         "resume_prompt_accepted_provider_failed"
     );
-    assert_eq!(
-        fixture.latest_resume_acceptance().0.as_deref(),
-        Some("accepted")
-    );
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
     let delivered = fixture.mailbox_row(notification.seq);
     assert!(delivered.delivered_at.is_some(), "{delivered:?}");
     assert_eq!(delivered.delivery_attempts, 1);
@@ -584,11 +575,10 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     let resumed_result = result_envelope(&resumed);
     let resumed_invocation_uuid = resumed_result["id"].as_str().unwrap();
     let resumed_stderr = String::from_utf8_lossy(&resumed.stderr);
-    let (acceptance, evidence) = positive.latest_resume_acceptance();
-    assert_eq!(acceptance.as_deref(), Some("accepted"));
     assert_eq!(
-        evidence.as_deref(),
-        Some("validated prompt acceptance: exact session, delivery nonce, and prompt SHA-256")
+        positive.latest_resume_acceptance(),
+        (None, None),
+        "prompt acceptance and session-resume acceptance are distinct durable entities"
     );
     assert_eq!(resumed_result["exit_code"], 0);
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
