@@ -179,6 +179,7 @@ pub(super) fn record_resume_acceptance_if_present(
 pub(super) struct ResumeCompletionClassification {
     pub(super) recovered_generic_nonzero: bool,
     pub(super) terminal_completion_confirmed: bool,
+    pub(super) mailbox_submission_confirmed_after_nonzero: bool,
 }
 
 pub(super) fn finalize_completed_attempt_for_resume(
@@ -189,7 +190,7 @@ pub(super) fn finalize_completed_attempt_for_resume(
     result: &oulipoly_runtime::executor::ExecutionResult,
     completion: ResumeCompletionClassification,
 ) -> Result<ResumeAttemptLoopControl, String> {
-    match finalize_completed_attempt(CompletedAttemptInput {
+    let control = finalize_completed_attempt(CompletedAttemptInput {
         agent_runtime_services: input.agent_runtime_services,
         env: input.env,
         invocation: &attempt.invocation,
@@ -208,7 +209,11 @@ pub(super) fn finalize_completed_attempt_for_resume(
         max_attempts: input.max_attempts,
         recovered_generic_nonzero: completion.recovered_generic_nonzero,
         terminal_completion_confirmed: completion.terminal_completion_confirmed,
-    })? {
+    })?;
+    if completion.mailbox_submission_confirmed_after_nonzero {
+        return finalize_confirmed_nonzero_submission(input, attempt, provider_session_id, result);
+    }
+    match control {
         CompletedAttemptControl::Continue => {
             finalize_retrying_resume(input, attempt, provider_session_id, result)
         }
@@ -223,6 +228,23 @@ pub(super) fn finalize_completed_attempt_for_resume(
             finalize_failed_resume(input, attempt, provider_session_id, result, exit_code)
         }
     }
+}
+
+fn finalize_confirmed_nonzero_submission(
+    input: &ResumeAttemptInput<'_>,
+    attempt: &ResumeInvocationAttempt<'_>,
+    provider_session_id: &str,
+    result: &oulipoly_runtime::executor::ExecutionResult,
+) -> Result<ResumeAttemptLoopControl, String> {
+    wake::complete_successful_mailbox_delivery(
+        input,
+        provider_session_id,
+        &attempt.invocation.id,
+        result.exit_code,
+    )?;
+    Ok(ResumeAttemptLoopControl::Return(mapper::failure_exit_code(
+        result.exit_code,
+    )))
 }
 
 fn finalize_retrying_resume(

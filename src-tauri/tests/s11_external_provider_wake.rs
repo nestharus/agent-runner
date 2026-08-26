@@ -439,6 +439,43 @@ fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evid
     }
 }
 
+#[test]
+fn trusted_submission_settles_mailbox_delivery_after_provider_nonzero() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+
+    assert_eq!(resumed.status.code(), Some(29), "{resumed:?}");
+    let result = result_envelope(&resumed);
+    let invocation_uuid = result["id"].as_str().unwrap();
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["exit_code"], 29);
+    assert_eq!(
+        fixture.latest_resume_acceptance().0.as_deref(),
+        Some("accepted")
+    );
+    let delivered = fixture.mailbox_row(notification.seq);
+    assert!(delivered.delivered_at.is_some(), "{delivered:?}");
+    assert_eq!(delivered.delivery_attempts, 1);
+    assert_eq!(
+        delivered.delivered_by_invocation_uuid.as_deref(),
+        Some(invocation_uuid)
+    );
+    fixture.assert_xdg_isolated();
+}
+
 fn assert_owner_session_consumes_detached_child_completion(provider: &'static str) {
     let positive = Fixture::with_provider(provider);
     positive.write_external_provider();
@@ -708,16 +745,17 @@ def produced_assistant_response_marker_event(request, seq):
     }
 
 def exit_event(request, seq, session_id):
+    code = 29 if os.environ.get("S11_EXIT_NONZERO") == "1" else 0
     event = {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
         "time_unix_ms": 1000 + seq,
         "kind": "exit",
-        "status": {"kind": "exited", "code": 0},
+        "status": {"kind": "exited", "code": code},
         "terminal_signal": {
-            "kind": "clean_exit",
-            "evidence": "fixture clean exit",
+            "kind": "nonzero_exit" if code else "clean_exit",
+            "evidence": "fixture nonzero exit" if code else "fixture clean exit",
             "observed_at_unix_ms": 1000 + seq,
         },
     }

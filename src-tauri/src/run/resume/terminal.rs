@@ -82,15 +82,28 @@ pub(super) fn handle_resume_attempt_result(
         submitted_turn_confirmation,
     };
     let provenance = classification.age270_mailbox_provenance;
-    let mailbox_delivery_outcome = match age270_mailbox_eligibility_for_classification(
-        provenance.physical_clean_exit_candidate,
-        provenance.effective_clean_exit_candidate,
-        provenance.age270_failure_applied,
-    ) {
-        Age270MailboxEligibility::Ineligible => None,
-        Age270MailboxEligibility::PreMutationCleanExit => Some(
-            wake::resolve_mailbox_delivery_outcome(input, provider, result, completion_evidence),
-        ),
+    let mailbox_delivery_outcome = if result.exit_code != 0
+        && submitted_turn_confirmation.is_some()
+        && !classification.recovered_generic_nonzero
+        && !input.mailbox_delivery_seqs.is_empty()
+    {
+        Some(wake::MailboxDeliveryOutcome::Confirmed)
+    } else {
+        match age270_mailbox_eligibility_for_classification(
+            provenance.physical_clean_exit_candidate,
+            provenance.effective_clean_exit_candidate,
+            provenance.age270_failure_applied,
+        ) {
+            Age270MailboxEligibility::Ineligible => None,
+            Age270MailboxEligibility::PreMutationCleanExit => {
+                Some(wake::resolve_mailbox_delivery_outcome(
+                    input,
+                    provider,
+                    result,
+                    completion_evidence,
+                ))
+            }
+        }
     };
     handle_resume_attempt_terminal_signal(
         input,
@@ -247,6 +260,11 @@ fn handle_resume_attempt_terminal_signal(
     })?;
     let outcome =
         mapper::resume_terminal_disposition_outcome(disposition_control, result.exit_code);
+    let outcome = stop_retry_after_confirmed_nonzero_submission(
+        outcome,
+        result.exit_code,
+        mailbox_delivery_outcome,
+    );
     apply_resume_terminal_disposition_effects(
         input,
         attempt,
@@ -284,14 +302,37 @@ fn handle_resume_attempt_terminal_signal(
         ResumeCompletionClassification {
             recovered_generic_nonzero: completion_evidence.recovered_generic_nonzero,
             terminal_completion_confirmed,
+            mailbox_submission_confirmed_after_nonzero: result.exit_code != 0
+                && completion_evidence.submitted_turn_confirmation.is_some()
+                && !completion_evidence.recovered_generic_nonzero
+                && !input.mailbox_delivery_seqs.is_empty(),
         },
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum ResumeTerminalDispositionOutcome {
     Continue(i32),
     Return(i32),
     CompletedAttempt,
+}
+
+fn stop_retry_after_confirmed_nonzero_submission(
+    outcome: ResumeTerminalDispositionOutcome,
+    physical_exit_code: i32,
+    mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
+) -> ResumeTerminalDispositionOutcome {
+    if physical_exit_code != 0
+        && matches!(
+            mailbox_delivery_outcome,
+            Some(wake::MailboxDeliveryOutcome::Confirmed)
+        )
+        && matches!(outcome, ResumeTerminalDispositionOutcome::Continue(_))
+    {
+        ResumeTerminalDispositionOutcome::Return(nonzero_resume_exit_code(physical_exit_code))
+    } else {
+        outcome
+    }
 }
 
 fn apply_resume_terminal_disposition_effects(
@@ -303,17 +344,21 @@ fn apply_resume_terminal_disposition_effects(
     mailbox_delivery_outcome: Option<wake::MailboxDeliveryOutcome>,
 ) -> Result<(), String> {
     if let Some(mailbox_delivery_outcome) = mailbox_delivery_outcome {
-        let ResumeTerminalDispositionOutcome::Return(shell_exit_code) = outcome else {
-            return Err(
-                "AGE-270 mailbox outcome requires a terminal Return disposition".to_string(),
-            );
+        let shell_exit_code = match outcome {
+            ResumeTerminalDispositionOutcome::Return(shell_exit_code) => *shell_exit_code,
+            ResumeTerminalDispositionOutcome::CompletedAttempt => return Ok(()),
+            ResumeTerminalDispositionOutcome::Continue(_) => {
+                return Err(
+                    "confirmed mailbox submission cannot continue provider routing".to_string(),
+                );
+            }
         };
         return wake::settle_age270_mailbox_delivery_outcome(
             input,
             provider_session_id,
             &attempt.invocation.id,
             result.exit_code,
-            *shell_exit_code,
+            shell_exit_code,
             mailbox_delivery_outcome,
         );
     }
@@ -400,9 +445,11 @@ fn emit_recovered_resume_terminal_signal_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        Age270MailboxEligibility, age270_mailbox_eligibility_for_classification,
-        apply_incomplete_tool_boundary_failure, apply_unconfirmed_resume_completion_failure,
+        Age270MailboxEligibility, ResumeTerminalDispositionOutcome,
+        age270_mailbox_eligibility_for_classification, apply_incomplete_tool_boundary_failure,
+        apply_unconfirmed_resume_completion_failure, stop_retry_after_confirmed_nonzero_submission,
     };
+    use crate::run::resume::wake::MailboxDeliveryOutcome;
     use oulipoly_runtime::executor::terminal_signal::TerminalSignalKind;
     use oulipoly_runtime::executor::{
         ExecutionResult, ResumeAcceptanceStatus, SessionCaptureMethod, SessionCaptureResult,
@@ -499,5 +546,25 @@ mod tests {
                 "unexpected eligibility for P={physical}, E={effective}, A={applied}"
             );
         }
+    }
+
+    #[test]
+    fn confirmed_nonzero_mailbox_submission_stops_provider_retry() {
+        assert_eq!(
+            stop_retry_after_confirmed_nonzero_submission(
+                ResumeTerminalDispositionOutcome::Continue(29),
+                29,
+                Some(MailboxDeliveryOutcome::Confirmed),
+            ),
+            ResumeTerminalDispositionOutcome::Return(29)
+        );
+        assert_eq!(
+            stop_retry_after_confirmed_nonzero_submission(
+                ResumeTerminalDispositionOutcome::Continue(29),
+                29,
+                Some(MailboxDeliveryOutcome::Unconfirmed),
+            ),
+            ResumeTerminalDispositionOutcome::Continue(29)
+        );
     }
 }
