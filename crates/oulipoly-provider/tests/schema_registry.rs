@@ -64,6 +64,19 @@ fn schema_registry_lookup_and_validation_helpers_cover_s2_matrix() {
             });
     }
 
+    registry
+        .validate_request(
+            "describe",
+            non_launch_fixture(&fixtures, "describe", "legacy_request"),
+        )
+        .expect("legacy describe request must remain valid");
+    registry
+        .validate_response(
+            "describe",
+            non_launch_fixture(&fixtures, "describe", "legacy_success_response"),
+        )
+        .expect("legacy describe response must omit the negotiated capability and remain valid");
+
     let launch = registry
         .schema_for_subcommand("launch")
         .expect("missing launch request registry row");

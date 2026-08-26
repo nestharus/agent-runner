@@ -33,6 +33,28 @@ fn prompt_acceptance_capability_requires_explicit_v1_host_selection() {
 }
 
 #[test]
+fn describe_fixture_binds_prompt_acceptance_to_host_selection() {
+    let fixtures = fixtures();
+    for (request_name, response_name) in [
+        ("request", "success_response"),
+        ("legacy_request", "legacy_success_response"),
+    ] {
+        let request: dto::DescribeRequest =
+            serde_json::from_value(non_launch_fixture(&fixtures, "describe", request_name).clone())
+                .unwrap();
+        let response: dto::DescribeResponse = serde_json::from_value(
+            non_launch_fixture(&fixtures, "describe", response_name).clone(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            dto::host_requested_prompt_acceptance_v1(&request.host),
+            response.result.capabilities.prompt_acceptance_v1
+        );
+    }
+}
+
+#[test]
 fn dto_roundtrip_covers_every_s2_contract_type() {
     let fixtures = fixtures();
 

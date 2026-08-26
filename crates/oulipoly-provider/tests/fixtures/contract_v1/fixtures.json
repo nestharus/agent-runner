@@ -1,8 +1,10 @@
 {
   "non_launch": {
     "describe": {
-      "request": {"contract":"oulipoly.provider/v1","request_id":"req-describe","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner","working_directory":"/home/user/project"},"params":{}},
+      "request": {"contract":"oulipoly.provider/v1","request_id":"req-describe","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner","working_directory":"/home/user/project","env":{"OULIPOLY_HOST_PROMPT_ACCEPTANCE_V1":"1"}},"params":{}},
+      "legacy_request": {"contract":"oulipoly.provider/v1","request_id":"req-describe-legacy","provider_instance_id":"acct-primary","host":{"app":"oulipoly-agent-runner","working_directory":"/home/user/project"},"params":{}},
       "success_response": {"contract":"oulipoly.provider/v1","request_id":"req-describe","ok":true,"result":{"provider_id":"example","display_name":"Example Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{"launch":true,"prompt_acceptance_v1":true,"policy":true,"quota":true,"session":true,"session_enumerate":true,"terminal":true,"rotation":true,"discovery":true,"settings":true,"setup_brain":false,"setup":true,"migration":true},"settings_schema_id":"example.settings/v1","concurrency":{"safe_for_parallel_invocation":true,"state_locking":"advisory_file_lock_and_atomic_rename"}}},
+      "legacy_success_response": {"contract":"oulipoly.provider/v1","request_id":"req-describe-legacy","ok":true,"result":{"provider_id":"example","display_name":"Example Provider","contract_versions":["oulipoly.provider/v1"],"preferred_contract":"oulipoly.provider/v1","capabilities":{"launch":true,"policy":true,"quota":true,"session":true,"session_enumerate":true,"terminal":true,"rotation":true,"discovery":true,"settings":true,"setup_brain":false,"setup":true,"migration":true},"settings_schema_id":"example.settings/v1","concurrency":{"safe_for_parallel_invocation":true,"state_locking":"advisory_file_lock_and_atomic_rename"}}},
       "error_response": {"contract":"oulipoly.provider/v1","request_id":"req-describe","ok":false,"error":{"code":"unsupported","category":"unsupported","message":"capability is not implemented","retryable":false,"details":{"subcommand":"describe"}}}
     },
     "schema": {
