@@ -27,7 +27,8 @@
 //!         submodule tree it declares and re-exports as the intrinsic internal
 //!         surface of the routing concern — burn_rate, context, density,
 //!         eligibility, forensics, invocation_fallback, live_load, migration,
-//!         placement_pin, projection, refresh_inputs, snapshot, topology, working_set
+//!         placement_pin, projection, recent_failure, refresh_inputs, snapshot,
+//!         topology, working_set
 //!       - the RoutingError routing-failure type this hub defines and the
 //!         select_provider/score_routing_candidates selection orchestration
 //!       - intrinsic routing-input carriers subordinate to this domain, consumed by
@@ -90,6 +91,7 @@ mod live_load;
 mod migration;
 mod placement_pin;
 mod projection;
+mod recent_failure;
 mod refresh_inputs;
 mod snapshot;
 mod topology;
@@ -136,6 +138,7 @@ use eligibility::eligible_provider_indices;
 use invocation_fallback::score_by_invocation_count;
 use live_load::restrict_to_least_loaded;
 use placement_pin::{fresh_run_pin_provider, select_pinned_provider};
+use recent_failure::restrict_to_recent_failure_working_set;
 use refresh_inputs::refresh_routing_inputs;
 use snapshot::{QuotaSnapshot, load_quota_snapshot};
 use topology::repair_routing_topology;
@@ -265,7 +268,8 @@ fn score_routing_candidates(
     snapshot: &QuotaSnapshot,
     candidates: &[usize],
 ) -> usize {
-    let least_loaded = restrict_to_least_loaded(model, state, candidates);
+    let failure_eligible = restrict_to_recent_failure_working_set(model, state, candidates);
+    let least_loaded = restrict_to_least_loaded(model, state, failure_eligible.as_slice());
     score_least_loaded_candidates(model, state, snapshot, least_loaded.as_slice())
 }
 
@@ -296,7 +300,7 @@ fn candidates_have_windows(snapshot: &QuotaSnapshot, candidates: &[usize]) -> bo
 
 #[cfg(test)]
 #[rustfmt::skip]
-pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 17] {
+pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 18] {
     macro_rules! source {
         ($path:literal, $file:literal) => { ($path, production_balancer_source($path, include_str!($file))) };
     }
@@ -312,6 +316,7 @@ pub(crate) fn balancer_production_sources() -> [(&'static str, &'static str); 17
         source!("crates/oulipoly-runtime/src/balancer/density/trace.rs", "density/trace.rs"),
         source!("crates/oulipoly-runtime/src/balancer/invocation_fallback.rs", "invocation_fallback.rs"),
         source!("crates/oulipoly-runtime/src/balancer/live_load.rs", "live_load.rs"),
+        source!("crates/oulipoly-runtime/src/balancer/recent_failure.rs", "recent_failure.rs"),
         source!("crates/oulipoly-runtime/src/balancer/placement_pin.rs", "placement_pin.rs"),
         source!("crates/oulipoly-runtime/src/balancer/eligibility.rs", "eligibility.rs"),
         source!("crates/oulipoly-runtime/src/balancer/context.rs", "context.rs"),

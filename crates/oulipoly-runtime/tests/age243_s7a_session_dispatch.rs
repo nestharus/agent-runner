@@ -351,10 +351,16 @@ fn external_provider_locate_dispatch_maps_success_and_request_identity() {
             require_existing_observed: true,
         }
     );
-    assert_request_shape(
-        &fixture.request_records_for("session.locate_transcript"),
-        "session.locate_transcript",
-        Some(SESSION_ID),
+    let records = fixture.request_records_for("session.locate_transcript");
+    assert_request_shape(&records, "session.locate_transcript", Some(SESSION_ID));
+    let request = &records[0]["request"];
+    assert_eq!(
+        request["host"]["config_root"],
+        fixture.dir.path().join("config-root").display().to_string()
+    );
+    assert_eq!(
+        request["host"]["data_root"],
+        fixture.dir.path().join("data-root").display().to_string()
     );
     assert_eq!(fixture.request_records_for("describe").len(), 1);
 }

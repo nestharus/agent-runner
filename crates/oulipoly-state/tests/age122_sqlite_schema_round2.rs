@@ -70,8 +70,8 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
         "invocations repair SQL must remain sidecar-based and include completion authority"
     );
     assert!(
-        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 18;"),
-        "schema version must include caller-bound completion registration authority"
+        schema_source().contains("pub const CURRENT_SCHEMA_VERSION: i32 = 19;"),
+        "schema version must include the running-first invocation projection index"
     );
     assert!(
         !lib_source().contains("pub mod lifecycle_log"),
@@ -120,6 +120,7 @@ fn invocations_schema_sql_keeps_raw_io_sidecar_based_with_completion_authority()
             "0016_invocation_completion_authority_summary.sql",
             "0017_completion_registration_authority.sql",
             "0018_invocation_completion_materialization_summary.sql",
+            "0019_invocation_running_projection_index.sql",
         ],
         "migration inventory must include only sanctioned state-db migrations"
     );

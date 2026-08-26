@@ -328,6 +328,7 @@ prompt_mode = "stdin"
             EnqueueResult::Conflict { existing } => existing,
         };
         let result = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id,
                 claim_token,
@@ -344,7 +345,7 @@ prompt_mode = "stdin"
     fn seed_auto_wake_claim(&self, session_id: &str, claim_token: &str) {
         let seq = self.seed_pending_auto_wake_claim(session_id, claim_token);
         let mut db = MailboxDb::open(&self.sidecar_path()).unwrap();
-        db.mark_delivered(session_id, &[seq], "notification-boundary-test")
+        db.mark_delivered(session_id, None, &[seq], "notification-boundary-test")
             .unwrap();
     }
 
@@ -502,6 +503,53 @@ fn successful_resume_records_resolved_provider_identity() {
     assert_eq!(row.success, Some(true));
     assert_eq!(row.exit_code, Some(0));
     assert_eq!(row.resume_acceptance_status.as_deref(), Some("unconfirmed"));
+}
+
+#[test]
+fn resumed_provider_observes_exact_durable_admission_before_launch() {
+    let fixture = Fixture::new();
+    fixture.write_resume_pool(
+        "age123-resume",
+        &[
+            ProviderFixture {
+                name: "provider-a",
+                body: "printf '%s\\n' 'unexpected provider a launch' >&2\nexit 99",
+            },
+            ProviderFixture {
+                name: "provider-b",
+                body: r#"python3 - <<'PY'
+import os
+import sqlite3
+
+path = os.path.join(os.environ["XDG_DATA_HOME"], "oulipoly-agent-runner", "pid-identity.db")
+connection = sqlite3.connect(path)
+rows = connection.execute(
+    "SELECT session_id, state FROM session_admission_queue WHERE state = 'launching'"
+).fetchall()
+assert rows == [("6169694d-de0f-40d1-890c-6e28e55bab28", "launching")], rows
+PY
+printf '%s\n' 'resume admission observed'
+exit 0"#,
+            },
+        ],
+    );
+    fixture.seed_rotated_chain("provider-a", "provider-b");
+
+    let output = fixture.run_resume(CHAIN_ID);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let connection = Connection::open(fixture.sidecar_path()).unwrap();
+    let (session_id, state, generation): (Option<String>, String, Option<String>) = connection
+        .query_row(
+            "SELECT session_id, state, runtime_generation_uuid
+             FROM session_admission_queue",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(session_id.as_deref(), Some(SESSION_B));
+    assert_eq!(state, "settled");
+    assert!(generation.is_some());
 }
 
 #[test]
@@ -667,7 +715,11 @@ fn notification_auto_wake_validation_rejects_invalid_child_markers_before_provid
         assert_eq!(pending[0].seq, seq, "{case}");
         assert_eq!(pending[0].delivery_attempts, 0, "{case}");
         assert!(pending[0].delivered_at.is_none(), "{case}");
-        let claim = db.wake_claim(CHAIN_ID).unwrap().unwrap();
+        let claim = db
+            .wake_session_reader()
+            .wake_claim(CHAIN_ID)
+            .unwrap()
+            .unwrap();
         assert_eq!(claim.claim_token, CLAIM_TOKEN, "{case}");
         assert_eq!(claim.auto_wake_count, 1, "{case}");
     }

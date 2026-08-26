@@ -70,9 +70,18 @@ fn no_controlling_terminal_fallback_records_no_pty_control_path() {
     assert_eq!(fs::read_to_string(&child_result).unwrap(), "ok\n");
 
     let db = MailboxDb::open(&sidecar_path).unwrap();
-    let runtime = db.session_runtime(SESSION_ID).unwrap().unwrap();
-    assert_eq!(runtime.mode, "pty_interactive");
-    assert!(runtime.pty_control_path.is_none());
+    let metadata = db
+        .wake_session_reader()
+        .session_metadata(SESSION_ID)
+        .unwrap()
+        .unwrap();
+    let projection = db
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION_ID)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.mode, "pty_interactive");
+    assert!(projection.pty_control_path.is_none());
 }
 
 #[test]

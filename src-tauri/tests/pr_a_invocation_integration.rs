@@ -9,7 +9,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 
 // These tests start with an empty invocation table. When a child row is seeded
 // before the CLI run, the supervised parent row created by that run receives id 2.
@@ -125,7 +124,7 @@ fn run_agent_bash_nested_child(
     owner_invocation_uuid: &str,
     registration_authority: &str,
     agent_bash_bin: &Path,
-) -> String {
+) -> Output {
     let command = nested_child_command(fixture);
     let mut run = Command::new(agent_bash_bin);
     run.arg("run").arg("--").arg("bash").arg("-lc").arg(command);
@@ -137,11 +136,7 @@ fn run_agent_bash_nested_child(
         owner_invocation_uuid,
         registration_authority,
     );
-    let output = run.output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let dispatch: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let handle = dispatch["handle"].as_str().expect("agent-bash handle");
-    wait_for_agent_bash_done(fixture, agent_bash_bin, handle)
+    run.output().unwrap()
 }
 
 fn nested_child_command(fixture: &Fixture) -> String {
@@ -180,28 +175,6 @@ fn configure_agent_bash_env(
         env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
     );
     command.env_remove("OULIPOLY_DATA_DIR");
-}
-
-fn wait_for_agent_bash_done(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        last = agent_bash_status(fixture, agent_bash_bin, handle);
-        if last.starts_with("DONE") {
-            return last;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("agent-bash job did not finish: {last}");
-}
-
-fn agent_bash_status(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
-    let mut status = Command::new(agent_bash_bin);
-    status.arg("status").arg("--full").arg(handle);
-    status.env("XDG_STATE_HOME", fixture.state_home());
-    let output = status.output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn agent_bash_bin_from_env() -> PathBuf {
@@ -375,7 +348,7 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
 }
 
 #[test]
-fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
+fn nested_agent_bash_rejects_unattested_synthetic_completion_owner() {
     let agent_bash_bin = agent_bash_bin_from_env();
     let fixture = Fixture::new();
     let parent = CompositeInvocationId {
@@ -408,11 +381,10 @@ fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
         .completion_registration_authority
         .process_environment_value()
         .to_string();
-    let parent_row_id = started.invocation_row_id;
     drop(state);
     let parent_env = serde_json::to_string(&parent).unwrap();
 
-    let status = run_agent_bash_nested_child(
+    let output = run_agent_bash_nested_child(
         &fixture,
         &parent_env,
         owner_session_id,
@@ -421,17 +393,13 @@ fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
         &agent_bash_bin,
     );
 
-    assert!(status.starts_with("DONE rc=0"), "{status}");
-    let child = parse_valid_invocations(&status)
-        .into_iter()
-        .find(|invocation| invocation.id != parent.id)
-        .expect("nested child invocation marker should be captured");
-    let child_row = fixture
-        .open_db()
-        .get_invocation_by_uuid(&child.id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(child_row.parent_invocation_id, Some(parent_row_id));
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("explicit completion owner requires matching parent invocation"),
+        "{output:?}"
+    );
+    assert!(parse_valid_invocations(&String::from_utf8_lossy(&output.stderr)).is_empty());
 }
 
 #[test]

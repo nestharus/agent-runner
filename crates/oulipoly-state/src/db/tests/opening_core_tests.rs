@@ -21,6 +21,16 @@
 
 use super::common::*;
 use super::*;
+
+#[test]
+fn bundled_sqlite_includes_vfs_deadlock_and_wal_reset_fixes() {
+    assert!(
+        rusqlite::version_number() >= 3_051_003,
+        "bundled SQLite must include the 3.51.2 VFS deadlock fix and 3.51.3 WAL-reset fix, got {}",
+        rusqlite::version()
+    );
+}
+
 #[test]
 fn state_db_open_sets_busy_timeout() {
     let dir = tempfile::tempdir().unwrap();

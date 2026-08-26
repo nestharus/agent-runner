@@ -38,6 +38,7 @@ const EXPECTED_EDGES: &[(&str, &str)] = &[
     ("oulipoly-runtime", "oulipoly-config"),
     ("oulipoly-runtime", "oulipoly-core"),
     ("oulipoly-runtime", "oulipoly-provider"),
+    ("oulipoly-provider", "oulipoly-core"),
     ("oulipoly-setup", "oulipoly-state"),
     ("oulipoly-state", "oulipoly-config"),
     ("oulipoly-state", "oulipoly-agent-messenger"),

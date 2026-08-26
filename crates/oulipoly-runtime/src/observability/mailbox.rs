@@ -17,8 +17,9 @@ use crate::observability::liveness::{
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::storage_diagnostic;
 use oulipoly_state::mailbox::{
-    ExactProcessEvidence, MailboxDb, MailboxRow, RuntimeGenerationRow, SessionGenerationProjection,
-    SessionRuntimeReadOnlyLiveness, SessionRuntimeRow, WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
+    ExactProcessEvidence, MailboxDb, MailboxRow, RuntimeGenerationReadOnlyLiveness,
+    RuntimeGenerationRow, SessionGenerationProjection, SessionMetadataRow,
+    WAKE_SWEEP_ABANDONED_ERROR, WakeClaimRow,
 };
 use oulipoly_state::pid_identity::PidIdentityDb;
 use std::collections::HashSet;
@@ -100,9 +101,9 @@ fn push_session_node(
     session_id: &str,
     root: &ObservabilityRoot,
     root_invocation_uuid: Option<&str>,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     generation: Option<&SessionGenerationProjection>,
-    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    runtime_liveness: Option<RuntimeGenerationReadOnlyLiveness>,
 ) {
     projection.nodes.push(session_node(
         session_id,
@@ -120,7 +121,10 @@ fn generation_projection(
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<SessionGenerationProjection> {
     let mailbox = mailbox?;
-    match mailbox.session_generation_projection(session_id) {
+    match mailbox
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+    {
         Ok(projection) => Some(projection),
         Err(err) => {
             diagnostics.push(storage_diagnostic(
@@ -132,7 +136,7 @@ fn generation_projection(
     }
 }
 
-fn runtime_liveness_is_stale(liveness: Option<SessionRuntimeReadOnlyLiveness>) -> bool {
+fn runtime_liveness_is_stale(liveness: Option<RuntimeGenerationReadOnlyLiveness>) -> bool {
     liveness.is_some_and(runtime_is_stale)
 }
 
@@ -158,7 +162,7 @@ fn runtime_row(
     mailbox: Option<&MailboxDb>,
     session_id: &str,
     diagnostics: &mut Vec<MonitorDiagnostic>,
-) -> Option<SessionRuntimeRow> {
+) -> Option<SessionMetadataRow> {
     let mailbox = mailbox?;
     match read_runtime_row(mailbox, session_id) {
         Ok(row) => row,
@@ -172,8 +176,8 @@ fn runtime_row(
 fn read_runtime_row(
     mailbox: &MailboxDb,
     session_id: &str,
-) -> Result<Option<SessionRuntimeRow>, String> {
-    mailbox.session_runtime(session_id)
+) -> Result<Option<SessionMetadataRow>, String> {
+    mailbox.wake_session_reader().session_metadata(session_id)
 }
 
 fn runtime_read_diagnostic(message: String) -> MonitorDiagnostic {
@@ -184,7 +188,7 @@ fn runtime_liveness(
     mailbox: Option<&MailboxDb>,
     session_id: &str,
     diagnostics: &mut Vec<MonitorDiagnostic>,
-) -> Option<SessionRuntimeReadOnlyLiveness> {
+) -> Option<RuntimeGenerationReadOnlyLiveness> {
     let mailbox = mailbox?;
     match read_runtime_liveness(mailbox, session_id) {
         Ok(liveness) => Some(liveness),
@@ -198,8 +202,10 @@ fn runtime_liveness(
 fn read_runtime_liveness(
     mailbox: &MailboxDb,
     session_id: &str,
-) -> Result<SessionRuntimeReadOnlyLiveness, String> {
-    mailbox.classify_session_runtime_read_only(session_id)
+) -> Result<RuntimeGenerationReadOnlyLiveness, String> {
+    mailbox
+        .runtime_lifecycle_reader()
+        .classify_session_liveness(session_id)
 }
 
 fn runtime_liveness_read_diagnostic(message: String) -> MonitorDiagnostic {
@@ -252,7 +258,7 @@ fn wake_claim(
 }
 
 fn read_wake_claim(mailbox: &MailboxDb, session_id: &str) -> Result<Option<WakeClaimRow>, String> {
-    mailbox.wake_claim(session_id)
+    mailbox.wake_session_reader().wake_claim(session_id)
 }
 
 fn wake_claim_read_diagnostic(message: String) -> MonitorDiagnostic {
@@ -263,9 +269,9 @@ fn session_node(
     session_id: &str,
     root: &ObservabilityRoot,
     root_invocation_uuid: Option<&str>,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     generation: Option<&SessionGenerationProjection>,
-    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    runtime_liveness: Option<RuntimeGenerationReadOnlyLiveness>,
 ) -> MonitorNode {
     let exact_generation = one_generation(generation);
     MonitorNode {
@@ -274,24 +280,18 @@ fn session_node(
         kind: MonitorNodeKind::Session,
         label: session_label(root, runtime, exact_generation),
         status: session_status(runtime, generation, runtime_liveness),
-        pid: exact_generation
-            .and_then(|row| row.spawned_os_pid)
-            .or_else(|| runtime.and_then(|row| row.running_os_pid)),
+        pid: exact_generation.and_then(|row| row.spawned_os_pid),
         pgid: None,
         liveness: generation_liveness(generation).unwrap_or_else(|| {
             runtime_liveness
                 .map(runtime_liveness_status)
                 .unwrap_or(LivenessStatus::Unknown)
         }),
-        started_at: exact_generation
-            .and_then(|row| row.running_at.clone())
-            .or_else(|| runtime.and_then(|row| row.turn_started_at.clone())),
+        started_at: exact_generation.and_then(|row| row.running_at.clone()),
         updated_at: exact_generation
             .map(|row| generation_updated_at(row).to_string())
             .or_else(|| runtime.map(|row| row.updated_at.clone())),
-        completed_at: exact_generation
-            .and_then(|row| row.exited_at.clone())
-            .or_else(|| runtime.and_then(|row| row.turn_ended_at.clone())),
+        completed_at: exact_generation.and_then(|row| row.exited_at.clone()),
         last_output_excerpt: None,
         inspect_ref: None,
         cancel_ref: root_invocation_uuid.map(|uuid| CancelRef::ProviderSessionEnd {
@@ -400,8 +400,8 @@ fn wake_claim_label(claim: &WakeClaimRow) -> String {
 fn wake_diagnostics(
     session_id: &str,
     pending_count: usize,
-    runtime: Option<&SessionRuntimeRow>,
-    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    runtime: Option<&SessionMetadataRow>,
+    runtime_liveness: Option<RuntimeGenerationReadOnlyLiveness>,
     claim: Option<&WakeClaimRow>,
     pid: Option<&PidIdentityDb>,
     limits: SnapshotLimits,
@@ -419,13 +419,13 @@ fn wake_diagnostics(
     diagnostics
 }
 
-fn wake_needed_no_runtime(pending_count: usize, runtime: Option<&SessionRuntimeRow>) -> bool {
+fn wake_needed_no_runtime(pending_count: usize, runtime: Option<&SessionMetadataRow>) -> bool {
     pending_mailbox_without_runtime(pending_count, runtime)
 }
 
 fn wake_needed_no_claim(
     pending_count: usize,
-    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    runtime_liveness: Option<RuntimeGenerationReadOnlyLiveness>,
     claim: Option<&WakeClaimRow>,
 ) -> bool {
     pending_mailbox_idle_without_claim(pending_count, runtime_liveness, claim)
@@ -433,18 +433,18 @@ fn wake_needed_no_claim(
 
 fn pending_mailbox_without_runtime(
     pending_count: usize,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
 ) -> bool {
     pending_count > 0 && runtime.is_none()
 }
 
 fn pending_mailbox_idle_without_claim(
     pending_count: usize,
-    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    runtime_liveness: Option<RuntimeGenerationReadOnlyLiveness>,
     claim: Option<&WakeClaimRow>,
 ) -> bool {
     pending_count > 0
-        && runtime_liveness == Some(SessionRuntimeReadOnlyLiveness::Idle)
+        && runtime_liveness == Some(RuntimeGenerationReadOnlyLiveness::Idle)
         && claim.is_none()
 }
 
@@ -582,7 +582,7 @@ fn mailbox_session_parent_id(session_id: &str) -> String {
 
 fn session_label(
     root: &ObservabilityRoot,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     generation: Option<&RuntimeGenerationRow>,
 ) -> String {
     let provider = runtime
@@ -599,24 +599,21 @@ fn session_label(
 }
 
 fn session_status(
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
     generation: Option<&SessionGenerationProjection>,
-    runtime_liveness: Option<SessionRuntimeReadOnlyLiveness>,
+    runtime_liveness: Option<RuntimeGenerationReadOnlyLiveness>,
 ) -> MonitorStatus {
+    if runtime_liveness.is_some_and(runtime_is_stale) {
+        return MonitorStatus::Stale;
+    }
     match generation {
         Some(SessionGenerationProjection::One(_)) => return MonitorStatus::Running,
         Some(SessionGenerationProjection::Multiple(_)) => return MonitorStatus::Unknown,
         Some(SessionGenerationProjection::None) | None => {}
     }
-    if runtime_liveness.is_some_and(runtime_is_stale) {
-        return MonitorStatus::Stale;
-    }
-    match runtime.map(|row| row.run_state.as_str()) {
-        Some("running") => MonitorStatus::Running,
-        Some("idle") => MonitorStatus::Idle,
-        Some(_) => MonitorStatus::Unknown,
-        None => MonitorStatus::Unknown,
-    }
+    runtime
+        .map(|_| MonitorStatus::Idle)
+        .unwrap_or(MonitorStatus::Unknown)
 }
 
 fn mailbox_status(row: &MailboxRow) -> MonitorStatus {

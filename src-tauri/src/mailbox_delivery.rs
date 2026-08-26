@@ -3,14 +3,18 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `predicate`, `validator`
 
 use oulipoly_runtime::delivery_evidence::PtyTransportAcknowledgementEvidence;
-use oulipoly_state::StateDb;
+#[cfg(test)]
+use oulipoly_state::mailbox::{
+    AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, RuntimeGenerationId,
+};
 use oulipoly_state::mailbox::{
     ExactProcessEvidence, ExitRuntimeGenerationNonOrderly, GenerationMutation, MailboxDb,
-    MailboxRow, RuntimeGenerationFence, RuntimeLifecycleState, RuntimeTerminalReason,
-    SUBMITTED_INPUT_KIND, SessionGenerationProjection, SessionRuntimeRow, SessionRuntimeUpsert,
-    mailbox_row_is_deliverable_pending,
+    MailboxDeliveryEvidenceObligation, MailboxRow, RuntimeGenerationFence, RuntimeLifecycleState,
+    RuntimeTerminalReason, SUBMITTED_INPUT_KIND, SessionGenerationProjection,
+    SessionMetadataUpsert, mailbox_row_is_deliverable_pending,
 };
 use oulipoly_state::pid_identity::{ProcessIdentityObservation, observe_live_process_identity};
+use oulipoly_state::{DeliveryEvidence, DeliveryEvidenceKind, SessionLifecycleRepository, StateDb};
 use serde::Serialize;
 use std::path::Path;
 use uuid::Uuid;
@@ -19,7 +23,8 @@ use uuid::Uuid;
 use oulipoly_runtime::executor::cli::pty_broker::{
     PtyControlClientErrorKind, USER_INPUT_IDLE_INJECT_MS, append_notify_trace_record,
     inject_control_envelope, notify_trace_decision, notify_trace_inject_status,
-    pty_delivery_ack_message, trace_token, unlink_control_socket_if_owned,
+    pty_delivery_ack_message, pty_delivery_uncertain_message, trace_token,
+    unlink_control_socket_if_owned,
 };
 
 const MAILBOX_BATCH_MAX_ROWS: usize = 20;
@@ -56,7 +61,14 @@ pub(crate) struct PtyMailboxDeliveryDiagnostic {
 struct PtyRuntimeAuthority {
     control_path: String,
     delivery_invocation_uuid: String,
-    turn_generation_id: Option<String>,
+    turn_generation_id: String,
+}
+
+#[cfg(unix)]
+enum DeliverySubmissionRead {
+    Started,
+    NotStarted,
+    Unreadable(String),
 }
 
 #[cfg(unix)]
@@ -75,6 +87,12 @@ fn attempt_pty_mailbox_delivery_inner(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> PtyMailboxDeliveryDiagnostic {
+    if let Err(err) = acknowledge_injected_pty_delivery_attempts(mailbox, session_id) {
+        tracing::warn!(
+            session_id,
+            "Failed to acknowledge injected PTY delivery: {err}"
+        );
+    }
     if matches!(mailbox.notifications_paused(session_id), Ok(true)) {
         return pty_status(
             false,
@@ -92,27 +110,34 @@ fn attempt_pty_mailbox_delivery_inner(
     let control_path = authority.control_path;
     let delivery_invocation_uuid = authority.delivery_invocation_uuid;
     let turn_generation_id = authority.turn_generation_id;
-    if let Err(err) = acknowledge_injected_pty_delivery_attempts(mailbox, session_id) {
-        tracing::warn!(
-            session_id,
-            "Failed to acknowledge injected PTY delivery: {err}"
-        );
-    }
-    let Some(prepared) =
-        (match prepare_pty_mailbox_delivery(mailbox, session_id, &delivery_invocation_uuid) {
-            Ok(prepared) => prepared,
-            Err(err) => {
+    let Some(prepared) = (match prepare_pty_mailbox_delivery(
+        mailbox,
+        session_id,
+        &delivery_invocation_uuid,
+        &turn_generation_id,
+    ) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            if err.starts_with("mailbox_delivery_submission_uncertain:") {
                 return pty_status(
-                    false,
-                    "protocol_error",
+                    true,
+                    "submission_uncertain",
                     Some(control_path),
                     Vec::new(),
-                    None,
+                    pending_count(mailbox, session_id),
                     Some(err),
                 );
             }
-        })
-    else {
+            return pty_status(
+                false,
+                "protocol_error",
+                Some(control_path),
+                Vec::new(),
+                None,
+                Some(err),
+            );
+        }
+    }) else {
         return pty_status(
             false,
             "no_pending",
@@ -137,22 +162,61 @@ fn attempt_pty_mailbox_delivery_inner(
             if response.ack
                 && response.message == pty_delivery_ack_message(&prepared.attempt_id) =>
         {
-            acknowledge_pty_batch_injected(
-                mailbox,
-                session_id,
-                &prepared.attempt_id,
-                turn_generation_id.as_deref(),
-                control_path,
+            acknowledge_pty_batch_injected(mailbox, session_id, &prepared.attempt_id, control_path)
+        }
+        Ok(response)
+            if response.ack
+                && response.message == pty_delivery_uncertain_message(&prepared.attempt_id) =>
+        {
+            pty_status(
+                true,
+                "submission_uncertain",
+                Some(control_path),
+                Vec::new(),
+                pending_count(mailbox, session_id),
+                Some(response.message),
             )
         }
-        Ok(response) if response.ack => mark_unconfirmed_pty_ack(
-            mailbox,
-            session_id,
-            &prepared.attempt_id,
-            control_path,
-            response.message,
-        ),
+        Ok(response) if response.ack => {
+            match delivery_attempt_submission_read(mailbox, &prepared.attempt_id) {
+                DeliverySubmissionRead::Started => {
+                    submission_uncertain_status(mailbox, session_id, control_path, response.message)
+                }
+                DeliverySubmissionRead::Unreadable(error) => submission_uncertain_status(
+                    mailbox,
+                    session_id,
+                    control_path,
+                    format!("{}; {error}", response.message),
+                ),
+                DeliverySubmissionRead::NotStarted => mark_unconfirmed_pty_ack(
+                    mailbox,
+                    session_id,
+                    &prepared.attempt_id,
+                    control_path,
+                    response.message,
+                ),
+            }
+        }
         Ok(response) => {
+            match delivery_attempt_submission_read(mailbox, &prepared.attempt_id) {
+                DeliverySubmissionRead::Started => {
+                    return submission_uncertain_status(
+                        mailbox,
+                        session_id,
+                        control_path,
+                        response.message,
+                    );
+                }
+                DeliverySubmissionRead::Unreadable(error) => {
+                    return submission_uncertain_status(
+                        mailbox,
+                        session_id,
+                        control_path,
+                        format!("{}; {error}", response.message),
+                    );
+                }
+                DeliverySubmissionRead::NotStarted => {}
+            }
             resolve_unacknowledged_pty_attempt_or_warn(mailbox, session_id, &prepared.attempt_id);
             let status = pty_nack_status(&response.message).to_string();
             pty_status(
@@ -172,7 +236,24 @@ fn attempt_pty_mailbox_delivery_inner(
                     &prepared.attempt_id,
                 );
             }
-            pty_client_error_status(mailbox, session_id, control_path, err.kind, err.message)
+            match delivery_attempt_submission_read(mailbox, &prepared.attempt_id) {
+                DeliverySubmissionRead::Started => {
+                    submission_uncertain_status(mailbox, session_id, control_path, err.message)
+                }
+                DeliverySubmissionRead::Unreadable(error) => submission_uncertain_status(
+                    mailbox,
+                    session_id,
+                    control_path,
+                    format!("{}; {error}", err.message),
+                ),
+                DeliverySubmissionRead::NotStarted => pty_client_error_status(
+                    mailbox,
+                    session_id,
+                    control_path,
+                    err.kind,
+                    err.message,
+                ),
+            }
         }
     }
 }
@@ -182,7 +263,10 @@ fn pty_runtime_authority(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> Result<PtyRuntimeAuthority, PtyMailboxDeliveryDiagnostic> {
-    match mailbox.session_generation_projection(session_id) {
+    match mailbox
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+    {
         Ok(SessionGenerationProjection::One(generation)) => {
             let control_path = generation.pty_control_path.clone();
             if terminalize_stale_runtime_generation(
@@ -235,7 +319,7 @@ fn pty_runtime_authority(
             Ok(PtyRuntimeAuthority {
                 control_path,
                 delivery_invocation_uuid: generation.spawn_invocation_uuid.clone(),
-                turn_generation_id: Some(generation.generation_id.to_string()),
+                turn_generation_id: generation.generation_id.to_string(),
             })
         }
         Ok(SessionGenerationProjection::Multiple(_)) => Err(pty_status(
@@ -246,7 +330,14 @@ fn pty_runtime_authority(
             pending_count(mailbox, session_id),
             Some("multiple nonterminal runtime generations".to_string()),
         )),
-        Ok(SessionGenerationProjection::None) => legacy_pty_runtime_authority(mailbox, session_id),
+        Ok(SessionGenerationProjection::None) => Err(pty_status(
+            false,
+            "no_runtime",
+            None,
+            Vec::new(),
+            pending_count(mailbox, session_id),
+            None,
+        )),
         Err(err) => Err(pty_status(
             false,
             "no_runtime",
@@ -256,71 +347,6 @@ fn pty_runtime_authority(
             Some(err.to_string()),
         )),
     }
-}
-
-#[cfg(unix)]
-fn legacy_pty_runtime_authority(
-    mailbox: &MailboxDb,
-    session_id: &str,
-) -> Result<PtyRuntimeAuthority, PtyMailboxDeliveryDiagnostic> {
-    let runtime = match mailbox.session_runtime(session_id) {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => {
-            return Err(pty_status(
-                false,
-                "no_runtime",
-                None,
-                Vec::new(),
-                pending_count(mailbox, session_id),
-                None,
-            ));
-        }
-        Err(err) => {
-            return Err(pty_status(
-                false,
-                "no_runtime",
-                None,
-                Vec::new(),
-                None,
-                Some(err),
-            ));
-        }
-    };
-    if runtime.mode != "pty_interactive" {
-        return Err(pty_status(
-            false,
-            "not_pty",
-            None,
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            None,
-        ));
-    }
-    let Some(control_path) = live_pty_control_path(&runtime) else {
-        return Err(pty_status(
-            false,
-            "no_socket",
-            runtime.pty_control_path,
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            None,
-        ));
-    };
-    let Some(delivery_invocation_uuid) = runtime.running_invocation_uuid else {
-        return Err(pty_status(
-            false,
-            "protocol_error",
-            Some(control_path),
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            Some("running invocation missing".to_string()),
-        ));
-    };
-    Ok(PtyRuntimeAuthority {
-        control_path,
-        delivery_invocation_uuid,
-        turn_generation_id: None,
-    })
 }
 
 #[cfg(unix)]
@@ -352,6 +378,7 @@ pub(crate) fn prepare_pty_mailbox_delivery(
     db: &mut MailboxDb,
     session_id: &str,
     delivery_invocation_uuid: &str,
+    turn_generation_id: &str,
 ) -> Result<Option<PreparedPtyMailboxDelivery>, String> {
     let pending = pending_mailbox_rows(db, session_id, None)?;
     if !has_pending_rows(&pending) {
@@ -364,6 +391,7 @@ pub(crate) fn prepare_pty_mailbox_delivery(
         &candidate_attempt_id,
         session_id,
         delivery_invocation_uuid,
+        turn_generation_id,
         &seqs,
         batch.remaining_count,
     )?;
@@ -385,67 +413,17 @@ pub(crate) fn mailbox_prefix_max_bytes() -> usize {
 }
 
 #[cfg(unix)]
-fn live_pty_control_path(runtime: &SessionRuntimeRow) -> Option<String> {
-    (runtime.run_state == "running")
-        .then_some(runtime.pty_control_path.as_ref())
-        .flatten()
-        .filter(|path| !path.is_empty())
-        .cloned()
-}
-
-#[cfg(unix)]
 fn acknowledge_pty_batch_injected(
     mailbox: &mut MailboxDb,
     session_id: &str,
     attempt_id: &str,
-    turn_generation_id: Option<&str>,
     control_path: String,
 ) -> PtyMailboxDeliveryDiagnostic {
     let seqs = mailbox
-        .delivery_attempt_window(attempt_id)
-        .ok()
-        .flatten()
-        .map(|window| {
-            window
-                .rows
-                .into_iter()
-                .map(|row| row.seq)
-                .collect::<Vec<_>>()
-        })
+        .delivery_attempt_item_seqs(attempt_id)
         .unwrap_or_default();
-    if let Some(turn_generation_id) = turn_generation_id
-        && let Err(error) =
-            record_pty_transport_evidence(attempt_id, session_id, turn_generation_id)
-    {
-        return pty_status(
-            true,
-            "evidence_error",
-            Some(control_path),
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            Some(error),
-        );
-    }
-    let confirmation = mailbox
-        .record_delivery_attempt_transport_ack(attempt_id)
-        .and_then(|recorded| {
-            if recorded {
-                mailbox.confirm_delivery_attempt(attempt_id)
-            } else {
-                mailbox
-                    .delivery_attempt_disposition(attempt_id)
-                    .map(|disposition| {
-                        matches!(
-                            disposition,
-                            Some(
-                                oulipoly_state::mailbox::MailboxDeliveryAttemptDisposition::Resolved
-                            )
-                        )
-                    })
-            }
-        });
-    match confirmation {
-        Ok(true) => pty_status(
+    match reconcile_pty_transport_evidence(mailbox, session_id, Some(attempt_id)) {
+        Ok(()) => pty_status(
             true,
             "acked",
             Some(control_path),
@@ -453,21 +431,13 @@ fn acknowledge_pty_batch_injected(
             pending_count(mailbox, session_id),
             Some("ok".to_string()),
         ),
-        Ok(false) => pty_status(
+        Err(error) => pty_status(
             true,
-            "mark_delivered_error",
+            "evidence_pending",
             Some(control_path),
-            Vec::new(),
+            seqs,
             pending_count(mailbox, session_id),
-            Some(format!("delivery attempt {attempt_id} is not registered")),
-        ),
-        Err(err) => pty_status(
-            true,
-            "mark_delivered_error",
-            Some(control_path),
-            Vec::new(),
-            pending_count(mailbox, session_id),
-            Some(err),
+            Some(error),
         ),
     }
 }
@@ -494,7 +464,7 @@ fn mark_unconfirmed_pty_ack(
         .unwrap_or_default();
     resolve_unacknowledged_pty_attempt_or_warn(mailbox, session_id, attempt_id);
     let failure = mailbox
-        .mark_delivery_failed(session_id, &seqs, "mailbox_delivery_unconfirmed")
+        .mark_delivery_failed(session_id, None, &seqs, "mailbox_delivery_unconfirmed")
         .err();
     pty_status(
         true,
@@ -545,7 +515,10 @@ fn terminalize_stale_runtime_generation(
     session_id: &str,
     control_path: &str,
 ) -> bool {
-    let generation = match mailbox.session_generation_projection(session_id) {
+    let generation = match mailbox
+        .runtime_lifecycle_reader()
+        .session_generation_projection(session_id)
+    {
         Ok(SessionGenerationProjection::One(generation)) => generation,
         Ok(SessionGenerationProjection::None | SessionGenerationProjection::Multiple(_))
         | Err(_) => return false,
@@ -566,6 +539,7 @@ fn terminalize_stale_runtime_generation(
         spawn_invocation_uuid: &generation.spawn_invocation_uuid,
     };
     let terminalized = mailbox
+        .runtime_lifecycle()
         .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
             fence,
             reason: RuntimeTerminalReason::RecoveredDead,
@@ -577,7 +551,6 @@ fn terminalize_stale_runtime_generation(
                 GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_)
             )
         });
-    let _ = mailbox.session_liveness(session_id);
     let _ = unlink_control_socket_if_owned(control_path);
     terminalized
 }
@@ -613,65 +586,218 @@ fn pty_status(
 }
 
 fn pty_status_implies_submit(status: &str) -> bool {
-    matches!(status, "acked" | "mark_delivered_error")
+    matches!(
+        status,
+        "acked" | "evidence_pending" | "mark_delivered_error" | "submission_uncertain"
+    )
+}
+
+#[cfg(unix)]
+fn submission_uncertain_status(
+    mailbox: &MailboxDb,
+    session_id: &str,
+    control_path: String,
+    message: String,
+) -> PtyMailboxDeliveryDiagnostic {
+    pty_status(
+        true,
+        "submission_uncertain",
+        Some(control_path),
+        Vec::new(),
+        pending_count(mailbox, session_id),
+        Some(message),
+    )
 }
 
 fn acknowledge_injected_pty_delivery_attempts(
     mailbox: &mut MailboxDb,
     session_id: &str,
 ) -> Result<(), String> {
-    let windows = mailbox.accepted_delivery_attempt_windows(session_id)?;
-    if windows.is_empty() {
-        return Ok(());
+    reconcile_pty_transport_evidence(mailbox, session_id, None)
+}
+
+fn reconcile_pty_transport_evidence(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+    only_attempt_id: Option<&str>,
+) -> Result<(), String> {
+    let obligations = mailbox.pending_delivery_evidence_obligations(session_id)?;
+    let mut matched = only_attempt_id.is_none();
+    for obligation in obligations
+        .into_iter()
+        .filter(|obligation| only_attempt_id.is_none_or(|id| obligation.attempt_id == id))
+    {
+        matched = true;
+        reconcile_pty_transport_evidence_obligation(mailbox, &obligation)?;
     }
-    let generations = mailbox
-        .runtime_generation_history(session_id)
-        .map_err(|error| error.to_string())?;
-    for window in windows {
-        let mut matches = generations.iter().filter(|generation| {
-            generation.spawn_invocation_uuid == window.delivery_invocation_uuid
-        });
-        let generation = matches.next().ok_or_else(|| {
-            format!(
-                "Cannot resolve runtime generation for accepted PTY delivery attempt {}",
-                window.attempt_id
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(format!(
-                "Multiple runtime generations match accepted PTY delivery attempt {}",
-                window.attempt_id
-            ));
-        }
-        let generation_id = generation.generation_id.to_string();
-        record_pty_transport_evidence(&window.attempt_id, session_id, &generation_id)?;
-        mailbox.confirm_delivery_attempt(&window.attempt_id)?;
+    if !matched {
+        let attempt_id = only_attempt_id.expect("an exact obligation was requested");
+        let obligation = mailbox
+            .delivery_evidence_obligation(attempt_id)?
+            .ok_or_else(|| format!("Mailbox evidence obligation {attempt_id} is missing"))?;
+        verify_exact_pty_transport_evidence(&obligation)?;
     }
     Ok(())
 }
 
-fn record_pty_transport_evidence(
-    attempt_id: &str,
-    session_id: &str,
-    turn_generation_id: &str,
+fn reconcile_pty_transport_evidence_obligation(
+    mailbox: &mut MailboxDb,
+    obligation: &MailboxDeliveryEvidenceObligation,
 ) -> Result<(), String> {
-    let observed_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
-        .as_millis()
-        .try_into()
-        .map_err(|_| "PTY evidence timestamp exceeds i64".to_string())?;
+    let mut obligation = obligation.clone();
+    let mut evidence = pty_transport_evidence(&obligation);
+    let expected = expected_pty_transport_evidence(&evidence);
     let mut state = StateDb::open_default()?;
-    PtyTransportAcknowledgementEvidence {
-        evidence_id: format!("pty_transport_ack:{attempt_id}"),
-        delivery_attempt_id: attempt_id.to_owned(),
-        session_id: session_id.to_owned(),
-        turn_generation_id: turn_generation_id.to_owned(),
-        observed_at,
+    if obligation.legacy
+        && let Some(existing) = state
+            .delivery_evidence(&expected.evidence_id)
+            .map_err(|error| error.to_string())?
+        && delivery_evidence_identity_matches(&existing, &expected)
+        && existing.observed_at != expected.observed_at
+    {
+        if !mailbox.adopt_legacy_delivery_evidence_observed_at(
+            &obligation.attempt_id,
+            existing.observed_at,
+        )? {
+            return Err(format!(
+                "Legacy mailbox evidence obligation {} changed before State evidence could be adopted",
+                obligation.attempt_id
+            ));
+        }
+        obligation.observed_at = existing.observed_at;
+        evidence.observed_at = existing.observed_at;
     }
-    .record(&mut state)
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    let expected = expected_pty_transport_evidence(&evidence);
+    evidence
+        .record(&mut state)
+        .map_err(|error| error.to_string())?;
+    verify_exact_pty_transport_evidence_in_state(&state, &obligation, &expected)?;
+    wait_at_evidence_clear_barrier_for_test(&obligation.attempt_id);
+    if mailbox.mark_delivery_evidence_reconciled(&obligation.attempt_id)? {
+        return Ok(());
+    }
+    if mailbox
+        .delivery_evidence_obligation(&obligation.attempt_id)?
+        .as_ref()
+        == Some(&obligation)
+    {
+        verify_exact_pty_transport_evidence(&obligation)?;
+        return Ok(());
+    }
+    Err(format!(
+        "Mailbox evidence obligation {} changed before it could be cleared",
+        obligation.attempt_id
+    ))
+}
+
+fn delivery_evidence_identity_matches(
+    actual: &DeliveryEvidence,
+    expected: &DeliveryEvidence,
+) -> bool {
+    actual.evidence_id == expected.evidence_id
+        && actual.kind == expected.kind
+        && actual.delivery_id == expected.delivery_id
+        && actual.session_id == expected.session_id
+        && actual.turn_generation_id == expected.turn_generation_id
+}
+
+#[cfg(test)]
+pub(crate) static DATA_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn evidence_clear_barrier_slot()
+-> &'static std::sync::Mutex<Option<(String, std::sync::Arc<std::sync::Barrier>)>> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<Option<(String, std::sync::Arc<std::sync::Barrier>)>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn wait_at_evidence_clear_barrier_for_test(attempt_id: &str) {
+    let barrier = evidence_clear_barrier_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(expected_attempt_id, _)| expected_attempt_id == attempt_id)
+        .map(|(_, barrier)| std::sync::Arc::clone(barrier));
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn wait_at_evidence_clear_barrier_for_test(_attempt_id: &str) {}
+
+fn pty_transport_evidence(
+    obligation: &MailboxDeliveryEvidenceObligation,
+) -> PtyTransportAcknowledgementEvidence {
+    PtyTransportAcknowledgementEvidence {
+        evidence_id: format!("pty_transport_ack:{}", obligation.attempt_id),
+        delivery_attempt_id: obligation.attempt_id.clone(),
+        session_id: obligation.session_id.clone(),
+        turn_generation_id: obligation.turn_generation_id.clone(),
+        observed_at: obligation.observed_at,
+    }
+}
+
+fn expected_pty_transport_evidence(
+    evidence: &PtyTransportAcknowledgementEvidence,
+) -> DeliveryEvidence {
+    DeliveryEvidence {
+        evidence_id: evidence.evidence_id.clone(),
+        kind: DeliveryEvidenceKind::PtyTransportAck,
+        delivery_id: evidence.delivery_attempt_id.clone(),
+        session_id: evidence.session_id.clone(),
+        turn_generation_id: evidence.turn_generation_id.clone(),
+        observed_at: evidence.observed_at,
+    }
+}
+
+fn verify_exact_pty_transport_evidence(
+    obligation: &MailboxDeliveryEvidenceObligation,
+) -> Result<(), String> {
+    let evidence = pty_transport_evidence(obligation);
+    let expected = expected_pty_transport_evidence(&evidence);
+    let state = StateDb::open_default()?;
+    verify_exact_pty_transport_evidence_in_state(&state, obligation, &expected)
+}
+
+fn verify_exact_pty_transport_evidence_in_state(
+    state: &StateDb,
+    obligation: &MailboxDeliveryEvidenceObligation,
+    expected: &DeliveryEvidence,
+) -> Result<(), String> {
+    if state
+        .delivery_evidence(&expected.evidence_id)
+        .map_err(|error| error.to_string())?
+        != Some(expected.clone())
+    {
+        return Err(format!(
+            "State evidence readback mismatch for mailbox delivery attempt {}",
+            obligation.attempt_id
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_pending_pty_delivery_evidence(
+    mailbox: &mut MailboxDb,
+    session_id: &str,
+) -> Result<(), String> {
+    reconcile_pty_transport_evidence(mailbox, session_id, None)
+}
+
+#[cfg(unix)]
+fn delivery_attempt_submission_read(
+    mailbox: &MailboxDb,
+    attempt_id: &str,
+) -> DeliverySubmissionRead {
+    match mailbox.delivery_attempt_submission_started(attempt_id) {
+        Ok(true) => DeliverySubmissionRead::Started,
+        Ok(false) => DeliverySubmissionRead::NotStarted,
+        Err(error) => DeliverySubmissionRead::Unreadable(error),
+    }
 }
 
 pub(crate) fn finalize_pty_mailbox_delivery_handoff(
@@ -685,6 +811,7 @@ pub(crate) fn finalize_pty_mailbox_delivery_handoff(
     let Some(mut mailbox) = MailboxDb::open_default_if_exists()? else {
         return Ok(false);
     };
+    reconcile_pending_pty_delivery_evidence(&mut mailbox, session_id)?;
     let attempt_ids = mailbox
         .accepted_delivery_attempt_windows(session_id)?
         .into_iter()
@@ -695,8 +822,13 @@ pub(crate) fn finalize_pty_mailbox_delivery_handoff(
         return Ok(false);
     }
     for attempt_id in attempt_ids {
-        mailbox.confirm_delivery_attempt(&attempt_id)?;
+        if !mailbox.confirm_delivery_attempt(&attempt_id)? {
+            return Err(format!(
+                "Mailbox delivery attempt {attempt_id} cannot be confirmed without an exact generation-bound State evidence obligation"
+            ));
+        }
     }
+    reconcile_pending_pty_delivery_evidence(&mut mailbox, session_id)?;
     crate::wake_coordinator::mark_session_idle_after_turn(
         session_id,
         invocation_uuid,
@@ -835,7 +967,7 @@ pub(crate) fn prepare_headless_resume_delivery(
     let Some(mut db) = open_mailbox_sidecar()? else {
         return Ok(empty_delivery(answer, session_id));
     };
-    record_headless_session_runtime(&mut db, resolved, models_dir)?;
+    record_headless_session_metadata(&mut db, resolved, models_dir)?;
     if db.notifications_paused(&session_id)? {
         return Ok(empty_delivery(answer, session_id));
     }
@@ -892,7 +1024,8 @@ fn load_pending_mailbox_rows(
 
 fn verify_pending_mailbox_payloads(db: &MailboxDb, rows: &[MailboxRow]) -> Result<(), String> {
     for row in rows {
-        db.verify_mailbox_row_payload(row)
+        db.payloads()
+            .verify_mailbox_row_payload(row)
             .map_err(|err| format_mailbox_payload_unavailable(row.seq, err))?;
     }
     Ok(())
@@ -984,6 +1117,7 @@ fn prepared_delivery(
 
 pub(crate) fn mark_headless_resume_delivered(
     session_id: &str,
+    chain_id: Option<&str>,
     seqs: &[i64],
     delivered_by_invocation_uuid: &str,
 ) -> Result<(), String> {
@@ -993,11 +1127,12 @@ pub(crate) fn mark_headless_resume_delivered(
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("mailbox sidecar missing while marking delivered rows".to_string());
     };
-    db.mark_delivered(session_id, seqs, delivered_by_invocation_uuid)
+    db.mark_delivered(session_id, chain_id, seqs, delivered_by_invocation_uuid)
 }
 
 pub(crate) fn mark_headless_resume_delivery_failed(
     session_id: &str,
+    chain_id: Option<&str>,
     seqs: &[i64],
     delivery_error: &str,
 ) -> Result<(), String> {
@@ -1007,7 +1142,7 @@ pub(crate) fn mark_headless_resume_delivery_failed(
     let Some(mut db) = MailboxDb::open_default_if_exists()? else {
         return Err("mailbox sidecar missing while marking failed delivery rows".to_string());
     };
-    db.mark_delivery_failed(session_id, seqs, delivery_error)
+    db.mark_delivery_failed(session_id, chain_id, seqs, delivery_error)
 }
 
 struct MailboxBatch {
@@ -1015,27 +1150,26 @@ struct MailboxBatch {
     remaining_count: usize,
 }
 
-fn record_headless_session_runtime(
+fn record_headless_session_metadata(
     db: &mut MailboxDb,
     resolved: &oulipoly_state::ResolvedResume,
     models_dir: Option<&Path>,
 ) -> Result<(), String> {
     let models_dir = models_dir_string(models_dir);
-    let input = headless_session_runtime_upsert(resolved, models_dir.as_deref());
-    db.upsert_session_runtime(input)
+    let input = headless_session_metadata_upsert(resolved, models_dir.as_deref());
+    db.wake_sessions().upsert_session_metadata(input)
 }
 
-fn headless_session_runtime_upsert<'a>(
+fn headless_session_metadata_upsert<'a>(
     resolved: &'a oulipoly_state::ResolvedResume,
     models_dir: Option<&'a str>,
-) -> SessionRuntimeUpsert<'a> {
-    SessionRuntimeUpsert {
+) -> SessionMetadataUpsert<'a> {
+    SessionMetadataUpsert {
         session_id: &resolved.active_session_id,
         mode: "headless",
         invocation_uuid: None,
         provider_name: Some(&resolved.active_provider),
         model_name: resolved.model_name.as_deref(),
-        pty_control_path: None,
         models_dir,
         effective_cwd: None,
         selected_auto_wake_max: None,
@@ -1224,6 +1358,27 @@ fn sanitize(value: &str) -> String {
 mod tests {
     use super::*;
 
+    struct DataDirOverride(Option<std::ffi::OsString>);
+
+    impl DataDirOverride {
+        fn install(path: &Path) -> Self {
+            let prior = std::env::var_os("OULIPOLY_DATA_DIR");
+            unsafe { std::env::set_var("OULIPOLY_DATA_DIR", path) };
+            Self(prior)
+        }
+    }
+
+    impl Drop for DataDirOverride {
+        fn drop(&mut self) {
+            unsafe {
+                match self.0.as_ref() {
+                    Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                    None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn compose_without_pending_preserves_answer_by_caller_contract() {
         let original = Some("byte-identical".to_string());
@@ -1247,6 +1402,411 @@ mod tests {
             prefix.contains("[OULIPOLY-DELIVERY nonce-123]\n[END OULIPOLY NOTIFICATIONS]"),
             "{prefix}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_submission_state_is_unreadable_not_not_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let mailbox = MailboxDb::open(&directory.path().join("pid-identity.db")).unwrap();
+
+        assert!(matches!(
+            delivery_attempt_submission_read(&mailbox, "missing-attempt"),
+            DeliverySubmissionRead::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_exact_evidence_reconciliation_is_idempotent_after_readback() {
+        let _env_lock = DATA_DIR_ENV_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(directory.path());
+        drop(StateDb::open_default().unwrap());
+        let mut mailbox = MailboxDb::open_default().unwrap();
+        let EnqueueResult::Inserted(row) = mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "session-a",
+                handle: "handle-a",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("invocation-a"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("boot-a"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/tmp/state",
+                meta_path: "/tmp/meta",
+                log_path: "/tmp/log",
+                rc_path: "/tmp/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected inserted mailbox row");
+        };
+        mailbox
+            .register_or_reuse_delivery_attempt(
+                "concurrent-attempt",
+                "session-a",
+                "invocation-a",
+                "generation-a",
+                &[row.seq],
+                0,
+            )
+            .unwrap();
+        mailbox
+            .begin_delivery_attempt_submission("concurrent-attempt")
+            .unwrap();
+        mailbox
+            .confirm_delivery_attempt("concurrent-attempt")
+            .unwrap();
+        drop(mailbox);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *evidence_clear_barrier_slot().lock().unwrap() = Some((
+            "concurrent-attempt".to_string(),
+            std::sync::Arc::clone(&barrier),
+        ));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            threads.push(std::thread::spawn(|| {
+                let mut mailbox = MailboxDb::open_default().unwrap();
+                reconcile_pty_transport_evidence(
+                    &mut mailbox,
+                    "session-a",
+                    Some("concurrent-attempt"),
+                )
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        *evidence_clear_barrier_slot().lock().unwrap() = None;
+
+        assert_eq!(results, vec![Ok(()), Ok(())]);
+        let mailbox = MailboxDb::open_default().unwrap();
+        assert!(
+            mailbox
+                .pending_delivery_evidence_obligations("session-a")
+                .unwrap()
+                .is_empty()
+        );
+        let state = StateDb::open_default().unwrap();
+        assert!(
+            state
+                .delivery_evidence("pty_transport_ack:concurrent-attempt")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn v4_migration_adopts_existing_exact_state_evidence_timestamp() {
+        let _env_lock = DATA_DIR_ENV_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(directory.path());
+        let mut mailbox = MailboxDb::open_default().unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("97777777-7777-4777-8777-777777777777").unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "legacy-invocation",
+                session_id: Some("legacy-session"),
+                runtime_mode: "pty_interactive",
+                provider_name: "legacy-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let EnqueueResult::Inserted(row) = mailbox
+            .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                session_id: "legacy-session",
+                handle: "legacy-handle",
+                payload_json: "{}",
+                owner_invocation_uuid: Some("legacy-invocation"),
+                matched_os_pid: Some(1),
+                matched_os_boot_id: Some("legacy-boot"),
+                matched_os_pid_starttime_ticks: Some(1),
+                matched_chain_index: Some(0),
+                state_dir: "/tmp/state",
+                meta_path: "/tmp/meta",
+                log_path: "/tmp/log",
+                rc_path: "/tmp/rc",
+                rc: 0,
+            })
+            .unwrap()
+        else {
+            panic!("expected inserted mailbox row");
+        };
+        mailbox
+            .register_delivery_attempt(
+                "legacy-attempt",
+                "legacy-session",
+                "legacy-invocation",
+                &[row.seq],
+                0,
+            )
+            .unwrap();
+        mailbox
+            .begin_delivery_attempt_submission("legacy-attempt")
+            .unwrap();
+        mailbox.confirm_delivery_attempt("legacy-attempt").unwrap();
+
+        let exact_observed_at = 123_456;
+        let exact_evidence = PtyTransportAcknowledgementEvidence {
+            evidence_id: "pty_transport_ack:legacy-attempt".to_string(),
+            delivery_attempt_id: "legacy-attempt".to_string(),
+            session_id: "legacy-session".to_string(),
+            turn_generation_id: generation_id.to_string(),
+            observed_at: exact_observed_at,
+        };
+        let mut state = StateDb::open_default().unwrap();
+        exact_evidence.record(&mut state).unwrap();
+        drop(state);
+        drop(mailbox);
+
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+        for column in [
+            "evidence_reconciled_at",
+            "evidence_observed_at",
+            "evidence_turn_generation_id",
+            "submission_started_at",
+            "evidence_disposition",
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "ALTER TABLE mailbox_delivery_attempts DROP COLUMN {column};"
+                ))
+                .unwrap();
+        }
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+
+        let mut mailbox = MailboxDb::open_default().unwrap();
+        let migrated = mailbox
+            .pending_delivery_evidence_obligations("legacy-session")
+            .unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert!(migrated[0].legacy);
+        assert_ne!(migrated[0].observed_at, exact_observed_at);
+
+        reconcile_pending_pty_delivery_evidence(&mut mailbox, "legacy-session").unwrap();
+        assert!(
+            mailbox
+                .pending_delivery_evidence_obligations("legacy-session")
+                .unwrap()
+                .is_empty()
+        );
+        let state = StateDb::open_default().unwrap();
+        assert_eq!(
+            state
+                .delivery_evidence("pty_transport_ack:legacy-attempt")
+                .unwrap()
+                .unwrap()
+                .observed_at,
+            exact_observed_at
+        );
+    }
+
+    #[test]
+    fn v4_unresolved_ack_handoff_requires_exact_migrated_generation_evidence() {
+        fn enqueue(
+            mailbox: &mut MailboxDb,
+            session_id: &str,
+            handle: &str,
+            invocation_uuid: &str,
+        ) -> MailboxRow {
+            let EnqueueResult::Inserted(row) = mailbox
+                .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+                    session_id,
+                    handle,
+                    payload_json: "{}",
+                    owner_invocation_uuid: Some(invocation_uuid),
+                    matched_os_pid: Some(1),
+                    matched_os_boot_id: Some("legacy-boot"),
+                    matched_os_pid_starttime_ticks: Some(1),
+                    matched_chain_index: Some(0),
+                    state_dir: "/tmp/state",
+                    meta_path: "/tmp/meta",
+                    log_path: "/tmp/log",
+                    rc_path: "/tmp/rc",
+                    rc: 0,
+                })
+                .unwrap()
+            else {
+                panic!("expected inserted mailbox row");
+            };
+            row
+        }
+
+        fn create_generation(
+            mailbox: &mut MailboxDb,
+            generation_uuid: &str,
+            session_id: &str,
+            invocation_uuid: &str,
+        ) -> RuntimeGenerationId {
+            let generation_id = RuntimeGenerationId::parse(generation_uuid).unwrap();
+            mailbox
+                .runtime_lifecycle()
+                .create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: invocation_uuid,
+                    session_id: Some(session_id),
+                    runtime_mode: "pty_interactive",
+                    provider_name: "legacy-provider",
+                    model_name: None,
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                })
+                .unwrap();
+            generation_id
+        }
+
+        let _env_lock = DATA_DIR_ENV_LOCK.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(directory.path());
+        drop(StateDb::open_default().unwrap());
+        let mut mailbox = MailboxDb::open_default().unwrap();
+        let unique = (
+            "legacy-unique-session",
+            "legacy-unique-invocation",
+            "legacy-unique-attempt",
+        );
+        let unmatched = (
+            "legacy-unmatched-session",
+            "legacy-unmatched-invocation",
+            "legacy-unmatched-attempt",
+        );
+        let ambiguous = (
+            "legacy-ambiguous-session",
+            "legacy-ambiguous-invocation",
+            "legacy-ambiguous-attempt",
+        );
+        let unique_generation = create_generation(
+            &mut mailbox,
+            "98888888-8888-4888-8888-888888888888",
+            unique.0,
+            unique.1,
+        );
+        for generation_uuid in [
+            "99999999-9999-4999-8999-999999999999",
+            "9aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        ] {
+            create_generation(&mut mailbox, generation_uuid, ambiguous.0, ambiguous.1);
+        }
+        for (session_id, invocation_uuid, attempt_id) in [unique, unmatched, ambiguous] {
+            let row = enqueue(&mut mailbox, session_id, attempt_id, invocation_uuid);
+            mailbox
+                .register_delivery_attempt(attempt_id, session_id, invocation_uuid, &[row.seq], 0)
+                .unwrap();
+            mailbox
+                .record_delivery_attempt_transport_ack(attempt_id)
+                .unwrap();
+        }
+        drop(mailbox);
+
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let connection = rusqlite::Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute(
+                "UPDATE runtime_generation
+                 SET lifecycle_state = 'exited',
+                     exited_at = created_at,
+                     terminal_reason = 'startup_failed',
+                     exit_code = 0
+                 WHERE generation_uuid = ?1",
+                rusqlite::params![unique_generation.to_string()],
+            )
+            .unwrap();
+        for column in [
+            "evidence_reconciled_at",
+            "evidence_observed_at",
+            "evidence_turn_generation_id",
+            "submission_started_at",
+            "evidence_disposition",
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "ALTER TABLE mailbox_delivery_attempts DROP COLUMN {column};"
+                ))
+                .unwrap();
+        }
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+
+        let mailbox = MailboxDb::open_default().unwrap();
+        let obligation = mailbox
+            .pending_delivery_evidence_obligations(unique.0)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(obligation.attempt_id, unique.2);
+        assert_eq!(obligation.turn_generation_id, unique_generation.to_string());
+        assert!(obligation.legacy);
+        drop(mailbox);
+
+        assert!(finalize_pty_mailbox_delivery_handoff(Some(unique.0), unique.1, 0).unwrap());
+        let mailbox = MailboxDb::open_default().unwrap();
+        let unique_attempt = mailbox.delivery_attempt_window(unique.2).unwrap().unwrap();
+        assert!(unique_attempt.resolved_at.is_some());
+        let unique_rows = mailbox.list_mailbox(unique.0, true).unwrap();
+        assert_eq!(unique_rows.len(), 1);
+        assert!(unique_rows[0].delivered_at.is_some());
+        assert!(
+            mailbox
+                .pending_delivery_evidence_obligations(unique.0)
+                .unwrap()
+                .is_empty()
+        );
+        drop(mailbox);
+        let state = StateDb::open_default().unwrap();
+        assert_eq!(
+            state
+                .delivery_evidence(&format!("pty_transport_ack:{}", unique.2))
+                .unwrap(),
+            Some(expected_pty_transport_evidence(&pty_transport_evidence(
+                &obligation
+            )))
+        );
+        drop(state);
+
+        for (attempt, expected_disposition) in [
+            (unmatched, "legacy_unmatched_generation"),
+            (ambiguous, "legacy_ambiguous_generation"),
+        ] {
+            let error =
+                finalize_pty_mailbox_delivery_handoff(Some(attempt.0), attempt.1, 0).unwrap_err();
+            assert!(error.contains("exact generation-bound State evidence obligation"));
+            let mailbox = MailboxDb::open_default().unwrap();
+            let window = mailbox.delivery_attempt_window(attempt.2).unwrap().unwrap();
+            assert!(window.resolved_at.is_none());
+            assert!(window.rows[0].delivered_at.is_none());
+            let disposition = rusqlite::Connection::open(&sidecar_path)
+                .unwrap()
+                .query_row(
+                    "SELECT evidence_disposition
+                     FROM mailbox_delivery_attempts
+                     WHERE attempt_id = ?1",
+                    rusqlite::params![attempt.2],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(disposition, expected_disposition);
+            drop(mailbox);
+            assert!(
+                StateDb::open_default()
+                    .unwrap()
+                    .delivery_evidence(&format!("pty_transport_ack:{}", attempt.2))
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

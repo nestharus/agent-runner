@@ -1050,12 +1050,14 @@ fn opencode_cwd_does_not_override_stderr_limit_with_info_proof() {
     let fake = fixture.fake_bin_dir.join("proof-with-oversized-stderr");
     write_fake_export(
         &fake,
-        r#"printf '%s' '{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},"messages":["'
+        r#"i=0
+while [ "$i" -lt 32 ]; do
+  printf '%s' 'SENSITIVE_STDERR_SENTINEL' >&2
+  i=$((i + 1))
+done
+printf '%s' '{"info":{"id":"ses_public_export_fixture_01","directory":"/tmp"},"messages":["'
 while :; do
   printf '%s' 'SENSITIVE_TRANSCRIPT_SENTINEL'
-done &
-while :; do
-  printf '%s' 'SENSITIVE_STDERR_SENTINEL' >&2
 done
 "#,
     );

@@ -15,6 +15,7 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::{process_identity_liveness, unverified_pid_liveness};
 use crate::observability::mailbox::mailbox_state;
 use crate::observability::state_access::storage_diagnostic;
+use oulipoly_core::CancellationToken;
 use oulipoly_state::invocation_marker::INVOCATION_MARKER_PREFIX;
 use oulipoly_state::mailbox::{AGENT_BASH_COMPLETE_KIND, MailboxRow};
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow, ProcessIdentity};
@@ -45,6 +46,7 @@ pub(crate) struct AgentBashProjectInput<'a> {
     pub(crate) invocation_uuids: &'a HashSet<String>,
     pub(crate) mailbox_rows: &'a [MailboxRow],
     pub(crate) limits: SnapshotLimits,
+    pub(crate) cancellation: &'a CancellationToken,
 }
 
 #[derive(Default)]
@@ -140,12 +142,16 @@ fn agent_bash_root_dir(root: PathBuf) -> PathBuf {
 pub(crate) fn project_agent_bash(input: AgentBashProjectInput<'_>) -> AgentBashProjection {
     let mut diagnostics = Vec::new();
     let mut seen_handles = HashSet::new();
+    if input.cancellation.is_cancelled() {
+        return agent_bash_projection(Vec::new(), diagnostics, 0);
+    }
     let mut nodes = mailbox_workload_nodes(
         input.cache,
         input.session_id,
         input.invocation_uuids,
         input.mailbox_rows,
         input.limits,
+        input.cancellation,
         &mut diagnostics,
         &mut seen_handles,
     );
@@ -157,6 +163,7 @@ pub(crate) fn project_agent_bash(input: AgentBashProjectInput<'_>) -> AgentBashP
         input.session_id,
         input.invocation_uuids,
         input.limits,
+        input.cancellation,
         &mut diagnostics,
         &mut seen_handles,
     ));
@@ -199,18 +206,23 @@ fn home_state_dir(home: PathBuf) -> PathBuf {
     home.join(".local/state")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mailbox_workload_nodes(
     cache: &AgentBashMetaCache,
     session_id: Option<&str>,
     invocation_uuids: &HashSet<String>,
     rows: &[MailboxRow],
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
     seen_handles: &mut HashSet<String>,
 ) -> Vec<MonitorNode> {
     let rows = agent_bash_complete_rows(rows);
     let mut nodes = Vec::new();
     for row in rows {
+        if cancellation.is_cancelled() {
+            break;
+        }
         push_mailbox_workload_node(
             &mut nodes,
             cache,
@@ -330,28 +342,34 @@ fn scanned_workload_nodes(
     session_id: Option<&str>,
     invocation_uuids: &HashSet<String>,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
     seen_handles: &mut HashSet<String>,
 ) -> Vec<MonitorNode> {
     let Some(root_dir) = root_dir else {
         return Vec::new();
     };
-    candidate_dirs(root_dir, limits, diagnostics)
-        .into_iter()
-        .filter_map(|candidate| {
-            scanned_workload_node(
-                cache,
-                state,
-                pid,
-                session_id,
-                invocation_uuids,
-                limits,
-                diagnostics,
-                seen_handles,
-                &candidate.state_dir,
-            )
-        })
-        .collect()
+    let mut nodes = Vec::new();
+    for candidate in candidate_dirs(root_dir, limits, cancellation, diagnostics) {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if let Some(node) = scanned_workload_node(
+            cache,
+            state,
+            pid,
+            session_id,
+            invocation_uuids,
+            limits,
+            cancellation,
+            diagnostics,
+            seen_handles,
+            &candidate.state_dir,
+        ) {
+            nodes.push(node);
+        }
+    }
+    nodes
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,18 +380,29 @@ fn scanned_workload_node(
     session_id: Option<&str>,
     invocation_uuids: &HashSet<String>,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
     seen_handles: &mut HashSet<String>,
     state_dir: &Path,
 ) -> Option<MonitorNode> {
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let meta_path = state_dir.join("meta.json");
     let meta = read_meta_for_scan(cache, state_dir, &meta_path, diagnostics)?;
+    if cancellation.is_cancelled() {
+        return None;
+    }
     if handle_was_seen(seen_handles, &meta.handle) {
         return None;
     }
     remember_meta_handle(seen_handles, &meta);
-    let owner = resolve_owner(state, pid, &meta.caller_chain, diagnostics)
-        .or_else(|| workload_marker_owner(state, state_dir, &meta, invocation_uuids))?;
+    let owner =
+        resolve_owner(state, pid, &meta.caller_chain, cancellation, diagnostics).or_else(|| {
+            (!cancellation.is_cancelled())
+                .then(|| workload_marker_owner(state, state_dir, &meta, invocation_uuids))
+                .flatten()
+        })?;
     if !owner_matches_root(&owner, session_id, invocation_uuids) {
         return None;
     }
@@ -457,6 +486,7 @@ fn workload_log_snapshot(path: PathBuf, tail: Option<String>) -> WorkloadLogSnap
 fn candidate_dirs(
     root_dir: &Path,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Vec<CandidateDir> {
     let entries = match read_candidate_dir_entries(root_dir) {
@@ -467,7 +497,7 @@ fn candidate_dirs(
             return Vec::new();
         }
     };
-    candidate_dirs_from_entries(entries, limits)
+    candidate_dirs_from_entries(entries, limits, cancellation)
 }
 
 fn read_candidate_dir_entries(root_dir: &Path) -> Result<std::fs::ReadDir, std::io::Error> {
@@ -485,15 +515,37 @@ fn agent_bash_root_read_diagnostic(root_dir: &Path, err: std::io::Error) -> Moni
 }
 
 fn candidate_dirs_from_entries(
-    entries: std::fs::ReadDir,
+    entries: impl IntoIterator<Item = Result<std::fs::DirEntry, std::io::Error>>,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
 ) -> Vec<CandidateDir> {
-    let mut dirs = entries
-        .filter_map(|entry| candidate_dir(entry.ok()?))
-        .collect::<Vec<_>>();
-    dirs.sort_by(compare_candidate_dir);
-    dirs.truncate(limits.agent_bash_scan_dirs);
+    let limit = limits.agent_bash_scan_dirs;
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut dirs = Vec::new();
+    for entry in entries {
+        if cancellation.is_cancelled() {
+            return Vec::new();
+        }
+        if let Some(candidate) = entry.ok().and_then(candidate_dir) {
+            retain_candidate_dir(&mut dirs, candidate, limit);
+        }
+    }
     dirs
+}
+
+fn retain_candidate_dir(dirs: &mut Vec<CandidateDir>, candidate: CandidateDir, limit: usize) {
+    let insertion = dirs
+        .binary_search_by(|existing| compare_candidate_dir(existing, &candidate))
+        .unwrap_or_else(|insertion| insertion);
+    if insertion >= limit {
+        return;
+    }
+    if dirs.len() == limit {
+        dirs.pop();
+    }
+    dirs.insert(insertion, candidate);
 }
 
 fn candidate_dir(entry: std::fs::DirEntry) -> Option<CandidateDir> {
@@ -842,10 +894,30 @@ fn resolve_owner(
     state: Option<&StateDb>,
     pid: Option<&PidIdentityDb>,
     chain: &[CallerIdentity],
+    cancellation: &CancellationToken,
+    diagnostics: &mut Vec<MonitorDiagnostic>,
+) -> Option<ResolvedOwner> {
+    resolve_owner_until(
+        state,
+        pid,
+        chain,
+        &|| cancellation.is_cancelled(),
+        diagnostics,
+    )
+}
+
+fn resolve_owner_until(
+    state: Option<&StateDb>,
+    pid: Option<&PidIdentityDb>,
+    chain: &[CallerIdentity],
+    is_cancelled: &dyn Fn() -> bool,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<ResolvedOwner> {
     let pid = pid?;
     for entry in chain {
+        if is_cancelled() {
+            return None;
+        }
         match resolve_owner_for_entry(state, pid, entry) {
             Ok(Some(owner)) => return Some(owner),
             Ok(None) => {}
@@ -1203,4 +1275,138 @@ fn present_string_array_items(values: Vec<Option<&str>>) -> Vec<&str> {
 
 fn owned_strings(values: Vec<&str>) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use oulipoly_state::pid_identity::PidIdentityRecord;
+
+    struct CancelDuringDiscovery<'a> {
+        entries: std::fs::ReadDir,
+        cancellation: &'a CancellationToken,
+        visited: &'a std::cell::Cell<usize>,
+        cancel_after: usize,
+    }
+
+    impl Iterator for CancelDuringDiscovery<'_> {
+        type Item = Result<std::fs::DirEntry, std::io::Error>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let visited = self.visited.get();
+            if visited == self.cancel_after {
+                self.cancellation.cancel();
+            }
+            self.visited.set(visited + 1);
+            self.entries.next()
+        }
+    }
+
+    #[test]
+    fn cancelled_candidate_discovery_stops_before_materializing_retained_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..32 {
+            std::fs::create_dir(directory.path().join(format!("ab_{index:08x}"))).unwrap();
+        }
+        let cancellation = CancellationToken::new();
+        let visited = std::cell::Cell::new(0);
+        let entries = CancelDuringDiscovery {
+            entries: std::fs::read_dir(directory.path()).unwrap(),
+            cancellation: &cancellation,
+            visited: &visited,
+            cancel_after: 4,
+        };
+
+        let candidates =
+            candidate_dirs_from_entries(entries, SnapshotLimits::default(), &cancellation);
+
+        assert!(candidates.is_empty());
+        assert!(visited.get() < 32);
+    }
+
+    #[test]
+    fn candidate_retention_never_exceeds_the_configured_bound() {
+        let mut candidates = Vec::new();
+        let mut peak_retained = 0;
+
+        for age in 0..100 {
+            retain_candidate_dir(
+                &mut candidates,
+                candidate_dir_from_parts(
+                    PathBuf::from(format!("ab_{age:08x}")),
+                    UNIX_EPOCH.checked_add(Duration::from_secs(age)),
+                ),
+                4,
+            );
+            peak_retained = peak_retained.max(candidates.len());
+        }
+
+        assert_eq!(peak_retained, 4);
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.modified_at.unwrap())
+                .collect::<Vec<_>>(),
+            [99, 98, 97, 96].map(|age| UNIX_EPOCH + Duration::from_secs(age))
+        );
+    }
+
+    #[test]
+    fn owner_resolution_stops_before_a_later_matching_chain_entry_after_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid = PidIdentityDb::open(&directory.path().join("pid-identity.db")).unwrap();
+        let missing = ProcessIdentity {
+            os_pid: 1001,
+            os_boot_id: "boot-a".to_string(),
+            os_pid_starttime_ticks: 11,
+        };
+        let matching = ProcessIdentity {
+            os_pid: 1002,
+            os_boot_id: "boot-a".to_string(),
+            os_pid_starttime_ticks: 12,
+        };
+        pid.record_identity(PidIdentityRecord {
+            identity: &matching,
+            os_pgid: None,
+            invocation_uuid: "matching-invocation",
+            session_id: Some("matching-session"),
+            provider_name: None,
+            model_name: None,
+            recorded_at: "2026-08-18T00:00:00Z",
+        })
+        .unwrap();
+        let chain = [
+            CallerIdentity {
+                chain_index: 0,
+                identity: missing,
+            },
+            CallerIdentity {
+                chain_index: 1,
+                identity: matching,
+            },
+        ];
+        let checks = std::cell::Cell::new(0);
+        let mut diagnostics = Vec::new();
+
+        let cancelled = resolve_owner_until(
+            None,
+            Some(&pid),
+            &chain,
+            &|| {
+                let check = checks.get();
+                checks.set(check + 1);
+                check == 1
+            },
+            &mut diagnostics,
+        );
+
+        assert!(cancelled.is_none());
+        assert_eq!(checks.get(), 2);
+        assert!(diagnostics.is_empty());
+        let resolved =
+            resolve_owner_until(None, Some(&pid), &chain, &|| false, &mut diagnostics).unwrap();
+        assert_eq!(resolved.invocation_uuid, "matching-invocation");
+        assert_eq!(resolved.matched_chain_index, Some(1));
+    }
 }

@@ -271,13 +271,13 @@ fn list_rows(session_id: &str, all: bool) -> Result<Vec<MailboxRow>, String> {
     };
     let mut rows = db.list_mailbox(session_id, all)?;
     for row in &mut rows {
-        row.payload_json = db.hydrate_agent_bash_payload_json(row)?;
+        row.payload_json = db.payloads().hydrate_agent_bash_payload_json(row)?;
     }
     Ok(rows)
 }
 
 pub(crate) fn run_compact_delivered(limit: usize, apply: bool, json: bool) -> Result<i32, String> {
-    let Some(mut db) = MailboxDb::open_default_if_exists()? else {
+    let Some(db) = MailboxDb::open_default_if_exists()? else {
         let empty = DeliveredPayloadCompactionStats::default();
         render_compaction(
             MailboxCompactionResponse {
@@ -291,11 +291,11 @@ pub(crate) fn run_compact_delivered(limit: usize, apply: bool, json: bool) -> Re
         )?;
         return Ok(0);
     };
-    let before = db.delivered_payload_compaction_stats()?;
+    let before = db.payloads().delivered_payload_compaction_stats()?;
     let report = apply
-        .then(|| db.compact_delivered_payloads(limit))
+        .then(|| db.payloads().compact_delivered_payloads(limit))
         .transpose()?;
-    let after = db.delivered_payload_compaction_stats()?;
+    let after = db.payloads().delivered_payload_compaction_stats()?;
     render_compaction(
         MailboxCompactionResponse {
             applied: apply,

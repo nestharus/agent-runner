@@ -2,6 +2,7 @@
 //! mapper, formatter
 
 use super::{ExternalRotationError, ExternalRotationIdentity, error_formatter};
+use crate::provider_registry::DescribeHostOptions;
 use crate::services::MigrationServiceRequest;
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, HostContext, JsonObject, MigrationObject, RequestEnvelope, RotationObject,
@@ -12,13 +13,14 @@ use std::collections::BTreeMap;
 pub(super) fn rotation_request(
     identity: &ExternalRotationIdentity,
     request: &MigrationServiceRequest<'_>,
+    host_options: &DescribeHostOptions,
     operation: &str,
 ) -> Result<Value, ExternalRotationError> {
     serialize_request(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id: format!("s7c-{operation}"),
         provider_instance_id: identity.provider_instance_id.clone(),
-        host: host_context(request),
+        host: host_context(request, host_options),
         params: RotationObject {
             fields: request_fields(identity, request, operation),
         },
@@ -28,13 +30,14 @@ pub(super) fn rotation_request(
 pub(super) fn migration_request(
     identity: &ExternalRotationIdentity,
     request: &MigrationServiceRequest<'_>,
+    host_options: &DescribeHostOptions,
     operation: &str,
 ) -> Result<Value, ExternalRotationError> {
     serialize_request(RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id: format!("s7c-{operation}"),
         provider_instance_id: identity.provider_instance_id.clone(),
-        host: host_context(request),
+        host: host_context(request, host_options),
         params: MigrationObject {
             fields: request_fields(identity, request, operation),
         },
@@ -92,16 +95,35 @@ fn rotation_transition_reason(request: &MigrationServiceRequest<'_>) -> &'static
     "quota_threshold"
 }
 
-fn host_context(request: &MigrationServiceRequest<'_>) -> HostContext {
+fn host_context(
+    request: &MigrationServiceRequest<'_>,
+    host_options: &DescribeHostOptions,
+) -> HostContext {
     HostContext {
         app: "oulipoly-agent-runner".to_string(),
         app_version: None,
         platform: Some(std::env::consts::OS.to_string()),
         working_directory: Some(request.effective_cwd.display().to_string()),
-        config_root: None,
-        data_root: oulipoly_state::paths::data_dir()
-            .ok()
+        config_root: host_options
+            .config_root
+            .as_ref()
             .map(|path| path.display().to_string()),
+        data_root: host_options
+            .data_root
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .or_else(|| {
+                request
+                    .state
+                    .path()
+                    .parent()
+                    .map(|path| path.display().to_string())
+            })
+            .or_else(|| {
+                oulipoly_state::paths::data_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            }),
         env: BTreeMap::new(),
         deadline_unix_ms: None,
     }

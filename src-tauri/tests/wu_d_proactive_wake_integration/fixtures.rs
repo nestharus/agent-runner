@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 pub(crate) struct Fixture {
-    pub(crate) dir: tempfile::TempDir,
+    pub(crate) dir: Option<tempfile::TempDir>,
     pub(crate) config_home: PathBuf,
     pub(crate) data_home: PathBuf,
     pub(crate) state_home: PathBuf,
@@ -37,7 +37,7 @@ impl Fixture {
         fs::create_dir_all(&home_dir).unwrap();
         fs::create_dir_all(&work_dir).unwrap();
         Self {
-            dir,
+            dir: Some(dir),
             config_home,
             data_home,
             state_home,
@@ -84,7 +84,7 @@ impl Fixture {
             .env_remove("OULIPOLY_AUTO_WAKE_TOKEN")
             .env_remove("OULIPOLY_AUTO_WAKE_COUNT")
             .env_remove("OULIPOLY_PARENT_INVOCATION")
-            .current_dir(self.dir.path());
+            .current_dir(self.root());
     }
 
     pub(crate) fn run_agent(&self, prompt: &str) -> Output {
@@ -125,7 +125,7 @@ impl Fixture {
     }
 
     pub(crate) fn write_script(&self, name: &str, body: &str) -> PathBuf {
-        let path = self.dir.path().join(name);
+        let path = self.root().join(name);
         fs::write(
             &path,
             format!("#!/usr/bin/env bash\nset -euo pipefail\n{body}\n"),
@@ -138,5 +138,22 @@ impl Fixture {
     }
     pub(crate) fn prompt_file(&self, name: &str) -> PathBuf {
         self.work_dir.join(name)
+    }
+
+    fn root(&self) -> &std::path::Path {
+        self.dir.as_ref().expect("fixture directory").path()
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(directory) = self.dir.take()
+        {
+            eprintln!(
+                "preserved failed proactive-wake fixture at {}",
+                directory.keep().display()
+            );
+        }
     }
 }

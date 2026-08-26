@@ -40,7 +40,7 @@
 //!     Domain: provider subprocess supervision and bounded byte capture
 //!     Owns:
 //!       - ByteLimit, CapturedBytes, and accumulator truncation semantics
-//!       - CancellationToken and ProcessLimits lifecycle inputs
+//!       - ProcessLimits lifecycle inputs using the shared core CancellationToken
 //!       - ProcessCommand, ProcessOutcome, and ProcessRunner public surfaces
 //!       - total-runtime and stdout-line-gap timeout behavior
 //!       - cross-platform process group termination and executable checks
@@ -48,12 +48,12 @@
 
 use crate::error::{HostErrorKind, ProviderClientError, ProviderDiagnostics};
 use crate::generated::ProcessStatus;
+pub use oulipoly_core::CancellationToken;
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -270,41 +270,6 @@ fn capture_window(limit: ByteLimit, current_len: usize, incoming_len: usize) -> 
 }
 
 #[derive(Debug, Clone)]
-pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
-}
-
-impl CancellationToken {
-    pub fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
-    }
-
-    pub fn cancel_after(&self, duration: Duration) {
-        let token = self.clone();
-        thread::spawn(move || {
-            thread::sleep(duration);
-            token.cancel();
-        });
-    }
-}
-
-impl Default for CancellationToken {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct ProcessLimits {
     pub timeout: Duration,
     pub kill_after_grace: Duration,
@@ -316,18 +281,18 @@ pub struct ProcessLimits {
 
 #[derive(Clone)]
 pub struct ProcessSpawnObserver {
-    callback: Arc<dyn Fn(u32) + Send + Sync>,
+    callback: Arc<dyn Fn(u32) -> Result<(), String> + Send + Sync>,
 }
 
 impl ProcessSpawnObserver {
-    pub fn new(callback: impl Fn(u32) + Send + Sync + 'static) -> Self {
+    pub fn new(callback: impl Fn(u32) -> Result<(), String> + Send + Sync + 'static) -> Self {
         Self {
             callback: Arc::new(callback),
         }
     }
 
-    fn observe(&self, child_id: u32) {
-        (self.callback)(child_id);
+    fn observe(&self, child_id: u32) -> Result<(), String> {
+        (self.callback)(child_id)
     }
 }
 
@@ -531,7 +496,14 @@ impl ProcessRunner {
     {
         let argv = command.argv();
         let mut child = spawn_provider_process(&command, envs)?;
-        notify_spawn_observer(&self.limits.spawn_observer, child.id());
+        if let Err(error) = notify_spawn_observer(&self.limits.spawn_observer, child.id()) {
+            return Err(terminate_after_spawn_observer_failure(
+                child,
+                &command,
+                self.limits.kill_after_grace,
+                error,
+            ));
+        }
         let (stdout_line_activity, stdout_line_rx) = stdout_line_activity_channel(timeout_mode);
         let threads = start_process_threads(
             &mut child,
@@ -541,14 +513,36 @@ impl ProcessRunner {
             stdout_processor,
         );
 
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let mut last_stdout_line = started;
         let mut cancellation_started = None;
         loop {
             record_stdout_line_activity(&stdout_line_rx, &mut last_stdout_line);
 
-            if let Some(status) = poll_child_status(&mut child, &command)? {
-                kill_tree(&mut child);
+            if self.limits.spawn_observer.is_some()
+                && child_custody_test_fault("external_status_poll").is_err()
+            {
+                return Err(self.terminate_and_collect(
+                    child,
+                    command,
+                    threads,
+                    HostErrorKind::WaitFailed,
+                    false,
+                ));
+            }
+            let status = match poll_child_status(&mut child, &command) {
+                Ok(status) => status,
+                Err(_) => {
+                    return Err(self.terminate_and_collect(
+                        child,
+                        command,
+                        threads,
+                        HostErrorKind::WaitFailed,
+                        false,
+                    ));
+                }
+            };
+            if let Some(status) = status {
                 return Ok(map_completed_process_outcome(
                     status,
                     threads,
@@ -682,6 +676,40 @@ fn start_process_threads<P: StdoutProcessor>(
     }
 }
 
+#[cfg(unix)]
+fn poll_child_status(
+    child: &mut Child,
+    command: &ProcessCommand,
+) -> Result<Option<ExitStatus>, ProviderClientError> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(host_process_error(
+            HostErrorKind::WaitFailed,
+            command,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    // WNOWAIT keeps the exact leader unreaped while its owned descendants are cleaned.
+    kill_tree(child);
+    child
+        .wait()
+        .map(Some)
+        .map_err(|error| host_process_error(HostErrorKind::WaitFailed, command, error))
+}
+
+#[cfg(not(unix))]
 fn poll_child_status(
     child: &mut Child,
     command: &ProcessCommand,
@@ -760,6 +788,50 @@ fn cancellation_grace_expired(cancelled_at: &Instant, kill_after_grace: Duration
     cancelled_at.elapsed() >= cancellation_grace(kill_after_grace)
 }
 
+#[cfg(unix)]
+fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) -> TerminatedProcess {
+    let mut force_killed = false;
+    let grace_started = Instant::now();
+    let status = loop {
+        match child_exited_without_reaping(child) {
+            Ok(true) => {
+                // Keep the leader waitable until its exact process group is clean.
+                kill_tree(child);
+                break child.wait().ok();
+            }
+            Ok(false) if should_force_kill(&grace_started, kill_after_grace) => {
+                force_killed = true;
+                kill_tree(child);
+                break child.wait().ok();
+            }
+            Ok(false) => thread::sleep(Duration::from_millis(5)),
+            Err(_) => break None,
+        }
+    };
+    TerminatedProcess {
+        status,
+        force_killed,
+    }
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
+#[cfg(not(unix))]
 fn wait_for_terminated_process(child: &mut Child, kill_after_grace: Duration) -> TerminatedProcess {
     let mut force_killed = false;
     let grace_started = Instant::now();
@@ -837,10 +909,68 @@ fn termination_diagnostics_from_parts(
     diagnostics
 }
 
-fn notify_spawn_observer(observer: &Option<ProcessSpawnObserver>, child_id: u32) {
+fn notify_spawn_observer(
+    observer: &Option<ProcessSpawnObserver>,
+    child_id: u32,
+) -> Result<(), String> {
     if let Some(observer) = observer {
-        observer.observe(child_id);
+        observer.observe(child_id)?;
     }
+    Ok(())
+}
+
+fn child_custody_test_fault(site: &str) -> Result<(), String> {
+    if std::env::var("OULIPOLY_CHILD_CUSTODY_TEST_FAULT")
+        .ok()
+        .as_deref()
+        == Some(site)
+    {
+        wait_for_child_custody_test_ready()?;
+        return Err(format!("injected child custody failure at {site}"));
+    }
+    Ok(())
+}
+
+fn wait_for_child_custody_test_ready() -> Result<(), String> {
+    let Some(path) = std::env::var_os("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if path.is_file() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Err(format!(
+        "timed out waiting for child custody test readiness at {}",
+        path.display()
+    ))
+}
+
+fn terminate_after_spawn_observer_failure(
+    mut child: Child,
+    command: &ProcessCommand,
+    kill_after_grace: Duration,
+    error: String,
+) -> ProviderClientError {
+    terminate_tree(&mut child);
+    let terminated = wait_for_terminated_process(&mut child, kill_after_grace);
+    let mut diagnostics = ProviderDiagnostics::with_description(error);
+    diagnostics.process_was_force_killed = terminated.force_killed;
+    diagnostics.process_was_reaped = terminated.status.is_some();
+    if let Some(status) = terminated.status {
+        let status = process_status(status);
+        diagnostics.provider_exit_code = exit_code(&status);
+        diagnostics.provider_process_nonzero = process_nonzero(&status);
+    }
+    ProviderClientError::host_transport(
+        HostErrorKind::Other("spawn_observer_failed".to_string()),
+        subcommand_for_error(command),
+        None,
+        diagnostics,
+    )
 }
 
 fn drain_reader(
@@ -1072,11 +1202,13 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ByteAccumulator, ByteLimit, CancellationToken, ProcessCommand, ProcessLimits, ProcessRunner,
+        ByteAccumulator, ByteLimit, CancellationToken, ProcessCommand, ProcessLimits,
+        ProcessRunner, ProcessSpawnObserver,
     };
     use crate::testkit::{FakeProvider, FakeProviderMode, LeakProbe};
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[test]
@@ -1120,6 +1252,54 @@ mod tests {
         assert!(outcome.stderr.truncated);
         assert_eq!(outcome.stdout.captured_len, 64 * 1024);
         assert_eq!(outcome.stderr.captured_len, 64 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_observer_failure_synchronously_terminates_and_reaps_exact_child() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let observed_pid = Arc::new(Mutex::new(None));
+        let pid_slot = Arc::clone(&observed_pid);
+        let limits = ProcessLimits {
+            timeout: Duration::from_secs(30),
+            kill_after_grace: Duration::from_millis(25),
+            spawn_observer: Some(ProcessSpawnObserver::new(move |pid| {
+                *pid_slot.lock().unwrap() = Some(pid);
+                Err("injected generation binding failure".to_string())
+            })),
+            ..ProcessLimits::default()
+        };
+
+        let error = ProcessRunner::new(limits)
+            .run(
+                ProcessCommand::new(fake.path()).arg("launch"),
+                serde_json::to_vec(&describe_request()).expect("request should serialize"),
+                FakeProviderMode::Sleep.env(),
+            )
+            .expect_err("observer failure must abort provider launch");
+
+        assert_eq!(error.transport_kind(), "spawn_observer_failed");
+        assert!(error.diagnostics().process_was_reaped);
+        let pid = observed_pid.lock().unwrap().expect("spawned child pid") as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "child remained live or zombie"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "exact child was not reaped"
+        );
     }
 
     #[test]
@@ -1229,6 +1409,34 @@ mod tests {
         assert_eq!(error.transport_kind(), "host_cancelled");
         assert!(error.diagnostics().process_was_force_killed);
         assert!(error.diagnostics().process_was_reaped);
+        leak_probe.assert_no_descendants();
+    }
+
+    #[test]
+    fn leader_exit_during_grace_does_not_leave_resistant_pipe_holder() {
+        let fake = FakeProvider::compile(fake_provider_source());
+        let token = CancellationToken::new();
+        let leak_probe = LeakProbe::new();
+        let limits = ProcessLimits {
+            timeout: Duration::from_secs(30),
+            kill_after_grace: Duration::from_millis(100),
+            cancellation: Some(token.clone()),
+            ..ProcessLimits::default()
+        };
+        token.cancel_after(Duration::from_millis(100));
+
+        let started = std::time::Instant::now();
+        let error = ProcessRunner::new(limits)
+            .run(
+                ProcessCommand::new(fake.path()).arg("describe"),
+                serde_json::to_vec(&describe_request()).expect("request should serialize"),
+                FakeProviderMode::SigtermExitingLeaderResistantDescendant
+                    .env_with_probe(&leak_probe),
+            )
+            .expect_err("cancelled mixed process tree should terminate");
+        assert_eq!(error.transport_kind(), "host_cancelled");
+        assert!(error.diagnostics().process_was_reaped);
+        assert!(started.elapsed() < Duration::from_secs(2));
         leak_probe.assert_no_descendants();
     }
 

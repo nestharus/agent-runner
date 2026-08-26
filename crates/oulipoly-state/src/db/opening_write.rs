@@ -275,13 +275,65 @@ impl StateDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, ReadOnlyOpenError> {
-        Self::validate_read_only_paths(path)?;
-        let (conn, snapshot) = Self::open_read_only_connection(path)?;
-        Self::probe_read_only_schema(path, &conn)?;
+        Self::open_read_only_with_cancel(path, &|| false)
+    }
+
+    pub fn open_read_only_with_cancel(
+        path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        let source = Self::validate_read_only_paths(path)?;
+        let (conn, snapshot) = Self::open_read_only_connection(&source, is_cancelled)?;
+        Self::open_from_read_only_parts(source, conn, snapshot)
+    }
+
+    pub fn open_read_only_with_retry_timeout(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        Self::open_read_only_with_retry_timeout_and_cancel(path, retry_timeout, &|| false)
+    }
+
+    pub fn open_read_only_with_retry_timeout_and_cancel(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        let source = Self::validate_read_only_paths(path)?;
+        let (conn, snapshot) = Self::open_read_only_connection_with_retry_timeout(
+            &source,
+            retry_timeout,
+            is_cancelled,
+        )?;
+        Self::open_from_read_only_parts(source, conn, snapshot)
+    }
+
+    pub fn open_read_only_with_retry_and_work_timeout_and_cancel(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+        work_timeout: std::time::Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        let source = Self::validate_read_only_paths(path)?;
+        let (conn, snapshot) = Self::open_read_only_connection_with_retry_and_work_timeout(
+            &source,
+            retry_timeout,
+            work_timeout,
+            is_cancelled,
+        )?;
+        Self::open_from_read_only_parts(source, conn, snapshot)
+    }
+
+    fn open_from_read_only_parts(
+        source: PathBuf,
+        conn: sqlite::Connection,
+        snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
+    ) -> Result<Self, ReadOnlyOpenError> {
+        Self::probe_read_only_schema(&source, &conn)?;
 
         Ok(Self {
             conn,
-            db_path: path.to_path_buf(),
+            db_path: source,
             completion_authority_state: None,
             lifecycle_sink: Mutex::new(Box::new(NoopLifecycleEventSink)),
             _read_only_snapshot: Some(snapshot),
@@ -389,10 +441,12 @@ impl StateDb {
         let authority = self.completion_authority_state.as_ref()?;
         let canonical = std::fs::canonicalize(&authority.source_path).ok()?;
         let metadata = std::fs::metadata(&canonical).ok()?;
+        let identity =
+            crate::filesystem_identity::path_file_identity(&canonical, &metadata).ok()?;
         if canonical != authority.path
             || !metadata.is_file()
-            || !state_file_has_one_link(&metadata)
-            || state_file_identity(&metadata)? != authority.file
+            || identity.links != 1
+            || state_identity(identity) != authority.file
         {
             return None;
         }
@@ -435,13 +489,15 @@ impl StateDb {
             return None;
         }
         let metadata = std::fs::metadata(&canonical).ok()?;
-        if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+        let identity =
+            crate::filesystem_identity::path_file_identity(&canonical, &metadata).ok()?;
+        if !metadata.is_file() || identity.links != 1 {
             return None;
         }
         Some(CompletionAuthorityStateIdentity {
             source_path,
             path: canonical,
-            file: state_file_identity(&metadata)?,
+            file: state_identity(identity),
         })
     }
 
@@ -548,18 +604,43 @@ fn inspect_state_storage_file(
             ));
         }
     };
-    if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+    let identity = match crate::filesystem_identity::path_file_identity(path, &metadata) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect State DB {role} file identity {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    classify_state_storage_metadata(path, role, &metadata, identity)
+}
+
+fn classify_state_storage_metadata(
+    path: &Path,
+    role: &str,
+    metadata: &std::fs::Metadata,
+    identity: crate::filesystem_identity::OpenFileIdentity,
+) -> Result<Option<StateFileIdentity>, String> {
+    if !metadata.is_file() {
         return Err(format!(
             "State DB {role} requires a regular file with exactly one hard link: {}",
             path.display(),
         ));
     }
-    state_file_identity(&metadata).map(Some).ok_or_else(|| {
-        format!(
-            "State DB {role} file identity is unavailable: {}",
-            path.display()
-        )
-    })
+    // SQLite may unlink a WAL, journal, or shared-memory file between path
+    // lookup and metadata inspection. The zero-link inode is already absent.
+    if identity.links == 0 {
+        return Ok(None);
+    }
+    if identity.links != 1 {
+        return Err(format!(
+            "State DB {role} requires a regular file with exactly one hard link: {}",
+            path.display(),
+        ));
+    }
+    Ok(Some(state_identity(identity)))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -600,48 +681,11 @@ impl StateDb {
     }
 }
 
-#[cfg(unix)]
-fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    metadata.nlink() == 1
-}
-
-#[cfg(unix)]
-fn state_file_identity(metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    Some(StateFileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn state_file_has_one_link(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.number_of_links() == Some(1)
-}
-
-#[cfg(windows)]
-fn state_file_identity(metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-
-    Some(StateFileIdentity {
-        volume: u64::from(metadata.volume_serial_number()?),
-        file: metadata.file_index()?,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn state_file_has_one_link(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(not(any(unix, windows)))]
-fn state_file_identity(_metadata: &std::fs::Metadata) -> Option<StateFileIdentity> {
-    None
+fn state_identity(identity: crate::filesystem_identity::OpenFileIdentity) -> StateFileIdentity {
+    StateFileIdentity {
+        volume: identity.storage,
+        file: identity.file,
+    }
 }
 
 impl StateNamespaceGuard {
@@ -734,18 +778,19 @@ fn opened_state_storage_file_identity(
             path.display()
         )
     })?;
-    if !metadata.is_file() || !state_file_has_one_link(&metadata) {
+    let identity = crate::filesystem_identity::open_file_identity(file).map_err(|error| {
+        format!(
+            "Failed to inspect opened State DB {role} identity {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() || identity.links != 1 {
         return Err(format!(
             "State DB {role} requires a regular file with exactly one hard link: {}",
             path.display()
         ));
     }
-    state_file_identity(&metadata).ok_or_else(|| {
-        format!(
-            "State DB {role} file identity is unavailable: {}",
-            path.display()
-        )
-    })
+    Ok(state_identity(identity))
 }
 
 impl Drop for StateNamespaceGuard {
@@ -808,6 +853,71 @@ impl StateDbRebuildAuthority {
 #[cfg(test)]
 mod state_namespace_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinked_sqlite_artifact_is_absent_not_a_hard_link_violation() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_path = directory.path().join("state.db-shm");
+        let artifact = std::fs::File::create(&artifact_path).unwrap();
+        std::fs::remove_file(&artifact_path).unwrap();
+        let metadata = artifact.metadata().unwrap();
+        let identity = crate::filesystem_identity::open_file_identity(&artifact).unwrap();
+
+        assert_eq!(identity.links, 0);
+        assert!(
+            classify_state_storage_metadata(
+                &artifact_path,
+                "SQLite artifact",
+                &metadata,
+                identity,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_current_schema_opens_do_not_request_state_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.db");
+        let state = StateDb::open(&state_path).unwrap();
+        state
+            .conn
+            .execute(
+                "INSERT INTO session_chains
+                    (chain_id, created_at, last_used_at, model_name)
+                 VALUES ('current-open', '2026-08-18T00:00:00Z', '2026-08-18T00:00:00Z', 'test')",
+                [],
+            )
+            .unwrap();
+        drop(state);
+
+        let blocker = sqlite::Connection::open(&state_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let openers = (0..8)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let state_path = state_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    StateDb::open(&state_path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let opened = openers
+            .into_iter()
+            .map(|opener| opener.join().unwrap())
+            .collect::<Vec<_>>();
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        for result in opened {
+            drop(result.expect("current-schema open must not acquire the SQLite writer"));
+        }
+    }
 
     #[test]
     fn writable_state_holds_shared_namespace_authority_for_its_lifetime() {

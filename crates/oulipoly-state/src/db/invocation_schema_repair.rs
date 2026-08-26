@@ -66,6 +66,7 @@ impl StateDb {
     pub(super) fn initialize_invocations_schema(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_schema_sql())
             .map_err(Self::format_initialize_invocations_schema_error)?;
+        Self::ensure_invocation_indexes(conn)?;
         Self::ensure_completion_registration_authority_trigger(conn)?;
         Self::ensure_invocations_row_version_support(conn)
     }
@@ -116,6 +117,7 @@ impl StateDb {
 
     fn ensure_invocation_indexes(conn: &sqlite::Connection) -> Result<(), String> {
         conn.execute_batch(Self::invocations_index_sql())
+            .and_then(|_| conn.execute_batch(crate::db::invocation_running_projection_index_sql()))
             .map_err(Self::format_invocation_indexes_error)
     }
 

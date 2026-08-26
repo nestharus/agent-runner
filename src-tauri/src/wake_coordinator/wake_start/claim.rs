@@ -11,8 +11,13 @@ pub(super) fn acquire_wake_claim(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
     claim_token: &str,
+    auto_wake_max: i64,
 ) -> Result<WakeClaimAcquireResult, String> {
-    db.try_acquire_or_renew_wake_claim(wake_claim_request(input, claim_token), input.renew_token)
+    db.wake_sessions().try_acquire_startable_wake_claim(
+        wake_claim_request(input, claim_token),
+        input.renew_token,
+        auto_wake_max,
+    )
 }
 
 fn wake_claim_request<'a>(input: StartWakeInput<'a>, claim_token: &'a str) -> WakeClaimRequest<'a> {

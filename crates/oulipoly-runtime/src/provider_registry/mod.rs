@@ -10,11 +10,12 @@ mod options;
 use artifact_key::{ArtifactKey, artifact_key};
 use cache::DescribeCache;
 pub(crate) use describe::DescribeHostOptions;
-use describe::describe_provider;
+use describe::{describe_provider, describe_provider_with_cancellation};
 use oulipoly_config::{
     ModelConfig, ProviderConfig, ProvidersConfig, derive_provider_name,
     provider_implementation_ref::ProviderImplementationRef,
 };
+use oulipoly_provider::client::CancellationToken;
 use oulipoly_provider::generated::DescribeResult;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -198,6 +199,20 @@ impl ProviderRegistry {
         self.describe_uncached_model_artifact(model_name, &key)
     }
 
+    pub(crate) fn describe_model_provider_instance_with_cancellation(
+        &self,
+        model_name: &str,
+        provider_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<DescribeResult, ProviderRegistryError> {
+        let key = self.lookup_model_provider_artifact_key(model_name, provider_name)?;
+        if let Some(result) = self.cached_describe(&key) {
+            return Ok(result);
+        }
+
+        self.describe_uncached_model_artifact_with_cancellation(model_name, &key, cancellation)
+    }
+
     fn lookup_artifact_key(&self, model_name: &str) -> Result<ArtifactKey, ProviderRegistryError> {
         self.model_artifacts
             .get(model_name)
@@ -268,9 +283,35 @@ impl ProviderRegistry {
         model_name: &str,
         key: &ArtifactKey,
     ) -> Result<DescribeResult, ProviderRegistryError> {
+        self.describe_uncached_model_artifact_inner(model_name, key, None)
+    }
+
+    fn describe_uncached_model_artifact_with_cancellation(
+        &self,
+        model_name: &str,
+        key: &ArtifactKey,
+        cancellation: &CancellationToken,
+    ) -> Result<DescribeResult, ProviderRegistryError> {
+        self.describe_uncached_model_artifact_inner(model_name, key, Some(cancellation))
+    }
+
+    fn describe_uncached_model_artifact_inner(
+        &self,
+        model_name: &str,
+        key: &ArtifactKey,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<DescribeResult, ProviderRegistryError> {
         match self.lookup_artifact(model_name, key)? {
             RuntimeProviderArtifact::Enabled(artifact) => {
-                let result = describe_provider(&self.client_factory, artifact, &self.host_options)?;
+                let result = match cancellation {
+                    Some(cancellation) => describe_provider_with_cancellation(
+                        &self.client_factory,
+                        artifact,
+                        &self.host_options,
+                        cancellation,
+                    ),
+                    None => describe_provider(&self.client_factory, artifact, &self.host_options),
+                }?;
                 self.store_describe(key, result.clone());
                 Ok(result)
             }

@@ -58,6 +58,12 @@ fn main() -> ExitCode {
 fn process_entrypoint() -> ExitCode {
     initialize_tracing();
 
+    if wake_coordinator::is_wake_reclaim_handoff_invocation() {
+        return cli_exit_to_code(&cli_exit(
+            wake_coordinator::run_wake_reclaim_handoff_invocation().map(|()| 0),
+        ));
+    }
+
     if should_run_gui() {
         return run_gui_entrypoint();
     }

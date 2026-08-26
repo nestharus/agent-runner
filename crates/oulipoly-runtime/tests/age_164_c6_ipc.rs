@@ -42,7 +42,10 @@
 
 use oulipoly_agent_messenger::{ReturnedArtifactRef, ReturnedArtifactSource, StoreAddress};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
-use oulipoly_runtime::executor::cli::execute;
+use oulipoly_runtime::executor::{
+    ExecutionResult,
+    cli::{execute, execute_with_mailbox_db_path},
+};
 use oulipoly_state::CompositeInvocationId;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -108,6 +111,22 @@ fn parent_env(invocation_uuid: Uuid) -> String {
     format!(r#"{{"source":"age-164-c6","id":"{invocation_uuid}"}}"#)
 }
 
+fn execute_isolated(
+    model: &ModelConfig,
+    parent: &str,
+    dir: &Path,
+) -> Result<ExecutionResult, String> {
+    execute_with_mailbox_db_path(
+        model,
+        0,
+        "prompt",
+        None,
+        &HashMap::new(),
+        Some(parent),
+        &dir.join("pid-identity.db"),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Env var name: OULIPOLY_PARENT_INVOCATION — exact name, exact payload.
 // ---------------------------------------------------------------------------
@@ -129,10 +148,10 @@ fn parent_invocation_env_var_name_is_exact() {
         provider: None,
     };
 
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.exit_code, 0);
+    assert!(dir.path().join("pid-identity.db").is_file());
     assert_eq!(std::fs::read_to_string(&observed).unwrap(), parent);
 }
 
@@ -158,8 +177,7 @@ fn return_channel_env_var_name_is_bound_when_parent_env_set() {
         provider: None,
     };
 
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.exit_code, 0);
     let observed_value = std::fs::read_to_string(&observed).unwrap();
@@ -214,8 +232,7 @@ fn return_channel_jsonl_one_object_per_line_is_accepted() {
         inputs: Vec::new(),
         provider: None,
     };
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.returned_artifacts.len(), 2);
@@ -260,8 +277,7 @@ fn return_channel_jsonl_malformed_line_is_dropped_but_others_kept() {
         inputs: Vec::new(),
         provider: None,
     };
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.returned_artifacts.len(), 1);
@@ -299,8 +315,7 @@ fn return_channel_blank_line_is_skipped_without_artifact() {
         inputs: Vec::new(),
         provider: None,
     };
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.returned_artifacts.len(), 1);
     assert_eq!(result.returned_artifacts[0].name, "blob");
@@ -339,8 +354,7 @@ fn return_channel_sidecar_file_is_deleted_after_read() {
         inputs: Vec::new(),
         provider: None,
     };
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.exit_code, 0);
     let channel_path =
@@ -379,8 +393,7 @@ fn return_channel_cleanup_tolerates_non_empty_dir() {
         inputs: Vec::new(),
         provider: None,
     };
-    let result =
-        execute(&model, 0, "prompt", None, &HashMap::new(), Some(&parent)).expect("execute");
+    let result = execute_isolated(&model, &parent, dir.path()).expect("execute");
 
     assert_eq!(result.exit_code, 0);
     assert!(result.returned_artifacts.is_empty());

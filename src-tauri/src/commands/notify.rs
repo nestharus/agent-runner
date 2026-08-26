@@ -225,8 +225,8 @@ fn register_completion_event(
     let paths = notify_path_strings(args.state_dir, args.meta, args.log, args.rc)?;
     let metadata = read_metadata(args.meta)?;
     let owner = parse_owner_binding(&metadata)?;
-    validate_owner_binding(&owner, &metadata)?;
     let mut state = StateDb::open_default()?;
+    reconcile_owner_binding(&state, &owner, &metadata)?;
     let admission_id = completion_obligation_admission_id(args.handle, &owner.invocation_uuid);
     let registration = CompletionEventRegistrationInput {
         event_id: args.handle,
@@ -335,9 +335,41 @@ fn wake_after_unsubmitted_delivery(
     session_id: &str,
     delivery: &PtyMailboxDeliveryDiagnostic,
 ) -> Option<WakeDiagnostic> {
-    (!delivery.submitted && delivery.status != "paused")
-        .then(|| crate::wake_coordinator::trigger_notify_wake(session_id))
+    let wake = (!delivery.submitted && delivery.status != "paused")
+        .then(|| crate::wake_coordinator::trigger_notify_wake(session_id));
+    trace_completion_wake(session_id, wake.as_ref());
+    wake
 }
+
+#[cfg(unix)]
+fn trace_completion_wake(session_id: &str, wake: Option<&WakeDiagnostic>) {
+    use oulipoly_runtime::executor::cli::pty_broker::{append_notify_trace_record, trace_token};
+
+    let Some(wake) = wake else {
+        return;
+    };
+    append_notify_trace_record(&format!(
+        "trigger=completion-wake session_id={} attempted={} status={} claim_token={} wake_pid={} auto_wake_count={} message={}",
+        trace_token(session_id),
+        wake.attempted,
+        trace_token(&wake.status),
+        wake.claim_token
+            .as_deref()
+            .map(trace_token)
+            .unwrap_or_else(|| "none".to_string()),
+        wake.wake_pid
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        wake.auto_wake_count
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        wake.message
+            .as_deref()
+            .map(trace_token)
+            .unwrap_or_else(|| "none".to_string()),
+    ));
+}
+
+#[cfg(not(unix))]
+fn trace_completion_wake(_session_id: &str, _wake: Option<&WakeDiagnostic>) {}
 
 fn deliver_event_listeners(
     mailbox: &mut MailboxDb,
@@ -388,12 +420,12 @@ fn optional_nonempty_string(metadata: &Value, field: &str) -> Result<Option<Stri
         .ok_or_else(|| format!("meta.json {field} must be a non-empty string"))
 }
 
-fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), String> {
-    let path = StateDb::default_path()?;
-    if !path.exists() {
-        return Err("State DB is unavailable for completion listener validation".to_string());
-    }
-    let record = completion_owner_invocation(&path, owner)?;
+fn reconcile_owner_binding(
+    state: &StateDb,
+    owner: &OwnerBinding,
+    metadata: &Value,
+) -> Result<(), String> {
+    let record = completion_owner_invocation(state, owner)?;
     match resolved_invocation_session_id(&record) {
         Some(session_id) if session_id == owner.session_id => return Ok(()),
         Some(_) => return Err(owner_binding_error(owner)),
@@ -404,7 +436,7 @@ fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), 
             &owner.invocation_uuid,
             &owner.session_id,
         )? {
-            let rebound = completion_owner_invocation(&path, owner)?;
+            let rebound = completion_owner_invocation(state, owner)?;
             if resolved_invocation_session_id(&rebound).as_deref()
                 == Some(owner.session_id.as_str())
             {
@@ -413,7 +445,7 @@ fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), 
             return Err(owner_binding_error(owner));
         }
         if running_owner_binding_is_live(owner, metadata)? {
-            bind_verified_live_owner_session(&record, owner)?;
+            bind_verified_live_owner_session(state, &record, owner)?;
             return Ok(());
         }
     }
@@ -421,10 +453,10 @@ fn validate_owner_binding(owner: &OwnerBinding, metadata: &Value) -> Result<(), 
 }
 
 fn bind_verified_live_owner_session(
+    state: &StateDb,
     record: &InvocationRecord,
     owner: &OwnerBinding,
 ) -> Result<(), String> {
-    let state = StateDb::open_default()?;
     state.bind_invocation_provider_session_start(
         record.id,
         &oulipoly_state::ProviderSessionBinding {
@@ -437,11 +469,9 @@ fn bind_verified_live_owner_session(
 }
 
 fn completion_owner_invocation(
-    path: &Path,
+    state: &StateDb,
     owner: &OwnerBinding,
 ) -> Result<InvocationRecord, String> {
-    let state = StateDb::open_read_only(path)
-        .map_err(|err| format!("Failed to open state DB read-only: {err:?}"))?;
     state
         .get_invocation_by_uuid(&owner.invocation_uuid)?
         .ok_or_else(|| {

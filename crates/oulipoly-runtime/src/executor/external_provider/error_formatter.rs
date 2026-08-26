@@ -17,6 +17,12 @@ pub(crate) fn format_external_dispatch_error(error: ExternalProviderDispatchErro
         ExternalProviderDispatchError::ProviderProtocol { category } => {
             format!("external provider protocol failed: {category}")
         }
+        ExternalProviderDispatchError::ProviderFailure {
+            operation,
+            code,
+            message,
+            diagnostics,
+        } => format_provider_failure(&operation, &code, &message, &diagnostics),
         ExternalProviderDispatchError::CancellationFallback { reason } => {
             let _ = reason;
             "external provider launch cancelled before final event".to_string()
@@ -24,6 +30,20 @@ pub(crate) fn format_external_dispatch_error(error: ExternalProviderDispatchErro
         ExternalProviderDispatchError::PolicyRejected { diagnostics } => {
             format_policy_rejection(&diagnostics)
         }
+    }
+}
+
+fn format_provider_failure(
+    operation: &str,
+    code: &str,
+    message: &str,
+    diagnostics: &[Diagnostic],
+) -> String {
+    let base = format!("external provider {operation} failed: {code}: {message}");
+    if diagnostics.is_empty() {
+        base
+    } else {
+        format!("{base}: diagnostics: {}", format_diagnostics(diagnostics))
     }
 }
 

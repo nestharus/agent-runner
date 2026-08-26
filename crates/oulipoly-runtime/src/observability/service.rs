@@ -23,6 +23,7 @@ use crate::observability::visibility::retain_live_subtrees;
 use crate::provider_registry::ProviderRegistry;
 use crate::session_provider::SessionProviderIdentity;
 use oulipoly_config::SessionStorage;
+use oulipoly_core::CancellationToken;
 use oulipoly_state::mailbox::MailboxRow;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -39,7 +40,16 @@ pub struct ObservabilityRoot {
 }
 
 pub trait ObservabilitySnapshotPort {
-    fn snapshot(&self, root: &ObservabilityRoot, limits: SnapshotLimits) -> MonitorSnapshot;
+    fn snapshot(&self, root: &ObservabilityRoot, limits: SnapshotLimits) -> MonitorSnapshot {
+        self.snapshot_with_cancel(root, limits, &CancellationToken::new())
+    }
+
+    fn snapshot_with_cancel(
+        &self,
+        root: &ObservabilityRoot,
+        limits: SnapshotLimits,
+        cancellation: &CancellationToken,
+    ) -> MonitorSnapshot;
 }
 
 pub struct ProductionObservabilitySnapshotService {
@@ -117,16 +127,44 @@ impl Default for ProductionObservabilitySnapshotService {
 }
 
 impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
-    fn snapshot(&self, root: &ObservabilityRoot, limits: SnapshotLimits) -> MonitorSnapshot {
+    fn snapshot_with_cancel(
+        &self,
+        root: &ObservabilityRoot,
+        limits: SnapshotLimits,
+        cancellation: &CancellationToken,
+    ) -> MonitorSnapshot {
+        self.snapshot_from_stores(
+            root,
+            limits,
+            SnapshotStores::open_default_read_only_with_cancel(&|| cancellation.is_cancelled()),
+            cancellation,
+        )
+    }
+}
+
+impl ProductionObservabilitySnapshotService {
+    fn snapshot_from_stores(
+        &self,
+        root: &ObservabilityRoot,
+        limits: SnapshotLimits,
+        stores: SnapshotStores,
+        cancellation: &CancellationToken,
+    ) -> MonitorSnapshot {
         let generated_at = SystemTime::now();
-        let stores = SnapshotStores::open_default_read_only();
+        if cancellation.is_cancelled() {
+            return cancelled_snapshot(generated_at);
+        }
         let invocation = project_invocations(
             stores.state.as_ref(),
             stores.pid.as_ref(),
             stores.mailbox.as_ref(),
             root,
             limits,
+            cancellation,
         );
+        if cancellation.is_cancelled() {
+            return cancelled_snapshot(generated_at);
+        }
         let active_session_id =
             active_snapshot_session_id(invocation.active_session_id.clone(), root);
         let mailbox = project_mailbox(
@@ -138,13 +176,20 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
             &invocation.invocation_uuids,
             limits,
         );
+        if cancellation.is_cancelled() {
+            return cancelled_snapshot(generated_at);
+        }
         let agent_bash = project_agent_bash(self.agent_bash_input(
             &stores,
             active_session_id.as_deref(),
             &invocation.invocation_uuids,
             &mailbox.rows,
             limits,
+            cancellation,
         ));
+        if cancellation.is_cancelled() {
+            return cancelled_snapshot(generated_at);
+        }
         let pending_mailbox_count = mailbox.pending_count;
         let running_agent_bash_count = agent_bash.running_count;
         let root_invocation_uuid = invocation.root_invocation_uuid.clone();
@@ -161,7 +206,11 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
             active_session_id.as_deref(),
             root_invocation_uuid.as_deref(),
             limits,
+            cancellation,
         );
+        if cancellation.is_cancelled() {
+            return cancelled_snapshot(generated_at);
+        }
         if !limits.include_terminal {
             retain_live_subtrees(&mut nodes);
         }
@@ -180,9 +229,7 @@ impl ObservabilitySnapshotPort for ProductionObservabilitySnapshotService {
             diagnostics,
         )
     }
-}
 
-impl ProductionObservabilitySnapshotService {
     /// Build the agent-bash projection input from the open stores and the active
     /// session's invocation/mailbox context.
     fn agent_bash_input<'a>(
@@ -192,6 +239,7 @@ impl ProductionObservabilitySnapshotService {
         invocation_uuids: &'a HashSet<String>,
         mailbox_rows: &'a [MailboxRow],
         limits: SnapshotLimits,
+        cancellation: &'a CancellationToken,
     ) -> AgentBashProjectInput<'a> {
         AgentBashProjectInput {
             root_dir: self.agent_bash_root.as_deref(),
@@ -202,6 +250,7 @@ impl ProductionObservabilitySnapshotService {
             invocation_uuids,
             mailbox_rows,
             limits,
+            cancellation,
         }
     }
 
@@ -215,11 +264,17 @@ impl ProductionObservabilitySnapshotService {
         active_session_id: Option<&str>,
         root_invocation_uuid: Option<&str>,
         limits: SnapshotLimits,
+        cancellation: &CancellationToken,
     ) {
-        let Some(transcript) =
-            self.transcript
-                .resolve(root.provider_name.as_deref(), active_session_id, limits)
-        else {
+        if cancellation.is_cancelled() {
+            return;
+        }
+        let Some(transcript) = self.transcript.resolve(
+            root.provider_name.as_deref(),
+            active_session_id,
+            limits,
+            cancellation,
+        ) else {
             return;
         };
         attach_transcript_inspect_ref(
@@ -238,12 +293,13 @@ impl TranscriptSource {
         provider_name: Option<&str>,
         session_id: Option<&str>,
         limits: SnapshotLimits,
+        cancellation: &CancellationToken,
     ) -> Option<ResolvedSessionTranscript> {
         match self {
             Self::Local(resolver) => resolver
                 .resolve(provider_name, session_id)
                 .map(ResolvedSessionTranscript::local),
-            Self::ProviderInspect(resolver) => resolver.resolve(limits),
+            Self::ProviderInspect(resolver) => resolver.resolve(limits, cancellation),
         }
     }
 }
@@ -361,6 +417,32 @@ fn monitor_snapshot(
         nodes,
         diagnostics,
     }
+}
+
+fn cancelled_snapshot(generated_at: SystemTime) -> MonitorSnapshot {
+    let nodes = Vec::new();
+    let diagnostics = vec![MonitorDiagnostic {
+        code: "snapshot:cancelled".to_string(),
+        severity: MonitorDiagnosticSeverity::Info,
+        message: "Observability snapshot cancelled before completion".to_string(),
+        node_id: None,
+    }];
+    monitor_snapshot(
+        generated_at,
+        None,
+        None,
+        MonitorSummary {
+            status: MonitorStatus::Cancelled,
+            total_nodes: 0,
+            invocation_nodes: 0,
+            running_nodes: 0,
+            pending_mailbox_count: 0,
+            running_agent_bash_count: 0,
+            diagnostics_count: diagnostics.len(),
+        },
+        nodes,
+        diagnostics,
+    )
 }
 
 fn summary(

@@ -6,7 +6,7 @@ use oulipoly_runtime::executor::cli::pty_broker::{
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
     MailboxDb, MailboxRow, RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState,
-    RuntimeTerminalReason, SessionRuntimeRunningUpdate,
+    RuntimeTerminalReason, SessionGenerationProjection,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -120,6 +120,17 @@ impl Fixture {
         let registration = self.run(command);
         assert!(registration.status.success(), "{registration:?}");
         self.run(self.notify_command(handle, &artifacts))
+    }
+
+    fn run_mailbox_status(&self, session_id: &str) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
+        command
+            .arg("mailbox")
+            .arg("status")
+            .arg("--session-id")
+            .arg(session_id)
+            .arg("--json");
+        self.run(command)
     }
 
     fn register_command(&self, handle: &str, artifacts: &NotifyArtifacts) -> Command {
@@ -249,6 +260,7 @@ impl Fixture {
         let mut mailbox = MailboxDb::open(&self.sidecar_path()).unwrap();
         let generation_id = RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap();
         mailbox
+            .runtime_lifecycle()
             .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id: &generation_id,
                 spawn_invocation_uuid: INVOCATION_A,
@@ -262,28 +274,15 @@ impl Fixture {
             })
             .unwrap();
         mailbox
+            .runtime_lifecycle()
             .bind_runtime_generation_running(BindRuntimeGenerationRunning {
                 fence: RuntimeGenerationFence {
                     generation_id: &generation_id,
                     spawn_invocation_uuid: INVOCATION_A,
                 },
                 spawned_os_pid: identity.os_pid,
-                exact_process_identity: Some(identity),
+                exact_process_identity: identity,
                 os_pgid: None,
-            })
-            .unwrap();
-        mailbox
-            .mark_session_running(SessionRuntimeRunningUpdate {
-                session_id: SESSION_A,
-                mode: "pty_interactive",
-                invocation_uuid: LIVE_INVOCATION,
-                provider_name: Some("fixture-provider"),
-                model_name: Some("fixture-model"),
-                identity,
-                pty_control_path: Some(&path_string(control_path)),
-                turn_start_max_mailbox_seq: None,
-                models_dir: None,
-                effective_cwd: None,
             })
             .unwrap();
     }
@@ -415,7 +414,8 @@ fn notify_control_ack_immediately_delivers_without_provider_observation() {
     fixture.record_owner_identity(&identity);
     let socket = fixture.socket_path("ack.sock");
     let captured = Arc::new(Mutex::new(String::new()));
-    let server = spawn_control_server(&socket, true, "$delivery_nonce", Arc::clone(&captured));
+    let server =
+        spawn_confirming_control_server(&socket, fixture.sidecar_path(), Arc::clone(&captured));
     fixture.mark_live_pty_runtime(&identity, &socket);
 
     let output = fixture.run_notify("h-live-ack", owner_metadata(SESSION_A, INVOCATION_A));
@@ -481,7 +481,78 @@ fn notify_control_ack_immediately_delivers_without_provider_observation() {
         listeners[0].acknowledgement_reason.as_deref(),
         Some("injected")
     );
+    assert!(
+        fixture
+            .mailbox()
+            .pending_delivery_evidence_obligations(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (1, 1)
+    );
     fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn exact_ack_state_evidence_insert_fault_stays_submitted_and_reconciles_once() {
+    let fixture = Fixture::new();
+    let identity = current_identity();
+    fixture.record_owner_identity(&identity);
+    let socket = fixture.socket_path("evidence-insert-fault.sock");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let server =
+        spawn_confirming_control_server(&socket, fixture.sidecar_path(), Arc::clone(&captured));
+    fixture.mark_live_pty_runtime(&identity, &socket);
+    let fault = fixture.conn();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_pty_evidence_insert
+             BEFORE INSERT ON session_delivery_evidence
+             BEGIN SELECT RAISE(FAIL, 'injected evidence failure'); END;",
+        )
+        .unwrap();
+
+    let output = fixture.run_notify(
+        "h-evidence-insert-fault",
+        owner_metadata(SESSION_A, INVOCATION_A),
+    );
+    server.join().unwrap();
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["pty_delivery"]["status"], "evidence_pending");
+    assert_eq!(value["pty_delivery"]["submitted"], true);
+    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([1]));
+    let payload = captured.lock().unwrap().clone();
+    let attempt_id = delivery_attempt_id(&payload);
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (0, 0)
+    );
+    assert_delivered_with_pending_evidence(&fixture, "h-evidence-insert-fault", &attempt_id);
+    fault
+        .execute_batch("DROP TRIGGER fail_pty_evidence_insert")
+        .unwrap();
+
+    let replay = fixture.run_notify(
+        "h-evidence-reconcile-trigger",
+        owner_metadata(SESSION_A, INVOCATION_A),
+    );
+    assert_success(&replay);
+    assert_eq!(
+        fixture
+            .mailbox()
+            .pending_delivery_evidence_obligations(SESSION_A)
+            .unwrap(),
+        Vec::new()
+    );
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (1, 1)
+    );
+    assert_eq!(payload.matches("[END OULIPOLY NOTIFICATIONS]").count(), 1);
 }
 
 #[test]
@@ -509,10 +580,69 @@ fn notify_live_pty_generic_ack_is_not_delivery_evidence() {
     assert_eq!(rows[0].delivery_attempts, 1);
     let generation = fixture
         .mailbox()
+        .runtime_lifecycle_reader()
         .runtime_generation(&RuntimeGenerationId::parse(LIVE_INVOCATION).unwrap())
         .unwrap()
         .unwrap();
     assert!(generation.active_delivery_claim_id.is_none());
+}
+
+#[test]
+fn unexpected_positive_ack_after_submission_start_remains_uncertain_without_wake() {
+    let fixture = Fixture::new();
+    let identity = current_identity();
+    fixture.record_owner_identity(&identity);
+    let socket = fixture.socket_path("started-generic-ack.sock");
+    let captured = Arc::new(Mutex::new(String::new()));
+    let server = spawn_submission_started_control_server(
+        &socket,
+        fixture.sidecar_path(),
+        "ok",
+        Arc::clone(&captured),
+    );
+    fixture.mark_live_pty_runtime(&identity, &socket);
+
+    let output = fixture.run_notify(
+        "h-started-generic-ack",
+        owner_metadata(SESSION_A, INVOCATION_A),
+    );
+    server.join().unwrap();
+
+    assert_success(&output);
+    let value = stdout_json(&output);
+    assert_eq!(value["pty_delivery"]["status"], "submission_uncertain");
+    assert_eq!(value["pty_delivery"]["submitted"], true);
+    assert_eq!(value["pty_delivery"]["delivered_seqs"], json!([]));
+    assert!(value["wake"].is_null());
+    let payload = captured.lock().unwrap().clone();
+    let attempt_id = delivery_attempt_id(&payload);
+    let mailbox = fixture.mailbox();
+    let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered_at.is_none());
+    assert_eq!(rows[0].delivery_attempts, 0);
+    let attempt = mailbox
+        .delivery_attempt_window(&attempt_id)
+        .unwrap()
+        .unwrap();
+    assert!(attempt.submission_started_at.is_some());
+    assert!(attempt.acknowledged_at.is_none());
+    assert!(attempt.resolved_at.is_none());
+    assert!({
+        drop(mailbox);
+        fixture
+            .mailbox()
+            .register_or_reuse_delivery_attempt(
+                "replacement-attempt",
+                SESSION_A,
+                "replacement-invocation",
+                "replacement-generation",
+                &[rows[0].seq],
+                0,
+            )
+            .unwrap_err()
+            .contains(&attempt_id)
+    });
 }
 
 #[test]
@@ -577,13 +707,14 @@ fn notify_stale_socket_cleans_runtime_and_does_not_report_busy() {
     assert_eq!(value["pty_delivery"]["status"], "stale_generation");
     assert_eq!(value["pty_delivery"]["submitted"], false);
     assert_eq!(value["wake"]["status"], "spawned");
-    let runtime = fixture
+    let projection = fixture
         .mailbox()
-        .session_runtime(SESSION_A)
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION_A)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.run_state, "idle");
-    assert!(runtime.pty_control_path.is_none());
+    assert_eq!(projection.run_state, "idle");
+    assert!(projection.pty_control_path.is_none());
     assert!(!stale_socket.exists());
     assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
     let rows = fixture.mailbox().list_pending(SESSION_A).unwrap();
@@ -653,15 +784,17 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
         &format!("[OULIPOLY-DELIVERY {}]", delivery_attempt_id(&received)),
     );
     assert!(repl.wait().unwrap().success());
-    let runtime = fixture
+    let projection = fixture
         .mailbox()
-        .session_runtime(SESSION_A)
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION_A)
         .unwrap()
         .unwrap();
-    assert_eq!(runtime.run_state, "idle");
-    assert!(runtime.pty_control_path.is_none());
+    assert_eq!(projection.run_state, "idle");
+    assert!(projection.pty_control_path.is_none());
     let history = fixture
         .mailbox()
+        .runtime_lifecycle_reader()
         .runtime_generation_history(SESSION_A)
         .unwrap();
     assert_eq!(history.len(), 1);
@@ -670,6 +803,658 @@ fn fixture_interactive_session_agent_bash_completion_arrives_live() {
         history[0].terminal_reason,
         Some(RuntimeTerminalReason::OrderlyCompletion)
     );
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn real_broker_ack_clear_fault_retains_obligation_without_duplicate_delivery() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("clear-fault-received.log");
+    let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-clear-fault", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "abababab-abab-4bab-8bab-abababababab",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-clear-fault",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-clear-fault", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let fault = Connection::open(fixture.sidecar_path()).unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_evidence_obligation_clear
+             BEFORE UPDATE OF evidence_reconciled_at ON mailbox_delivery_attempts
+             BEGIN SELECT RAISE(FAIL, 'injected obligation clear failure'); END;",
+        )
+        .unwrap();
+
+    let first = fixture.run_notify(
+        "h-clear-fault-first",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
+    assert_success(&first);
+    let first_value = stdout_json(&first);
+    assert_eq!(first_value["pty_delivery"]["status"], "evidence_pending");
+    assert_eq!(first_value["pty_delivery"]["submitted"], true);
+    let first_output = read_until(
+        pty.master.as_raw_fd(),
+        "GOT_NOTIFY_1",
+        Duration::from_secs(5),
+    );
+    if !first_output.contains("GOT_NOTIFY_1") {
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!("first notification did not reach provider: {first_output:?}");
+    }
+    let first_received = fs::read_to_string(&received_log).unwrap();
+    let first_attempt_id = delivery_attempt_id(&first_received);
+    assert_delivered_with_pending_evidence(&fixture, "h-clear-fault-first", &first_attempt_id);
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &first_attempt_id),
+        (1, 1)
+    );
+    fault
+        .execute_batch("DROP TRIGGER fail_evidence_obligation_clear")
+        .unwrap();
+
+    let recovery = fixture.run_notify(
+        "h-clear-fault-recovery",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
+    assert_success(&recovery);
+    assert_eq!(stdout_json(&recovery)["pty_delivery"]["status"], "acked");
+    let second_output = read_until(
+        pty.master.as_raw_fd(),
+        "GOT_NOTIFY_2",
+        Duration::from_secs(5),
+    );
+    if !second_output.contains("GOT_NOTIFY_2") {
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!("recovery notification did not reach provider: {second_output:?}");
+    }
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert_eq!(received.matches("handle: h-clear-fault-first").count(), 1);
+    assert_eq!(
+        received
+            .matches(&format!("[OULIPOLY-DELIVERY {first_attempt_id}]"))
+            .count(),
+        1
+    );
+    assert!(
+        fixture
+            .mailbox()
+            .pending_delivery_evidence_obligations(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &first_attempt_id),
+        (1, 1)
+    );
+    assert!(repl.wait().unwrap().success());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn production_plain_and_tui_confirmation_faults_remain_uncertain_after_provider_exit() {
+    for observed_tui in [false, true] {
+        let fixture = Fixture::new();
+        let received_log = fixture.dir.path().join(format!(
+            "{}-confirmation-exit-received.log",
+            if observed_tui { "tui" } else { "plain" }
+        ));
+        let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+        fixture.write_interactive_model("fixture-confirmation-exit", "fixture-provider", &script);
+        fixture.seed_active_chain(
+            "adadadad-adad-4dad-8dad-adadadadadad",
+            "fixture-provider",
+            SESSION_A,
+            "fixture-confirmation-exit",
+        );
+        let pty = OuterPty::open(30, 100);
+        let mut repl = spawn_repl_under_pty_mode(
+            &fixture,
+            &pty,
+            "fixture-confirmation-exit",
+            SESSION_A,
+            observed_tui,
+        );
+        let startup = read_until(
+            pty.master.as_raw_fd(),
+            "READY_FOR_NOTIFY",
+            Duration::from_secs(5),
+        );
+        assert!(
+            startup.contains("READY_FOR_NOTIFY"),
+            "startup was {startup:?}"
+        );
+        let invocation_uuid = wait_for_running_invocation(&fixture);
+        let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+        let fault = Connection::open(fixture.sidecar_path()).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_production_confirmation
+                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected confirmation failure'); END;",
+            )
+            .unwrap();
+
+        let notify = fixture.run_notify(
+            "h-confirmation-exit",
+            owner_metadata(SESSION_A, &invocation_uuid),
+        );
+        assert_success(&notify);
+        let diagnostic = stdout_json(&notify);
+        assert_eq!(diagnostic["pty_delivery"]["status"], "submission_uncertain");
+        assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
+        let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+        assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+        assert!(repl.wait().unwrap().success());
+        let received = fs::read_to_string(&received_log).unwrap();
+        let attempt_id = delivery_attempt_id(&received);
+        let mailbox = fixture.mailbox();
+        let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].delivered_at.is_none());
+        let attempt = mailbox
+            .delivery_attempt_window(&attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(attempt.submission_started_at.is_some());
+        assert!(attempt.acknowledged_at.is_none());
+        assert!(attempt.resolved_at.is_none());
+        assert_eq!(received.matches("handle: h-confirmation-exit").count(), 1);
+        assert_eq!(
+            state_delivery_evidence_counts(&fixture, &attempt_id),
+            (0, 0)
+        );
+    }
+}
+
+#[test]
+fn production_plain_and_tui_state_open_faults_reconcile_exact_evidence_once() {
+    for observed_tui in [false, true] {
+        let fixture = Fixture::new();
+        let mode = if observed_tui { "tui" } else { "plain" };
+        let received_log = fixture
+            .dir
+            .path()
+            .join(format!("{mode}-state-open-fault-received.log"));
+        let barrier = fixture.dir.path().join(format!("{mode}-after-confirm"));
+        let held_state_path = fixture.dir.path().join(format!("{mode}-held-state.db"));
+        let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+        fixture.write_interactive_model("fixture-state-open-fault", "fixture-provider", &script);
+        fixture.seed_active_chain(
+            "afafafaf-afaf-4faf-8faf-afafafafafaf",
+            "fixture-provider",
+            SESSION_A,
+            "fixture-state-open-fault",
+        );
+        let pty = OuterPty::open(30, 100);
+        let mut repl = spawn_repl_under_pty_mode_with_test_hooks(
+            &fixture,
+            &pty,
+            "fixture-state-open-fault",
+            SESSION_A,
+            observed_tui,
+            None,
+            Some(&barrier),
+        );
+        let startup = read_until(
+            pty.master.as_raw_fd(),
+            "READY_FOR_NOTIFY",
+            Duration::from_secs(5),
+        );
+        assert!(
+            startup.contains("READY_FOR_NOTIFY"),
+            "startup was {startup:?}"
+        );
+        let invocation_uuid = wait_for_running_invocation(&fixture);
+        let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+
+        let state_path = fixture.state_path();
+        let (output, attempt_id) = thread::scope(|scope| {
+            let notify = scope.spawn(|| {
+                fixture.run_notify(
+                    "h-production-state-open-fault",
+                    owner_metadata(SESSION_A, &invocation_uuid),
+                )
+            });
+            wait_for_file_contains(&barrier.join("ready"), "ready", Duration::from_secs(5));
+            fs::rename(&state_path, &held_state_path).unwrap();
+            fs::create_dir(&state_path).unwrap();
+            fs::write(barrier.join("release"), "release").unwrap();
+            let output = notify.join().unwrap();
+            let received = wait_for_file_contains(
+                &received_log,
+                "[OULIPOLY-DELIVERY ",
+                Duration::from_secs(5),
+            );
+            let attempt_id = delivery_attempt_id(&received);
+            assert_delivered_with_pending_evidence(
+                &fixture,
+                "h-production-state-open-fault",
+                &attempt_id,
+            );
+            fs::remove_dir(&state_path).unwrap();
+            fs::rename(&held_state_path, &state_path).unwrap();
+            (output, attempt_id)
+        });
+
+        assert_success(&output);
+        let diagnostic = stdout_json(&output);
+        assert_eq!(diagnostic["pty_delivery"]["status"], "evidence_pending");
+        assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
+        assert_eq!(diagnostic["pty_delivery"]["delivered_seqs"], json!([1]));
+        let provider_output =
+            read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+        assert!(
+            provider_output.contains("GOT_NOTIFY"),
+            "output was {provider_output:?}"
+        );
+        assert!(repl.wait().unwrap().success());
+        let received = fs::read_to_string(&received_log).unwrap();
+        assert!(
+            fixture
+                .mailbox()
+                .pending_delivery_evidence_obligations(SESSION_A)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state_delivery_evidence_counts(&fixture, &attempt_id),
+            (1, 1)
+        );
+        let replay = fixture.run_mailbox_status(SESSION_A);
+        assert_success(&replay);
+        assert_eq!(
+            state_delivery_evidence_counts(&fixture, &attempt_id),
+            (1, 1)
+        );
+        assert_eq!(
+            received
+                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn production_plain_and_tui_state_faults_reconcile_without_new_mailbox_rows() {
+    for observed_tui in [false, true] {
+        let fixture = Fixture::new();
+        let received_log = fixture.dir.path().join(format!(
+            "{}-state-fault-received.log",
+            if observed_tui { "tui" } else { "plain" }
+        ));
+        let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+        fixture.write_interactive_model("fixture-state-fault", "fixture-provider", &script);
+        fixture.seed_active_chain(
+            "aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae",
+            "fixture-provider",
+            SESSION_A,
+            "fixture-state-fault",
+        );
+        let pty = OuterPty::open(30, 100);
+        let mut repl = spawn_repl_under_pty_mode(
+            &fixture,
+            &pty,
+            "fixture-state-fault",
+            SESSION_A,
+            observed_tui,
+        );
+        let startup = read_until(
+            pty.master.as_raw_fd(),
+            "READY_FOR_NOTIFY",
+            Duration::from_secs(5),
+        );
+        assert!(
+            startup.contains("READY_FOR_NOTIFY"),
+            "startup was {startup:?}"
+        );
+        let invocation_uuid = wait_for_running_invocation(&fixture);
+        let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+        let fault = fixture.conn();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_production_pty_evidence
+                 BEFORE INSERT ON session_delivery_evidence
+                 BEGIN SELECT RAISE(FAIL, 'injected evidence failure'); END;",
+            )
+            .unwrap();
+
+        let notify = fixture.run_notify(
+            "h-production-state-fault",
+            owner_metadata(SESSION_A, &invocation_uuid),
+        );
+        assert_success(&notify);
+        let diagnostic = stdout_json(&notify);
+        assert_eq!(diagnostic["pty_delivery"]["status"], "evidence_pending");
+        assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
+        let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
+        assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+        assert!(repl.wait().unwrap().success());
+        let received = fs::read_to_string(&received_log).unwrap();
+        let attempt_id = delivery_attempt_id(&received);
+        assert_delivered_with_pending_evidence(&fixture, "h-production-state-fault", &attempt_id);
+        assert_eq!(
+            state_delivery_evidence_counts(&fixture, &attempt_id),
+            (0, 0)
+        );
+        fault
+            .execute_batch("DROP TRIGGER fail_production_pty_evidence")
+            .unwrap();
+
+        let recovery = fixture.run_mailbox_status(SESSION_A);
+        assert_success(&recovery);
+        assert!(
+            fixture
+                .mailbox()
+                .pending_delivery_evidence_obligations(SESSION_A)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            state_delivery_evidence_counts(&fixture, &attempt_id),
+            (1, 1)
+        );
+        assert_eq!(
+            received.matches("handle: h-production-state-fault").count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn production_plain_and_tui_drain_faults_retain_attempt_through_provider_handoff() {
+    for observed_tui in [false, true] {
+        for phase in ["body", "delimiter"] {
+            let fixture = Fixture::new();
+            let mode = if observed_tui { "tui" } else { "plain" };
+            let fault = format!("{mode}_{phase}_drain");
+            let received_log = fixture
+                .dir
+                .path()
+                .join(format!("{mode}-{phase}-drain-received.log"));
+            let script =
+                fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+            fixture.write_interactive_model("fixture-drain-fault", "fixture-provider", &script);
+            fixture.seed_active_chain(
+                "bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc",
+                "fixture-provider",
+                SESSION_A,
+                "fixture-drain-fault",
+            );
+            let pty = OuterPty::open(30, 100);
+            let mut repl = spawn_repl_under_pty_mode_with_test_hooks(
+                &fixture,
+                &pty,
+                "fixture-drain-fault",
+                SESSION_A,
+                observed_tui,
+                Some(&fault),
+                None,
+            );
+            let startup = read_until(
+                pty.master.as_raw_fd(),
+                "READY_FOR_NOTIFY",
+                Duration::from_secs(5),
+            );
+            assert!(
+                startup.contains("READY_FOR_NOTIFY"),
+                "startup was {startup:?}"
+            );
+            let invocation_uuid = wait_for_running_invocation(&fixture);
+            let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+            let generation_id = running_generation_id(&fixture);
+
+            let notify = fixture.run_notify(
+                &format!("h-{mode}-{phase}-drain-fault"),
+                owner_metadata(SESSION_A, &invocation_uuid),
+            );
+            assert_success(&notify);
+            let diagnostic = stdout_json(&notify);
+            assert_eq!(diagnostic["pty_delivery"]["status"], "submission_uncertain");
+            assert_eq!(diagnostic["pty_delivery"]["submitted"], true);
+            assert!(diagnostic["wake"].is_null());
+
+            unsafe {
+                libc::kill(child_identity.os_pid as libc::pid_t, libc::SIGTERM);
+            }
+            let _ = repl.wait().unwrap();
+            let attempt_id = only_delivery_attempt_id(&fixture);
+            let mut mailbox = fixture.mailbox();
+            let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].delivered_at.is_none());
+            let attempt = mailbox
+                .delivery_attempt_window(&attempt_id)
+                .unwrap()
+                .unwrap();
+            assert!(attempt.submission_started_at.is_some());
+            assert!(attempt.acknowledged_at.is_none());
+            assert!(attempt.resolved_at.is_none());
+            assert!(
+                mailbox
+                    .register_or_reuse_delivery_attempt(
+                        "replacement-attempt",
+                        SESSION_A,
+                        "replacement-invocation",
+                        "replacement-generation",
+                        &[rows[0].seq],
+                        0,
+                    )
+                    .unwrap_err()
+                    .contains(&attempt_id)
+            );
+            let generation = mailbox
+                .runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(generation.lifecycle_state, RuntimeLifecycleState::Exited);
+        }
+    }
+}
+
+#[test]
+fn production_tui_pre_submission_fault_sends_no_provider_input() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("tui-pre-submission-received.log");
+    let script = fixture_provider_waiting_for_notification(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-pre-submission", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "bdbdbdbd-bdbd-4dbd-8dbd-bdbdbdbdbdbd",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-pre-submission",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty_mode_with_test_hooks(
+        &fixture,
+        &pty,
+        "fixture-pre-submission",
+        SESSION_A,
+        true,
+        Some("tui_pre_submission"),
+        None,
+    );
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+
+    let notify = fixture.run_notify(
+        "h-tui-pre-submission",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
+    assert_success(&notify);
+    let diagnostic = stdout_json(&notify);
+    assert_eq!(diagnostic["pty_delivery"]["status"], "protocol_error");
+    assert_eq!(diagnostic["pty_delivery"]["submitted"], false);
+    assert_eq!(unresolved_delivery_attempt_count(&fixture), 0);
+    assert_eq!(fs::read_to_string(&received_log).unwrap(), "");
+
+    unsafe {
+        libc::kill(child_identity.os_pid as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = repl.wait().unwrap();
+}
+
+#[test]
+fn real_broker_confirmation_fault_reports_uncertain_and_reuses_without_retransmit() {
+    let fixture = Fixture::new();
+    let received_log = fixture.dir.path().join("confirmation-fault-received.log");
+    let script = fixture_provider_waiting_for_two_notifications(fixture.dir.path(), &received_log);
+    fixture.write_interactive_model("fixture-confirmation-fault", "fixture-provider", &script);
+    fixture.seed_active_chain(
+        "acacacac-acac-4cac-8cac-acacacacacac",
+        "fixture-provider",
+        SESSION_A,
+        "fixture-confirmation-fault",
+    );
+    let pty = OuterPty::open(30, 100);
+    let mut repl = spawn_repl_under_pty(&fixture, &pty, "fixture-confirmation-fault", SESSION_A);
+    let startup = read_until(
+        pty.master.as_raw_fd(),
+        "READY_FOR_NOTIFY",
+        Duration::from_secs(5),
+    );
+    assert!(
+        startup.contains("READY_FOR_NOTIFY"),
+        "startup was {startup:?}"
+    );
+    let invocation_uuid = wait_for_running_invocation(&fixture);
+    let _child_identity = wait_for_child_identity(&fixture, &invocation_uuid);
+    let fault = Connection::open(fixture.sidecar_path()).unwrap();
+    fault
+        .execute_batch(
+            "CREATE TRIGGER fail_broker_confirmation
+             BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+             BEGIN SELECT RAISE(FAIL, 'injected broker confirmation failure'); END;",
+        )
+        .unwrap();
+
+    let first = fixture.run_notify(
+        "h-confirmation-fault-first",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
+    assert_success(&first);
+    let first_value = stdout_json(&first);
+    assert_eq!(
+        first_value["pty_delivery"]["status"],
+        "submission_uncertain"
+    );
+    assert_eq!(first_value["pty_delivery"]["submitted"], true);
+    let first_output = read_until(
+        pty.master.as_raw_fd(),
+        "GOT_NOTIFY_1",
+        Duration::from_secs(5),
+    );
+    if !first_output.contains("GOT_NOTIFY_1") {
+        let _ = repl.kill();
+        let _ = repl.wait();
+        panic!("uncertain notification did not reach provider: {first_output:?}");
+    }
+    let first_received = fs::read_to_string(&received_log).unwrap();
+    let attempt_id = delivery_attempt_id(&first_received);
+    let mailbox = fixture.mailbox();
+    let first_rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(first_rows.len(), 1);
+    assert!(first_rows[0].delivered_at.is_none());
+    let attempt = mailbox
+        .delivery_attempt_window(&attempt_id)
+        .unwrap()
+        .unwrap();
+    assert!(attempt.submission_started_at.is_some());
+    assert!(attempt.acknowledged_at.is_none());
+    assert!(attempt.resolved_at.is_none());
+    let first_listeners = mailbox
+        .completion_event_listeners("h-confirmation-fault-first")
+        .unwrap();
+    assert_eq!(first_listeners.len(), 1);
+    assert!(first_listeners[0].acknowledged_at.is_none());
+    drop(mailbox);
+    fault
+        .execute_batch("DROP TRIGGER fail_broker_confirmation")
+        .unwrap();
+
+    let recovery = fixture.run_notify(
+        "h-confirmation-fault-recovery",
+        owner_metadata(SESSION_A, &invocation_uuid),
+    );
+    assert_success(&recovery);
+    assert_eq!(
+        stdout_json(&recovery)["pty_delivery"]["status"],
+        "submission_uncertain"
+    );
+    thread::sleep(Duration::from_millis(200));
+    let received = fs::read_to_string(&received_log).unwrap();
+    assert_eq!(
+        received
+            .matches("handle: h-confirmation-fault-first")
+            .count(),
+        1
+    );
+    assert_eq!(
+        received
+            .matches("handle: h-confirmation-fault-recovery")
+            .count(),
+        0
+    );
+    assert_eq!(
+        received
+            .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+            .count(),
+        1
+    );
+    let mailbox = fixture.mailbox();
+    let attempts: i64 = Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox_delivery_attempts",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1);
+    let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].delivered_at.is_none());
+    assert!(rows[1].delivered_at.is_none());
+    assert!(
+        mailbox
+            .pending_delivery_evidence_obligations(SESSION_A)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        state_delivery_evidence_counts(&fixture, &attempt_id),
+        (0, 0)
+    );
+    let _ = repl.kill();
+    let _ = repl.wait();
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -872,7 +1657,9 @@ fn live_broker_confirmation_contracts_overlapping_attempts() {
     let overlap_response = inject_control_envelope(&control_path, &overlap).unwrap();
     assert!(overlap_response.ack, "{overlap_response:?}");
     let output = read_until(pty.master.as_raw_fd(), "GOT_NOTIFY", Duration::from_secs(5));
-    assert!(output.contains("GOT_NOTIFY"), "output was {output:?}");
+    if !output.contains("GOT_NOTIFY") {
+        wait_for_file_contains(&received_log, "handle: h-overlap-4", Duration::from_secs(5));
+    }
     fixture.ingest_turn(
         "fixture-provider",
         SESSION_A,
@@ -1171,6 +1958,50 @@ fn spawn_control_server(
     })
 }
 
+fn spawn_confirming_control_server(
+    path: &Path,
+    sidecar_path: PathBuf,
+    captured: Arc<Mutex<String>>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let payload = read_inject_payload(&mut stream);
+        let attempt_id = delivery_nonce_from_payload(&payload).to_string();
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        assert!(
+            mailbox
+                .begin_delivery_attempt_submission(&attempt_id)
+                .unwrap()
+        );
+        assert!(mailbox.confirm_delivery_attempt(&attempt_id).unwrap());
+        *captured.lock().unwrap() = payload;
+        write_response(&mut stream, true, &format!("delivery_ack:{attempt_id}"));
+    })
+}
+
+fn spawn_submission_started_control_server(
+    path: &Path,
+    sidecar_path: PathBuf,
+    message: &'static str,
+    captured: Arc<Mutex<String>>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(path).unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let payload = read_inject_payload(&mut stream);
+        let attempt_id = delivery_nonce_from_payload(&payload).to_string();
+        assert!(
+            MailboxDb::open(&sidecar_path)
+                .unwrap()
+                .begin_delivery_attempt_submission(&attempt_id)
+                .unwrap()
+        );
+        *captured.lock().unwrap() = payload;
+        write_response(&mut stream, true, message);
+    })
+}
+
 fn delivery_nonce_from_payload(payload: &str) -> &str {
     let start = payload.rfind("[OULIPOLY-DELIVERY ").unwrap() + "[OULIPOLY-DELIVERY ".len();
     let tail = &payload[start..];
@@ -1215,12 +2046,55 @@ fn spawn_repl_under_pty(
     model_name: &str,
     session_id: &str,
 ) -> Child {
+    spawn_repl_under_pty_mode(fixture, pty, model_name, session_id, true)
+}
+
+fn spawn_repl_under_pty_mode(
+    fixture: &Fixture,
+    pty: &OuterPty,
+    model_name: &str,
+    session_id: &str,
+    observed_tui: bool,
+) -> Child {
+    spawn_repl_under_pty_mode_with_test_hooks(
+        fixture,
+        pty,
+        model_name,
+        session_id,
+        observed_tui,
+        None,
+        None,
+    )
+}
+
+fn spawn_repl_under_pty_mode_with_test_hooks(
+    fixture: &Fixture,
+    pty: &OuterPty,
+    model_name: &str,
+    session_id: &str,
+    observed_tui: bool,
+    delivery_fault: Option<&str>,
+    after_confirm_barrier: Option<&Path>,
+) -> Child {
     let stdin = pty.slave.try_clone().unwrap();
     let stdout = pty.slave.try_clone().unwrap();
     let stderr = pty.slave.try_clone().unwrap();
     let slave_fd = pty.slave.as_raw_fd();
     let master_fd = pty.master.as_raw_fd();
     let mut cmd = fixture.base_repl_command(model_name, session_id);
+    cmd.env("TERM", "xterm-256color");
+    if !observed_tui {
+        cmd.env("OULIPOLY_INTERACTIVE_TUI", "0");
+    }
+    if let Some(delivery_fault) = delivery_fault {
+        cmd.env("OULIPOLY_PTY_DELIVERY_TEST_FAULT", delivery_fault);
+    }
+    if let Some(after_confirm_barrier) = after_confirm_barrier {
+        cmd.env(
+            "OULIPOLY_PTY_DELIVERY_AFTER_CONFIRM_TEST_BARRIER",
+            after_confirm_barrier,
+        );
+    }
     cmd.stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
@@ -1326,6 +2200,7 @@ fn fixture_provider_waiting_for_two_notifications(dir: &Path, received_log: &Pat
             r#"#!/usr/bin/env bash
 set -euo pipefail
 : > {received}
+printf '%s' "${{OULIPOLY_COMPLETION_REGISTRATION_AUTHORITY-}}" > {authority}
 test -t 0
 test -t 1
 test -t 2
@@ -1345,7 +2220,8 @@ while IFS= read -r line; do
   fi
 done
 "#,
-            received = shell_single_quote(&path_string(received_log))
+            received = shell_single_quote(&path_string(received_log)),
+            authority = shell_single_quote(&path_string(&dir.join(REGISTRATION_AUTHORITY_FILE))),
         ),
     )
     .unwrap();
@@ -1416,10 +2292,11 @@ fn wait_for_running_invocation(fixture: &Fixture) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(db) = MailboxDb::open(&fixture.sidecar_path())
-            && let Ok(Some(runtime)) = db.session_runtime(SESSION_A)
-            && let Some(invocation_uuid) = runtime.running_invocation_uuid
+            && let Ok(SessionGenerationProjection::One(generation)) = db
+                .runtime_lifecycle_reader()
+                .session_generation_projection(SESSION_A)
         {
-            return invocation_uuid;
+            return generation.spawn_invocation_uuid;
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -1427,13 +2304,27 @@ fn wait_for_running_invocation(fixture: &Fixture) -> String {
 }
 
 fn running_control_path(fixture: &Fixture) -> String {
-    fixture
+    let projection = fixture
         .mailbox()
-        .session_runtime(SESSION_A)
-        .unwrap()
-        .expect("running session runtime")
-        .pty_control_path
-        .expect("PTY control path")
+        .runtime_lifecycle_reader()
+        .session_generation_projection(SESSION_A)
+        .unwrap();
+    let SessionGenerationProjection::One(generation) = projection else {
+        panic!("expected one running runtime generation");
+    };
+    generation.pty_control_path.expect("PTY control path")
+}
+
+fn running_generation_id(fixture: &Fixture) -> RuntimeGenerationId {
+    let projection = fixture
+        .mailbox()
+        .runtime_lifecycle_reader()
+        .session_generation_projection(SESSION_A)
+        .unwrap();
+    let SessionGenerationProjection::One(generation) = projection else {
+        panic!("expected one running runtime generation");
+    };
+    generation.generation_id
 }
 
 fn wait_for_child_identity(fixture: &Fixture, invocation_uuid: &str) -> ProcessIdentity {
@@ -1498,6 +2389,51 @@ fn unresolved_delivery_attempt_count(fixture: &Fixture) -> i64 {
             |row| row.get(0),
         )
         .unwrap()
+}
+
+fn only_delivery_attempt_id(fixture: &Fixture) -> String {
+    Connection::open(fixture.sidecar_path())
+        .unwrap()
+        .query_row(
+            "SELECT attempt_id FROM mailbox_delivery_attempts ORDER BY created_at, attempt_id",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn state_delivery_evidence_counts(fixture: &Fixture, attempt_id: &str) -> (i64, i64) {
+    let connection = Connection::open(fixture.state_path()).unwrap();
+    let acknowledgement_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_delivery_acknowledgements WHERE delivery_id = ?1",
+            params![attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let evidence_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_delivery_evidence WHERE evidence_id = ?1",
+            params![format!("pty_transport_ack:{attempt_id}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (acknowledgement_count, evidence_count)
+}
+
+fn assert_delivered_with_pending_evidence(fixture: &Fixture, handle: &str, attempt_id: &str) {
+    let mailbox = fixture.mailbox();
+    let rows = mailbox.list_mailbox(SESSION_A, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered_at.is_some());
+    let listeners = mailbox.completion_event_listeners(handle).unwrap();
+    assert_eq!(listeners.len(), 1);
+    assert!(listeners[0].acknowledged_at.is_some());
+    let obligations = mailbox
+        .pending_delivery_evidence_obligations(SESSION_A)
+        .unwrap();
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].attempt_id, attempt_id);
 }
 
 fn owner_metadata(session_id: &str, invocation_uuid: &str) -> Value {

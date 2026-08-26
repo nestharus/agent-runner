@@ -143,11 +143,11 @@ impl LiveSessionBindingServer {
         &mut self,
         spawn_context: SpawnIdentityContext,
         generation: RunningRuntimeGeneration,
-    ) -> Result<(), String> {
+    ) {
         let listener = self
             .listener
             .take()
-            .ok_or_else(|| "Live-session binding server was already started".to_string())?;
+            .expect("live-session binding server starts exactly once");
         let context = self.context.clone();
         let token = self.token.clone();
         let session_id = Arc::clone(&self.session_id);
@@ -163,7 +163,6 @@ impl LiveSessionBindingServer {
                 generation,
             );
         }));
-        Ok(())
     }
 }
 
@@ -829,8 +828,8 @@ mod tests {
             let generation = record_child_identity(child.id(), Some(&spawn_context))
                 .unwrap()
                 .unwrap();
-            let process_identity = generation.exact_process_identity.clone().unwrap();
-            server.start(spawn_context, generation).unwrap();
+            let process_identity = generation.exact_process_identity.clone();
+            server.start(spawn_context, generation);
             Self {
                 _temp: temp,
                 state_path,

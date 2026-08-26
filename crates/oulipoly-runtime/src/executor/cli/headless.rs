@@ -41,8 +41,62 @@ pub fn execute(
     extra_inputs: &HashMap<String, Vec<String>>,
     parent_invocation_env: Option<&str>,
 ) -> Result<ExecutionResult, String> {
+    execute_with_optional_mailbox_db_path(
+        model,
+        provider_index,
+        prompt,
+        working_dir,
+        extra_inputs,
+        parent_invocation_env,
+        None,
+    )
+}
+
+/// Execute a model while recording runtime identity in an explicit mailbox sidecar.
+pub fn execute_with_mailbox_db_path(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
+    mailbox_db_path: &Path,
+) -> Result<ExecutionResult, String> {
+    execute_with_optional_mailbox_db_path(
+        model,
+        provider_index,
+        prompt,
+        working_dir,
+        extra_inputs,
+        parent_invocation_env,
+        Some(mailbox_db_path),
+    )
+}
+
+fn execute_with_optional_mailbox_db_path(
+    model: &ModelConfig,
+    provider_index: usize,
+    prompt: &str,
+    working_dir: Option<&Path>,
+    extra_inputs: &HashMap<String, Vec<String>>,
+    parent_invocation_env: Option<&str>,
+    mailbox_db_path: Option<&Path>,
+) -> Result<ExecutionResult, String> {
     let provider = provider_for_index(model, provider_index)?;
     let input_args = resolve_input_flags(model, extra_inputs)?;
+    let spawn_identity = context_from_parent_invocation_env(
+        parent_invocation_env,
+        &provider.name,
+        Some(&model.name),
+        None,
+        SpawnRuntimeMode::Headless,
+        working_dir,
+        None,
+    )
+    .map(|context| match mailbox_db_path {
+        Some(path) => context.with_mailbox_db_path(path.to_path_buf()),
+        None => context,
+    });
     let (result, temp_files) = execute_provider(
         provider,
         model.prompt_mode,
@@ -51,15 +105,7 @@ pub fn execute(
         &input_args,
         parent_invocation_env,
         None,
-        context_from_parent_invocation_env(
-            parent_invocation_env,
-            &provider.name,
-            Some(&model.name),
-            None,
-            SpawnRuntimeMode::Headless,
-            working_dir,
-            None,
-        ),
+        spawn_identity,
     )?;
     cleanup_temp_files(temp_files);
 

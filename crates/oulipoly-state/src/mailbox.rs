@@ -3,9 +3,10 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
 //! `predicate`, `validator`
 //!
-//! Resume-backed notification mailbox storage in the PID identity sidecar DB.
-//! This module deliberately owns only additive sidecar tables and never touches
-//! the versioned `state.db` schema.
+//! PID-sidecar facade for mailbox delivery and cross-entity transactions.
+//! Runtime lifecycle, wake/session state, payload retention, completion authority,
+//! namespace authority, and schema evolution expose separate capability owners
+//! while retaining one physical SQLite transaction boundary.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{
@@ -22,6 +23,9 @@ use uuid::Uuid;
 
 use crate::pid_identity::{self, ProcessIdentity};
 
+#[path = "mailbox/schema.rs"]
+mod schema;
+
 pub const AGENT_BASH_COMPLETE_KIND: &str = "agent_bash_complete";
 pub const MAILBOX_DELIVERY_UNCONFIRMED_ERROR: &str = "mailbox_delivery_unconfirmed";
 pub const MAILBOX_INGRESS_EXPIRED_ERROR: &str = "mailbox_ingress_expired";
@@ -31,7 +35,8 @@ pub const SUBMITTED_INPUT_KIND: &str = "input";
 pub const WAKE_SWEEP_ABANDONED_ERROR: &str = "wake_sweep_abandoned";
 pub const MAILBOX_PAYLOAD_RETENTION_POLICY: &str = "until_terminal_disposition";
 const COMPACTED_PAYLOAD_SCHEMA_VERSION: u8 = 1;
-const MAILBOX_SIDECAR_SCHEMA_VERSION: i64 = 1;
+// Agent-bash registration must not inherit test-support's shortened generic writer wait.
+const COMPLETION_AUTHORITY_SQLITE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const MAILBOX_ROW_COLUMNS: &str = "seq, session_id, kind, handle, payload_json, enqueued_at,
     delivered_at, delivered_by_invocation_uuid, delivery_attempts,
     delivery_error, owner_invocation_uuid, matched_os_pid,
@@ -230,6 +235,7 @@ pub struct RuntimeGenerationRow {
     pub effective_cwd: Option<String>,
     pub spawned_os_pid: Option<i64>,
     pub exact_process_evidence: ExactProcessEvidence,
+    pub creator_process_evidence: ExactProcessEvidence,
     pub created_at: String,
     pub running_at: Option<String>,
     pub draining_at: Option<String>,
@@ -267,7 +273,7 @@ pub struct CreateRuntimeGeneration<'a> {
 pub struct BindRuntimeGenerationRunning<'a> {
     pub fence: RuntimeGenerationFence<'a>,
     pub spawned_os_pid: i64,
-    pub exact_process_identity: Option<&'a ProcessIdentity>,
+    pub exact_process_identity: &'a ProcessIdentity,
     pub os_pgid: Option<i64>,
 }
 
@@ -295,6 +301,12 @@ pub enum SessionGenerationProjection {
     None,
     One(Box<RuntimeGenerationRow>),
     Multiple(Vec<RuntimeGenerationRow>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCompatibilityReconciliation {
+    Reconciled,
+    NoGeneration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -419,6 +431,7 @@ pub struct FinishRuntimeGenerationDrain<'a> {
     pub fence: RuntimeGenerationFence<'a>,
     pub drain_request_id: &'a DrainRequestId,
     pub exit_code: Option<i32>,
+    pub compatibility_exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,20 +628,19 @@ pub enum EnqueueResult {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SessionRuntimeUpsert<'a> {
+pub struct SessionMetadataUpsert<'a> {
     pub session_id: &'a str,
     pub mode: &'a str,
     pub invocation_uuid: Option<&'a str>,
     pub provider_name: Option<&'a str>,
     pub model_name: Option<&'a str>,
-    pub pty_control_path: Option<&'a str>,
     pub models_dir: Option<&'a str>,
     pub effective_cwd: Option<&'a str>,
     pub selected_auto_wake_max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SessionRuntimeRunningUpdate<'a> {
+pub struct LegacyRuntimeProjection<'a> {
     pub session_id: &'a str,
     pub mode: &'a str,
     pub invocation_uuid: &'a str,
@@ -642,19 +654,34 @@ pub struct SessionRuntimeRunningUpdate<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SessionRuntimeIdleUpdate<'a> {
+pub struct LegacyRuntimeProjectionSettlement<'a> {
     pub session_id: &'a str,
     pub invocation_uuid: &'a str,
     pub last_exit_code: Option<i32>,
 }
 
+/// Resume and wake-policy metadata. This row intentionally exposes no live
+/// process or lifecycle state; `runtime_generation` is the sole live authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRuntimeRow {
+pub struct SessionMetadataRow {
     pub session_id: String,
     pub mode: String,
     pub invocation_uuid: Option<String>,
     pub provider_name: Option<String>,
     pub model_name: Option<String>,
+    pub updated_at: String,
+    pub models_dir: Option<String>,
+    pub effective_cwd: Option<String>,
+    pub auto_wake_count: i64,
+    pub selected_auto_wake_max: Option<i64>,
+}
+
+/// Compatibility columns retained in the installed `session_runtime` table.
+/// Generation lifecycle transactions maintain this projection atomically; no
+/// production liveness or wake decision treats it as runtime authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRuntimeProjectionRow {
+    pub session_id: String,
     pub pty_control_path: Option<String>,
     pub updated_at: String,
     pub run_state: String,
@@ -666,10 +693,6 @@ pub struct SessionRuntimeRow {
     pub turn_ended_at: Option<String>,
     pub turn_start_max_mailbox_seq: Option<i64>,
     pub last_exit_code: Option<i32>,
-    pub models_dir: Option<String>,
-    pub effective_cwd: Option<String>,
-    pub auto_wake_count: i64,
-    pub selected_auto_wake_max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,22 +702,13 @@ pub enum SessionLiveness {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionRuntimeReadOnlyLiveness {
+pub enum RuntimeGenerationReadOnlyLiveness {
     Busy,
     Idle,
     StaleMissingInvocation,
     StaleMissingIdentity,
     StaleDead,
     StalePidReused,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SessionRuntimeLivenessDecision {
-    Busy,
-    Idle,
-    Stale {
-        running_invocation_uuid: Option<String>,
-    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -712,6 +726,7 @@ pub enum WakeClaimAcquireResult {
     Acquired(WakeClaimRow),
     NoPending,
     Busy,
+    CapReached { current_count: i64, max_count: i64 },
     AlreadyInFlight(WakeClaimRow),
 }
 
@@ -736,6 +751,28 @@ pub struct WakeSweepCandidate {
     pub max_pending_seq: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAdmissionRow {
+    pub queue_sequence: i64,
+    pub admission_id: String,
+    pub registration_identity: String,
+    pub session_id: Option<String>,
+    pub state: String,
+    pub queue_reason: String,
+    pub claim_token: Option<String>,
+    pub claimed_at_unix_ms: Option<i64>,
+    pub runtime_generation_uuid: Option<String>,
+    pub launcher_os_pid: i64,
+    pub launcher_os_boot_id: String,
+    pub launcher_os_pid_starttime_ticks: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAdmissionAttempt {
+    Admitted(SessionAdmissionRow),
+    Empty,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailboxDeliveryAttemptDisposition {
     Pending,
@@ -749,9 +786,19 @@ pub struct MailboxDeliveryWindow {
     pub session_id: String,
     pub delivery_invocation_uuid: String,
     pub acknowledged_at: Option<String>,
+    pub submission_started_at: Option<String>,
     pub resolved_at: Option<String>,
     pub rows: Vec<MailboxRow>,
     pub remaining_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxDeliveryEvidenceObligation {
+    pub attempt_id: String,
+    pub session_id: String,
+    pub turn_generation_id: String,
+    pub observed_at: i64,
+    pub legacy: bool,
 }
 
 struct WakeSweepSessionState {
@@ -779,6 +826,37 @@ pub struct MailboxDb {
     path: PathBuf,
     _read_only_snapshot: Option<crate::read_only_snapshot::ReadOnlySnapshot>,
     _namespace_authority: Option<MailboxAuthorityFence>,
+}
+
+/// Exclusive writer for durable runtime-generation lifecycle transitions.
+pub struct RuntimeLifecycleRepository<'a> {
+    conn: &'a mut Connection,
+}
+
+/// Read-only runtime-generation projection and liveness surface.
+pub struct RuntimeLifecycleReader<'a> {
+    conn: &'a Connection,
+}
+
+/// Content-addressed payload publication, verification, hydration, and compaction.
+pub struct PayloadRetentionRepository<'a> {
+    conn: &'a Connection,
+    path: &'a Path,
+}
+
+/// Session metadata plus atomic wake-claim admission and lifecycle authority.
+pub struct WakeSessionRepository<'a> {
+    conn: &'a mut Connection,
+}
+
+/// Durable FIFO admission and in-flight launch reservation authority.
+pub struct SessionAdmissionRepository<'a> {
+    conn: &'a mut Connection,
+}
+
+/// Read-only session metadata, compatibility projection, and wake-claim surface.
+pub struct WakeSessionReader<'a> {
+    conn: &'a Connection,
 }
 
 /// Serializes cooperating canonical-path creation and replacement independently
@@ -1033,16 +1111,17 @@ impl MailboxAuthorityFence {
                             ),
                         });
                     }
-                    validate_mailbox_source(path, &sidecar_path, target_identity).map_err(
-                        |source| MailboxAuthorityFenceError::Open {
-                            path: sidecar_path.clone(),
-                            source,
-                        },
-                    )?;
+                    let retained_target_identity =
+                        validate_mailbox_source(path, &sidecar_path, target_identity).map_err(
+                            |source| MailboxAuthorityFenceError::Open {
+                                path: sidecar_path.clone(),
+                                source,
+                            },
+                        )?;
                     return Ok(Self {
                         file,
                         sidecar_path,
-                        target_identity,
+                        target_identity: retained_target_identity,
                     });
                 }
                 Err(fs4::TryLockError::WouldBlock) if Instant::now() < deadline => {
@@ -1171,8 +1250,7 @@ impl MailboxDb {
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
         set_wal_mode(&conn)?;
-        pid_identity::ensure_identity_schema(&conn)?;
-        ensure_mailbox_schema(&mut conn)?;
+        ensure_shared_sidecar_schema(&mut conn)?;
         Ok(Self {
             conn,
             path: path.to_path_buf(),
@@ -1182,8 +1260,42 @@ impl MailboxDb {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, String> {
-        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create(path)
+        Self::open_read_only_with_cancel(path, &|| false)
+    }
+
+    pub fn open_read_only_with_cancel(
+        path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        let snapshot =
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_cancel(path, is_cancelled)
+                .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        Self::open_snapshot(path, snapshot)
+    }
+
+    pub fn open_read_only_with_pid_identity_and_work_timeout(
+        path: &Path,
+        retry_timeout: StdDuration,
+        work_timeout: StdDuration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<(crate::pid_identity::PidIdentityDb, Self), String> {
+        let snapshot =
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
+                path,
+                retry_timeout,
+                work_timeout,
+                is_cancelled,
+            )
             .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
+        let pid = crate::pid_identity::PidIdentityDb::open_snapshot(path, snapshot.clone())?;
+        let mailbox = Self::open_snapshot(path, snapshot)?;
+        Ok((pid, mailbox))
+    }
+
+    fn open_snapshot(
+        path: &Path,
+        snapshot: crate::read_only_snapshot::ReadOnlySnapshot,
+    ) -> Result<Self, String> {
         let conn = Connection::open_with_flags(snapshot.path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| format!("Failed to open PID mailbox sidecar read-only: {err}"))?;
         Ok(Self {
@@ -1202,7 +1314,7 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to open PID mailbox sidecar authority: {err}"))?;
         authority.validate_opened_target()?;
         configure_writable_sidecar_connection(&conn)?;
-        conn.busy_timeout(completion_authority_sqlite_timeout())
+        conn.busy_timeout(COMPLETION_AUTHORITY_SQLITE_TIMEOUT)
             .map_err(|err| format!("Failed to configure PID mailbox sidecar authority: {err}"))?;
         Ok(Self {
             conn,
@@ -1258,11 +1370,47 @@ impl MailboxDb {
         )
     }
 
+    pub fn runtime_lifecycle(&mut self) -> RuntimeLifecycleRepository<'_> {
+        RuntimeLifecycleRepository {
+            conn: &mut self.conn,
+        }
+    }
+
+    pub fn runtime_lifecycle_reader(&self) -> RuntimeLifecycleReader<'_> {
+        RuntimeLifecycleReader { conn: &self.conn }
+    }
+
+    pub fn payloads(&self) -> PayloadRetentionRepository<'_> {
+        PayloadRetentionRepository {
+            conn: &self.conn,
+            path: &self.path,
+        }
+    }
+
+    pub fn wake_sessions(&mut self) -> WakeSessionRepository<'_> {
+        WakeSessionRepository {
+            conn: &mut self.conn,
+        }
+    }
+
+    pub fn session_admissions(&mut self) -> SessionAdmissionRepository<'_> {
+        SessionAdmissionRepository {
+            conn: &mut self.conn,
+        }
+    }
+
+    pub fn wake_session_reader(&self) -> WakeSessionReader<'_> {
+        WakeSessionReader { conn: &self.conn }
+    }
+}
+
+impl RuntimeLifecycleRepository<'_> {
     pub fn create_runtime_generation(
         &mut self,
         request: CreateRuntimeGeneration<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
         validate_runtime_generation_create(&request)?;
+        let creator_process_identity = current_runtime_creator_identity()?;
         let now = now_rfc3339();
         let tx = self
             .conn
@@ -1275,8 +1423,9 @@ impl MailboxDb {
                 "INSERT OR IGNORE INTO runtime_generation (
                     generation_uuid, lifecycle_state, spawn_invocation_uuid, session_id,
                     runtime_mode, provider_name, model_name, pty_control_path, models_dir,
-                    effective_cwd, created_at
-                 ) VALUES (?1, 'starting', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    effective_cwd, created_at, creator_identity_os_pid,
+                    creator_identity_os_boot_id, creator_identity_os_pid_starttime_ticks
+                 ) VALUES (?1, 'starting', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     request.generation_id.to_string(),
                     request.spawn_invocation_uuid,
@@ -1288,6 +1437,9 @@ impl MailboxDb {
                     request.models_dir,
                     request.effective_cwd,
                     &now,
+                    creator_process_identity.os_pid,
+                    &creator_process_identity.os_boot_id,
+                    creator_process_identity.os_pid_starttime_ticks,
                 ],
             )
             .map_err(generation_storage_error(
@@ -1296,7 +1448,14 @@ impl MailboxDb {
         let row = runtime_generation_by_id_on(&tx, request.generation_id)?.ok_or_else(|| {
             GenerationStorageError::new("Runtime generation missing after create".to_string())
         })?;
-        let result = map_runtime_generation_create(changed, row, &request);
+        let result =
+            map_runtime_generation_create(changed, row, &request, &creator_process_identity);
+        bind_runtime_generation_admission_on(
+            &tx,
+            request.spawn_invocation_uuid,
+            request.generation_id,
+            &creator_process_identity,
+        )?;
         tx.commit().map_err(generation_storage_error(
             "commit generation creation transaction",
         ))?;
@@ -1365,9 +1524,9 @@ impl MailboxDb {
                     request.fence.generation_id.to_string(),
                     request.fence.spawn_invocation_uuid,
                     request.spawned_os_pid,
-                    identity.map(|identity| identity.os_pid),
-                    identity.map(|identity| identity.os_boot_id.as_str()),
-                    identity.map(|identity| identity.os_pid_starttime_ticks),
+                    identity.os_pid,
+                    &identity.os_boot_id,
+                    identity.os_pid_starttime_ticks,
                     &now,
                 ],
             )
@@ -1382,6 +1541,7 @@ impl MailboxDb {
             runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
                 GenerationStorageError::new("Runtime generation missing after binding".to_string())
             })?;
+        project_running_generation_on(&tx, &row)?;
         tx.commit().map_err(generation_storage_error(
             "commit generation binding transaction",
         ))?;
@@ -1433,6 +1593,11 @@ impl MailboxDb {
         .map_err(generation_storage_error(
             "attach runtime generation session",
         ))?;
+        bind_runtime_generation_admission_session_on(
+            &tx,
+            request.fence.generation_id,
+            request.session_id,
+        )?;
         if let ExactProcessEvidence::Recorded(identity) = &before.exact_process_evidence
             && !pid_identity::attach_identity_session_on(&tx, identity, request.session_id)
                 .map_err(GenerationStorageError::new)?
@@ -1450,25 +1615,28 @@ impl MailboxDb {
                     "Runtime generation missing after session attachment".to_string(),
                 )
             })?;
+        project_running_generation_on(&tx, &row)?;
         tx.commit().map_err(generation_storage_error(
             "commit generation session attachment transaction",
         ))?;
         Ok(GenerationMutation::Applied(row))
     }
+}
 
+impl RuntimeLifecycleReader<'_> {
     pub fn resolve_runtime_generation(
         &self,
         selector: RuntimeGenerationSelector<'_>,
     ) -> Result<RuntimeGenerationResolution, GenerationStorageError> {
         let rows = match selector {
             RuntimeGenerationSelector::Exact(fence) => {
-                runtime_generation_by_id_on(&self.conn, fence.generation_id)?
+                runtime_generation_by_id_on(self.conn, fence.generation_id)?
                     .filter(|row| row.spawn_invocation_uuid == fence.spawn_invocation_uuid)
                     .into_iter()
                     .collect()
             }
             RuntimeGenerationSelector::ProcessIdentity(identity) => {
-                runtime_generations_by_process_identity_on(&self.conn, identity)?
+                runtime_generations_by_process_identity_on(self.conn, identity)?
             }
         };
         Ok(match rows.len() {
@@ -1484,7 +1652,7 @@ impl MailboxDb {
         &self,
         generation_id: &RuntimeGenerationId,
     ) -> Result<Option<RuntimeGenerationRow>, GenerationStorageError> {
-        runtime_generation_by_id_on(&self.conn, generation_id)
+        runtime_generation_by_id_on(self.conn, generation_id)
     }
 
     pub fn session_generation_projection(
@@ -1492,7 +1660,7 @@ impl MailboxDb {
         session_id: &str,
     ) -> Result<SessionGenerationProjection, GenerationStorageError> {
         let sql = format_runtime_generations_for_session_sql(true);
-        let rows = runtime_generations_for_session_on(&self.conn, session_id, &sql)?;
+        let rows = runtime_generations_for_session_on(self.conn, session_id, &sql)?;
         Ok(match rows.len() {
             0 => SessionGenerationProjection::None,
             1 => SessionGenerationProjection::One(Box::new(
@@ -1507,7 +1675,115 @@ impl MailboxDb {
         session_id: &str,
     ) -> Result<Vec<RuntimeGenerationRow>, GenerationStorageError> {
         let sql = format_runtime_generations_for_session_sql(false);
-        runtime_generations_for_session_on(&self.conn, session_id, &sql)
+        runtime_generations_for_session_on(self.conn, session_id, &sql)
+    }
+
+    pub fn classify_session_liveness(
+        &self,
+        session_id: &str,
+    ) -> Result<RuntimeGenerationReadOnlyLiveness, String> {
+        let sql = format_runtime_generations_for_session_sql(true);
+        let generations = runtime_generations_for_session_on(self.conn, session_id, &sql)
+            .map_err(|error| error.to_string())?;
+        Ok(classify_generation_liveness_read_only(&generations))
+    }
+}
+
+impl RuntimeLifecycleRepository<'_> {
+    pub fn reconcile_session_liveness(
+        &mut self,
+        session_id: &str,
+    ) -> Result<SessionLiveness, String> {
+        let sql = format_runtime_generations_for_session_sql(true);
+        let generations = runtime_generations_for_session_on(self.conn, session_id, &sql)
+            .map_err(|error| error.to_string())?;
+        let mut observed_busy = false;
+        for generation in generations {
+            match generation_liveness_observation(&generation) {
+                GenerationLivenessObservation::Busy => observed_busy = true,
+                GenerationLivenessObservation::Stale => {
+                    let result = self
+                        .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                            fence: RuntimeGenerationFence {
+                                generation_id: &generation.generation_id,
+                                spawn_invocation_uuid: &generation.spawn_invocation_uuid,
+                            },
+                            reason: RuntimeTerminalReason::RecoveredDead,
+                            exit_code: None,
+                        })
+                        .map_err(|error| error.to_string())?;
+                    if matches!(result, GenerationMutation::Rejected(_)) {
+                        observed_busy = true;
+                    }
+                }
+            }
+        }
+        Ok(if observed_busy {
+            SessionLiveness::Busy
+        } else {
+            SessionLiveness::Idle
+        })
+    }
+
+    /// Updates only the non-authoritative terminal projection after proving
+    /// that one exact runtime generation owns the completed invocation.
+    pub fn reconcile_terminal_compatibility_projection(
+        &mut self,
+        session_id: &str,
+        spawn_invocation_uuid: &str,
+        compatibility_exit_code: Option<i32>,
+    ) -> Result<TerminalCompatibilityReconciliation, GenerationStorageError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(generation_storage_error(
+                "start terminal compatibility reconciliation transaction",
+            ))?;
+        let (generation_count, exited_count) = tx
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN lifecycle_state = 'exited' THEN 1 ELSE 0 END), 0)
+                 FROM runtime_generation
+                 WHERE session_id = ?1 AND spawn_invocation_uuid = ?2",
+                params![session_id, spawn_invocation_uuid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(generation_storage_error(
+                "read terminal compatibility generation authority",
+            ))?;
+        if generation_count == 0 {
+            tx.commit().map_err(generation_storage_error(
+                "commit absent terminal compatibility reconciliation",
+            ))?;
+            return Ok(TerminalCompatibilityReconciliation::NoGeneration);
+        }
+        if generation_count != 1 || exited_count != 1 {
+            return Err(GenerationStorageError::new(format!(
+                "Runtime generation authority for session {session_id} invocation {spawn_invocation_uuid} is not one exact exited generation"
+            )));
+        }
+        tx.execute(
+            "UPDATE session_runtime
+             SET last_exit_code = ?3
+             WHERE session_id = ?1
+               AND run_state = 'idle'
+               AND running_invocation_uuid IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM runtime_generation
+                   WHERE session_id = ?1
+                     AND spawn_invocation_uuid = ?2
+                     AND lifecycle_state = 'exited'
+               )",
+            params![session_id, spawn_invocation_uuid, compatibility_exit_code],
+        )
+        .map_err(generation_storage_error(
+            "reconcile terminal compatibility projection",
+        ))?;
+        tx.commit().map_err(generation_storage_error(
+            "commit terminal compatibility reconciliation",
+        ))?;
+        Ok(TerminalCompatibilityReconciliation::Reconciled)
     }
 
     pub fn acquire_runtime_generation_delivery(
@@ -1536,6 +1812,15 @@ impl MailboxDb {
             ))?;
             return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
         }
+        let generation_session_id = match runtime_generation_session_id(&before) {
+            Ok(session_id) => session_id.to_string(),
+            Err(rejection) => {
+                tx.commit().map_err(generation_storage_error(
+                    "commit sessionless delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
+            }
+        };
         let has_existing_claim = before.active_delivery_claim_id.is_some();
         if has_existing_claim && validate_existing_delivery_claim(&before).is_err() {
             tx.commit().map_err(generation_storage_error(
@@ -1544,6 +1829,21 @@ impl MailboxDb {
             return Ok(DeliveryClaimAcquireResult::Rejected(
                 GenerationRejection::InvariantViolation,
             ));
+        }
+        if has_existing_claim {
+            let claimed_states = mailbox_delivery_states_on(
+                &tx,
+                &generation_session_id,
+                &before.active_delivery_seqs,
+            )?;
+            if !all_mailbox_seqs_owned(&claimed_states) {
+                tx.commit().map_err(generation_storage_error(
+                    "commit cross-session delivery claim transaction",
+                ))?;
+                return Ok(DeliveryClaimAcquireResult::Rejected(
+                    GenerationRejection::SessionConflict,
+                ));
+            }
         }
         let existing_claim_stale =
             runtime_delivery_claim_is_stale(&before, request.stale_after_seconds);
@@ -1606,7 +1906,16 @@ impl MailboxDb {
                 return Ok(DeliveryClaimAcquireResult::Rejected(rejection));
             }
         }
-        let delivery_states = mailbox_delivery_states_on(&tx, request.seqs)?;
+        let delivery_states =
+            mailbox_delivery_states_on(&tx, &generation_session_id, request.seqs)?;
+        if !all_mailbox_seqs_owned(&delivery_states) {
+            tx.commit().map_err(generation_storage_error(
+                "commit cross-session delivery claim batch transaction",
+            ))?;
+            return Ok(DeliveryClaimAcquireResult::Rejected(
+                GenerationRejection::SessionConflict,
+            ));
+        }
         let rows_pending = all_mailbox_seqs_pending(&delivery_states);
         let claim_encodings = active_delivery_claim_encodings_on(&tx, request.fence.generation_id)?;
         let claim_batches = parse_active_delivery_claim_batches(claim_encodings)?;
@@ -1685,6 +1994,10 @@ impl MailboxDb {
             return Ok(GenerationMutation::Rejected(rejection));
         }
         let before = before.expect("validated active claim requires a generation row");
+        let session_id = before
+            .session_id
+            .as_deref()
+            .expect("validated active claim requires a session");
         if let Err(rejection) = validate_running_delivery_confirmation(&before) {
             tx.commit().map_err(generation_storage_error(
                 "commit non-running delivery confirmation transaction",
@@ -1695,18 +2008,19 @@ impl MailboxDb {
             let changed = tx
                 .execute(
                     "UPDATE mailbox
-                     SET delivered_at = ?2,
-                         delivered_by_invocation_uuid = ?3,
+                     SET delivered_at = ?3,
+                         delivered_by_invocation_uuid = ?4,
                          delivery_attempts = delivery_attempts + 1,
                          delivery_error = NULL
                      WHERE seq = ?1
+                       AND session_id = ?2
                        AND delivered_at IS NULL",
-                    params![seq, &now, request.delivered_by_invocation_uuid],
+                    params![seq, session_id, &now, request.delivered_by_invocation_uuid],
                 )
                 .map_err(generation_storage_error(
                     "confirm claimed mailbox row delivery",
                 ))?;
-            validate_confirmed_mailbox_row_change(*seq, changed)?;
+            validate_claimed_mailbox_row_change(*seq, changed, "confirmation")?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -1725,6 +2039,8 @@ impl MailboxDb {
         &mut self,
         request: FailRuntimeGenerationDelivery<'_>,
     ) -> Result<GenerationMutation<RuntimeGenerationRow>, GenerationStorageError> {
+        reject_unauthorized_terminal_wake_abandonment(request.delivery_error)
+            .map_err(GenerationStorageError::new)?;
         validate_delivery_claim_seqs(request.seqs)?;
         let tx = self
             .conn
@@ -1744,18 +2060,26 @@ impl MailboxDb {
             ))?;
             return Ok(GenerationMutation::Rejected(rejection));
         }
+        let before = before.expect("validated active claim requires a generation row");
+        let session_id = before
+            .session_id
+            .as_deref()
+            .expect("validated active claim requires a session");
         for seq in request.seqs {
-            tx.execute(
-                "UPDATE mailbox
-                 SET delivery_attempts = delivery_attempts + 1,
-                     delivery_error = ?2
-                 WHERE seq = ?1
-                   AND delivered_at IS NULL",
-                params![seq, request.delivery_error],
-            )
-            .map_err(generation_storage_error(
-                "record claimed mailbox row delivery failure",
-            ))?;
+            let changed = tx
+                .execute(
+                    "UPDATE mailbox
+                     SET delivery_attempts = delivery_attempts + 1,
+                         delivery_error = ?3
+                     WHERE seq = ?1
+                       AND session_id = ?2
+                       AND delivered_at IS NULL",
+                    params![seq, session_id, request.delivery_error],
+                )
+                .map_err(generation_storage_error(
+                    "record claimed mailbox row delivery failure",
+                ))?;
+            validate_claimed_mailbox_row_change(*seq, changed, "failure")?;
         }
         clear_runtime_delivery_claim_on(&tx, request.fence, request.claim_id)?;
         let row =
@@ -1800,7 +2124,13 @@ impl MailboxDb {
             ))?;
             return Ok(result);
         }
-        if let Err(rejection) = validate_non_orderly_predecessor(&before) {
+        if let Err(rejection) = validate_recovered_dead_process(&before, &request) {
+            tx.commit().map_err(generation_storage_error(
+                "commit live generation recovery rejection",
+            ))?;
+            return Ok(GenerationMutation::Rejected(rejection));
+        }
+        if let Err(rejection) = validate_non_orderly_predecessor(&before, &request) {
             tx.commit().map_err(generation_storage_error(
                 "commit illegal generation exit transaction",
             ))?;
@@ -1812,9 +2142,12 @@ impl MailboxDb {
                  active_delivery_claim_uuid = NULL,
                  active_delivery_claimed_at = NULL,
                  active_delivery_seqs_json = NULL
-             WHERE generation_uuid = ?1
-               AND spawn_invocation_uuid = ?2
-               AND lifecycle_state IN ('starting', 'running')",
+              WHERE generation_uuid = ?1
+                AND spawn_invocation_uuid = ?2
+                AND (
+                    lifecycle_state IN ('starting', 'running')
+                    OR (lifecycle_state = 'draining' AND ?4 = 'recovered_dead')
+                )",
             params![
                 request.fence.generation_id.to_string(),
                 request.fence.spawn_invocation_uuid,
@@ -1826,10 +2159,12 @@ impl MailboxDb {
         .map_err(generation_storage_error(
             "exit runtime generation non-orderly",
         ))?;
+        settle_runtime_generation_admission_on(&tx, request.fence.generation_id)?;
         let row =
             runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
                 GenerationStorageError::new("Runtime generation missing after exit".to_string())
             })?;
+        project_exited_generation_on(&tx, &row, &now, row.exit_code)?;
         tx.commit().map_err(generation_storage_error(
             "commit non-orderly generation exit transaction",
         ))?;
@@ -2066,18 +2401,22 @@ impl MailboxDb {
             ],
         )
         .map_err(generation_storage_error("finish runtime generation drain"))?;
+        settle_runtime_generation_admission_on(&tx, request.fence.generation_id)?;
         let row =
             runtime_generation_by_id_on(&tx, request.fence.generation_id)?.ok_or_else(|| {
                 GenerationStorageError::new(
                     "Runtime generation missing after drain finish".to_string(),
                 )
             })?;
+        project_exited_generation_on(&tx, &row, &now, request.compatibility_exit_code)?;
         tx.commit().map_err(generation_storage_error(
             "commit generation drain finish transaction",
         ))?;
         Ok(map_finished_drain(row))
     }
+}
 
+impl MailboxDb {
     #[cfg(test)]
     pub(crate) fn register_completion_event(
         &mut self,
@@ -2131,7 +2470,9 @@ impl MailboxDb {
         input: CompletionEventTriggerInput<'_>,
     ) -> Result<CompletionEventTriggerResult, String> {
         validate_completion_event_trigger(&input)?;
-        let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let published = self
+            .payloads()
+            .publish_immutable_payload(input.payload_json.as_bytes())?;
         let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
@@ -2224,7 +2565,9 @@ impl MailboxDb {
         &mut self,
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
-        let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let published = self
+            .payloads()
+            .publish_immutable_payload(input.payload_json.as_bytes())?;
         let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
@@ -2243,7 +2586,7 @@ impl MailboxDb {
         input: &SubmittedInputEnqueue<'_>,
     ) -> Result<EnqueueResult, String> {
         validate_submitted_input(input)?;
-        let published = self.publish_immutable_payload(input.input)?;
+        let published = self.payloads().publish_immutable_payload(input.input)?;
         let handle = submitted_input_handle(input.submission_token, input.target)?;
         let payload_json = submitted_input_payload_json(input, &published)?;
         let now = now_rfc3339();
@@ -2256,6 +2599,36 @@ impl MailboxDb {
         tx.commit()
             .map_err(|err| format!("Failed to commit input enqueue transaction: {err}"))?;
         Ok(result)
+    }
+}
+
+impl PayloadRetentionRepository<'_> {
+    fn payload_reference(&self, bytes: &[u8]) -> Result<PublishedMailboxPayload, String> {
+        let byte_len = u64::try_from(bytes.len())
+            .map_err(|_| "Mailbox payload length does not fit u64".to_string())?;
+        let sha256 = sha256_hex(bytes);
+        Ok(PublishedMailboxPayload {
+            address: payload_address(&sha256),
+            file_path: self.payload_path_for_sha256(&sha256)?,
+            sha256,
+            byte_len,
+            retention_policy: MAILBOX_PAYLOAD_RETENTION_POLICY.to_string(),
+        })
+    }
+
+    fn payload_path_for_sha256(&self, sha256: &str) -> Result<PathBuf, String> {
+        validate_sha256_hex(sha256)?;
+        let root = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Ok(root
+            .join(MAILBOX_PAYLOAD_DIRECTORY)
+            .join(MAILBOX_PAYLOAD_ADDRESS_VERSION)
+            .join(MAILBOX_PAYLOAD_ALGORITHM)
+            .join(&sha256[..2])
+            .join(sha256))
     }
 
     /// Publishes bytes before their acceptance metadata is committed. A caller
@@ -2333,13 +2706,13 @@ impl MailboxDb {
     }
 
     pub fn compact_delivered_payloads(
-        &mut self,
+        &self,
         limit: usize,
     ) -> Result<DeliveredPayloadCompactionReport, String> {
         if limit == 0 {
             return Ok(DeliveredPayloadCompactionReport::default());
         }
-        let candidates = delivered_payload_compaction_candidates(&self.conn, limit)?;
+        let candidates = delivered_payload_compaction_candidates(self.conn, limit)?;
         let mut report = DeliveredPayloadCompactionReport {
             scanned_rows: candidates.len(),
             ..DeliveredPayloadCompactionReport::default()
@@ -2349,7 +2722,7 @@ impl MailboxDb {
             let published = self.retained_payload_for_compaction(&candidate)?;
             let compacted_json = compacted_payload_json(&candidate.kind, &published)?;
             let changed =
-                mark_payload_compacted(&self.conn, &candidate, &published, &compacted_json)?;
+                mark_payload_compacted(self.conn, &candidate, &published, &compacted_json)?;
             let delta = map_compaction_report_delta(
                 original_len,
                 &published,
@@ -2373,7 +2746,9 @@ impl MailboxDb {
             None => self.publish_immutable_payload(candidate.payload_json.as_bytes()),
         }
     }
+}
 
+impl MailboxDb {
     pub fn list_pending(&self, session_id: &str) -> Result<Vec<MailboxRow>, String> {
         self.list_pending_for_delivery(session_id, None)
     }
@@ -2603,6 +2978,7 @@ impl MailboxDb {
     pub fn mark_delivered(
         &mut self,
         session_id: &str,
+        chain_id: Option<&str>,
         seqs: &[i64],
         delivered_by_invocation_uuid: &str,
     ) -> Result<(), String> {
@@ -2612,19 +2988,31 @@ impl MailboxDb {
         let now = now_rfc3339();
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|err| format!("Failed to start mailbox delivery transaction: {err}"))?;
+        let delivery_states = mailbox_delivery_target_states_on(&tx, session_id, chain_id, seqs)
+            .map_err(|err| format!("Failed to validate mailbox delivery batch: {err}"))?;
+        if !all_mailbox_seqs_owned(&delivery_states) {
+            return Err(
+                "Mailbox delivery batch contains a missing or foreign-session row".to_string(),
+            );
+        }
+        let update_sql = format!(
+            "UPDATE mailbox
+             SET delivered_at = ?4,
+                 delivered_by_invocation_uuid = ?5,
+                 delivery_attempts = delivery_attempts + 1,
+                 delivery_error = NULL
+             WHERE seq = ?3
+               AND delivered_at IS NULL
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+        );
         for seq in seqs {
             tx.execute(
-                "UPDATE mailbox
-                 SET delivered_at = ?3,
-                     delivered_by_invocation_uuid = ?4,
-                     delivery_attempts = delivery_attempts + 1,
-                     delivery_error = NULL
-                 WHERE seq = ?2
-                   AND delivered_at IS NULL",
+                &update_sql,
                 params![
-                    rusqlite::types::Null,
+                    session_id,
+                    chain_id,
                     seq,
                     &now,
                     delivered_by_invocation_uuid
@@ -2632,7 +3020,7 @@ impl MailboxDb {
             )
             .map_err(|err| format!("Failed to mark mailbox row delivered: {err}"))?;
         }
-        acknowledge_completion_event_listeners_for_seqs(&tx, seqs, &now)?;
+        acknowledge_completion_event_listeners_for_seqs(&tx, session_id, chain_id, seqs, &now)?;
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         tx.commit()
             .map_err(|err| format!("Failed to commit mailbox delivery transaction: {err}"))
@@ -2657,9 +3045,10 @@ impl MailboxDb {
             "UPDATE mailbox_delivery_attempts
              SET resolved_at = ?3
              WHERE session_id = ?1
-               AND delivery_invocation_uuid != ?2
-               AND acknowledged_at IS NULL
-               AND resolved_at IS NULL",
+                AND delivery_invocation_uuid != ?2
+                AND acknowledged_at IS NULL
+                AND submission_started_at IS NULL
+                AND resolved_at IS NULL",
             params![session_id, delivery_invocation_uuid, &now],
         )
         .map_err(|err| {
@@ -2712,6 +3101,7 @@ impl MailboxDb {
         attempt_id: &str,
         session_id: &str,
         delivery_invocation_uuid: &str,
+        turn_generation_id: &str,
         seqs: &[i64],
         remaining_count: usize,
     ) -> Result<String, String> {
@@ -2726,7 +3116,7 @@ impl MailboxDb {
         resolve_completed_delivery_attempts(&tx, session_id, &now, None)?;
         let existing = tx
             .query_row(
-                "SELECT attempt_id
+                "SELECT attempt_id, evidence_turn_generation_id
                  FROM mailbox_delivery_attempts
                  WHERE session_id = ?1
                    AND delivery_invocation_uuid = ?2
@@ -2734,23 +3124,57 @@ impl MailboxDb {
                  ORDER BY created_at, attempt_id
                  LIMIT 1",
                 params![session_id, delivery_invocation_uuid],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()
             .map_err(|err| format!("Failed to query reusable mailbox delivery attempt: {err}"))?;
-        if let Some(existing) = existing {
+        if let Some((existing, recorded_generation_id)) = existing {
+            if let Some(recorded_generation_id) = recorded_generation_id
+                && recorded_generation_id != turn_generation_id
+            {
+                return Err(format!(
+                    "Mailbox delivery attempt {existing} belongs to State generation {recorded_generation_id}, not {turn_generation_id}"
+                ));
+            }
+            tx.execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET evidence_turn_generation_id = COALESCE(evidence_turn_generation_id, ?2)
+                 WHERE attempt_id = ?1",
+                params![&existing, turn_generation_id],
+            )
+            .map_err(|err| format!("Failed to bind reused mailbox delivery evidence: {err}"))?;
             tx.commit().map_err(|err| {
                 format!("Failed to commit reused mailbox delivery attempt: {err}")
             })?;
             return Ok(existing);
         }
+        let retained_submission = tx
+            .query_row(
+                "SELECT attempt_id
+                 FROM mailbox_delivery_attempts
+                 WHERE session_id = ?1
+                   AND submission_started_at IS NOT NULL
+                   AND resolved_at IS NULL
+                 ORDER BY submission_started_at, created_at, attempt_id
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to query retained mailbox submission: {err}"))?;
+        if let Some(retained_submission) = retained_submission {
+            return Err(format!(
+                "mailbox_delivery_submission_uncertain:{retained_submission}"
+            ));
+        }
         tx.execute(
             "UPDATE mailbox_delivery_attempts
              SET resolved_at = ?3
              WHERE session_id = ?1
-               AND delivery_invocation_uuid != ?2
-               AND acknowledged_at IS NULL
-               AND resolved_at IS NULL",
+                AND delivery_invocation_uuid != ?2
+                AND acknowledged_at IS NULL
+                AND submission_started_at IS NULL
+                AND resolved_at IS NULL",
             params![session_id, delivery_invocation_uuid, &now],
         )
         .map_err(|err| {
@@ -2759,14 +3183,15 @@ impl MailboxDb {
         tx.execute(
             "INSERT INTO mailbox_delivery_attempts (
                 attempt_id, session_id, delivery_invocation_uuid, created_at,
-                prepared_remaining_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                prepared_remaining_count, evidence_turn_generation_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 attempt_id,
                 session_id,
                 delivery_invocation_uuid,
                 &now,
-                remaining_count as i64
+                remaining_count as i64,
+                turn_generation_id,
             ],
         )
         .map_err(|err| format!("Failed to insert mailbox delivery attempt: {err}"))?;
@@ -2835,10 +3260,17 @@ impl MailboxDb {
         &self,
         attempt_id: &str,
     ) -> Result<Option<MailboxDeliveryWindow>, String> {
-        let Some((session_id, delivery_invocation_uuid, acknowledged_at, resolved_at)) = self
+        let Some((
+            session_id,
+            delivery_invocation_uuid,
+            acknowledged_at,
+            submission_started_at,
+            resolved_at,
+        )) = self
             .conn
             .query_row(
-                "SELECT session_id, delivery_invocation_uuid, acknowledged_at, resolved_at
+                "SELECT session_id, delivery_invocation_uuid, acknowledged_at,
+                        submission_started_at, resolved_at
                  FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
                 params![attempt_id],
                 |row| {
@@ -2847,6 +3279,7 @@ impl MailboxDb {
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -2893,10 +3326,25 @@ impl MailboxDb {
             session_id,
             delivery_invocation_uuid,
             acknowledged_at,
+            submission_started_at,
             resolved_at,
             remaining_count: pending_count.saturating_sub(rows.len()),
             rows,
         }))
+    }
+
+    pub fn delivery_attempt_item_seqs(&self, attempt_id: &str) -> Result<Vec<i64>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mailbox_seq FROM mailbox_delivery_attempt_items
+                 WHERE attempt_id = ?1 ORDER BY mailbox_seq",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox delivery item query: {err}"))?;
+        stmt.query_map(params![attempt_id], |row| row.get(0))
+            .map_err(|err| format!("Failed to query mailbox delivery items: {err}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read mailbox delivery item: {err}"))
     }
 
     pub fn accepted_delivery_attempt_windows(
@@ -2954,13 +3402,41 @@ impl MailboxDb {
         self.conn
             .execute(
                 "UPDATE mailbox_delivery_attempts
-                 SET acknowledged_at = COALESCE(acknowledged_at, ?2)
+                 SET submission_started_at = COALESCE(submission_started_at, ?2),
+                     acknowledged_at = COALESCE(acknowledged_at, ?2)
                  WHERE attempt_id = ?1
                    AND resolved_at IS NULL",
                 params![attempt_id, &now],
             )
             .map(|changed| changed > 0)
             .map_err(|err| format!("Failed to record mailbox delivery transport ACK: {err}"))
+    }
+
+    pub fn begin_delivery_attempt_submission(&mut self, attempt_id: &str) -> Result<bool, String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET submission_started_at = COALESCE(submission_started_at, ?2)
+                 WHERE attempt_id = ?1
+                   AND resolved_at IS NULL",
+                params![attempt_id, &now],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|err| format!("Failed to start mailbox delivery submission: {err}"))
+    }
+
+    pub fn delivery_attempt_submission_started(&self, attempt_id: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT submission_started_at IS NOT NULL
+                 FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to inspect mailbox delivery submission: {err}"))?
+            .ok_or_else(|| format!("Mailbox delivery attempt {attempt_id} is missing"))
     }
 
     pub fn resolve_unacknowledged_delivery_attempt(
@@ -2974,6 +3450,7 @@ impl MailboxDb {
                  SET resolved_at = ?2
                  WHERE attempt_id = ?1
                    AND acknowledged_at IS NULL
+                   AND submission_started_at IS NULL
                    AND resolved_at IS NULL",
                 params![attempt_id, &now],
             )
@@ -2983,6 +3460,7 @@ impl MailboxDb {
 
     pub fn confirm_delivery_attempt(&mut self, attempt_id: &str) -> Result<bool, String> {
         let now = now_rfc3339();
+        let observed_at = now_unix_millis()?;
         let tx = self.conn.transaction().map_err(|err| {
             format!("Failed to start mailbox delivery confirmation transaction: {err}")
         })?;
@@ -2990,7 +3468,14 @@ impl MailboxDb {
             .query_row(
                 "SELECT session_id, delivery_invocation_uuid
                  FROM mailbox_delivery_attempts
-                 WHERE attempt_id = ?1 AND acknowledged_at IS NOT NULL",
+                 WHERE attempt_id = ?1
+                   AND submission_started_at IS NOT NULL
+                   AND (
+                       evidence_disposition IS NULL
+                       OR evidence_disposition IN (
+                           'pending', 'legacy_pending', 'reconciled', 'legacy_reconciled'
+                       )
+                   )",
                 params![attempt_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -2999,6 +3484,15 @@ impl MailboxDb {
         else {
             return Ok(false);
         };
+        tx.execute(
+            "UPDATE mailbox_delivery_attempts
+             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
+                 evidence_observed_at = COALESCE(evidence_observed_at, ?3),
+                 evidence_disposition = COALESCE(evidence_disposition, 'pending')
+             WHERE attempt_id = ?1",
+            params![attempt_id, &now, observed_at],
+        )
+        .map_err(|err| format!("Failed to record mailbox delivery transport ACK: {err}"))?;
         tx.execute(
             "UPDATE mailbox
              SET delivered_at = ?3,
@@ -3031,11 +3525,137 @@ impl MailboxDb {
         Ok(true)
     }
 
+    pub fn pending_delivery_evidence_obligations(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<MailboxDeliveryEvidenceObligation>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT attempt_id, session_id, evidence_turn_generation_id,
+                        evidence_observed_at,
+                        evidence_disposition = 'legacy_pending'
+                 FROM mailbox_delivery_attempts
+                 WHERE session_id = ?1
+                   AND acknowledged_at IS NOT NULL
+                   AND evidence_turn_generation_id IS NOT NULL
+                   AND evidence_observed_at IS NOT NULL
+                   AND evidence_disposition IN ('pending', 'legacy_pending')
+                   AND evidence_reconciled_at IS NULL
+                 ORDER BY acknowledged_at, created_at, attempt_id",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox evidence obligations: {err}"))?;
+        stmt.query_map(params![session_id], |row| {
+            Ok(MailboxDeliveryEvidenceObligation {
+                attempt_id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_generation_id: row.get(2)?,
+                observed_at: row.get(3)?,
+                legacy: row.get(4)?,
+            })
+        })
+        .map_err(|err| format!("Failed to query mailbox evidence obligations: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read mailbox evidence obligation: {err}"))
+    }
+
+    pub fn pending_delivery_evidence_obligation_session_ids(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT session_id
+                 FROM mailbox_delivery_attempts
+                 WHERE acknowledged_at IS NOT NULL
+                   AND evidence_turn_generation_id IS NOT NULL
+                   AND evidence_observed_at IS NOT NULL
+                   AND evidence_disposition IN ('pending', 'legacy_pending')
+                   AND evidence_reconciled_at IS NULL
+                 ORDER BY session_id
+                 LIMIT ?1",
+            )
+            .map_err(|err| format!("Failed to prepare mailbox evidence session query: {err}"))?;
+        stmt.query_map(params![limit as i64], |row| row.get(0))
+            .map_err(|err| format!("Failed to query mailbox evidence sessions: {err}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("Failed to read mailbox evidence session: {err}"))
+    }
+
+    pub fn delivery_evidence_obligation(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<MailboxDeliveryEvidenceObligation>, String> {
+        self.conn
+            .query_row(
+                "SELECT attempt_id, session_id, evidence_turn_generation_id,
+                        evidence_observed_at,
+                        evidence_disposition IN ('legacy_pending', 'legacy_reconciled')
+                 FROM mailbox_delivery_attempts
+                 WHERE attempt_id = ?1
+                   AND acknowledged_at IS NOT NULL
+                   AND evidence_turn_generation_id IS NOT NULL
+                   AND evidence_observed_at IS NOT NULL",
+                params![attempt_id],
+                |row| {
+                    Ok(MailboxDeliveryEvidenceObligation {
+                        attempt_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        turn_generation_id: row.get(2)?,
+                        observed_at: row.get(3)?,
+                        legacy: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| format!("Failed to read mailbox evidence obligation: {err}"))
+    }
+
+    pub fn mark_delivery_evidence_reconciled(&mut self, attempt_id: &str) -> Result<bool, String> {
+        let now = now_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET evidence_reconciled_at = COALESCE(evidence_reconciled_at, ?2),
+                     evidence_disposition = CASE evidence_disposition
+                         WHEN 'legacy_pending' THEN 'legacy_reconciled'
+                         ELSE 'reconciled'
+                       END
+                 WHERE attempt_id = ?1
+                   AND acknowledged_at IS NOT NULL
+                   AND evidence_observed_at IS NOT NULL
+                   AND evidence_reconciled_at IS NULL",
+                params![attempt_id, &now],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|err| format!("Failed to clear mailbox evidence obligation: {err}"))
+    }
+
+    pub fn adopt_legacy_delivery_evidence_observed_at(
+        &mut self,
+        attempt_id: &str,
+        observed_at: i64,
+    ) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "UPDATE mailbox_delivery_attempts
+                 SET evidence_observed_at = ?2
+                 WHERE attempt_id = ?1
+                   AND evidence_disposition = 'legacy_pending'
+                   AND evidence_reconciled_at IS NULL",
+                params![attempt_id, observed_at],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|err| format!("Failed to adopt legacy mailbox evidence timestamp: {err}"))
+    }
+
     pub fn fail_unobserved_delivery_attempt(
         &mut self,
         attempt_id: &str,
         delivery_error: &str,
     ) -> Result<bool, String> {
+        reject_unauthorized_terminal_wake_abandonment(delivery_error)?;
         let now = now_rfc3339();
         let tx = self.conn.transaction().map_err(|err| {
             format!("Failed to start unobserved mailbox delivery transaction: {err}")
@@ -3083,24 +3703,41 @@ impl MailboxDb {
 
     pub fn mark_delivery_failed(
         &mut self,
-        _session_id: &str,
+        session_id: &str,
+        chain_id: Option<&str>,
         seqs: &[i64],
         delivery_error: &str,
     ) -> Result<(), String> {
+        reject_unauthorized_terminal_wake_abandonment(delivery_error)?;
         if seqs.is_empty() {
             return Ok(());
         }
-        let tx = self.conn.transaction().map_err(|err| {
-            format!("Failed to start mailbox delivery failure transaction: {err}")
-        })?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| {
+                format!("Failed to start mailbox delivery failure transaction: {err}")
+            })?;
+        let delivery_states = mailbox_delivery_target_states_on(&tx, session_id, chain_id, seqs)
+            .map_err(|err| format!("Failed to validate mailbox delivery failure batch: {err}"))?;
+        if !all_mailbox_seqs_pending(&delivery_states) {
+            return Err(
+                "Mailbox delivery failure batch contains a missing, settled, or foreign-target row"
+                    .to_string(),
+            );
+        }
+        let update_sql = format!(
+            "UPDATE mailbox
+             SET delivery_attempts = delivery_attempts + 1,
+                 delivery_error = ?4
+             WHERE seq = ?3
+               AND delivered_at IS NULL
+               AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+        );
         for seq in seqs {
             tx.execute(
-                "UPDATE mailbox
-                 SET delivery_attempts = delivery_attempts + 1,
-                     delivery_error = ?3
-                 WHERE seq = ?2
-                   AND delivered_at IS NULL",
-                params![rusqlite::types::Null, seq, delivery_error],
+                &update_sql,
+                params![session_id, chain_id, seq, delivery_error],
             )
             .map_err(|err| format!("Failed to mark mailbox row delivery failed: {err}"))?;
         }
@@ -3108,10 +3745,10 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to commit mailbox delivery failure transaction: {err}"))
     }
 
-    pub fn mark_pending_abandoned(
+    #[cfg(test)]
+    fn force_pending_abandoned_for_test(
         &mut self,
         session_id: &str,
-        delivery_error: &str,
         limit: usize,
     ) -> Result<usize, String> {
         if limit == 0 {
@@ -3128,13 +3765,13 @@ impl MailboxDb {
                  WHERE seq IN (
                     SELECT seq
                     FROM mailbox
-                    WHERE session_id = ?1
-                      AND delivered_at IS NULL
-                      AND (delivery_error IS NULL OR delivery_error != ?2)
+                     WHERE session_id = ?1
+                       AND delivered_at IS NULL
+                       AND (delivery_error IS NULL OR delivery_error != ?2)
                     ORDER BY seq ASC
                     LIMIT ?3
                  )",
-                params![session_id, delivery_error, limit as i64],
+                params![session_id, WAKE_SWEEP_ABANDONED_ERROR, limit as i64],
             )
             .map_err(|err| format!("Failed to mark mailbox rows abandoned: {err}"))?;
         if changed > 0 {
@@ -3148,10 +3785,12 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to commit mailbox abandonment transaction: {err}"))?;
         Ok(changed)
     }
+}
 
-    pub fn upsert_session_runtime(
+impl WakeSessionRepository<'_> {
+    pub fn upsert_session_metadata(
         &mut self,
-        input: SessionRuntimeUpsert<'_>,
+        input: SessionMetadataUpsert<'_>,
     ) -> Result<(), String> {
         let now = now_rfc3339();
         self.conn
@@ -3162,19 +3801,17 @@ impl MailboxDb {
                     invocation_uuid,
                     provider_name,
                     model_name,
-                    pty_control_path,
                     updated_at,
                     models_dir,
                     effective_cwd,
                     selected_auto_wake_max
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(session_id)
                  DO UPDATE SET
                     mode = excluded.mode,
                     invocation_uuid = COALESCE(excluded.invocation_uuid, session_runtime.invocation_uuid),
                     provider_name = excluded.provider_name,
                     model_name = excluded.model_name,
-                    pty_control_path = excluded.pty_control_path,
                     updated_at = excluded.updated_at,
                     models_dir = COALESCE(excluded.models_dir, session_runtime.models_dir),
                     effective_cwd = COALESCE(excluded.effective_cwd, session_runtime.effective_cwd),
@@ -3188,7 +3825,6 @@ impl MailboxDb {
                     input.invocation_uuid,
                     input.provider_name,
                     input.model_name,
-                    input.pty_control_path,
                     &now,
                     input.models_dir,
                     input.effective_cwd,
@@ -3199,46 +3835,262 @@ impl MailboxDb {
         Ok(())
     }
 
-    pub fn mark_session_running(
+    /// Installs a compatibility projection for a pre-generation runtime.
+    /// New runtime producers must use `RuntimeLifecycleRepository` instead.
+    pub fn project_legacy_runtime_running(
         &mut self,
-        input: SessionRuntimeRunningUpdate<'_>,
+        input: LegacyRuntimeProjection<'_>,
     ) -> Result<(), String> {
         validate_running_run_state()?;
         let now = now_rfc3339();
         let turn_start_max_mailbox_seq = self.running_turn_start_max_mailbox_seq(&input)?;
-        mark_session_running_row(&self.conn, input, &now, turn_start_max_mailbox_seq)
+        project_runtime_compatibility_row(self.conn, input, &now, turn_start_max_mailbox_seq)
     }
 
-    pub fn mark_session_idle(
+    /// Settles a retained compatibility projection. Generation-owned callers
+    /// settle it inside the same lifecycle transaction.
+    pub fn settle_legacy_runtime_projection(
         &mut self,
-        input: SessionRuntimeIdleUpdate<'_>,
+        input: LegacyRuntimeProjectionSettlement<'_>,
     ) -> Result<bool, String> {
         validate_idle_run_state()?;
         let now = now_rfc3339();
-        mark_session_idle_row(&self.conn, input, &now)
+        settle_runtime_compatibility_row(self.conn, input, &now)
     }
+}
 
-    pub fn session_runtime(&self, session_id: &str) -> Result<Option<SessionRuntimeRow>, String> {
-        let row = session_runtime_row(&self.conn, session_id)?;
-        validate_session_runtime_row(row.as_ref())?;
+impl SessionAdmissionRepository<'_> {
+    pub fn enqueue(
+        &mut self,
+        admission_id: &str,
+        registration_identity: &str,
+        session_id: Option<&str>,
+        launcher: &ProcessIdentity,
+        now_unix_ms: i64,
+    ) -> Result<SessionAdmissionRow, String> {
+        validate_session_admission_identity(admission_id, "admission_id")?;
+        validate_session_admission_identity(registration_identity, "registration_identity")?;
+        validate_optional_session_admission_identity(session_id, "session_id")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start session admission enqueue: {err}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO session_admission_queue (
+                admission_id, registration_identity, session_id, state, queue_reason,
+                launcher_os_pid, launcher_os_boot_id,
+                launcher_os_pid_starttime_ticks,
+                created_at_unix_ms, updated_at_unix_ms
+             ) VALUES (?1, ?2, ?3, 'queued', 'fifo_wait', ?4, ?5, ?6, ?7, ?7)",
+            params![
+                admission_id,
+                registration_identity,
+                session_id,
+                launcher.os_pid,
+                &launcher.os_boot_id,
+                launcher.os_pid_starttime_ticks,
+                now_unix_ms,
+            ],
+        )
+        .map_err(|err| format!("Failed to enqueue session admission: {err}"))?;
+        let existing = session_admission_by_registration_on(&tx, registration_identity)?
+            .ok_or_else(|| "Session admission row is missing after enqueue".to_string())?;
+        if let (Some(existing_session), Some(requested_session)) =
+            (existing.session_id.as_deref(), session_id)
+            && existing_session != requested_session
+        {
+            return Err(format!(
+                "Session admission {} is already bound to session {existing_session}, not {requested_session}",
+                existing.admission_id
+            ));
+        }
+        if existing.session_id.is_none() && session_id.is_some() {
+            tx.execute(
+                "UPDATE session_admission_queue
+                 SET session_id = ?2, updated_at_unix_ms = ?3
+                 WHERE registration_identity = ?1 AND session_id IS NULL",
+                params![registration_identity, session_id, now_unix_ms],
+            )
+            .map_err(|err| format!("Failed to bind queued session admission: {err}"))?;
+        }
+        let row = session_admission_by_registration_on(&tx, registration_identity)?
+            .ok_or_else(|| "Session admission row disappeared during enqueue".to_string())?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit session admission enqueue: {err}"))?;
         Ok(row)
     }
 
-    pub fn session_liveness(&mut self, session_id: &str) -> Result<SessionLiveness, String> {
-        let row = self.session_runtime(session_id)?;
-        let decision = session_runtime_liveness_decision(row.as_ref())?;
-        self.clear_stale_running_row_for_liveness(session_id, &decision)?;
-        Ok(session_liveness_from_decision(&decision))
+    pub fn row(&self, registration_identity: &str) -> Result<Option<SessionAdmissionRow>, String> {
+        session_admission_by_registration_on(self.conn, registration_identity)
     }
 
-    pub fn classify_session_runtime_read_only(
+    pub fn queued_position(&self, registration_identity: &str) -> Result<Option<i64>, String> {
+        self.conn
+            .query_row(
+                "SELECT CASE WHEN target.state = 'queued' THEN (
+                     SELECT COUNT(*)
+                     FROM session_admission_queue queued
+                     WHERE queued.state = 'queued'
+                       AND queued.queue_sequence <= target.queue_sequence
+                 ) END
+                 FROM session_admission_queue target
+                 WHERE target.registration_identity = ?1",
+                params![registration_identity],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(|err| format!("Failed to read session admission queue position: {err}"))
+    }
+
+    pub fn update_queued_reason(
+        &mut self,
+        registration_identity: &str,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<bool, String> {
+        validate_session_admission_identity(reason, "queue_reason")?;
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET queue_reason = ?2, updated_at_unix_ms = ?3
+                 WHERE registration_identity = ?1 AND state = 'queued'",
+                params![registration_identity, reason, now_unix_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| format!("Failed to update session admission queue reason: {err}"))
+    }
+
+    pub fn try_admit_next(
+        &mut self,
+        claim_token: &str,
+        now_unix_ms: i64,
+        stale_before_unix_ms: i64,
+    ) -> Result<SessionAdmissionAttempt, String> {
+        validate_session_admission_identity(claim_token, "claim_token")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start session admission drain: {err}"))?;
+        cancel_dead_queued_session_admissions_on(&tx, now_unix_ms)?;
+        reconcile_dead_starting_generations_on(&tx, now_unix_ms)?;
+        recover_stale_session_admissions_on(&tx, stale_before_unix_ms, now_unix_ms)?;
+        let next = tx
+            .query_row(
+                "SELECT registration_identity
+                 FROM session_admission_queue
+                 WHERE state = 'queued'
+                 ORDER BY queue_sequence ASC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| format!("Failed to select next session admission: {err}"))?;
+        let Some(registration_identity) = next else {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit empty admission drain: {err}"))?;
+            return Ok(SessionAdmissionAttempt::Empty);
+        };
+        let changed = tx
+            .execute(
+                "UPDATE session_admission_queue
+                 SET state = 'admitted', queue_reason = 'capacity_reserved', claim_token = ?2,
+                     claimed_at_unix_ms = ?3, updated_at_unix_ms = ?3
+                 WHERE registration_identity = ?1 AND state = 'queued'",
+                params![&registration_identity, claim_token, now_unix_ms],
+            )
+            .map_err(|err| format!("Failed to reserve session admission: {err}"))?;
+        if changed != 1 {
+            return Err("Session admission changed during serialized drain".to_string());
+        }
+        let row = session_admission_by_registration_on(&tx, &registration_identity)?
+            .ok_or_else(|| "Admitted session row disappeared".to_string())?;
+        tx.commit()
+            .map_err(|err| format!("Failed to commit session admission: {err}"))?;
+        Ok(SessionAdmissionAttempt::Admitted(row))
+    }
+
+    pub fn begin_launch(
+        &mut self,
+        registration_identity: &str,
+        claim_token: &str,
+        now_unix_ms: i64,
+    ) -> Result<bool, String> {
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET state = 'launching', queue_reason = 'launching', updated_at_unix_ms = ?3
+                 WHERE registration_identity = ?1
+                   AND claim_token = ?2
+                   AND state = 'admitted'",
+                params![registration_identity, claim_token, now_unix_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| format!("Failed to begin exact session admission launch: {err}"))
+    }
+
+    pub fn bind_session(
+        &mut self,
+        registration_identity: &str,
+        claim_token: &str,
+        session_id: &str,
+        now_unix_ms: i64,
+    ) -> Result<bool, String> {
+        validate_session_admission_identity(session_id, "session_id")?;
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET session_id = ?3, updated_at_unix_ms = ?4
+                 WHERE registration_identity = ?1
+                   AND claim_token = ?2
+                   AND (session_id IS NULL OR session_id = ?3)",
+                params![registration_identity, claim_token, session_id, now_unix_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| format!("Failed to bind session admission identity: {err}"))
+    }
+
+    pub fn settle(
+        &mut self,
+        registration_identity: &str,
+        claim_token: &str,
+    ) -> Result<bool, String> {
+        let now_unix_ms = now_unix_millis()?;
+        self.conn
+            .execute(
+                "UPDATE session_admission_queue
+                 SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?3
+                 WHERE registration_identity = ?1
+                   AND claim_token = ?2
+                   AND state IN ('admitted', 'launching')",
+                params![registration_identity, claim_token, now_unix_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|err| format!("Failed to settle exact session admission: {err}"))
+    }
+}
+
+impl WakeSessionReader<'_> {
+    pub fn session_metadata(&self, session_id: &str) -> Result<Option<SessionMetadataRow>, String> {
+        session_metadata_row(self.conn, session_id)
+    }
+
+    pub fn legacy_runtime_projection(
         &self,
         session_id: &str,
-    ) -> Result<SessionRuntimeReadOnlyLiveness, String> {
-        let row = self.session_runtime(session_id)?;
-        classify_session_runtime_row_read_only(row.as_ref())
+    ) -> Result<Option<LegacyRuntimeProjectionRow>, String> {
+        let row = legacy_runtime_projection_row(self.conn, session_id)?;
+        validate_legacy_runtime_projection(row.as_ref())?;
+        Ok(row)
     }
 
+    pub fn wake_claim(&self, session_id: &str) -> Result<Option<WakeClaimRow>, String> {
+        wake_claim(self.conn, session_id)
+    }
+}
+
+impl WakeSessionRepository<'_> {
     pub fn try_acquire_wake_claim(
         &mut self,
         input: WakeClaimRequest<'_>,
@@ -3251,16 +4103,42 @@ impl MailboxDb {
         input: WakeClaimRequest<'_>,
         renew_token: Option<&str>,
     ) -> Result<WakeClaimAcquireResult, String> {
-        if let Some(result) = self.wake_claim_start_blocker(input.session_id)? {
-            return Ok(result);
+        self.try_acquire_startable_wake_claim(input, renew_token, i64::MAX)
+    }
+
+    pub fn try_acquire_startable_wake_claim(
+        &mut self,
+        input: WakeClaimRequest<'_>,
+        renew_token: Option<&str>,
+        auto_wake_max: i64,
+    ) -> Result<WakeClaimAcquireResult, String> {
+        if auto_wake_max <= 0 {
+            return Err("Wake claim auto-wake maximum must be positive".to_string());
         }
         let now = now_rfc3339();
-        let tx = begin_wake_claim_transaction(&mut self.conn)?;
+        let tx = begin_wake_claim_transaction(self.conn)?;
+        if wake_claim_runtime_is_busy_tx(&tx, input.session_id)? {
+            commit_empty_wake_claim_transaction(tx)?;
+            return Ok(WakeClaimAcquireResult::Busy);
+        }
+        if wake_claim_notifications_paused_tx(&tx, input.session_id)? {
+            commit_empty_wake_claim_transaction(tx)?;
+            return Ok(WakeClaimAcquireResult::NoPending);
+        }
         let pending_bounds = pending_seq_bounds_for_claim_tx(&tx, input.session_id)?;
         let Some((min_seq, max_seq)) = pending_bounds else {
             commit_empty_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::NoPending);
         };
+        if let Some((current_count, max_count)) =
+            wake_claim_cap_reached_tx(&tx, input, auto_wake_max)?
+        {
+            commit_empty_wake_claim_transaction(tx)?;
+            return Ok(WakeClaimAcquireResult::CapReached {
+                current_count,
+                max_count,
+            });
+        }
         if let Some(existing) = fresh_in_flight_wake_claim_for_input(&tx, input, renew_token)? {
             commit_existing_wake_claim_transaction(tx)?;
             return Ok(WakeClaimAcquireResult::AlreadyInFlight(existing));
@@ -3269,40 +4147,79 @@ impl MailboxDb {
         commit_wake_claim_transaction(tx)?;
         Ok(WakeClaimAcquireResult::Acquired(claim))
     }
+}
 
-    fn wake_claim_start_blocker(
-        &mut self,
-        session_id: &str,
-    ) -> Result<Option<WakeClaimAcquireResult>, String> {
-        if !self.session_has_pending_mailbox(session_id)? {
-            return Ok(Some(WakeClaimAcquireResult::NoPending));
-        }
-        if self.session_is_busy(session_id)? {
-            return Ok(Some(WakeClaimAcquireResult::Busy));
-        }
-        Ok(None)
-    }
-
-    pub fn wake_claim(&self, session_id: &str) -> Result<Option<WakeClaimRow>, String> {
-        wake_claim(&self.conn, session_id)
-    }
-
+impl WakeSessionRepository<'_> {
     pub fn release_wake_claim(
         &mut self,
         session_id: &str,
-        claim_token: Option<&str>,
+        claim_token: &str,
     ) -> Result<bool, String> {
-        let changed = match claim_token {
-            Some(token) => self.conn.execute(
-                "DELETE FROM session_wake_claim WHERE session_id = ?1 AND claim_token = ?2",
-                params![session_id, token],
-            ),
-            None => self.conn.execute(
-                "DELETE FROM session_wake_claim WHERE session_id = ?1",
-                params![session_id],
-            ),
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NULL",
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release wake claim: {err}"))?;
+        Ok(changed > 0)
+    }
+
+    pub fn release_wake_claim_for_manual_resume(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start manual wake-claim release: {err}"))?;
+        let Some(claim) = wake_claim_tx(&tx, session_id)? else {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit missing manual wake claim: {err}"))?;
+            return Ok(false);
+        };
+        if claim.claim_token != claim_token
+            || !wake_claim_is_releasable_for_manual_resume(&tx, &claim)?
+        {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit retained manual wake claim: {err}"))?;
+            return Ok(false);
         }
-        .map_err(|err| format!("Failed to release wake claim: {err}"))?;
+        let changed = tx
+            .execute(
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2",
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release manual wake claim: {err}"))?;
+        if changed != 1 {
+            return Err("Manual wake claim changed during exact-token release".to_string());
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit manual wake-claim release: {err}"))?;
+        Ok(true)
+    }
+
+    pub fn release_admitted_wake_claim(
+        &mut self,
+        session_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NOT NULL",
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release admitted wake claim: {err}"))?;
         Ok(changed > 0)
     }
 
@@ -3316,7 +4233,9 @@ impl MailboxDb {
             .conn
             .execute(
                 "UPDATE session_wake_claim
-                 SET wake_pid = ?3
+                 SET wake_pid = ?3,
+                     wake_os_boot_id = NULL,
+                     wake_os_pid_starttime_ticks = NULL
                  WHERE session_id = ?1
                    AND claim_token = ?2",
                 params![session_id, claim_token, wake_pid],
@@ -3330,22 +4249,35 @@ impl MailboxDb {
         session_id: &str,
         claim_token: &str,
         wake_pid: i64,
-        provider_name: Option<&str>,
-        model_name: Option<&str>,
     ) -> Result<bool, String> {
-        if let Some(identity) = pid_identity::read_live_process_identity(wake_pid)? {
-            let recorded_at = now_rfc3339();
-            let record = wake_claim_pid_identity_record(
-                &identity,
-                claim_token,
-                session_id,
-                provider_name,
-                model_name,
-                &recorded_at,
-            );
-            pid_identity::PidIdentityDb::open(self.path())?.record_identity(record)?;
+        let identity = pid_identity::read_live_process_identity(wake_pid)?;
+        let changed = match identity {
+            Some(identity) => self.conn.execute(
+                "UPDATE session_wake_claim
+                 SET wake_pid = ?3,
+                     wake_os_boot_id = ?4,
+                     wake_os_pid_starttime_ticks = ?5
+                 WHERE session_id = ?1
+                   AND claim_token = ?2",
+                params![
+                    session_id,
+                    claim_token,
+                    wake_pid,
+                    &identity.os_boot_id,
+                    identity.os_pid_starttime_ticks,
+                ],
+            ),
+            None => self.conn.execute(
+                "UPDATE session_wake_claim
+                 SET wake_pid = ?3
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_pid IS NULL",
+                params![session_id, claim_token, wake_pid],
+            ),
         }
-        self.record_wake_claim_pid(session_id, claim_token, wake_pid)
+        .map_err(|err| format!("Failed to record wake claim process identity: {err}"))?;
+        Ok(changed > 0)
     }
 
     pub fn wake_sweep_candidates(
@@ -3416,7 +4348,7 @@ impl MailboxDb {
         let Some((min_pending_seq, max_pending_seq)) = self.pending_seq_bounds(&session_id)? else {
             return Ok(None);
         };
-        let claim = self.wake_claim(&session_id)?;
+        let claim = wake_claim(self.conn, &session_id)?;
         Ok(Some(WakeSweepSessionState {
             session_id,
             min_pending_seq,
@@ -3442,7 +4374,7 @@ impl MailboxDb {
         stale_after_seconds: i64,
     ) -> Result<bool, String> {
         match state.claim.as_ref() {
-            Some(claim) => wake_claim_is_reclaimable(&self.conn, claim, stale_after_seconds),
+            Some(claim) => wake_claim_is_reclaimable(self.conn, claim, stale_after_seconds),
             None => Ok(true),
         }
     }
@@ -3472,8 +4404,7 @@ impl MailboxDb {
     }
 
     fn persisted_auto_wake_count(&self, session_id: &str) -> Result<i64, String> {
-        Ok(self
-            .session_runtime(session_id)?
+        Ok(session_metadata_row(self.conn, session_id)?
             .map(|runtime| runtime.auto_wake_count)
             .unwrap_or(0))
     }
@@ -3482,10 +4413,66 @@ impl MailboxDb {
         &mut self,
         session_id: &str,
         claim_token: &str,
+        child_identity: &ProcessIdentity,
     ) -> Result<bool, String> {
-        let claim = self.wake_claim(session_id)?;
-        let valid = wake_claim_is_valid_for_child(claim.as_ref(), claim_token);
-        self.release_after_child_claim_validation(session_id, claim_token, valid)
+        let observed_busy = self.session_is_busy(session_id)?;
+        let admission_id = Uuid::new_v4().to_string();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("Failed to start wake-child admission transaction: {err}"))?;
+        let claim = wake_claim(&tx, session_id)?;
+        let Some(claim) = claim.filter(|claim| wake_claim_matches_child(claim, claim_token)) else {
+            tx.commit()
+                .map_err(|err| format!("Failed to commit rejected wake-child admission: {err}"))?;
+            return Ok(false);
+        };
+        if claim.wake_invocation_uuid.is_some() {
+            let replay_matches =
+                wake_claim_has_matching_live_process_identity(&tx, &claim, child_identity)?;
+            tx.commit()
+                .map_err(|err| format!("Failed to commit replayed wake-child admission: {err}"))?;
+            return Ok(replay_matches);
+        }
+        if observed_busy || wake_claim_runtime_is_busy_tx(&tx, session_id)? {
+            tx.execute(
+                "DELETE FROM session_wake_claim
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NULL",
+                params![session_id, claim_token],
+            )
+            .map_err(|err| format!("Failed to release busy wake-child claim: {err}"))?;
+            tx.commit()
+                .map_err(|err| format!("Failed to commit busy wake-child rejection: {err}"))?;
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE session_wake_claim
+                 SET wake_invocation_uuid = ?3,
+                     wake_pid = ?4,
+                     wake_os_boot_id = ?5,
+                     wake_os_pid_starttime_ticks = ?6
+                 WHERE session_id = ?1
+                   AND claim_token = ?2
+                   AND wake_invocation_uuid IS NULL",
+                params![
+                    session_id,
+                    claim_token,
+                    &admission_id,
+                    child_identity.os_pid,
+                    &child_identity.os_boot_id,
+                    child_identity.os_pid_starttime_ticks,
+                ],
+            )
+            .map_err(|err| format!("Failed to admit wake child: {err}"))?;
+        if changed != 1 {
+            return Err("Wake claim changed during child admission".to_string());
+        }
+        tx.commit()
+            .map_err(|err| format!("Failed to commit wake-child admission: {err}"))?;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -3503,7 +4490,9 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to age wake claim for test: {err}"))?;
         Ok(())
     }
+}
 
+impl MailboxDb {
     fn list_mailbox_all(&self, session_id: &str) -> Result<Vec<MailboxRow>, String> {
         let mut stmt = self
             .conn
@@ -3526,7 +4515,9 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to query mailbox rows: {err}"))?;
         collect_rows(rows)
     }
+}
 
+impl WakeSessionRepository<'_> {
     fn pending_wake_session_ids(&self, limit: usize) -> Result<Vec<String>, String> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -3565,28 +4556,20 @@ impl MailboxDb {
             .map_err(|err| format!("Failed to read pending wake session row: {err}"))
     }
 
-    fn release_after_child_claim_validation(
-        &mut self,
-        session_id: &str,
-        claim_token: &str,
-        valid: bool,
-    ) -> Result<bool, String> {
-        if !valid {
-            return Ok(false);
-        }
-        self.release_busy_child_wake_claim(session_id, claim_token)
-    }
-
     fn pending_seq_bounds(&self, session_id: &str) -> Result<Option<(i64, i64)>, String> {
-        pending_seq_bounds_on(&self.conn, session_id)
+        pending_seq_bounds_on(self.conn, session_id)
     }
+}
 
+impl MailboxDb {
     #[cfg(test)]
     fn enqueue_agent_bash_complete_then_rollback(
         &mut self,
         input: &AgentBashCompleteEnqueue<'_>,
     ) -> Result<(), String> {
-        let published = self.publish_immutable_payload(input.payload_json.as_bytes())?;
+        let published = self
+            .payloads()
+            .publish_immutable_payload(input.payload_json.as_bytes())?;
         let payload_json = compacted_payload_json(AGENT_BASH_COMPLETE_KIND, &published)?;
         let now = now_rfc3339();
         let tx = self
@@ -3596,48 +4579,16 @@ impl MailboxDb {
         let _ = enqueue_agent_bash_complete_in_tx(&tx, input, &payload_json, &published, &now)?;
         Err("forced rollback before commit".to_string())
     }
+}
 
-    fn payload_reference(&self, bytes: &[u8]) -> Result<PublishedMailboxPayload, String> {
-        let byte_len = u64::try_from(bytes.len())
-            .map_err(|_| "Mailbox payload length does not fit u64".to_string())?;
-        let sha256 = sha256_hex(bytes);
-        Ok(PublishedMailboxPayload {
-            address: payload_address(&sha256),
-            file_path: self.payload_path_for_sha256(&sha256)?,
-            sha256,
-            byte_len,
-            retention_policy: MAILBOX_PAYLOAD_RETENTION_POLICY.to_string(),
-        })
-    }
-
-    fn payload_path_for_sha256(&self, sha256: &str) -> Result<PathBuf, String> {
-        validate_sha256_hex(sha256)?;
-        let root = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        Ok(root
-            .join(MAILBOX_PAYLOAD_DIRECTORY)
-            .join(MAILBOX_PAYLOAD_ADDRESS_VERSION)
-            .join(MAILBOX_PAYLOAD_ALGORITHM)
-            .join(&sha256[..2])
-            .join(sha256))
-    }
-
+impl WakeSessionRepository<'_> {
     fn max_mailbox_seq(&self, session_id: &str) -> Result<Option<i64>, String> {
-        self.conn
-            .query_row(
-                "SELECT MAX(seq) FROM mailbox WHERE session_id = ?1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .map_err(|err| format!("Failed to read mailbox max seq: {err}"))
+        max_mailbox_seq_on(self.conn, session_id)
     }
 
     fn running_turn_start_max_mailbox_seq(
         &self,
-        input: &SessionRuntimeRunningUpdate<'_>,
+        input: &LegacyRuntimeProjection<'_>,
     ) -> Result<Option<i64>, String> {
         let Some(seq) = input.turn_start_max_mailbox_seq else {
             return self.max_mailbox_seq(input.session_id);
@@ -3645,80 +4596,10 @@ impl MailboxDb {
         Ok(Some(seq))
     }
 
-    fn session_has_pending_mailbox(&self, session_id: &str) -> Result<bool, String> {
-        self.list_pending(session_id)
-            .map(|pending| !pending.is_empty())
-    }
-
     fn session_is_busy(&mut self, session_id: &str) -> Result<bool, String> {
-        self.session_liveness(session_id)
+        RuntimeLifecycleRepository { conn: self.conn }
+            .reconcile_session_liveness(session_id)
             .map(|liveness| liveness == SessionLiveness::Busy)
-    }
-
-    fn release_busy_child_wake_claim(
-        &mut self,
-        session_id: &str,
-        claim_token: &str,
-    ) -> Result<bool, String> {
-        if self.busy_child_wake_claim_should_release(session_id)? {
-            self.release_child_wake_claim(session_id, claim_token)?;
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn busy_child_wake_claim_should_release(&mut self, session_id: &str) -> Result<bool, String> {
-        self.session_is_busy(session_id)
-    }
-
-    fn release_child_wake_claim(
-        &mut self,
-        session_id: &str,
-        claim_token: &str,
-    ) -> Result<(), String> {
-        self.release_wake_claim(session_id, Some(claim_token))?;
-        Ok(())
-    }
-
-    fn clear_stale_running_row_for_liveness(
-        &mut self,
-        session_id: &str,
-        decision: &SessionRuntimeLivenessDecision,
-    ) -> Result<(), String> {
-        if let SessionRuntimeLivenessDecision::Stale {
-            running_invocation_uuid,
-        } = decision
-        {
-            self.clear_stale_running_row(session_id, running_invocation_uuid.as_deref())?;
-        }
-        Ok(())
-    }
-
-    fn clear_stale_running_row(
-        &mut self,
-        session_id: &str,
-        running_invocation_uuid: Option<&str>,
-    ) -> Result<(), String> {
-        let now = now_rfc3339();
-        self.conn
-            .execute(
-                "UPDATE session_runtime
-                 SET run_state = 'idle',
-                     updated_at = ?3,
-                     pty_control_path = NULL,
-                     running_invocation_uuid = NULL,
-                     running_os_pid = NULL,
-                     running_os_boot_id = NULL,
-                     running_os_pid_starttime_ticks = NULL,
-                     turn_ended_at = COALESCE(turn_ended_at, ?3)
-                  WHERE session_id = ?1
-                    AND run_state = 'running'
-                    AND ((?2 IS NULL AND running_invocation_uuid IS NULL)
-                         OR running_invocation_uuid = ?2)",
-                params![session_id, running_invocation_uuid, &now],
-            )
-            .map_err(|err| format!("Failed to clear stale session runtime row: {err}"))?;
-        Ok(())
     }
 }
 
@@ -3783,7 +4664,7 @@ fn acquire_mailbox_rebuild_writer(
             },
         )?;
     connection
-        .busy_timeout(completion_authority_sqlite_timeout())
+        .busy_timeout(mailbox_writer_sqlite_timeout())
         .map_err(|error| format!("Failed to configure PID mailbox rebuild writer: {error}"))?;
     match connection.execute_batch("BEGIN IMMEDIATE") {
         Ok(()) => Ok(Some(connection)),
@@ -3822,12 +4703,12 @@ fn sqlite_error_is_contention(error: &rusqlite::Error) -> bool {
 }
 
 #[cfg(not(any(test, feature = "test-support")))]
-fn completion_authority_sqlite_timeout() -> StdDuration {
+fn mailbox_writer_sqlite_timeout() -> StdDuration {
     StdDuration::from_secs(5)
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn completion_authority_sqlite_timeout() -> StdDuration {
+fn mailbox_writer_sqlite_timeout() -> StdDuration {
     StdDuration::from_millis(500)
 }
 
@@ -4308,25 +5189,6 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     ))
 }
 
-fn wake_claim_pid_identity_record<'a>(
-    identity: &'a ProcessIdentity,
-    claim_token: &'a str,
-    session_id: &'a str,
-    provider_name: Option<&'a str>,
-    model_name: Option<&'a str>,
-    recorded_at: &'a str,
-) -> pid_identity::PidIdentityRecord<'a> {
-    pid_identity::PidIdentityRecord {
-        identity,
-        os_pgid: None,
-        invocation_uuid: claim_token,
-        session_id: Some(session_id),
-        provider_name,
-        model_name,
-        recorded_at,
-    }
-}
-
 #[cfg(test)]
 fn aged_wake_claim_timestamp(seconds_old: i64) -> String {
     (Utc::now() - Duration::seconds(seconds_old)).to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -4381,7 +5243,8 @@ fn wake_sweep_candidate(
 fn begin_wake_claim_transaction(
     conn: &mut Connection,
 ) -> Result<rusqlite::Transaction<'_>, String> {
-    conn.transaction().map_err(format_start_wake_claim_tx_error)
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(format_start_wake_claim_tx_error)
 }
 
 fn format_start_wake_claim_tx_error(err: rusqlite::Error) -> String {
@@ -4392,7 +5255,83 @@ fn pending_seq_bounds_for_claim_tx(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
 ) -> Result<Option<(i64, i64)>, String> {
-    pending_seq_bounds_tx(tx, session_id)
+    let query = format!(
+        "SELECT MIN(seq), MAX(seq)
+         FROM mailbox
+         WHERE delivered_at IS NULL
+           AND {PENDING_MAILBOX_TARGET_PREDICATE}
+           AND (delivery_error IS NULL OR delivery_error != ?3)
+           AND (
+                delivery_error IS NULL
+                OR delivery_error != ?4
+                OR delivery_attempts < ?5
+           )"
+    );
+    tx.query_row(
+        &query,
+        params![
+            session_id,
+            Option::<&str>::None,
+            WAKE_SWEEP_ABANDONED_ERROR,
+            MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+            MAX_UNCONFIRMED_DELIVERY_ATTEMPTS,
+        ],
+        |row| {
+            let min_seq: Option<i64> = row.get(0)?;
+            let max_seq: Option<i64> = row.get(1)?;
+            Ok(min_seq.zip(max_seq))
+        },
+    )
+    .map_err(|err| format!("Failed to read deliverable wake-claim bounds: {err}"))
+}
+
+fn wake_claim_runtime_is_busy_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM runtime_generation
+             WHERE session_id = ?1 AND lifecycle_state != 'exited'
+         )",
+        params![session_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|err| format!("Failed to validate wake-claim runtime authority: {err}"))
+}
+
+fn wake_claim_notifications_paused_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<bool, String> {
+    tx.query_row(
+        "SELECT COALESCE((
+             SELECT paused FROM mailbox_notification_control WHERE session_id = ?1
+         ), 0)",
+        params![session_id],
+        |row| row.get::<_, bool>(0),
+    )
+    .map_err(|err| format!("Failed to validate wake-claim notification state: {err}"))
+}
+
+fn wake_claim_cap_reached_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: WakeClaimRequest<'_>,
+    fallback_max: i64,
+) -> Result<Option<(i64, i64)>, String> {
+    let persisted = tx
+        .query_row(
+            "SELECT auto_wake_count, selected_auto_wake_max
+             FROM session_runtime WHERE session_id = ?1",
+            params![input.session_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(|err| format!("Failed to validate wake-claim retry cap: {err}"))?;
+    let (persisted_count, selected_max) = persisted.unwrap_or((0, None));
+    let current_count = persisted_count.max(input.auto_wake_count.saturating_sub(1));
+    let max_count = selected_max.unwrap_or(fallback_max);
+    Ok((current_count >= max_count).then_some((current_count, max_count)))
 }
 
 fn fresh_in_flight_wake_claim_for_input(
@@ -4916,6 +5855,17 @@ fn validate_runtime_generation_create(
     validate_runtime_mode(request.runtime_mode)
 }
 
+fn current_runtime_creator_identity() -> Result<ProcessIdentity, GenerationStorageError> {
+    let os_pid = i64::from(std::process::id());
+    pid_identity::read_live_process_identity(os_pid)
+        .map_err(GenerationStorageError::new)?
+        .ok_or_else(|| {
+            GenerationStorageError::new(format!(
+                "Runtime generation creator process {os_pid} is not live"
+            ))
+        })
+}
+
 fn validate_runtime_mode(mode: &str) -> Result<(), GenerationStorageError> {
     match mode {
         "headless" | "pty_interactive" => Ok(()),
@@ -4933,10 +5883,7 @@ fn validate_runtime_generation_binding(
             "Runtime generation spawned OS PID must be positive".to_string(),
         ));
     }
-    if request
-        .exact_process_identity
-        .is_some_and(|identity| identity.os_pid != request.spawned_os_pid)
-    {
+    if request.exact_process_identity.os_pid != request.spawned_os_pid {
         return Err(GenerationStorageError::new(
             "Exact process identity PID does not match spawned OS PID".to_string(),
         ));
@@ -4947,6 +5894,7 @@ fn validate_runtime_generation_binding(
 fn runtime_generation_create_matches(
     row: &RuntimeGenerationRow,
     request: &CreateRuntimeGeneration<'_>,
+    creator_process_identity: &ProcessIdentity,
 ) -> bool {
     row.lifecycle_state == RuntimeLifecycleState::Starting
         && row.spawn_invocation_uuid == request.spawn_invocation_uuid
@@ -4957,6 +5905,8 @@ fn runtime_generation_create_matches(
         && row.pty_control_path.as_deref() == request.pty_control_path
         && row.models_dir.as_deref() == request.models_dir
         && row.effective_cwd.as_deref() == request.effective_cwd
+        && row.creator_process_evidence
+            == ExactProcessEvidence::Recorded(creator_process_identity.clone())
 }
 
 fn runtime_generation_binding_matches(
@@ -4964,22 +5914,20 @@ fn runtime_generation_binding_matches(
     request: &BindRuntimeGenerationRunning<'_>,
 ) -> bool {
     row.spawned_os_pid == Some(request.spawned_os_pid)
-        && match (&row.exact_process_evidence, request.exact_process_identity) {
-            (ExactProcessEvidence::NotRecorded, None) => true,
-            (ExactProcessEvidence::Recorded(recorded), Some(requested)) => recorded == requested,
-            _ => false,
-        }
+        && row.exact_process_evidence
+            == ExactProcessEvidence::Recorded(request.exact_process_identity.clone())
 }
 
 fn map_runtime_generation_create(
     changed: usize,
     row: RuntimeGenerationRow,
     request: &CreateRuntimeGeneration<'_>,
+    creator_process_identity: &ProcessIdentity,
 ) -> GenerationMutation<RuntimeGenerationRow> {
     if changed == 1 {
         return GenerationMutation::Applied(row);
     }
-    if runtime_generation_create_matches(&row, request) {
+    if runtime_generation_create_matches(&row, request, creator_process_identity) {
         GenerationMutation::AlreadyApplied(row)
     } else {
         GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
@@ -5022,9 +5970,7 @@ fn bind_generation_process_identity(
     request: &BindRuntimeGenerationRunning<'_>,
     recorded_at: &str,
 ) -> Result<bool, GenerationStorageError> {
-    let Some(identity) = request.exact_process_identity else {
-        return Ok(true);
-    };
+    let identity = request.exact_process_identity;
     pid_identity::bind_identity_on(
         conn,
         pid_identity::PidIdentityRecord {
@@ -5129,6 +6075,7 @@ fn validate_active_delivery_claim(
         return Err(GenerationRejection::NotFound);
     };
     validate_generation_fence(row, fence)?;
+    runtime_generation_session_id(row)?;
     if row.active_delivery_claim_id.as_ref() != Some(claim_id)
         || row.active_delivery_seqs != seqs
         || row.active_delivery_claimed_at.is_none()
@@ -5150,15 +6097,23 @@ fn validate_running_delivery_confirmation(
     })
 }
 
-fn validate_confirmed_mailbox_row_change(
+fn runtime_generation_session_id(row: &RuntimeGenerationRow) -> Result<&str, GenerationRejection> {
+    row.session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+        .ok_or(GenerationRejection::SessionConflict)
+}
+
+fn validate_claimed_mailbox_row_change(
     seq: i64,
     changed: usize,
+    operation: &str,
 ) -> Result<(), GenerationStorageError> {
     if changed == 1 {
         return Ok(());
     }
     Err(GenerationStorageError::new(format!(
-        "Claimed mailbox row {seq} was not pending at confirmation"
+        "Claimed mailbox row {seq} was not owned and pending at {operation}"
     )))
 }
 
@@ -5193,13 +6148,39 @@ fn validate_generation_fence(
     Err(GenerationRejection::FenceMismatch)
 }
 
+fn validate_recovered_dead_process(
+    before: &RuntimeGenerationRow,
+    request: &ExitRuntimeGenerationNonOrderly<'_>,
+) -> Result<(), GenerationRejection> {
+    if request.reason != RuntimeTerminalReason::RecoveredDead {
+        return Ok(());
+    }
+    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(before) else {
+        return Err(GenerationRejection::InvariantViolation);
+    };
+    match pid_identity::observe_live_process_identity(recorded.os_pid) {
+        pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+            Err(GenerationRejection::ProcessIdentityConflict)
+        }
+        pid_identity::ProcessIdentityObservation::ExactLive(_)
+        | pid_identity::ProcessIdentityObservation::Dead => Ok(()),
+        pid_identity::ProcessIdentityObservation::Unsupported
+        | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+            Err(GenerationRejection::InvariantViolation)
+        }
+    }
+}
+
 fn validate_non_orderly_predecessor(
     before: &RuntimeGenerationRow,
+    request: &ExitRuntimeGenerationNonOrderly<'_>,
 ) -> Result<(), GenerationRejection> {
     if matches!(
         before.lifecycle_state,
         RuntimeLifecycleState::Starting | RuntimeLifecycleState::Running
-    ) {
+    ) || (before.lifecycle_state == RuntimeLifecycleState::Draining
+        && request.reason == RuntimeTerminalReason::RecoveredDead)
+    {
         return Ok(());
     }
     Err(GenerationRejection::IllegalPredecessor {
@@ -5412,7 +6393,8 @@ fn runtime_generation_select_sql(predicate: &str) -> String {
                 exited_at, terminal_reason, exit_code, drain_request_uuid,
                 drain_requested_at, drain_requested_by_invocation_uuid,
                 active_delivery_claim_uuid, active_delivery_claimed_at,
-                active_delivery_seqs_json
+                active_delivery_seqs_json, creator_identity_os_pid,
+                creator_identity_os_boot_id, creator_identity_os_pid_starttime_ticks
          FROM runtime_generation
          WHERE {predicate}"
     )
@@ -5434,6 +6416,9 @@ struct RawRuntimeGenerationFields {
     identity_os_pid: Option<i64>,
     identity_os_boot_id: Option<String>,
     identity_os_pid_starttime_ticks: Option<i64>,
+    creator_identity_os_pid: Option<i64>,
+    creator_identity_os_boot_id: Option<String>,
+    creator_identity_os_pid_starttime_ticks: Option<i64>,
     terminal_reason: Option<String>,
     drain_request_uuid: Option<String>,
     active_delivery_claim_uuid: Option<String>,
@@ -5445,6 +6430,7 @@ struct ParsedRuntimeGenerationFields {
     generation_id: RuntimeGenerationId,
     lifecycle_state: RuntimeLifecycleState,
     exact_process_evidence: ExactProcessEvidence,
+    creator_process_evidence: ExactProcessEvidence,
     terminal_reason: Option<RuntimeTerminalReason>,
     drain_request_id: Option<DrainRequestId>,
     active_delivery_claim_id: Option<DeliveryClaimId>,
@@ -5462,6 +6448,13 @@ fn parse_runtime_generation_fields(
         raw.identity_os_pid,
         raw.identity_os_boot_id,
         raw.identity_os_pid_starttime_ticks,
+        11,
+    )?;
+    let creator_process_evidence = exact_process_evidence_from_columns(
+        raw.creator_identity_os_pid,
+        raw.creator_identity_os_boot_id,
+        raw.creator_identity_os_pid_starttime_ticks,
+        26,
     )?;
     let terminal_reason = raw
         .terminal_reason
@@ -5496,6 +6489,7 @@ fn parse_runtime_generation_fields(
         generation_id,
         lifecycle_state,
         exact_process_evidence,
+        creator_process_evidence,
         terminal_reason,
         drain_request_id,
         active_delivery_claim_id,
@@ -5510,6 +6504,9 @@ fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Runti
         identity_os_pid: row.get(11)?,
         identity_os_boot_id: row.get(12)?,
         identity_os_pid_starttime_ticks: row.get(13)?,
+        creator_identity_os_pid: row.get(26)?,
+        creator_identity_os_boot_id: row.get(27)?,
+        creator_identity_os_pid_starttime_ticks: row.get(28)?,
         terminal_reason: row.get(18)?,
         drain_request_uuid: row.get(20)?,
         active_delivery_claim_uuid: row.get(23)?,
@@ -5528,6 +6525,7 @@ fn map_runtime_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Runti
         effective_cwd: row.get(9)?,
         spawned_os_pid: row.get(10)?,
         exact_process_evidence: parsed.exact_process_evidence,
+        creator_process_evidence: parsed.creator_process_evidence,
         created_at: row.get(14)?,
         running_at: row.get(15)?,
         draining_at: row.get(16)?,
@@ -5547,6 +6545,7 @@ fn exact_process_evidence_from_columns(
     os_pid: Option<i64>,
     os_boot_id: Option<String>,
     os_pid_starttime_ticks: Option<i64>,
+    column_index: usize,
 ) -> rusqlite::Result<ExactProcessEvidence> {
     match (os_pid, os_boot_id, os_pid_starttime_ticks) {
         (None, None, None) => Ok(ExactProcessEvidence::NotRecorded),
@@ -5558,7 +6557,7 @@ fn exact_process_evidence_from_columns(
             }))
         }
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            11,
+            column_index,
             rusqlite::types::Type::Null,
             Box::new(GenerationStorageError::new(
                 "Runtime generation has partial exact process identity evidence".to_string(),
@@ -5595,6 +6594,16 @@ fn validate_delivery_claim_seqs(seqs: &[i64]) -> Result<(), GenerationStorageErr
     Ok(())
 }
 
+fn reject_unauthorized_terminal_wake_abandonment(delivery_error: &str) -> Result<(), String> {
+    if delivery_error == WAKE_SWEEP_ABANDONED_ERROR {
+        return Err(
+            "Terminal wake abandonment requires a dedicated authority-bearing disposition"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn serialize_delivery_seqs(seqs: &[i64]) -> Result<String, GenerationStorageError> {
     serde_json::to_string(seqs).map_err(|err| {
         GenerationStorageError::new(format!(
@@ -5624,14 +6633,15 @@ fn runtime_delivery_claim_is_stale(row: &RuntimeGenerationRow, stale_after_secon
 
 fn mailbox_delivery_states_on(
     conn: &Connection,
+    session_id: &str,
     seqs: &[i64],
 ) -> Result<Vec<Option<Option<String>>>, GenerationStorageError> {
     let mut states = Vec::with_capacity(seqs.len());
     for seq in seqs {
         let state = conn
             .query_row(
-                "SELECT delivered_at FROM mailbox WHERE seq = ?1",
-                params![seq],
+                "SELECT delivered_at FROM mailbox WHERE session_id = ?1 AND seq = ?2",
+                params![session_id, seq],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()
@@ -5641,6 +6651,35 @@ fn mailbox_delivery_states_on(
         states.push(state);
     }
     Ok(states)
+}
+
+fn mailbox_delivery_target_states_on(
+    conn: &Connection,
+    session_id: &str,
+    chain_id: Option<&str>,
+    seqs: &[i64],
+) -> Result<Vec<Option<Option<String>>>, GenerationStorageError> {
+    let sql = format!(
+        "SELECT delivered_at FROM mailbox
+         WHERE seq = ?3 AND {PENDING_MAILBOX_TARGET_PREDICATE}"
+    );
+    let mut states = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        let state = conn
+            .query_row(&sql, params![session_id, chain_id, seq], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map_err(generation_storage_error(
+                "verify mailbox delivery target authority",
+            ))?;
+        states.push(state);
+    }
+    Ok(states)
+}
+
+fn all_mailbox_seqs_owned(states: &[Option<Option<String>>]) -> bool {
+    states.iter().all(Option::is_some)
 }
 
 fn all_mailbox_seqs_pending(states: &[Option<Option<String>>]) -> bool {
@@ -5736,9 +6775,72 @@ fn clear_runtime_delivery_claim_on(
     Ok(())
 }
 
-fn mark_session_running_row(
+fn project_running_generation_on(
     conn: &Connection,
-    input: SessionRuntimeRunningUpdate<'_>,
+    generation: &RuntimeGenerationRow,
+) -> Result<(), GenerationStorageError> {
+    if generation.lifecycle_state != RuntimeLifecycleState::Running {
+        return Ok(());
+    }
+    let Some(session_id) = generation.session_id.as_deref() else {
+        return Ok(());
+    };
+    let ExactProcessEvidence::Recorded(identity) = &generation.exact_process_evidence else {
+        return Ok(());
+    };
+    let projected_at = generation.running_at.as_deref().ok_or_else(|| {
+        GenerationStorageError::new(
+            "Running runtime generation has no running timestamp for compatibility projection"
+                .to_string(),
+        )
+    })?;
+    let turn_start_max_mailbox_seq =
+        max_mailbox_seq_on(conn, session_id).map_err(GenerationStorageError::new)?;
+    project_runtime_compatibility_row(
+        conn,
+        LegacyRuntimeProjection {
+            session_id,
+            mode: &generation.runtime_mode,
+            invocation_uuid: &generation.spawn_invocation_uuid,
+            provider_name: Some(&generation.provider_name),
+            model_name: generation.model_name.as_deref(),
+            identity,
+            pty_control_path: generation.pty_control_path.as_deref(),
+            turn_start_max_mailbox_seq,
+            models_dir: generation.models_dir.as_deref(),
+            effective_cwd: generation.effective_cwd.as_deref(),
+        },
+        projected_at,
+        turn_start_max_mailbox_seq,
+    )
+    .map_err(GenerationStorageError::new)
+}
+
+fn project_exited_generation_on(
+    conn: &Connection,
+    generation: &RuntimeGenerationRow,
+    projected_at: &str,
+    compatibility_exit_code: Option<i32>,
+) -> Result<(), GenerationStorageError> {
+    let Some(session_id) = generation.session_id.as_deref() else {
+        return Ok(());
+    };
+    settle_runtime_compatibility_row(
+        conn,
+        LegacyRuntimeProjectionSettlement {
+            session_id,
+            invocation_uuid: &generation.spawn_invocation_uuid,
+            last_exit_code: compatibility_exit_code,
+        },
+        projected_at,
+    )
+    .map(|_| ())
+    .map_err(GenerationStorageError::new)
+}
+
+fn project_runtime_compatibility_row(
+    conn: &Connection,
+    input: LegacyRuntimeProjection<'_>,
     now: &str,
     turn_start_max_mailbox_seq: Option<i64>,
 ) -> Result<(), String> {
@@ -5811,18 +6913,18 @@ fn mark_session_running_row(
     Ok(())
 }
 
-fn mark_session_idle_row(
+fn settle_runtime_compatibility_row(
     conn: &Connection,
-    input: SessionRuntimeIdleUpdate<'_>,
+    input: LegacyRuntimeProjectionSettlement<'_>,
     now: &str,
 ) -> Result<bool, String> {
-    let changed = mark_session_idle_row_count(conn, input, now)?;
+    let changed = settle_runtime_compatibility_row_count(conn, input, now)?;
     Ok(row_changed(changed))
 }
 
-fn mark_session_idle_row_count(
+fn settle_runtime_compatibility_row_count(
     conn: &Connection,
-    input: SessionRuntimeIdleUpdate<'_>,
+    input: LegacyRuntimeProjectionSettlement<'_>,
     now: &str,
 ) -> Result<usize, String> {
     conn.execute(
@@ -5852,27 +6954,115 @@ fn row_changed(changed: usize) -> bool {
     changed > 0
 }
 
-fn session_runtime_row(
+fn session_metadata_row(
     conn: &Connection,
     session_id: &str,
-) -> Result<Option<SessionRuntimeRow>, String> {
+) -> Result<Option<SessionMetadataRow>, String> {
     conn.query_row(
-        "SELECT session_id, mode, invocation_uuid, provider_name, model_name,
-                pty_control_path, updated_at, run_state, running_invocation_uuid,
-                running_os_pid, running_os_boot_id, running_os_pid_starttime_ticks,
-                turn_started_at, turn_ended_at, turn_start_max_mailbox_seq,
-                last_exit_code, models_dir, effective_cwd, auto_wake_count,
-                selected_auto_wake_max
+        "SELECT session_id, mode, invocation_uuid, provider_name, model_name, updated_at,
+                models_dir, effective_cwd, auto_wake_count, selected_auto_wake_max
          FROM session_runtime
          WHERE session_id = ?1",
         params![session_id],
-        map_session_runtime_row,
+        map_session_metadata_row,
     )
     .optional()
-    .map_err(|err| format!("Failed to read session runtime row: {err}"))
+    .map_err(|err| format!("Failed to read session metadata row: {err}"))
 }
 
-fn validate_session_runtime_row(row: Option<&SessionRuntimeRow>) -> Result<(), String> {
+fn legacy_runtime_projection_row(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<LegacyRuntimeProjectionRow>, String> {
+    conn.query_row(
+        "SELECT session_id, pty_control_path, updated_at, run_state,
+                running_invocation_uuid, running_os_pid, running_os_boot_id,
+                running_os_pid_starttime_ticks, turn_started_at, turn_ended_at,
+                turn_start_max_mailbox_seq, last_exit_code
+         FROM session_runtime
+         WHERE session_id = ?1",
+        params![session_id],
+        map_legacy_runtime_projection_row,
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read legacy runtime projection row: {err}"))
+}
+
+fn max_mailbox_seq_on(conn: &Connection, session_id: &str) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT MAX(seq) FROM mailbox WHERE session_id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .map_err(|err| format!("Failed to read mailbox max seq: {err}"))
+}
+
+enum GenerationLivenessObservation {
+    Busy,
+    Stale,
+}
+
+fn generation_liveness_observation(
+    generation: &RuntimeGenerationRow,
+) -> GenerationLivenessObservation {
+    let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation) else {
+        return GenerationLivenessObservation::Busy;
+    };
+    match pid_identity::observe_live_process_identity(recorded.os_pid) {
+        pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+            GenerationLivenessObservation::Busy
+        }
+        pid_identity::ProcessIdentityObservation::ExactLive(_)
+        | pid_identity::ProcessIdentityObservation::Dead => GenerationLivenessObservation::Stale,
+        pid_identity::ProcessIdentityObservation::Unsupported
+        | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+            GenerationLivenessObservation::Busy
+        }
+    }
+}
+
+fn generation_liveness_process(generation: &RuntimeGenerationRow) -> &ExactProcessEvidence {
+    if generation.lifecycle_state == RuntimeLifecycleState::Starting {
+        &generation.creator_process_evidence
+    } else {
+        &generation.exact_process_evidence
+    }
+}
+
+fn classify_generation_liveness_read_only(
+    generations: &[RuntimeGenerationRow],
+) -> RuntimeGenerationReadOnlyLiveness {
+    if generations.is_empty() {
+        return RuntimeGenerationReadOnlyLiveness::Idle;
+    }
+    let mut stale = RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity;
+    for generation in generations {
+        let ExactProcessEvidence::Recorded(recorded) = generation_liveness_process(generation)
+        else {
+            continue;
+        };
+        match pid_identity::observe_live_process_identity(recorded.os_pid) {
+            pid_identity::ProcessIdentityObservation::ExactLive(live) if live == *recorded => {
+                return RuntimeGenerationReadOnlyLiveness::Busy;
+            }
+            pid_identity::ProcessIdentityObservation::ExactLive(_) => {
+                stale = RuntimeGenerationReadOnlyLiveness::StalePidReused;
+            }
+            pid_identity::ProcessIdentityObservation::Dead => {
+                stale = RuntimeGenerationReadOnlyLiveness::StaleDead;
+            }
+            pid_identity::ProcessIdentityObservation::Unsupported
+            | pid_identity::ProcessIdentityObservation::ReadError(_) => {
+                return RuntimeGenerationReadOnlyLiveness::Busy;
+            }
+        }
+    }
+    stale
+}
+
+fn validate_legacy_runtime_projection(
+    row: Option<&LegacyRuntimeProjectionRow>,
+) -> Result<(), String> {
     let Some(row) = row else {
         return Ok(());
     };
@@ -5885,175 +7075,6 @@ fn validate_running_run_state() -> Result<(), String> {
 
 fn validate_idle_run_state() -> Result<(), String> {
     validate_legacy_run_state("idle")
-}
-
-fn runtime_row_is_idle(row: &SessionRuntimeRow) -> bool {
-    row.run_state != "running"
-}
-
-fn live_process_identity_for_runtime(
-    recorded: &ProcessIdentity,
-) -> Result<Option<ProcessIdentity>, String> {
-    pid_identity::read_live_process_identity(recorded.os_pid)
-}
-
-fn runtime_identity_is_live(live: Option<&ProcessIdentity>, recorded: &ProcessIdentity) -> bool {
-    live.is_some_and(|live| live == recorded)
-}
-
-struct RuntimeLivenessEvidence {
-    invocation_uuid: Option<String>,
-    recorded: Option<ProcessIdentity>,
-    live: Option<ProcessIdentity>,
-}
-
-fn session_runtime_liveness_decision(
-    row: Option<&SessionRuntimeRow>,
-) -> Result<SessionRuntimeLivenessDecision, String> {
-    let Some(row) = row else {
-        return Ok(SessionRuntimeLivenessDecision::Idle);
-    };
-    if runtime_row_is_idle(row) {
-        return Ok(SessionRuntimeLivenessDecision::Idle);
-    }
-    let evidence = runtime_liveness_evidence(row)?;
-    Ok(session_runtime_liveness_from_evidence(evidence))
-}
-
-fn classify_session_runtime_row_read_only(
-    row: Option<&SessionRuntimeRow>,
-) -> Result<SessionRuntimeReadOnlyLiveness, String> {
-    let Some(row) = row else {
-        return Ok(SessionRuntimeReadOnlyLiveness::Idle);
-    };
-    if runtime_row_is_idle(row) {
-        return Ok(SessionRuntimeReadOnlyLiveness::Idle);
-    }
-    let evidence = runtime_liveness_evidence(row)?;
-    Ok(read_only_liveness_from_evidence(evidence))
-}
-
-fn runtime_liveness_evidence(row: &SessionRuntimeRow) -> Result<RuntimeLivenessEvidence, String> {
-    let invocation_uuid = row.running_invocation_uuid.clone();
-    let recorded = runtime_liveness_recorded_identity(row, invocation_uuid.as_ref());
-    let live = live_process_identity_for_evidence(recorded.as_ref())?;
-    Ok(runtime_liveness_evidence_from_parts(
-        invocation_uuid,
-        recorded,
-        live,
-    ))
-}
-
-fn runtime_liveness_recorded_identity(
-    row: &SessionRuntimeRow,
-    invocation_uuid: Option<&String>,
-) -> Option<ProcessIdentity> {
-    invocation_uuid.and_then(|_| runtime_row_identity(row))
-}
-
-fn live_process_identity_for_evidence(
-    recorded: Option<&ProcessIdentity>,
-) -> Result<Option<ProcessIdentity>, String> {
-    match recorded {
-        Some(recorded) => live_process_identity_for_runtime(recorded),
-        None => Ok(None),
-    }
-}
-
-fn runtime_liveness_evidence_from_parts(
-    invocation_uuid: Option<String>,
-    recorded: Option<ProcessIdentity>,
-    live: Option<ProcessIdentity>,
-) -> RuntimeLivenessEvidence {
-    RuntimeLivenessEvidence {
-        invocation_uuid,
-        recorded,
-        live,
-    }
-}
-
-fn session_runtime_liveness_from_evidence(
-    evidence: RuntimeLivenessEvidence,
-) -> SessionRuntimeLivenessDecision {
-    if liveness_evidence_missing_invocation(&evidence) {
-        return stale_liveness_decision(None);
-    };
-    let recorded_missing = liveness_evidence_missing_recorded(&evidence);
-    let invocation_uuid = evidence.invocation_uuid.expect("invocation checked above");
-    if recorded_missing {
-        return stale_liveness_decision(Some(invocation_uuid));
-    };
-    let recorded = evidence.recorded.expect("recorded identity checked above");
-    if liveness_evidence_is_busy(&evidence.live, &recorded) {
-        return SessionRuntimeLivenessDecision::Busy;
-    }
-    stale_liveness_decision(Some(invocation_uuid))
-}
-
-fn liveness_evidence_missing_invocation(evidence: &RuntimeLivenessEvidence) -> bool {
-    evidence.invocation_uuid.is_none()
-}
-
-fn liveness_evidence_missing_recorded(evidence: &RuntimeLivenessEvidence) -> bool {
-    evidence.recorded.is_none()
-}
-
-fn liveness_evidence_is_busy(live: &Option<ProcessIdentity>, recorded: &ProcessIdentity) -> bool {
-    runtime_identity_is_live(live.as_ref(), recorded)
-}
-
-fn stale_liveness_decision(
-    running_invocation_uuid: Option<String>,
-) -> SessionRuntimeLivenessDecision {
-    SessionRuntimeLivenessDecision::Stale {
-        running_invocation_uuid,
-    }
-}
-
-fn read_only_liveness_from_evidence(
-    evidence: RuntimeLivenessEvidence,
-) -> SessionRuntimeReadOnlyLiveness {
-    if liveness_evidence_missing_recorded(&evidence) {
-        return read_only_missing_liveness(evidence.invocation_uuid.as_deref());
-    };
-    if read_only_liveness_evidence_missing_live(&evidence) {
-        return SessionRuntimeReadOnlyLiveness::StaleDead;
-    };
-    let recorded = evidence.recorded.expect("recorded identity checked above");
-    let live = evidence.live.expect("live identity checked above");
-    read_only_liveness_from_live_identity(&live, &recorded)
-}
-
-fn read_only_liveness_evidence_missing_live(evidence: &RuntimeLivenessEvidence) -> bool {
-    evidence.live.is_none()
-}
-
-fn read_only_liveness_from_live_identity(
-    live: &ProcessIdentity,
-    recorded: &ProcessIdentity,
-) -> SessionRuntimeReadOnlyLiveness {
-    if live == recorded {
-        SessionRuntimeReadOnlyLiveness::Busy
-    } else {
-        SessionRuntimeReadOnlyLiveness::StalePidReused
-    }
-}
-
-fn read_only_missing_liveness(invocation_uuid: Option<&str>) -> SessionRuntimeReadOnlyLiveness {
-    if invocation_uuid.is_some() {
-        SessionRuntimeReadOnlyLiveness::StaleMissingIdentity
-    } else {
-        SessionRuntimeReadOnlyLiveness::StaleMissingInvocation
-    }
-}
-
-fn session_liveness_from_decision(decision: &SessionRuntimeLivenessDecision) -> SessionLiveness {
-    match decision {
-        SessionRuntimeLivenessDecision::Busy => SessionLiveness::Busy,
-        SessionRuntimeLivenessDecision::Idle | SessionRuntimeLivenessDecision::Stale { .. } => {
-            SessionLiveness::Idle
-        }
-    }
 }
 
 fn fresh_in_flight_wake_claim(
@@ -6083,6 +7104,44 @@ fn wake_claim_is_reclaimable(
     Ok(claim_is_stale(claim, stale_after_seconds))
 }
 
+fn wake_claim_is_releasable_for_manual_resume(
+    conn: &Connection,
+    claim: &WakeClaimRow,
+) -> Result<bool, String> {
+    if claim.wake_invocation_uuid.is_none() {
+        return Ok(true);
+    }
+    let Some(wake_pid) = claim.wake_pid else {
+        return Ok(false);
+    };
+    let Some(live) = wake_claim_live_process_identity(wake_pid)? else {
+        return Ok(true);
+    };
+    if !wake_claim_has_persisted_process_identity(conn, claim)? {
+        return Ok(false);
+    }
+    wake_claim_has_matching_live_process_identity(conn, claim, &live).map(|matched| !matched)
+}
+
+fn wake_claim_has_persisted_process_identity(
+    conn: &Connection,
+    claim: &WakeClaimRow,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT wake_pid IS NOT NULL
+                AND wake_os_boot_id IS NOT NULL
+                AND wake_os_pid_starttime_ticks IS NOT NULL
+         FROM session_wake_claim
+         WHERE session_id = ?1
+           AND claim_token = ?2",
+        params![&claim.session_id, &claim.claim_token],
+        |row| row.get::<_, bool>(0),
+    )
+    .optional()
+    .map(|recorded| recorded.unwrap_or(false))
+    .map_err(|err| format!("Failed to read wake claim process identity: {err}"))
+}
+
 fn wake_claim_pid_is_reclaimable(conn: &Connection, claim: &WakeClaimRow) -> Result<bool, String> {
     let Some(wake_pid) = claim.wake_pid else {
         return Ok(false);
@@ -6098,23 +7157,23 @@ fn wake_claim_pid_is_live_identity_matched(
     let Some(live) = wake_claim_live_process_identity(wake_pid)? else {
         return Ok(false);
     };
-    wake_claim_live_identity_has_matching_sidecar_row(conn, claim, &live)
+    wake_claim_has_matching_live_process_identity(conn, claim, &live)
 }
 
 fn wake_claim_live_process_identity(wake_pid: i64) -> Result<Option<ProcessIdentity>, String> {
     pid_identity::read_live_process_identity(wake_pid)
 }
 
-fn wake_claim_live_identity_has_matching_sidecar_row(
+fn wake_claim_has_matching_live_process_identity(
     conn: &Connection,
     claim: &WakeClaimRow,
     live: &ProcessIdentity,
 ) -> Result<bool, String> {
-    let exists = wake_claim_live_identity_matching_sidecar_exists(conn, claim, live)?;
+    let exists = wake_claim_matching_live_process_identity_exists(conn, claim, live)?;
     Ok(sqlite_exists_value_to_bool(exists))
 }
 
-fn wake_claim_live_identity_matching_sidecar_exists(
+fn wake_claim_matching_live_process_identity_exists(
     conn: &Connection,
     claim: &WakeClaimRow,
     live: &ProcessIdentity,
@@ -6122,23 +7181,23 @@ fn wake_claim_live_identity_matching_sidecar_exists(
     conn.query_row(
         "SELECT EXISTS(
             SELECT 1
-            FROM pid_identity
-            WHERE os_pid = ?1
-              AND os_boot_id = ?2
-              AND os_pid_starttime_ticks = ?3
-              AND invocation_uuid = ?4
-              AND session_id = ?5
+            FROM session_wake_claim
+            WHERE session_id = ?1
+              AND claim_token = ?2
+              AND wake_pid = ?3
+              AND wake_os_boot_id = ?4
+              AND wake_os_pid_starttime_ticks = ?5
         )",
         params![
+            &claim.session_id,
+            &claim.claim_token,
             live.os_pid,
             &live.os_boot_id,
             live.os_pid_starttime_ticks,
-            &claim.claim_token,
-            &claim.session_id,
         ],
         |row| row.get::<_, i64>(0),
     )
-    .map_err(|err| format!("Failed to verify wake PID sidecar identity: {err}"))
+    .map_err(|err| format!("Failed to verify wake claim process identity: {err}"))
 }
 
 fn sqlite_exists_value_to_bool(value: i64) -> bool {
@@ -6181,6 +7240,8 @@ fn upsert_wake_claim_tx(
             claim_token = excluded.claim_token,
             claimed_at = excluded.claimed_at,
             wake_pid = excluded.wake_pid,
+            wake_os_boot_id = NULL,
+            wake_os_pid_starttime_ticks = NULL,
             wake_invocation_uuid = excluded.wake_invocation_uuid,
             reason = excluded.reason,
             auto_wake_count = excluded.auto_wake_count,
@@ -6230,10 +7291,6 @@ fn update_session_runtime_auto_wake_count_tx(
 
 fn wake_claim_matches_child(claim: &WakeClaimRow, claim_token: &str) -> bool {
     claim.claim_token == claim_token
-}
-
-fn wake_claim_is_valid_for_child(claim: Option<&WakeClaimRow>, claim_token: &str) -> bool {
-    claim.is_some_and(|claim| wake_claim_matches_child(claim, claim_token))
 }
 
 pub(crate) fn validate_completion_event_registration(
@@ -6999,18 +8056,24 @@ fn completion_event_mailbox_rows_on(
 
 fn acknowledge_completion_event_listeners_for_seqs(
     tx: &Transaction<'_>,
+    session_id: &str,
+    chain_id: Option<&str>,
     seqs: &[i64],
     now: &str,
 ) -> Result<(), String> {
+    let sql = format!(
+        "UPDATE completion_event_listener
+         SET acknowledged_at = COALESCE(acknowledged_at, ?4),
+             acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
+         WHERE mailbox_seq = ?3
+           AND EXISTS (
+               SELECT 1 FROM mailbox
+               WHERE mailbox.seq = ?3 AND {PENDING_MAILBOX_TARGET_PREDICATE}
+           )"
+    );
     for seq in seqs {
-        tx.execute(
-            "UPDATE completion_event_listener
-             SET acknowledged_at = COALESCE(acknowledged_at, ?2),
-                 acknowledgement_reason = COALESCE(acknowledgement_reason, 'injected')
-             WHERE mailbox_seq = ?1",
-            params![seq, now],
-        )
-        .map_err(|err| format!("Failed to acknowledge completion event listener: {err}"))?;
+        tx.execute(&sql, params![session_id, chain_id, seq, now])
+            .map_err(|err| format!("Failed to acknowledge completion event listener: {err}"))?;
     }
     Ok(())
 }
@@ -7049,17 +8112,38 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn set_wal_mode(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-        .map_err(|err| format!("Failed to set durable PID mailbox sidecar mode: {err}"))
+pub(crate) fn set_wal_mode(conn: &Connection) -> Result<(), String> {
+    const RETRY_INTERVAL: StdDuration = StdDuration::from_millis(10);
+    const TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") {
+            Ok(()) => return Ok(()),
+            Err(error) if sqlite_error_is_contention(&error) && Instant::now() < deadline => {
+                std::thread::sleep(RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Failed to set durable PID mailbox sidecar mode: {error}"
+                ));
+            }
+        }
+    }
 }
 
 pub(crate) fn configure_writable_sidecar_connection(conn: &Connection) -> Result<(), String> {
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|err| format!("Failed to enable PID mailbox sidecar foreign keys: {err}"))?;
+    conn.busy_timeout(mailbox_writer_sqlite_timeout())
+        .map_err(|err| format!("Failed to configure PID mailbox writer wait: {err}"))?;
     #[cfg(test)]
     install_completion_finalization_vm_counter(conn);
     Ok(())
+}
+
+pub(crate) fn ensure_shared_sidecar_schema(conn: &mut Connection) -> Result<(), String> {
+    schema::ensure(conn)
 }
 
 fn mailbox_schema_definition() -> &'static str {
@@ -7129,9 +8213,14 @@ fn mailbox_schema_definition() -> &'static str {
             delivery_invocation_uuid      TEXT NOT NULL,
             created_at                    TEXT NOT NULL,
             prepared_remaining_count      INTEGER NOT NULL,
+            submission_started_at         TEXT,
             acknowledged_at               TEXT,
             resolved_at                   TEXT,
-            resolved_by_attempt_id        TEXT
+            resolved_by_attempt_id        TEXT,
+            evidence_turn_generation_id   TEXT,
+            evidence_observed_at           INTEGER,
+            evidence_reconciled_at         TEXT,
+            evidence_disposition           TEXT
         );
 
         CREATE TABLE IF NOT EXISTS mailbox_delivery_attempt_items (
@@ -7511,12 +8600,24 @@ fn mailbox_schema_definition() -> &'static str {
             active_delivery_claim_uuid         TEXT,
             active_delivery_claimed_at          TEXT,
             active_delivery_seqs_json           TEXT,
+            creator_identity_os_pid             INTEGER,
+            creator_identity_os_boot_id         TEXT,
+            creator_identity_os_pid_starttime_ticks INTEGER,
             CHECK (
                 (identity_os_pid IS NULL AND identity_os_boot_id IS NULL AND identity_os_pid_starttime_ticks IS NULL)
                 OR
                 (identity_os_pid IS NOT NULL AND identity_os_boot_id IS NOT NULL AND identity_os_pid_starttime_ticks IS NOT NULL)
             ),
             CHECK (identity_os_pid IS NULL OR identity_os_pid = spawned_os_pid),
+            CHECK (
+                (creator_identity_os_pid IS NULL
+                    AND creator_identity_os_boot_id IS NULL
+                    AND creator_identity_os_pid_starttime_ticks IS NULL)
+                OR
+                (creator_identity_os_pid IS NOT NULL
+                    AND creator_identity_os_boot_id IS NOT NULL
+                    AND creator_identity_os_pid_starttime_ticks IS NOT NULL)
+            ),
             CHECK (
                 (active_delivery_claim_uuid IS NULL
                     AND active_delivery_claimed_at IS NULL
@@ -7596,6 +8697,8 @@ fn mailbox_schema_definition() -> &'static str {
             claim_token                      TEXT NOT NULL,
             claimed_at                       TEXT NOT NULL,
             wake_pid                         INTEGER,
+            wake_os_boot_id                  TEXT,
+            wake_os_pid_starttime_ticks      INTEGER,
             wake_invocation_uuid             TEXT,
             reason                           TEXT NOT NULL,
             auto_wake_count                  INTEGER NOT NULL,
@@ -7605,6 +8708,418 @@ fn mailbox_schema_definition() -> &'static str {
 
         CREATE INDEX IF NOT EXISTS idx_session_wake_claim_claimed_at
             ON session_wake_claim(claimed_at);"
+}
+
+pub(super) fn session_admission_schema_definition() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS session_admission_queue (
+        queue_sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+        admission_id            TEXT NOT NULL UNIQUE,
+        registration_identity   TEXT NOT NULL UNIQUE,
+        session_id              TEXT,
+        state                   TEXT NOT NULL CHECK(state IN ('queued', 'admitted', 'launching', 'settled', 'cancelled')),
+        queue_reason            TEXT NOT NULL,
+        claim_token             TEXT,
+        claimed_at_unix_ms      INTEGER,
+        runtime_generation_uuid TEXT UNIQUE,
+        launcher_os_pid         INTEGER NOT NULL,
+        launcher_os_boot_id     TEXT NOT NULL,
+        launcher_os_pid_starttime_ticks INTEGER NOT NULL,
+        created_at_unix_ms      INTEGER NOT NULL,
+        updated_at_unix_ms      INTEGER NOT NULL,
+        CHECK (
+            (state IN ('queued', 'cancelled') AND claim_token IS NULL AND claimed_at_unix_ms IS NULL)
+            OR
+            (state IN ('admitted', 'launching', 'settled') AND claim_token IS NOT NULL AND claimed_at_unix_ms IS NOT NULL)
+        )
+     );
+
+     CREATE INDEX IF NOT EXISTS idx_session_admission_fifo
+       ON session_admission_queue(state, queue_sequence);
+
+     CREATE INDEX IF NOT EXISTS idx_session_admission_claim
+       ON session_admission_queue(claim_token, claimed_at_unix_ms);"
+}
+
+pub(super) fn ensure_session_admission_launcher_identity_schema(
+    conn: &Connection,
+) -> Result<(), String> {
+    let columns = table_columns(
+        conn,
+        "session_admission_queue",
+        &format_table_columns_pragma("session_admission_queue"),
+    )?;
+    if columns
+        .iter()
+        .any(|column| column == "launcher_os_pid_starttime_ticks")
+    {
+        return Ok(());
+    }
+    let active_runtime: bool = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM runtime_generation WHERE lifecycle_state != 'exited'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("Failed to inspect runtime quiescence before v7: {err}"))?;
+    let active_admission: bool = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM session_admission_queue WHERE state != 'settled'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|err| format!("Failed to inspect admission quiescence before v7: {err}"))?;
+    if active_runtime || active_admission {
+        return Err(
+            "PID mailbox sidecar v7 migration requires a quiescent runner; stop all provider launchers before upgrading"
+                .to_string(),
+        );
+    }
+
+    conn.execute_batch(
+        "ALTER TABLE session_admission_queue RENAME TO session_admission_queue_v6;
+         DROP INDEX IF EXISTS idx_session_admission_fifo;
+         DROP INDEX IF EXISTS idx_session_admission_claim;",
+    )
+    .map_err(|err| format!("Failed to preserve v6 session admission queue: {err}"))?;
+    conn.execute_batch(session_admission_schema_definition())
+        .map_err(|err| format!("Failed to create launcher-owned session admission queue: {err}"))?;
+    conn.execute_batch(
+        "INSERT INTO session_admission_queue (
+            queue_sequence, admission_id, registration_identity, session_id, state,
+            queue_reason, claim_token, claimed_at_unix_ms, runtime_generation_uuid,
+            launcher_os_pid, launcher_os_boot_id,
+            launcher_os_pid_starttime_ticks, created_at_unix_ms, updated_at_unix_ms
+         )
+         SELECT queue_sequence, admission_id, registration_identity, session_id,
+                CASE WHEN state = 'queued' THEN 'cancelled' ELSE state END,
+                CASE WHEN state = 'queued' THEN 'upgrade_cancelled' ELSE state END,
+                CASE WHEN state = 'queued' THEN NULL ELSE claim_token END,
+                CASE WHEN state = 'queued' THEN NULL ELSE claimed_at_unix_ms END,
+                runtime_generation_uuid, 0, 'legacy-unverifiable', 0,
+                created_at_unix_ms, updated_at_unix_ms
+         FROM session_admission_queue_v6;
+         DROP TABLE session_admission_queue_v6;",
+    )
+    .map_err(|err| format!("Failed to migrate v6 session admission rows: {err}"))
+}
+
+fn validate_session_admission_identity(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("Session admission {field} must not be empty"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_session_admission_identity(
+    value: Option<&str>,
+    field: &str,
+) -> Result<(), String> {
+    match value {
+        Some(value) => validate_session_admission_identity(value, field),
+        None => Ok(()),
+    }
+}
+
+fn session_admission_by_registration_on(
+    conn: &Connection,
+    registration_identity: &str,
+) -> Result<Option<SessionAdmissionRow>, String> {
+    conn.query_row(
+        "SELECT queue_sequence, admission_id, registration_identity, session_id,
+                state, queue_reason, claim_token, claimed_at_unix_ms, runtime_generation_uuid,
+                launcher_os_pid, launcher_os_boot_id,
+                launcher_os_pid_starttime_ticks
+         FROM session_admission_queue
+         WHERE registration_identity = ?1",
+        params![registration_identity],
+        |row| {
+            Ok(SessionAdmissionRow {
+                queue_sequence: row.get(0)?,
+                admission_id: row.get(1)?,
+                registration_identity: row.get(2)?,
+                session_id: row.get(3)?,
+                state: row.get(4)?,
+                queue_reason: row.get(5)?,
+                claim_token: row.get(6)?,
+                claimed_at_unix_ms: row.get(7)?,
+                runtime_generation_uuid: row.get(8)?,
+                launcher_os_pid: row.get(9)?,
+                launcher_os_boot_id: row.get(10)?,
+                launcher_os_pid_starttime_ticks: row.get(11)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| format!("Failed to read session admission row: {err}"))
+}
+
+fn recover_stale_session_admissions_on(
+    conn: &Connection,
+    stale_before_unix_ms: i64,
+    now_unix_ms: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE session_admission_queue
+         SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?1
+         WHERE state NOT IN ('settled', 'cancelled')
+           AND runtime_generation_uuid IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM runtime_generation AS generation
+             WHERE generation.generation_uuid = session_admission_queue.runtime_generation_uuid
+               AND generation.lifecycle_state != 'exited'
+           )",
+        params![now_unix_ms],
+    )
+    .map_err(|err| format!("Failed to settle exited session admissions: {err}"))?;
+    conn.execute(
+        "UPDATE session_admission_queue
+         SET state = 'queued', queue_reason = 'fifo_wait',
+             claim_token = NULL, claimed_at_unix_ms = NULL,
+             runtime_generation_uuid = NULL, updated_at_unix_ms = ?2
+         WHERE state = 'admitted'
+           AND runtime_generation_uuid IS NULL
+           AND claimed_at_unix_ms <= ?1",
+        params![stale_before_unix_ms, now_unix_ms],
+    )
+    .map_err(|err| format!("Failed to recover stale session admission reservations: {err}"))?;
+    Ok(())
+}
+
+fn cancel_dead_queued_session_admissions_on(
+    conn: &Connection,
+    now_unix_ms: i64,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT registration_identity, launcher_os_pid, launcher_os_boot_id,
+                    launcher_os_pid_starttime_ticks
+             FROM session_admission_queue
+             WHERE (state = 'queued'
+                    OR (state = 'launching' AND runtime_generation_uuid IS NULL))
+             ORDER BY queue_sequence",
+        )
+        .map_err(|err| format!("Failed to prepare queued launcher reconciliation: {err}"))?;
+    let owners = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ProcessIdentity {
+                    os_pid: row.get(1)?,
+                    os_boot_id: row.get(2)?,
+                    os_pid_starttime_ticks: row.get(3)?,
+                },
+            ))
+        })
+        .map_err(|err| format!("Failed to query queued launcher identities: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read queued launcher identity: {err}"))?;
+    drop(statement);
+
+    for (registration_identity, recorded) in owners {
+        let live = pid_identity::read_live_process_identity(recorded.os_pid)?;
+        if live.as_ref() == Some(&recorded) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE session_admission_queue
+             SET state = 'cancelled', queue_reason = 'launcher_exited', claim_token = NULL,
+                 claimed_at_unix_ms = NULL, updated_at_unix_ms = ?2
+             WHERE registration_identity = ?1
+               AND (state = 'queued'
+                    OR (state = 'launching' AND runtime_generation_uuid IS NULL))
+               AND launcher_os_pid = ?3
+               AND launcher_os_boot_id = ?4
+               AND launcher_os_pid_starttime_ticks = ?5",
+            params![
+                &registration_identity,
+                now_unix_ms,
+                recorded.os_pid,
+                &recorded.os_boot_id,
+                recorded.os_pid_starttime_ticks,
+            ],
+        )
+        .map_err(|err| format!("Failed to cancel dead queued launcher: {err}"))?;
+    }
+    Ok(())
+}
+
+fn reconcile_dead_starting_generations_on(
+    conn: &Connection,
+    now_unix_ms: i64,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT generation_uuid, creator_identity_os_pid,
+                    creator_identity_os_boot_id,
+                    creator_identity_os_pid_starttime_ticks
+             FROM runtime_generation
+             WHERE lifecycle_state = 'starting'
+               AND identity_os_pid IS NULL
+               AND creator_identity_os_pid IS NOT NULL",
+        )
+        .map_err(|err| format!("Failed to prepare starting-generation reconciliation: {err}"))?;
+    let generations = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ProcessIdentity {
+                    os_pid: row.get(1)?,
+                    os_boot_id: row.get(2)?,
+                    os_pid_starttime_ticks: row.get(3)?,
+                },
+            ))
+        })
+        .map_err(|err| format!("Failed to query starting-generation creators: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to read starting-generation creator: {err}"))?;
+    drop(statement);
+    let exited_at = now_rfc3339();
+
+    for (generation_uuid, creator) in generations {
+        let live = pid_identity::read_live_process_identity(creator.os_pid)?;
+        if live.as_ref() == Some(&creator) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE runtime_generation
+             SET lifecycle_state = 'exited', exited_at = ?2,
+                 terminal_reason = 'recovered_dead'
+             WHERE generation_uuid = ?1
+               AND lifecycle_state = 'starting'
+               AND identity_os_pid IS NULL
+               AND creator_identity_os_pid = ?3
+               AND creator_identity_os_boot_id = ?4
+               AND creator_identity_os_pid_starttime_ticks = ?5",
+            params![
+                &generation_uuid,
+                &exited_at,
+                creator.os_pid,
+                &creator.os_boot_id,
+                creator.os_pid_starttime_ticks,
+            ],
+        )
+        .map_err(|err| format!("Failed to reconcile dead starting generation: {err}"))?;
+        conn.execute(
+            "UPDATE session_admission_queue
+              SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
+             WHERE runtime_generation_uuid = ?1
+               AND state IN ('admitted', 'launching')",
+            params![&generation_uuid, now_unix_ms],
+        )
+        .map_err(|err| format!("Failed to settle dead starting admission: {err}"))?;
+    }
+    Ok(())
+}
+
+fn bind_runtime_generation_admission_on(
+    conn: &Connection,
+    spawn_invocation_uuid: &str,
+    generation_id: &RuntimeGenerationId,
+    creator_identity: &ProcessIdentity,
+) -> Result<(), GenerationStorageError> {
+    let admission_exists = conn
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM session_admission_queue
+                WHERE registration_identity = ?1
+             )",
+            params![spawn_invocation_uuid],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(generation_storage_error(
+            "inspect runtime generation session admission",
+        ))?;
+    if !admission_exists {
+        return Ok(());
+    }
+    let changed = conn
+        .execute(
+            "UPDATE session_admission_queue
+         SET runtime_generation_uuid = ?2
+         WHERE registration_identity = ?1
+           AND state = 'launching'
+           AND runtime_generation_uuid IS NULL
+           AND launcher_os_pid = ?3
+           AND launcher_os_boot_id = ?4
+           AND launcher_os_pid_starttime_ticks = ?5",
+            params![
+                spawn_invocation_uuid,
+                generation_id.to_string(),
+                creator_identity.os_pid,
+                &creator_identity.os_boot_id,
+                creator_identity.os_pid_starttime_ticks,
+            ],
+        )
+        .map_err(generation_storage_error(
+            "bind runtime generation to session admission",
+        ))?;
+    if changed != 1 {
+        return Err(GenerationStorageError::new(
+            "Runtime generation session admission is stale or owned by another launcher"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn bind_runtime_generation_admission_session_on(
+    conn: &Connection,
+    generation_id: &RuntimeGenerationId,
+    session_id: &str,
+) -> Result<(), GenerationStorageError> {
+    let conflicting = conn
+        .query_row(
+            "SELECT session_id
+             FROM session_admission_queue
+             WHERE runtime_generation_uuid = ?1 AND session_id IS NOT NULL",
+            params![generation_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(generation_storage_error(
+            "inspect runtime generation admission session",
+        ))?;
+    if conflicting
+        .as_deref()
+        .is_some_and(|current| current != session_id)
+    {
+        return Err(GenerationStorageError::new(
+            "Runtime generation admission belongs to another session".to_string(),
+        ));
+    }
+    conn.execute(
+        "UPDATE session_admission_queue
+         SET session_id = ?2
+         WHERE runtime_generation_uuid = ?1 AND session_id IS NULL",
+        params![generation_id.to_string(), session_id],
+    )
+    .map(|_| ())
+    .map_err(generation_storage_error(
+        "bind runtime generation admission session",
+    ))
+}
+
+fn settle_runtime_generation_admission_on(
+    conn: &Connection,
+    generation_id: &RuntimeGenerationId,
+) -> Result<(), GenerationStorageError> {
+    let now_unix_ms = now_unix_millis().map_err(GenerationStorageError::new)?;
+    conn.execute(
+        "UPDATE session_admission_queue
+         SET state = 'settled', queue_reason = 'settled', updated_at_unix_ms = ?2
+         WHERE runtime_generation_uuid = ?1
+           AND state IN ('admitted', 'launching')",
+        params![generation_id.to_string(), now_unix_ms],
+    )
+    .map(|_| ())
+    .map_err(generation_storage_error(
+        "settle runtime generation session admission",
+    ))
 }
 
 fn normalized_mailbox_path(sidecar_path: &Path) -> std::io::Result<PathBuf> {
@@ -7655,21 +9170,22 @@ fn validate_mailbox_source(
     source_path: &Path,
     retained_path: &Path,
     expected_identity: Option<MailboxFileIdentity>,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<MailboxFileIdentity>> {
     if normalized_mailbox_path(source_path)? != retained_path {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "PID mailbox sidecar source changed during authority acquisition",
         ));
     }
-    if inspect_mailbox_storage_file(retained_path)? != expected_identity {
+    let observed_identity = inspect_mailbox_storage_file(retained_path)?;
+    if expected_identity.is_some() && observed_identity != expected_identity {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "PID mailbox sidecar target changed during authority acquisition",
         ));
     }
     validate_mailbox_sqlite_artifacts(retained_path)?;
-    Ok(())
+    Ok(observed_identity)
 }
 
 #[cfg(any(unix, windows))]
@@ -7679,7 +9195,20 @@ fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFi
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+    let identity = match crate::filesystem_identity::path_file_identity(path, &metadata) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    classify_mailbox_storage_metadata(path, &metadata, identity)
+}
+
+fn classify_mailbox_storage_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    identity: crate::filesystem_identity::OpenFileIdentity,
+) -> std::io::Result<Option<MailboxFileIdentity>> {
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!(
@@ -7688,7 +9217,22 @@ fn inspect_mailbox_storage_file(path: &Path) -> std::io::Result<Option<MailboxFi
             ),
         ));
     }
-    Ok(Some(mailbox_file_identity(&metadata)?))
+    // SQLite may unlink a WAL or journal between path lookup and metadata
+    // inspection. A zero-link inode is already outside the namespace; actual
+    // hard-link aliases still have more than one link and remain rejected.
+    if identity.links == 0 {
+        return Ok(None);
+    }
+    if identity.links != 1 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "PID mailbox storage requires a regular file with exactly one hard link: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(Some(mailbox_identity(identity)))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -7728,7 +9272,8 @@ fn opened_mailbox_file_identity(
     path: &Path,
 ) -> std::io::Result<MailboxFileIdentity> {
     let metadata = file.metadata()?;
-    if !metadata.is_file() || !mailbox_file_has_one_link(&metadata) {
+    let identity = crate::filesystem_identity::open_file_identity(file)?;
+    if !metadata.is_file() || identity.links != 1 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             format!(
@@ -7737,86 +9282,14 @@ fn opened_mailbox_file_identity(
             ),
         ));
     }
-    mailbox_file_identity(&metadata)
+    Ok(mailbox_identity(identity))
 }
 
-#[cfg(unix)]
-fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink() == 1
-}
-
-#[cfg(unix)]
-fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(MailboxFileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn mailbox_file_has_one_link(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    metadata.number_of_links() == Some(1)
-}
-
-#[cfg(windows)]
-fn mailbox_file_identity(metadata: &fs::Metadata) -> std::io::Result<MailboxFileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-    Ok(MailboxFileIdentity {
-        volume: u64::from(metadata.volume_serial_number().ok_or_else(|| {
-            std::io::Error::new(ErrorKind::Unsupported, "missing volume serial number")
-        })?),
-        file: metadata
-            .file_index()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::Unsupported, "missing file index"))?,
-    })
-}
-
-fn ensure_mailbox_schema(conn: &mut Connection) -> Result<(), String> {
-    let stored_version = mailbox_sidecar_schema_version(conn)?;
-    if stored_version == MAILBOX_SIDECAR_SCHEMA_VERSION {
-        return Ok(());
+fn mailbox_identity(identity: crate::filesystem_identity::OpenFileIdentity) -> MailboxFileIdentity {
+    MailboxFileIdentity {
+        volume: identity.storage,
+        file: identity.file,
     }
-    if stored_version != 0 {
-        return Err(format!(
-            "Unsupported PID mailbox sidecar schema version {stored_version}; expected {MAILBOX_SIDECAR_SCHEMA_VERSION}"
-        ));
-    }
-
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|err| format!("Failed to lock PID mailbox sidecar schema upgrade: {err}"))?;
-    let locked_version = mailbox_sidecar_schema_version(&tx)?;
-    if locked_version == MAILBOX_SIDECAR_SCHEMA_VERSION {
-        return tx
-            .commit()
-            .map_err(|err| format!("Failed to finish PID mailbox sidecar schema check: {err}"));
-    }
-    if locked_version != 0 {
-        return Err(format!(
-            "Unsupported PID mailbox sidecar schema version {locked_version}; expected {MAILBOX_SIDECAR_SCHEMA_VERSION}"
-        ));
-    }
-    tx.execute_batch(mailbox_schema_definition())
-        .map_err(|err| format!("Failed to upgrade PID mailbox sidecar schema: {err}"))?;
-    ensure_mailbox_sidecar_identity_locked(&tx)?;
-    ensure_mailbox_columns(&tx)?;
-    ensure_mailbox_target_index(&tx)?;
-    ensure_mailbox_compaction_index(&tx)?;
-    ensure_mailbox_delivery_owner_index(&tx)?;
-    ensure_session_runtime_columns(&tx)?;
-    ensure_runtime_generation_columns(&tx)?;
-    tx.pragma_update(None, "user_version", MAILBOX_SIDECAR_SCHEMA_VERSION)
-        .map_err(|err| format!("Failed to record PID mailbox sidecar schema version: {err}"))?;
-    tx.commit()
-        .map_err(|err| format!("Failed to commit PID mailbox sidecar schema upgrade: {err}"))
-}
-
-fn mailbox_sidecar_schema_version(conn: &Connection) -> Result<i64, String> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(|err| format!("Failed to read PID mailbox sidecar schema version: {err}"))
 }
 
 fn ensure_mailbox_sidecar_identity_locked(conn: &Connection) -> Result<(), String> {
@@ -7849,6 +9322,66 @@ fn ensure_mailbox_columns(conn: &Connection) -> Result<(), String> {
     for (name, definition) in missing_mailbox_columns(&columns) {
         add_sidecar_column(conn, "mailbox", name, definition)?;
     }
+    Ok(())
+}
+
+fn ensure_mailbox_delivery_attempt_columns(conn: &Connection) -> Result<(), String> {
+    let sql = format_table_columns_pragma("mailbox_delivery_attempts");
+    let columns = table_columns(conn, "mailbox_delivery_attempts", &sql)?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    for (name, definition) in [
+        ("submission_started_at", "TEXT"),
+        ("evidence_turn_generation_id", "TEXT"),
+        ("evidence_observed_at", "INTEGER"),
+        ("evidence_reconciled_at", "TEXT"),
+        ("evidence_disposition", "TEXT"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            add_sidecar_column(conn, "mailbox_delivery_attempts", name, definition)?;
+        }
+    }
+    conn.execute_batch(
+        "UPDATE mailbox_delivery_attempts
+         SET submission_started_at = acknowledged_at
+         WHERE acknowledged_at IS NOT NULL
+           AND submission_started_at IS NULL;
+
+         UPDATE mailbox_delivery_attempts AS attempts
+         SET evidence_turn_generation_id = (
+                 SELECT generation_uuid
+                 FROM runtime_generation AS generations
+                 WHERE generations.session_id = attempts.session_id
+                   AND generations.spawn_invocation_uuid = attempts.delivery_invocation_uuid
+             ),
+             evidence_observed_at = CAST(strftime('%s', acknowledged_at) AS INTEGER) * 1000,
+             evidence_disposition = 'legacy_pending'
+         WHERE acknowledged_at IS NOT NULL
+           AND evidence_turn_generation_id IS NULL
+           AND evidence_observed_at IS NULL
+           AND evidence_disposition IS NULL
+           AND 1 = (
+                 SELECT COUNT(*)
+                 FROM runtime_generation AS generations
+                 WHERE generations.session_id = attempts.session_id
+                   AND generations.spawn_invocation_uuid = attempts.delivery_invocation_uuid
+              );
+
+         UPDATE mailbox_delivery_attempts AS attempts
+         SET evidence_disposition = CASE (
+                 SELECT COUNT(*)
+                 FROM runtime_generation AS generations
+                 WHERE generations.session_id = attempts.session_id
+                   AND generations.spawn_invocation_uuid = attempts.delivery_invocation_uuid
+             )
+             WHEN 0 THEN 'legacy_unmatched_generation'
+             ELSE 'legacy_ambiguous_generation'
+             END
+         WHERE acknowledged_at IS NOT NULL
+           AND evidence_disposition IS NULL;",
+    )
+    .map_err(|err| format!("Failed to backfill mailbox delivery settlement: {err}"))?;
     Ok(())
 }
 
@@ -7906,6 +9439,20 @@ fn ensure_session_runtime_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_wake_claim_process_identity_columns(conn: &Connection) -> Result<(), String> {
+    let sql = format_table_columns_pragma("session_wake_claim");
+    let columns = table_columns(conn, "session_wake_claim", &sql)?;
+    for (name, definition) in [
+        ("wake_os_boot_id", "TEXT"),
+        ("wake_os_pid_starttime_ticks", "INTEGER"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            add_sidecar_column(conn, "session_wake_claim", name, definition)?;
+        }
+    }
+    Ok(())
+}
+
 fn ensure_runtime_generation_columns(conn: &Connection) -> Result<(), String> {
     let sql = format_table_columns_pragma("runtime_generation");
     let columns = table_columns(conn, "runtime_generation", &sql)?;
@@ -7915,10 +9462,40 @@ fn ensure_runtime_generation_columns(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn runtime_generation_column_additions() -> [(&'static str, &'static str); 2] {
+fn settle_unverifiable_runtime_generations(conn: &Connection) -> Result<(), String> {
+    let now = now_rfc3339();
+    conn.execute(
+        "UPDATE runtime_generation
+         SET lifecycle_state = 'exited',
+             exited_at = ?1,
+             terminal_reason = CASE lifecycle_state
+                 WHEN 'starting' THEN 'startup_failed'
+                 ELSE 'abnormal_termination'
+             END,
+             active_delivery_claim_uuid = NULL,
+             active_delivery_claimed_at = NULL,
+             active_delivery_seqs_json = NULL
+         WHERE (lifecycle_state = 'starting'
+                AND creator_identity_os_pid IS NULL
+                AND creator_identity_os_boot_id IS NULL
+                AND creator_identity_os_pid_starttime_ticks IS NULL)
+            OR (lifecycle_state IN ('running', 'draining')
+                AND identity_os_pid IS NULL
+                AND identity_os_boot_id IS NULL
+                AND identity_os_pid_starttime_ticks IS NULL)",
+        params![&now],
+    )
+    .map_err(|err| format!("Failed to settle unverifiable runtime generations: {err}"))?;
+    Ok(())
+}
+
+fn runtime_generation_column_additions() -> [(&'static str, &'static str); 5] {
     [
         ("active_delivery_claimed_at", "TEXT"),
         ("active_delivery_seqs_json", "TEXT"),
+        ("creator_identity_os_pid", "INTEGER"),
+        ("creator_identity_os_boot_id", "TEXT"),
+        ("creator_identity_os_pid_starttime_ticks", "INTEGER"),
     ]
 }
 
@@ -7998,34 +9575,6 @@ fn validate_legacy_run_state(run_state: &str) -> Result<(), String> {
     }
 }
 
-fn runtime_row_identity(row: &SessionRuntimeRow) -> Option<ProcessIdentity> {
-    Some(ProcessIdentity {
-        os_pid: row.running_os_pid?,
-        os_boot_id: row.running_os_boot_id.clone()?,
-        os_pid_starttime_ticks: row.running_os_pid_starttime_ticks?,
-    })
-}
-
-fn pending_seq_bounds_tx(
-    tx: &rusqlite::Transaction<'_>,
-    session_id: &str,
-) -> Result<Option<(i64, i64)>, String> {
-    tx.query_row(
-        "SELECT MIN(seq), MAX(seq)
-         FROM mailbox
-         WHERE session_id = ?1
-           AND delivered_at IS NULL
-           AND (delivery_error IS NULL OR delivery_error != ?2)",
-        params![session_id, WAKE_SWEEP_ABANDONED_ERROR],
-        |row| {
-            let min_seq: Option<i64> = row.get(0)?;
-            let max_seq: Option<i64> = row.get(1)?;
-            Ok(min_seq.zip(max_seq))
-        },
-    )
-    .map_err(|err| format!("Failed to read pending mailbox seq bounds: {err}"))
-}
-
 fn pending_seq_bounds_on(
     conn: &Connection,
     session_id: &str,
@@ -8093,28 +9642,37 @@ fn claim_age_exceeds_stale_after(claimed_at: DateTime<Utc>, stale_after_seconds:
     age > Duration::seconds(stale_after_seconds)
 }
 
-fn map_session_runtime_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRuntimeRow> {
-    Ok(SessionRuntimeRow {
+fn map_session_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadataRow> {
+    Ok(SessionMetadataRow {
         session_id: row.get(0)?,
         mode: row.get(1)?,
         invocation_uuid: row.get(2)?,
         provider_name: row.get(3)?,
         model_name: row.get(4)?,
-        pty_control_path: row.get(5)?,
-        updated_at: row.get(6)?,
-        run_state: row.get(7)?,
-        running_invocation_uuid: row.get(8)?,
-        running_os_pid: row.get(9)?,
-        running_os_boot_id: row.get(10)?,
-        running_os_pid_starttime_ticks: row.get(11)?,
-        turn_started_at: row.get(12)?,
-        turn_ended_at: row.get(13)?,
-        turn_start_max_mailbox_seq: row.get(14)?,
-        last_exit_code: row.get(15)?,
-        models_dir: row.get(16)?,
-        effective_cwd: row.get(17)?,
-        auto_wake_count: row.get(18)?,
-        selected_auto_wake_max: row.get(19)?,
+        updated_at: row.get(5)?,
+        models_dir: row.get(6)?,
+        effective_cwd: row.get(7)?,
+        auto_wake_count: row.get(8)?,
+        selected_auto_wake_max: row.get(9)?,
+    })
+}
+
+fn map_legacy_runtime_projection_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<LegacyRuntimeProjectionRow> {
+    Ok(LegacyRuntimeProjectionRow {
+        session_id: row.get(0)?,
+        pty_control_path: row.get(1)?,
+        updated_at: row.get(2)?,
+        run_state: row.get(3)?,
+        running_invocation_uuid: row.get(4)?,
+        running_os_pid: row.get(5)?,
+        running_os_boot_id: row.get(6)?,
+        running_os_pid_starttime_ticks: row.get(7)?,
+        turn_started_at: row.get(8)?,
+        turn_ended_at: row.get(9)?,
+        turn_start_max_mailbox_seq: row.get(10)?,
+        last_exit_code: row.get(11)?,
     })
 }
 
@@ -8177,10 +9735,306 @@ fn now_rfc3339() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+fn now_unix_millis() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "mailbox evidence timestamp exceeds i64".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::StateDb;
+
+    const STARTING_GENERATION_FIXTURE_PATH: &str = "OULIPOLY_TEST_STARTING_GENERATION_FIXTURE_PATH";
+    const WAKE_CLAIM_FOREIGN_CHILD_FIXTURE: &str = "OULIPOLY_TEST_WAKE_CLAIM_FOREIGN_CHILD";
+
+    #[test]
+    fn pid_and_mailbox_readers_share_one_snapshot_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let (pid, mailbox) = MailboxDb::open_read_only_with_pid_identity_and_work_timeout(
+            &sidecar_path,
+            StdDuration::from_millis(250),
+            StdDuration::from_secs(5),
+            &|| false,
+        )
+        .unwrap();
+
+        assert_eq!(pid.path(), sidecar_path);
+        assert_eq!(mailbox.path(), sidecar_path);
+        drop(pid);
+        let schema_version: i64 = mailbox
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, schema::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn starting_runtime_generation_fixture() {
+        let Some(path) = std::env::var_os(STARTING_GENERATION_FIXTURE_PATH) else {
+            return;
+        };
+        let generation_id =
+            RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+        let mut db = MailboxDb::open(Path::new(&path)).unwrap();
+        let GenerationMutation::Applied(row) = db
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "starting-fixture-invocation",
+                session_id: Some("starting-fixture-session"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: Some("model-a"),
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap()
+        else {
+            panic!("fixture generation was not created");
+        };
+        assert!(matches!(
+            row.creator_process_evidence,
+            ExactProcessEvidence::Recorded(_)
+        ));
+    }
+
+    #[test]
+    fn wake_claim_foreign_child_fixture() {
+        if std::env::var_os(WAKE_CLAIM_FOREIGN_CHILD_FIXTURE).is_none() {
+            return;
+        }
+        std::thread::sleep(StdDuration::from_secs(30));
+    }
+
+    #[test]
+    fn dead_starting_generation_creator_is_recovered_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("mailbox::tests::starting_runtime_generation_fixture")
+            .arg("--nocapture")
+            .env(STARTING_GENERATION_FIXTURE_PATH, &sidecar_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let generation_id =
+            RuntimeGenerationId::parse("90111111-1111-4111-8111-111111111111").unwrap();
+        let mut db = MailboxDb::open(&sidecar_path).unwrap();
+        let before = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.lifecycle_state, RuntimeLifecycleState::Starting);
+        assert!(matches!(
+            before.creator_process_evidence,
+            ExactProcessEvidence::Recorded(_)
+        ));
+        assert_eq!(
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("starting-fixture-session")
+                .unwrap(),
+            SessionLiveness::Idle
+        );
+        let after = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(
+            after.terminal_reason,
+            Some(RuntimeTerminalReason::RecoveredDead)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinked_sqlite_artifact_is_absent_not_a_hard_link_violation() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifact_path = directory.path().join("pid-identity.db-wal");
+        let artifact = File::create(&artifact_path).unwrap();
+        fs::remove_file(&artifact_path).unwrap();
+        let metadata = artifact.metadata().unwrap();
+        let identity = crate::filesystem_identity::open_file_identity(&artifact).unwrap();
+
+        assert_eq!(identity.links, 0);
+        assert_eq!(
+            classify_mailbox_storage_metadata(&artifact_path, &metadata, identity).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn one_hundred_concurrent_startups_share_fresh_sidecar_authority() {
+        assert_one_hundred_concurrent_startups(false);
+    }
+
+    #[test]
+    fn one_hundred_mixed_mailbox_and_pid_startups_share_fresh_sidecar_authority() {
+        assert_one_hundred_concurrent_startups(true);
+    }
+
+    fn assert_one_hundred_concurrent_startups(mixed_pid_handles: bool) {
+        const STARTUPS: usize = 100;
+
+        enum SidecarHandle {
+            Mailbox(MailboxDb),
+            Pid(crate::pid_identity::PidIdentityDb),
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(STARTUPS + 1));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(STARTUPS + 1));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::with_capacity(STARTUPS);
+
+        for ordinal in 0..STARTUPS {
+            let sidecar_path = sidecar_path.clone();
+            let start = std::sync::Arc::clone(&start);
+            let release = std::sync::Arc::clone(&release);
+            let result_tx = result_tx.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                let handle = if mixed_pid_handles && ordinal % 2 == 1 {
+                    crate::pid_identity::PidIdentityDb::open(&sidecar_path).map(SidecarHandle::Pid)
+                } else {
+                    MailboxDb::open(&sidecar_path).map(SidecarHandle::Mailbox)
+                };
+                result_tx
+                    .send(handle.as_ref().map(|_| ()).map_err(Clone::clone))
+                    .unwrap();
+                release.wait();
+                match handle {
+                    Ok(SidecarHandle::Mailbox(mailbox)) => drop(mailbox),
+                    Ok(SidecarHandle::Pid(pid_identity)) => drop(pid_identity),
+                    Err(_) => {}
+                }
+            }));
+        }
+        drop(result_tx);
+
+        start.wait();
+        let results = result_rx.iter().take(STARTUPS).collect::<Vec<_>>();
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(results.len(), STARTUPS);
+        let failures = results
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        assert!(failures.is_empty(), "startup failures: {failures:#?}");
+    }
+
+    #[test]
+    fn ordinary_mailbox_connections_wait_for_bounded_writer_contention() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let blocker = MailboxDb::open(&sidecar_path).unwrap();
+        let mut launch = MailboxDb::open(&sidecar_path).unwrap();
+        let timeout_ms = launch
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(
+            timeout_ms >= 500,
+            "configured busy timeout was {timeout_ms}ms"
+        );
+        blocker
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (created_tx, created_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let generation_id =
+                RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+            let result = launch
+                .runtime_lifecycle()
+                .create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "launch-contention-invocation",
+                    session_id: Some("launch-contention-session"),
+                    runtime_mode: "headless",
+                    provider_name: "provider-a",
+                    model_name: Some("model-a"),
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                })
+                .map(|mutation| matches!(mutation, GenerationMutation::Applied(_)))
+                .map_err(|error| error.to_string());
+            created_tx.send((launch, result)).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            created_rx
+                .recv_timeout(StdDuration::from_millis(25))
+                .is_err(),
+            "runtime generation creation must wait while the sweep-side writer is held"
+        );
+        blocker.connection().execute_batch("ROLLBACK").unwrap();
+        let (mut launch, created) = created_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+        assert_eq!(created, Ok(true));
+
+        blocker
+            .connection()
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (bound_tx, bound_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let identity = ProcessIdentity {
+                os_pid: 901,
+                os_boot_id: "launch-contention-boot".to_string(),
+                os_pid_starttime_ticks: 1,
+            };
+            let generation_id =
+                RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+            let result = launch
+                .runtime_lifecycle()
+                .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                    fence: RuntimeGenerationFence {
+                        generation_id: &generation_id,
+                        spawn_invocation_uuid: "launch-contention-invocation",
+                    },
+                    spawned_os_pid: 901,
+                    exact_process_identity: &identity,
+                    os_pgid: None,
+                })
+                .map(|mutation| matches!(mutation, GenerationMutation::Applied(_)))
+                .map_err(|error| error.to_string());
+            bound_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            bound_rx.recv_timeout(StdDuration::from_millis(25)).is_err(),
+            "runtime generation binding must wait while the sweep-side writer is held"
+        );
+        blocker.connection().execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            bound_rx.recv_timeout(StdDuration::from_secs(1)).unwrap(),
+            Ok(true)
+        );
+    }
 
     #[test]
     fn every_writable_sidecar_constructor_enforces_foreign_keys() {
@@ -8202,6 +10056,14 @@ mod tests {
 
         let authority = MailboxAuthorityFence::acquire(&sidecar_path).unwrap();
         let existing = MailboxDb::open_existing_for_completion_authority(&authority).unwrap();
+        let completion_authority_timeout = existing
+            .connection()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert!(
+            completion_authority_timeout >= 5_000,
+            "completion authority busy timeout was {completion_authority_timeout}ms"
+        );
         assert_writable_sidecar_rejects_orphan(existing.connection(), "existing-authority");
         drop(existing);
         drop(authority);
@@ -8247,22 +10109,6 @@ mod tests {
         drop(crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap());
         assert_eq!(materialization_summary_count(&sidecar_path), 0);
 
-        begin_completion_finalization_vm_count();
-        drop(MailboxDb::open(&sidecar_path).unwrap());
-        let current_open_steps = end_completion_finalization_vm_count();
-        eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
-        assert_eq!(materialization_summary_count(&sidecar_path), 0);
-        assert!(
-            current_open_steps < 512,
-            "current-schema open performed unexpected SQLite work: {current_open_steps}"
-        );
-
-        let connection = Connection::open(&sidecar_path).unwrap();
-        connection.pragma_update(None, "user_version", 0).unwrap();
-        drop(connection);
-        drop(crate::pid_identity::PidIdentityDb::open(&sidecar_path).unwrap());
-        assert_eq!(materialization_summary_count(&sidecar_path), 0);
-
         drop(MailboxDb::open(&sidecar_path).unwrap());
         let connection = Connection::open(&sidecar_path).unwrap();
         let (version, count): (i64, i64) = (
@@ -8279,8 +10125,692 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert_eq!(version, 1);
+        assert_eq!(version, schema::CURRENT_VERSION);
         assert_eq!(count, 32);
+
+        connection
+            .execute(
+                "DELETE FROM completion_authority_materialization_summary",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        begin_completion_finalization_vm_count();
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let current_open_steps = end_completion_finalization_vm_count();
+        eprintln!("current-schema ordinary open VM steps: {current_open_steps}");
+        assert_eq!(materialization_summary_count(&sidecar_path), 0);
+        assert!(
+            current_open_steps < 512,
+            "current-schema open performed unexpected SQLite work: {current_open_steps}"
+        );
+    }
+
+    #[test]
+    fn v2_upgrade_adds_wake_claim_process_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE session_wake_claim;
+                 CREATE TABLE session_wake_claim (
+                    session_id                       TEXT PRIMARY KEY,
+                    claim_token                      TEXT NOT NULL,
+                    claimed_at                       TEXT NOT NULL,
+                    wake_pid                         INTEGER,
+                    wake_invocation_uuid             TEXT,
+                    reason                           TEXT NOT NULL,
+                    auto_wake_count                  INTEGER NOT NULL,
+                    min_pending_seq_at_claim         INTEGER,
+                    max_pending_seq_at_claim         INTEGER
+                 );
+                 CREATE INDEX idx_session_wake_claim_claimed_at
+                    ON session_wake_claim(claimed_at);
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+        let columns = table_columns(
+            &connection,
+            "session_wake_claim",
+            "PRAGMA table_info(session_wake_claim)",
+        )
+        .unwrap();
+        assert!(columns.iter().any(|column| column == "wake_os_boot_id"));
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "wake_os_pid_starttime_ticks")
+        );
+    }
+
+    #[test]
+    fn v5_upgrade_adds_durable_session_admission_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE session_admission_queue;
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let row = mailbox
+            .session_admissions()
+            .enqueue(
+                "admission-id",
+                "registration-id",
+                None,
+                &current_identity(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(row.state, "queued");
+        assert_eq!(row.queue_sequence, 1);
+        let connection = Connection::open(&sidecar_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+    }
+
+    #[test]
+    fn v6_upgrade_requires_quiescent_admission_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE session_admission_queue;
+                 CREATE TABLE session_admission_queue (
+                    queue_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    admission_id TEXT NOT NULL UNIQUE,
+                    registration_identity TEXT NOT NULL UNIQUE,
+                    session_id TEXT,
+                    state TEXT NOT NULL CHECK(state IN ('queued', 'admitted', 'launching', 'settled')),
+                    claim_token TEXT,
+                    claimed_at_unix_ms INTEGER,
+                    runtime_generation_uuid TEXT UNIQUE,
+                    created_at_unix_ms INTEGER NOT NULL,
+                    updated_at_unix_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO session_admission_queue (
+                    admission_id, registration_identity, state,
+                    created_at_unix_ms, updated_at_unix_ms
+                 ) VALUES ('legacy-admission', 'legacy-registration', 'queued', 1, 1);
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = match MailboxDb::open(&sidecar_path) {
+            Ok(_) => panic!("non-quiescent v6 sidecar must not upgrade"),
+            Err(error) => error,
+        };
+        assert!(error.contains("requires a quiescent runner"), "{error}");
+        let connection = Connection::open(&sidecar_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        connection
+            .execute("DELETE FROM session_admission_queue", [])
+            .unwrap();
+        drop(connection);
+
+        let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        assert!(
+            table_columns(
+                &mailbox.conn,
+                "session_admission_queue",
+                "PRAGMA table_info(session_admission_queue)",
+            )
+            .unwrap()
+            .iter()
+            .any(|column| column == "launcher_os_pid_starttime_ticks")
+        );
+    }
+
+    #[test]
+    fn admission_drain_reconciles_dead_sessionless_starting_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("97777777-7777-4777-8777-777777777777").unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "dead-starting-invocation",
+                session_id: None,
+                runtime_mode: "headless",
+                provider_name: "test-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        mailbox
+            .conn
+            .execute(
+                "UPDATE runtime_generation
+                 SET creator_identity_os_pid = ?2,
+                     creator_identity_os_boot_id = 'dead-boot',
+                     creator_identity_os_pid_starttime_ticks = 1
+                 WHERE generation_uuid = ?1",
+                params![generation_id.to_string(), i64::MAX],
+            )
+            .unwrap();
+        mailbox
+            .session_admissions()
+            .enqueue(
+                "live-admission",
+                "live-registration",
+                None,
+                &current_identity(),
+                2,
+            )
+            .unwrap();
+
+        let admitted = mailbox
+            .session_admissions()
+            .try_admit_next("live-claim", 0, 3)
+            .unwrap();
+        let SessionAdmissionAttempt::Admitted(admitted) = admitted else {
+            panic!("live admission was not admitted after dead generation recovery");
+        };
+        assert_eq!(admitted.registration_identity, "live-registration");
+        assert_eq!(
+            mailbox
+                .runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            RuntimeLifecycleState::Exited
+        );
+    }
+
+    #[test]
+    fn v3_upgrade_settles_unverifiable_runtime_authorities() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let connection = Connection::open(&sidecar_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runtime_generation (
+                    generation_uuid TEXT PRIMARY KEY,
+                    lifecycle_state TEXT NOT NULL,
+                    identity_os_pid INTEGER,
+                    identity_os_boot_id TEXT,
+                    identity_os_pid_starttime_ticks INTEGER,
+                    exited_at TEXT,
+                    terminal_reason TEXT,
+                    active_delivery_claim_uuid TEXT,
+                    active_delivery_claimed_at TEXT,
+                    active_delivery_seqs_json TEXT
+                 );
+                 INSERT INTO runtime_generation (generation_uuid, lifecycle_state)
+                 VALUES ('legacy-starting', 'starting');
+                 INSERT INTO runtime_generation (generation_uuid, lifecycle_state)
+                 VALUES ('legacy-unverified-running', 'running');
+                 INSERT INTO runtime_generation (
+                    generation_uuid, lifecycle_state, identity_os_pid,
+                    identity_os_boot_id, identity_os_pid_starttime_ticks
+                 ) VALUES ('legacy-verified-running', 'running', 42, 'legacy-boot', 7);
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(MailboxDb::open(&sidecar_path).unwrap());
+        let connection = Connection::open(&sidecar_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+        let columns = table_columns(
+            &connection,
+            "runtime_generation",
+            "PRAGMA table_info(runtime_generation)",
+        )
+        .unwrap();
+        for column in [
+            "creator_identity_os_pid",
+            "creator_identity_os_boot_id",
+            "creator_identity_os_pid_starttime_ticks",
+        ] {
+            assert!(columns.iter().any(|candidate| candidate == column));
+        }
+        for (generation_uuid, expected_state, expected_reason) in [
+            ("legacy-starting", "exited", Some("startup_failed")),
+            (
+                "legacy-unverified-running",
+                "exited",
+                Some("abnormal_termination"),
+            ),
+            ("legacy-verified-running", "running", None),
+        ] {
+            let observed = connection
+                .query_row(
+                    "SELECT lifecycle_state, terminal_reason
+                     FROM runtime_generation
+                     WHERE generation_uuid = ?1",
+                    params![generation_uuid],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                observed,
+                (
+                    expected_state.to_string(),
+                    expected_reason.map(str::to_string)
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn v4_upgrade_preserves_acknowledged_attempt_retry_exclusion_and_evidence_obligation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let unresolved_row = inserted_row(
+            mailbox.enqueue_agent_bash_complete(&input("legacy-unresolved", "session-a")),
+        );
+        let resolved_row = inserted_row(
+            mailbox.enqueue_agent_bash_complete(&input("legacy-resolved", "session-b")),
+        );
+        let unmatched_row = inserted_row(
+            mailbox.enqueue_agent_bash_complete(&input("legacy-unmatched", "session-c")),
+        );
+        let ambiguous_row = inserted_row(
+            mailbox.enqueue_agent_bash_complete(&input("legacy-ambiguous", "session-d")),
+        );
+        mailbox
+            .register_delivery_attempt(
+                "legacy-unresolved-attempt",
+                "session-a",
+                "legacy-unresolved-invocation",
+                &[unresolved_row.seq],
+                0,
+            )
+            .unwrap();
+        mailbox
+            .register_delivery_attempt(
+                "legacy-resolved-attempt",
+                "session-b",
+                "legacy-resolved-invocation",
+                &[resolved_row.seq],
+                0,
+            )
+            .unwrap();
+        for (attempt_id, session_id, invocation_id, seq) in [
+            (
+                "legacy-unmatched-attempt",
+                "session-c",
+                "legacy-unmatched-invocation",
+                unmatched_row.seq,
+            ),
+            (
+                "legacy-ambiguous-attempt",
+                "session-d",
+                "legacy-ambiguous-invocation",
+                ambiguous_row.seq,
+            ),
+        ] {
+            mailbox
+                .register_delivery_attempt(attempt_id, session_id, invocation_id, &[seq], 0)
+                .unwrap();
+            mailbox
+                .record_delivery_attempt_transport_ack(attempt_id)
+                .unwrap();
+        }
+        mailbox
+            .record_delivery_attempt_transport_ack("legacy-unresolved-attempt")
+            .unwrap();
+        mailbox
+            .record_delivery_attempt_transport_ack("legacy-resolved-attempt")
+            .unwrap();
+        assert!(
+            mailbox
+                .confirm_delivery_attempt("legacy-resolved-attempt")
+                .unwrap()
+        );
+        let unresolved_generation_id =
+            RuntimeGenerationId::parse("93333333-3333-4333-8333-333333333333").unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &unresolved_generation_id,
+                spawn_invocation_uuid: "legacy-unresolved-invocation",
+                session_id: Some("session-a"),
+                runtime_mode: "pty_interactive",
+                provider_name: "legacy-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        let resolved_generation_id =
+            RuntimeGenerationId::parse("94444444-4444-4444-8444-444444444444").unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &resolved_generation_id,
+                spawn_invocation_uuid: "legacy-resolved-invocation",
+                session_id: Some("session-b"),
+                runtime_mode: "pty_interactive",
+                provider_name: "legacy-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        for generation_uuid in [
+            "95555555-5555-4555-8555-555555555555",
+            "96666666-6666-4666-8666-666666666666",
+        ] {
+            let generation_id = RuntimeGenerationId::parse(generation_uuid).unwrap();
+            mailbox
+                .runtime_lifecycle()
+                .create_runtime_generation(CreateRuntimeGeneration {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "legacy-ambiguous-invocation",
+                    session_id: Some("session-d"),
+                    runtime_mode: "pty_interactive",
+                    provider_name: "legacy-provider",
+                    model_name: None,
+                    pty_control_path: None,
+                    models_dir: None,
+                    effective_cwd: None,
+                })
+                .unwrap();
+        }
+        drop(mailbox);
+
+        let connection = Connection::open(&sidecar_path).unwrap();
+        for column in [
+            "evidence_reconciled_at",
+            "evidence_observed_at",
+            "evidence_turn_generation_id",
+            "submission_started_at",
+            "evidence_disposition",
+        ] {
+            connection
+                .execute_batch(&format!(
+                    "ALTER TABLE mailbox_delivery_attempts DROP COLUMN {column};"
+                ))
+                .unwrap();
+        }
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let unresolved = mailbox
+            .delivery_attempt_window("legacy-unresolved-attempt")
+            .unwrap()
+            .unwrap();
+        assert!(unresolved.submission_started_at.is_some());
+        assert!(unresolved.acknowledged_at.is_some());
+        assert!(unresolved.resolved_at.is_none());
+        let unresolved_obligations = mailbox
+            .pending_delivery_evidence_obligations("session-a")
+            .unwrap();
+        assert_eq!(unresolved_obligations.len(), 1);
+        assert_eq!(
+            unresolved_obligations[0].turn_generation_id,
+            unresolved_generation_id.to_string()
+        );
+        assert!(unresolved_obligations[0].legacy);
+        assert_eq!(
+            mailbox
+                .accepted_delivery_attempt_windows("session-a")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            mailbox
+                .register_or_reuse_delivery_attempt(
+                    "replacement-attempt",
+                    "session-a",
+                    "replacement-invocation",
+                    "replacement-generation",
+                    &[unresolved_row.seq],
+                    0,
+                )
+                .unwrap_err()
+                .contains("legacy-unresolved-attempt")
+        );
+        let resolved = mailbox
+            .delivery_attempt_window("legacy-resolved-attempt")
+            .unwrap()
+            .unwrap();
+        assert!(resolved.submission_started_at.is_some());
+        assert!(resolved.resolved_at.is_some());
+        let obligations = mailbox
+            .pending_delivery_evidence_obligations("session-b")
+            .unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].attempt_id, "legacy-resolved-attempt");
+        assert_eq!(obligations[0].session_id, "session-b");
+        assert_eq!(
+            obligations[0].turn_generation_id,
+            resolved_generation_id.to_string()
+        );
+        assert!(obligations[0].observed_at > 0);
+        assert!(obligations[0].legacy);
+        let connection = Connection::open(&sidecar_path).unwrap();
+        for (attempt_id, expected) in [
+            ("legacy-unmatched-attempt", "legacy_unmatched_generation"),
+            ("legacy-ambiguous-attempt", "legacy_ambiguous_generation"),
+        ] {
+            let disposition = connection
+                .query_row(
+                    "SELECT evidence_disposition FROM mailbox_delivery_attempts WHERE attempt_id = ?1",
+                    params![attempt_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(disposition, expected);
+            assert!(!mailbox.confirm_delivery_attempt(attempt_id).unwrap());
+            let attempt = mailbox
+                .delivery_attempt_window(attempt_id)
+                .unwrap()
+                .unwrap();
+            assert!(attempt.resolved_at.is_none());
+            assert!(attempt.rows[0].delivered_at.is_none());
+        }
+        assert!(
+            mailbox
+                .pending_delivery_evidence_obligations("session-c")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mailbox
+                .pending_delivery_evidence_obligations("session-d")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v1_upgrade_promotes_complete_legacy_runtime_authority_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let identity = current_identity();
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        mailbox
+            .wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
+                session_id: "legacy-session",
+                mode: "pty_interactive",
+                invocation_uuid: "legacy-invocation",
+                provider_name: Some("legacy-provider"),
+                model_name: Some("legacy-model"),
+                identity: &identity,
+                pty_control_path: Some("/tmp/legacy-control.sock"),
+                turn_start_max_mailbox_seq: None,
+                models_dir: Some("/tmp/legacy-models"),
+                effective_cwd: Some("/tmp/legacy-work"),
+            })
+            .unwrap();
+        mailbox
+            .connection()
+            .pragma_update(None, "user_version", 1)
+            .unwrap();
+        drop(mailbox);
+
+        let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let SessionGenerationProjection::One(generation) = mailbox
+            .runtime_lifecycle_reader()
+            .session_generation_projection("legacy-session")
+            .unwrap()
+        else {
+            panic!("legacy runtime authority was not promoted");
+        };
+        assert_eq!(generation.lifecycle_state, RuntimeLifecycleState::Running);
+        assert_eq!(generation.spawn_invocation_uuid, "legacy-invocation");
+        assert_eq!(generation.provider_name, "legacy-provider");
+        assert_eq!(
+            generation.pty_control_path.as_deref(),
+            Some("/tmp/legacy-control.sock")
+        );
+        assert_eq!(
+            mailbox
+                .connection()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema::CURRENT_VERSION
+        );
+        drop(mailbox);
+
+        let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let SessionGenerationProjection::One(_) = mailbox
+            .runtime_lifecycle_reader()
+            .session_generation_projection("legacy-session")
+            .unwrap()
+        else {
+            panic!("promoted runtime authority changed on current-schema reopen");
+        };
+    }
+
+    #[test]
+    fn v1_upgrade_does_not_revive_an_exited_runtime_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let identity = current_identity();
+        let generation_id =
+            RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "legacy-invocation",
+        };
+        let mut mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "legacy-invocation",
+                session_id: Some("legacy-session"),
+                runtime_mode: "headless",
+                provider_name: "legacy-provider",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence,
+                spawned_os_pid: identity.os_pid,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
+        mailbox
+            .runtime_lifecycle()
+            .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                fence,
+                reason: RuntimeTerminalReason::AbnormalTermination,
+                exit_code: Some(17),
+            })
+            .unwrap();
+        mailbox
+            .connection()
+            .execute(
+                "UPDATE session_runtime
+                 SET run_state = 'running',
+                     running_invocation_uuid = 'legacy-invocation',
+                     running_os_pid = ?2,
+                     running_os_boot_id = ?3,
+                     running_os_pid_starttime_ticks = ?4,
+                     turn_started_at = updated_at,
+                     turn_ended_at = NULL,
+                     last_exit_code = NULL
+                 WHERE session_id = ?1",
+                params![
+                    "legacy-session",
+                    identity.os_pid,
+                    &identity.os_boot_id,
+                    identity.os_pid_starttime_ticks,
+                ],
+            )
+            .unwrap();
+        mailbox
+            .connection()
+            .pragma_update(None, "user_version", 1)
+            .unwrap();
+        drop(mailbox);
+
+        let mailbox = MailboxDb::open(&sidecar_path).unwrap();
+        let generation = mailbox
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .expect("exited runtime generation was not retained");
+        assert_eq!(generation.lifecycle_state, RuntimeLifecycleState::Exited);
+        let projection = mailbox
+            .wake_session_reader()
+            .legacy_runtime_projection("legacy-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.run_state, "idle");
+        assert!(projection.running_invocation_uuid.is_none());
+        assert_eq!(projection.last_exit_code, Some(17));
     }
 
     #[test]
@@ -8376,13 +10906,13 @@ mod tests {
         assert!(error.contains("completion_authority_contention"), "{error}");
         assert_eq!(mailbox.sidecar_generation().unwrap(), generation);
         mailbox
-            .upsert_session_runtime(SessionRuntimeUpsert {
+            .wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: "idle-handle-session",
                 mode: "headless",
                 invocation_uuid: Some("idle-handle-invocation"),
                 provider_name: None,
                 model_name: None,
-                pty_control_path: None,
                 models_dir: None,
                 effective_cwd: None,
                 selected_auto_wake_max: None,
@@ -8400,7 +10930,8 @@ mod tests {
         assert_ne!(reopened.sidecar_generation().unwrap(), generation);
         assert!(
             reopened
-                .session_runtime("idle-handle-session")
+                .wake_session_reader()
+                .session_metadata("idle-handle-session")
                 .unwrap()
                 .is_none()
         );
@@ -8704,7 +11235,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let input = input("handle-a", "session-a");
-        let payload = db.payload_reference(input.payload_json.as_bytes()).unwrap();
+        let payload = db
+            .payloads()
+            .payload_reference(input.payload_json.as_bytes())
+            .unwrap();
 
         let err = db
             .enqueue_agent_bash_complete_then_rollback(&input)
@@ -8713,15 +11247,21 @@ mod tests {
         assert_eq!(err, "forced rollback before commit");
         assert!(db.list_mailbox("session-a", true).unwrap().is_empty());
         assert!(payload.file_path.exists());
-        db.verify_published_payload(&payload).unwrap();
+        db.payloads().verify_published_payload(&payload).unwrap();
     }
 
     #[test]
     fn immutable_payload_publication_is_content_addressed_and_detects_tampering() {
         let dir = tempfile::tempdir().unwrap();
         let db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let first = db.publish_immutable_payload(b"payload-a").unwrap();
-        let second = db.publish_immutable_payload(b"payload-a").unwrap();
+        let first = db
+            .payloads()
+            .publish_immutable_payload(b"payload-a")
+            .unwrap();
+        let second = db
+            .payloads()
+            .publish_immutable_payload(b"payload-a")
+            .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(fs::read(&first.file_path).unwrap(), b"payload-a");
@@ -8736,7 +11276,7 @@ mod tests {
         fs::set_permissions(&first.file_path, permissions).unwrap();
         fs::write(&first.file_path, b"payload-b").unwrap();
 
-        assert!(db.verify_published_payload(&first).is_err());
+        assert!(db.payloads().verify_published_payload(&first).is_err());
     }
 
     #[test]
@@ -8817,7 +11357,7 @@ mod tests {
             .find(|row| row.session_id == "session-a")
             .unwrap()
             .seq;
-        db.mark_delivered("session-a", &[session_a_seq], "delivery-a")
+        db.mark_delivered("session-a", None, &[session_a_seq], "delivery-a")
             .unwrap();
         let listeners = db.completion_event_listeners(event_id).unwrap();
         let first = listeners
@@ -9346,6 +11886,9 @@ mod tests {
             identity_os_pid: None,
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -9365,6 +11908,9 @@ mod tests {
             identity_os_pid: Some(42),
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -9378,6 +11924,9 @@ mod tests {
             identity_os_pid: Some(42),
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -9397,6 +11946,9 @@ mod tests {
             identity_os_pid: None,
             identity_os_boot_id: None,
             identity_os_pid_starttime_ticks: None,
+            creator_identity_os_pid: None,
+            creator_identity_os_boot_id: None,
+            creator_identity_os_pid_starttime_ticks: None,
             terminal_reason: None,
             drain_request_uuid: None,
             active_delivery_claim_uuid: None,
@@ -9597,10 +12149,10 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
 
-        db.mark_delivered("session-a", &[row.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
         let first = db.list_mailbox("session-a", true).unwrap().remove(0);
-        db.mark_delivered("session-a", &[row.seq], "resume-2")
+        db.mark_delivered("session-a", None, &[row.seq], "resume-2")
             .unwrap();
         let second = db.list_mailbox("session-a", true).unwrap().remove(0);
 
@@ -9610,6 +12162,26 @@ mod tests {
             Some("resume-1")
         );
         assert_eq!(second.delivery_attempts, 1);
+    }
+
+    #[test]
+    fn mark_delivered_rejects_a_mixed_session_batch_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let owned = inserted_row(db.enqueue_agent_bash_complete(&input("owned", "session-a")));
+        let foreign = inserted_row(db.enqueue_agent_bash_complete(&input("foreign", "session-b")));
+
+        let error = db
+            .mark_delivered("session-a", None, &[owned.seq, foreign.seq], "invocation-a")
+            .unwrap_err();
+
+        assert!(error.contains("missing or foreign-session row"));
+        for session_id in ["session-a", "session-b"] {
+            let unchanged = db.list_mailbox(session_id, true).unwrap().remove(0);
+            assert!(unchanged.delivered_at.is_none());
+            assert!(unchanged.delivered_by_invocation_uuid.is_none());
+            assert_eq!(unchanged.delivery_attempts, 0);
+        }
     }
 
     #[test]
@@ -9792,6 +12364,7 @@ mod tests {
                 "attempt-1",
                 "session-a",
                 "invocation-a",
+                "generation-a",
                 &[row.seq],
                 0,
             )
@@ -9801,6 +12374,7 @@ mod tests {
                 "attempt-2",
                 "session-a",
                 "invocation-a",
+                "generation-a",
                 &[row.seq],
                 0,
             )
@@ -9814,6 +12388,159 @@ mod tests {
                 .unwrap()
                 .is_some_and(|window| window.resolved_at.is_none())
         );
+    }
+
+    #[test]
+    fn submission_started_retains_exact_attempt_and_blocks_replacement_after_confirmation_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pid-identity.db");
+        let mut db = MailboxDb::open(&path).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        let attempt = db
+            .register_or_reuse_delivery_attempt(
+                "attempt-1",
+                "session-a",
+                "invocation-a",
+                "generation-a",
+                &[row.seq],
+                0,
+            )
+            .unwrap();
+        assert!(db.begin_delivery_attempt_submission(&attempt).unwrap());
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_delivery_confirmation
+                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected confirmation failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.confirm_delivery_attempt(&attempt).is_err());
+        let retained = db.delivery_attempt_window(&attempt).unwrap().unwrap();
+        assert!(retained.submission_started_at.is_some());
+        assert!(retained.acknowledged_at.is_none());
+        assert!(retained.resolved_at.is_none());
+        assert_eq!(retained.rows, vec![row.clone()]);
+        assert!(
+            db.register_or_reuse_delivery_attempt(
+                "replacement",
+                "session-a",
+                "invocation-b",
+                "generation-b",
+                &[row.seq],
+                0,
+            )
+            .unwrap_err()
+            .contains("mailbox_delivery_submission_uncertain:attempt-1")
+        );
+        assert_eq!(
+            db.register_or_reuse_delivery_attempt(
+                "retry",
+                "session-a",
+                "invocation-a",
+                "generation-a",
+                &[row.seq],
+                0,
+            )
+            .unwrap(),
+            attempt
+        );
+        db.connection()
+            .execute_batch("DROP TRIGGER fail_delivery_confirmation")
+            .unwrap();
+
+        assert!(db.confirm_delivery_attempt(&attempt).unwrap());
+        assert!(db.list_pending("session-a").unwrap().is_empty());
+        let obligations = db
+            .pending_delivery_evidence_obligations("session-a")
+            .unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(obligations[0].attempt_id, attempt);
+        assert_eq!(obligations[0].turn_generation_id, "generation-a");
+    }
+
+    #[test]
+    fn pre_submission_fault_remains_genuinely_unobserved_and_replaceable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        db.register_or_reuse_delivery_attempt(
+            "attempt-1",
+            "session-a",
+            "invocation-a",
+            "generation-a",
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+        db.connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_submission_start
+                 BEFORE UPDATE OF submission_started_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected submission-start failure'); END;",
+            )
+            .unwrap();
+
+        assert!(db.begin_delivery_attempt_submission("attempt-1").is_err());
+        assert!(!db.delivery_attempt_submission_started("attempt-1").unwrap());
+        assert!(
+            db.resolve_unacknowledged_delivery_attempt("attempt-1")
+                .unwrap()
+        );
+        db.connection()
+            .execute_batch("DROP TRIGGER fail_submission_start")
+            .unwrap();
+        assert_eq!(
+            db.register_or_reuse_delivery_attempt(
+                "attempt-2",
+                "session-a",
+                "invocation-b",
+                "generation-b",
+                &[row.seq],
+                0,
+            )
+            .unwrap(),
+            "attempt-2"
+        );
+    }
+
+    #[test]
+    fn resolved_delivery_keeps_evidence_obligation_until_one_idempotent_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        db.register_or_reuse_delivery_attempt(
+            "attempt-1",
+            "session-a",
+            "invocation-a",
+            "generation-a",
+            &[row.seq],
+            0,
+        )
+        .unwrap();
+        db.begin_delivery_attempt_submission("attempt-1").unwrap();
+        db.confirm_delivery_attempt("attempt-1").unwrap();
+
+        let obligation = db
+            .pending_delivery_evidence_obligations("session-a")
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(obligation.attempt_id, "attempt-1");
+        assert!(
+            db.delivery_attempt_window("attempt-1")
+                .unwrap()
+                .unwrap()
+                .resolved_at
+                .is_some()
+        );
+        assert!(db.mark_delivery_evidence_reconciled("attempt-1").unwrap());
+        assert!(
+            db.pending_delivery_evidence_obligations("session-a")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!db.mark_delivery_evidence_reconciled("attempt-1").unwrap());
     }
 
     #[test]
@@ -9908,7 +12635,7 @@ mod tests {
         db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &seqs, 0)
             .unwrap();
         assert!(!db.confirm_delivery_attempt("attempt-1").unwrap());
-        db.mark_delivered("session-a", &[rows[0].seq], "sibling-invocation")
+        db.mark_delivered("session-a", None, &[rows[0].seq], "sibling-invocation")
             .unwrap();
         db.record_delivery_attempt_transport_ack("attempt-1")
             .unwrap();
@@ -9986,6 +12713,35 @@ mod tests {
     }
 
     #[test]
+    fn unobserved_delivery_failure_rejects_terminal_wake_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        db.register_delivery_attempt("attempt-1", "session-a", "invocation-a", &[row.seq], 0)
+            .unwrap();
+        db.record_delivery_attempt_transport_ack("attempt-1")
+            .unwrap();
+
+        let error = db
+            .fail_unobserved_delivery_attempt("attempt-1", WAKE_SWEEP_ABANDONED_ERROR)
+            .unwrap_err();
+
+        assert!(error.contains("dedicated authority-bearing disposition"));
+        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+        let resolved_at: Option<String> = db
+            .connection()
+            .query_row(
+                "SELECT resolved_at FROM mailbox_delivery_attempts WHERE attempt_id = 'attempt-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(resolved_at.is_none());
+    }
+
+    #[test]
     fn accepted_attempt_owner_requires_transport_ack_and_oldest_pending_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -10034,11 +12790,11 @@ mod tests {
             inserted_row(db.enqueue_agent_bash_complete(&input("exhausted", "session-a")));
         let deliverable =
             inserted_row(db.enqueue_agent_bash_complete(&input("deliverable", "session-a")));
-        db.mark_pending_abandoned("session-a", WAKE_SWEEP_ABANDONED_ERROR, 1)
-            .unwrap();
+        db.force_pending_abandoned_for_test("session-a", 1).unwrap();
         for _ in 0..MAX_UNCONFIRMED_DELIVERY_ATTEMPTS {
             db.mark_delivery_failed(
                 "session-a",
+                None,
                 &[exhausted.seq],
                 MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
             )
@@ -10224,14 +12980,14 @@ mod tests {
                 params![delivered.seq, &delivered_payload],
             )
             .unwrap();
-        db.mark_delivered("session-a", &[delivered.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[delivered.seq], "resume-1")
             .unwrap();
 
-        let before = db.delivered_payload_compaction_stats().unwrap();
+        let before = db.payloads().delivered_payload_compaction_stats().unwrap();
         assert_eq!(before.eligible_rows, 1);
         assert_eq!(before.inline_bytes, delivered_payload.len() as u64);
 
-        let report = db.compact_delivered_payloads(1).unwrap();
+        let report = db.payloads().compact_delivered_payloads(1).unwrap();
         assert_eq!(report.scanned_rows, 1);
         assert_eq!(report.compacted_rows, 1);
         assert_eq!(
@@ -10245,12 +13001,16 @@ mod tests {
         assert_ne!(compacted.payload_json, delivered_payload);
         assert!(compacted.payload_compacted_at.is_some());
         assert_eq!(
-            db.hydrate_agent_bash_payload_json(compacted).unwrap(),
+            db.payloads()
+                .hydrate_agent_bash_payload_json(compacted)
+                .unwrap(),
             delivered_payload
         );
         let still_pending = rows.iter().find(|row| row.seq == pending.seq).unwrap();
         assert_eq!(
-            db.hydrate_agent_bash_payload_json(still_pending).unwrap(),
+            db.payloads()
+                .hydrate_agent_bash_payload_json(still_pending)
+                .unwrap(),
             input("x", "y").payload_json
         );
         assert!(still_pending.delivered_at.is_none());
@@ -10266,11 +13026,11 @@ mod tests {
         );
 
         assert_eq!(
-            db.delivered_payload_compaction_stats().unwrap(),
+            db.payloads().delivered_payload_compaction_stats().unwrap(),
             DeliveredPayloadCompactionStats::default()
         );
         assert_eq!(
-            db.compact_delivered_payloads(1).unwrap(),
+            db.payloads().compact_delivered_payloads(1).unwrap(),
             DeliveredPayloadCompactionReport::default()
         );
     }
@@ -10298,10 +13058,10 @@ mod tests {
                 params![row.seq, &payload],
             )
             .unwrap();
-        db.mark_delivered("session-a", &[row.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
 
-        let report = db.compact_delivered_payloads(1).unwrap();
+        let report = db.payloads().compact_delivered_payloads(1).unwrap();
         assert_eq!(report.compacted_rows, 1);
         let compacted = db.list_mailbox("session-a", true).unwrap().remove(0);
         assert_eq!(
@@ -10309,7 +13069,9 @@ mod tests {
             payload
         );
         assert_eq!(
-            db.hydrate_agent_bash_payload_json(&compacted).unwrap(),
+            db.payloads()
+                .hydrate_agent_bash_payload_json(&compacted)
+                .unwrap(),
             payload
         );
     }
@@ -10337,7 +13099,9 @@ mod tests {
         let legacy = db.list_mailbox("session-a", true).unwrap().remove(0);
         assert_eq!(legacy.payload_compacted_at, None);
         assert_eq!(
-            db.hydrate_agent_bash_payload_json(&legacy).unwrap(),
+            db.payloads()
+                .hydrate_agent_bash_payload_json(&legacy)
+                .unwrap(),
             payload
         );
     }
@@ -10360,8 +13124,13 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
 
-        db.mark_delivery_failed("session-a", &[row.seq], "mailbox_delivery_unconfirmed")
-            .unwrap();
+        db.mark_delivery_failed(
+            "session-a",
+            None,
+            &[row.seq],
+            "mailbox_delivery_unconfirmed",
+        )
+        .unwrap();
         let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
 
         assert!(failed.delivered_at.is_none());
@@ -10373,6 +13142,78 @@ mod tests {
     }
 
     #[test]
+    fn mark_delivery_failed_rejects_a_mixed_foreign_target_batch_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let owned = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+        let foreign = inserted_row(db.enqueue_agent_bash_complete(&input("handle-b", "session-b")));
+
+        let error = db
+            .mark_delivery_failed(
+                "session-a",
+                None,
+                &[owned.seq, foreign.seq],
+                "mailbox_delivery_unconfirmed",
+            )
+            .unwrap_err();
+
+        assert!(error.contains("missing, settled, or foreign-target row"));
+        for session_id in ["session-a", "session-b"] {
+            let unchanged = db.list_mailbox(session_id, true).unwrap().remove(0);
+            assert_eq!(unchanged.delivery_attempts, 0);
+            assert!(unchanged.delivery_error.is_none());
+        }
+    }
+
+    #[test]
+    fn mark_delivery_failed_accepts_an_authorized_chain_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let EnqueueResult::Inserted(row) = db
+            .enqueue_submitted_input(&submitted_input(
+                "chain-failure-token",
+                InboxTargetKind::Chain,
+                "chain-a",
+                b"chain input",
+            ))
+            .unwrap()
+        else {
+            panic!("expected chain-targeted input to be inserted");
+        };
+
+        db.mark_delivery_failed(
+            "active-session-a",
+            Some("chain-a"),
+            &[row.seq],
+            "mailbox_delivery_unconfirmed",
+        )
+        .unwrap();
+
+        let failed = db.list_mailbox("chain-a", true).unwrap().remove(0);
+        assert_eq!(failed.delivery_attempts, 1);
+        assert_eq!(
+            failed.delivery_error.as_deref(),
+            Some("mailbox_delivery_unconfirmed")
+        );
+    }
+
+    #[test]
+    fn generic_delivery_failure_rejects_terminal_wake_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
+
+        let error = db
+            .mark_delivery_failed("session-a", None, &[row.seq], WAKE_SWEEP_ABANDONED_ERROR)
+            .unwrap_err();
+
+        assert!(error.contains("dedicated authority-bearing disposition"));
+        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+    }
+
+    #[test]
     fn list_pending_excludes_delivered() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
@@ -10380,7 +13221,7 @@ mod tests {
             inserted_row(db.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
         let pending = inserted_row(db.enqueue_agent_bash_complete(&input("handle-b", "session-a")));
 
-        db.mark_delivered("session-a", &[delivered.seq], "resume-1")
+        db.mark_delivered("session-a", None, &[delivered.seq], "resume-1")
             .unwrap();
 
         let pending_rows = db.list_pending("session-a").unwrap();
@@ -10447,78 +13288,84 @@ mod tests {
     }
 
     #[test]
-    fn session_runtime_selected_auto_wake_max_round_trips_and_is_write_once() {
+    fn session_metadata_selected_auto_wake_max_round_trips_and_is_write_once() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
 
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: "session-max",
-            mode: "headless",
-            invocation_uuid: Some("owner-invocation"),
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: Some(32),
-        })
-        .unwrap();
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: "session-max",
-            mode: "headless",
-            invocation_uuid: None,
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: Some(99),
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-max",
+                mode: "headless",
+                invocation_uuid: Some("owner-invocation"),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: Some(32),
+            })
+            .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-max",
+                mode: "headless",
+                invocation_uuid: None,
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: Some(99),
+            })
+            .unwrap();
 
-        let row = db.session_runtime("session-max").unwrap().unwrap();
+        let row = db
+            .wake_session_reader()
+            .session_metadata("session-max")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.selected_auto_wake_max, Some(32));
         assert_eq!(row.invocation_uuid.as_deref(), Some("owner-invocation"));
     }
 
     #[test]
-    fn session_runtime_legacy_null_accepts_first_selected_auto_wake_max() {
+    fn session_metadata_legacy_null_accepts_first_selected_auto_wake_max() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: "session-legacy",
-            mode: "headless",
-            invocation_uuid: Some("owner-invocation"),
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-legacy",
+                mode: "headless",
+                invocation_uuid: Some("owner-invocation"),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
 
         assert_eq!(
-            db.session_runtime("session-legacy")
+            db.wake_session_reader()
+                .session_metadata("session-legacy")
                 .unwrap()
                 .unwrap()
                 .selected_auto_wake_max,
             None
         );
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: "session-legacy",
-            mode: "headless",
-            invocation_uuid: None,
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: Some(32),
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-legacy",
+                mode: "headless",
+                invocation_uuid: None,
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: Some(32),
+            })
+            .unwrap();
         assert_eq!(
-            db.session_runtime("session-legacy")
+            db.wake_session_reader()
+                .session_metadata("session-legacy")
                 .unwrap()
                 .unwrap()
                 .selected_auto_wake_max,
@@ -10555,41 +13402,54 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let identity = current_identity();
 
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "invocation-a",
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            identity: &identity,
-            pty_control_path: None,
-            turn_start_max_mailbox_seq: Some(7),
-            models_dir: Some("/tmp/models"),
-            effective_cwd: Some("/tmp/work"),
-        })
-        .unwrap();
+        db.wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: "invocation-a",
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                identity: &identity,
+                pty_control_path: None,
+                turn_start_max_mailbox_seq: Some(7),
+                models_dir: Some("/tmp/models"),
+                effective_cwd: Some("/tmp/work"),
+            })
+            .unwrap();
 
-        let row = db.session_runtime("session-a").unwrap().unwrap();
-        assert_eq!(row.run_state, "running");
-        assert_eq!(row.mode, "headless");
-        assert_eq!(row.invocation_uuid.as_deref(), Some("invocation-a"));
-        assert_eq!(row.running_invocation_uuid.as_deref(), Some("invocation-a"));
-        assert_eq!(row.provider_name.as_deref(), Some("provider-a"));
-        assert_eq!(row.model_name.as_deref(), Some("model-a"));
-        assert_eq!(row.running_os_pid, Some(identity.os_pid));
+        let metadata = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap();
+        let projection = db
+            .wake_session_reader()
+            .legacy_runtime_projection("session-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.run_state, "running");
+        assert_eq!(metadata.mode, "headless");
+        assert_eq!(metadata.invocation_uuid.as_deref(), Some("invocation-a"));
         assert_eq!(
-            row.running_os_boot_id.as_deref(),
+            projection.running_invocation_uuid.as_deref(),
+            Some("invocation-a")
+        );
+        assert_eq!(metadata.provider_name.as_deref(), Some("provider-a"));
+        assert_eq!(metadata.model_name.as_deref(), Some("model-a"));
+        assert_eq!(projection.running_os_pid, Some(identity.os_pid));
+        assert_eq!(
+            projection.running_os_boot_id.as_deref(),
             Some(identity.os_boot_id.as_str())
         );
         assert_eq!(
-            row.running_os_pid_starttime_ticks,
+            projection.running_os_pid_starttime_ticks,
             Some(identity.os_pid_starttime_ticks)
         );
-        assert_eq!(row.turn_start_max_mailbox_seq, Some(7));
-        assert_eq!(row.models_dir.as_deref(), Some("/tmp/models"));
-        assert_eq!(row.effective_cwd.as_deref(), Some("/tmp/work"));
-        assert!(row.turn_started_at.is_some());
-        assert!(row.turn_ended_at.is_none());
+        assert_eq!(projection.turn_start_max_mailbox_seq, Some(7));
+        assert_eq!(metadata.models_dir.as_deref(), Some("/tmp/models"));
+        assert_eq!(metadata.effective_cwd.as_deref(), Some("/tmp/work"));
+        assert!(projection.turn_started_at.is_some());
+        assert!(projection.turn_ended_at.is_none());
     }
 
     #[test]
@@ -10598,82 +13458,99 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let identity = current_identity();
 
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "owner-invocation",
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            identity: &identity,
-            pty_control_path: None,
-            turn_start_max_mailbox_seq: None,
-            models_dir: Some("/tmp/models"),
-            effective_cwd: Some("/tmp/work"),
-        })
-        .unwrap();
-        assert!(
-            db.mark_session_idle(SessionRuntimeIdleUpdate {
+        db.wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id: "session-a",
+                mode: "headless",
                 invocation_uuid: "owner-invocation",
-                last_exit_code: Some(0),
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                identity: &identity,
+                pty_control_path: None,
+                turn_start_max_mailbox_seq: None,
+                models_dir: Some("/tmp/models"),
+                effective_cwd: Some("/tmp/work"),
             })
-            .unwrap()
+            .unwrap();
+        assert!(
+            db.wake_sessions()
+                .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
+                    session_id: "session-a",
+                    invocation_uuid: "owner-invocation",
+                    last_exit_code: Some(0),
+                })
+                .unwrap()
         );
 
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: None,
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-            selected_auto_wake_max: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: None,
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: None,
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.try_acquire_wake_claim(WakeClaimRequest {
-                session_id: "session-a",
-                claim_token: "wake-token",
-                reason: "notify_idle",
-                auto_wake_count: 1,
-                wake_invocation_uuid: None,
-                stale_after_seconds: 600,
-            })
-            .unwrap(),
+            db.wake_sessions()
+                .try_acquire_wake_claim(WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "wake-token",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                })
+                .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
 
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "wake-invocation",
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            identity: &identity,
-            pty_control_path: None,
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: "wake-invocation",
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                identity: &identity,
+                pty_control_path: None,
+                turn_start_max_mailbox_seq: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
 
-        let running = db.session_runtime("session-a").unwrap().unwrap();
-        assert_eq!(running.invocation_uuid.as_deref(), Some("owner-invocation"));
+        let metadata = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap();
+        let projection = db
+            .wake_session_reader()
+            .legacy_runtime_projection("session-a")
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            running.running_invocation_uuid.as_deref(),
+            metadata.invocation_uuid.as_deref(),
+            Some("owner-invocation")
+        );
+        assert_eq!(
+            projection.running_invocation_uuid.as_deref(),
             Some("wake-invocation")
         );
         assert!(
-            db.mark_session_idle(SessionRuntimeIdleUpdate {
-                session_id: "session-a",
-                invocation_uuid: "wake-invocation",
-                last_exit_code: Some(0),
-            })
-            .unwrap()
+            db.wake_sessions()
+                .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
+                    session_id: "session-a",
+                    invocation_uuid: "wake-invocation",
+                    last_exit_code: Some(0),
+                })
+                .unwrap()
         );
     }
 
@@ -10683,24 +13560,34 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let identity = current_identity();
 
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "pty_interactive",
-            invocation_uuid: "invocation-a",
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            identity: &identity,
-            pty_control_path: Some("/tmp/oulipoly-a.sock"),
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
+                session_id: "session-a",
+                mode: "pty_interactive",
+                invocation_uuid: "invocation-a",
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                identity: &identity,
+                pty_control_path: Some("/tmp/oulipoly-a.sock"),
+                turn_start_max_mailbox_seq: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
 
-        let row = db.session_runtime("session-a").unwrap().unwrap();
-        assert_eq!(row.mode, "pty_interactive");
+        let metadata = db
+            .wake_session_reader()
+            .session_metadata("session-a")
+            .unwrap()
+            .unwrap();
+        let projection = db
+            .wake_session_reader()
+            .legacy_runtime_projection("session-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.mode, "pty_interactive");
         assert_eq!(
-            row.pty_control_path.as_deref(),
+            projection.pty_control_path.as_deref(),
             Some("/tmp/oulipoly-a.sock")
         );
     }
@@ -10711,42 +13598,53 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let identity = current_identity();
 
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "new-invocation",
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            identity: &identity,
-            pty_control_path: Some("/tmp/oulipoly-test.sock"),
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: "new-invocation",
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                identity: &identity,
+                pty_control_path: Some("/tmp/oulipoly-test.sock"),
+                turn_start_max_mailbox_seq: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
 
         assert!(
-            !db.mark_session_idle(SessionRuntimeIdleUpdate {
-                session_id: "session-a",
-                invocation_uuid: "old-invocation",
-                last_exit_code: Some(0),
-            })
-            .unwrap()
+            !db.wake_sessions()
+                .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
+                    session_id: "session-a",
+                    invocation_uuid: "old-invocation",
+                    last_exit_code: Some(0),
+                })
+                .unwrap()
         );
         assert_eq!(
-            db.session_runtime("session-a").unwrap().unwrap().run_state,
+            db.wake_session_reader()
+                .legacy_runtime_projection("session-a")
+                .unwrap()
+                .unwrap()
+                .run_state,
             "running"
         );
 
         assert!(
-            db.mark_session_idle(SessionRuntimeIdleUpdate {
-                session_id: "session-a",
-                invocation_uuid: "new-invocation",
-                last_exit_code: Some(0),
-            })
-            .unwrap()
+            db.wake_sessions()
+                .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
+                    session_id: "session-a",
+                    invocation_uuid: "new-invocation",
+                    last_exit_code: Some(0),
+                })
+                .unwrap()
         );
-        let row = db.session_runtime("session-a").unwrap().unwrap();
+        let row = db
+            .wake_session_reader()
+            .legacy_runtime_projection("session-a")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.run_state, "idle");
         assert_eq!(row.last_exit_code, Some(0));
         assert!(row.turn_ended_at.is_some());
@@ -10760,26 +13658,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let identity = current_identity();
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "invocation-a",
-            provider_name: None,
-            model_name: None,
-            identity: &identity,
-            pty_control_path: None,
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "invocation-a",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "invocation-a",
+                },
+                spawned_os_pid: identity.os_pid,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
 
         assert_eq!(
-            db.session_liveness("session-a").unwrap(),
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("session-a")
+                .unwrap(),
             SessionLiveness::Busy
         );
         assert_eq!(
-            db.session_runtime("session-a").unwrap().unwrap().run_state,
+            db.wake_session_reader()
+                .legacy_runtime_projection("session-a")
+                .unwrap()
+                .unwrap()
+                .run_state,
             "running"
         );
     }
@@ -10790,29 +13707,228 @@ mod tests {
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
         let mut identity = current_identity();
         identity.os_pid_starttime_ticks += 1;
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "invocation-a",
-            provider_name: None,
-            model_name: None,
-            identity: &identity,
-            pty_control_path: Some("/tmp/stale.sock"),
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("92222222-2222-4222-8222-222222222222").unwrap();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "invocation-a",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: None,
+                pty_control_path: Some("/tmp/stale.sock"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "invocation-a",
+                },
+                spawned_os_pid: identity.os_pid,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
 
         assert_eq!(
-            db.session_liveness("session-a").unwrap(),
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("session-a")
+                .unwrap(),
             SessionLiveness::Idle
         );
-        let row = db.session_runtime("session-a").unwrap().unwrap();
+        let row = db
+            .wake_session_reader()
+            .legacy_runtime_projection("session-a")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.run_state, "idle");
         assert!(row.running_invocation_uuid.is_none());
         assert!(row.running_os_pid.is_none());
         assert!(row.pty_control_path.is_none());
+    }
+
+    #[test]
+    fn draining_reused_child_reconciles_once_and_preserves_drain_audit_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let mut identity = current_identity();
+        identity.os_pid_starttime_ticks += 1;
+        let generation_id =
+            RuntimeGenerationId::parse("93333333-3333-4333-8333-333333333333").unwrap();
+        let drain_request_id =
+            DrainRequestId::parse("94444444-4444-4444-8444-444444444444").unwrap();
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-draining-stale",
+        };
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: fence.spawn_invocation_uuid,
+                session_id: Some("session-draining-stale"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence,
+                spawned_os_pid: identity.os_pid,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+                requested_by_invocation_uuid: "orderly-owner",
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+            })
+            .unwrap();
+
+        assert_eq!(
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("session-draining-stale")
+                .unwrap(),
+            SessionLiveness::Idle
+        );
+        assert_eq!(
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("session-draining-stale")
+                .unwrap(),
+            SessionLiveness::Idle
+        );
+        let recovered = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(
+            recovered.terminal_reason,
+            Some(RuntimeTerminalReason::RecoveredDead)
+        );
+        assert_eq!(recovered.drain_request_id, Some(drain_request_id));
+        assert!(recovered.drain_requested_at.is_some());
+        assert_eq!(
+            recovered.drain_requested_by_invocation_uuid.as_deref(),
+            Some("orderly-owner")
+        );
+        assert!(recovered.draining_at.is_some());
+    }
+
+    #[test]
+    fn draining_live_child_and_foreign_fence_remain_nonterminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let identity = current_identity();
+        let generation_id =
+            RuntimeGenerationId::parse("95555555-5555-4555-8555-555555555555").unwrap();
+        let drain_request_id =
+            DrainRequestId::parse("96666666-6666-4666-8666-666666666666").unwrap();
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-draining-live",
+        };
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: fence.spawn_invocation_uuid,
+                session_id: Some("session-draining-live"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence,
+                spawned_os_pid: identity.os_pid,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+                requested_by_invocation_uuid: "orderly-owner",
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                fence,
+                drain_request_id: &drain_request_id,
+            })
+            .unwrap();
+
+        assert_eq!(
+            db.runtime_lifecycle()
+                .reconcile_session_liveness("session-draining-live")
+                .unwrap(),
+            SessionLiveness::Busy
+        );
+        assert_eq!(
+            db.runtime_lifecycle()
+                .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                    fence: RuntimeGenerationFence {
+                        generation_id: &generation_id,
+                        spawn_invocation_uuid: "foreign-invocation",
+                    },
+                    reason: RuntimeTerminalReason::RecoveredDead,
+                    exit_code: None,
+                })
+                .unwrap(),
+            GenerationMutation::Rejected(GenerationRejection::FenceMismatch)
+        );
+        assert_eq!(
+            db.runtime_lifecycle()
+                .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                    fence,
+                    reason: RuntimeTerminalReason::RecoveredDead,
+                    exit_code: None,
+                })
+                .unwrap(),
+            GenerationMutation::Rejected(GenerationRejection::ProcessIdentityConflict)
+        );
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
+                    fence,
+                    reason: RuntimeTerminalReason::AbnormalTermination,
+                    exit_code: None,
+                })
+                .unwrap(),
+            GenerationMutation::Rejected(GenerationRejection::IllegalPredecessor {
+                actual: RuntimeLifecycleState::Draining,
+                ..
+            })
+        ));
+        assert_eq!(
+            db.runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            RuntimeLifecycleState::Draining
+        );
     }
 
     #[test]
@@ -10825,6 +13941,7 @@ mod tests {
             .unwrap();
 
         let result = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
@@ -10847,72 +13964,200 @@ mod tests {
     }
 
     #[test]
+    fn wake_startable_claim_rechecks_runtime_generation_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("91111111-1111-4111-8111-111111111111").unwrap();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "runtime-invocation",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: Some("model-a"),
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+
+        let result = db
+            .wake_sessions()
+            .try_acquire_startable_wake_claim(
+                WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: Some("wake-a"),
+                    stale_after_seconds: 600,
+                },
+                None,
+                8,
+            )
+            .unwrap();
+
+        assert!(matches!(result, WakeClaimAcquireResult::Busy));
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wake_startable_claim_rechecks_notification_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.set_notifications_paused("session-a", true).unwrap();
+
+        let result = db
+            .wake_sessions()
+            .try_acquire_startable_wake_claim(
+                WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: Some("wake-a"),
+                    stale_after_seconds: 600,
+                },
+                None,
+                8,
+            )
+            .unwrap();
+
+        assert!(matches!(result, WakeClaimAcquireResult::NoPending));
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wake_startable_claim_rechecks_persisted_retry_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        let first = db
+            .wake_sessions()
+            .try_acquire_startable_wake_claim(
+                WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 3,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                },
+                None,
+                3,
+            )
+            .unwrap();
+        assert!(matches!(first, WakeClaimAcquireResult::Acquired(_)));
+        assert!(
+            db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap()
+        );
+
+        let result = db
+            .wake_sessions()
+            .try_acquire_startable_wake_claim(
+                WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-b",
+                    reason: "notify_idle",
+                    auto_wake_count: 4,
+                    wake_invocation_uuid: Some("wake-b"),
+                    stale_after_seconds: 600,
+                },
+                None,
+                3,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            WakeClaimAcquireResult::CapReached {
+                current_count: 3,
+                max_count: 3
+            }
+        ));
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn wake_claim_count_persists_on_session_runtime_after_claim_release() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: None,
-            provider_name: Some("provider-a"),
-            model_name: Some("model-a"),
-            pty_control_path: None,
-            models_dir: Some("/tmp/models"),
-            effective_cwd: None,
-            selected_auto_wake_max: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: None,
+                provider_name: Some("provider-a"),
+                model_name: Some("model-a"),
+                models_dir: Some("/tmp/models"),
+                effective_cwd: None,
+                selected_auto_wake_max: None,
+            })
+            .unwrap();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
 
         let result = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
                 auto_wake_count: 5,
-                wake_invocation_uuid: Some("wake-a"),
+                wake_invocation_uuid: None,
                 stale_after_seconds: 600,
             })
             .unwrap();
 
         assert!(matches!(result, WakeClaimAcquireResult::Acquired(_)));
         assert_eq!(
-            db.session_runtime("session-a")
+            db.wake_session_reader()
+                .session_metadata("session-a")
                 .unwrap()
                 .unwrap()
                 .auto_wake_count,
             5
         );
-        db.release_wake_claim("session-a", Some("token-a")).unwrap();
-        let candidates = db.wake_sweep_candidates(600, 10).unwrap();
+        db.wake_sessions()
+            .release_wake_claim("session-a", "token-a")
+            .unwrap();
+        let candidates = db.wake_sessions().wake_sweep_candidates(600, 10).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].auto_wake_count, 6);
     }
 
     #[test]
-    fn wake_busy_pending_skips_claim() {
+    fn wake_claim_release_requires_the_exact_current_token() {
         let dir = tempfile::tempdir().unwrap();
         let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
-        let identity = current_identity();
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
-        db.mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: "session-a",
-            mode: "headless",
-            invocation_uuid: "invocation-a",
-            provider_name: None,
-            model_name: None,
-            identity: &identity,
-            pty_control_path: None,
-            turn_start_max_mailbox_seq: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
-
-        assert!(matches!(
-            db.try_acquire_wake_claim(WakeClaimRequest {
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
                 reason: "notify_idle",
@@ -10920,10 +14165,336 @@ mod tests {
                 wake_invocation_uuid: None,
                 stale_after_seconds: 600,
             })
-            .unwrap(),
-            WakeClaimAcquireResult::Busy
+            .unwrap();
+
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim("session-a", "token-b")
+                .unwrap()
+        );
+        assert_eq!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            "token-a"
+        );
+        assert!(
+            db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn admitted_wake_child_blocks_manual_claim_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        let admitted_identity = current_identity();
+
+        assert!(
+            !db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-b", &admitted_identity)
+                .unwrap()
+        );
+        assert!(
+            db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a", &admitted_identity)
+                .unwrap()
+        );
+        assert!(
+            db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a", &admitted_identity)
+                .unwrap(),
+            "the exact admitted child must retain idempotent replay authority"
+        );
+        let mut foreign_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("mailbox::tests::wake_claim_foreign_child_fixture")
+            .arg("--nocapture")
+            .env(WAKE_CLAIM_FOREIGN_CHILD_FIXTURE, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let foreign_identity =
+            pid_identity::read_live_process_identity(i64::from(foreign_child.id()))
+                .unwrap()
+                .unwrap();
+        let foreign_replay = db
+            .wake_sessions()
+            .validate_wake_claim_for_child("session-a", "token-a", &foreign_identity)
+            .unwrap();
+        foreign_child.kill().unwrap();
+        foreign_child.wait().unwrap();
+        assert!(
+            !foreign_replay,
+            "a different process identity must not replay an admitted wake token"
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .wake_invocation_uuid
+                .is_some(),
+            "child validation must durably reserve the wake claim"
+        );
+        assert_eq!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .wake_pid,
+            Some(i64::from(std::process::id())),
+            "child admission must durably bind its own process identity"
+        );
+        assert!(
+            !db.wake_sessions()
+                .record_wake_claim_pid_identity("session-a", "token-a", i64::MAX)
+                .unwrap(),
+            "a failed parent observation must not overwrite child-owned identity"
+        );
+        assert_eq!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .wake_pid,
+            Some(i64::from(std::process::id()))
+        );
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim("session-a", "token-a")
+                .unwrap(),
+            "manual release must not erase a child-admitted wake claim"
+        );
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim_for_manual_resume("session-a", "token-a")
+                .unwrap(),
+            "manual resume must not erase a live child-admitted wake claim"
+        );
+        assert!(
+            db.wake_sessions()
+                .release_admitted_wake_claim("session-a", "token-a")
+                .unwrap(),
+            "the admitted child must retain exact-token cleanup authority"
+        );
+    }
+
+    #[test]
+    fn manual_resume_releases_an_exact_dead_admitted_wake_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some("wake-a"),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        db.wake_sessions()
+            .record_wake_claim_pid("session-a", "token-a", i64::MAX)
+            .unwrap();
+
+        assert!(
+            db.wake_sessions()
+                .release_wake_claim_for_manual_resume("session-a", "token-a")
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manual_resume_releases_an_exact_pid_reused_admitted_wake_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some("wake-a"),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        let identity = current_identity();
+        db.wake_sessions()
+            .record_wake_claim_pid_identity("session-a", "token-a", identity.os_pid)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE session_wake_claim
+                 SET wake_os_pid_starttime_ticks = ?2
+                 WHERE session_id = ?1",
+                params!["session-a", identity.os_pid_starttime_ticks + 1],
+            )
+            .unwrap();
+
+        assert!(
+            db.wake_sessions()
+                .release_wake_claim_for_manual_resume("session-a", "token-a")
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn manual_resume_retains_an_admitted_claim_without_process_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: Some("wake-a"),
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+
+        assert!(
+            !db.wake_sessions()
+                .release_wake_claim_for_manual_resume("session-a", "token-a")
+                .unwrap()
+        );
+        assert_eq!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .unwrap()
+                .claim_token,
+            "token-a"
+        );
+    }
+
+    #[test]
+    fn wake_child_validation_rejects_claim_when_runtime_authority_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .try_acquire_wake_claim(WakeClaimRequest {
+                session_id: "session-a",
+                claim_token: "token-a",
+                reason: "notify_idle",
+                auto_wake_count: 1,
+                wake_invocation_uuid: None,
+                stale_after_seconds: 600,
+            })
+            .unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("92222222-2222-4222-8222-222222222222").unwrap();
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
+                generation_id: &generation_id,
+                spawn_invocation_uuid: "runtime-invocation",
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: Some("model-a"),
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+
+        assert!(
+            !db.wake_sessions()
+                .validate_wake_claim_for_child("session-a", "token-a", &current_identity())
+                .unwrap()
+        );
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn wake_claim_ignores_legacy_runtime_projection_after_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let identity = current_identity();
+        db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
+            .unwrap();
+        db.wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
+                session_id: "session-a",
+                mode: "headless",
+                invocation_uuid: "invocation-a",
+                provider_name: None,
+                model_name: None,
+                identity: &identity,
+                pty_control_path: None,
+                turn_start_max_mailbox_seq: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+
+        assert!(matches!(
+            db.wake_sessions()
+                .try_acquire_wake_claim(WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                })
+                .unwrap(),
+            WakeClaimAcquireResult::Acquired(_)
         ));
-        assert!(db.wake_claim("session-a").unwrap().is_none());
+        assert!(
+            db.wake_session_reader()
+                .wake_claim("session-a")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -10933,6 +14504,7 @@ mod tests {
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         let first = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-a",
@@ -10945,6 +14517,7 @@ mod tests {
         assert!(matches!(first, WakeClaimAcquireResult::Acquired(_)));
 
         let second = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-b",
@@ -10968,20 +14541,24 @@ mod tests {
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.try_acquire_wake_claim(WakeClaimRequest {
-                session_id: "session-a",
-                claim_token: "token-a",
-                reason: "notify_idle",
-                auto_wake_count: 1,
-                wake_invocation_uuid: None,
-                stale_after_seconds: 600,
-            })
-            .unwrap(),
+            db.wake_sessions()
+                .try_acquire_wake_claim(WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                })
+                .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
-        db.force_wake_claim_age_for_test("session-a", 601).unwrap();
+        db.wake_sessions()
+            .force_wake_claim_age_for_test("session-a", 601)
+            .unwrap();
 
         let stolen = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-b",
@@ -11007,21 +14584,24 @@ mod tests {
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.try_acquire_wake_claim(WakeClaimRequest {
-                session_id: "session-a",
-                claim_token: "token-a",
-                reason: "notify_idle",
-                auto_wake_count: 1,
-                wake_invocation_uuid: None,
-                stale_after_seconds: 600,
-            })
-            .unwrap(),
+            db.wake_sessions()
+                .try_acquire_wake_claim(WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                })
+                .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
-        db.record_wake_claim_pid("session-a", "token-a", 999_999_999)
+        db.wake_sessions()
+            .record_wake_claim_pid("session-a", "token-a", 999_999_999)
             .unwrap();
 
         let stolen = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-b",
@@ -11045,35 +14625,30 @@ mod tests {
         db.enqueue_agent_bash_complete(&input("handle-a", "session-a"))
             .unwrap();
         assert!(matches!(
-            db.try_acquire_wake_claim(WakeClaimRequest {
-                session_id: "session-a",
-                claim_token: "token-a",
-                reason: "notify_idle",
-                auto_wake_count: 1,
-                wake_invocation_uuid: None,
-                stale_after_seconds: 600,
-            })
-            .unwrap(),
+            db.wake_sessions()
+                .try_acquire_wake_claim(WakeClaimRequest {
+                    session_id: "session-a",
+                    claim_token: "token-a",
+                    reason: "notify_idle",
+                    auto_wake_count: 1,
+                    wake_invocation_uuid: None,
+                    stale_after_seconds: 600,
+                })
+                .unwrap(),
             WakeClaimAcquireResult::Acquired(_)
         ));
         let identity = current_identity();
+        db.wake_sessions()
+            .record_wake_claim_pid_identity("session-a", "token-a", identity.os_pid)
+            .unwrap();
         let sidecar = pid_identity::PidIdentityDb::open(db.path()).unwrap();
-        sidecar
-            .record_identity(pid_identity::PidIdentityRecord {
-                identity: &identity,
-                os_pgid: None,
-                invocation_uuid: "token-a",
-                session_id: Some("session-a"),
-                provider_name: Some("wake"),
-                model_name: Some("model-a"),
-                recorded_at: "2026-06-08T00:00:00Z",
-            })
+        assert!(sidecar.lookup_by_identity(&identity).unwrap().is_none());
+        db.wake_sessions()
+            .force_wake_claim_age_for_test("session-a", 601)
             .unwrap();
-        db.record_wake_claim_pid("session-a", "token-a", identity.os_pid)
-            .unwrap();
-        db.force_wake_claim_age_for_test("session-a", 601).unwrap();
 
         let result = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: "session-a",
                 claim_token: "token-b",
@@ -11112,18 +14687,19 @@ mod tests {
             (&second_id, "invocation-b", Some("session-a")),
         ] {
             assert!(matches!(
-                db.create_runtime_generation(CreateRuntimeGeneration {
-                    generation_id,
-                    spawn_invocation_uuid: invocation_uuid,
-                    session_id,
-                    runtime_mode: "headless",
-                    provider_name: "provider-a",
-                    model_name: Some("model-a"),
-                    pty_control_path: None,
-                    models_dir: None,
-                    effective_cwd: None,
-                })
-                .unwrap(),
+                db.runtime_lifecycle()
+                    .create_runtime_generation(CreateRuntimeGeneration {
+                        generation_id,
+                        spawn_invocation_uuid: invocation_uuid,
+                        session_id,
+                        runtime_mode: "headless",
+                        provider_name: "provider-a",
+                        model_name: Some("model-a"),
+                        pty_control_path: None,
+                        models_dir: None,
+                        effective_cwd: None,
+                    })
+                    .unwrap(),
                 GenerationMutation::Applied(_)
             ));
         }
@@ -11132,39 +14708,43 @@ mod tests {
             (&second_id, "invocation-b", &second_identity),
         ] {
             assert!(matches!(
-                db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
-                    fence: RuntimeGenerationFence {
-                        generation_id,
-                        spawn_invocation_uuid: invocation_uuid,
-                    },
-                    spawned_os_pid: identity.os_pid,
-                    exact_process_identity: Some(identity),
-                    os_pgid: None,
-                })
-                .unwrap(),
+                db.runtime_lifecycle()
+                    .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                        fence: RuntimeGenerationFence {
+                            generation_id,
+                            spawn_invocation_uuid: invocation_uuid,
+                        },
+                        spawned_os_pid: identity.os_pid,
+                        exact_process_identity: identity,
+                        os_pgid: None,
+                    })
+                    .unwrap(),
                 GenerationMutation::Applied(_)
             ));
         }
         assert!(matches!(
-            db.attach_runtime_generation_session(AttachRuntimeGenerationSession {
-                fence: RuntimeGenerationFence {
-                    generation_id: &first_id,
-                    spawn_invocation_uuid: "invocation-a",
-                },
-                session_id: "session-a",
-            })
-            .unwrap(),
+            db.runtime_lifecycle()
+                .attach_runtime_generation_session(AttachRuntimeGenerationSession {
+                    fence: RuntimeGenerationFence {
+                        generation_id: &first_id,
+                        spawn_invocation_uuid: "invocation-a",
+                    },
+                    session_id: "session-a",
+                })
+                .unwrap(),
             GenerationMutation::Applied(_)
         ));
 
-        let SessionGenerationProjection::Multiple(rows) =
-            db.session_generation_projection("session-a").unwrap()
+        let SessionGenerationProjection::Multiple(rows) = db
+            .runtime_lifecycle_reader()
+            .session_generation_projection("session-a")
+            .unwrap()
         else {
             panic!("overlapping generations must remain explicit");
         };
         assert_eq!(rows.len(), 2);
         assert!(matches!(
-            db.resolve_runtime_generation(RuntimeGenerationSelector::ProcessIdentity(
+            db.runtime_lifecycle_reader().resolve_runtime_generation(RuntimeGenerationSelector::ProcessIdentity(
                 &first_identity
             ))
             .unwrap(),
@@ -11180,44 +14760,53 @@ mod tests {
             RuntimeGenerationId::parse("33333333-3333-4333-8333-333333333333").unwrap();
         let drain_request_id =
             DrainRequestId::parse("44444444-4444-4444-8444-444444444444").unwrap();
-        db.create_runtime_generation(CreateRuntimeGeneration {
-            generation_id: &generation_id,
-            spawn_invocation_uuid: "invocation-a",
-            session_id: Some("session-a"),
-            runtime_mode: "headless",
-            provider_name: "provider-a",
-            model_name: None,
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
-        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
-            fence: RuntimeGenerationFence {
+        let identity = ProcessIdentity {
+            os_pid: 103,
+            os_boot_id: "drain-test-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id: &generation_id,
                 spawn_invocation_uuid: "invocation-a",
-            },
-            spawned_os_pid: 103,
-            exact_process_identity: None,
-            os_pgid: None,
-        })
-        .unwrap();
+                session_id: Some("session-a"),
+                runtime_mode: "headless",
+                provider_name: "provider-a",
+                model_name: None,
+                pty_control_path: None,
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id: &generation_id,
+                    spawn_invocation_uuid: "invocation-a",
+                },
+                spawned_os_pid: 103,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
         let fence = RuntimeGenerationFence {
             generation_id: &generation_id,
             spawn_invocation_uuid: "invocation-a",
         };
 
         assert!(matches!(
-            db.request_runtime_generation_drain(RequestRuntimeGenerationDrain {
-                fence,
-                drain_request_id: &drain_request_id,
-                requested_by_invocation_uuid: "drainer-a",
-            })
-            .unwrap(),
+            db.runtime_lifecycle()
+                .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                    fence,
+                    drain_request_id: &drain_request_id,
+                    requested_by_invocation_uuid: "drainer-a",
+                })
+                .unwrap(),
             DrainRequestResult::Installed(_, DrainHandoff::Ready)
         ));
         assert!(matches!(
-            db.advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+            db.runtime_lifecycle()
+                .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
                 fence,
                 drain_request_id: &drain_request_id,
             })
@@ -11226,11 +14815,13 @@ mod tests {
                 if row.lifecycle_state == RuntimeLifecycleState::Draining
         ));
         assert!(matches!(
-            db.finish_runtime_generation_drain(FinishRuntimeGenerationDrain {
-                fence,
-                drain_request_id: &drain_request_id,
-                exit_code: Some(0),
-            })
+            db.runtime_lifecycle()
+                .finish_runtime_generation_drain(FinishRuntimeGenerationDrain {
+                    fence,
+                    drain_request_id: &drain_request_id,
+                    exit_code: Some(0),
+                    compatibility_exit_code: Some(0),
+                })
             .unwrap(),
             DrainFinishResult::Finished(ref row)
                 if row.lifecycle_state == RuntimeLifecycleState::Exited
@@ -11255,51 +14846,241 @@ mod tests {
         };
 
         assert!(matches!(
-            db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+            db.runtime_lifecycle()
+                .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[row.seq],
+                    stale_after_seconds: 30,
+                })
+                .unwrap(),
+            DeliveryClaimAcquireResult::Acquired(_)
+        ));
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
+                    fence,
+                    drain_request_id: &drain_request_id,
+                    requested_by_invocation_uuid: "drainer-a",
+                })
+                .unwrap(),
+            DrainRequestResult::Installed(_, DrainHandoff::ClaimOutstanding { .. })
+        ));
+        assert_eq!(
+            db.runtime_lifecycle()
+                .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                    fence,
+                    drain_request_id: &drain_request_id,
+                })
+                .unwrap(),
+            DrainAdvanceResult::WaitingOnClaim(claim_id.clone())
+        );
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .confirm_runtime_generation_delivery(ConfirmRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[row.seq],
+                    delivered_by_invocation_uuid: "invocation-a",
+                })
+                .unwrap(),
+            GenerationMutation::Applied(_)
+        ));
+        assert!(matches!(
+            db.runtime_lifecycle()
+                .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
+                    fence,
+                    drain_request_id: &drain_request_id,
+                })
+                .unwrap(),
+            DrainAdvanceResult::Advanced(_)
+        ));
+        assert!(db.list_pending("session-a").unwrap().is_empty());
+    }
+
+    #[test]
+    fn runtime_generation_delivery_failure_is_session_bound_and_releases_its_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("56565656-5656-4656-8656-565656565656").unwrap();
+        let claim_id = DeliveryClaimId::parse("78787878-7878-4878-8878-787878787878").unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("claimed", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+        db.runtime_lifecycle()
+            .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
                 fence,
                 claim_id: &claim_id,
                 seqs: &[row.seq],
                 stale_after_seconds: 30,
             })
-            .unwrap(),
-            DeliveryClaimAcquireResult::Acquired(_)
-        ));
+            .unwrap();
+
         assert!(matches!(
-            db.request_runtime_generation_drain(RequestRuntimeGenerationDrain {
-                fence,
-                drain_request_id: &drain_request_id,
-                requested_by_invocation_uuid: "drainer-a",
-            })
-            .unwrap(),
-            DrainRequestResult::Installed(_, DrainHandoff::ClaimOutstanding { .. })
+            db.runtime_lifecycle()
+                .fail_runtime_generation_delivery(FailRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[row.seq],
+                    delivery_error: MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+                })
+                .unwrap(),
+            GenerationMutation::Applied(_)
         ));
+
+        let failed = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(failed.delivery_attempts, 1);
         assert_eq!(
-            db.advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
-                fence,
-                drain_request_id: &drain_request_id,
-            })
-            .unwrap(),
-            DrainAdvanceResult::WaitingOnClaim(claim_id.clone())
+            failed.delivery_error.as_deref(),
+            Some(MAILBOX_DELIVERY_UNCONFIRMED_ERROR)
         );
-        assert!(matches!(
-            db.confirm_runtime_generation_delivery(ConfirmRuntimeGenerationDelivery {
+        assert!(
+            db.runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .active_delivery_claim_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_generation_delivery_failure_rejects_terminal_wake_abandonment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("abababab-abab-4bab-8bab-abababababab").unwrap();
+        let claim_id = DeliveryClaimId::parse("cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd").unwrap();
+        let row = inserted_row(db.enqueue_agent_bash_complete(&input("claimed", "session-a")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+        db.runtime_lifecycle()
+            .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
                 fence,
                 claim_id: &claim_id,
                 seqs: &[row.seq],
+                stale_after_seconds: 30,
+            })
+            .unwrap();
+
+        let error = db
+            .runtime_lifecycle()
+            .fail_runtime_generation_delivery(FailRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[row.seq],
+                delivery_error: WAKE_SWEEP_ABANDONED_ERROR,
+            })
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("dedicated authority-bearing disposition")
+        );
+        let unchanged = db.list_mailbox("session-a", true).unwrap().remove(0);
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+        let generation = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation.active_delivery_claim_id, Some(claim_id));
+        assert_eq!(generation.active_delivery_seqs, vec![row.seq]);
+    }
+
+    #[test]
+    fn runtime_generation_delivery_authority_is_session_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = MailboxDb::open(&dir.path().join("pid-identity.db")).unwrap();
+        let generation_id =
+            RuntimeGenerationId::parse("12121212-1212-4212-8212-121212121212").unwrap();
+        let claim_id = DeliveryClaimId::parse("34343434-3434-4434-8434-343434343434").unwrap();
+        let foreign = inserted_row(db.enqueue_agent_bash_complete(&input("foreign", "session-b")));
+        create_running_generation(&mut db, &generation_id, "invocation-a", "session-a");
+        let fence = RuntimeGenerationFence {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: "invocation-a",
+        };
+
+        assert_eq!(
+            db.runtime_lifecycle()
+                .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[foreign.seq],
+                    stale_after_seconds: 30,
+                })
+                .unwrap(),
+            DeliveryClaimAcquireResult::Rejected(GenerationRejection::SessionConflict)
+        );
+        assert!(
+            db.runtime_lifecycle_reader()
+                .runtime_generation(&generation_id)
+                .unwrap()
+                .unwrap()
+                .active_delivery_claim_id
+                .is_none()
+        );
+
+        let seqs_json = serde_json::to_string(&[foreign.seq]).unwrap();
+        db.connection()
+            .execute(
+                "UPDATE runtime_generation
+                 SET active_delivery_claim_uuid = ?2,
+                     active_delivery_claimed_at = '2026-08-18T00:00:00Z',
+                     active_delivery_seqs_json = ?3
+                 WHERE generation_uuid = ?1",
+                params![generation_id.to_string(), claim_id.to_string(), seqs_json],
+            )
+            .unwrap();
+
+        let confirmation_error = db
+            .runtime_lifecycle()
+            .confirm_runtime_generation_delivery(ConfirmRuntimeGenerationDelivery {
+                fence,
+                claim_id: &claim_id,
+                seqs: &[foreign.seq],
                 delivered_by_invocation_uuid: "invocation-a",
             })
-            .unwrap(),
-            GenerationMutation::Applied(_)
-        ));
-        assert!(matches!(
-            db.advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
-                fence,
-                drain_request_id: &drain_request_id,
-            })
-            .unwrap(),
-            DrainAdvanceResult::Advanced(_)
-        ));
-        assert!(db.list_pending("session-a").unwrap().is_empty());
+            .unwrap_err();
+        assert!(
+            confirmation_error
+                .to_string()
+                .contains("not owned and pending")
+        );
+        for _ in 0..2 {
+            let failure_error = db
+                .runtime_lifecycle()
+                .fail_runtime_generation_delivery(FailRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[foreign.seq],
+                    delivery_error: MAILBOX_DELIVERY_UNCONFIRMED_ERROR,
+                })
+                .unwrap_err();
+            assert!(failure_error.to_string().contains("not owned and pending"));
+        }
+
+        let unchanged = db.list_mailbox("session-b", true).unwrap().remove(0);
+        assert!(unchanged.delivered_at.is_none());
+        assert_eq!(unchanged.delivery_attempts, 0);
+        assert!(unchanged.delivery_error.is_none());
+        let generation = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(generation.active_delivery_claim_id, Some(claim_id));
+        assert_eq!(generation.active_delivery_seqs, vec![foreign.seq]);
     }
 
     #[test]
@@ -11318,20 +15099,22 @@ mod tests {
             spawn_invocation_uuid: "invocation-a",
         };
 
-        db.request_runtime_generation_drain(RequestRuntimeGenerationDrain {
-            fence,
-            drain_request_id: &drain_request_id,
-            requested_by_invocation_uuid: "drainer-a",
-        })
-        .unwrap();
-        assert_eq!(
-            db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+        db.runtime_lifecycle()
+            .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
                 fence,
-                claim_id: &claim_id,
-                seqs: &[row.seq],
-                stale_after_seconds: 30,
+                drain_request_id: &drain_request_id,
+                requested_by_invocation_uuid: "drainer-a",
             })
-            .unwrap(),
+            .unwrap();
+        assert_eq!(
+            db.runtime_lifecycle()
+                .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                    fence,
+                    claim_id: &claim_id,
+                    seqs: &[row.seq],
+                    stale_after_seconds: 30,
+                })
+                .unwrap(),
             DeliveryClaimAcquireResult::Rejected(GenerationRejection::DrainRequestConflict)
         );
         assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
@@ -11352,13 +15135,14 @@ mod tests {
             generation_id: &generation_id,
             spawn_invocation_uuid: "invocation-a",
         };
-        db.acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
-            fence,
-            claim_id: &first_claim,
-            seqs: &[first.seq],
-            stale_after_seconds: 30,
-        })
-        .unwrap();
+        db.runtime_lifecycle()
+            .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
+                fence,
+                claim_id: &first_claim,
+                seqs: &[first.seq],
+                stale_after_seconds: 30,
+            })
+            .unwrap();
         let second = inserted_row(db.enqueue_agent_bash_complete(&input("second", "session-a")));
         db.connection()
             .execute(
@@ -11370,6 +15154,7 @@ mod tests {
             .unwrap();
 
         let DeliveryClaimAcquireResult::Recovered(recovered) = db
+            .runtime_lifecycle()
             .acquire_runtime_generation_delivery(AcquireRuntimeGenerationDelivery {
                 fence,
                 claim_id: &replacement_claim,
@@ -11390,28 +15175,35 @@ mod tests {
         invocation_uuid: &str,
         session_id: &str,
     ) {
-        db.create_runtime_generation(CreateRuntimeGeneration {
-            generation_id,
-            spawn_invocation_uuid: invocation_uuid,
-            session_id: Some(session_id),
-            runtime_mode: "pty_interactive",
-            provider_name: "provider-a",
-            model_name: None,
-            pty_control_path: Some("/tmp/control.sock"),
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
-        db.bind_runtime_generation_running(BindRuntimeGenerationRunning {
-            fence: RuntimeGenerationFence {
+        let identity = ProcessIdentity {
+            os_pid: 103,
+            os_boot_id: "delivery-test-boot".to_string(),
+            os_pid_starttime_ticks: 1,
+        };
+        db.runtime_lifecycle()
+            .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id,
                 spawn_invocation_uuid: invocation_uuid,
-            },
-            spawned_os_pid: 103,
-            exact_process_identity: None,
-            os_pgid: None,
-        })
-        .unwrap();
+                session_id: Some(session_id),
+                runtime_mode: "pty_interactive",
+                provider_name: "provider-a",
+                model_name: None,
+                pty_control_path: Some("/tmp/control.sock"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
+        db.runtime_lifecycle()
+            .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+                fence: RuntimeGenerationFence {
+                    generation_id,
+                    spawn_invocation_uuid: invocation_uuid,
+                },
+                spawned_os_pid: 103,
+                exact_process_identity: &identity,
+                os_pgid: None,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -11427,11 +15219,12 @@ mod tests {
         let row =
             inserted_row(mailbox.enqueue_agent_bash_complete(&input("handle-a", "session-a")));
         mailbox
-            .mark_delivered("session-a", &[row.seq], "resume-1")
+            .mark_delivered("session-a", None, &[row.seq], "resume-1")
             .unwrap();
         let identity = current_identity();
         mailbox
-            .mark_session_running(SessionRuntimeRunningUpdate {
+            .wake_sessions()
+            .project_legacy_runtime_running(LegacyRuntimeProjection {
                 session_id: "session-a",
                 mode: "headless",
                 invocation_uuid: "invocation-a",
@@ -11445,7 +15238,8 @@ mod tests {
             })
             .unwrap();
         mailbox
-            .mark_session_idle(SessionRuntimeIdleUpdate {
+            .wake_sessions()
+            .settle_legacy_runtime_projection(LegacyRuntimeProjectionSettlement {
                 session_id: "session-a",
                 invocation_uuid: "invocation-a",
                 last_exit_code: Some(0),
@@ -11453,6 +15247,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             mailbox
+                .wake_sessions()
                 .try_acquire_wake_claim(WakeClaimRequest {
                     session_id: "session-a",
                     claim_token: "token-a",

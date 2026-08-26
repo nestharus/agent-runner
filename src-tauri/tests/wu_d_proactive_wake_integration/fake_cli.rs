@@ -68,13 +68,76 @@ pub(crate) fn delayed_agent_bash_provider_script(agent_bash_bin: &Path) -> Strin
         &format!(
             r#"runner="${{AGENT_BASH_AGENT_RUNNER_BIN:?missing}}"
 owner_invocation="$(python3 -c 'import json, os; print(json.loads(os.environ["OULIPOLY_PARENT_INVOCATION"])["id"])')"
-AGENT_BASH_OWNER_SESSION_ID="$session" \
-AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
-AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
-{agent_bash_bin} run --completion-scope tree --delivery async -- \
-  bash -lc '( sleep 1; printf nested-tree-complete ) &' \
-  > "$work/agent-bash-dispatch.json" \
-  2> "$work/agent-bash-dispatch.err""#,
+writer_ready="$work/pid-sidecar-writer-ready"
+python3 - "$XDG_DATA_HOME/oulipoly-agent-runner/pid-identity.db" "$owner_invocation" "$writer_ready" <<'PY' &
+import sqlite3
+import sys
+import time
+
+path, owner_invocation, ready = sys.argv[1:]
+connection = sqlite3.connect(path, timeout=0.1)
+admission_deadline = time.monotonic() + 5
+revision = 0
+while True:
+    try:
+        cursor = connection.execute(
+            "UPDATE pid_identity SET recorded_at = ? WHERE invocation_uuid = ?",
+            ("owner-lookup-admission", owner_invocation),
+        )
+        connection.commit()
+    except sqlite3.OperationalError as error:
+        connection.rollback()
+        if "locked" not in str(error).lower() or time.monotonic() >= admission_deadline:
+            raise
+        time.sleep(0.01)
+        continue
+    if cursor.rowcount == 1:
+        break
+    if time.monotonic() >= admission_deadline:
+        raise RuntimeError("owner identity did not appear before write burst")
+    time.sleep(0.01)
+
+open(ready, "w", encoding="utf-8").close()
+deadline = time.monotonic() + 1
+while time.monotonic() < deadline:
+    try:
+        cursor = connection.execute(
+            "UPDATE pid_identity SET recorded_at = ? WHERE invocation_uuid = ?",
+            ("owner-lookup-burst-" + str(revision), owner_invocation),
+        )
+        connection.commit()
+    except sqlite3.OperationalError as error:
+        connection.rollback()
+        if "locked" not in str(error).lower():
+            raise
+        time.sleep(0.001)
+        continue
+    if cursor.rowcount != 1:
+        raise RuntimeError("owner identity disappeared during write burst")
+    revision += 1
+PY
+writer_pid=$!
+for _ in $(seq 1 200); do
+  [ -e "$writer_ready" ] && break
+  sleep 0.01
+done
+[ -e "$writer_ready" ]
+if AGENT_BASH_OWNER_SESSION_ID="$session" \
+   AGENT_BASH_OWNER_INVOCATION_UUID="$owner_invocation" \
+   AGENT_BASH_AGENT_RUNNER_BIN="$runner" \
+   {agent_bash_bin} run --completion-scope tree --delivery async -- \
+     bash -lc '( sleep 1; printf nested-tree-complete ) &' \
+     > "$work/agent-bash-dispatch.json" \
+     2> "$work/agent-bash-dispatch.err"; then
+  :
+else
+  rc=$?
+  cat "$work/agent-bash-dispatch.err" >&2
+  wait "$writer_pid" || true
+  exit "$rc"
+fi
+wait "$writer_pid"
+"#,
         ),
         "",
         "acr329-resumed-input.txt",

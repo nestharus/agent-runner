@@ -148,12 +148,18 @@ fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
             VALUES
                 ('p', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z', 0),
                 ('already-high', 0.20, '2026-04-28T00:00:00Z', 3, '2026-04-21T00:00:00Z', 4);
-            INSERT INTO provider_quota_windows
-                (provider_name, window_id, used_percent, resets_at)
-            VALUES
-                ('p', 0, 0.20, '2026-04-22T00:00:00Z'),
-                ('p', 1, 0.30, '2026-04-28T00:00:00Z'),
-                ('already-high', 0, 0.20, '2026-04-22T00:00:00Z');",
+             INSERT INTO provider_quota_windows
+                 (provider_name, window_id, used_percent, resets_at)
+             VALUES
+                 ('p', 0, 0.20, '2026-04-22T00:00:00Z'),
+                 ('p', 1, 0.30, '2026-04-28T00:00:00Z'),
+                 ('already-high', 0, 0.20, '2026-04-22T00:00:00Z');
+             CREATE TABLE topology_update_audit (provider_name TEXT NOT NULL);
+             CREATE TRIGGER audit_topology_update
+             AFTER UPDATE OF topology_peak_live_window_count ON provider_quotas
+             BEGIN
+                 INSERT INTO topology_update_audit (provider_name) VALUES (NEW.provider_name);
+             END;",
         )
         .unwrap();
     mark_current_schema_version(&conn);
@@ -176,6 +182,56 @@ fn provider_quotas_topology_backfill_recovers_when_column_already_exists() {
         4,
         "schema repair must not lower a previously learned topology peak"
     );
+    drop(db);
+    let audit = sqlite::Connection::open(&path).unwrap();
+    let touched = audit
+        .prepare("SELECT provider_name FROM topology_update_audit ORDER BY provider_name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(touched, vec!["p"]);
+}
+
+#[test]
+fn provider_quotas_topology_backfill_does_not_request_writer_when_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let setup = sqlite::Connection::open(&path).unwrap();
+    setup
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE provider_quotas (
+                 provider_name TEXT PRIMARY KEY,
+                 topology_peak_live_window_count INTEGER NOT NULL DEFAULT 0,
+                 last_topology_probe_at TEXT
+             );
+             CREATE TABLE provider_quota_windows (
+                 provider_name TEXT NOT NULL,
+                 window_id INTEGER NOT NULL,
+                 PRIMARY KEY (provider_name, window_id)
+             );
+             INSERT INTO provider_quotas
+                 (provider_name, topology_peak_live_window_count)
+             VALUES ('p', 1);
+             INSERT INTO provider_quota_windows (provider_name, window_id)
+             VALUES ('p', 0);",
+        )
+        .unwrap();
+    drop(setup);
+
+    let blocker = sqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let candidate = sqlite::Connection::open(&path).unwrap();
+    candidate
+        .busy_timeout(std::time::Duration::from_millis(50))
+        .unwrap();
+
+    let result = StateDb::ensure_provider_quotas_topology_schema(&candidate);
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    result.expect("current topology repair must not acquire the SQLite writer");
 }
 
 #[test]

@@ -36,7 +36,7 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
     fixture.write_provider(&delayed_agent_bash_provider_script(&agent_bash_bin()));
 
     let initial = fixture.run_agent("dispatch delayed nested work");
-    assert_exit_code_zero(&initial);
+    assert_delayed_dispatch_exit_code_zero(&fixture, &initial);
     assert_eq!(invocation_count(&fixture), 2);
 
     let handle = dispatch_handle(&fixture, "agent-bash-dispatch.json");
@@ -45,6 +45,16 @@ pub(crate) fn delayed_agent_bash_completion_wakes_inactive_headless_parent_once(
     let session_id = wait_for_sidecar_session(&fixture, "mailbox");
     wait_for_automatic_delivery(&fixture, &session_id, 1);
     assert_delayed_completion_outcome(&fixture, &session_id, &handle);
+}
+
+fn assert_delayed_dispatch_exit_code_zero(fixture: &Fixture, output: &Output) {
+    let dispatch_error = std::fs::read_to_string(fixture.prompt_file("agent-bash-dispatch.err"))
+        .unwrap_or_else(|error| format!("unavailable: {error}"));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{output:?}; agent-bash dispatch stderr: {dispatch_error}"
+    );
 }
 
 pub(crate) fn polled_completion_after_enqueue_does_not_wake_parent() {
@@ -178,10 +188,8 @@ fn assert_late_consumed_completion_outcome(fixture: &Fixture, session_id: &str, 
     );
     let stderr = String::from_utf8_lossy(&initial.stderr);
     assert!(
-        stderr.contains(&format!(
-            "late_consumed_completion_acknowledged session_id={session_id}"
-        )),
-        "missing late-consumption acknowledgement in stderr: {stderr}"
+        !stderr.contains("late_consumed_completion_acknowledged"),
+        "internal late-consumption acknowledgement leaked to stderr: {stderr}"
     );
     assert_eq!(invocation_count(fixture), 2);
     assert_prompt_file_missing(fixture, "late-consumed-resumed-input.txt");
@@ -242,8 +250,14 @@ fn automatic_delivery_settled(fixture: &Fixture, session_id: &str, expected_len:
 
 fn panic_automatic_delivery_timeout(fixture: &Fixture, session_id: &str) -> ! {
     let rows = fixture.mailbox().list_mailbox(session_id, true);
-    let claim = fixture.mailbox().wake_claim(session_id);
-    let runtime = fixture.mailbox().session_runtime(session_id);
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(session_id);
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(session_id);
     panic!(
         "{}",
         format_automatic_delivery_timeout(&rows, &claim, &runtime)
@@ -353,7 +367,12 @@ fn assert_failed_delivery(fixture: &Fixture, invocation_id: &str) {
     );
     assert_eq!(rows[0].delivery_attempts, 1);
     assert!(rows[0].delivery_error.is_none());
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.run_state, "idle");
     assert_eq!(runtime.last_exit_code, Some(0));
     assert_no_wake_claim(fixture, SESSION);

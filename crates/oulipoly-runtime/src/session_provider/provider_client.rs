@@ -1,6 +1,6 @@
 use super::types::{SessionProviderError, SessionProviderIdentity};
 use crate::provider_registry::{ProviderRegistry, ProviderRegistryError};
-use oulipoly_provider::client::ProviderClient;
+use oulipoly_provider::client::{CancellationToken, ProviderClient};
 use oulipoly_provider::error::ProviderClientError;
 use oulipoly_provider::generated::DescribeResult;
 use serde_json::Value;
@@ -9,9 +9,35 @@ pub(super) fn session_client(
     registry: &ProviderRegistry,
     identity: &SessionProviderIdentity,
 ) -> Result<ProviderClient, SessionProviderError> {
-    let describe = describe_session_provider(registry, identity)?;
+    session_client_inner(registry, identity, None)
+}
+
+pub(super) fn session_client_with_cancellation(
+    registry: &ProviderRegistry,
+    identity: &SessionProviderIdentity,
+    cancellation: &CancellationToken,
+) -> Result<ProviderClient, SessionProviderError> {
+    session_client_inner(registry, identity, Some(cancellation))
+}
+
+fn session_client_inner(
+    registry: &ProviderRegistry,
+    identity: &SessionProviderIdentity,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ProviderClient, SessionProviderError> {
+    let describe = match cancellation {
+        Some(cancellation) => registry.describe_model_provider_instance_with_cancellation(
+            &identity.model_name,
+            &identity.provider_name,
+            cancellation,
+        ),
+        None => {
+            registry.describe_model_provider_instance(&identity.model_name, &identity.provider_name)
+        }
+    }
+    .map_err(map_registry_error)?;
     require_session_capability(&describe)?;
-    enabled_provider_instance_client(registry, identity)
+    enabled_provider_instance_client(registry, identity, cancellation)
 }
 
 pub(super) fn session_enumerate_client(
@@ -21,7 +47,7 @@ pub(super) fn session_enumerate_client(
     let describe = describe_session_provider(registry, identity)?;
     require_session_capability(&describe)?;
     require_session_enumerate_capability(&describe)?;
-    enabled_provider_instance_client(registry, identity)
+    enabled_provider_instance_client(registry, identity, None)
 }
 
 fn describe_session_provider(
@@ -60,11 +86,17 @@ fn require_session_enumerate_capability(
 fn enabled_provider_instance_client(
     registry: &ProviderRegistry,
     identity: &SessionProviderIdentity,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ProviderClient, SessionProviderError> {
     let artifact = registry
         .enabled_artifact_for_model_provider(&identity.model_name, &identity.provider_name)
         .map_err(map_registry_error)?;
-    Ok(registry.client_factory().client_for(artifact))
+    Ok(match cancellation {
+        Some(cancellation) => registry
+            .client_factory()
+            .client_for_with_cancellation(artifact, cancellation),
+        None => registry.client_factory().client_for(artifact),
+    })
 }
 
 pub(super) fn provider_client(

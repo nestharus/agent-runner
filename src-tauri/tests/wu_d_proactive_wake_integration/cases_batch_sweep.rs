@@ -7,7 +7,7 @@
 use crate::fake_cli::provider_script;
 use crate::fixtures::Fixture;
 use crate::liveness::{
-    assert_dead_owner_debris_reaped, delivered_rows_without_pending_or_claim,
+    assert_dead_owner_debris_retained, delivered_rows_without_pending_or_claim,
     delivered_single_row_without_error_or_claim, settle_wake_sweep, wait_for_file, wait_until,
 };
 use crate::test_guard::integration_test_guard;
@@ -73,7 +73,8 @@ fn assert_one_failed_delivery(fixture: &Fixture, session_id: &str) {
     assert_age270_invocation(fixture, invocation_id);
     let runtime = fixture
         .mailbox()
-        .session_runtime(session_id)
+        .wake_session_reader()
+        .legacy_runtime_projection(session_id)
         .unwrap()
         .unwrap();
     assert_eq!(runtime.run_state, "idle");
@@ -170,7 +171,7 @@ pub(crate) fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
+pub(crate) fn wake_sweep_retains_non_resumable_abandoned_transient_session() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script(
@@ -180,7 +181,8 @@ pub(crate) fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
     ));
     // Idle headless runtime with a dead-owner pending row, but NO session turn /
     // chain -> no durable resume evidence. The session is never auto-woken
-    // (anti-resurrection) and, being non-resumable, its undeliverable row is reaped.
+    // (anti-resurrection), but automatic terminal reap is withheld because the
+    // sweep cannot fence State and mailbox authority atomically.
     fixture.seed_idle_runtime();
     fixture.seed_mailbox(SESSION, "h-non-resumable-transient");
 
@@ -189,18 +191,18 @@ pub(crate) fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
     settle_wake_sweep();
 
     assert_prompt_file_missing(&fixture, "non-resumable-transient-resumed.txt");
-    assert_dead_owner_debris_reaped(&fixture, SESSION);
+    assert_dead_owner_debris_retained(&fixture, SESSION);
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
 
-pub(crate) fn wake_sweep_reaps_dead_owner_session_with_chain_but_no_turns() {
+pub(crate) fn wake_sweep_retains_dead_owner_session_with_chain_but_no_turns() {
     let _guard = integration_test_guard();
     let fixture = Fixture::new();
     fixture.write_provider(&provider_script("", "", "chain-no-turns-resumed.txt"));
     // A registered chain segment with ZERO produced turns is an empty resume
-    // target, not durable work. With a dead owner, it must be reaped (not
-    // preserved as if resumable) and never auto-woken.
+    // target, not durable work. With a dead owner it is never auto-woken, but
+    // remains pending for an explicitly fenced operator disposition.
     fixture.seed_active_chain_for(
         "33333333-3333-4333-8333-333333333333",
         PROVIDER,
@@ -215,7 +217,7 @@ pub(crate) fn wake_sweep_reaps_dead_owner_session_with_chain_but_no_turns() {
     settle_wake_sweep();
 
     assert_prompt_file_missing(&fixture, "chain-no-turns-resumed.txt");
-    assert_dead_owner_debris_reaped(&fixture, SESSION);
+    assert_dead_owner_debris_retained(&fixture, SESSION);
     assert_no_wake_claim(&fixture, SESSION);
     assert_xdg_isolated(&fixture);
 }
@@ -327,7 +329,12 @@ pub(crate) fn environment_empty_sweep_uses_persisted_wake_max_beyond_five() {
     wait_until("persisted-max sweep delivery", || {
         delivered_single_row_without_error_or_claim(&fixture, SESSION)
     });
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.selected_auto_wake_max, Some(32));
     assert_eq!(runtime.auto_wake_count, 6);
     assert_one_failed_delivery(&fixture, SESSION);
@@ -425,7 +432,12 @@ fi"#,
         .unwrap()
         .parse::<i64>()
         .unwrap();
-    let claim = fixture.mailbox().wake_claim(SESSION).unwrap().unwrap();
+    let claim = fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.claim_token, renewed_token);
     assert_ne!(claim.claim_token, old_token);
     assert_eq!(claim.wake_pid, Some(renewed_pid));
@@ -532,7 +544,12 @@ pub(crate) fn persisted_wake_max_caps_sweep_at_selected_value() {
 
     assert_prompt_file_missing(&fixture, "sweep-cap-should-not-run.txt");
     assert_pending_mailbox_count(&fixture, SESSION, 1);
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.selected_auto_wake_max, Some(32));
     assert_eq!(runtime.auto_wake_count, 32);
     assert_xdg_isolated(&fixture);
