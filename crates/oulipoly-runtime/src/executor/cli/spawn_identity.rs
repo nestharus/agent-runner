@@ -14,15 +14,17 @@ use oulipoly_state::mailbox::{
     DrainRequestResult, ExactProcessEvidence, ExitRuntimeGenerationNonOrderly,
     FinishRuntimeGenerationDrain, GenerationMutation, MailboxDb, RequestRuntimeGenerationDrain,
     RuntimeGenerationFence, RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
-    SessionRuntimeRunningUpdate,
 };
 use oulipoly_state::pid_identity::{
     self, ProcessIdentity, ProcessIdentityObservation, observe_live_process_identity,
 };
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::time::{Duration, Instant};
 
 const AUTO_WAKE_ENV: &str = "OULIPOLY_AUTO_WAKE";
 const PARENT_INVOCATION_ENV: &str = "OULIPOLY_PARENT_INVOCATION";
+const CHILD_CUSTODY_TEST_FAULT_ENV: &str = "OULIPOLY_CHILD_CUSTODY_TEST_FAULT";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnRuntimeMode {
@@ -129,7 +131,9 @@ pub(crate) fn split_invocation_launch_environment(
         })
         .transpose()?;
     let identity = if authority.is_some() {
-        serde_json::to_string(&parsed).map_err(|error| {
+        let invocation = serde_json::from_value::<CompositeInvocationId>(parsed)
+            .map_err(|error| format!("Invalid invocation identity environment: {error}"))?;
+        serde_json::to_string(&invocation).map_err(|error| {
             format!("Failed to serialize invocation identity environment: {error}")
         })?
     } else {
@@ -208,7 +212,218 @@ impl SpawnIdentityContext {
 pub(crate) struct RunningRuntimeGeneration {
     pub generation_id: RuntimeGenerationId,
     pub spawned_os_pid: i64,
-    pub exact_process_identity: Option<ProcessIdentity>,
+    pub exact_process_identity: ProcessIdentity,
+}
+
+pub(crate) struct ChildGenerationCustody<'a> {
+    child: Option<Child>,
+    context: Option<&'a SpawnIdentityContext>,
+    #[cfg(unix)]
+    signal_guard: Option<super::terminal_signal::InteractiveSignalGuard>,
+    exit_observed: bool,
+    generation_completed: bool,
+}
+
+impl<'a> ChildGenerationCustody<'a> {
+    pub(crate) fn new(
+        child: Child,
+        context: Option<&'a SpawnIdentityContext>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            child: Some(child),
+            context,
+            #[cfg(unix)]
+            signal_guard: None,
+            exit_observed: false,
+            generation_completed: false,
+        })
+    }
+
+    pub(crate) fn child(&self) -> &Child {
+        self.child.as_ref().expect("child custody is armed")
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("child custody is armed")
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn install_signal_forwarding(&mut self) -> Result<(), String> {
+        self.signal_guard = Some(
+            super::terminal_signal::InteractiveSignalGuard::install_process_group(
+                self.child().id(),
+            )?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        #[cfg(unix)]
+        {
+            if !exact_generation_exit_pending(self.child())? {
+                return Ok(None);
+            }
+            self.signal_guard.take();
+            let child = self.child.as_mut().expect("child custody is armed");
+            // WNOWAIT keeps the exact leader unreaped while descendants are cleaned.
+            let status = terminate_and_reap_exact_generation(child)?;
+            self.exit_observed = true;
+            Ok(Some(status))
+        }
+        #[cfg(not(unix))]
+        {
+            let status = self.child_mut().try_wait()?;
+            if status.is_some() {
+                self.exit_observed = true;
+            }
+            Ok(status)
+        }
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub(crate) fn terminate_and_wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        self.signal_guard.take();
+        let status = terminate_and_reap_exact_generation(self.child_mut())?;
+        self.exit_observed = true;
+        Ok(status)
+    }
+
+    pub(crate) fn observe_exit(&mut self) -> Result<(), String> {
+        self.exit_observed = true;
+        Ok(())
+    }
+
+    pub(crate) fn complete_orderly(
+        mut self,
+        exit_code: Option<i32>,
+        compatibility_exit_code: Option<i32>,
+    ) -> Result<(), String> {
+        if !self.exit_observed {
+            return Err("Cannot complete child generation before observing exit".to_string());
+        }
+        mark_runtime_generation_orderly_completed(
+            self.context,
+            exit_code,
+            compatibility_exit_code,
+        )?;
+        self.generation_completed = true;
+        #[cfg(unix)]
+        self.signal_guard.take();
+        self.child.take();
+        Ok(())
+    }
+}
+
+fn signal_owned_generation(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    {
+        let process_group = child.id() as libc::pid_t;
+        if unsafe { libc::killpg(process_group, libc::SIGKILL) } == 0 {
+            return;
+        }
+    }
+    let _ = child.kill();
+}
+
+trait ExactGenerationFinalizer {
+    type Exit;
+
+    fn terminate_owned_generation(&mut self);
+    fn reap_exact_leader(&mut self) -> std::io::Result<Self::Exit>;
+}
+
+impl ExactGenerationFinalizer for Child {
+    type Exit = std::process::ExitStatus;
+
+    fn terminate_owned_generation(&mut self) {
+        signal_owned_generation(self);
+    }
+
+    fn reap_exact_leader(&mut self) -> std::io::Result<Self::Exit> {
+        self.wait()
+    }
+}
+
+fn terminate_and_reap_exact_generation<T: ExactGenerationFinalizer>(
+    generation: &mut T,
+) -> std::io::Result<T::Exit> {
+    generation.terminate_owned_generation();
+    generation.reap_exact_leader()
+}
+
+impl Drop for ChildGenerationCustody<'_> {
+    fn drop(&mut self) {
+        let mut observed_exit_code = None;
+        #[cfg(unix)]
+        self.signal_guard.take();
+        if let Some(child) = self.child.as_mut() {
+            if !self.exit_observed {
+                if let Ok(status) = terminate_and_reap_exact_generation(child) {
+                    observed_exit_code = status.code();
+                    self.exit_observed = true;
+                }
+            } else if let Ok(status) = child.wait() {
+                observed_exit_code = status.code();
+                self.exit_observed = true;
+            }
+        }
+        if !self.generation_completed {
+            let _ = mark_runtime_generation_exited(self.context, observed_exit_code);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn exact_generation_exit_pending(child: &Child) -> std::io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+pub(crate) fn child_custody_test_fault(site: &str) -> Result<(), String> {
+    if std::env::var(CHILD_CUSTODY_TEST_FAULT_ENV).ok().as_deref() == Some(site) {
+        wait_for_child_custody_test_ready()?;
+        return Err(format!("injected child custody failure at {site}"));
+    }
+    Ok(())
+}
+
+fn wait_for_child_custody_test_ready() -> Result<(), String> {
+    let Some(path) = std::env::var_os("OULIPOLY_CHILD_CUSTODY_TEST_READY_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if path.is_file() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(format!(
+        "timed out waiting for child custody test readiness at {}",
+        path.display()
+    ))
 }
 
 pub(crate) fn register_runtime_generation_starting(
@@ -220,6 +435,7 @@ pub(crate) fn register_runtime_generation_starting(
     let mut db = context.open_mailbox()?;
     recover_stale_session_generations(&mut db, context)?;
     match db
+        .runtime_lifecycle()
         .create_runtime_generation(CreateRuntimeGeneration {
             generation_id: &context.generation_id,
             spawn_invocation_uuid: &context.invocation_uuid,
@@ -248,13 +464,19 @@ fn recover_stale_session_generations(
         return Ok(());
     };
     let generations = db
+        .runtime_lifecycle_reader()
         .runtime_generation_history(session_id)
         .map_err(|err| err.to_string())?;
     for generation in generations {
         if generation.lifecycle_state == RuntimeLifecycleState::Exited {
             continue;
         }
-        let ExactProcessEvidence::Recorded(identity) = &generation.exact_process_evidence else {
+        let liveness_evidence = if generation.lifecycle_state == RuntimeLifecycleState::Starting {
+            &generation.creator_process_evidence
+        } else {
+            &generation.exact_process_evidence
+        };
+        let ExactProcessEvidence::Recorded(identity) = liveness_evidence else {
             continue;
         };
         let stale = match observe_live_process_identity(identity.os_pid) {
@@ -268,6 +490,7 @@ fn recover_stale_session_generations(
             continue;
         }
         let mutation = db
+            .runtime_lifecycle()
             .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
                 fence: RuntimeGenerationFence {
                     generation_id: &generation.generation_id,
@@ -283,7 +506,6 @@ fn recover_stale_session_generations(
             ));
         }
     }
-    let _ = db.session_liveness(session_id)?;
     Ok(())
 }
 
@@ -294,31 +516,32 @@ pub(crate) fn record_child_identity(
     let Some(context) = context else {
         return Ok(None);
     };
+    child_custody_test_fault("identity_capture")?;
     let os_pid = i64::from(child_id);
     let exact_process_identity = match pid_identity::read_live_process_identity(os_pid) {
-        Ok(identity) => identity,
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            let err = format!("Spawned child process {os_pid} is not live during identity binding");
+            warn_child_identity_record_failed(context, child_id, &err);
+            return Err(err);
+        }
         Err(err) => {
             warn_child_identity_record_failed(context, child_id, &err);
-            None
+            return Err(err);
         }
     };
     let mut db = context.open_mailbox()?;
     let mutation = db
+        .runtime_lifecycle()
         .bind_runtime_generation_running(BindRuntimeGenerationRunning {
             fence: generation_fence(context),
             spawned_os_pid: os_pid,
-            exact_process_identity: exact_process_identity.as_ref(),
+            exact_process_identity: &exact_process_identity,
             os_pgid: None,
         })
         .map_err(|err| err.to_string())?;
     match mutation {
         GenerationMutation::Applied(_) | GenerationMutation::AlreadyApplied(_) => {
-            if let (Some(session_id), Some(identity)) = (
-                context.session_id.as_deref(),
-                exact_process_identity.as_ref(),
-            ) {
-                mark_session_running_with_session_id(context, session_id, identity);
-            }
             Ok(Some(RunningRuntimeGeneration {
                 generation_id: context.generation_id.clone(),
                 spawned_os_pid: os_pid,
@@ -344,6 +567,7 @@ pub(crate) fn backfill_captured_session_id(
     }
     let mut db = context.open_mailbox()?;
     match db
+        .runtime_lifecycle()
         .attach_runtime_generation_session(AttachRuntimeGenerationSession {
             fence: generation_fence(context),
             session_id,
@@ -357,9 +581,6 @@ pub(crate) fn backfill_captured_session_id(
             ));
         }
     }
-    if let Some(identity) = generation.exact_process_identity.as_ref() {
-        mark_session_running_with_session_id(context, session_id, identity);
-    }
     Ok(())
 }
 
@@ -369,21 +590,6 @@ fn warn_child_identity_record_failed(context: &SpawnIdentityContext, child_id: u
         child_pid = child_id,
         "Failed to record PID identity sidecar row: {err}"
     );
-}
-
-fn mark_session_running_with_session_id(
-    context: &SpawnIdentityContext,
-    session_id: &str,
-    identity: &ProcessIdentity,
-) {
-    match context.open_mailbox().and_then(|mut db| {
-        db.mark_session_running(session_runtime_running_update(
-            context, session_id, identity,
-        ))
-    }) {
-        Ok(()) => {}
-        Err(err) => warn_mark_session_running_failed(context, session_id, &err),
-    }
 }
 
 pub(crate) fn mark_runtime_generation_spawn_failed(
@@ -406,6 +612,7 @@ pub(crate) fn mark_runtime_generation_exited(
 pub(crate) fn mark_runtime_generation_orderly_completed(
     context: Option<&SpawnIdentityContext>,
     exit_code: Option<i32>,
+    compatibility_exit_code: Option<i32>,
 ) -> Result<(), String> {
     let Some(context) = context else {
         return Ok(());
@@ -413,6 +620,7 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
     let drain_request_id = DrainRequestId::new();
     let mut db = context.open_mailbox()?;
     let handoff = match db
+        .runtime_lifecycle()
         .request_runtime_generation_drain(RequestRuntimeGenerationDrain {
             fence: generation_fence(context),
             drain_request_id: &drain_request_id,
@@ -437,6 +645,7 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
         );
     }
     match db
+        .runtime_lifecycle()
         .advance_runtime_generation_drain(AdvanceRuntimeGenerationDrain {
             fence: generation_fence(context),
             drain_request_id: &drain_request_id,
@@ -460,10 +669,12 @@ pub(crate) fn mark_runtime_generation_orderly_completed(
         }
     }
     match db
+        .runtime_lifecycle()
         .finish_runtime_generation_drain(FinishRuntimeGenerationDrain {
             fence: generation_fence(context),
             drain_request_id: &drain_request_id,
             exit_code,
+            compatibility_exit_code,
         })
         .map_err(|err| err.to_string())?
     {
@@ -487,6 +698,7 @@ fn exit_runtime_generation(
     };
     let mut db = context.open_mailbox()?;
     match db
+        .runtime_lifecycle()
         .exit_runtime_generation_non_orderly(ExitRuntimeGenerationNonOrderly {
             fence: generation_fence(context),
             reason,
@@ -508,40 +720,13 @@ fn generation_fence(context: &SpawnIdentityContext) -> RuntimeGenerationFence<'_
     }
 }
 
-fn session_runtime_running_update<'a>(
-    context: &'a SpawnIdentityContext,
-    session_id: &'a str,
-    identity: &'a ProcessIdentity,
-) -> SessionRuntimeRunningUpdate<'a> {
-    SessionRuntimeRunningUpdate {
-        session_id,
-        mode: context.mode.as_str(),
-        invocation_uuid: &context.invocation_uuid,
-        provider_name: Some(&context.provider_name),
-        model_name: context.model_name.as_deref(),
-        identity,
-        pty_control_path: context.pty_control_path.as_deref(),
-        turn_start_max_mailbox_seq: None,
-        models_dir: context.models_dir.as_deref(),
-        effective_cwd: context.effective_cwd.as_deref(),
-    }
-}
-
-fn warn_mark_session_running_failed(context: &SpawnIdentityContext, session_id: &str, err: &str) {
-    tracing::warn!(
-        invocation_uuid = %context.invocation_uuid,
-        session_id,
-        "Failed to mark session runtime running: {err}"
-    );
-}
-
 fn parse_invocation_env_silent(value: &str) -> Option<CompositeInvocationId> {
     CompositeInvocationId::parse_env_value(value).ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::provider_parent_invocation_env_for;
+    use super::*;
 
     const CURRENT: &str = r#"{"source":"opencode3","id":"11111111-1111-4111-8111-111111111111"}"#;
     const OWNER: &str = r#"{"source":"opencode3","id":"22222222-2222-4222-8222-222222222222"}"#;
@@ -567,6 +752,103 @@ mod tests {
         assert_eq!(
             provider_parent_invocation_env_for(Some(CURRENT), true, Some("not-json")).as_deref(),
             Some(CURRENT)
+        );
+    }
+
+    #[test]
+    fn failed_child_identity_binding_never_commits_identityless_running_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let sidecar_path = directory.path().join("pid-identity.db");
+        let context = context_from_parent_invocation_env(
+            Some(CURRENT),
+            "provider-a",
+            Some("model-a"),
+            Some("session-a"),
+            SpawnRuntimeMode::Headless,
+            None,
+            None,
+        )
+        .unwrap()
+        .with_mailbox_db_path(sidecar_path.clone());
+        register_runtime_generation_starting(Some(&context)).unwrap();
+
+        let mut dead_child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dead_child_id = dead_child.id();
+        dead_child.wait().unwrap();
+        assert!(record_child_identity(dead_child_id, Some(&context)).is_err());
+
+        let db = MailboxDb::open(&sidecar_path).unwrap();
+        let starting = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(starting.lifecycle_state, RuntimeLifecycleState::Starting);
+        assert_eq!(
+            starting.exact_process_evidence,
+            ExactProcessEvidence::NotRecorded
+        );
+        drop(db);
+
+        mark_runtime_generation_exited(Some(&context), None).unwrap();
+        let db = MailboxDb::open(&sidecar_path).unwrap();
+        let exited = db
+            .runtime_lifecycle_reader()
+            .runtime_generation(&context.generation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exited.lifecycle_state, RuntimeLifecycleState::Exited);
+        assert_eq!(
+            exited.terminal_reason,
+            Some(RuntimeTerminalReason::AbnormalTermination)
+        );
+    }
+
+    #[test]
+    fn exact_generation_finalizer_never_signals_after_reap_and_target_substitution() {
+        #[derive(Default)]
+        struct SubstitutingFinalizer {
+            reaped: bool,
+            foreign_target_substituted: bool,
+            events: Vec<&'static str>,
+        }
+
+        impl ExactGenerationFinalizer for SubstitutingFinalizer {
+            type Exit = ();
+
+            fn terminate_owned_generation(&mut self) {
+                assert!(
+                    !self.reaped,
+                    "numeric target was signaled after leader reap"
+                );
+                assert!(!self.foreign_target_substituted);
+                self.events.push("terminate_exact_generation");
+            }
+
+            fn reap_exact_leader(&mut self) -> std::io::Result<Self::Exit> {
+                self.reaped = true;
+                self.foreign_target_substituted = true;
+                self.events.push("reap_and_substitute_foreign_target");
+                Ok(())
+            }
+        }
+
+        let mut finalizer = SubstitutingFinalizer::default();
+        terminate_and_reap_exact_generation(&mut finalizer).unwrap();
+
+        assert!(finalizer.reaped);
+        assert!(finalizer.foreign_target_substituted);
+        assert_eq!(
+            finalizer.events,
+            [
+                "terminate_exact_generation",
+                "reap_and_substitute_foreign_target"
+            ]
         );
     }
 }

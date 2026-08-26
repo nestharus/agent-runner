@@ -499,6 +499,10 @@ fn execute_balanced_attempt(
     extra_inputs: &HashMap<String, Vec<String>>,
     attempt: &mut BalancedInvocationAttempt<'_>,
 ) -> Result<executor::ExecutionResult, String> {
+    let _admission = crate::wake_coordinator::admit_session_launch(
+        &attempt.invocation.id,
+        attempt.start_known_provider_session_id.as_deref(),
+    )?;
     let executor_request = super::mapper::balanced_executor_request_for_attempt(
         (model, provider, provider_index, prompt_mode),
         (prompt, working_dir, &env.models_dir, extra_inputs),

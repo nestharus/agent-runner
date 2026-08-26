@@ -82,20 +82,7 @@ impl StateDb {
                         AND completion_registration_capability_digest NOT GLOB '*[^0-9a-f]*'
                     )
                 )
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_invocations_uuid
-            ON invocations (invocation_uuid);
-        CREATE INDEX IF NOT EXISTS idx_invocations_parent
-            ON invocations (parent_invocation_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_created
-            ON invocations (provider_name, created_at);
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_session
-            ON invocations (provider_name, session_id)
-            WHERE session_id IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_invocations_provider_provider_session
-            ON invocations (provider_name, provider_index, provider_session_id)
-            WHERE provider_session_id IS NOT NULL;",
+        );",
             invocation_returned_artifacts_schema_sql!()
         )
     }

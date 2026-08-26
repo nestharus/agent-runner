@@ -171,6 +171,13 @@ fn map_retry_notification(
     Ok(notification)
 }
 
+fn map_expired_notification(
+    session_id: &str,
+    row: &MailboxRow,
+) -> Result<SessionNotification<MailboxRow>, String> {
+    Ok(SessionNotification::new(row.seq, row.clone(), turn(session_id, row.seq)).expiring_at(10))
+}
+
 fn receive_turn(turns: &Receiver<FakeTurn>) -> FakeTurn {
     turns
         .recv_timeout(Duration::from_secs(5))
@@ -354,6 +361,49 @@ fn chain_targeted_input_is_bound_to_the_exact_recipient_session() {
             .acknowledgement(&format!("mailbox:session-a:{}", row.seq))
             .unwrap()
             .is_some()
+    );
+    owner.close(12).unwrap();
+}
+
+#[test]
+fn chain_targeted_ingress_failure_is_bound_to_the_resolved_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("state.db");
+    let mailbox_path = dir.path().join("pid-identity.db");
+    let mut mailbox = MailboxDb::open(&mailbox_path).unwrap();
+    let row = enqueue_chain_input(&mut mailbox, "chain-a", "chain-failure-token");
+    let fence = owner(1, "chain-failure");
+    let (owner, turns) = start_owner(&state_path, fence.clone(), 4);
+    let mut ingress = SessionMailboxIngress::new(
+        "session-a",
+        Some("chain-a".to_owned()),
+        fence,
+        4,
+        mailbox,
+        StateDb::open(&state_path).unwrap(),
+        map_expired_notification,
+    )
+    .unwrap();
+
+    assert!(
+        ingress
+            .fallback_read(&owner, 11)
+            .unwrap()
+            .accepted_sequences
+            .is_empty()
+    );
+    assert!(matches!(turns.try_recv(), Err(TryRecvError::Empty)));
+    let failed = MailboxDb::open(&mailbox_path)
+        .unwrap()
+        .list_mailbox("chain-a", true)
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.seq == row.seq)
+        .unwrap();
+    assert_eq!(failed.delivery_attempts, 1);
+    assert_eq!(
+        failed.delivery_error.as_deref(),
+        Some(MAILBOX_INGRESS_EXPIRED_ERROR)
     );
     owner.close(12).unwrap();
 }

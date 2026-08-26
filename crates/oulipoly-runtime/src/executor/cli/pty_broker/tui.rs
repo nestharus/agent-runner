@@ -36,25 +36,34 @@ use super::outbound_observer::{
     ObservedUserTurn, OutboundObservation, OutboundObservationIdentity, OutboundObservationResult,
     OutboundObserverSource, OutboundObserverWorker,
 };
+#[cfg(test)]
+use super::seed_test_mailbox_delivery;
 use super::snapshot_worker::{MonitorSnapshotProvider, MonitorSnapshotWorker};
 use super::transcript_view::project_transcript_tail;
 use super::{
-    ChildOutputState, ControlSocket, INJECT_WAIT_LIMIT, InputLineState, PendingChildInput,
-    RELAY_BUFFER_BYTES, acknowledge_control_payload, flush_pending_child_input, is_pty_eof_error,
-    poll_fds, poll_master_fd, poll_relay_fds, poll_single_fd, prepare_control_payload,
-    pty_delivery_ack_message, queue_control_injection, read_control_request, read_fd, readable,
-    send_signal_to_child_group, set_pty_winsize, terminal_winsize, validate_peer_uid, winsize_eq,
-    writable, write_control_response,
+    ChildOutputState, ControlPayloadOutcome, ControlSocket, INJECT_WAIT_LIMIT, InputLineState,
+    PendingChildInput, RELAY_BUFFER_BYTES, begin_control_payload_submission,
+    flush_pending_child_input, is_pty_eof_error, poll_fds, poll_master_fd, poll_relay_fds,
+    poll_single_fd, prepare_control_payload, pty_delivery_ack_message, pty_delivery_test_fault,
+    pty_delivery_uncertain_message, queue_control_injection, read_control_request, read_fd,
+    readable, send_signal_to_child_group, set_pty_winsize, settle_control_payload,
+    submission_uncertain_outcome, terminal_winsize, validate_peer_uid, winsize_eq, writable,
+    write_control_response,
 };
+use crate::executor::cli::spawn_identity::ChildGenerationCustody;
 use crate::observability::{
     InspectRef, LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity, MonitorNode,
     MonitorNodeId, MonitorNodeKind, MonitorSnapshot, MonitorStatus, ObservabilityRoot,
 };
 #[cfg(test)]
-use crate::observability::{ObservabilitySnapshotPort, SnapshotLimits};
+use crate::observability::{
+    ObservabilitySnapshotPort, ProductionObservabilitySnapshotService, SnapshotLimits,
+};
 use base64::Engine as _;
 #[cfg(test)]
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use oulipoly_core::CancellationToken;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -67,7 +76,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, ExitStatus};
+use std::process::ExitStatus;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3691,10 +3700,6 @@ fn format_tui_terminal_init_error(err: io::Error) -> String {
     format!("Failed to initialize TUI terminal: {err}")
 }
 
-fn try_wait_child(child: &mut Child) -> io::Result<Option<ExitStatus>> {
-    child.try_wait()
-}
-
 fn format_interactive_child_poll_error(err: io::Error) -> String {
     format!("Failed to poll interactive child: {err}")
 }
@@ -4039,7 +4044,7 @@ pub(super) fn relay_until_exit_observed(
     writer: File,
     master: &File,
     control: Option<&ControlSocket>,
-    child: &mut Child,
+    custody: &mut ChildGenerationCustody<'_>,
     monitor: MonitorSnapshotProvider,
     root: ObservabilityRoot,
     outbound_source: OutboundObserverSource,
@@ -4106,7 +4111,7 @@ pub(super) fn relay_until_exit_observed(
             apply_sizing(
                 real_fd,
                 master_fd,
-                child.id(),
+                custody.child().id(),
                 &pane,
                 protection,
                 &mut parser,
@@ -4264,7 +4269,7 @@ pub(super) fn relay_until_exit_observed(
                 pending_child_input: &mut pending_child_input,
                 outbound_release_gate: &mut outbound_release_gate,
                 buffer: &mut buffer,
-                child_pid: Some(child.id()),
+                child_pid: Some(custody.child().id()),
             };
             let _ = service_control(control, &mut control_io);
             mark_render_dirty(&mut dirty, &mut priority, true, RenderPriority::Interactive);
@@ -4278,7 +4283,7 @@ pub(super) fn relay_until_exit_observed(
             apply_sizing(
                 real_fd,
                 master_fd,
-                child.id(),
+                custody.child().id(),
                 &pane,
                 protection,
                 &mut parser,
@@ -4300,7 +4305,9 @@ pub(super) fn relay_until_exit_observed(
             );
         }
         publisher.check_error()?;
-        status = try_wait_child(child).map_err(format_interactive_child_poll_error)?;
+        status = custody
+            .try_wait()
+            .map_err(format_interactive_child_poll_error)?;
     }
 
     drain_pty_output(master_fd, &mut parser, &mut buffer)?;
@@ -5645,10 +5652,15 @@ fn format_control_accept_error(err: io::Error) -> String {
     format!("Failed to accept PTY control connection: {err}")
 }
 
-fn control_response_message(response: Result<Option<String>, String>) -> (bool, String) {
+fn control_response_message(response: Result<ControlPayloadOutcome, String>) -> (bool, String) {
     match response {
-        Ok(Some(delivery_nonce)) => (true, pty_delivery_ack_message(&delivery_nonce)),
-        Ok(None) => (true, "ok".to_string()),
+        Ok(ControlPayloadOutcome::Accepted(Some(delivery_nonce))) => {
+            (true, pty_delivery_ack_message(&delivery_nonce))
+        }
+        Ok(ControlPayloadOutcome::Accepted(None)) => (true, "ok".to_string()),
+        Ok(ControlPayloadOutcome::SubmissionUncertain(delivery_nonce)) => {
+            (true, pty_delivery_uncertain_message(&delivery_nonce))
+        }
         Err(message) => (false, message),
     }
 }
@@ -5665,18 +5677,20 @@ fn inject_control_payload(
     stream: &mut UnixStream,
     io: &mut ControlInjectionIo<'_>,
     control: &ControlSocket,
-) -> Result<Option<String>, String> {
+) -> Result<ControlPayloadOutcome, String> {
     validate_control_peer(stream)?;
     let session_id = control
         .session_id()
         .ok_or_else(|| "awaiting_session_identity".to_string())?;
-    let payload = prepare_control_payload(
+    let mut payload = prepare_control_payload(
         read_tui_control_payload(stream)?,
         Some((&session_id, control.invocation_uuid())),
     )?;
     if payload.bytes.is_empty() {
-        acknowledge_control_payload(&payload)?;
-        return Ok(payload.delivery_attempt_id);
+        if payload.submission_uncertain {
+            return Ok(submission_uncertain_outcome(&payload));
+        }
+        return settle_control_payload(&payload);
     }
     validate_control_input_ready(
         io.parser.screen().bracketed_paste(),
@@ -5684,9 +5698,16 @@ fn inject_control_payload(
         control.age(),
     )?;
     let bracketed_paste = io.parser.screen().bracketed_paste();
-    submit_control_payload(io, &payload.bytes, bracketed_paste)?;
-    acknowledge_control_payload(&payload)?;
-    Ok(payload.delivery_attempt_id)
+    pty_delivery_test_fault("tui_pre_submission")?;
+    begin_control_payload_submission(&mut payload)?;
+    if let Err(error) = submit_control_payload(io, &payload.bytes, bracketed_paste) {
+        return if payload.submission_started {
+            Ok(submission_uncertain_outcome(&payload))
+        } else {
+            Err(error)
+        };
+    }
+    settle_control_payload(&payload)
 }
 
 fn validate_control_input_ready(
@@ -5745,6 +5766,7 @@ fn drain_control_payload(
     io: &mut ControlInjectionIo<'_>,
     phase: ControlSubmitDrainPhase,
 ) -> Result<(), String> {
+    pty_delivery_test_fault(&format!("tui_{}_drain", phase.token()))?;
     let start = Instant::now();
     while !io.pending_child_input.is_empty() {
         if start.elapsed() >= INJECT_WAIT_LIMIT {
@@ -5821,7 +5843,10 @@ fn child_input_for_real_read(forward: &[u8]) -> Vec<u8> {
 mod tests {
     use super::super::{PtyPair, configure_child_pty};
     use super::*;
+    use oulipoly_state::mailbox::MailboxDb;
+    use oulipoly_state::{InvocationStart, StateDb};
     use ratatui::backend::TestBackend;
+    use std::ffi::OsString;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::FromRawFd;
     use std::process::Command;
@@ -5829,6 +5854,54 @@ mod tests {
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    struct DataDirOverride {
+        prior: Option<OsString>,
+    }
+
+    impl DataDirOverride {
+        fn install(path: &std::path::Path) -> Self {
+            let prior = std::env::var_os("OULIPOLY_DATA_DIR");
+            unsafe {
+                std::env::set_var("OULIPOLY_DATA_DIR", path);
+            }
+            Self { prior }
+        }
+    }
+
+    impl Drop for DataDirOverride {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prior.as_ref() {
+                    Some(value) => std::env::set_var("OULIPOLY_DATA_DIR", value),
+                    None => std::env::remove_var("OULIPOLY_DATA_DIR"),
+                }
+            }
+        }
+    }
+
+    fn start_monitor_invocation(
+        state: &StateDb,
+        invocation_uuid: &str,
+        parent_invocation_id: Option<i64>,
+    ) -> i64 {
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: invocation_uuid.to_string(),
+                model_name: "fixture~high".to_string(),
+                provider_name: "fixture-provider".to_string(),
+                provider_index: 0,
+                parent_invocation_id,
+            })
+            .unwrap()
+    }
+
+    fn lock_terminal_render_test() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn row_text(buf: &Buffer, area_y: u16, width: u16) -> String {
         (0..width)
@@ -6496,6 +6569,101 @@ mod tests {
         let error = drain_control_payload(&mut io, ControlSubmitDrainPhase::Delimiter)
             .expect_err("a delimiter drain failure must not report success");
         assert!(error.starts_with("control_submit_delimiter_"), "{error}");
+    }
+
+    #[test]
+    fn tui_retains_one_submission_when_confirmation_fails_after_body_and_enter_drain() {
+        let _env_lock = crate::test_support::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _data_dir = DataDirOverride::install(dir.path());
+        let attempt_id = "tui-fault-attempt";
+        let path = seed_test_mailbox_delivery(dir.path(), attempt_id);
+        let fault = rusqlite::Connection::open(&path).unwrap();
+        fault
+            .execute_batch(
+                "CREATE TRIGGER fail_tui_confirmation
+                 BEFORE UPDATE OF acknowledged_at ON mailbox_delivery_attempts
+                 BEGIN SELECT RAISE(FAIL, 'injected TUI confirmation failure'); END;",
+            )
+            .unwrap();
+        let envelope = format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]");
+        let mut payload = prepare_control_payload(envelope.into_bytes(), None).unwrap();
+        let (child_peer, master) = pipe_files();
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut line_state = InputLineState::default();
+        let mut child_output_state = ChildOutputState::default();
+        let mut pending_child_input = PendingChildInput::new();
+        let mut outbound_release_gate = OutboundReleaseGate::default();
+        let mut buffer = vec![0_u8; RELAY_BUFFER_BYTES];
+        let mut io = ControlInjectionIo {
+            master_fd: master.as_raw_fd(),
+            parser: &mut parser,
+            line_state: &mut line_state,
+            child_output_state: &mut child_output_state,
+            pending_child_input: &mut pending_child_input,
+            outbound_release_gate: &mut outbound_release_gate,
+            buffer: &mut buffer,
+            child_pid: None,
+        };
+
+        begin_control_payload_submission(&mut payload).unwrap();
+        submit_control_payload(&mut io, &payload.bytes, false).unwrap();
+        assert_eq!(
+            control_response_message(settle_control_payload(&payload)),
+            (true, pty_delivery_uncertain_message(attempt_id))
+        );
+        let mut retained = MailboxDb::open(&path).unwrap();
+        let window = retained
+            .delivery_attempt_window(attempt_id)
+            .unwrap()
+            .unwrap();
+        assert!(window.submission_started_at.is_some());
+        assert!(window.acknowledged_at.is_none());
+        assert!(window.resolved_at.is_none());
+        assert_eq!(window.rows.len(), 1);
+        assert!(
+            retained
+                .register_or_reuse_delivery_attempt(
+                    "replacement",
+                    "session-a",
+                    "invocation-b",
+                    "generation-b",
+                    &[window.rows[0].seq],
+                    0,
+                )
+                .unwrap_err()
+                .contains("mailbox_delivery_submission_uncertain:tui-fault-attempt")
+        );
+        drop(retained);
+        fault
+            .execute_batch("DROP TRIGGER fail_tui_confirmation")
+            .unwrap();
+        let retry = prepare_control_payload(
+            format!("notify\n[OULIPOLY-DELIVERY {attempt_id}]").into_bytes(),
+            None,
+        )
+        .unwrap();
+        assert!(retry.bytes.is_empty());
+        assert_eq!(
+            settle_control_payload(&retry),
+            Ok(ControlPayloadOutcome::SubmissionUncertain(
+                attempt_id.to_string()
+            ))
+        );
+        set_nonblocking(child_peer.as_raw_fd());
+        let mut submitted = Vec::new();
+        drain_available(child_peer.as_raw_fd(), &mut submitted).unwrap();
+        let submitted = String::from_utf8(submitted).unwrap();
+        assert_eq!(
+            submitted
+                .matches(&format!("[OULIPOLY-DELIVERY {attempt_id}]"))
+                .count(),
+            1,
+            "{submitted}"
+        );
+        assert!(submitted.ends_with('\r'));
+        let db = MailboxDb::open(&path).unwrap();
+        assert_eq!(db.list_pending("session-a").unwrap().len(), 1);
     }
 
     #[test]
@@ -7689,6 +7857,7 @@ mod tests {
 
     #[test]
     fn render_thread_keeps_drawing_while_processing_side_is_busy() {
+        let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
         let mut drain_master = outer.master.try_clone().expect("clone drain master");
@@ -7881,6 +8050,7 @@ mod tests {
     // exit status, and paints the collapsed monitor row to the real terminal.
     #[test]
     fn observed_relay_gives_child_a_tty_forwards_input_and_renders_monitor() {
+        let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
         let full = libc::winsize {
@@ -7908,17 +8078,20 @@ mod tests {
         let monitor = Box::new(FakeMonitor::new(empty_snapshot()));
         let root = ObservabilityRoot::default();
         let relay = thread::spawn(move || {
-            let mut child = child;
+            let mut custody = ChildGenerationCustody::new(child, None).unwrap();
             let result = relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
                 None,
-                &mut child,
+                &mut custody,
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
             );
+            if result.is_ok() {
+                custody.observe_exit().unwrap();
+            }
             done_relay.store(true, Ordering::SeqCst);
             result
         });
@@ -7973,6 +8146,7 @@ mod tests {
 
     #[test]
     fn observed_relay_forwards_input_while_snapshot_provider_is_slow() {
+        let _terminal_lock = lock_terminal_render_test();
         let outer = open_outer_pty(24, 80);
         make_raw(outer.slave.as_raw_fd());
         let full = libc::winsize {
@@ -8006,18 +8180,23 @@ mod tests {
             Arc::clone(&snapshot_release),
         ));
         let root = ObservabilityRoot::default();
+        let (relay_done_tx, relay_done_rx) = mpsc::sync_channel(1);
         let relay = thread::spawn(move || {
-            let mut child = child;
-            relay_until_exit_observed(
+            let mut custody = ChildGenerationCustody::new(child, None).unwrap();
+            let result = relay_until_exit_observed(
                 input_fd,
                 writer,
                 &master,
                 None,
-                &mut child,
+                &mut custody,
                 monitor,
                 root,
                 OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
-            )
+            );
+            if result.is_ok() {
+                custody.observe_exit().unwrap();
+            }
+            let _ = relay_done_tx.send(result);
         });
 
         set_nonblocking(outer.master.as_raw_fd());
@@ -8033,23 +8212,145 @@ mod tests {
         }
         let input_observed_while_snapshot_blocked = observation_path.exists();
 
+        let relay_result = relay_done_rx.recv_timeout(Duration::from_millis(500));
+        let settled_before_snapshot_release = relay_result.is_ok();
+
         let (released, wake) = &*snapshot_release;
         *released.lock().expect("snapshot release lock") = true;
         wake.notify_all();
 
-        let status = relay
-            .join()
-            .expect("relay thread panicked")
-            .expect("relay error");
+        let result = relay_result.unwrap_or_else(|_| {
+            relay_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("relay should settle after snapshot release")
+        });
+        relay.join().expect("relay thread panicked");
+        let status = result.expect("relay error");
         assert!(
             input_observed_while_snapshot_blocked,
             "relay must forward input without waiting for the blocked snapshot provider"
+        );
+        assert!(
+            settled_before_snapshot_release,
+            "child settlement must not wait for best-effort snapshot observation"
         );
         assert_eq!(
             status.code(),
             Some(42),
             "child read timeout proves input was forwarded without waiting for the slow snapshot"
         );
+    }
+
+    #[test]
+    fn observed_relay_interrupts_active_production_invocation_query_after_child_exit() {
+        let _terminal_lock = lock_terminal_render_test();
+        let _env_lock = crate::test_support::lock_env();
+        let data_root = tempfile::tempdir().expect("data root");
+        let _data_dir = DataDirOverride::install(data_root.path());
+        let state = StateDb::open_default().expect("state");
+        let root_uuid = "31000000-0000-0000-0000-000000000000";
+        let root_id = start_monitor_invocation(&state, root_uuid, None);
+        let ancestor_id = start_monitor_invocation(
+            &state,
+            "32000000-0000-0000-0000-000000000000",
+            Some(root_id),
+        );
+        state
+            .finalize_invocation(ancestor_id, true, 0, None, None)
+            .unwrap();
+        start_monitor_invocation(
+            &state,
+            "33000000-0000-0000-0000-000000000000",
+            Some(ancestor_id),
+        );
+        for index in 0..128 {
+            let id = start_monitor_invocation(
+                &state,
+                &format!("34000000-0000-0000-0000-{index:012}"),
+                Some(root_id),
+            );
+            state.finalize_invocation(id, true, 0, None, None).unwrap();
+        }
+        let unrelated_root =
+            start_monitor_invocation(&state, "35000000-0000-0000-0000-000000000000", None);
+        for index in 0..512 {
+            start_monitor_invocation(
+                &state,
+                &format!("36000000-0000-0000-0000-{index:012}"),
+                Some(unrelated_root),
+            );
+        }
+        let query_pause = state.pause_invocation_query_progress_for_test();
+        drop(state);
+
+        let outer = open_outer_pty(24, 80);
+        make_raw(outer.slave.as_raw_fd());
+        let full = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let termios = tty_termios(outer.slave.as_raw_fd());
+        let pty = PtyPair::open(&top_pane_winsize(&full), &termios).expect("inner pty");
+        let observation_path = data_root.path().join("input-observed");
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c").arg(
+            r#"IFS= read -r -t 5 line || exit 6; [ "$line" = "ping" ] || exit 8; printf observed > "$OBSERVED_INPUT_PATH"; exit 42"#,
+        );
+        cmd.env("OBSERVED_INPUT_PATH", &observation_path);
+        configure_child_pty(&mut cmd, &pty).expect("configure child pty");
+        let child = cmd.spawn().expect("spawn child");
+        drop(pty.slave);
+
+        let writer = outer.slave.try_clone().expect("clone writer");
+        let input_fd = outer.slave.as_raw_fd();
+        let master = pty.master;
+        let monitor = Box::new(ProductionObservabilitySnapshotService::new(None));
+        let root = ObservabilityRoot {
+            invocation_uuid: Some(root_uuid.to_string()),
+            ..ObservabilityRoot::default()
+        };
+        let (relay_done_tx, relay_done_rx) = mpsc::sync_channel(1);
+        let relay = thread::spawn(move || {
+            let mut custody = ChildGenerationCustody::new(child, None).unwrap();
+            let result = relay_until_exit_observed(
+                input_fd,
+                writer,
+                &master,
+                None,
+                &mut custody,
+                monitor,
+                root,
+                OutboundObserverSource::Unavailable("test_observer_unavailable".to_string()),
+            );
+            if result.is_ok() {
+                custody.observe_exit().unwrap();
+            }
+            let _ = relay_done_tx.send(result);
+        });
+
+        assert!(
+            query_pause.wait_until_entered(Duration::from_secs(5)),
+            "production invocation query never reached its SQLite progress callback"
+        );
+        (&outer.master).write_all(b"ping\n").expect("write input");
+        set_nonblocking(outer.master.as_raw_fd());
+        let mut buf = [0_u8; 8192];
+        let observation_deadline = Instant::now() + Duration::from_secs(2);
+        while !observation_path.exists() && Instant::now() < observation_deadline {
+            let _ = (&outer.master).read(&mut buf);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(observation_path.exists(), "child never observed input");
+
+        let settled_at = Instant::now();
+        let result = relay_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("child settlement should interrupt the active SQLite query");
+        relay.join().expect("relay thread panicked");
+        assert!(settled_at.elapsed() < Duration::from_secs(1));
+        assert_eq!(result.expect("relay error").code(), Some(42));
     }
 
     // The child PTY is resized to the TOP pane (persistent overlay rows reserved) on terminal
@@ -8233,7 +8534,12 @@ mod tests {
     }
 
     impl ObservabilitySnapshotPort for FakeMonitor {
-        fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
+        fn snapshot_with_cancel(
+            &self,
+            _root: &ObservabilityRoot,
+            _limits: SnapshotLimits,
+            _cancellation: &CancellationToken,
+        ) -> MonitorSnapshot {
             self.snapshot.clone()
         }
     }
@@ -8256,18 +8562,29 @@ mod tests {
                 release,
             }
         }
+
+        fn wait_for_release(&self, cancellation: &CancellationToken) -> MonitorSnapshot {
+            let _ = self.entered.try_send(());
+            let (released, wake) = &*self.release;
+            let mut guard = released.lock().expect("snapshot release lock");
+            while !*guard && !cancellation.is_cancelled() {
+                guard = wake
+                    .wait_timeout(guard, Duration::from_millis(5))
+                    .expect("snapshot release wait")
+                    .0;
+            }
+            self.snapshot.clone()
+        }
     }
 
     impl ObservabilitySnapshotPort for BlockingMonitor {
-        fn snapshot(&self, _root: &ObservabilityRoot, _limits: SnapshotLimits) -> MonitorSnapshot {
-            let _ = self.entered.try_send(());
-            let (released, wake) = &*self.release;
-            let guard = released.lock().expect("snapshot release lock");
-            drop(
-                wake.wait_while(guard, |released| !*released)
-                    .expect("snapshot release wait"),
-            );
-            self.snapshot.clone()
+        fn snapshot_with_cancel(
+            &self,
+            _root: &ObservabilityRoot,
+            _limits: SnapshotLimits,
+            cancellation: &CancellationToken,
+        ) -> MonitorSnapshot {
+            self.wait_for_release(cancellation)
         }
     }
 

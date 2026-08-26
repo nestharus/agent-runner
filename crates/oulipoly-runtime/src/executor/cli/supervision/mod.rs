@@ -29,20 +29,17 @@ mod live_quota;
 mod predicates;
 mod process;
 mod process_validate;
-mod status;
 mod stdin;
 mod stdin_access;
 mod stdin_predicates;
 mod terminal_outcome;
-mod termination;
 
 use super::provider_identity::ProviderRecognizer;
 use super::session_capture::{CapturePlan, parse_stdout_json_event_session_id};
 use super::spawn_identity::{
-    RunningRuntimeGeneration, SpawnIdentityContext, backfill_captured_session_id,
-    mark_runtime_generation_exited, mark_runtime_generation_orderly_completed,
-    mark_runtime_generation_spawn_failed, record_child_identity,
-    register_runtime_generation_starting,
+    ChildGenerationCustody, RunningRuntimeGeneration, SpawnIdentityContext,
+    backfill_captured_session_id, child_custody_test_fault, mark_runtime_generation_spawn_failed,
+    record_child_identity, register_runtime_generation_starting,
 };
 use crate::executor::terminal_signal::{TerminalSignal, TerminalStatusEvidence};
 use oulipoly_config::{PromptMode, ProviderConfig};
@@ -131,25 +128,17 @@ fn execute_with_supervisor(
     process::configure_supervised_command(&mut cmd, &config);
     process::configure_supervised_process_group(&mut cmd);
     register_runtime_generation_starting(spawn_identity)?;
-    let mut child = match process::spawn_supervised_child(cmd, provider_name) {
+    let child = match process::spawn_supervised_child(cmd, provider_name) {
         Ok(child) => child,
         Err(err) => {
             let _ = mark_runtime_generation_spawn_failed(spawn_identity);
             return Err(err);
         }
     };
-    let recorded_generation = match record_child_identity(child.id(), spawn_identity) {
-        Ok(generation) => generation,
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = mark_runtime_generation_exited(spawn_identity, None);
-            return Err(err);
-        }
-    };
-    let drains = drain::start_child_drains(&mut child)?;
-    let child_process_group = child.id();
-    let stdin_writer = stdin::start_child_stdin_writer(&mut child, &mut config)?;
+    let mut custody = ChildGenerationCustody::new(child, spawn_identity)?;
+    let recorded_generation = record_child_identity(custody.child().id(), spawn_identity)?;
+    let drains = drain::start_child_drains(custody.child_mut())?;
+    let stdin_writer = stdin::start_child_stdin_writer(custody.child_mut(), &mut config)?;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut streamed_session_id = None;
@@ -165,17 +154,26 @@ fn execute_with_supervisor(
             recorded_generation.as_ref(),
         );
 
-        if let Some(status) = status::poll_child_status(&mut child)? {
+        child_custody_test_fault("headless_status_poll")?;
+        if let Some(status) = custody
+            .try_wait()
+            .map_err(|error| errors::poll_child_status_error(&error))?
+        {
+            custody.observe_exit()?;
             break terminal_outcome::terminal_outcome_from_status(status);
         }
 
+        child_custody_test_fault("headless_live_quota")?;
         if let Some(outcome) = live_quota_terminal_outcome(
-            &mut child,
+            &mut custody,
             provider_name,
             config.recognizer,
             &stdout,
             &stderr,
         )? {
+            if outcome.2.is_some() {
+                custody.observe_exit()?;
+            }
             break outcome;
         }
 
@@ -199,7 +197,6 @@ fn execute_with_supervisor(
         );
     };
 
-    termination::cleanup_process_group_after_child_exit(child_process_group)?;
     drain::finish_child_drains(drains, &mut stdout, &mut stderr, &mut last_output_seen);
     observe_streamed_session_id(
         capture_plan,
@@ -219,7 +216,12 @@ fn execute_with_supervisor(
         real_status,
     );
     output.streamed_session_id = streamed_session_id;
-    mark_runtime_generation_orderly_completed(spawn_identity, Some(output.exit_code))?;
+    let compatibility_exit_code = if output.exit_code == 0 && output.terminal_reason.is_some() {
+        1
+    } else {
+        output.exit_code
+    };
+    custody.complete_orderly(Some(output.exit_code), Some(compatibility_exit_code))?;
     if stdin_predicates::stdin_write_error_is_fatal(stdin_write_error.as_deref(), &output)
         && let Some(err) = stdin_write_error
     {
@@ -254,7 +256,7 @@ fn observe_streamed_session_id(
 }
 
 fn live_quota_terminal_outcome(
-    child: &mut std::process::Child,
+    custody: &mut ChildGenerationCustody<'_>,
     provider_name: &str,
     recognizer: ProviderRecognizer,
     stdout: &[u8],
@@ -265,13 +267,5 @@ fn live_quota_terminal_outcome(
     if !predicates::live_signal_is_quota_exhausted_inband(&live_signal) {
         return Ok(None);
     }
-    live_quota::terminate_for_live_quota(
-        child,
-        provider_name,
-        recognizer,
-        stdout,
-        stderr,
-        live_signal,
-    )
-    .map(Some)
+    live_quota::terminate_for_live_quota(custody, live_signal).map(Some)
 }

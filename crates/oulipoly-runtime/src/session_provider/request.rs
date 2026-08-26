@@ -3,6 +3,7 @@ use super::types::{
     SessionProviderEnumerateRequest, SessionProviderError, SessionProviderIdentity,
     SessionProviderLifecycleContext,
 };
+use crate::provider_registry::DescribeHostOptions;
 use crate::session_metadata::TranscriptLookupMode;
 use oulipoly_provider::generated::{
     CONTRACT_VERSION, JsonObject, RequestEnvelope, SessionBaseParams, SessionEnumerateParams,
@@ -14,11 +15,19 @@ pub(super) fn base_request(
     identity: &SessionProviderIdentity,
     session_id: Option<&str>,
     effective_cwd: Option<&Path>,
+    host_options: &DescribeHostOptions,
     extra: JsonObject,
     request_label: &str,
 ) -> Result<Value, SessionProviderError> {
     let request_id = session_request_id(request_label);
-    let envelope = session_request_envelope(identity, session_id, effective_cwd, extra, request_id);
+    let envelope = session_request_envelope(
+        identity,
+        session_id,
+        effective_cwd,
+        host_options,
+        extra,
+        request_id,
+    );
     serialize_session_request(envelope)
 }
 
@@ -30,6 +39,7 @@ fn session_request_envelope(
     identity: &SessionProviderIdentity,
     session_id: Option<&str>,
     effective_cwd: Option<&Path>,
+    host_options: &DescribeHostOptions,
     extra: JsonObject,
     request_id: String,
 ) -> RequestEnvelope<SessionBaseParams> {
@@ -38,7 +48,7 @@ fn session_request_envelope(
         contract: CONTRACT_VERSION.to_string(),
         request_id,
         provider_instance_id: Some(provider_instance_id(identity)),
-        host: host_context(effective_cwd),
+        host: host_context(effective_cwd, host_options),
         params: session_base_params(identity, session_id, extra),
     }
 }
@@ -133,12 +143,13 @@ pub(super) fn user_observation_extra() -> JsonObject {
 
 pub(super) fn enumerate_request(
     request: &SessionProviderEnumerateRequest<'_>,
+    host_options: &DescribeHostOptions,
 ) -> Result<Value, SessionProviderError> {
     let envelope = RequestEnvelope {
         contract: CONTRACT_VERSION.to_string(),
         request_id: session_request_id("enumerate"),
         provider_instance_id: Some(provider_instance_id(&request.identity)),
-        host: host_context(request.effective_cwd),
+        host: host_context(request.effective_cwd, host_options),
         params: SessionEnumerateParams {
             settings_id: request.identity.settings_id.clone(),
             limit: request.limit,

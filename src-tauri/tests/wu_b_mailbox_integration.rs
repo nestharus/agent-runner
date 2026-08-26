@@ -2,8 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, EnqueueResult, InboxTarget, InboxTargetKind, MailboxDb, MailboxRow,
-    RuntimeLifecycleState, RuntimeTerminalReason, SessionRuntimeUpsert, SubmittedInputEnqueue,
+    AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, InboxTarget, InboxTargetKind,
+    MailboxDb, MailboxRow, RuntimeGenerationId, RuntimeLifecycleState, RuntimeTerminalReason,
+    SubmittedInputEnqueue,
 };
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRecord, ProcessIdentity, read_live_process_identity,
@@ -116,6 +117,16 @@ impl Fixture {
         delivery_mode: &str,
         artifacts: &NotifyArtifacts,
     ) -> Output {
+        self.run_register_artifacts_with_output(handle, delivery_mode, artifacts, true)
+    }
+
+    fn run_register_artifacts_with_output(
+        &self,
+        handle: &str,
+        delivery_mode: &str,
+        artifacts: &NotifyArtifacts,
+        json: bool,
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oulipoly-agent-runner"));
         cmd.arg("notify")
             .arg("agent-bash-register")
@@ -130,8 +141,10 @@ impl Fixture {
             .arg("--log")
             .arg(&artifacts.log)
             .arg("--rc")
-            .arg(&artifacts.rc)
-            .arg("--json");
+            .arg(&artifacts.rc);
+        if json {
+            cmd.arg("--json");
+        }
         let metadata: Value = serde_json::from_slice(&fs::read(&artifacts.meta).unwrap()).unwrap();
         if let Some(invocation_uuid) = metadata
             .get("owner_invocation_uuid")
@@ -852,13 +865,16 @@ fn completion_response_reports_delivery_for_every_listener_session() {
 fn completion_for_headless_runtime_is_not_submitted_to_pty() {
     let fixture = Fixture::new();
     fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let generation_id = RuntimeGenerationId::parse(INVOCATION_A).unwrap();
     MailboxDb::open(&fixture.sidecar_path())
         .unwrap()
-        .upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: SESSION_A,
-            mode: "headless",
-            invocation_uuid: Some(INVOCATION_A),
-            provider_name: None,
+        .runtime_lifecycle()
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation_id,
+            spawn_invocation_uuid: INVOCATION_A,
+            session_id: Some(SESSION_A),
+            runtime_mode: "headless",
+            provider_name: "fixture-provider",
             model_name: None,
             pty_control_path: None,
             models_dir: None,
@@ -875,7 +891,7 @@ fn completion_for_headless_runtime_is_not_submitted_to_pty() {
     let completed = stdout_json(&completion);
     assert_eq!(completed["pty_delivery"]["status"], "not_pty");
     assert_eq!(completed["pty_delivery"]["submitted"], false);
-    assert_eq!(completed["wake"]["status"], "spawned");
+    assert_eq!(completed["wake"]["status"], "busy");
     let rows = fixture.mailbox_rows(SESSION_A, false);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].handle, "h-headless-not-pty");
@@ -901,6 +917,31 @@ fn completion_registration_rejects_an_unbound_session() {
     assert_eq!(json["status"], "notification_event_error");
     assert!(json["message"].as_str().unwrap().contains("is not bound"));
     assert!(fixture.mailbox_rows(SESSION_A, true).is_empty());
+    fixture.assert_default_user_paths_untouched();
+}
+
+#[test]
+fn completion_registration_human_error_preserves_structured_output_and_stderr_detail() {
+    let fixture = Fixture::new();
+    fixture.seed_state_invocation_with_provider_session(INVOCATION_A, SESSION_A);
+    let artifacts = fixture.write_notify_artifacts(
+        "h-wrong-session-human",
+        owner_metadata(SESSION_B, INVOCATION_A),
+        0,
+    );
+
+    let output = fixture.run_register_artifacts_with_output(
+        "h-wrong-session-human",
+        "async",
+        &artifacts,
+        false,
+    );
+
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    let json = stdout_json(&output);
+    let message = json["message"].as_str().expect("error message");
+    assert!(message.contains("is not bound"), "{message}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains(message));
     fixture.assert_default_user_paths_untouched();
 }
 
@@ -1138,7 +1179,7 @@ fn mailbox_compact_delivered_is_dry_run_by_default_and_hydrates_list_output() {
             params![row.seq, &original_payload],
         )
         .unwrap();
-    db.mark_delivered(SESSION_A, &[row.seq], INVOCATION_A)
+    db.mark_delivered(SESSION_A, None, &[row.seq], INVOCATION_A)
         .unwrap();
     drop(db);
 
@@ -1511,6 +1552,7 @@ fn resume_marks_delivered_after_exact_turn_confirmation() {
     );
     let history = MailboxDb::open(&fixture.sidecar_path())
         .unwrap()
+        .runtime_lifecycle_reader()
         .runtime_generation_history(SESSION_A)
         .unwrap();
     assert_eq!(history.len(), 1);
@@ -1712,12 +1754,22 @@ fn resume_typed_physical_zero_failure_keeps_selected_mailbox_outside_age270_seam
     assert_eq!(row.delivery_attempts, 1);
     assert_eq!(row.delivery_error.as_deref(), Some("bounded_silence"));
     let mailbox = MailboxDb::open(&fixture.sidecar_path()).unwrap();
-    let runtime = mailbox.session_runtime(SESSION_A).unwrap().unwrap();
+    let runtime = mailbox
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION_A)
+        .unwrap()
+        .unwrap();
     assert_eq!(runtime.run_state, "idle");
     assert!(runtime.running_invocation_uuid.is_none());
     assert!(runtime.running_os_pid.is_none());
     assert_eq!(runtime.last_exit_code, Some(1));
-    assert!(mailbox.wake_claim(SESSION_A).unwrap().is_none());
+    assert!(
+        mailbox
+            .wake_session_reader()
+            .wake_claim(SESSION_A)
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(invocation_count(&fixture), 1);
 }
 

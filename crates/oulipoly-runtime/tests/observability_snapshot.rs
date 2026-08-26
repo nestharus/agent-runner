@@ -6,6 +6,7 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, SessionStorage,
     provider_implementation_ref::ProviderImplementationRef,
 };
+use oulipoly_core::CancellationToken;
 use oulipoly_runtime::observability::{
     InspectRef, LivenessStatus, MonitorNodeKind, MonitorStatus, ObservabilityRoot,
     ObservabilitySnapshotPort, ProductionObservabilitySnapshotService, SnapshotLimits,
@@ -13,25 +14,34 @@ use oulipoly_runtime::observability::{
 use oulipoly_runtime::provider_registry::{ProviderRegistry, ProviderRegistryOptions};
 use oulipoly_runtime::session_provider::SessionProviderIdentity;
 use oulipoly_state::mailbox::{
-    AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
-    RuntimeGenerationId, SessionRuntimeRunningUpdate, SessionRuntimeUpsert,
+    AgentBashCompleteEnqueue, BindRuntimeGenerationRunning, CreateRuntimeGeneration, EnqueueResult,
+    MailboxDb, RuntimeGenerationFence, RuntimeGenerationId, SessionMetadataUpsert,
     WAKE_SWEEP_ABANDONED_ERROR, WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
 use oulipoly_state::{InvocationStart, StateDb};
+use rusqlite::params;
 #[cfg(unix)]
 use serde_json::Value;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command};
+#[cfg(unix)]
+use std::sync::mpsc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 const ROOT_UUID: &str = "11111111-1111-4111-8111-111111111111";
 const CHILD_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const SESSION_ID: &str = "session-observe";
 #[cfg(target_os = "linux")]
 const LIVE_CHILD_UUID: &str = "33333333-3333-4333-8333-333333333333";
+#[cfg(target_os = "linux")]
+const TERMINAL_ANCESTOR_UUID: &str = "33333333-3333-4333-8333-333333333334";
 #[cfg(target_os = "linux")]
 const DEAD_CHILD_UUID: &str = "44444444-4444-4444-8444-444444444444";
 #[cfg(target_os = "linux")]
@@ -362,6 +372,51 @@ fn overlay_counts_live_logical_child_after_terminal_history_and_fails_closed() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn overlay_retains_terminal_ancestor_of_live_grandchild_after_terminal_history() {
+    let fixture = Fixture::new();
+    let root_process = TestProcess::spawn();
+    let grandchild_process = TestProcess::spawn();
+    let state = fixture.open_state();
+    let root_id = seed_invocation(&state, ROOT_UUID, None);
+    state
+        .update_session_capture(root_id, Some(SESSION_ID), "stdout-json")
+        .unwrap();
+    for index in 0..TERMINAL_DESCENDANT_COUNT {
+        let uuid = format!("81000000-0000-4000-8000-{index:012}");
+        let row_id = seed_invocation(&state, &uuid, Some(root_id));
+        state
+            .finalize_invocation(row_id, true, 0, None, Some("completed"))
+            .unwrap();
+    }
+    let ancestor_id = seed_invocation(&state, TERMINAL_ANCESTOR_UUID, Some(root_id));
+    state
+        .finalize_invocation(ancestor_id, true, 0, None, Some("completed"))
+        .unwrap();
+    seed_invocation(&state, LIVE_CHILD_UUID, Some(ancestor_id));
+    drop(state);
+    let pid = fixture.open_pid();
+    record_identity(&pid, ROOT_UUID, Some(SESSION_ID), root_process.identity());
+    record_identity(
+        &pid,
+        LIVE_CHILD_UUID,
+        Some(SESSION_ID),
+        grandchild_process.identity(),
+    );
+    drop(pid);
+
+    let snapshot = fixture
+        .service()
+        .snapshot(&fixture.root(), SnapshotLimits::default());
+
+    assert_eq!(
+        node(&snapshot, &format!("invocation:{TERMINAL_ANCESTOR_UUID}")).status,
+        MonitorStatus::Succeeded
+    );
+    assert_verified_running_process(&snapshot, LIVE_CHILD_UUID, grandchild_process.identity());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn delivered_wake_edge_keeps_live_workload_under_original_root() {
     let fixture = Fixture::new();
     let wake_process = TestProcess::spawn();
@@ -414,7 +469,7 @@ fn delivered_wake_edge_keeps_live_workload_under_original_root() {
         result => panic!("unexpected enqueue result: {result:?}"),
     };
     mailbox
-        .mark_delivered(SESSION_ID, &[row.seq], LIVE_CHILD_UUID)
+        .mark_delivered(SESSION_ID, None, &[row.seq], LIVE_CHILD_UUID)
         .unwrap();
     drop(mailbox);
 
@@ -660,6 +715,81 @@ fn provider_inspect_missing_format_id_attaches_no_transcript_ref() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn provider_inspect_snapshot_cancellation_stops_blocked_provider_lookup() {
+    let fixture = Fixture::new();
+    seed_running_root(&fixture);
+    let record_path = fixture.data_dir.join("provider-blocking-records.jsonl");
+    let external_path = fixture.data_dir.join("external-blocking-session.jsonl");
+    let provider_path = write_external_locate_provider_with_behavior(
+        &fixture,
+        &record_path,
+        &external_path,
+        ExternalLocateProviderBehavior::Blocking,
+    );
+    let service = ProductionObservabilitySnapshotService::for_provider_inspect(
+        external_registry(&provider_path),
+        external_identity(),
+        SESSION_ID.to_string(),
+        Some(fixture.data_dir.join("provider-work")),
+    );
+    let root = fixture.root();
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let snapshot =
+            service.snapshot_with_cancel(&root, SnapshotLimits::default(), &worker_cancellation);
+        let _ = sender.send(snapshot);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while recorded_subcommand_count(&record_path, "session.locate_transcript") == 0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        recorded_subcommand_count(&record_path, "session.locate_transcript"),
+        1,
+        "provider lookup did not start"
+    );
+
+    cancellation.cancel();
+    let snapshot = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("cancelled provider lookup must return promptly");
+    assert!(
+        snapshot
+            .nodes
+            .iter()
+            .all(|node| !matches!(node.inspect_ref, Some(InspectRef::SessionTranscript { .. }))),
+        "cancelled snapshot must not publish a provider transcript"
+    );
+}
+
+#[test]
+fn public_cancelled_snapshot_is_distinct_from_a_completed_idle_observation() {
+    let fixture = Fixture::new();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let snapshot = fixture.service().snapshot_with_cancel(
+        &fixture.root(),
+        SnapshotLimits::default(),
+        &cancellation,
+    );
+
+    assert_eq!(snapshot.summary.status, MonitorStatus::Cancelled);
+    assert!(
+        snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "snapshot:cancelled")
+    );
+}
+
 #[test]
 fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
     let fixture = Fixture::new();
@@ -672,18 +802,31 @@ fn stale_runtime_snapshot_emits_diagnostic_without_mutating_runtime_row() {
     let mut stale = current_identity();
     stale.os_pid_starttime_ticks += 1;
     let mut mailbox = fixture.open_mailbox();
+    let generation = RuntimeGenerationId::parse("99999999-9999-4999-8999-999999999999").unwrap();
     mailbox
-        .mark_session_running(SessionRuntimeRunningUpdate {
-            session_id: SESSION_ID,
-            mode: "pty_interactive",
-            invocation_uuid: ROOT_UUID,
-            provider_name: Some("provider-a"),
+        .runtime_lifecycle()
+        .create_runtime_generation(CreateRuntimeGeneration {
+            generation_id: &generation,
+            spawn_invocation_uuid: ROOT_UUID,
+            session_id: Some(SESSION_ID),
+            runtime_mode: "pty_interactive",
+            provider_name: "provider-a",
             model_name: Some("model-a"),
-            identity: &stale,
             pty_control_path: Some("/tmp/oulipoly-observe.sock"),
-            turn_start_max_mailbox_seq: None,
             models_dir: None,
             effective_cwd: Some("/tmp/work"),
+        })
+        .unwrap();
+    mailbox
+        .runtime_lifecycle()
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation,
+                spawn_invocation_uuid: ROOT_UUID,
+            },
+            spawned_os_pid: stale.os_pid,
+            exact_process_identity: &stale,
+            os_pgid: None,
         })
         .unwrap();
     drop(mailbox);
@@ -734,6 +877,7 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
             .unwrap()
     );
     let claim = mailbox
+        .wake_sessions()
         .try_acquire_wake_claim(WakeClaimRequest {
             session_id: SESSION_ID,
             claim_token: "claim-physical-read-only",
@@ -746,6 +890,7 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
     assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
     let generation = RuntimeGenerationId::parse("88888888-8888-4888-8888-888888888888").unwrap();
     mailbox
+        .runtime_lifecycle()
         .create_runtime_generation(CreateRuntimeGeneration {
             generation_id: &generation,
             spawn_invocation_uuid: ROOT_UUID,
@@ -758,14 +903,27 @@ fn observability_sidecar_reads_preserve_physical_file_inventory_and_bytes() {
             effective_cwd: Some("/work/observability-read-only"),
         })
         .unwrap();
+    let identity = current_identity();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .runtime_lifecycle()
+        .bind_runtime_generation_running(BindRuntimeGenerationRunning {
+            fence: RuntimeGenerationFence {
+                generation_id: &generation,
+                spawn_invocation_uuid: ROOT_UUID,
+            },
+            spawned_os_pid: identity.os_pid,
+            exact_process_identity: &identity,
+            os_pgid: None,
+        })
+        .unwrap();
+    mailbox
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_ID,
             mode: "headless",
             invocation_uuid: Some(ROOT_UUID),
             provider_name: Some("provider-a"),
             model_name: Some("model-a"),
-            pty_control_path: None,
             models_dir: Some("/models/observability-read-only"),
             effective_cwd: Some("/work/observability-read-only"),
         })
@@ -794,13 +952,13 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
     seed_root_session(&fixture);
     let mut mailbox = fixture.open_mailbox();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_ID,
             mode: "pty_interactive",
             invocation_uuid: Some(ROOT_UUID),
             provider_name: Some("provider-a"),
             model_name: Some("model-a"),
-            pty_control_path: Some("/tmp/oulipoly-observe.sock"),
             models_dir: None,
             effective_cwd: None,
         })
@@ -825,32 +983,42 @@ fn pending_mailbox_without_claim_is_reported_as_stuck() {
 }
 
 #[test]
-fn abandoned_mailbox_is_failed_and_does_not_require_wake() {
+fn historical_abandoned_mailbox_is_failed_and_does_not_require_wake() {
     let fixture = Fixture::new();
     seed_root_session(&fixture);
     let mut mailbox = fixture.open_mailbox();
-    mailbox
+    let mailbox_row = match mailbox
         .enqueue_agent_bash_complete(&mailbox_input("handle-abandoned", SESSION_ID))
-        .unwrap();
+        .unwrap()
+    {
+        EnqueueResult::Inserted(row) => row,
+        other => panic!("unexpected enqueue result: {other:?}"),
+    };
+    drop(mailbox);
+    let connection = rusqlite::Connection::open(fixture.sidecar_path()).unwrap();
     assert_eq!(
-        mailbox
-            .mark_pending_abandoned(SESSION_ID, WAKE_SWEEP_ABANDONED_ERROR, 1)
+        connection
+            .execute(
+                "UPDATE mailbox SET delivery_error = ?3 WHERE session_id = ?1 AND seq = ?2",
+                params![SESSION_ID, mailbox_row.seq, WAKE_SWEEP_ABANDONED_ERROR],
+            )
             .unwrap(),
         1
     );
-    drop(mailbox);
+    drop(connection);
 
     let live = fixture
         .service()
         .snapshot(&fixture.root(), SnapshotLimits::default());
     assert_eq!(live.summary.pending_mailbox_count, 0);
     assert!(!has_diagnostic(&live, "wake-needed:no-runtime"));
-    assert!(find_node(&live, "mailbox:session-observe:1").is_none());
+    let node_id = format!("mailbox:{SESSION_ID}:{}", mailbox_row.seq);
+    assert!(find_node(&live, &node_id).is_none());
 
     let full = fixture
         .service()
         .snapshot(&fixture.root(), full_snapshot_limits());
-    let row = node(&full, "mailbox:session-observe:1");
+    let row = node(&full, &node_id);
     assert_eq!(row.status, MonitorStatus::Failed);
     assert_eq!(
         row.mailbox.as_ref().unwrap().delivery_error.as_deref(),
@@ -867,6 +1035,7 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
         .enqueue_agent_bash_complete(&mailbox_input("handle-pending", SESSION_ID))
         .unwrap();
     let claim = mailbox
+        .wake_sessions()
         .try_acquire_wake_claim(WakeClaimRequest {
             session_id: SESSION_ID,
             claim_token: "claim-a",
@@ -879,6 +1048,7 @@ fn wake_claim_with_dead_pid_is_reported_as_claim_dead() {
     assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
     assert!(
         mailbox
+            .wake_sessions()
             .record_wake_claim_pid(SESSION_ID, "claim-a", 999_999_999)
             .unwrap()
     );
@@ -962,7 +1132,13 @@ fn agent_bash_scan_is_bounded_filters_unrelated_and_degrades_corrupt_meta() {
     let running_dir = write_agent_bash_meta(
         &root,
         "yy-running",
-        &agent_bash_meta("yy-running", "RUNNING", &owner, Some(777), None),
+        &agent_bash_meta(
+            "yy-running",
+            "RUNNING",
+            &owner,
+            Some(dead_identity().os_pid),
+            None,
+        ),
         "running tail",
     );
     set_dir_mtime(&running_dir, 50);
@@ -1677,6 +1853,7 @@ enum ExternalLocateProviderBehavior {
     Located,
     LocatedWithoutFormatId,
     Failing,
+    Blocking,
 }
 
 #[cfg(unix)]
@@ -1733,19 +1910,23 @@ fn external_locate_provider_body(
     behavior: ExternalLocateProviderBehavior,
 ) -> String {
     let locate_ok = !matches!(behavior, ExternalLocateProviderBehavior::Failing);
+    let block_locate = matches!(behavior, ExternalLocateProviderBehavior::Blocking);
     let format_id = match behavior {
         ExternalLocateProviderBehavior::Located => r#""canonical-transcript-v1""#,
         ExternalLocateProviderBehavior::LocatedWithoutFormatId
-        | ExternalLocateProviderBehavior::Failing => "None",
+        | ExternalLocateProviderBehavior::Failing
+        | ExternalLocateProviderBehavior::Blocking => "None",
     };
     format!(
         r#"#!/usr/bin/env python3
 import json
 import pathlib
 import sys
+import time
 
 CONTRACT = "oulipoly.provider/v1"
 LOCATE_OK = {locate_ok}
+BLOCK_LOCATE = {block_locate}
 FORMAT_ID = {format_id}
 subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
 request = json.loads(sys.stdin.read() or "{{}}")
@@ -1782,6 +1963,9 @@ if subcommand == "describe":
         "settings_schema_id": "provider-a-test-settings",
     }})
 elif subcommand == "session.locate_transcript":
+    if BLOCK_LOCATE:
+        while True:
+            time.sleep(1)
     if LOCATE_OK:
         result = {{
             "located": True,
@@ -1821,6 +2005,7 @@ print(json.dumps(response))
         record_path = serde_json::to_string(&record_path.display().to_string()).unwrap(),
         transcript_path = serde_json::to_string(&transcript_path.display().to_string()).unwrap(),
         locate_ok = if locate_ok { "True" } else { "False" },
+        block_locate = if block_locate { "True" } else { "False" },
         format_id = format_id,
     )
 }

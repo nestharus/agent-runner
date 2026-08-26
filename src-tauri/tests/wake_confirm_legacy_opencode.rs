@@ -35,7 +35,7 @@
 //! ```
 
 use oulipoly_state::StateDb;
-use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb};
+use oulipoly_state::mailbox::{AgentBashCompleteEnqueue, MailboxDb, SessionGenerationProjection};
 use rusqlite::{Connection, params};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -339,7 +339,12 @@ fn legacy_opencode_resume_confirms_delivery_after_host_observed_assistant_respon
     });
 
     assert_success(&output);
-    let runtime = fixture.mailbox().session_runtime(SESSION).unwrap().unwrap();
+    let runtime = fixture
+        .mailbox()
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
     let expected_models_dir = path_string(&fixture.models_dir);
     assert_eq!(
         runtime.models_dir.as_deref(),
@@ -455,9 +460,9 @@ fn prepared_fixture() -> Fixture {
     wait_until("legacy opencode parent runtime idle", || {
         fixture
             .mailbox()
-            .session_runtime(SESSION)
-            .unwrap()
-            .is_some_and(|runtime| runtime.run_state == "idle")
+            .runtime_lifecycle_reader()
+            .session_generation_projection(SESSION)
+            .is_ok_and(|projection| matches!(projection, SessionGenerationProjection::None))
     });
     fixture
 }

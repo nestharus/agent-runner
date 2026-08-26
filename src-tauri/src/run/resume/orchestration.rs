@@ -244,6 +244,10 @@ fn run_resume_attempt(
     };
     let mut bound_attempt =
         lifecycle::setup_bound_resume_attempt(&input, &provider, provider_index)?;
+    let _admission = crate::wake_coordinator::admit_session_launch(
+        &bound_attempt.attempt.invocation.id,
+        Some(&bound_attempt.provider_session_id),
+    )?;
 
     let mut result = match execution::execute_resume_attempt_command(
         &input,

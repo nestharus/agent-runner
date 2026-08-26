@@ -29,9 +29,10 @@ use crate::observability::limits::SnapshotLimits;
 use crate::observability::liveness::pid_row_liveness;
 use crate::observability::service::ObservabilityRoot;
 use crate::observability::state_access::{process_identity_ref, storage_diagnostic};
+use oulipoly_core::CancellationToken;
 use oulipoly_state::mailbox::MailboxDb;
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRow};
-use oulipoly_state::{InvocationRecord, InvocationStatus, StateDb};
+use oulipoly_state::{InvocationChildrenPage, InvocationRecord, InvocationStatus, StateDb};
 use std::collections::HashSet;
 
 pub(crate) struct InvocationProjection {
@@ -49,11 +50,15 @@ pub(crate) fn project_invocations(
     mailbox: Option<&MailboxDb>,
     root: &ObservabilityRoot,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
 ) -> InvocationProjection {
     let mut diagnostics = Vec::new();
     let Some(state) = state else {
         return empty_projection(root);
     };
+    if cancellation.is_cancelled() {
+        return empty_projection(root);
+    }
     let root_record = match root_invocation_record(state, root) {
         Ok(record) => record,
         Err(err) => {
@@ -74,6 +79,7 @@ pub(crate) fn project_invocations(
             None,
             active_session_id,
             limits,
+            cancellation,
             &mut projection,
         );
     }
@@ -150,6 +156,7 @@ fn build_invocation_tree(
     parent_uuid: Option<String>,
     active_session_id: Option<String>,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     projection: &mut InvocationProjection,
 ) {
     let mut visited = HashSet::from([record.id]);
@@ -162,6 +169,7 @@ fn build_invocation_tree(
         active_session_id,
         0,
         limits,
+        cancellation,
         &mut visited,
         projection,
     );
@@ -177,9 +185,13 @@ fn build_invocation_node(
     active_session_id: Option<String>,
     depth: usize,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     visited: &mut HashSet<i64>,
     projection: &mut InvocationProjection,
 ) {
+    if cancellation.is_cancelled() {
+        return;
+    }
     if invocation_node_limit_reached(projection, limits) {
         push_invocation_truncated_diagnostic(projection);
         return;
@@ -205,6 +217,7 @@ fn build_invocation_node(
         limits
             .max_invocation_nodes
             .saturating_sub(projection.invocation_count),
+        cancellation,
         &mut projection.diagnostics,
     ) else {
         return;
@@ -217,6 +230,7 @@ fn build_invocation_node(
         active_session_id,
         depth,
         limits,
+        cancellation,
         visited,
         projection,
         children,
@@ -278,19 +292,38 @@ fn invocation_children(
     record: &InvocationRecord,
     include_terminal: bool,
     remaining_nodes: usize,
+    cancellation: &CancellationToken,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) -> Option<Vec<InvocationRecord>> {
-    match read_invocation_children(state, record.id) {
-        Ok(mut children) => {
+    match read_invocation_children(
+        state,
+        record.id,
+        remaining_nodes,
+        !include_terminal,
+        cancellation,
+    ) {
+        Ok(page) => {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if page.has_more_children {
+                diagnostics.push(invocation_truncated_diagnostic());
+            }
+            if page.live_coverage_incomplete {
+                diagnostics.push(invocation_live_coverage_diagnostic());
+            }
+            let mut children = page.children;
             append_delivery_invocation_children(
                 state,
                 mailbox,
                 record,
-                remaining_nodes,
+                remaining_nodes.saturating_sub(children.len()),
+                cancellation,
                 &mut children,
                 diagnostics,
             );
             order_invocation_children(&mut children, include_terminal);
+            children.truncate(remaining_nodes);
             Some(children)
         }
         Err(err) => {
@@ -305,9 +338,13 @@ fn append_delivery_invocation_children(
     mailbox: Option<&MailboxDb>,
     record: &InvocationRecord,
     limit: usize,
+    cancellation: &CancellationToken,
     children: &mut Vec<InvocationRecord>,
     diagnostics: &mut Vec<MonitorDiagnostic>,
 ) {
+    if limit == 0 {
+        return;
+    }
     let Some(mailbox) = mailbox else {
         return;
     };
@@ -324,6 +361,9 @@ fn append_delivery_invocation_children(
         .map(|child| child.id)
         .collect::<HashSet<_>>();
     for uuid in child_uuids {
+        if cancellation.is_cancelled() {
+            return;
+        }
         match state.get_invocation_by_uuid(&uuid) {
             Ok(Some(child)) if child.id != record.id && child_ids.insert(child.id) => {
                 children.push(child);
@@ -339,8 +379,24 @@ fn append_delivery_invocation_children(
 fn read_invocation_children(
     state: &StateDb,
     record_id: i64,
-) -> Result<Vec<InvocationRecord>, String> {
-    state.list_invocation_children(record_id)
+    limit: usize,
+    prioritize_running: bool,
+    cancellation: &CancellationToken,
+) -> Result<InvocationChildrenPage, String> {
+    if prioritize_running {
+        state.list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            record_id,
+            limit,
+            cancellation,
+        )
+    } else {
+        state.list_invocation_children_bounded_page_with_cancel(
+            record_id,
+            limit,
+            false,
+            cancellation,
+        )
+    }
 }
 
 fn order_invocation_children(children: &mut [InvocationRecord], include_terminal: bool) {
@@ -370,11 +426,15 @@ fn visit_invocation_children(
     active_session_id: Option<String>,
     depth: usize,
     limits: SnapshotLimits,
+    cancellation: &CancellationToken,
     visited: &mut HashSet<i64>,
     projection: &mut InvocationProjection,
     children: Vec<InvocationRecord>,
 ) {
     for child in children {
+        if cancellation.is_cancelled() {
+            return;
+        }
         if child_was_visited(visited, child.id) {
             continue;
         }
@@ -389,6 +449,7 @@ fn visit_invocation_children(
             active_session_id.clone(),
             depth + 1,
             limits,
+            cancellation,
             visited,
             projection,
         );
@@ -585,5 +646,126 @@ fn invocation_truncated_diagnostic() -> MonitorDiagnostic {
         severity: MonitorDiagnosticSeverity::Warning,
         message: "invocation subtree exceeded the snapshot node cap".to_string(),
         node_id: None,
+    }
+}
+
+fn invocation_live_coverage_diagnostic() -> MonitorDiagnostic {
+    MonitorDiagnostic {
+        code: "truncated:invocation-live-coverage".to_string(),
+        severity: MonitorDiagnosticSeverity::Warning,
+        message: "bounded live-descendant scan saturated; active descendants may be omitted"
+            .to_string(),
+        node_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oulipoly_state::InvocationStart;
+
+    #[test]
+    fn invocation_children_never_materializes_the_lookahead_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let root_id = start_invocation(&state, "70000000-0000-4000-8000-000000000000", None);
+        for index in 1..=3 {
+            start_invocation(
+                &state,
+                &format!("70000000-0000-4000-8000-{index:012}"),
+                Some(root_id),
+            );
+        }
+        let root = state
+            .get_invocation_by_uuid("70000000-0000-4000-8000-000000000000")
+            .unwrap()
+            .unwrap();
+        let mut diagnostics = Vec::new();
+
+        let children = invocation_children(
+            &state,
+            None,
+            &root,
+            true,
+            2,
+            &CancellationToken::new(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "truncated:invocation-nodes");
+    }
+
+    #[test]
+    fn invocation_children_disclose_saturated_live_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDb::open(&directory.path().join("state.db")).unwrap();
+        let root_id = start_invocation(&state, "71000000-0000-4000-8000-000000000000", None);
+        for index in 0..8 {
+            let child_id = start_invocation(
+                &state,
+                &format!("71000000-0000-4000-8001-{index:012}"),
+                Some(root_id),
+            );
+            state
+                .finalize_invocation(child_id, true, 0, None, None)
+                .unwrap();
+        }
+        let hidden_ancestor_id = start_invocation(
+            &state,
+            "72000000-0000-4000-8000-000000000000",
+            Some(root_id),
+        );
+        state
+            .finalize_invocation(hidden_ancestor_id, true, 0, None, None)
+            .unwrap();
+        start_invocation(
+            &state,
+            "73000000-0000-4000-8000-000000000000",
+            Some(hidden_ancestor_id),
+        );
+        let root = state
+            .get_invocation_by_uuid("71000000-0000-4000-8000-000000000000")
+            .unwrap()
+            .unwrap();
+        let mut diagnostics = Vec::new();
+
+        let children = invocation_children(
+            &state,
+            None,
+            &root,
+            false,
+            2,
+            &CancellationToken::new(),
+            &mut diagnostics,
+        )
+        .unwrap();
+
+        assert_eq!(children.len(), 2);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "truncated:invocation-nodes")
+        );
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "truncated:invocation-live-coverage"
+                && diagnostic
+                    .message
+                    .contains("active descendants may be omitted")
+        }));
+    }
+
+    fn start_invocation(state: &StateDb, uuid: &str, parent_invocation_id: Option<i64>) -> i64 {
+        state
+            .start_invocation(&InvocationStart {
+                invocation_uuid: uuid.to_string(),
+                model_name: "model-a".to_string(),
+                provider_name: "provider-a".to_string(),
+                provider_index: 0,
+                parent_invocation_id,
+            })
+            .unwrap()
     }
 }

@@ -7,7 +7,7 @@
 use chrono::Utc;
 use oulipoly_state::mailbox::{
     AgentBashCompleteEnqueue, CreateRuntimeGeneration, EnqueueResult, MailboxDb,
-    MailboxDeliveryAttemptDisposition, RuntimeGenerationId, SessionRuntimeUpsert,
+    MailboxDeliveryAttemptDisposition, RuntimeGenerationId, SessionMetadataUpsert,
     WakeClaimAcquireResult, WakeClaimRequest,
 };
 use oulipoly_state::pid_identity::{PidIdentityDb, PidIdentityRecord, ProcessIdentity};
@@ -69,6 +69,7 @@ impl Fixture {
                 .unwrap()
         );
         let claim = mailbox
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: SESSION,
                 claim_token: CLAIM,
@@ -81,6 +82,7 @@ impl Fixture {
         assert!(matches!(claim, WakeClaimAcquireResult::Acquired(_)));
         let generation = RuntimeGenerationId::parse(GENERATION).unwrap();
         mailbox
+            .runtime_lifecycle()
             .create_runtime_generation(CreateRuntimeGeneration {
                 generation_id: &generation,
                 spawn_invocation_uuid: INVOCATION,
@@ -94,13 +96,13 @@ impl Fixture {
             })
             .unwrap();
         mailbox
-            .upsert_session_runtime(SessionRuntimeUpsert {
+            .wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
                 session_id: SESSION,
                 mode: "headless",
                 invocation_uuid: Some(INVOCATION),
                 provider_name: Some("provider-read-only"),
                 model_name: Some("model-read-only"),
-                pty_control_path: None,
                 models_dir: Some("/models/read-only"),
                 effective_cwd: Some("/work/read-only"),
             })
@@ -134,7 +136,11 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].handle, "h-read-only");
     assert_eq!(rows[0].delivery_attempts, 0);
-    let claim = mailbox.wake_claim(SESSION).unwrap().unwrap();
+    let claim = mailbox
+        .wake_session_reader()
+        .wake_claim(SESSION)
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.claim_token, CLAIM);
     assert_eq!(claim.min_pending_seq_at_claim, Some(rows[0].seq));
     assert_eq!(claim.max_pending_seq_at_claim, Some(rows[0].seq));
@@ -153,16 +159,29 @@ fn mailbox_open_read_only_preserves_files_and_recovers_claim_and_attempt_history
         [rows[0].seq]
     );
     let generation = mailbox
+        .runtime_lifecycle_reader()
         .runtime_generation(&RuntimeGenerationId::parse(GENERATION).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(generation.spawn_invocation_uuid, INVOCATION);
     assert_eq!(generation.session_id.as_deref(), Some(SESSION));
     assert_eq!(generation.provider_name, "provider-read-only");
-    let runtime = mailbox.session_runtime(SESSION).unwrap().unwrap();
-    assert_eq!(runtime.invocation_uuid.as_deref(), Some(INVOCATION));
-    assert_eq!(runtime.run_state, "idle");
-    assert_eq!(runtime.provider_name.as_deref(), Some("provider-read-only"));
+    let metadata = mailbox
+        .wake_session_reader()
+        .session_metadata(SESSION)
+        .unwrap()
+        .unwrap();
+    let projection = mailbox
+        .wake_session_reader()
+        .legacy_runtime_projection(SESSION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.invocation_uuid.as_deref(), Some(INVOCATION));
+    assert_eq!(projection.run_state, "idle");
+    assert_eq!(
+        metadata.provider_name.as_deref(),
+        Some("provider-read-only")
+    );
     drop(mailbox);
 
     assert_physical_snapshot_unchanged(&before, &physical_snapshot(parent));
@@ -214,6 +233,99 @@ fn mailbox_open_read_only_recovers_committed_wal_state_without_mutating_source()
     assert_eq!(rows[1].handle, "h-committed-in-wal");
     drop(mailbox);
     assert_physical_snapshot_unchanged(&before, &physical_snapshot(parent));
+    drop(writer);
+}
+
+#[cfg(unix)]
+#[test]
+fn mailbox_open_read_only_through_leaf_symlink_recovers_canonical_wal_state() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = Fixture::seeded();
+    let alias_path = fixture.sidecar_path.with_file_name("pid-identity-alias.db");
+    let mut writer = MailboxDb::open(&fixture.sidecar_path).unwrap();
+    writer
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: SESSION,
+            handle: "h-canonical-wal",
+            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete","wal":true}"#,
+            owner_invocation_uuid: Some(INVOCATION),
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "/wal/state",
+            meta_path: "/wal/meta.json",
+            log_path: "/wal/log",
+            rc_path: "/wal/rc",
+            rc: 0,
+        })
+        .unwrap();
+    assert!(path_with_suffix(&fixture.sidecar_path, "-wal").exists());
+    symlink(&fixture.sidecar_path, &alias_path).unwrap();
+    let before = physical_snapshot(fixture.sidecar_path.parent().unwrap());
+
+    let mailbox = MailboxDb::open_read_only(&alias_path).unwrap();
+    let rows = mailbox.list_mailbox(SESSION, true).unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].handle, "h-canonical-wal");
+    drop(mailbox);
+    assert_physical_snapshot_unchanged(
+        &before,
+        &physical_snapshot(fixture.sidecar_path.parent().unwrap()),
+    );
+    drop(writer);
+}
+
+#[test]
+fn mailbox_open_read_only_rejects_multi_link_database_identity() {
+    let fixture = Fixture::seeded();
+    let alias_path = fixture
+        .sidecar_path
+        .with_file_name("pid-identity-hard-link.db");
+    std::fs::hard_link(&fixture.sidecar_path, &alias_path).unwrap();
+
+    let result = MailboxDb::open_read_only(&alias_path);
+
+    assert!(
+        result.is_err(),
+        "multi-link SQLite identity must be rejected"
+    );
+}
+
+#[test]
+fn mailbox_open_read_only_rejects_multi_link_wal_identity() {
+    let fixture = Fixture::seeded();
+    let mut writer = MailboxDb::open(&fixture.sidecar_path).unwrap();
+    writer
+        .enqueue_agent_bash_complete(&AgentBashCompleteEnqueue {
+            session_id: SESSION,
+            handle: "h-multi-link-wal",
+            payload_json: r#"{"schema_version":1,"kind":"agent_bash_complete","wal":true}"#,
+            owner_invocation_uuid: Some(INVOCATION),
+            matched_os_pid: None,
+            matched_os_boot_id: None,
+            matched_os_pid_starttime_ticks: None,
+            matched_chain_index: None,
+            state_dir: "/wal/state",
+            meta_path: "/wal/meta.json",
+            log_path: "/wal/log",
+            rc_path: "/wal/rc",
+            rc: 0,
+        })
+        .unwrap();
+    let wal = path_with_suffix(&fixture.sidecar_path, "-wal");
+    let second_link = fixture.sidecar_path.with_file_name("linked-wal");
+    assert!(wal.exists());
+    std::fs::hard_link(&wal, &second_link).unwrap();
+
+    let result = MailboxDb::open_read_only(&fixture.sidecar_path);
+
+    assert!(
+        result.is_err(),
+        "a multi-link WAL must be rejected like a multi-link main database"
+    );
     drop(writer);
 }
 
@@ -282,6 +394,61 @@ fn state_open_read_only_recovers_committed_wal_invocation_and_turn_without_mutat
     drop(writer);
 }
 
+#[cfg(unix)]
+#[test]
+fn state_open_read_only_leaf_symlink_uses_only_canonical_sidecars() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let state_path = data_dir.join("state.db");
+    let alias_path = data_dir.join("state-alias.db");
+    let initial = StateDb::open(&state_path).unwrap();
+    initial
+        .start_invocation(&InvocationStart {
+            invocation_uuid: INVOCATION.to_string(),
+            model_name: "model-before-wal".to_string(),
+            provider_name: "provider-read-only".to_string(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
+        .unwrap();
+    drop(initial);
+
+    let writer = Connection::open(&state_path).unwrap();
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    writer
+        .execute(
+            "UPDATE invocations SET model_name = 'model-in-canonical-wal' WHERE invocation_uuid = ?1",
+            [INVOCATION],
+        )
+        .unwrap();
+    assert!(path_with_suffix(&state_path, "-wal").exists());
+    symlink(&state_path, &alias_path).unwrap();
+    let alias_wal = path_with_suffix(&alias_path, "-wal");
+    std::fs::write(&alias_wal, "unrelated alias artifact").unwrap();
+    let mut permissions = std::fs::metadata(&alias_wal).unwrap().permissions();
+    permissions.set_mode(0o000);
+    std::fs::set_permissions(&alias_wal, permissions).unwrap();
+
+    let state = StateDb::open_read_only(&alias_path).unwrap();
+    let invocation = state.get_invocation_by_uuid(INVOCATION).unwrap().unwrap();
+
+    assert_eq!(invocation.model_name, "model-in-canonical-wal");
+    assert_eq!(state.path(), state_path.canonicalize().unwrap());
+    let reopened = StateDb::open_read_only(state.path()).unwrap();
+    let reopened_invocation = reopened
+        .get_invocation_by_uuid(INVOCATION)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_invocation.model_name, "model-in-canonical-wal");
+    drop(reopened);
+    drop(state);
+    drop(writer);
+}
+
 #[test]
 fn read_only_missing_paths_for_all_facades_create_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -323,7 +490,6 @@ fn pid_identity_open_read_only_preserves_source_and_recovers_exact_identity() {
             recorded_at: "2026-08-07T00:00:00Z",
         })
         .unwrap();
-    drop(writer);
     let before = physical_snapshot(dir.path());
 
     let pid = PidIdentityDb::open_read_only(&sidecar_path).unwrap();
@@ -334,6 +500,7 @@ fn pid_identity_open_read_only_preserves_source_and_recovers_exact_identity() {
     assert_eq!(row.identity(), identity);
     drop(pid);
     assert_physical_snapshot_unchanged(&before, &physical_snapshot(dir.path()));
+    drop(writer);
 }
 
 #[test]

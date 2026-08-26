@@ -313,7 +313,12 @@ impl ProviderClient {
         let outcome = self.run_launch_resolved(&resolved, request, envs)?;
         let diagnostics = launch_diagnostics(&outcome);
         self.record_process_state(&outcome, &diagnostics);
-        parse_launch_output(outcome.stdout, diagnostics, outcome.status)
+        parse_launch_output(
+            outcome.stdout,
+            diagnostics,
+            outcome.status,
+            request_id.as_deref(),
+        )
     }
 
     fn record_process_state<T: StdoutDrainOutput>(
@@ -694,14 +699,56 @@ fn parse_launch_output(
     stdout: LaunchStdoutDrain,
     diagnostics: ProviderDiagnostics,
     status: ProcessStatus,
+    request_id: Option<&str>,
 ) -> Result<LaunchResult, ProviderClientError> {
+    let captured_stdout = stdout.captured_bytes();
     match stdout.result {
         Ok(mut result) => {
             result.diagnostics = diagnostics.clone();
             Ok(result)
         }
-        Err(error) => Err(error.with_process_context(diagnostics, status)),
+        Err(error) => {
+            if let Some(capability_error) =
+                launch_capability_error(&captured_stdout.bytes, &diagnostics, &status, request_id)
+            {
+                return Err(capability_error);
+            }
+            Err(error.with_process_context(diagnostics, status))
+        }
     }
+}
+
+fn launch_capability_error(
+    stdout: &[u8],
+    diagnostics: &ProviderDiagnostics,
+    status: &ProcessStatus,
+    request_id: Option<&str>,
+) -> Option<ProviderClientError> {
+    if diagnostics.stdout.truncated {
+        return None;
+    }
+    let envelope = serde_json::from_slice::<Value>(stdout).ok()?;
+    if response_envelope_ok(&envelope) != Some(false) {
+        return None;
+    }
+    if let Err(error) = check_contract_and_request(
+        &envelope,
+        request_id.unwrap_or_default(),
+        "launch",
+        diagnostics.clone(),
+    ) {
+        return Some(error.with_process_context(diagnostics.clone(), status.clone()));
+    }
+    Some(
+        ProviderCapabilityError::from_valid_envelope(
+            "launch",
+            envelope,
+            diagnostics.clone(),
+            Some(status.clone()),
+        )
+        .map(ProviderClientError::from_capability)
+        .unwrap_or_else(|error| error),
+    )
 }
 
 fn serialize_request_bytes(

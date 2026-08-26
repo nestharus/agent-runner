@@ -12,7 +12,8 @@ pub(super) fn acquire_wake_claim(
     input: StartWakeInput<'_>,
     claim_token: &str,
 ) -> Result<WakeClaimAcquireResult, String> {
-    db.try_acquire_or_renew_wake_claim(wake_claim_request(input, claim_token), input.renew_token)
+    db.wake_sessions()
+        .try_acquire_startable_wake_claim(wake_claim_request(input, claim_token), input.renew_token)
 }
 
 fn wake_claim_request<'a>(input: StartWakeInput<'a>, claim_token: &'a str) -> WakeClaimRequest<'a> {

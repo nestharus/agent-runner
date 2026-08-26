@@ -43,6 +43,41 @@ fn avoids_errored_providers() {
     assert_eq!(select_provider(&model, &db, None).unwrap(), 1);
 }
 
+#[test]
+fn failing_idle_provider_does_not_monopolize_nested_dispatch_while_healthy_provider_is_live() {
+    let db = StateDb::open(Path::new(":memory:")).unwrap();
+    let model = two_provider_model();
+
+    for _ in 0..ERROR_THRESHOLD {
+        record_invocation_for_test(&db, &model.name, "a", 0, false);
+    }
+    db.start_invocation(&invocation_start_for_test(&model.name, "b", 1))
+        .unwrap();
+
+    assert_eq!(
+        select_provider(&model, &db, None).unwrap(),
+        1,
+        "recent-error suppression must run before least-live-load restriction"
+    );
+}
+
+#[test]
+fn live_parent_on_every_provider_does_not_create_a_provider_capacity_cap() {
+    let db = StateDb::open(Path::new(":memory:")).unwrap();
+    let model = two_provider_model();
+
+    for (provider_index, provider_name) in [(0, "a"), (1, "b")] {
+        db.start_invocation(&invocation_start_for_test(
+            &model.name,
+            provider_name,
+            provider_index,
+        ))
+        .unwrap();
+    }
+
+    assert!(select_provider(&model, &db, None).is_ok());
+}
+
 // Risk: Balancer recent-error call-site | level: unit
 // Source: ~/projects/agent-runner/planning/trunk/proposals/10-routing-alpha-skipped.md §Test-intent track
 #[test]

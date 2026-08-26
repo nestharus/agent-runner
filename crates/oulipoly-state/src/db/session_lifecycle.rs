@@ -378,6 +378,10 @@ pub trait SessionLifecycleRepository {
         &mut self,
         evidence: &DeliveryEvidence,
     ) -> SessionLifecycleResult<AcknowledgementWrite>;
+    fn accept_pending_with_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite>;
     fn delivery_evidence(
         &self,
         evidence_id: &str,
@@ -1011,6 +1015,67 @@ impl SessionLifecycleRepository for StateDb {
             } else {
                 Err(SessionLifecycleError::Conflict("delivery evidence"))
             };
+        }
+        tx.execute(
+            "INSERT INTO session_delivery_evidence (
+                evidence_id, evidence_kind, delivery_id, session_id,
+                turn_generation_id, observed_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+            params![
+                evidence.evidence_id,
+                evidence.kind.as_str(),
+                evidence.delivery_id,
+                evidence.session_id,
+                evidence.turn_generation_id,
+                evidence.observed_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(AcknowledgementWrite::Advanced)
+    }
+
+    fn accept_pending_with_delivery_evidence(
+        &mut self,
+        evidence: &DeliveryEvidence,
+    ) -> SessionLifecycleResult<AcknowledgementWrite> {
+        validate_delivery_evidence(evidence)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let acknowledgement = read_acknowledgement(&tx, &evidence.delivery_id)?;
+        let acknowledgement_inserted = match acknowledgement {
+            Some(existing)
+                if existing.session_id == evidence.session_id
+                    && existing.turn_generation_id == evidence.turn_generation_id =>
+            {
+                false
+            }
+            Some(_) => return Err(SessionLifecycleError::FenceMismatch),
+            None => {
+                tx.execute(
+                    "INSERT INTO session_delivery_acknowledgements (
+                        delivery_id, session_id, turn_generation_id, accepted_at
+                     ) VALUES (?, ?, ?, ?)",
+                    params![
+                        evidence.delivery_id,
+                        evidence.session_id,
+                        evidence.turn_generation_id,
+                        evidence.observed_at,
+                    ],
+                )?;
+                true
+            }
+        };
+        if let Some(existing) = read_delivery_evidence(&tx, &evidence.evidence_id)? {
+            if existing != *evidence {
+                return Err(SessionLifecycleError::Conflict("delivery evidence"));
+            }
+            tx.commit()?;
+            return Ok(if acknowledgement_inserted {
+                AcknowledgementWrite::Advanced
+            } else {
+                AcknowledgementWrite::AlreadyRecorded
+            });
         }
         tx.execute(
             "INSERT INTO session_delivery_evidence (

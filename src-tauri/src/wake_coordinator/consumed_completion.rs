@@ -30,39 +30,17 @@ pub(super) fn reconcile_late_consumed_completions_on(
         let Some(owner) = completion_owner(&row) else {
             continue;
         };
-        let Some(event_id) = db.acknowledge_consumed_completion_event_for_mailbox_seq(
+        db.acknowledge_consumed_completion_event_for_mailbox_seq(
             row.seq,
             &owner.owner_session_id,
             &owner.owner_invocation_uuid,
-        )?
-        else {
-            continue;
-        };
-        emit_late_consumed_completion_acknowledgement(&row, &event_id);
+        )?;
     }
     Ok(())
 }
 
 fn late_consumed_completion_candidate(row: &MailboxRow) -> bool {
     row.kind == AGENT_BASH_COMPLETE_KIND && consumed_marker_is_regular_file(row)
-}
-
-fn emit_late_consumed_completion_acknowledgement(row: &MailboxRow, event_id: &str) {
-    eprintln!(
-        "{}",
-        format_late_consumed_completion_acknowledgement(row, event_id)
-    );
-}
-
-fn format_late_consumed_completion_acknowledgement(row: &MailboxRow, event_id: &str) -> String {
-    format!(
-        "late_consumed_completion_acknowledged session_id={} seq={} event_id={} handle={} owner_invocation_uuid={}",
-        row.session_id,
-        row.seq,
-        event_id,
-        row.handle,
-        row.owner_invocation_uuid.as_deref().unwrap_or("unknown"),
-    )
 }
 
 fn completion_owner(row: &MailboxRow) -> Option<CompletionOwner> {

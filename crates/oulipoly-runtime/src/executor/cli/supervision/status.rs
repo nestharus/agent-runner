@@ -16,16 +16,10 @@
 //! ```
 
 use super::errors::{
-    live_quota_try_wait_error, poll_child_status_error, reap_child_process_error,
-    terminate_try_wait_error, termination_grace_try_wait_error,
+    live_quota_try_wait_error, reap_child_process_error, terminate_try_wait_error,
+    termination_grace_try_wait_error,
 };
 use std::process::{Child, ExitStatus};
-
-pub(super) fn poll_child_status(child: &mut Child) -> Result<Option<ExitStatus>, String> {
-    child
-        .try_wait()
-        .map_err(|err| poll_child_status_error(&err))
-}
 
 pub(super) fn try_wait_before_live_quota_terminate(
     child: &mut Child,

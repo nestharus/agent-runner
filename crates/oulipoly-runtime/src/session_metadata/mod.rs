@@ -703,7 +703,7 @@ pub fn resolve_resume_workspace_root(
 ) -> Result<PathBuf, MetadataError> {
     let provider = effective_provider_for_resolved(resolved, providers_cfg)?;
     if resolved_uses_external_provider(resolved)
-        && let Some(workspace_root) = session_runtime_workspace_root(resolved)?
+        && let Some(workspace_root) = stored_session_workspace_root(resolved)?
     {
         return Ok(workspace_root);
     }
@@ -716,7 +716,7 @@ pub fn resolve_resume_workspace_root(
     {
         return Ok(workspace_root);
     }
-    if let Some(workspace_root) = session_runtime_workspace_root(resolved)? {
+    if let Some(workspace_root) = stored_session_workspace_root(resolved)? {
         return Ok(workspace_root);
     }
     resolve_cwd_from_session_storage(
@@ -726,20 +726,21 @@ pub fn resolve_resume_workspace_root(
     )
 }
 
-fn session_runtime_workspace_root(
+fn stored_session_workspace_root(
     resolved: &oulipoly_state::ResolvedResume,
 ) -> Result<Option<PathBuf>, MetadataError> {
-    let Some(db) = external_session_runtime_db()? else {
+    let Some(db) = external_session_metadata_db()? else {
         return Ok(None);
     };
     let Some(row) = db
-        .session_runtime(&resolved.active_session_id)
-        .map_err(external_session_runtime_error)?
+        .wake_session_reader()
+        .session_metadata(&resolved.active_session_id)
+        .map_err(external_session_metadata_error)?
     else {
         return Ok(None);
     };
     row.effective_cwd
-        .map(|value| validate_stored_workspace_root(value, "session_runtime_effective_cwd"))
+        .map(|value| validate_stored_workspace_root(value, "session_metadata_effective_cwd"))
         .transpose()
 }
 
@@ -764,10 +765,10 @@ fn supports_invocation_workspace_fallback(session_storage: Option<&SessionStorag
     matches!(session_storage, Some(SessionStorage::Script { .. }))
 }
 
-fn external_session_runtime_db() -> Result<Option<oulipoly_state::mailbox::MailboxDb>, MetadataError>
-{
+fn external_session_metadata_db()
+-> Result<Option<oulipoly_state::mailbox::MailboxDb>, MetadataError> {
     oulipoly_state::mailbox::MailboxDb::open_default_if_exists()
-        .map_err(external_session_runtime_error)
+        .map_err(external_session_metadata_error)
 }
 
 fn validate_stored_workspace_root(value: String, source: &str) -> Result<PathBuf, MetadataError> {
@@ -803,7 +804,7 @@ fn stored_workspace_root_not_absolute_message(path: &std::path::Path, source: &s
     format!("{source}_not_absolute: {}", path.display())
 }
 
-fn external_session_runtime_error(message: String) -> MetadataError {
+fn external_session_metadata_error(message: String) -> MetadataError {
     MetadataError::Operational { message }
 }
 

@@ -87,13 +87,13 @@ fn wake_sweep_does_not_resurrect_abandoned_transient_session() {
 }
 
 #[test]
-fn wake_sweep_reaps_non_resumable_abandoned_transient_session() {
-    cases_batch_sweep::wake_sweep_reaps_non_resumable_abandoned_transient_session();
+fn wake_sweep_retains_non_resumable_abandoned_transient_session() {
+    cases_batch_sweep::wake_sweep_retains_non_resumable_abandoned_transient_session();
 }
 
 #[test]
-fn wake_sweep_reaps_dead_owner_session_with_chain_but_no_turns() {
-    cases_batch_sweep::wake_sweep_reaps_dead_owner_session_with_chain_but_no_turns();
+fn wake_sweep_retains_dead_owner_session_with_chain_but_no_turns() {
+    cases_batch_sweep::wake_sweep_retains_dead_owner_session_with_chain_but_no_turns();
 }
 
 #[test]
@@ -128,6 +128,6 @@ fn wake_sweep_skips_twice_unconfirmed_rows_and_delivers_newer_pending_mailbox() 
 }
 
 #[test]
-fn wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris() {
-    cases_wake_backlog::wake_sweep_backlog_recovers_recent_leak_and_reaps_dead_owner_debris();
+fn wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris() {
+    cases_wake_backlog::wake_sweep_backlog_recovers_recent_leak_and_retains_dead_owner_debris();
 }

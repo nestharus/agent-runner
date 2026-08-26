@@ -4,24 +4,25 @@
 
 use oulipoly_state::StateDb;
 use oulipoly_state::mailbox::{
-    MailboxDb, MailboxRow, SessionGenerationProjection, SessionRuntimeRow, WakeSweepCandidate,
+    MailboxDb, MailboxRow, SessionGenerationProjection, SessionMetadataRow, WakeSweepCandidate,
 };
 use oulipoly_state::pid_identity::{ProcessIdentity, read_live_process_identity};
 
 use super::{WakeSweepDisposition, consumed};
 
 pub(super) fn wake_sweep_candidate_disposition(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
 ) -> Result<WakeSweepDisposition, String> {
     // Recoverable means either an idle headless runtime with durable resume
     // evidence, or a live owner PID identity that must not be reaped. Missing
-    // runtime/history with no live owner is abandoned debris, not resumable work.
+    // runtime/history with no live owner is retained abandoned debris, not
+    // resumable work.
     if db.notifications_paused(&candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
-    if consumed::pending_mailbox_consumed_marker_present(db, &candidate.session_id) {
+    if consumed::pending_mailbox_consumed_marker_present(db, state, &candidate.session_id)? {
         return Ok(WakeSweepDisposition::Skip);
     }
     if wake_sweep_candidate_is_unclaimed_abandoned_transient(db, &candidate.session_id)? {
@@ -39,8 +40,9 @@ pub(super) fn wake_sweep_candidate_disposition(
 /// Disposition for an unclaimed session whose pending rows all have a dead owner
 /// PID lineage. Such a session is never auto-woken (anti-resurrection, #44/#55).
 /// When it also has no durable resume evidence, its pending rows are
-/// undeliverable debris and are reaped so they do not accumulate; a resumable
-/// session is left pending so a later deliberate resume can still consume it.
+/// undeliverable debris and are retained pending under the fail-closed policy;
+/// a resumable session is also left pending so a later deliberate resume can
+/// still consume it.
 fn abandoned_transient_disposition(
     db: &MailboxDb,
     state: Option<&StateDb>,
@@ -48,13 +50,13 @@ fn abandoned_transient_disposition(
 ) -> Result<WakeSweepDisposition, String> {
     // Preserve only sessions with durable WORK — at least one produced assistant
     // turn. A bare resume target (a registered chain segment with zero turns) is
-    // an empty registration, not work, so a dead-owner session with no produced
-    // turns is reaped rather than left pending forever.
+    // an empty registration, not work. Both cases remain pending because this
+    // scope assigns no terminal abandonment authority.
     if wake_sweep_candidate_has_produced_turns(db, state, candidate)? {
         trace_abandoned_transient_wake_skip(&candidate.session_id);
         return Ok(WakeSweepDisposition::Skip);
     }
-    trace_abandoned_transient_wake_reap(&candidate.session_id);
+    trace_abandoned_transient_wake_retained(&candidate.session_id);
     Ok(WakeSweepDisposition::Abandoned)
 }
 
@@ -98,12 +100,20 @@ fn option_is_present<T>(value: Option<T>) -> bool {
 }
 
 fn wake_sweep_candidate_resumable_runtime(
-    db: &MailboxDb,
+    db: &mut MailboxDb,
     state: Option<&StateDb>,
     candidate: &WakeSweepCandidate,
-) -> Result<Option<SessionRuntimeRow>, String> {
+) -> Result<Option<SessionMetadataRow>, String> {
+    if db
+        .runtime_lifecycle()
+        .reconcile_session_liveness(&candidate.session_id)?
+        == oulipoly_state::mailbox::SessionLiveness::Busy
+    {
+        return Ok(None);
+    }
     if !matches!(
-        db.session_generation_projection(&candidate.session_id)
+        db.runtime_lifecycle_reader()
+            .session_generation_projection(&candidate.session_id)
             .map_err(|err| err.to_string())?,
         SessionGenerationProjection::None
     ) {
@@ -122,13 +132,14 @@ fn wake_sweep_candidate_resumable_runtime(
 fn wake_sweep_candidate_runtime(
     db: &MailboxDb,
     candidate: &WakeSweepCandidate,
-) -> Result<Option<SessionRuntimeRow>, String> {
-    db.session_runtime(&candidate.session_id)
+) -> Result<Option<SessionMetadataRow>, String> {
+    db.wake_session_reader()
+        .session_metadata(&candidate.session_id)
 }
 
 fn wake_sweep_runtime_is_resumable(
     state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> Result<bool, String> {
     if !wake_sweep_runtime_can_resume(runtime) {
         return Ok(false);
@@ -136,9 +147,8 @@ fn wake_sweep_runtime_is_resumable(
     wake_sweep_runtime_has_resume_evidence(state, runtime)
 }
 
-fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
+fn wake_sweep_runtime_can_resume(runtime: &SessionMetadataRow) -> bool {
     runtime.mode == "headless"
-        && runtime.run_state != "running"
         && runtime
             .provider_name
             .as_deref()
@@ -147,7 +157,7 @@ fn wake_sweep_runtime_can_resume(runtime: &SessionRuntimeRow) -> bool {
 
 fn wake_sweep_runtime_has_resume_evidence(
     state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> Result<bool, String> {
     let evidence = wake_sweep_runtime_resume_evidence_values(state, runtime)?;
     Ok(resume_evidence_values_present(evidence))
@@ -155,7 +165,7 @@ fn wake_sweep_runtime_has_resume_evidence(
 
 fn wake_sweep_runtime_resume_evidence_values(
     state: Option<&StateDb>,
-    runtime: &SessionRuntimeRow,
+    runtime: &SessionMetadataRow,
 ) -> Result<Option<(bool, u64)>, String> {
     let Some(state) = state else {
         return Ok(None);
@@ -231,7 +241,9 @@ fn wake_sweep_candidate_is_unclaimed_abandoned_transient(
 }
 
 fn wake_sweep_candidate_has_wake_claim(db: &MailboxDb, session_id: &str) -> Result<bool, String> {
-    db.wake_claim(session_id).map(option_is_present)
+    db.wake_session_reader()
+        .wake_claim(session_id)
+        .map(option_is_present)
 }
 
 fn pending_rows_are_abandoned_transient(rows: &[MailboxRow]) -> Result<bool, String> {
@@ -280,9 +292,9 @@ fn trace_abandoned_transient_wake_skip(session_id: &str) {
     );
 }
 
-fn trace_abandoned_transient_wake_reap(session_id: &str) {
+fn trace_abandoned_transient_wake_retained(session_id: &str) {
     tracing::warn!(
         session_id,
-        "Reaping abandoned transient session with dead owner lineage and no resume evidence"
+        "Retaining abandoned transient session with dead owner lineage and no resume evidence"
     );
 }

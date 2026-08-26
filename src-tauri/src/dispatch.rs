@@ -89,12 +89,11 @@ pub(crate) use predicate::{
 };
 
 pub(crate) fn run(cli: Cli) -> Result<i32, String> {
-    // Keep inspection-only listing ahead of startup recovery and provider dispatch.
-    if let Some(Subcommands::Session {
-        command: SessionSubcommands::List { json },
-    }) = &cli.command
+    // Keep read-only session inspection ahead of startup recovery and provider dispatch.
+    if let Some(Subcommands::Session { command }) = &cli.command
+        && let Some(result) = dispatch_inspection_only_session(command)
     {
-        return crate::commands::session_list::run_session_list(*json);
+        return result;
     }
 
     // Maintenance must not trigger wake recovery before it inspects or compacts storage.
@@ -108,9 +107,16 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     if let Err(err) = recover_pending_session_replaces() {
         return Ok(handle_pending_session_replace_error(&err));
     }
-    if startup_wake_reclaim_sweep_enabled(&cli) {
-        crate::wake_coordinator::run_startup_wake_reclaim_sweep();
-    }
+    let _startup_wake_reclaim_guard = if startup_wake_reclaim_sweep_enabled(&cli) {
+        if provider_launch_schedules_startup_wake_reclaim(&cli) {
+            crate::wake_coordinator::start_startup_wake_reclaim_sweep()
+        } else {
+            crate::wake_coordinator::run_startup_wake_reclaim_sweep();
+            None
+        }
+    } else {
+        None
+    };
 
     if cli.new {
         return run_default_provider_repl(&cli);
@@ -145,6 +151,28 @@ pub(crate) fn run(cli: Cli) -> Result<i32, String> {
     crate::commands::direct_model::run_agent_cli(&cli, &agent_runtime_services)
 }
 
+fn dispatch_inspection_only_session(command: &SessionSubcommands) -> Option<Result<i32, String>> {
+    match command {
+        SessionSubcommands::List { json } => {
+            Some(crate::commands::session_list::run_session_list(*json))
+        }
+        SessionSubcommands::OfPid { pid, json } => {
+            Some(crate::commands::pid_session::run_of_pid(*pid, *json))
+        }
+        SessionSubcommands::Alive { pid, json } => {
+            Some(crate::commands::pid_session::run_alive(*pid, *json))
+        }
+        SessionSubcommands::Subtree {
+            pid,
+            json,
+            max_depth,
+        } => Some(crate::commands::pid_session::run_subtree(
+            *pid, *json, *max_depth,
+        )),
+        _ => None,
+    }
+}
+
 fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
     if cli.resume.is_some() {
         return false;
@@ -158,6 +186,13 @@ fn startup_wake_reclaim_sweep_enabled(cli: &Cli) -> bool {
                 ..
             })
     )
+}
+
+fn provider_launch_schedules_startup_wake_reclaim(cli: &Cli) -> bool {
+    if cli.usage {
+        return false;
+    }
+    cli.command.is_none() || matches!(&cli.command, Some(Subcommands::Repl { resume: None, .. }))
 }
 
 fn recover_pending_session_replaces() -> Result<(), session_replace::ReplaceError> {
@@ -186,6 +221,7 @@ fn pending_session_replace_exit_code(err: &session_replace::ReplaceError) -> i32
 }
 
 fn run_default_provider_repl(cli: &Cli) -> Result<i32, String> {
+    crate::wake_coordinator::start_wake_reclaim_maintenance_driver();
     run_default_provider_repl_for_project(cli.project.clone())
 }
 
@@ -193,7 +229,10 @@ fn run_default_provider_repl_for_project(
     project: Option<std::path::PathBuf>,
 ) -> Result<i32, String> {
     let services = oulipoly_runtime::repl_default_provider::RuntimeServices::production(project)?;
-    oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(services)
+    oulipoly_runtime::repl_default_provider::run_repl_with_default_provider(
+        services,
+        |invocation| crate::wake_coordinator::admit_session_launch(&invocation.id, None),
+    )
 }
 
 fn run_usage_command(
@@ -323,6 +362,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
             meta,
             log,
             rc,
+            repair_admitted,
             json,
         } => crate::commands::notify::run_agent_bash_register(
             crate::commands::notify::AgentBashRegisterArgs {
@@ -332,6 +372,7 @@ fn dispatch_notify_subcommand(command: NotifySubcommands) -> Result<i32, String>
                 meta: &meta,
                 log: &log,
                 rc: &rc,
+                repair_admitted,
                 json,
             },
         ),
@@ -722,6 +763,28 @@ mod tests {
         .unwrap();
 
         assert!(!startup_wake_reclaim_sweep_enabled(&cli));
+    }
+
+    #[test]
+    fn provider_launch_schedules_startup_recovery_but_mailbox_inspection_does_not() {
+        let launch = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "-m",
+            "fixture-model",
+            "fixture prompt",
+        ])
+        .unwrap();
+        let mailbox = Cli::try_parse_from([
+            "oulipoly-agent-runner",
+            "mailbox",
+            "list",
+            "--session-id",
+            "fixture-session",
+        ])
+        .unwrap();
+
+        assert!(provider_launch_schedules_startup_wake_reclaim(&launch));
+        assert!(!provider_launch_schedules_startup_wake_reclaim(&mailbox));
     }
 
     fn assert_resume_debug_contains_option_field(

@@ -131,7 +131,7 @@ fn classify_file_open_unreadable(result: std::io::Result<std::fs::File>) -> bool
 }
 
 impl StateDb {
-    pub(super) fn validate_read_only_paths(path: &Path) -> Result<(), ReadOnlyOpenError> {
+    pub(super) fn validate_read_only_paths(path: &Path) -> Result<PathBuf, ReadOnlyOpenError> {
         if !path.exists() {
             return Err(ReadOnlyOpenError::Missing {
                 path: path.to_path_buf(),
@@ -142,7 +142,12 @@ impl StateDb {
                 path: path.to_path_buf(),
             });
         }
-        Self::validate_read_only_sidecars(path)
+        let canonical =
+            std::fs::canonicalize(path).map_err(|error| ReadOnlyOpenError::Operational {
+                message: format!("Failed to resolve read-only SQLite database identity: {error}"),
+            })?;
+        Self::validate_read_only_sidecars(&canonical)?;
+        Ok(canonical)
     }
 
     pub(super) fn validate_read_only_sidecars(path: &Path) -> Result<(), ReadOnlyOpenError> {
@@ -156,6 +161,7 @@ impl StateDb {
 
     pub(super) fn open_read_only_connection(
         path: &Path,
+        is_cancelled: &dyn Fn() -> bool,
     ) -> Result<
         (
             sqlite::Connection,
@@ -164,10 +170,66 @@ impl StateDb {
         ReadOnlyOpenError,
     > {
         let snapshot =
-            crate::read_only_snapshot::ReadOnlySnapshot::create(path).map_err(|err| {
-                ReadOnlyOpenError::Operational {
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_cancel(path, is_cancelled)
+                .map_err(|err| ReadOnlyOpenError::Operational {
                     message: format!("Failed to snapshot read-only SQLite database: {err}"),
-                }
+                })?;
+        let conn = sqlite::Connection::open_with_flags(
+            snapshot.path(),
+            sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| classify_read_only_open_error(path, err))?;
+        Ok((conn, snapshot))
+    }
+
+    pub(super) fn open_read_only_connection_with_retry_timeout(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<
+        (
+            sqlite::Connection,
+            crate::read_only_snapshot::ReadOnlySnapshot,
+        ),
+        ReadOnlyOpenError,
+    > {
+        let snapshot = crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_timeout(
+            path,
+            retry_timeout,
+            is_cancelled,
+        )
+        .map_err(|err| ReadOnlyOpenError::Operational {
+            message: format!("Failed to snapshot read-only SQLite database: {err}"),
+        })?;
+        let conn = sqlite::Connection::open_with_flags(
+            snapshot.path(),
+            sqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|err| classify_read_only_open_error(path, err))?;
+        Ok((conn, snapshot))
+    }
+
+    pub(super) fn open_read_only_connection_with_retry_and_work_timeout(
+        path: &Path,
+        retry_timeout: std::time::Duration,
+        work_timeout: std::time::Duration,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<
+        (
+            sqlite::Connection,
+            crate::read_only_snapshot::ReadOnlySnapshot,
+        ),
+        ReadOnlyOpenError,
+    > {
+        let snapshot =
+            crate::read_only_snapshot::ReadOnlySnapshot::create_with_retry_and_work_timeout(
+                path,
+                retry_timeout,
+                work_timeout,
+                is_cancelled,
+            )
+            .map_err(|err| ReadOnlyOpenError::Operational {
+                message: format!("Failed to snapshot read-only SQLite database: {err}"),
             })?;
         let conn = sqlite::Connection::open_with_flags(
             snapshot.path(),

@@ -26,6 +26,147 @@
 
 use super::{StateDb, sqlite};
 use chrono::{DateTime, Utc};
+use oulipoly_core::CancellationToken;
+
+const INVOCATION_QUERY_PROGRESS_OPS: i32 = 100;
+// Inspect a finite window beyond the rendered node budget so terminal ancestors of
+// active descendants are preferred without returning to a global running-row seed.
+const RUNNING_DESCENDANT_CANDIDATE_FACTOR: usize = 4;
+const RUNNING_DESCENDANT_SCAN_FACTOR: usize = 8;
+const RUNNING_DESCENDANT_CANDIDATES_SQL: &str = "SELECT id
+     FROM invocations INDEXED BY idx_invocations_parent_running_created
+     WHERE parent_invocation_id = ?1
+     ORDER BY (status = 'running') DESC, created_at, id
+     LIMIT ?2";
+const RUNNING_DESCENDANT_EXISTS_SQL: &str = "WITH RECURSIVE descendants(id, status) AS (
+         SELECT id, status
+         FROM invocations
+         WHERE id = ?1
+         UNION
+         SELECT child.id, child.status
+         FROM invocations AS child INDEXED BY idx_invocations_parent
+         JOIN descendants AS parent ON child.parent_invocation_id = parent.id
+         WHERE parent.status != 'running'
+         LIMIT ?2
+     )
+     SELECT EXISTS(SELECT 1 FROM descendants WHERE status = 'running'),
+            COUNT(*)
+     FROM descendants";
+const INVOCATION_CHILDREN_OVERFLOW_SQL: &str = "SELECT EXISTS(
+         SELECT 1
+         FROM invocations INDEXED BY idx_invocations_parent
+         WHERE parent_invocation_id = ?1
+         LIMIT 1 OFFSET ?2
+     )";
+
+#[cfg(test)]
+std::thread_local! {
+    static INVOCATION_ROW_MAPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+struct InvocationQueryProgressPauseState {
+    entered: std::sync::Mutex<bool>,
+    release: std::sync::atomic::AtomicBool,
+    wake: std::sync::Condvar,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl InvocationQueryProgressPauseState {
+    fn new() -> Self {
+        Self {
+            entered: std::sync::Mutex::new(false),
+            release: std::sync::atomic::AtomicBool::new(false),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+
+    fn wait_for_release_or_cancellation(&self, cancellation: &CancellationToken) {
+        let mut entered = self
+            .entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *entered = true;
+        self.wake.notify_all();
+        while !self.release.load(std::sync::atomic::Ordering::SeqCst)
+            && !cancellation.is_cancelled()
+        {
+            entered = self
+                .wake
+                .wait_timeout(entered, std::time::Duration::from_millis(5))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type InvocationQueryProgressPauseRegistry = std::sync::Mutex<
+    Option<(
+        std::path::PathBuf,
+        std::sync::Arc<InvocationQueryProgressPauseState>,
+    )>,
+>;
+
+#[cfg(any(test, feature = "test-support"))]
+fn invocation_query_progress_pause_registry() -> &'static InvocationQueryProgressPauseRegistry {
+    static REGISTRY: std::sync::OnceLock<InvocationQueryProgressPauseRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn invocation_query_progress_pause(
+    path: &std::path::Path,
+) -> Option<std::sync::Arc<InvocationQueryProgressPauseState>> {
+    invocation_query_progress_pause_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(configured_path, _)| configured_path == path)
+        .map(|(_, pause)| std::sync::Arc::clone(pause))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub struct InvocationQueryProgressPause {
+    path: std::path::PathBuf,
+    state: std::sync::Arc<InvocationQueryProgressPauseState>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl InvocationQueryProgressPause {
+    pub fn wait_until_entered(&self, timeout: std::time::Duration) -> bool {
+        let entered = self
+            .state
+            .entered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (entered, _) = self
+            .state
+            .wake
+            .wait_timeout_while(entered, timeout, |entered| !*entered)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *entered
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for InvocationQueryProgressPause {
+    fn drop(&mut self) {
+        self.state
+            .release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.wake.notify_all();
+        let mut registry = invocation_query_progress_pause_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registry.as_ref().is_some_and(|(path, state)| {
+            path == &self.path && std::sync::Arc::ptr_eq(state, &self.state)
+        }) {
+            *registry = None;
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -51,6 +192,17 @@ pub struct InvocationRecord {
     pub resume_acceptance_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+pub struct InvocationChildrenPage {
+    pub children: Vec<InvocationRecord>,
+    pub has_more_children: bool,
+    pub live_coverage_incomplete: bool,
+}
+
+struct LiveSubtreeChildIds {
+    ids: Vec<i64>,
+    coverage_incomplete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +294,33 @@ fn format_unknown_invocation_status(raw: &str) -> String {
 }
 
 impl StateDb {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pause_invocation_query_progress_for_test(&self) -> InvocationQueryProgressPause {
+        let state = std::sync::Arc::new(InvocationQueryProgressPauseState::new());
+        let mut registry = invocation_query_progress_pause_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            registry.is_none(),
+            "only one invocation query progress pause may be active"
+        );
+        *registry = Some((self.db_path.clone(), std::sync::Arc::clone(&state)));
+        InvocationQueryProgressPause {
+            path: self.db_path.clone(),
+            state,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_invocation_row_map_count() {
+        INVOCATION_ROW_MAPS.with(|maps| maps.set(0));
+    }
+
+    #[cfg(test)]
+    pub(super) fn invocation_row_map_count() -> usize {
+        INVOCATION_ROW_MAPS.with(std::cell::Cell::get)
+    }
+
     pub fn record_legacy_resume_input_session_id(
         &self,
         id: i64,
@@ -229,6 +408,329 @@ impl StateDb {
             .map_err(Self::format_invocation_children_map_error)
     }
 
+    pub fn list_invocation_children_bounded(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        prioritize_running: bool,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        self.list_invocation_children_bounded_inner(parent_id, limit, prioritize_running)
+    }
+
+    pub fn list_invocation_children_bounded_with_cancel(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        prioritize_running: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        self.list_invocation_children_bounded_page_with_cancel(
+            parent_id,
+            limit,
+            prioritize_running,
+            cancellation,
+        )
+        .map(|page| page.children)
+    }
+
+    pub fn list_invocation_children_bounded_page_with_cancel(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        prioritize_running: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<InvocationChildrenPage, String> {
+        self.with_invocation_query_cancellation(cancellation, || {
+            let children =
+                self.list_invocation_children_bounded_inner(parent_id, limit, prioritize_running)?;
+            Ok(InvocationChildrenPage {
+                children,
+                has_more_children: self.invocation_children_overflow(parent_id, limit)?,
+                live_coverage_incomplete: false,
+            })
+        })
+    }
+
+    fn list_invocation_children_bounded_inner(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        prioritize_running: bool,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let clause = if prioritize_running {
+            "WHERE parent_invocation_id = ?1
+             ORDER BY (status = 'running') DESC, created_at, id
+             LIMIT ?2"
+        } else {
+            "WHERE parent_invocation_id = ?1
+             ORDER BY created_at, id
+             LIMIT ?2"
+        };
+        let sql = Self::invocation_record_select_sql(&self.conn, clause)?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt
+            .query_map(sqlite::params![parent_id, limit], Self::map_invocation_row)
+            .map_err(Self::format_invocation_children_query_error)?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocation_children_map_error)
+    }
+
+    pub fn list_invocation_children_with_running_descendants_bounded(
+        &self,
+        parent_id: i64,
+        limit: usize,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        self.list_invocation_children_with_running_descendants_bounded_inner(
+            parent_id,
+            limit,
+            &CancellationToken::new(),
+        )
+        .map(|(children, _)| children)
+    }
+
+    pub fn list_invocation_children_with_running_descendants_bounded_with_cancel(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<InvocationRecord>, String> {
+        self.list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+            parent_id,
+            limit,
+            cancellation,
+        )
+        .map(|page| page.children)
+    }
+
+    pub fn list_invocation_children_with_running_descendants_bounded_page_with_cancel(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<InvocationChildrenPage, String> {
+        self.with_invocation_query_cancellation(cancellation, || {
+            let (children, live_coverage_incomplete) = self
+                .list_invocation_children_with_running_descendants_bounded_inner(
+                    parent_id,
+                    limit,
+                    cancellation,
+                )?;
+            let has_more_children = self.invocation_children_overflow(parent_id, limit)?;
+            Ok(InvocationChildrenPage {
+                children,
+                has_more_children,
+                live_coverage_incomplete: live_coverage_incomplete || has_more_children,
+            })
+        })
+    }
+
+    fn list_invocation_children_with_running_descendants_bounded_inner(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<(Vec<InvocationRecord>, bool), String> {
+        if limit == 0 {
+            return Ok((Vec::new(), self.invocation_children_overflow(parent_id, 0)?));
+        }
+        let live_subtrees = self.list_live_subtree_child_ids(parent_id, limit, cancellation)?;
+        let mut children = Vec::with_capacity(limit);
+        for id in &live_subtrees.ids {
+            if let Some(record) = self.get_invocation_by_id(*id)? {
+                children.push(record);
+            }
+        }
+        if children.len() >= limit {
+            return Ok((children, live_subtrees.coverage_incomplete));
+        }
+
+        let candidates = self.list_invocation_children_excluding_ids_bounded(
+            parent_id,
+            limit - children.len(),
+            &live_subtrees.ids,
+        )?;
+        children.extend(candidates);
+        Ok((children, live_subtrees.coverage_incomplete))
+    }
+
+    fn list_invocation_children_excluding_ids_bounded(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        excluded_ids: &[i64],
+    ) -> Result<Vec<InvocationRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        if excluded_ids.is_empty() {
+            return self.list_invocation_children_bounded_inner(parent_id, limit, true);
+        }
+        let excluded_ids = excluded_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let clause = format!(
+            "WHERE parent_invocation_id = ?1
+               AND id NOT IN ({excluded_ids})
+             ORDER BY (status = 'running') DESC, created_at, id
+             LIMIT ?2"
+        );
+        let sql = Self::invocation_record_select_sql(&self.conn, &clause)?;
+        let mut statement = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(sqlite::params![parent_id, limit], Self::map_invocation_row)
+            .map_err(Self::format_invocation_children_query_error)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocation_children_map_error)
+    }
+
+    fn list_live_subtree_child_ids(
+        &self,
+        parent_id: i64,
+        limit: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<LiveSubtreeChildIds, String> {
+        let candidate_limit = limit.saturating_mul(RUNNING_DESCENDANT_CANDIDATE_FACTOR);
+        let mut coverage_incomplete =
+            self.invocation_children_overflow(parent_id, candidate_limit)?;
+        let query_limit = i64::try_from(candidate_limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .conn
+            .prepare(RUNNING_DESCENDANT_CANDIDATES_SQL)
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let candidate_ids = statement
+            .query_map(sqlite::params![parent_id, query_limit], |row| row.get(0))
+            .map_err(Self::format_invocation_children_query_error)?;
+        let candidate_ids = candidate_ids
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Self::format_invocation_children_map_error)?;
+        drop(statement);
+
+        let descendant_limit =
+            Self::scaled_invocation_query_limit(limit, RUNNING_DESCENDANT_SCAN_FACTOR);
+        let mut statement = self
+            .conn
+            .prepare(RUNNING_DESCENDANT_EXISTS_SQL)
+            .map_err(Self::format_invocation_child_lookup_prepare_error)?;
+        let mut live_child_ids = Vec::with_capacity(limit);
+        for candidate_id in candidate_ids {
+            if cancellation.is_cancelled() {
+                return Err("Invocation child lookup cancelled".to_string());
+            }
+            let (has_running_descendant, visited_rows) = statement
+                .query_row(sqlite::params![candidate_id, descendant_limit], |row| {
+                    Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(Self::format_invocation_children_query_error)?;
+            if visited_rows >= descendant_limit {
+                coverage_incomplete = true;
+            }
+            if has_running_descendant {
+                live_child_ids.push(candidate_id);
+                if live_child_ids.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(LiveSubtreeChildIds {
+            ids: live_child_ids,
+            coverage_incomplete,
+        })
+    }
+
+    fn invocation_children_overflow(&self, parent_id: i64, limit: usize) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                INVOCATION_CHILDREN_OVERFLOW_SQL,
+                sqlite::params![parent_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )
+            .map_err(Self::format_invocation_children_query_error)
+    }
+
+    fn scaled_invocation_query_limit(limit: usize, factor: usize) -> i64 {
+        i64::try_from(limit.saturating_mul(factor)).unwrap_or(i64::MAX)
+    }
+
+    fn with_invocation_query_cancellation<T>(
+        &self,
+        cancellation: &CancellationToken,
+        query: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        if cancellation.is_cancelled() {
+            return Err("Invocation child lookup cancelled".to_string());
+        }
+        let handler_cancellation = cancellation.clone();
+        let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_interrupted = std::sync::Arc::clone(&interrupted);
+        #[cfg(any(test, feature = "test-support"))]
+        let progress_pause = invocation_query_progress_pause(&self.db_path);
+        self.conn
+            .progress_handler(
+                INVOCATION_QUERY_PROGRESS_OPS,
+                Some(move || {
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(pause) = progress_pause.as_ref() {
+                        pause.wait_for_release_or_cancellation(&handler_cancellation);
+                    }
+                    let cancelled = handler_cancellation.is_cancelled();
+                    if cancelled {
+                        handler_interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    cancelled
+                }),
+            )
+            .map_err(|error| format!("Failed to install invocation query cancellation: {error}"))?;
+        let result = query();
+        let reset = self.conn.progress_handler(0, None::<fn() -> bool>);
+        if interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Invocation child lookup cancelled".to_string());
+        }
+        reset.map_err(|error| format!("Failed to clear invocation query cancellation: {error}"))?;
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn running_descendant_candidates_sql() -> &'static str {
+        RUNNING_DESCENDANT_CANDIDATES_SQL
+    }
+
+    #[cfg(test)]
+    pub(super) fn running_descendant_exists_sql() -> &'static str {
+        RUNNING_DESCENDANT_EXISTS_SQL
+    }
+
+    #[cfg(test)]
+    pub(super) fn invocation_children_overflow_sql() -> &'static str {
+        INVOCATION_CHILDREN_OVERFLOW_SQL
+    }
+
+    fn get_invocation_by_id(&self, id: i64) -> Result<Option<InvocationRecord>, String> {
+        let sql = Self::invocation_record_select_sql(&self.conn, "WHERE id = ?1")?;
+        let mut statement = self
+            .conn
+            .prepare(&sql)
+            .map_err(Self::format_invocation_lookup_prepare_error)?;
+        match statement.query_row(sqlite::params![id], Self::map_invocation_row) {
+            Ok(record) => Ok(Some(record)),
+            Err(sqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(Self::format_invocation_lookup_query_error(error)),
+        }
+    }
+
     fn format_invocation_child_lookup_prepare_error(err: sqlite::Error) -> String {
         format!("Failed to prepare invocation child lookup: {err}")
     }
@@ -242,6 +744,8 @@ impl StateDb {
     }
 
     fn map_invocation_row(row: &sqlite::Row<'_>) -> sqlite::Result<InvocationRecord> {
+        #[cfg(test)]
+        INVOCATION_ROW_MAPS.with(|maps| maps.set(maps.get() + 1));
         let raw = Self::read_invocation_record_raw_fields(row)?;
         let parsed = Self::parse_invocation_record_raw_fields(&raw)?;
         Ok(Self::map_invocation_record(raw, parsed))

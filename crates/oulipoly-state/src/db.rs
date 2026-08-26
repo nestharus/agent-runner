@@ -106,6 +106,7 @@ mod invocation_lifecycle_finalize_write;
 mod invocation_lifecycle_start;
 mod invocation_live_load;
 mod invocation_records;
+mod invocation_schema_indexes;
 mod invocation_schema_legacy_migration;
 mod invocation_schema_projection;
 mod invocation_schema_repair;
@@ -150,6 +151,8 @@ mod session_turns_replace;
 mod sqlite_adapter;
 mod timestamps;
 
+pub(crate) use invocation_schema_indexes::invocation_running_projection_index_sql;
+
 pub use self::chain_backfill::BackfillReport;
 pub use self::chain_segments_open::{
     ActiveChainSegmentSnapshot, ChainSegmentRotationInput, CompactSummaryEvidence,
@@ -171,7 +174,11 @@ use self::invocation_lifecycle_start::{
     FinalizeInvocationRow, FinalizeInvocationRowColumns, FinalizeLifecycleInput, OperationResult,
     active_lifecycle_session_id, lifecycle_terminal_status,
 };
-pub use self::invocation_records::{InvocationRecord, InvocationStart, InvocationStatus};
+#[cfg(feature = "test-support")]
+pub use self::invocation_records::InvocationQueryProgressPause;
+pub use self::invocation_records::{
+    InvocationChildrenPage, InvocationRecord, InvocationStart, InvocationStatus,
+};
 pub use self::invocation_schema_legacy_migration::LegacyProviderNames;
 use self::invocation_schema_table::{LegacyInvocationInsert, LegacyInvocationRow};
 use self::lifecycle_invocation_row::LifecycleInvocationRow;

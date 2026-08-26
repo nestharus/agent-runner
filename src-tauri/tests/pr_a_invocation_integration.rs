@@ -1,13 +1,14 @@
 #![cfg(unix)]
 
-use oulipoly_state::{CompositeInvocationId, InvocationStatus, StateDb};
+use oulipoly_state::{
+    CompositeInvocationId, InvocationStart, InvocationStatus, ProviderSessionBinding, StateDb,
+};
 use rusqlite::params;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 
 // These tests start with an empty invocation table. When a child row is seeded
 // before the CLI run, the supervised parent row created by that run receives id 2.
@@ -121,8 +122,9 @@ fn run_agent_bash_nested_child(
     parent_env: &str,
     owner_session_id: &str,
     owner_invocation_uuid: &str,
+    registration_authority: &str,
     agent_bash_bin: &Path,
-) -> String {
+) -> Output {
     let command = nested_child_command(fixture);
     let mut run = Command::new(agent_bash_bin);
     run.arg("run").arg("--").arg("bash").arg("-lc").arg(command);
@@ -132,12 +134,9 @@ fn run_agent_bash_nested_child(
         parent_env,
         owner_session_id,
         owner_invocation_uuid,
+        registration_authority,
     );
-    let output = run.output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let dispatch: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let handle = dispatch["handle"].as_str().expect("agent-bash handle");
-    wait_for_agent_bash_done(fixture, agent_bash_bin, handle)
+    run.output().unwrap()
 }
 
 fn nested_child_command(fixture: &Fixture) -> String {
@@ -158,6 +157,7 @@ fn configure_agent_bash_env(
     parent_env: &str,
     owner_session_id: &str,
     owner_invocation_uuid: &str,
+    registration_authority: &str,
 ) {
     command.env("XDG_CONFIG_HOME", &fixture.config_home);
     command.env("XDG_DATA_HOME", &fixture.data_home);
@@ -165,33 +165,16 @@ fn configure_agent_bash_env(
     command.env("OULIPOLY_PARENT_INVOCATION", parent_env);
     command.env("AGENT_BASH_OWNER_SESSION_ID", owner_session_id);
     command.env("AGENT_BASH_OWNER_INVOCATION_UUID", owner_invocation_uuid);
+    assert_eq!(registration_authority.len(), 64, "registration authority");
+    command.env(
+        oulipoly_state::COMPLETION_REGISTRATION_AUTHORITY_ENV,
+        registration_authority,
+    );
     command.env(
         "AGENT_BASH_AGENT_RUNNER_BIN",
         env!("CARGO_BIN_EXE_oulipoly-agent-runner"),
     );
     command.env_remove("OULIPOLY_DATA_DIR");
-}
-
-fn wait_for_agent_bash_done(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        last = agent_bash_status(fixture, agent_bash_bin, handle);
-        if last.starts_with("DONE") {
-            return last;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("agent-bash job did not finish: {last}");
-}
-
-fn agent_bash_status(fixture: &Fixture, agent_bash_bin: &Path, handle: &str) -> String {
-    let mut status = Command::new(agent_bash_bin);
-    status.arg("status").arg("--full").arg(handle);
-    status.env("XDG_STATE_HOME", fixture.state_home());
-    let output = status.output().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 fn agent_bash_bin_from_env() -> PathBuf {
@@ -365,41 +348,58 @@ fn resolves_parent_env_and_overwrites_child_subprocess_env() {
 }
 
 #[test]
-fn nested_agent_bash_chain_records_parent_id_from_inherited_env() {
+fn nested_agent_bash_rejects_unattested_synthetic_completion_owner() {
     let agent_bash_bin = agent_bash_bin_from_env();
     let fixture = Fixture::new();
-
-    let parent_output = fixture.run(None);
-    assert!(parent_output.status.success());
-    let parent = parse_invocation(&String::from_utf8_lossy(&parent_output.stderr));
-    let parent_row = fixture
-        .open_db()
-        .get_invocation_by_uuid(&parent.id)
-        .unwrap()
+    let parent = CompositeInvocationId {
+        source: "fixture-provider".to_string(),
+        id: "aaaaaaaa-0000-4000-8000-000000000010".to_string(),
+    };
+    let owner_session_id = "fixture-parent-session";
+    let state = fixture.open_db();
+    let started = state
+        .start_invocation_with_completion_registration_authority(&InvocationStart {
+            invocation_uuid: parent.id.clone(),
+            model_name: "fixture".to_string(),
+            provider_name: parent.source.clone(),
+            provider_index: 0,
+            parent_invocation_id: None,
+        })
         .unwrap();
-    assert_eq!(parent_row.status, InvocationStatus::Succeeded);
-    let owner_session_id = parent_row.provider_session_id.as_deref().unwrap();
+    state
+        .bind_invocation_provider_session_start(
+            started.invocation_row_id,
+            &ProviderSessionBinding {
+                provider_session_id: owner_session_id.to_string(),
+                capture_method: "fixture_running_parent",
+                resume_input_id: None,
+                provider_session_resolved_account: Some(parent.source.clone()),
+            },
+        )
+        .unwrap();
+    let registration_authority = started
+        .completion_registration_authority
+        .process_environment_value()
+        .to_string();
+    drop(state);
     let parent_env = serde_json::to_string(&parent).unwrap();
 
-    let status = run_agent_bash_nested_child(
+    let output = run_agent_bash_nested_child(
         &fixture,
         &parent_env,
         owner_session_id,
         &parent.id,
+        &registration_authority,
         &agent_bash_bin,
     );
 
-    assert!(status.starts_with("DONE rc=0"), "{status}");
-    let child = parse_valid_invocations(&status)
-        .into_iter()
-        .find(|invocation| invocation.id != parent.id)
-        .expect("nested child invocation marker should be captured");
-    let child_row = fixture
-        .open_db()
-        .get_invocation_by_uuid(&child.id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(child_row.parent_invocation_id, Some(parent_row.id));
+    assert_eq!(output.status.code(), Some(74), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("explicit completion owner requires matching parent invocation"),
+        "{output:?}"
+    );
+    assert!(parse_valid_invocations(&String::from_utf8_lossy(&output.stderr)).is_empty());
 }
 
 #[test]

@@ -30,7 +30,7 @@ use super::terminal_classify_handoff::classify_after_launch_success;
 use crate::executor::ExecutionResult;
 use crate::executor::cli::spawn_identity::{
     RunningRuntimeGeneration, SpawnIdentityContext, SpawnRuntimeMode, backfill_captured_session_id,
-    context_from_parent_invocation_env, mark_runtime_generation_exited,
+    child_custody_test_fault, context_from_parent_invocation_env, mark_runtime_generation_exited,
     mark_runtime_generation_orderly_completed, mark_runtime_generation_spawn_failed,
     record_child_identity, register_runtime_generation_starting,
 };
@@ -144,13 +144,13 @@ fn attempt_account_dispatch(
     );
     let candidate = build_launch_candidate(context)
         .map_err(|message| terminal_attempt_error(invalid_provider_input_error(message)))?;
-    let policy_request = build_policy_request(context, &candidate)
+    let policy_request = build_policy_request(context, &candidate, registry.host_options())
         .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     let policy_result = invoke_provider_policy(&client, policy_request)
         .map_err(classify_provider_client_attempt_error)?;
     let candidate = apply_policy_transform(candidate, policy_result)
         .map_err(|error| terminal_attempt_error(service_error(error)))?;
-    let launch_request = build_launch_request(context, &candidate)
+    let launch_request = build_launch_request(context, &candidate, registry.host_options())
         .map_err(|_| terminal_attempt_error(protocol_service_error("schema_invalid_request")))?;
     register_runtime_generation_starting(spawn_identity.as_ref()).map_err(|_| {
         terminal_attempt_error(protocol_service_error(
@@ -165,24 +165,33 @@ fn attempt_account_dispatch(
         }
     };
     if spawn_identity.is_some() {
-        require_recorded_external_generation(&recorded_generation).map_err(|_| {
-            terminal_attempt_error(protocol_service_error("runtime_generation_bind_failed"))
-        })?;
-        backfill_external_launch_session_id(
+        if require_recorded_external_generation(&recorded_generation).is_err() {
+            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(protocol_service_error(
+                "runtime_generation_bind_failed",
+            )));
+        }
+        if backfill_external_launch_session_id(
             spawn_identity.as_ref(),
             &recorded_generation,
             &launch_result,
         )
-        .map_err(|_| {
-            terminal_attempt_error(protocol_service_error("runtime_generation_attach_failed"))
-        })?;
-        mark_runtime_generation_orderly_completed(
-            spawn_identity.as_ref(),
-            launch_exit_code(&launch_result.exit.status),
-        )
-        .map_err(|_| {
-            terminal_attempt_error(protocol_service_error("runtime_generation_exit_failed"))
-        })?;
+        .is_err()
+        {
+            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(protocol_service_error(
+                "runtime_generation_attach_failed",
+            )));
+        }
+        let exit_code = launch_exit_code(&launch_result.exit.status);
+        if mark_runtime_generation_orderly_completed(spawn_identity.as_ref(), exit_code, exit_code)
+            .is_err()
+        {
+            finalize_failed_external_launch(spawn_identity.as_ref(), &recorded_generation);
+            return Err(terminal_attempt_error(protocol_service_error(
+                "runtime_generation_exit_failed",
+            )));
+        }
     }
     let classification = classify_after_launch_success(registry, context, &launch_result);
 
@@ -225,10 +234,11 @@ fn external_launch_spawn_observer(
 ) -> Option<ProcessSpawnObserver> {
     let context = context.cloned()?;
     Some(ProcessSpawnObserver::new(move |child_id| {
+        child_custody_test_fault("external_spawn_observer")?;
         let generation = record_child_identity(child_id, Some(&context)).and_then(|generation| {
             generation.ok_or_else(|| "Missing external runtime generation".to_string())
         });
-        remember_recorded_launch_generation(&recorded_generation, generation);
+        remember_recorded_launch_generation(&recorded_generation, generation)
     }))
 }
 
@@ -266,10 +276,12 @@ fn backfill_external_launch_session_marker(
 fn remember_recorded_launch_generation(
     recorded_generation: &RecordedLaunchGeneration,
     generation: Result<RunningRuntimeGeneration, String>,
-) {
-    if let Ok(mut recorded_generation) = recorded_generation.lock() {
-        *recorded_generation = Some(generation);
-    }
+) -> Result<(), String> {
+    let result = generation.clone().map(|_| ());
+    *recorded_generation
+        .lock()
+        .map_err(|_| "External runtime generation lock poisoned".to_string())? = Some(generation);
+    result
 }
 
 fn require_recorded_external_generation(

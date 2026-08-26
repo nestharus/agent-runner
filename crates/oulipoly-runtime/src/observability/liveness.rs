@@ -6,7 +6,7 @@
 
 use crate::observability::dto::{LivenessStatus, MonitorDiagnostic, MonitorDiagnosticSeverity};
 use chrono::{DateTime, Duration, Utc};
-use oulipoly_state::mailbox::{SessionRuntimeReadOnlyLiveness, WakeClaimRow};
+use oulipoly_state::mailbox::{RuntimeGenerationReadOnlyLiveness, WakeClaimRow};
 use oulipoly_state::pid_identity::{
     PidIdentityDb, PidIdentityRow, ProcessIdentity, ProcessIdentityObservation,
 };
@@ -56,24 +56,26 @@ fn unverified_process_identity_liveness(live: ProcessIdentityObservation) -> Liv
     }
 }
 
-pub(crate) fn runtime_liveness_status(liveness: SessionRuntimeReadOnlyLiveness) -> LivenessStatus {
+pub(crate) fn runtime_liveness_status(
+    liveness: RuntimeGenerationReadOnlyLiveness,
+) -> LivenessStatus {
     match liveness {
-        SessionRuntimeReadOnlyLiveness::Busy => LivenessStatus::VerifiedLive,
-        SessionRuntimeReadOnlyLiveness::Idle => LivenessStatus::NotApplicable,
-        SessionRuntimeReadOnlyLiveness::StaleDead => LivenessStatus::Dead,
-        SessionRuntimeReadOnlyLiveness::StalePidReused => LivenessStatus::PidReused,
-        SessionRuntimeReadOnlyLiveness::StaleMissingInvocation
-        | SessionRuntimeReadOnlyLiveness::StaleMissingIdentity => LivenessStatus::Unknown,
+        RuntimeGenerationReadOnlyLiveness::Busy => LivenessStatus::VerifiedLive,
+        RuntimeGenerationReadOnlyLiveness::Idle => LivenessStatus::NotApplicable,
+        RuntimeGenerationReadOnlyLiveness::StaleDead => LivenessStatus::Dead,
+        RuntimeGenerationReadOnlyLiveness::StalePidReused => LivenessStatus::PidReused,
+        RuntimeGenerationReadOnlyLiveness::StaleMissingInvocation
+        | RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity => LivenessStatus::Unknown,
     }
 }
 
-pub(crate) fn runtime_is_stale(liveness: SessionRuntimeReadOnlyLiveness) -> bool {
+pub(crate) fn runtime_is_stale(liveness: RuntimeGenerationReadOnlyLiveness) -> bool {
     matches!(
         liveness,
-        SessionRuntimeReadOnlyLiveness::StaleMissingInvocation
-            | SessionRuntimeReadOnlyLiveness::StaleMissingIdentity
-            | SessionRuntimeReadOnlyLiveness::StaleDead
-            | SessionRuntimeReadOnlyLiveness::StalePidReused
+        RuntimeGenerationReadOnlyLiveness::StaleMissingInvocation
+            | RuntimeGenerationReadOnlyLiveness::StaleMissingIdentity
+            | RuntimeGenerationReadOnlyLiveness::StaleDead
+            | RuntimeGenerationReadOnlyLiveness::StalePidReused
     )
 }
 
@@ -149,7 +151,7 @@ pub(crate) fn stale_runtime_diagnostic(node_id: Option<String>) -> MonitorDiagno
     MonitorDiagnostic {
         code: "stale-runtime".to_string(),
         severity: MonitorDiagnosticSeverity::Warning,
-        message: "session_runtime is marked running but its recorded PID identity is not live"
+        message: "runtime_generation is active but its recorded PID identity is not live"
             .to_string(),
         node_id,
     }

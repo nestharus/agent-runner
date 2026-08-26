@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 chrono.workspace = true
+ctor.workspace = true
 dirs.workspace = true
 fs4.workspace = true
 getrandom.workspace = true
@@ -29,3 +30,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }

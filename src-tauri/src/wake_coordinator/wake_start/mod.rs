@@ -6,8 +6,7 @@ mod claim;
 mod liveness;
 
 use oulipoly_state::mailbox::{
-    GenerationStorageError, MailboxDb, SessionGenerationProjection, SessionLiveness,
-    SessionRuntimeRow, WakeClaimAcquireResult, WakeClaimRow,
+    MailboxDb, SessionLiveness, SessionMetadataRow, WakeClaimAcquireResult, WakeClaimRow,
 };
 use uuid::Uuid;
 
@@ -28,7 +27,7 @@ pub(super) struct StartWakeInput<'a> {
 struct WakeStartContext<'a> {
     input: StartWakeInput<'a>,
     db: MailboxDb,
-    runtime: Option<SessionRuntimeRow>,
+    runtime: Option<SessionMetadataRow>,
     claim: WakeClaimRow,
 }
 
@@ -53,13 +52,7 @@ pub(super) fn start_wake_chain(input: StartWakeInput<'_>) -> WakeDiagnostic {
         &context.claim.claim_token,
         context.input.auto_wake_count,
     );
-    wake_spawn_diagnostic(
-        &mut context.db,
-        context.input,
-        context.runtime.as_ref(),
-        context.claim,
-        spawn,
-    )
+    wake_spawn_diagnostic(&mut context.db, context.input, context.claim, spawn)
 }
 
 fn prepare_wake_start_context<'a>(
@@ -75,63 +68,24 @@ fn prepare_wake_start_context_with_db<'a>(
     claim_token: &str,
     mut db: MailboxDb,
 ) -> Result<WakeStartContext<'a>, WakeDiagnostic> {
-    if generation_authority_blocks_wake(&db, input.session_id)? {
-        return Err(busy_diagnostic());
-    }
     let runtime =
-        session_runtime_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
+        session_metadata_for_wake(&db, input.session_id).map_err(storage_error_diagnostic)?;
     let input = normalize_start_wake_input(input, runtime.as_ref());
     super::consumed_completion::reconcile_late_consumed_completions_on(&mut db, input.session_id)
         .map_err(storage_error_diagnostic)?;
-    validate_wake_has_deliverable_pending(&db, input.session_id)?;
-    let liveness = wake_runtime_liveness(&mut db, input.session_id, runtime.as_ref())?;
-    cleanup_idle_runtime(runtime.as_ref(), liveness);
-    if wake_liveness_busy(liveness) {
+    let liveness = wake_runtime_liveness(&mut db, input.session_id)?;
+    cleanup_idle_runtime(&liveness);
+    if wake_liveness_busy(&liveness) {
         return Err(busy_diagnostic());
     }
     let claim = acquire_startable_wake_claim(&mut db, input, claim_token)?;
     Ok(wake_start_context(input, db, runtime, claim))
 }
 
-fn validate_wake_has_deliverable_pending(
-    db: &MailboxDb,
-    session_id: &str,
-) -> Result<(), WakeDiagnostic> {
-    match crate::mailbox_delivery::deliverable_pending_count_on(db, session_id) {
-        Ok(0) => Err(WakeDiagnostic::status("no_pending")),
-        Ok(_) => Ok(()),
-        Err(err) => Err(storage_error_diagnostic(err)),
-    }
-}
-
-fn generation_authority_blocks_wake(
-    db: &MailboxDb,
-    session_id: &str,
-) -> Result<bool, WakeDiagnostic> {
-    let projection =
-        session_generation_projection(db, session_id).map_err(generation_storage_diagnostic)?;
-    Ok(generation_projection_blocks_wake(projection))
-}
-
-fn session_generation_projection(
-    db: &MailboxDb,
-    session_id: &str,
-) -> Result<SessionGenerationProjection, GenerationStorageError> {
-    db.session_generation_projection(session_id)
-}
-
-fn generation_storage_diagnostic(err: GenerationStorageError) -> WakeDiagnostic {
-    storage_error_diagnostic(err.to_string())
-}
-
-fn generation_projection_blocks_wake(projection: SessionGenerationProjection) -> bool {
-    !matches!(projection, SessionGenerationProjection::None)
-}
-
 fn wake_start_context<'a>(
     input: StartWakeInput<'a>,
     db: MailboxDb,
-    runtime: Option<SessionRuntimeRow>,
+    runtime: Option<SessionMetadataRow>,
     claim: WakeClaimRow,
 ) -> WakeStartContext<'a> {
     WakeStartContext {
@@ -144,7 +98,7 @@ fn wake_start_context<'a>(
 
 fn normalize_start_wake_input<'a>(
     input: StartWakeInput<'a>,
-    runtime: Option<&SessionRuntimeRow>,
+    runtime: Option<&SessionMetadataRow>,
 ) -> StartWakeInput<'a> {
     let persisted_next = runtime
         .map(|runtime| runtime.auto_wake_count.saturating_add(1))
@@ -158,17 +112,16 @@ fn normalize_start_wake_input<'a>(
 fn wake_runtime_liveness(
     db: &mut MailboxDb,
     session_id: &str,
-    runtime: Option<&SessionRuntimeRow>,
-) -> Result<Option<SessionLiveness>, WakeDiagnostic> {
-    liveness::pty_runtime_liveness(db, session_id, runtime).map_err(storage_error_diagnostic)
+) -> Result<liveness::RuntimeLivenessCheck, WakeDiagnostic> {
+    liveness::runtime_liveness(db, session_id).map_err(storage_error_diagnostic)
 }
 
-fn cleanup_idle_runtime(runtime: Option<&SessionRuntimeRow>, liveness: Option<SessionLiveness>) {
-    liveness::cleanup_idle_runtime(runtime, liveness);
+fn cleanup_idle_runtime(check: &liveness::RuntimeLivenessCheck) {
+    liveness::cleanup_idle_runtime(check);
 }
 
-fn wake_liveness_busy(liveness: Option<SessionLiveness>) -> bool {
-    liveness::optional_pty_liveness_is_busy(liveness)
+fn wake_liveness_busy(check: &liveness::RuntimeLivenessCheck) -> bool {
+    check.liveness == SessionLiveness::Busy
 }
 
 fn busy_diagnostic() -> WakeDiagnostic {
@@ -197,12 +150,11 @@ fn wake_claim_to_start(result: WakeClaimAcquireResult) -> Result<WakeClaimRow, W
 fn wake_spawn_diagnostic(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
-    runtime: Option<&SessionRuntimeRow>,
     claim: WakeClaimRow,
     spawn: Result<i64, String>,
 ) -> WakeDiagnostic {
     match spawn {
-        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, runtime, claim, wake_pid),
+        Ok(wake_pid) => successful_wake_spawn_diagnostic(db, input, claim, wake_pid),
         Err(err) => failed_wake_spawn_diagnostic(db, input, claim, err),
     }
 }
@@ -210,11 +162,10 @@ fn wake_spawn_diagnostic(
 fn successful_wake_spawn_diagnostic(
     db: &mut MailboxDb,
     input: StartWakeInput<'_>,
-    runtime: Option<&SessionRuntimeRow>,
     claim: WakeClaimRow,
     wake_pid: i64,
 ) -> WakeDiagnostic {
-    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid, runtime);
+    record_wake_pid_or_warn(db, input.session_id, &claim.claim_token, wake_pid);
     spawned_wake_diagnostic(claim.claim_token, wake_pid, input.auto_wake_count)
 }
 
@@ -224,7 +175,9 @@ fn failed_wake_spawn_diagnostic(
     claim: WakeClaimRow,
     err: String,
 ) -> WakeDiagnostic {
-    let _ = db.release_wake_claim(input.session_id, Some(&claim.claim_token));
+    let _ = db
+        .wake_sessions()
+        .release_wake_claim(input.session_id, &claim.claim_token);
     spawn_error_diagnostic(claim.claim_token, input.auto_wake_count, err)
 }
 
@@ -232,37 +185,20 @@ fn open_wake_mailbox() -> Result<MailboxDb, String> {
     MailboxDb::open_default()
 }
 
-fn session_runtime_for_wake(
+fn session_metadata_for_wake(
     db: &MailboxDb,
     session_id: &str,
-) -> Result<Option<SessionRuntimeRow>, String> {
-    db.session_runtime(session_id)
+) -> Result<Option<SessionMetadataRow>, String> {
+    db.wake_session_reader().session_metadata(session_id)
 }
 
-fn record_wake_pid_or_warn(
-    db: &mut MailboxDb,
-    session_id: &str,
-    claim_token: &str,
-    wake_pid: i64,
-    runtime: Option<&SessionRuntimeRow>,
-) {
-    let (provider_name, model_name) = wake_pid_identity_names(runtime);
-    if let Err(err) = db.record_wake_claim_pid_identity(
-        session_id,
-        claim_token,
-        wake_pid,
-        provider_name,
-        model_name,
-    ) {
+fn record_wake_pid_or_warn(db: &mut MailboxDb, session_id: &str, claim_token: &str, wake_pid: i64) {
+    if let Err(err) =
+        db.wake_sessions()
+            .record_wake_claim_pid_identity(session_id, claim_token, wake_pid)
+    {
         warn_wake_pid_record_failed(session_id, claim_token, err);
     }
-}
-
-fn wake_pid_identity_names(runtime: Option<&SessionRuntimeRow>) -> (Option<&str>, Option<&str>) {
-    (
-        runtime.and_then(|row| row.provider_name.as_deref()),
-        runtime.and_then(|row| row.model_name.as_deref()),
-    )
 }
 
 fn warn_wake_pid_record_failed(session_id: &str, claim_token: &str, err: String) {
@@ -273,24 +209,25 @@ fn warn_wake_pid_record_failed(session_id: &str, claim_token: &str, err: String)
 mod tests {
     use super::*;
     use crate::wake_coordinator::consumed_completion::ConsumedCompletionFixture;
-    use oulipoly_state::mailbox::{SessionRuntimeUpsert, WakeClaimRequest};
+    use oulipoly_state::mailbox::{SessionMetadataUpsert, WakeClaimRequest};
 
     #[test]
     fn persisted_count_at_five_acquires_exact_wake_claim() {
         let fixture = ConsumedCompletionFixture::new();
         let mut db = fixture.mailbox();
-        db.upsert_session_runtime(SessionRuntimeUpsert {
-            session_id: ConsumedCompletionFixture::SESSION_ID,
-            mode: "headless",
-            invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
-            provider_name: Some("fixture-provider"),
-            model_name: Some("fixture-model"),
-            pty_control_path: None,
-            models_dir: None,
-            effective_cwd: None,
-        })
-        .unwrap();
+        db.wake_sessions()
+            .upsert_session_metadata(SessionMetadataUpsert {
+                session_id: ConsumedCompletionFixture::SESSION_ID,
+                mode: "headless",
+                invocation_uuid: Some(ConsumedCompletionFixture::INVOCATION_UUID),
+                provider_name: Some("fixture-provider"),
+                model_name: Some("fixture-model"),
+                models_dir: None,
+                effective_cwd: None,
+            })
+            .unwrap();
         let seeded = db
+            .wake_sessions()
             .try_acquire_wake_claim(WakeClaimRequest {
                 session_id: ConsumedCompletionFixture::SESSION_ID,
                 claim_token: "seed-count-token",
@@ -301,11 +238,9 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(seeded, WakeClaimAcquireResult::Acquired(_)));
-        db.release_wake_claim(
-            ConsumedCompletionFixture::SESSION_ID,
-            Some("seed-count-token"),
-        )
-        .unwrap();
+        db.wake_sessions()
+            .release_wake_claim(ConsumedCompletionFixture::SESSION_ID, "seed-count-token")
+            .unwrap();
 
         let context = prepare_wake_start_context_with_db(
             StartWakeInput {
@@ -329,6 +264,7 @@ mod tests {
         assert_eq!(
             context
                 .db
+                .wake_session_reader()
                 .wake_claim(ConsumedCompletionFixture::SESSION_ID)
                 .unwrap()
                 .unwrap()
@@ -365,7 +301,8 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            db.wake_claim(ConsumedCompletionFixture::SESSION_ID)
+            db.wake_session_reader()
+                .wake_claim(ConsumedCompletionFixture::SESSION_ID)
                 .unwrap()
                 .is_none()
         );

@@ -236,13 +236,16 @@ prompt_mode = "arg"
     )
     .unwrap();
 
-    let err = run_repl_with_default_provider(RuntimeServices {
-        config_root: missing_root,
-        state_db_path: Some(missing_default.path().join("state.db")),
-        working_dir: None,
-        state_db_opener: ProductionStateDbOpener,
-        routing_service: Arc::new(ProductionRoutingService),
-    })
+    let err = run_repl_with_default_provider(
+        RuntimeServices {
+            config_root: missing_root,
+            state_db_path: Some(missing_default.path().join("state.db")),
+            working_dir: None,
+            state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
+        },
+        |_| Ok(()),
+    )
     .unwrap_err();
 
     assert!(err.contains("'default_provider' must be set in"), "{err}");
@@ -261,13 +264,16 @@ prompt_mode = "arg"
     .unwrap();
     fs::write(malformed_root.join("providers.toml"), "not = [").unwrap();
 
-    let err = run_repl_with_default_provider(RuntimeServices {
-        config_root: malformed_root,
-        state_db_path: Some(malformed_providers.path().join("state.db")),
-        working_dir: None,
-        state_db_opener: ProductionStateDbOpener,
-        routing_service: Arc::new(ProductionRoutingService),
-    })
+    let err = run_repl_with_default_provider(
+        RuntimeServices {
+            config_root: malformed_root,
+            state_db_path: Some(malformed_providers.path().join("state.db")),
+            working_dir: None,
+            state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
+        },
+        |_| Ok(()),
+    )
     .unwrap_err();
 
     assert!(err.contains("TOML parse error"), "{err}");
@@ -300,13 +306,16 @@ prompt_mode = "arg"
     )
     .unwrap();
 
-    let err = run_repl_with_default_provider(RuntimeServices {
-        config_root: malformed_config_root,
-        state_db_path: Some(malformed_config.path().join("state.db")),
-        working_dir: None,
-        state_db_opener: ProductionStateDbOpener,
-        routing_service: Arc::new(ProductionRoutingService),
-    })
+    let err = run_repl_with_default_provider(
+        RuntimeServices {
+            config_root: malformed_config_root,
+            state_db_path: Some(malformed_config.path().join("state.db")),
+            working_dir: None,
+            state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
+        },
+        |_| Ok(()),
+    )
     .unwrap_err();
 
     assert!(err.contains("failed to parse app config"), "{err}");
@@ -351,13 +360,16 @@ prompt_mode = "arg"
     let opener = FakeStateDbOpener::default();
     let calls = opener.calls();
 
-    let err = run_repl_with_default_provider(RuntimeServices {
-        config_root,
-        state_db_path: None,
-        working_dir: None,
-        state_db_opener: opener,
-        routing_service: Arc::new(ProductionRoutingService),
-    })
+    let err = run_repl_with_default_provider(
+        RuntimeServices {
+            config_root,
+            state_db_path: None,
+            working_dir: None,
+            state_db_opener: opener,
+            routing_service: Arc::new(ProductionRoutingService),
+        },
+        |_| Ok(()),
+    )
     .unwrap_err();
 
     assert!(
@@ -410,13 +422,16 @@ prompt_mode = "arg"
     )
     .unwrap();
 
-    let error = run_repl_with_default_provider(RuntimeServices {
-        config_root,
-        state_db_path: Some(PathBuf::from(&explicit_state_db)),
-        working_dir: None,
-        state_db_opener: ProductionStateDbOpener,
-        routing_service: Arc::new(ProductionRoutingService),
-    })
+    let error = run_repl_with_default_provider(
+        RuntimeServices {
+            config_root,
+            state_db_path: Some(PathBuf::from(&explicit_state_db)),
+            working_dir: None,
+            state_db_opener: ProductionStateDbOpener,
+            routing_service: Arc::new(ProductionRoutingService),
+        },
+        |_| Ok(()),
+    )
     .unwrap_err();
 
     assert!(

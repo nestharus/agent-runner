@@ -36,10 +36,9 @@ use super::provider_identity::ProviderRecognizer;
 use super::pty_broker;
 use super::resume::{ResumePayload, compose_resume_provider_args};
 use super::spawn_identity::{
-    SpawnIdentityContext, SpawnRuntimeMode, context_from_parent_invocation_env,
-    mark_runtime_generation_exited, mark_runtime_generation_orderly_completed,
-    mark_runtime_generation_spawn_failed, record_child_identity,
-    register_runtime_generation_starting,
+    ChildGenerationCustody, SpawnIdentityContext, SpawnRuntimeMode, child_custody_test_fault,
+    context_from_parent_invocation_env, mark_runtime_generation_spawn_failed,
+    record_child_identity, register_runtime_generation_starting,
 };
 use super::terminal_signal;
 use crate::provider_registry::ProviderRegistry;
@@ -212,7 +211,7 @@ fn execute_interactive_with_result_and_monitor_context(
         let provider_inspect = monitor
             .provider_registry
             .map(pty_broker::ProviderInspectMonitorContext::new);
-        let status = if pty_broker::observed_tui_enabled() {
+        let child_exit = if pty_broker::observed_tui_enabled() {
             pty_broker::execute_interactive_child_observed(
                 cmd,
                 provider,
@@ -230,7 +229,7 @@ fn execute_interactive_with_result_and_monitor_context(
         };
         return Ok(interactive_result_from_status(
             provider,
-            &status,
+            &child_exit.status,
             live_session_capture_required,
             live_session_state.as_ref(),
         ));
@@ -243,47 +242,37 @@ fn execute_interactive_with_result_and_monitor_context(
         server.configure_command(&mut cmd);
     }
     configure_interactive_stdio(&mut cmd);
+    configure_direct_interactive_process_group(&mut cmd);
     register_runtime_generation_starting(spawn_identity.as_ref())?;
-    let mut child = match spawn_interactive_child(cmd, provider) {
+    let child = match spawn_interactive_child(cmd, provider) {
         Ok(child) => child,
         Err(err) => {
             let _ = mark_runtime_generation_spawn_failed(spawn_identity.as_ref());
             return Err(err);
         }
     };
+    let mut custody = ChildGenerationCustody::new(child, spawn_identity.as_ref())?;
 
     #[cfg(unix)]
-    let signal_guard = terminal_signal::InteractiveSignalGuard::install(&mut child)?;
-    let generation = match record_child_identity(child.id(), spawn_identity.as_ref()) {
-        Ok(generation) => generation,
-        Err(err) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = mark_runtime_generation_exited(spawn_identity.as_ref(), None);
-            return Err(err);
-        }
-    };
+    {
+        child_custody_test_fault("direct_signal_install")?;
+        custody.install_signal_forwarding()?;
+    }
+    let generation = record_child_identity(custody.child().id(), spawn_identity.as_ref())?;
     #[cfg(unix)]
     if let (Some(server), Some(context), Some(generation)) = (
         live_session_server.as_mut(),
         spawn_identity.as_ref(),
         generation,
-    ) && let Err(err) = server.start(context.clone(), generation)
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = mark_runtime_generation_exited(spawn_identity.as_ref(), None);
-        return Err(err);
+    ) {
+        server.start(context.clone(), generation);
     }
 
-    let status = wait_for_interactive_child(&mut child)?;
-    mark_runtime_generation_orderly_completed(
-        spawn_identity.as_ref(),
-        Some(crate::executor::cli::terminal_signal::exit_code_from_status(&status)),
-    )?;
-
-    #[cfg(unix)]
-    drop(signal_guard);
+    child_custody_test_fault("direct_wait")?;
+    let status = wait_for_interactive_child(&mut custody)?;
+    custody.observe_exit()?;
+    let exit_code = Some(crate::executor::cli::terminal_signal::exit_code_from_status(&status));
+    custody.complete_orderly(exit_code, exit_code)?;
 
     Ok(interactive_result_from_status(
         provider,
@@ -327,6 +316,15 @@ fn configure_interactive_stdio(cmd: &mut Command) {
     cmd.stderr(Stdio::inherit());
 }
 
+#[cfg(unix)]
+fn configure_direct_interactive_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_direct_interactive_process_group(_cmd: &mut Command) {}
+
 fn spawn_interactive_child(mut cmd: Command, provider: &ProviderConfig) -> Result<Child, String> {
     cmd.spawn()
         .map_err(|err| format_spawn_interactive_child_error(&provider.command, err))
@@ -360,8 +358,10 @@ fn interactive_spawn_identity_context(
     }))
 }
 
-fn wait_for_interactive_child(child: &mut Child) -> Result<ExitStatus, String> {
-    child.wait().map_err(format_interactive_wait_error)
+fn wait_for_interactive_child(
+    custody: &mut ChildGenerationCustody<'_>,
+) -> Result<ExitStatus, String> {
+    custody.wait().map_err(format_interactive_wait_error)
 }
 
 fn format_interactive_wait_error(err: io::Error) -> String {

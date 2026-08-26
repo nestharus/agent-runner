@@ -20,6 +20,7 @@ use crate::executor::cli::spawn_identity::{
     provider_parent_invocation_env, split_invocation_launch_environment,
 };
 use crate::executor::cli::{provider_name, resolve_input_flags, shell_split};
+use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
 use oulipoly_provider::generated::{
     BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LaunchParams, LaunchRequest,
@@ -130,13 +131,14 @@ fn insert_launch_env(env: &mut BTreeMap<String, String>, key: &str, value: Strin
 pub(crate) fn build_policy_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    host_options: &DescribeHostOptions,
 ) -> Result<Value, serde_json::Error> {
     let provider_args = model_provider_args(context);
     serde_json::to_value(PolicyEvaluateRequest {
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id("policy"),
         provider_instance_id: Some(context.provider.name.clone()),
-        host: host_context(context, &candidate.working_directory),
+        host: host_context(host_options, &candidate.working_directory),
         params: PolicyEvaluateParams {
             settings_id: context.settings_id.clone(),
             mode: mode(context),
@@ -149,6 +151,7 @@ pub(crate) fn build_policy_request(
 pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
+    host_options: &DescribeHostOptions,
 ) -> Result<Value, serde_json::Error> {
     let (argv, launch_stdin) = project_launch_carrier(context, candidate);
     let mut launch_env = candidate.env.clone();
@@ -171,7 +174,7 @@ pub(crate) fn build_launch_request(
         contract: CONTRACT_VERSION.to_string(),
         request_id: request_id("launch"),
         provider_instance_id: Some(context.provider.name.clone()),
-        host: host_context(context, &candidate.working_directory),
+        host: host_context(host_options, &candidate.working_directory),
         params: LaunchParams {
             settings_id: context.settings_id.clone(),
             mode: mode(context),
@@ -290,17 +293,20 @@ fn launch_stdin(context: &ExternalProviderDispatchContext) -> Option<String> {
     }
 }
 
-fn host_context(
-    _context: &ExternalProviderDispatchContext,
-    working_directory: &str,
-) -> HostContext {
+fn host_context(host_options: &DescribeHostOptions, working_directory: &str) -> HostContext {
     HostContext {
         app: "oulipoly-agent-runner".to_string(),
         app_version: None,
         platform: Some(std::env::consts::OS.to_string()),
         working_directory: Some(working_directory.to_string()),
-        config_root: None,
-        data_root: None,
+        config_root: host_options
+            .config_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        data_root: host_options
+            .data_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
         env: BTreeMap::new(),
         deadline_unix_ms: None,
     }

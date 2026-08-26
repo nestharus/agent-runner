@@ -23,6 +23,8 @@ use std::io::Write;
 use std::process::Child;
 use std::thread;
 
+use crate::executor::cli::spawn_identity::child_custody_test_fault;
+
 const STDIN_WRITE_CHUNK_SIZE: usize = 16 * 1024;
 
 pub(super) struct StdinWriter {
@@ -39,6 +41,7 @@ pub(super) fn start_child_stdin_writer(
     let Some(payload) = take_supervised_stdin_payload(config) else {
         return Ok(None);
     };
+    child_custody_test_fault("headless_stdin")?;
     let mut stdin = take_child_stdin(child)?;
     let handle = thread::spawn(move || {
         write_prompt_payload(&mut stdin, &payload).map_err(|err| write_stdin_error(&err))

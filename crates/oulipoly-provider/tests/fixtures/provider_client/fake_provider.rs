@@ -127,6 +127,9 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
         "sleep" => sleep_forever(),
         "child-grandchild" => child_grandchild(),
         "sigterm-resistant-child-grandchild" => sigterm_resistant_child_grandchild(),
+        "sigterm-exiting-leader-resistant-descendant" => {
+            sigterm_exiting_leader_resistant_descendant()
+        }
         "exit-with-pipe-holding-descendant" => exit_with_pipe_holding_descendant(),
         "pipe-holding-descendant" => pipe_holding_descendant(),
         "probe-child" => probe_child(),
@@ -135,6 +138,7 @@ fn dispatch_fake_provider_mode(mode: &str) -> i32 {
         "early-stdin-error" => early_stdin_error(),
         "early-stdin-empty" => early_stdin_empty(),
         "launch-valid" => launch_valid(0),
+        "launch-provider-error" => provider_error("conflict", "launch_conflict", 2),
         "launch-model-nonzero" => launch_valid(9),
         "launch-provider-nonzero-after-final" => launch_provider_nonzero_after_final(),
         "launch-provider-nonzero-no-final" => launch_provider_nonzero_no_final(),
@@ -845,6 +849,13 @@ fn sigterm_resistant_child_grandchild() -> i32 {
     spawn_probe_child(true)
 }
 
+fn sigterm_exiting_leader_resistant_descendant() -> i32 {
+    let mut command = pipe_holding_descendant_command();
+    command.env("FAKE_PROVIDER_IGNORE_SIGTERM", "1");
+    let _descendant = command.spawn().expect("resistant descendant should spawn");
+    sleep_forever()
+}
+
 fn exit_with_pipe_holding_descendant() -> i32 {
     let _ = read_stdin_to_string();
     let mut command = pipe_holding_descendant_command();
@@ -853,6 +864,7 @@ fn exit_with_pipe_holding_descendant() -> i32 {
 }
 
 fn pipe_holding_descendant() -> i32 {
+    maybe_ignore_sigterm();
     write_probe_pid("pipe-holder");
     thread::sleep(Duration::from_secs(2));
     0

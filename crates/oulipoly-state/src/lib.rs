@@ -34,6 +34,7 @@ mod chain_segments;
 pub mod continuation;
 mod db;
 pub mod deployment;
+mod filesystem_identity;
 pub mod invocation_marker;
 mod lifecycle_log;
 pub mod mailbox;
@@ -46,12 +47,15 @@ pub mod repositories;
 pub mod result_envelope;
 pub mod schema;
 pub mod schema_probe;
+mod snapshot_helper;
 
 pub type StateDbError = String;
 
 pub use crate::schema::{CURRENT_SCHEMA_VERSION, MINIMUM_SUPPORTED_SCHEMA_VERSION};
 pub use chain_segments::ChainSegmentRow;
 pub use db::DbError;
+#[cfg(feature = "test-support")]
+pub use db::InvocationQueryProgressPause;
 pub use db::LegacyProviderNames;
 pub use db::ProviderRecord;
 pub use db::ReadOnlyOpenError;
@@ -61,7 +65,7 @@ pub use db::StateDb;
 pub use db::StateDbRebuildAuthority;
 pub use db::StateDbWriterAuthority;
 pub use db::StateReadConnection;
-pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord};
+pub use db::{AccountRecord, AuthMethod, AuthStatus, CliProviderRecord, InvocationChildrenPage};
 pub use db::{
     AcknowledgementStage, AcknowledgementWrite, DeliveryAcknowledgement, DeliveryEvidence,
     DeliveryEvidenceKind, DispositionWrite, EventDisposition, ExactProcessIdentity,

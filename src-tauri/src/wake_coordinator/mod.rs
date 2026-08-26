@@ -3,6 +3,7 @@
 //! `accessor`, `filter`, `formatter`, `mapper`, `orchestration`, `parser`,
 //! `predicate`, `validator`
 
+mod admission;
 mod auto_wake_env;
 mod constants;
 mod consumed_completion;
@@ -14,7 +15,16 @@ mod turn_recheck;
 mod wake_start;
 
 pub(crate) type WakeDiagnostic = diagnostics::WakeDiagnostic;
-pub(crate) use sweep::LivePtyRetryDriverGuard;
+pub(crate) use sweep::{LivePtyRetryDriverGuard, StartupWakeReclaimGuard};
+
+pub(crate) use admission::SessionAdmissionGuard;
+
+pub(crate) fn admit_session_launch(
+    registration_identity: &str,
+    session_id: Option<&str>,
+) -> Result<SessionAdmissionGuard, String> {
+    admission::enqueue_and_wait(registration_identity, session_id)
+}
 
 pub(crate) fn mark_session_idle_after_turn(
     session_id: &str,
@@ -30,6 +40,18 @@ pub(crate) fn trigger_notify_wake(session_id: &str) -> WakeDiagnostic {
 
 pub(crate) fn run_startup_wake_reclaim_sweep() {
     sweep::run_startup_wake_reclaim_sweep();
+}
+
+pub(crate) fn start_startup_wake_reclaim_sweep() -> Option<StartupWakeReclaimGuard> {
+    sweep::start_startup_wake_reclaim_sweep()
+}
+
+pub(crate) fn is_wake_reclaim_handoff_invocation() -> bool {
+    sweep::is_wake_reclaim_handoff_invocation()
+}
+
+pub(crate) fn run_wake_reclaim_handoff_invocation() -> Result<(), String> {
+    sweep::run_wake_reclaim_handoff_invocation()
 }
 
 pub(crate) fn start_wake_reclaim_maintenance_driver() {

@@ -53,9 +53,15 @@ pub(crate) fn map_provider_client_error(error: ProviderClientError) -> ServiceEr
         ProviderClientError::Protocol { kind, .. } => service_error(
             ExternalProviderDispatchError::provider_protocol_failure(kind.as_str()),
         ),
-        ProviderClientError::ProviderCapability(error) => service_error(
-            ExternalProviderDispatchError::policy_rejected(error.error().diagnostics.clone()),
-        ),
+        ProviderClientError::ProviderCapability(error) => {
+            let provider_error = error.error();
+            service_error(ExternalProviderDispatchError::provider_failure(
+                error.subcommand(),
+                &provider_error.code,
+                &provider_error.message,
+                provider_error.diagnostics.clone(),
+            ))
+        }
     }
 }
 
@@ -225,5 +231,15 @@ mod tests {
                 "capability {category} must not rotate"
             );
         }
+    }
+
+    #[test]
+    fn provider_capability_error_preserves_operation_code_and_message() {
+        let error = map_provider_client_error(capability("invalid_request"));
+
+        assert_eq!(
+            error.to_string(),
+            "external provider policy.evaluate failed: auth_expired: account token expired"
+        );
     }
 }

@@ -5,7 +5,7 @@ use oulipoly_config::{
     ModelConfig, PromptMode, ProviderConfig, ProviderEntry, ProvidersConfig, SessionStorage,
 };
 use oulipoly_runtime::session_metadata::resolve_resume_workspace_root;
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
+use oulipoly_state::mailbox::{MailboxDb, SessionMetadataUpsert};
 use oulipoly_state::{InvocationStart, ModelStore, ProviderSessionBinding, StateDb};
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
@@ -213,13 +213,13 @@ fn imported_script_session_cwd_precedes_stale_mailbox_and_failing_script() {
     let mut mailbox = MailboxDb::open_default().unwrap();
     let stale_mailbox_cwd_text = stale_mailbox_cwd.display().to_string();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_IMPORTED,
             mode: "pty_interactive",
             invocation_uuid: Some("44444444-4444-4444-8444-444444444444"),
             provider_name: Some(PROVIDER),
             model_name: Some(MODEL_LOCAL),
-            pty_control_path: Some("/tmp/oulipoly-stale.sock"),
             models_dir: None,
             effective_cwd: Some(&stale_mailbox_cwd_text),
         })
@@ -265,13 +265,13 @@ fn external_provider_runtime_cwd_precedes_recorded_script_session_cwd() {
     let mut mailbox = MailboxDb::open_default().unwrap();
     let live_runtime_cwd_text = live_runtime_cwd.display().to_string();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_LIVE_RUNTIME,
             mode: "pty_interactive",
             invocation_uuid: Some("55555555-5555-4555-8555-555555555555"),
             provider_name: Some(PROVIDER),
             model_name: Some(MODEL_REF),
-            pty_control_path: Some("/tmp/oulipoly-live.sock"),
             models_dir: None,
             effective_cwd: Some(&live_runtime_cwd_text),
         })
@@ -309,13 +309,13 @@ fn mailbox_precedence_scenario() {
     let mut mailbox = MailboxDb::open_default().unwrap();
     let mailbox_cwd_text = mailbox_cwd.display().to_string();
     mailbox
-        .upsert_session_runtime(SessionRuntimeUpsert {
+        .wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
             session_id: SESSION_MAILBOX,
             mode: "pty_interactive",
             invocation_uuid: Some("33333333-3333-4333-8333-333333333333"),
             provider_name: Some(PROVIDER),
             model_name: Some(MODEL_REF),
-            pty_control_path: Some("/tmp/oulipoly-test.sock"),
             models_dir: None,
             effective_cwd: Some(&mailbox_cwd_text),
         })

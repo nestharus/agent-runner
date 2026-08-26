@@ -134,7 +134,11 @@ fn pending_mailbox_rows(fixture: &Fixture, session_id: &str) -> Vec<MailboxRow> 
 }
 
 fn wake_claim(fixture: &Fixture, session_id: &str) -> Option<WakeClaimRow> {
-    fixture.mailbox().wake_claim(session_id).unwrap()
+    fixture
+        .mailbox()
+        .wake_session_reader()
+        .wake_claim(session_id)
+        .unwrap()
 }
 
 fn required_wake_claim(fixture: &Fixture, session_id: &str) -> WakeClaimRow {

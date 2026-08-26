@@ -9,7 +9,7 @@ use oulipoly_config::ModelConfig;
 use oulipoly_runtime::executor;
 use oulipoly_runtime::services::InvocationLifecycleServicePort;
 use oulipoly_state::CompositeInvocationId;
-use oulipoly_state::mailbox::{MailboxDb, SessionRuntimeUpsert};
+use oulipoly_state::mailbox::{MailboxDb, SessionMetadataUpsert};
 
 use super::accessor::BalancedExecutionEnvironment;
 use super::disposition::BalancedLoopControl;
@@ -435,7 +435,7 @@ fn ingest_completed_attempt_session(
         input.agent_runtime_services,
         mapper::completed_session_ingest_request_for_attempt(input, &ingest_effective_cwd),
     );
-    record_external_session_runtime_if_needed(
+    record_external_session_metadata_if_needed(
         input,
         &ingest_effective_cwd,
         ingest_output.session_id.as_deref(),
@@ -455,7 +455,7 @@ fn ingest_completed_attempt_session(
     Ok(())
 }
 
-fn record_external_session_runtime_if_needed(
+fn record_external_session_metadata_if_needed(
     input: &CompletedAttemptInput<'_, '_, '_>,
     effective_cwd: &Path,
     ingested_session_id: Option<&str>,
@@ -466,7 +466,7 @@ fn record_external_session_runtime_if_needed(
     let Some(session_id) = external_runtime_session_id(input, ingested_session_id) else {
         return;
     };
-    if let Err(err) = record_external_session_runtime(input, session_id, effective_cwd) {
+    if let Err(err) = record_external_session_metadata(input, session_id, effective_cwd) {
         tracing::warn!(
             provider_name = input.provider_name,
             session_id,
@@ -485,21 +485,21 @@ fn external_runtime_session_id<'a>(
         .or(input.result.session_capture.session_id.as_deref())
 }
 
-fn record_external_session_runtime(
+fn record_external_session_metadata(
     input: &CompletedAttemptInput<'_, '_, '_>,
     session_id: &str,
     effective_cwd: &Path,
 ) -> Result<(), String> {
     let mut db = MailboxDb::open_default()?;
     let effective_cwd = effective_cwd.to_string_lossy();
-    db.upsert_session_runtime(SessionRuntimeUpsert {
-        session_id,
-        mode: "headless",
-        invocation_uuid: Some(&input.invocation.id),
-        provider_name: Some(input.provider_name),
-        model_name: Some(&input.model.name),
-        pty_control_path: None,
-        models_dir: Some(input.env.models_dir.to_string_lossy().as_ref()),
-        effective_cwd: Some(effective_cwd.as_ref()),
-    })
+    db.wake_sessions()
+        .upsert_session_metadata(SessionMetadataUpsert {
+            session_id,
+            mode: "headless",
+            invocation_uuid: Some(&input.invocation.id),
+            provider_name: Some(input.provider_name),
+            model_name: Some(&input.model.name),
+            models_dir: Some(input.env.models_dir.to_string_lossy().as_ref()),
+            effective_cwd: Some(effective_cwd.as_ref()),
+        })
 }
