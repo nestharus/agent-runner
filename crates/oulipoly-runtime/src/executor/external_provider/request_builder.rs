@@ -25,9 +25,11 @@ use crate::provider_registry::DescribeHostOptions;
 use oulipoly_config::PromptMode;
 use oulipoly_provider::generated::{
     BytePayload, CONTRACT_VERSION, HostContext, JsonObject, LaunchParams, LaunchRequest,
-    PolicyEvaluateParams, PolicyEvaluateRequest, ProviderModelRequest,
+    PROMPT_ACCEPTANCE_V1, PolicyEvaluateParams, PolicyEvaluateRequest, PromptAcceptanceRequestV1,
+    ProviderModelRequest,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -156,6 +158,7 @@ pub(crate) fn build_launch_request(
     context: &ExternalProviderDispatchContext,
     candidate: &LaunchCandidate,
     host_options: &DescribeHostOptions,
+    prompt_acceptance_v1: bool,
 ) -> Result<Value, serde_json::Error> {
     let (argv, launch_stdin) = project_launch_carrier(context, candidate);
     let mut launch_env = candidate.env.clone();
@@ -192,8 +195,32 @@ pub(crate) fn build_launch_request(
             env,
             stdin,
             session: launch_session(context),
+            prompt_acceptance: prompt_acceptance_v1
+                .then(|| prompt_acceptance_request(&candidate.prompt)),
         },
     })
+}
+
+fn prompt_acceptance_request(prompt: &str) -> PromptAcceptanceRequestV1 {
+    PromptAcceptanceRequestV1 {
+        protocol: PROMPT_ACCEPTANCE_V1.to_string(),
+        prompt_sha256: sha256_hex(prompt.as_bytes()),
+        delivery_nonce: delivery_nonce_from_prompt(prompt),
+    }
+}
+
+fn delivery_nonce_from_prompt(prompt: &str) -> Option<String> {
+    prompt.lines().find_map(|line| {
+        line.strip_prefix("[OULIPOLY-DELIVERY ")
+            .and_then(|suffix| suffix.strip_suffix(']'))
+            .filter(|nonce| !nonce.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[allow(clippy::needless_as_bytes)] // Keep the provider contract's byte unit explicit.

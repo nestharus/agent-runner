@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 pub const CONTRACT_VERSION: &str = "oulipoly.provider/v1";
+pub const PROMPT_ACCEPTANCE_V1: &str = "oulipoly.prompt_acceptance/v1";
+pub const PROMPT_ACCEPTED_MARKER_V1: &str = "oulipoly.prompt_accepted/v1";
 
 pub type JsonObject = BTreeMap<String, Value>;
 
@@ -310,6 +312,8 @@ pub struct EmptyParams {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DescribeCapabilities {
     pub launch: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_acceptance_v1: bool,
     pub policy: bool,
     pub quota: bool,
     pub session: bool,
@@ -475,6 +479,14 @@ pub struct PolicyEvaluateResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptAcceptanceRequestV1 {
+    pub protocol: String,
+    pub prompt_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_nonce: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaunchParams {
     pub settings_id: String,
     pub mode: String,
@@ -487,6 +499,8 @@ pub struct LaunchParams {
     pub stdin: Option<BytePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<JsonObject>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_acceptance: Option<PromptAcceptanceRequestV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

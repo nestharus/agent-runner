@@ -526,6 +526,8 @@ import pathlib
 import sys
 
 CONTRACT = "oulipoly.provider/v1"
+PROMPT_ACCEPTANCE = "oulipoly.prompt_acceptance/v1"
+PROMPT_ACCEPTED_MARKER = "oulipoly.prompt_accepted/v1"
 SESSION_ID = "5169694d-de0f-40d1-890c-6e28e55bab27"
 
 subcommand = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -563,6 +565,7 @@ def describe():
         "preferred_contract": CONTRACT,
         "capabilities": {
             "launch": True,
+            "prompt_acceptance_v1": True,
             "policy": True,
             "quota": False,
             "session": True,
@@ -641,12 +644,17 @@ def launch():
     if mode == "confirmed":
         emit(stream_event(seq, "stdout", "fixture terminal assistant response\n"))
         seq += 1
-    emit(marker_event(seq, "oulipoly.submitted_user_turn", {
+    acceptance = params.get("prompt_acceptance", {})
+    value = {
+        "protocol": PROMPT_ACCEPTANCE,
         "provider_session_id": session_id,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "source": "age270.fixture",
         "message_id": "age270-submitted-turn",
-    }))
+    }
+    if acceptance.get("delivery_nonce"):
+        value["delivery_nonce"] = acceptance["delivery_nonce"]
+    emit(marker_event(seq, PROMPT_ACCEPTED_MARKER, value))
     seq += 1
     if mode == "confirmed":
         emit(marker_event(seq, "oulipoly.produced_assistant_response", True))

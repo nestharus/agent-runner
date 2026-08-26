@@ -46,10 +46,10 @@ use crate::executor::{
     ExecutionResult, SessionCaptureMethod, SessionCaptureResult, SubmittedUserTurn,
 };
 use crate::services::TerminalClassification;
+use oulipoly_provider::generated::{PROMPT_ACCEPTANCE_V1, PROMPT_ACCEPTED_MARKER_V1};
 use oulipoly_provider::stream::LaunchResult;
 use serde_json::Value;
 
-const SUBMITTED_USER_TURN_MARKER: &str = "oulipoly.submitted_user_turn";
 pub(crate) const PROVIDER_SESSION_MARKER: &str = "oulipoly.provider_session";
 
 pub(crate) fn map_launch_result_with_terminal_classification(
@@ -57,6 +57,7 @@ pub(crate) fn map_launch_result_with_terminal_classification(
     provider_index: usize,
     provider_name: &str,
     classification: Option<TerminalClassification>,
+    prompt_acceptance_v1: bool,
 ) -> ExecutionResult {
     let stdout = result.stdout_bytes();
     let stderr = String::from_utf8_lossy(&result.stderr_bytes()).into_owned();
@@ -81,19 +82,28 @@ pub(crate) fn map_launch_result_with_terminal_classification(
         terminal_reason: terminal.terminal_reason,
         terminal_signal: Some(terminal.terminal_signal),
         produced_assistant_response,
-        submitted_user_turn: submitted_user_turn(&result),
+        submitted_user_turn: submitted_user_turn(&result, prompt_acceptance_v1),
         captured_child_invocations: Vec::new(),
         returned_artifacts: Vec::new(),
     }
 }
 
-fn submitted_user_turn(result: &LaunchResult) -> Option<SubmittedUserTurn> {
+fn submitted_user_turn(
+    result: &LaunchResult,
+    prompt_acceptance_v1: bool,
+) -> Option<SubmittedUserTurn> {
+    if !prompt_acceptance_v1 {
+        return None;
+    }
     result
-        .retained_marker_value(SUBMITTED_USER_TURN_MARKER)
+        .retained_marker_value(PROMPT_ACCEPTED_MARKER_V1)
         .and_then(submitted_user_turn_from_marker_value)
 }
 
 fn submitted_user_turn_from_marker_value(value: &Value) -> Option<SubmittedUserTurn> {
+    if nonempty_marker_string(value, "protocol").as_deref() != Some(PROMPT_ACCEPTANCE_V1) {
+        return None;
+    }
     let provider_session_id = nonempty_marker_string(value, "provider_session_id")
         .or_else(|| nonempty_marker_string(value, "session_id"))?;
     let prompt_sha256 = nonempty_marker_string(value, "prompt_sha256")?;

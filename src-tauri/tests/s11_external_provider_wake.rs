@@ -433,6 +433,27 @@ fn submitted_turn_prompt_hash_accepts_exact_and_rejects_mismatch_without_deliver
 }
 
 #[test]
+fn submitted_turn_marker_requires_declared_prompt_acceptance_capability() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    assert_success(&fixture.run_agent_with_env(
+        "seed undeclared attestation",
+        &[("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1")],
+    ));
+
+    let output = fixture.run_resume_with_env(
+        "manual undeclared attestation",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY", "1"),
+        ],
+    );
+
+    assert_unconfirmed_resume(&output);
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
+}
+
+#[test]
 fn accepted_owner_session_consumes_detached_child_completion_despite_ingest_evidence_loss() {
     for provider in OPENCODE_PROVIDERS {
         assert_owner_session_consumes_detached_child_completion(provider);
@@ -480,6 +501,31 @@ fn trusted_submission_settles_mailbox_delivery_after_provider_nonzero() {
     fixture.assert_xdg_isolated();
 }
 
+#[test]
+fn delivery_nonce_does_not_override_a_mismatched_prompt_hash() {
+    let fixture = Fixture::new();
+    fixture.write_external_provider();
+    fixture.remove_turn_script_fallback();
+    assert_success(&fixture.run_agent_with_env("owner waits for detached child", &[]));
+    let owner_invocation_uuid = fixture.latest_invocation_uuid();
+    let notification = fixture.seed_detached_child_completion(&owner_invocation_uuid);
+
+    let resumed = fixture.run_resume_with_env(
+        "continue owning workflow",
+        &[
+            ("S11_EMIT_SUBMITTED_TURN_MARKER", "1"),
+            ("S11_MARKER_PROMPT_SHA_MISMATCH", "1"),
+            ("S11_NO_ASSISTANT_RESULT", "1"),
+            ("S11_EXIT_NONZERO", "1"),
+        ],
+    );
+
+    assert_eq!(resumed.status.code(), Some(29), "{resumed:?}");
+    assert_eq!(fixture.latest_resume_acceptance(), (None, None));
+    let pending = fixture.mailbox_row(notification.seq);
+    assert!(pending.delivered_at.is_none(), "{pending:?}");
+}
+
 fn assert_owner_session_consumes_detached_child_completion(provider: &'static str) {
     let positive = Fixture::with_provider(provider);
     positive.write_external_provider();
@@ -512,7 +558,7 @@ fn assert_owner_session_consumes_detached_child_completion(provider: &'static st
     assert_eq!(acceptance.as_deref(), Some("accepted"));
     assert_eq!(
         evidence.as_deref(),
-        Some("validated submitted user turn: exact session and delivery nonce")
+        Some("validated submitted user turn: exact session, delivery nonce, and prompt SHA-256")
     );
     assert_eq!(resumed_result["exit_code"], 0);
     let (provider_name, provider_session_id) = positive.latest_resumed_provider_identity();
@@ -628,10 +674,11 @@ import hashlib
 import json
 import os
 import pathlib
-import re
 import sys
 
 CONTRACT = "oulipoly.provider/v1"
+PROMPT_ACCEPTANCE = "oulipoly.prompt_acceptance/v1"
+PROMPT_ACCEPTED_MARKER = "oulipoly.prompt_accepted/v1"
 SESSION = "ses_s11externalwake"
 
 def request_id(request):
@@ -646,24 +693,27 @@ def envelope(request, result):
     }
 
 def describe(request):
+    capabilities = {
+        "launch": True,
+        "policy": True,
+        "quota": False,
+        "session": True,
+        "terminal": False,
+        "rotation": False,
+        "discovery": False,
+        "settings": False,
+        "setup_brain": False,
+        "setup": False,
+        "migration": False,
+    }
+    if os.environ.get("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY") != "1":
+        capabilities["prompt_acceptance_v1"] = True
     return envelope(request, {
         "provider_id": "s11-external-provider-runtime-fixture",
         "display_name": "S11 External Provider Runtime Fixture",
         "contract_versions": [CONTRACT],
         "preferred_contract": CONTRACT,
-        "capabilities": {
-            "launch": True,
-            "policy": True,
-            "quota": False,
-            "session": True,
-            "terminal": False,
-            "rotation": False,
-            "discovery": False,
-            "settings": False,
-            "setup_brain": False,
-            "setup": False,
-            "migration": False,
-        },
+        "capabilities": capabilities,
     })
 
 def policy_evaluate(request):
@@ -716,24 +766,28 @@ def provider_session_marker_event(request, seq, session_id):
 
 def submitted_turn_marker_event(request, seq, session_id, prompt):
     prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    acceptance = request.get("params", {}).get("prompt_acceptance", {})
+    if os.environ.get("S11_OMIT_PROMPT_ACCEPTANCE_CAPABILITY") != "1":
+        assert acceptance.get("protocol") == PROMPT_ACCEPTANCE
+        assert acceptance.get("prompt_sha256") == prompt_sha
     if os.environ.get("S11_MARKER_PROMPT_SHA_MISMATCH") == "1":
         prompt_sha = hashlib.sha256(b"different payload").hexdigest()
     value = {
+        "protocol": PROMPT_ACCEPTANCE,
         "provider_session_id": session_id,
         "prompt_sha256": prompt_sha,
         "source": "s11.fixture",
         "message_id": "msg-s11-submitted",
     }
-    match = re.search(r"^\[OULIPOLY-DELIVERY ([^\]]+)\]$", prompt, re.MULTILINE)
-    if match:
-        value["delivery_nonce"] = match.group(1)
+    if acceptance.get("delivery_nonce"):
+        value["delivery_nonce"] = acceptance["delivery_nonce"]
     return {
         "contract": CONTRACT,
         "request_id": request_id(request),
         "seq": seq,
         "time_unix_ms": 1000 + seq,
         "kind": "marker",
-        "name": "oulipoly.submitted_user_turn",
+        "name": PROMPT_ACCEPTED_MARKER,
         "value": value,
     }
 

@@ -23,6 +23,10 @@
       "type": "object",
       "properties": {
         "launch": { "type": "boolean" },
+        "prompt_acceptance_v1": {
+          "type": "boolean",
+          "description": "Advertises support for the oulipoly.prompt_acceptance/v1 launch extension and oulipoly.prompt_accepted/v1 attestation marker. Omitted or false means the host must not trust prompt-acceptance markers from this provider."
+        },
         "policy": { "type": "boolean" },
         "quota": { "type": "boolean" },
         "session": { "type": "boolean" },

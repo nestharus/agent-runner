@@ -112,6 +112,7 @@ fn describe_result(provider_id: &str) -> DescribeResult {
         preferred_contract: CONTRACT_VERSION.to_string(),
         capabilities: DescribeCapabilities {
             launch: true,
+            prompt_acceptance_v1: false,
             policy: false,
             quota: false,
             session: false,

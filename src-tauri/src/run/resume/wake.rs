@@ -190,15 +190,15 @@ fn mailbox_delivery_turn_confirmed(
 
 #[derive(Clone, Copy)]
 pub(super) enum ValidatedSubmittedUserTurn {
-    DeliveryNonce,
+    DeliveryNonceAndPromptSha256,
     PromptSha256,
 }
 
 impl ValidatedSubmittedUserTurn {
     fn evidence(self) -> &'static str {
         match self {
-            Self::DeliveryNonce => {
-                "validated submitted user turn: exact session and delivery nonce"
+            Self::DeliveryNonceAndPromptSha256 => {
+                "validated submitted user turn: exact session, delivery nonce, and prompt SHA-256"
             }
             Self::PromptSha256 => "validated submitted user turn: exact session and prompt SHA-256",
         }
@@ -222,12 +222,14 @@ fn validate_submitted_user_turn_payload(
     submitted: &executor::SubmittedUserTurn,
     answer: &str,
 ) -> Option<ValidatedSubmittedUserTurn> {
+    if submitted.prompt_sha256 != sha256_hex(answer.as_bytes()) {
+        return None;
+    }
     if let Some(delivery_nonce) = input.mailbox_delivery_nonce {
         return (submitted.delivery_nonce.as_deref() == Some(delivery_nonce))
-            .then_some(ValidatedSubmittedUserTurn::DeliveryNonce);
+            .then_some(ValidatedSubmittedUserTurn::DeliveryNonceAndPromptSha256);
     }
-    (submitted.prompt_sha256 == sha256_hex(answer.as_bytes()))
-        .then_some(ValidatedSubmittedUserTurn::PromptSha256)
+    Some(ValidatedSubmittedUserTurn::PromptSha256)
 }
 
 pub(super) fn project_validated_submitted_turn_acceptance(

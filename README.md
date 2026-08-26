@@ -1061,6 +1061,12 @@ To implement a provider, begin with the [`Provider Contract Crate (oulipoly-prov
 
 > **Parse-only in this release:** Dynamic loading and runtime dispatch are not implemented in this release; the `provider = { ... }` field is recorded by the parser but has no effect on routing or execution.
 
+### Prompt Acceptance Attestation
+
+External provider binaries advertise `capabilities.prompt_acceptance_v1: true` only when they implement the `oulipoly.prompt_acceptance/v1` launch extension. For an advertised provider, the host adds `params.prompt_acceptance` with the protocol id, the SHA-256 of the exact launch prompt, and the mailbox delivery nonce when that prompt contains one. This contract data lets the provider correlate delivery without parsing an application-local prompt envelope.
+
+After submitting that exact prompt, the provider may emit a request-correlated marker named `oulipoly.prompt_accepted/v1`. Its value must contain the protocol id, provider session id, exact prompt SHA-256, and the requested delivery nonce when present. The host trusts the marker only when the capability was advertised and all supplied identities match; a nonce never substitutes for the exact prompt hash. Providers that omit the capability may still launch normally, but their prompt-acceptance markers cannot authorize durable settlement or suppress replay. Incompatible attestation semantics require a new protocol and capability version rather than changing v1 in place.
+
 ### Provider-Native Session Enumeration
 
 External provider binaries that support provider-native session discovery advertise `capabilities.session_enumerate: true` in `describe` and implement the `session.enumerate` subcommand. The runner uses this command for session import/listing metadata and treats provider-native stores as **read-only** during import: enumeration records chain rows and display metadata in `state.db`, and optional turn backfill reads through `session.read_turns`; it does not write to Claude, OpenCode, or any other provider-native store.
