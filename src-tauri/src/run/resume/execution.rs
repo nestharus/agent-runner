@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use oulipoly_runtime::executor;
 use oulipoly_runtime::provider_registry::ProviderRegistryOptions;
-use oulipoly_runtime::services::{ExecutorServiceRequest, ResumeServiceOutput};
+use oulipoly_runtime::services::{
+    ExecutorServiceRequest, MailboxDeliveryCorrelation, ResumeServiceOutput,
+};
 
 use super::orchestration::ResumeAttemptInput;
 use super::{formatter, mapper, migration, validator, wake};
@@ -285,6 +287,11 @@ fn provider_ref_resume_executor_request(
         extra_inputs: HashMap::new(),
         parent_invocation_env: Some(invocation_env.to_string()),
         start_known_provider_session_id: input.resolved.active_session_id.clone(),
+        mailbox_delivery_correlation: input.mailbox_delivery_nonce.map(|delivery_nonce| {
+            MailboxDeliveryCorrelation {
+                delivery_nonce: delivery_nonce.to_string(),
+            }
+        }),
     }
 }
 

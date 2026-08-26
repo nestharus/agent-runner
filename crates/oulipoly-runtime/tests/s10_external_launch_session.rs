@@ -228,6 +228,7 @@ fn external_execute_request(
                 extra_inputs: HashMap::new(),
                 parent_invocation_env: None,
                 start_known_provider_session_id: start_known_provider_session_id.to_string(),
+                mailbox_delivery_correlation: None,
             }
         }
         None => ExecutorServiceRequest::Effective {

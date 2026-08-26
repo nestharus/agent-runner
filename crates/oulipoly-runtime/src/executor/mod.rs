@@ -254,6 +254,7 @@ fn execute_legacy(request: ExecutorServiceRequest) -> Result<ExecutionResult, Se
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
+            mailbox_delivery_correlation: _,
         }
         | ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
             model,
@@ -319,6 +320,7 @@ fn external_provider_context_from_request(
                 parent_invocation_env,
                 start_known_provider_session_id: None,
                 start_known_provider_session_mode: None,
+                mailbox_delivery_correlation: None,
             }
             .into()
         }
@@ -344,6 +346,7 @@ fn external_provider_context_from_request(
             parent_invocation_env,
             start_known_provider_session_id: None,
             start_known_provider_session_mode: None,
+            mailbox_delivery_correlation: None,
         }
         .into(),
         ExecutorServiceRequest::EffectiveWithStartKnownProviderSessionId {
@@ -357,6 +360,7 @@ fn external_provider_context_from_request(
             extra_inputs,
             parent_invocation_env,
             start_known_provider_session_id,
+            mailbox_delivery_correlation,
         } => ExternalProviderDispatchInput {
             model,
             provider,
@@ -371,6 +375,7 @@ fn external_provider_context_from_request(
             start_known_provider_session_mode: Some(
                 crate::services::ProviderSessionStartMode::Resume,
             ),
+            mailbox_delivery_correlation,
         }
         .into(),
         ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
@@ -398,6 +403,7 @@ fn external_provider_context_from_request(
             start_known_provider_session_mode: Some(
                 crate::services::ProviderSessionStartMode::Create,
             ),
+            mailbox_delivery_correlation: None,
         }
         .into(),
     })

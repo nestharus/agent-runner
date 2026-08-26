@@ -32,6 +32,7 @@ fn apply_accepted_policy_transform(
     mut candidate: LaunchCandidate,
     result: PolicyEvaluateResult,
 ) -> LaunchCandidate {
+    // Prompt replacement changes launch text, not the mailbox batch this attempt delivers.
     let argv_transformed = apply_optional_argv(&mut candidate, result.argv);
     apply_optional_env(&mut candidate, result.env);
     apply_optional_stdin(&mut candidate, result.stdin);
@@ -105,4 +106,52 @@ fn prompt_arg_matches(candidate: &str, expected: &str) -> bool {
 
 fn replace_prompt_arg(target: &mut String, next: &str) {
     *target = next.to_string();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_policy_transform;
+    use crate::executor::external_provider::request_builder::LaunchCandidate;
+    use crate::services::MailboxDeliveryCorrelation;
+    use oulipoly_config::PromptMode;
+    use oulipoly_provider::generated::PolicyEvaluateResult;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn prompt_replacement_preserves_mailbox_delivery_correlation() {
+        let candidate = LaunchCandidate {
+            argv: vec!["provider".to_string(), "original".to_string()],
+            env: BTreeMap::new(),
+            stdin: None,
+            prompt: "original".to_string(),
+            prompt_mode: PromptMode::Arg,
+            working_directory: ".".to_string(),
+            mailbox_delivery_correlation: Some(MailboxDeliveryCorrelation {
+                delivery_nonce: "delivery-123".to_string(),
+            }),
+            completion_registration_authority: None,
+        };
+        let transformed = apply_policy_transform(
+            candidate,
+            PolicyEvaluateResult {
+                accepted: true,
+                argv: None,
+                env: None,
+                stdin: None,
+                prompt: Some("replacement".to_string()),
+                diagnostics: Vec::new(),
+                markers: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(transformed.prompt, "replacement");
+        assert_eq!(
+            transformed
+                .mailbox_delivery_correlation
+                .as_ref()
+                .map(|correlation| correlation.delivery_nonce.as_str()),
+            Some("delivery-123")
+        );
+    }
 }

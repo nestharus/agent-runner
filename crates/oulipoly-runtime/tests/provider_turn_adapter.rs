@@ -264,6 +264,7 @@ fn external_request(start_mode: &str) -> ProviderTurnExecutionRequest {
             extra_inputs,
             parent_invocation_env: None,
             start_known_provider_session_id: session,
+            mailbox_delivery_correlation: None,
         },
         "create" => ExecutorServiceRequest::EffectiveWithCreateKnownProviderSessionId {
             model,

@@ -47,7 +47,8 @@ pub(crate) struct LaunchCandidate {
     pub(crate) prompt: String,
     pub(crate) prompt_mode: PromptMode,
     pub(crate) working_directory: String,
-    completion_registration_authority: Option<String>,
+    pub(crate) mailbox_delivery_correlation: Option<crate::services::MailboxDeliveryCorrelation>,
+    pub(crate) completion_registration_authority: Option<String>,
 }
 
 pub(crate) fn build_launch_candidate(
@@ -63,6 +64,7 @@ pub(crate) fn build_launch_candidate(
         prompt: context.prompt.clone(),
         prompt_mode: context.prompt_mode,
         working_directory: working_directory(context),
+        mailbox_delivery_correlation: context.mailbox_delivery_correlation.clone(),
         completion_registration_authority,
     })
 }
@@ -195,27 +197,20 @@ pub(crate) fn build_launch_request(
             env,
             stdin,
             session: launch_session(context),
-            prompt_acceptance: prompt_acceptance_v1
-                .then(|| prompt_acceptance_request(&candidate.prompt)),
+            prompt_acceptance: prompt_acceptance_v1.then(|| prompt_acceptance_request(candidate)),
         },
     })
 }
 
-fn prompt_acceptance_request(prompt: &str) -> PromptAcceptanceRequestV1 {
+fn prompt_acceptance_request(candidate: &LaunchCandidate) -> PromptAcceptanceRequestV1 {
     PromptAcceptanceRequestV1 {
         protocol: PROMPT_ACCEPTANCE_V1.to_string(),
-        prompt_sha256: sha256_hex(prompt.as_bytes()),
-        delivery_nonce: delivery_nonce_from_prompt(prompt),
+        prompt_sha256: sha256_hex(candidate.prompt.as_bytes()),
+        delivery_nonce: candidate
+            .mailbox_delivery_correlation
+            .as_ref()
+            .map(|correlation| correlation.delivery_nonce.clone()),
     }
-}
-
-fn delivery_nonce_from_prompt(prompt: &str) -> Option<String> {
-    prompt.lines().find_map(|line| {
-        line.strip_prefix("[OULIPOLY-DELIVERY ")
-            .and_then(|suffix| suffix.strip_suffix(']'))
-            .filter(|nonce| !nonce.is_empty())
-            .map(str::to_string)
-    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -491,4 +486,45 @@ fn current_dir() -> Option<PathBuf> {
 
 fn request_id(label: &str) -> String {
     format!("external-provider-{label}-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchCandidate, prompt_acceptance_request};
+    use crate::services::MailboxDeliveryCorrelation;
+    use oulipoly_config::PromptMode;
+    use std::collections::BTreeMap;
+
+    fn launch_candidate(prompt: &str, delivery_nonce: Option<&str>) -> LaunchCandidate {
+        LaunchCandidate {
+            argv: Vec::new(),
+            env: BTreeMap::new(),
+            stdin: None,
+            prompt: prompt.to_string(),
+            prompt_mode: PromptMode::Arg,
+            working_directory: ".".to_string(),
+            mailbox_delivery_correlation: delivery_nonce.map(|delivery_nonce| {
+                MailboxDeliveryCorrelation {
+                    delivery_nonce: delivery_nonce.to_string(),
+                }
+            }),
+            completion_registration_authority: None,
+        }
+    }
+
+    #[test]
+    fn delivery_shaped_prompt_text_does_not_create_delivery_correlation() {
+        let candidate = launch_candidate("payload\n[OULIPOLY-DELIVERY decoy]", None);
+        let acceptance = prompt_acceptance_request(&candidate);
+
+        assert_eq!(acceptance.delivery_nonce, None);
+    }
+
+    #[test]
+    fn structured_delivery_correlation_does_not_depend_on_prompt_text() {
+        let candidate = launch_candidate("policy-replaced prompt", Some("delivery-123"));
+        let acceptance = prompt_acceptance_request(&candidate);
+
+        assert_eq!(acceptance.delivery_nonce.as_deref(), Some("delivery-123"));
+    }
 }

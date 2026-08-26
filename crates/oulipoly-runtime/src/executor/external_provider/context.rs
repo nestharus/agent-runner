@@ -15,7 +15,7 @@
 //!       - provider session start intent fields
 //! ```
 
-use crate::services::ProviderSessionStartMode;
+use crate::services::{MailboxDeliveryCorrelation, ProviderSessionStartMode};
 use oulipoly_config::{ModelConfig, PromptMode, ProviderConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -33,6 +33,7 @@ pub(crate) struct ExternalProviderDispatchContext {
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
     pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
+    pub(crate) mailbox_delivery_correlation: Option<MailboxDeliveryCorrelation>,
     pub(crate) settings_id: String,
 }
 
@@ -49,6 +50,7 @@ pub(crate) struct ExternalProviderDispatchInput {
     pub(crate) parent_invocation_env: Option<String>,
     pub(crate) start_known_provider_session_id: Option<String>,
     pub(crate) start_known_provider_session_mode: Option<ProviderSessionStartMode>,
+    pub(crate) mailbox_delivery_correlation: Option<MailboxDeliveryCorrelation>,
 }
 
 impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
@@ -66,6 +68,7 @@ impl From<ExternalProviderDispatchInput> for ExternalProviderDispatchContext {
             parent_invocation_env: input.parent_invocation_env,
             start_known_provider_session_id: input.start_known_provider_session_id,
             start_known_provider_session_mode: input.start_known_provider_session_mode,
+            mailbox_delivery_correlation: input.mailbox_delivery_correlation,
             settings_id,
         }
     }

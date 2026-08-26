@@ -315,6 +315,11 @@ pub enum SessionLockFailure {
     Lock(LockError),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MailboxDeliveryCorrelation {
+    pub delivery_nonce: String,
+}
+
 #[derive(Clone)]
 #[allow(
     clippy::large_enum_variant,
@@ -352,6 +357,7 @@ pub enum ExecutorServiceRequest {
         extra_inputs: HashMap<String, Vec<String>>,
         parent_invocation_env: Option<String>,
         start_known_provider_session_id: String,
+        mailbox_delivery_correlation: Option<MailboxDeliveryCorrelation>,
     },
     EffectiveWithCreateKnownProviderSessionId {
         model: ModelConfig,

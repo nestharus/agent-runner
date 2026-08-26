@@ -103,6 +103,7 @@ pub(in crate::run::balancing) fn balanced_executor_request(
                     extra_inputs: common.extra_inputs,
                     parent_invocation_env: common.parent_invocation_env,
                     start_known_provider_session_id,
+                    mailbox_delivery_correlation: None,
                 }
             }
         };
