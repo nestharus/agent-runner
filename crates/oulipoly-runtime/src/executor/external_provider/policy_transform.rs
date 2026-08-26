@@ -32,7 +32,6 @@ fn apply_accepted_policy_transform(
     mut candidate: LaunchCandidate,
     result: PolicyEvaluateResult,
 ) -> LaunchCandidate {
-    // Prompt replacement changes launch text, not the mailbox batch this attempt delivers.
     let argv_transformed = apply_optional_argv(&mut candidate, result.argv);
     apply_optional_env(&mut candidate, result.env);
     apply_optional_stdin(&mut candidate, result.stdin);
@@ -66,8 +65,13 @@ fn apply_optional_prompt(
     argv_transformed: bool,
 ) {
     if let Some(prompt) = prompt {
+        let prompt_changed = prompt != candidate.prompt;
         rewrite_arg_prompt_if_needed(candidate, &prompt, argv_transformed);
         candidate.prompt = prompt;
+        if prompt_changed {
+            // Acceptance of replacement text cannot prove delivery of the original batch.
+            candidate.mailbox_delivery_correlation = None;
+        }
     }
 }
 
@@ -118,7 +122,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn prompt_replacement_preserves_mailbox_delivery_correlation() {
+    fn prompt_replacement_clears_mailbox_delivery_correlation() {
         let candidate = LaunchCandidate {
             argv: vec!["provider".to_string(), "original".to_string()],
             env: BTreeMap::new(),
@@ -146,12 +150,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.prompt, "replacement");
-        assert_eq!(
-            transformed
-                .mailbox_delivery_correlation
-                .as_ref()
-                .map(|correlation| correlation.delivery_nonce.as_str()),
-            Some("delivery-123")
-        );
+        assert_eq!(transformed.mailbox_delivery_correlation, None);
     }
 }
